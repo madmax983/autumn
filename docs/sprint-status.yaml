@@ -1,7 +1,7 @@
 version: "6.0.0"
 project_name: "autumn"
 project_level: 4
-current_sprint: 4
+current_sprint: 5
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
 last_updated: "2026-03-21"
 
@@ -129,6 +129,32 @@ sprints:
         status: "completed"
         story_doc: "docs/stories/S-011.md"
         completion_date: "2026-03-21"
+
+  - sprint_number: 5
+    start_date: "2026-05-19"
+    end_date: "2026-05-30"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 0
+    status: "active"
+    goal: "Database foundation — pool, model macro, config integration"
+    notes: "S-013/S-014/S-015 were subsumed by S-012 in Sprint 4. Pulled S-019 forward from Sprint 6."
+    stories:
+      - story_id: "S-016"
+        title: "diesel-async connection pool (deadpool)"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-016.md"
+      - story_id: "S-018"
+        title: "#[derive(Model)] macro"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-018.md"
+      - story_id: "S-019"
+        title: "Database URL from config integration"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-019.md"
 
 velocity:
   sprint_1: 12
