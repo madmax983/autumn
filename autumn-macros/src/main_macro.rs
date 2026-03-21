@@ -1,7 +1,10 @@
 //! `#[autumn::main]` macro implementation.
 //!
-//! A thin wrapper around `#[tokio::main]` that sets up the async runtime
-//! for an Autumn application.
+//! Generates a synchronous `main()` that builds a tokio runtime and
+//! blocks on the user's async body. We generate the runtime manually
+//! instead of delegating to `#[tokio::main]` because `tokio::main`
+//! emits code with `::tokio::` paths, which don't resolve when the
+//! user only depends on `autumn`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -18,8 +21,17 @@ pub fn main_macro(item: TokenStream) -> TokenStream {
             .to_compile_error();
     }
 
+    let body = &input_fn.block;
+    let attrs = &input_fn.attrs;
+
     quote! {
-        #[::autumn::reexports::tokio::main]
-        #input_fn
+        #(#attrs)*
+        fn main() {
+            ::autumn::reexports::tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .block_on(async move #body);
+        }
     }
 }
