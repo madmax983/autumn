@@ -4,7 +4,7 @@
 //!
 //! This crate provides:
 //! - Route annotation macros (`#[get]`, `#[post]`, etc.)
-//! - The `routes![]` collection macro (S-005)
+//! - The `routes![]` collection macro
 //! - The `#[autumn::main]` entry point macro (S-008)
 //! - The `#[derive(Model)]` convenience macro (S-018)
 //!
@@ -12,6 +12,7 @@
 //! which re-exports everything.
 
 mod route;
+mod routes_macro;
 
 use proc_macro::TokenStream;
 
@@ -105,4 +106,28 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("DELETE", "delete", attr.into(), item.into()).into()
+}
+
+/// Collect annotated route handlers into a `Vec<Route>`.
+///
+/// Each handler must have been annotated with a route macro (`#[get]`,
+/// `#[post]`, etc.) which generates a companion
+/// `__autumn_route_info_{name}()` function.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn::{get, post, routes};
+///
+/// #[get("/hello")]
+/// async fn hello() -> &'static str { "hello" }
+///
+/// #[post("/create")]
+/// async fn create() -> &'static str { "created" }
+///
+/// let all_routes = routes![hello, create];
+/// ```
+#[proc_macro]
+pub fn routes(input: TokenStream) -> TokenStream {
+    routes_macro::routes_macro(input.into()).into()
 }
