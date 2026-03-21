@@ -19,8 +19,9 @@ use proc_macro::TokenStream;
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
 /// returns an [`autumn::route::Route`] pairing the path with an Axum
-/// handler. In debug builds, `#[axum::debug_handler]` is auto-applied
-/// for better error messages.
+/// handler. In debug builds, `#[axum::debug_handler]` is automatically
+/// applied for improved error messages. This has zero cost in release
+/// builds.
 ///
 /// # Example
 ///
@@ -35,4 +36,73 @@ use proc_macro::TokenStream;
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("GET", "get", attr.into(), item.into()).into()
+}
+
+/// Annotate an async function as a POST route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function that
+/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// handler. In debug builds, `#[axum::debug_handler]` is automatically
+/// applied for improved error messages. This has zero cost in release
+/// builds.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn::post;
+///
+/// #[post("/items")]
+/// async fn create_item() -> &'static str {
+///     "created"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("POST", "post", attr.into(), item.into()).into()
+}
+
+/// Annotate an async function as a PUT route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function that
+/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// handler. In debug builds, `#[axum::debug_handler]` is automatically
+/// applied for improved error messages. This has zero cost in release
+/// builds.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn::put;
+///
+/// #[put("/items/{id}")]
+/// async fn update_item() -> &'static str {
+///     "updated"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("PUT", "put", attr.into(), item.into()).into()
+}
+
+/// Annotate an async function as a DELETE route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function that
+/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// handler. In debug builds, `#[axum::debug_handler]` is automatically
+/// applied for improved error messages. This has zero cost in release
+/// builds.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn::delete;
+///
+/// #[delete("/items/{id}")]
+/// async fn remove_item() -> &'static str {
+///     "removed"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("DELETE", "delete", attr.into(), item.into()).into()
 }
