@@ -1,7 +1,7 @@
 version: "6.0.0"
 project_name: "autumn"
 project_level: 4
-current_sprint: 2
+current_sprint: 3
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
 last_updated: "2026-03-21"
 
@@ -68,10 +68,45 @@ sprints:
         story_doc: "docs/stories/S-026.md"
         completion_date: "2026-03-21"
 
+  - sprint_number: 3
+    start_date: "2026-04-21"
+    end_date: "2026-05-02"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 13
+    status: "completed"
+    goal: "First running server — routes are discovered, mounted, and respond to HTTP requests"
+    stories:
+      - story_id: "S-006"
+        title: "Path parameter extraction in route macros"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-006.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-008"
+        title: "#[autumn::main] macro (tokio::main wrapper)"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-008.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-009"
+        title: "App builder: routes → Axum router → server"
+        points: 5
+        status: "completed"
+        story_doc: "docs/stories/S-009.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-010"
+        title: "Startup route logging + empty-routes panic"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-010.md"
+        completion_date: "2026-03-21"
+
 velocity:
   sprint_1: 12
   sprint_2: 13
-  rolling_average: 12
+  sprint_3: 13
+  rolling_average: 13
 
 team:
   size: 1
