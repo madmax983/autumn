@@ -10,7 +10,22 @@
 //! An Autumn application runs with zero configuration — every field
 //! has a sensible default value.
 
+use std::path::Path;
+
 use serde::Deserialize;
+use thiserror::Error;
+
+/// Errors that can occur when loading configuration from a file.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// The config file exists but could not be read.
+    #[error("failed to read autumn.toml: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// The config file contains invalid TOML.
+    #[error("invalid autumn.toml: {0}")]
+    Parse(#[from] toml::de::Error),
+}
 
 /// Top-level framework configuration.
 ///
@@ -43,6 +58,39 @@ pub struct AutumnConfig {
     /// Health check endpoint settings.
     #[serde(default)]
     pub health: HealthConfig,
+}
+
+impl AutumnConfig {
+    /// Load configuration from `autumn.toml` in the current directory.
+    ///
+    /// Returns defaults if the file doesn't exist. Returns an error
+    /// if the file exists but contains invalid TOML.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] if the file cannot be read, or
+    /// [`ConfigError::Parse`] if the file contains invalid TOML.
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::load_from(Path::new("autumn.toml"))
+    }
+
+    /// Load configuration from a specific path.
+    ///
+    /// Used internally and for testing. Prefer [`load()`](Self::load)
+    /// in application code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Io`] if the file cannot be read, or
+    /// [`ConfigError::Parse`] if the file contains invalid TOML.
+    pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let contents = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&contents)?;
+        Ok(config)
+    }
 }
 
 /// HTTP server configuration.
@@ -266,5 +314,89 @@ mod tests {
         assert_eq!(auto, LogFormat::Auto);
         assert_eq!(pretty, LogFormat::Pretty);
         assert_eq!(json, LogFormat::Json);
+    }
+
+    // ── TOML loading tests ───────────────────────────────────────────
+
+    #[test]
+    fn load_missing_file_returns_defaults() {
+        let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml")).unwrap();
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(config.database.url, "postgres://localhost/autumn_dev");
+    }
+
+    #[test]
+    fn load_valid_full_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &path,
+            r#"
+[server]
+port = 8080
+host = "0.0.0.0"
+shutdown_timeout_secs = 60
+
+[database]
+url = "postgres://user:pass@db:5432/myapp"
+pool_size = 20
+connect_timeout_secs = 10
+
+[log]
+level = "debug"
+format = "Json"
+
+[health]
+path = "/healthz"
+"#,
+        )
+        .unwrap();
+
+        let config = AutumnConfig::load_from(&path).unwrap();
+        assert_eq!(config.server.port, 8080);
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.shutdown_timeout_secs, 60);
+        assert_eq!(config.database.url, "postgres://user:pass@db:5432/myapp");
+        assert_eq!(config.database.pool_size, 20);
+        assert_eq!(config.database.connect_timeout_secs, 10);
+        assert_eq!(config.log.level, "debug");
+        assert_eq!(config.log.format, LogFormat::Json);
+        assert_eq!(config.health.path, "/healthz");
+    }
+
+    #[test]
+    fn load_partial_config_merges_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(&path, "[server]\nport = 9090\n").unwrap();
+
+        let config = AutumnConfig::load_from(&path).unwrap();
+        assert_eq!(config.server.port, 9090);
+        // Defaults preserved
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.database.pool_size, 10);
+        assert_eq!(config.log.level, "info");
+    }
+
+    #[test]
+    fn load_invalid_toml_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(&path, "not valid [[[toml").unwrap();
+
+        let result = AutumnConfig::load_from(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("invalid autumn.toml"));
+    }
+
+    #[test]
+    fn load_empty_file_returns_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let config = AutumnConfig::load_from(&path).unwrap();
+        assert_eq!(config.server.port, 3000);
     }
 }
