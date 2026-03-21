@@ -6,8 +6,11 @@
 //! into a Spring Boot-style developer experience with proc-macro-driven
 //! conventions and escape hatches at every level.
 
+pub mod app;
 pub mod config;
 pub mod route;
+
+pub use app::app;
 
 // Re-export route macros so users can write `use autumn::get;`
 pub use autumn_macros::{delete, get, post, put, routes};
