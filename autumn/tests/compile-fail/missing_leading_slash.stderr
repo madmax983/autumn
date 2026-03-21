@@ -1,0 +1,5 @@
+error: Route path must start with '/'. Did you mean "/hello"?
+ --> tests/compile-fail/missing_leading_slash.rs:3:7
+  |
+3 | #[get("hello")]
+  |       ^^^^^^^
