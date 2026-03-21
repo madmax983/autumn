@@ -11,8 +11,8 @@ sprints:
     end_date: "2026-04-04"
     capacity_points: 12
     committed_points: 12
-    completed_points: 10
-    status: "in_progress"
+    completed_points: 12
+    status: "completed"
     goal: "Get the first annotated route handler compiling and responding to HTTP requests"
     stories:
       - story_id: "S-001"
@@ -30,8 +30,9 @@ sprints:
       - story_id: "S-025"
         title: "AutumnConfig struct with serde defaults"
         points: 2
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-025.md"
+        completion_date: "2026-03-21"
 
 velocity:
   rolling_average: null
