@@ -1,9 +1,9 @@
 version: "6.0.0"
 project_name: "autumn"
 project_level: 4
-current_sprint: 1
+current_sprint: 2
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
-last_updated: "2026-03-20"
+last_updated: "2026-03-21"
 
 sprints:
   - sprint_number: 1
@@ -34,8 +34,44 @@ sprints:
         story_doc: "docs/stories/S-025.md"
         completion_date: "2026-03-21"
 
+  - sprint_number: 2
+    start_date: "2026-04-07"
+    end_date: "2026-04-18"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 13
+    status: "completed"
+    goal: "Complete the route macro system: all HTTP methods, debug_handler, and routes![] collection"
+    stories:
+      - story_id: "S-003"
+        title: "#[post], #[put], #[delete] macros"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-003.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-004"
+        title: "Auto-apply debug_handler in debug builds"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-004.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-005"
+        title: "routes![] collection macro"
+        points: 5
+        status: "completed"
+        story_doc: "docs/stories/S-005.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-026"
+        title: "TOML config file loading (autumn.toml)"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-026.md"
+        completion_date: "2026-03-21"
+
 velocity:
-  rolling_average: null
+  sprint_1: 12
+  sprint_2: 13
+  rolling_average: 12
 
 team:
   size: 1
