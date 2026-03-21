@@ -1,3 +1,4 @@
+use autumn::extract::Path;
 use autumn::{delete, get, post, put};
 
 // ── GET handlers ─────────────────────────────────────────────────────
@@ -141,6 +142,18 @@ fn delete_route_info_has_correct_name() {
     assert_eq!(route.name, "remove_item");
 }
 
+// ── Path parameter extraction (S-006) ───────────────────────────────
+
+#[get("/users/{id}")]
+async fn get_user(_id: Path<i32>) -> &'static str {
+    "user"
+}
+
+#[get("/posts/{year}/{slug}")]
+async fn get_post(_params: Path<(i32, String)>) -> &'static str {
+    "post"
+}
+
 // ── debug_handler return-type coverage (S-004) ──────────────────────
 //
 // These tests prove that handlers with various return types compile
@@ -170,4 +183,26 @@ fn status_code_return_type_compiles_with_debug_handler() {
     assert_eq!(route.method, http::Method::GET);
     assert_eq!(route.path, "/status");
     assert_eq!(route.name, "returns_status");
+}
+
+// ── Path parameter tests (S-006) ────────────────────────────────────
+
+#[test]
+fn path_param_route_preserves_pattern() {
+    let route = __autumn_route_info_get_user();
+    assert_eq!(route.path, "/users/{id}");
+    assert_eq!(route.method, http::Method::GET);
+}
+
+#[test]
+fn path_param_route_has_correct_name() {
+    let route = __autumn_route_info_get_user();
+    assert_eq!(route.name, "get_user");
+}
+
+#[test]
+fn multi_path_params_route_preserves_pattern() {
+    let route = __autumn_route_info_get_post();
+    assert_eq!(route.path, "/posts/{year}/{slug}");
+    assert_eq!(route.method, http::Method::GET);
 }
