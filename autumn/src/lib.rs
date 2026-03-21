@@ -7,10 +7,11 @@
 //! conventions and escape hatches at every level.
 
 pub mod config;
+pub mod extract;
 pub mod route;
 
-// Re-export route macros so users can write `use autumn::get;`
-pub use autumn_macros::{delete, get, post, put, routes};
+// Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
+pub use autumn_macros::{delete, get, main, post, put, routes};
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
@@ -21,6 +22,7 @@ pub use autumn_macros::{delete, get, post, put, routes};
 pub mod reexports {
     pub use axum;
     pub use http;
+    pub use tokio;
 }
 
 /// Shared application state passed to all route handlers.
