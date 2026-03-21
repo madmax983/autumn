@@ -20,6 +20,7 @@
 
 use crate::AppState;
 use crate::config::AutumnConfig;
+use crate::middleware::RequestIdLayer;
 use crate::route::Route;
 
 /// Create a new application builder.
@@ -89,7 +90,7 @@ impl AppBuilder {
             println!("  {} {} ({})", route.method, route.path, route.name);
             router = router.route(route.path, route.handler);
         }
-        let router = router.with_state(AppState);
+        let router = router.layer(RequestIdLayer).with_state(AppState);
 
         // 5. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);

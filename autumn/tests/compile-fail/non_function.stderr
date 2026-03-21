@@ -1,5 +1,5 @@
-error: expected `fn`
+error: route macros can only be applied to functions
  --> tests/compile-fail/non_function.rs:4:1
   |
 4 | struct Hello;
-  | ^^^^^^
+  | ^^^^^^^^^^^^^

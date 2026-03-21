@@ -1,7 +1,7 @@
 version: "6.0.0"
 project_name: "autumn"
 project_level: 4
-current_sprint: 3
+current_sprint: 4
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
 last_updated: "2026-03-21"
 
@@ -102,10 +102,39 @@ sprints:
         story_doc: "docs/stories/S-010.md"
         completion_date: "2026-03-21"
 
+  - sprint_number: 4
+    start_date: "2026-05-05"
+    end_date: "2026-05-16"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 13
+    status: "completed"
+    goal: "Error handling and request infrastructure — ? works in handlers, every request gets an ID"
+    stories:
+      - story_id: "S-007"
+        title: "Proc macro compile_error! diagnostics"
+        points: 5
+        status: "completed"
+        story_doc: "docs/stories/S-007.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-012"
+        title: "AutumnError type + blanket From<E: Error>"
+        points: 5
+        status: "completed"
+        story_doc: "docs/stories/S-012.md"
+        completion_date: "2026-03-21"
+      - story_id: "S-011"
+        title: "Request ID middleware"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-011.md"
+        completion_date: "2026-03-21"
+
 velocity:
   sprint_1: 12
   sprint_2: 13
   sprint_3: 13
+  sprint_4: 13
   rolling_average: 13
 
 team:

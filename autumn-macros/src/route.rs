@@ -29,10 +29,24 @@ pub fn route_macro(
         return syn::Error::new(path.span(), "Route path must not be empty").to_compile_error();
     }
 
-    // Parse the annotated item — must be a function
-    let input_fn: ItemFn = match syn::parse2(item) {
+    // Validate path starts with '/'
+    if !path.value().starts_with('/') {
+        let suggested = format!("/{}", path.value());
+        return syn::Error::new(
+            path.span(),
+            format!("Route path must start with '/'. Did you mean \"{suggested}\"?"),
+        )
+        .to_compile_error();
+    }
+
+    // Parse the annotated item — must be a function.
+    // Clone before parsing so we can use the original tokens for error spans.
+    let input_fn: ItemFn = match syn::parse2(item.clone()) {
         Ok(f) => f,
-        Err(err) => return err.to_compile_error(),
+        Err(_) => {
+            return syn::Error::new_spanned(item, "route macros can only be applied to functions")
+                .to_compile_error();
+        }
     };
 
     // Validate: must be async
@@ -54,7 +68,7 @@ pub fn route_macro(
     // Note: we intentionally do NOT apply #[axum::debug_handler] here.
     // That macro generates code with `::axum::` paths, which don't resolve
     // when the user only depends on `autumn` (axum is a transitive dep).
-    // Better error diagnostics will come via custom compile_error! in S-007.
+    // Custom compile_error! diagnostics (S-007) provide error guidance instead.
 
     quote! {
         #input_fn

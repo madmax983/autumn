@@ -8,10 +8,13 @@
 
 pub mod app;
 pub mod config;
+pub mod error;
 pub mod extract;
+pub mod middleware;
 pub mod route;
 
 pub use app::app;
+pub use error::{AutumnError, AutumnResult};
 
 // Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
 pub use autumn_macros::{delete, get, main, post, put, routes};
