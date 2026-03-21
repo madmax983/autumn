@@ -1,4 +1,6 @@
-use autumn::get;
+use autumn::{delete, get, post, put};
+
+// ── GET handlers ─────────────────────────────────────────────────────
 
 #[get("/hello")]
 async fn hello() -> &'static str {
@@ -14,6 +16,42 @@ async fn index() -> &'static str {
 async fn nested() -> &'static str {
     "nested"
 }
+
+// ── POST / PUT / DELETE handlers (S-003) ─────────────────────────────
+
+#[post("/create")]
+async fn create_item() -> &'static str {
+    "created"
+}
+
+#[put("/update")]
+async fn update_item() -> &'static str {
+    "updated"
+}
+
+#[delete("/remove")]
+async fn remove_item() -> &'static str {
+    "removed"
+}
+
+// ── Handlers with various return types (S-004: debug_handler) ────────
+
+#[get("/string")]
+async fn returns_string() -> String {
+    "hello".to_owned()
+}
+
+#[post("/json")]
+async fn returns_json() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"ok": true}))
+}
+
+#[get("/status")]
+async fn returns_status() -> http::StatusCode {
+    http::StatusCode::NO_CONTENT
+}
+
+// ── GET tests ────────────────────────────────────────────────────────
 
 #[test]
 fn hello_route_info_has_correct_method() {
@@ -45,4 +83,91 @@ fn index_route_info_has_correct_fields() {
 fn nested_route_info_has_correct_path() {
     let route = __autumn_route_info_nested();
     assert_eq!(route.path, "/with/nested/path");
+}
+
+// ── POST / PUT / DELETE tests (S-003) ────────────────────────────────
+
+#[test]
+fn post_route_info_has_correct_method() {
+    let route = __autumn_route_info_create_item();
+    assert_eq!(route.method, http::Method::POST);
+}
+
+#[test]
+fn post_route_info_has_correct_path() {
+    let route = __autumn_route_info_create_item();
+    assert_eq!(route.path, "/create");
+}
+
+#[test]
+fn post_route_info_has_correct_name() {
+    let route = __autumn_route_info_create_item();
+    assert_eq!(route.name, "create_item");
+}
+
+#[test]
+fn put_route_info_has_correct_method() {
+    let route = __autumn_route_info_update_item();
+    assert_eq!(route.method, http::Method::PUT);
+}
+
+#[test]
+fn put_route_info_has_correct_path() {
+    let route = __autumn_route_info_update_item();
+    assert_eq!(route.path, "/update");
+}
+
+#[test]
+fn put_route_info_has_correct_name() {
+    let route = __autumn_route_info_update_item();
+    assert_eq!(route.name, "update_item");
+}
+
+#[test]
+fn delete_route_info_has_correct_method() {
+    let route = __autumn_route_info_remove_item();
+    assert_eq!(route.method, http::Method::DELETE);
+}
+
+#[test]
+fn delete_route_info_has_correct_path() {
+    let route = __autumn_route_info_remove_item();
+    assert_eq!(route.path, "/remove");
+}
+
+#[test]
+fn delete_route_info_has_correct_name() {
+    let route = __autumn_route_info_remove_item();
+    assert_eq!(route.name, "remove_item");
+}
+
+// ── debug_handler return-type coverage (S-004) ──────────────────────
+//
+// These tests prove that handlers with various return types compile
+// successfully under debug_handler (debug builds) and without it
+// (release builds). If debug_handler rejects a return type, the test
+// file itself will fail to compile.
+
+#[test]
+fn string_return_type_compiles_with_debug_handler() {
+    let route = __autumn_route_info_returns_string();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/string");
+    assert_eq!(route.name, "returns_string");
+}
+
+#[test]
+fn json_return_type_compiles_with_debug_handler() {
+    let route = __autumn_route_info_returns_json();
+    assert_eq!(route.method, http::Method::POST);
+    assert_eq!(route.path, "/json");
+    assert_eq!(route.name, "returns_json");
+}
+
+#[test]
+fn status_code_return_type_compiles_with_debug_handler() {
+    let route = __autumn_route_info_returns_status();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/status");
+    assert_eq!(route.name, "returns_status");
 }

@@ -10,7 +10,7 @@ pub mod config;
 pub mod route;
 
 // Re-export route macros so users can write `use autumn::get;`
-pub use autumn_macros::get;
+pub use autumn_macros::{delete, get, post, put};
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
