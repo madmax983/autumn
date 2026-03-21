@@ -51,11 +51,12 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
+    // Note: we intentionally do NOT apply #[axum::debug_handler] here.
+    // That macro generates code with `::axum::` paths, which don't resolve
+    // when the user only depends on `autumn` (axum is a transitive dep).
+    // Better error diagnostics will come via custom compile_error! in S-007.
+
     quote! {
-        #[cfg_attr(
-            debug_assertions,
-            ::autumn::reexports::axum::debug_handler(state = ::autumn::AppState)
-        )]
         #input_fn
 
         #[doc(hidden)]

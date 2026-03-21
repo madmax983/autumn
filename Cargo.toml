@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros"]
+members = ["autumn", "autumn-macros", "examples/hello"]
 resolver = "3"
 
 [workspace.package]

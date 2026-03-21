@@ -11,6 +11,7 @@
 //! Users should not depend on this crate directly — use `autumn` instead,
 //! which re-exports everything.
 
+mod main_macro;
 mod route;
 mod routes_macro;
 
@@ -130,4 +131,25 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
+}
+
+/// Set up the async runtime for an Autumn application.
+///
+/// This is a thin wrapper around `#[tokio::main]`. The real
+/// framework setup happens in `autumn::app().run()`.
+///
+/// # Example
+///
+/// ```ignore
+/// #[autumn::main]
+/// async fn main() {
+///     autumn::app()
+///         .routes(routes![hello])
+///         .run()
+///         .await;
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    main_macro::main_macro(item.into()).into()
 }
