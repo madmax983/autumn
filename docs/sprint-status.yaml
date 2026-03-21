@@ -156,6 +156,37 @@ sprints:
         status: "defined"
         story_doc: "docs/stories/S-019.md"
 
+  - sprint_number: 6
+    start_date: "2026-06-02"
+    end_date: "2026-06-13"
+    capacity_points: 12
+    committed_points: 12
+    completed_points: 0
+    status: "planned"
+    goal: "Full stack — Db extraction, Maud rendering, JSON and Form extractors (3-month gut check)"
+    notes: "S-018/S-019 moved to Sprint 5. Pulled S-023/S-031 forward from Sprint 7."
+    stories:
+      - story_id: "S-017"
+        title: "Db extractor (FromRequestParts impl)"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-017.md"
+      - story_id: "S-020"
+        title: "Maud re-export + Markup as handler return type"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-020.md"
+      - story_id: "S-023"
+        title: "Form<T> extractor re-export"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-023.md"
+      - story_id: "S-031"
+        title: "Json<T> re-export + response type integration"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-031.md"
+
 velocity:
   sprint_1: 12
   sprint_2: 13
