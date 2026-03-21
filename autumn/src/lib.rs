@@ -6,8 +6,10 @@
 //! into a Spring Boot-style developer experience with proc-macro-driven
 //! conventions and escape hatches at every level.
 
-// Re-export the proc macro crate so users only need `autumn` in their Cargo.toml.
-pub use autumn_macros;
+pub mod route;
+
+// Re-export route macros so users can write `use autumn::get;`
+pub use autumn_macros::get;
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
@@ -19,3 +21,10 @@ pub mod reexports {
     pub use axum;
     pub use http;
 }
+
+/// Shared application state passed to all route handlers.
+///
+/// Placeholder for v0.1 — the real `AppState` will hold config, database
+/// pool, and other framework-managed resources (S-009).
+#[derive(Clone, Debug)]
+pub struct AppState;
