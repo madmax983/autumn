@@ -1,0 +1,41 @@
+version: "6.0.0"
+project_name: "autumn"
+project_level: 4
+current_sprint: 1
+sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
+last_updated: "2026-03-20"
+
+sprints:
+  - sprint_number: 1
+    start_date: "2026-03-23"
+    end_date: "2026-04-04"
+    capacity_points: 12
+    committed_points: 12
+    completed_points: 2
+    status: "in_progress"
+    goal: "Get the first annotated route handler compiling and responding to HTTP requests"
+    stories:
+      - story_id: "S-001"
+        title: "Workspace skeleton & crate structure"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-001.md"
+        completion_date: "2026-03-20"
+      - story_id: "S-002"
+        title: "Basic #[get] route macro"
+        points: 8
+        status: "defined"
+        story_doc: "docs/stories/S-002.md"
+      - story_id: "S-025"
+        title: "AutumnConfig struct with serde defaults"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-025.md"
+
+velocity:
+  rolling_average: null
+
+team:
+  size: 1
+  sprint_length_weeks: 2
+  capacity_per_sprint: 12

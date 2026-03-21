@@ -1,0 +1,18 @@
+[package]
+name = "autumn"
+description = "An opinionated, convention-over-configuration web framework for Rust"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-macros = { path = "../autumn-macros" }
+axum.workspace = true
+http.workspace = true
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
