@@ -1,0 +1,5 @@
+error: Route path must not be empty
+ --> tests/compile-fail/empty_path.rs:3:7
+  |
+3 | #[get("")]
+  |       ^^

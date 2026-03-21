@@ -10,7 +10,7 @@ repository = "https://github.com/markm/autumn"
 
 [workspace.dependencies]
 # Runtime
-axum = "0.8"
+axum = { version = "0.8", features = ["macros"] }
 http = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

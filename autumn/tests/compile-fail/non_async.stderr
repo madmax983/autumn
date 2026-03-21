@@ -1,0 +1,5 @@
+error: Autumn route handlers must be async functions
+ --> tests/compile-fail/non_async.rs:4:1
+  |
+4 | fn hello() -> &'static str {
+  | ^^
