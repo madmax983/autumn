@@ -18,6 +18,7 @@ libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+maud = { version = "0.27", features = ["axum"] }
 toml = "0.8"
 tower = "0.5"
 

@@ -15,10 +15,17 @@ pub mod middleware;
 pub mod route;
 
 pub use app::app;
+pub use db::Db;
 pub use error::{AutumnError, AutumnResult};
 
 // Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
 pub use autumn_macros::{delete, get, main, model, post, put, routes};
+
+// Re-export Maud types for HTML rendering
+pub use maud::{Markup, PreEscaped, html};
+
+// Re-export Json at root level (commonly used in return types)
+pub use axum::Json;
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
