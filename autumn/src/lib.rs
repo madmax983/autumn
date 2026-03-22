@@ -11,12 +11,14 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod extract;
+pub(crate) mod htmx;
 pub mod middleware;
 pub mod route;
 
 pub use app::app;
 pub use db::Db;
 pub use error::{AutumnError, AutumnResult};
+pub use htmx::HTMX_VERSION;
 
 // Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
 pub use autumn_macros::{delete, get, main, model, post, put, routes};

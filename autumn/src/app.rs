@@ -110,6 +110,14 @@ impl AppBuilder {
             println!("  {} {} ({})", route.method, route.path, route.name);
             router = router.route(route.path, route.handler);
         }
+
+        // Framework-provided routes
+        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+        println!(
+            "  GET /static/js/htmx.min.js (htmx {})",
+            crate::htmx::HTMX_VERSION
+        );
+
         let state = AppState { pool };
         let router = router.layer(RequestIdLayer).with_state(state);
 
@@ -132,6 +140,19 @@ impl AppBuilder {
                 std::process::exit(1);
             });
     }
+}
+
+async fn htmx_handler() -> impl axum::response::IntoResponse {
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/javascript"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::htmx::HTMX_JS,
+    )
 }
 
 async fn shutdown_signal() {
