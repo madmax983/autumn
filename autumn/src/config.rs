@@ -1,10 +1,10 @@
 //! Framework configuration with sensible defaults.
 //!
-//! Autumn uses a three-layer configuration system (applied in later stories):
+//! Autumn uses a three-layer configuration system:
 //!
 //! 1. **Framework defaults** (this module) — compiled into the binary
 //! 2. **`autumn.toml`** — project-level overrides (S-026)
-//! 3. **`AUTUMN_*` environment variables** — deployment overrides (S-027)
+//! 3. **`AUTUMN_*` environment variables** — deployment overrides (S-019)
 //!
 //! This module defines the typed config structs and their defaults.
 //! An Autumn application runs with zero configuration — every field
@@ -25,6 +25,10 @@ pub enum ConfigError {
     /// The config file contains invalid TOML.
     #[error("invalid autumn.toml: {0}")]
     Parse(#[from] toml::de::Error),
+
+    /// A configuration value is invalid.
+    #[error("configuration error: {0}")]
+    Validation(String),
 }
 
 /// Top-level framework configuration.
@@ -63,15 +67,19 @@ pub struct AutumnConfig {
 impl AutumnConfig {
     /// Load configuration from `autumn.toml` in the current directory.
     ///
-    /// Returns defaults if the file doesn't exist. Returns an error
-    /// if the file exists but contains invalid TOML.
+    /// Applies environment variable overrides and validates the result.
+    /// Returns defaults if the file doesn't exist.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Io`] if the file cannot be read, or
-    /// [`ConfigError::Parse`] if the file contains invalid TOML.
+    /// Returns [`ConfigError::Io`] if the file cannot be read,
+    /// [`ConfigError::Parse`] if the file contains invalid TOML, or
+    /// [`ConfigError::Validation`] if a value is invalid.
     pub fn load() -> Result<Self, ConfigError> {
-        Self::load_from(Path::new("autumn.toml"))
+        let mut config = Self::load_from(Path::new("autumn.toml"))?;
+        config.apply_env_overrides();
+        config.database.validate()?;
+        Ok(config)
     }
 
     /// Load configuration from a specific path.
@@ -90,6 +98,36 @@ impl AutumnConfig {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
+    }
+
+    /// Apply environment variable overrides to the loaded config.
+    ///
+    /// Database-specific overrides (full `AUTUMN_*` system in S-027):
+    /// - `AUTUMN_DATABASE__URL` -> `database.url`
+    /// - `AUTUMN_DATABASE__POOL_SIZE` -> `database.pool_size`
+    /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` -> `database.connect_timeout_secs`
+    ///
+    /// Double underscore `__` separates nested config sections.
+    pub fn apply_env_overrides(&mut self) {
+        if let Ok(val) = std::env::var("AUTUMN_DATABASE__URL") {
+            self.database.url = Some(val);
+        }
+        if let Ok(val) = std::env::var("AUTUMN_DATABASE__POOL_SIZE") {
+            match val.parse::<usize>() {
+                Ok(size) => self.database.pool_size = size,
+                Err(_) => eprintln!(
+                    "Warning: AUTUMN_DATABASE__POOL_SIZE={val:?} is not a valid number, ignoring"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS") {
+            match val.parse::<u64>() {
+                Ok(secs) => self.database.connect_timeout_secs = secs,
+                Err(_) => eprintln!(
+                    "Warning: AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS={val:?} is not a valid number, ignoring"
+                ),
+            }
+        }
     }
 }
 
@@ -113,9 +151,9 @@ pub struct ServerConfig {
 /// Database connection configuration.
 #[derive(Debug, Deserialize)]
 pub struct DatabaseConfig {
-    /// Postgres connection URL. Default: `"postgres://localhost/autumn_dev"`.
-    #[serde(default = "default_db_url")]
-    pub url: String,
+    /// Postgres connection URL. `None` means no database is configured.
+    #[serde(default)]
+    pub url: Option<String>,
 
     /// Maximum number of connections in the pool. Default: `10`.
     #[serde(default = "default_pool_size")]
@@ -124,6 +162,25 @@ pub struct DatabaseConfig {
     /// Seconds to wait when acquiring a connection. Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+}
+
+impl DatabaseConfig {
+    /// Validate database configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error if the URL has an invalid scheme.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(ref url) = self.url
+            && !url.starts_with("postgres://")
+            && !url.starts_with("postgresql://")
+        {
+            return Err(ConfigError::Validation(format!(
+                "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Logging configuration.
@@ -179,10 +236,6 @@ const fn default_shutdown_timeout() -> u64 {
     30
 }
 
-fn default_db_url() -> String {
-    "postgres://localhost/autumn_dev".to_owned()
-}
-
 const fn default_pool_size() -> usize {
     10
 }
@@ -214,7 +267,7 @@ impl Default for ServerConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
-            url: default_db_url(),
+            url: None,
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout(),
         }
@@ -242,6 +295,34 @@ impl Default for HealthConfig {
 mod tests {
     use super::*;
 
+    /// RAII guard that sets an env var and restores it on drop.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: Tests run single-threaded (or with unique keys) so
+            // mutating the environment is acceptable.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                // SAFETY: Restoring previous env state in test teardown.
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn server_defaults() {
         let config = ServerConfig::default();
@@ -253,7 +334,7 @@ mod tests {
     #[test]
     fn database_defaults() {
         let config = DatabaseConfig::default();
-        assert_eq!(config.url, "postgres://localhost/autumn_dev");
+        assert!(config.url.is_none());
         assert_eq!(config.pool_size, 10);
         assert_eq!(config.connect_timeout_secs, 5);
     }
@@ -275,7 +356,7 @@ mod tests {
     fn top_level_default_populates_all_sections() {
         let config = AutumnConfig::default();
         assert_eq!(config.server.port, 3000);
-        assert_eq!(config.database.url, "postgres://localhost/autumn_dev");
+        assert!(config.database.url.is_none());
         assert_eq!(config.log.level, "info");
         assert_eq!(config.health.path, "/health");
     }
@@ -286,7 +367,7 @@ mod tests {
         assert_eq!(config.server.port, 3000);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
-        assert_eq!(config.database.url, "postgres://localhost/autumn_dev");
+        assert!(config.database.url.is_none());
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.database.connect_timeout_secs, 5);
         assert_eq!(config.log.level, "info");
@@ -298,9 +379,7 @@ mod tests {
     fn deserialize_partial_config_merges_with_defaults() {
         let json = r#"{"server": {"port": 8080}}"#;
         let config: AutumnConfig = serde_json::from_str(json).expect("partial config should parse");
-        // Overridden
         assert_eq!(config.server.port, 8080);
-        // Defaults preserved
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.log.level, "info");
@@ -322,7 +401,7 @@ mod tests {
     fn load_missing_file_returns_defaults() {
         let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml")).unwrap();
         assert_eq!(config.server.port, 3000);
-        assert_eq!(config.database.url, "postgres://localhost/autumn_dev");
+        assert!(config.database.url.is_none());
     }
 
     #[test]
@@ -356,7 +435,10 @@ path = "/healthz"
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.shutdown_timeout_secs, 60);
-        assert_eq!(config.database.url, "postgres://user:pass@db:5432/myapp");
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://user:pass@db:5432/myapp")
+        );
         assert_eq!(config.database.pool_size, 20);
         assert_eq!(config.database.connect_timeout_secs, 10);
         assert_eq!(config.log.level, "debug");
@@ -372,7 +454,6 @@ path = "/healthz"
 
         let config = AutumnConfig::load_from(&path).unwrap();
         assert_eq!(config.server.port, 9090);
-        // Defaults preserved
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.log.level, "info");
@@ -398,5 +479,84 @@ path = "/healthz"
 
         let config = AutumnConfig::load_from(&path).unwrap();
         assert_eq!(config.server.port, 3000);
+    }
+
+    // ── Environment variable override tests ──────────────────────
+
+    #[test]
+    fn env_override_database_url() {
+        let _guard = EnvGuard::set("AUTUMN_DATABASE__URL", "postgres://override:5432/test");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://override:5432/test")
+        );
+    }
+
+    #[test]
+    fn env_override_pool_size() {
+        let _guard = EnvGuard::set("AUTUMN_DATABASE__POOL_SIZE", "25");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.database.pool_size, 25);
+    }
+
+    #[test]
+    fn env_override_connect_timeout() {
+        let _guard = EnvGuard::set("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "15");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.database.connect_timeout_secs, 15);
+    }
+
+    #[test]
+    fn env_override_invalid_pool_size_ignored() {
+        let _guard = EnvGuard::set("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.database.pool_size, 10);
+    }
+
+    // ── Validation tests ─────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_invalid_url_scheme() {
+        let config = DatabaseConfig {
+            url: Some("mysql://localhost/test".to_owned()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must start with postgres://")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_postgres_url() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_postgresql_url() {
+        let config = DatabaseConfig {
+            url: Some("postgresql://localhost/test".to_owned()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_no_url() {
+        let config = DatabaseConfig::default();
+        assert!(config.validate().is_ok());
     }
 }

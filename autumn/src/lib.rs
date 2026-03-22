@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod extract;
 pub mod middleware;
@@ -17,7 +18,7 @@ pub use app::app;
 pub use error::{AutumnError, AutumnResult};
 
 // Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
-pub use autumn_macros::{delete, get, main, post, put, routes};
+pub use autumn_macros::{delete, get, main, model, post, put, routes};
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
@@ -27,13 +28,34 @@ pub use autumn_macros::{delete, get, main, post, put, routes};
 /// into reexports directly.
 pub mod reexports {
     pub use axum;
+    pub use diesel;
     pub use http;
     pub use tokio;
 }
 
 /// Shared application state passed to all route handlers.
 ///
-/// Placeholder for v0.1 — the real `AppState` will hold config, database
-/// pool, and other framework-managed resources (S-009).
-#[derive(Clone, Debug)]
-pub struct AppState;
+/// Holds framework-managed resources such as the optional database
+/// connection pool. Axum requires `Clone`, so internal resources
+/// use `Arc` or are already cheaply cloneable (deadpool `Pool` is
+/// `Arc`-wrapped internally).
+#[derive(Clone)]
+pub struct AppState {
+    /// Database connection pool. `None` when no `database.url` is configured.
+    pub pool:
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field(
+                "pool",
+                &self
+                    .pool
+                    .as_ref()
+                    .map(|p| format!("Pool(max={})", p.status().max_size)),
+            )
+            .finish()
+    }
+}

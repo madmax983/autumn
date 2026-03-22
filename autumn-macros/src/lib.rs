@@ -6,12 +6,13 @@
 //! - Route annotation macros (`#[get]`, `#[post]`, etc.)
 //! - The `routes![]` collection macro
 //! - The `#[autumn::main]` entry point macro (S-008)
-//! - The `#[derive(Model)]` convenience macro (S-018)
+//! - The `#[model]` attribute macro (S-018)
 //!
 //! Users should not depend on this crate directly — use `autumn` instead,
 //! which re-exports everything.
 
 mod main_macro;
+mod model;
 mod route;
 mod routes_macro;
 
@@ -152,4 +153,42 @@ pub fn routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Attribute macro for Autumn database models.
+///
+/// Applies Diesel (`Queryable`, `Selectable`, `Insertable`) and Serde
+/// (`Serialize`, `Deserialize`) derives, plus a `#[diesel(table_name)]`
+/// attribute. The table name can be specified explicitly or inferred
+/// from the struct name by converting `PascalCase` to `snake_case`
+/// and appending `s`.
+///
+/// # Examples
+///
+/// Explicit table name:
+///
+/// ```ignore
+/// use autumn::model;
+///
+/// #[model(table = "users")]
+/// pub struct User {
+///     pub id: i32,
+///     pub name: String,
+/// }
+/// ```
+///
+/// Inferred table name (`BlogPost` -> `blog_posts`):
+///
+/// ```ignore
+/// use autumn::model;
+///
+/// #[model]
+/// pub struct BlogPost {
+///     pub id: i32,
+///     pub title: String,
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
+    model::model_macro(attr.into(), item.into()).into()
 }
