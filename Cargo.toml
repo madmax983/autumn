@@ -21,6 +21,7 @@ thiserror = "2"
 maud = { version = "0.27", features = ["axum"] }
 toml = "0.8"
 tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
 
 # Proc macro
 syn = { version = "2", features = ["full"] }
