@@ -83,3 +83,21 @@ async fn serves_subdirectories() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn missing_static_directory_returns_404() {
+    // ServeDir pointed at a non-existent directory should 404, not panic
+    let app = Router::new().nest_service("/static", ServeDir::new("this_directory_does_not_exist"));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/anything.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
