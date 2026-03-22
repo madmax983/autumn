@@ -1,0 +1,26 @@
+/*
+ * Autumn — Tailwind CSS input file
+ *
+ * This file is processed by the Tailwind CLI during `cargo build`.
+ * The output lands at static/css/autumn.css (which is gitignored).
+ *
+ * Add your custom styles below the @import. Tailwind utility classes
+ * used in your Maud templates (src/**/*.rs) are automatically included.
+ *
+ * Tailwind v4 docs: https://tailwindcss.com/docs
+ */
+
+@import "tailwindcss";
+
+/*
+ * Custom styles
+ * ─────────────
+ * Add project-specific styles here. They'll be included in autumn.css
+ * alongside the Tailwind utilities your templates use.
+ *
+ * Example:
+ *
+ * .prose-autumn {
+ *     @apply prose prose-lg prose-slate;
+ * }
+ */
