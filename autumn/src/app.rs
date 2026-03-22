@@ -164,3 +164,65 @@ async fn shutdown_signal() {
         .expect("Failed to install Ctrl+C handler");
     println!("\nShutting down gracefully...");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn htmx_handler_returns_javascript_with_correct_headers() {
+        let app =
+            axum::Router::new().route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/static/js/htmx.min.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/javascript"),
+            "Expected application/javascript, got {content_type}"
+        );
+
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            cache_control.contains("immutable"),
+            "Expected immutable cache, got {cache_control}"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // Body length matches the embedded file
+        assert_eq!(body.len(), crate::htmx::HTMX_JS.len());
+
+        // Body starts with valid JavaScript
+        let start = std::str::from_utf8(&body[..50]).expect("htmx should be valid UTF-8");
+        assert!(
+            start.contains("htmx") || start.contains("function"),
+            "Response doesn't look like htmx JavaScript: {start}"
+        );
+    }
+}
