@@ -118,6 +118,9 @@ impl AppBuilder {
             crate::htmx::HTMX_VERSION
         );
 
+        // Static file serving from project's static/ directory
+        router = router.nest_service("/static", tower_http::services::ServeDir::new("static"));
+
         let state = AppState { pool };
         let router = router.layer(RequestIdLayer).with_state(state);
 
