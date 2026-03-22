@@ -145,7 +145,8 @@ impl AppBuilder {
     }
 }
 
-async fn htmx_handler() -> impl axum::response::IntoResponse {
+async fn htmx_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
     (
         [
             (http::header::CONTENT_TYPE, "application/javascript"),
@@ -156,6 +157,7 @@ async fn htmx_handler() -> impl axum::response::IntoResponse {
         ],
         crate::htmx::HTMX_JS,
     )
+        .into_response()
 }
 
 async fn shutdown_signal() {
