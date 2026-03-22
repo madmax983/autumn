@@ -11,7 +11,10 @@ repository = "https://github.com/markm/autumn"
 [workspace.dependencies]
 # Runtime
 axum = { version = "0.8", features = ["macros"] }
+diesel = { version = "2", features = ["sqlite"] }
+diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
 http = "1"
+libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

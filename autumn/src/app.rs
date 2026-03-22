@@ -20,6 +20,7 @@
 
 use crate::AppState;
 use crate::config::AutumnConfig;
+use crate::db;
 use crate::middleware::RequestIdLayer;
 use crate::route::Route;
 
@@ -60,9 +61,10 @@ impl AppBuilder {
     /// This method:
     /// 1. Loads configuration from `autumn.toml` (or defaults)
     /// 2. Validates that at least one route is registered
-    /// 3. Builds the Axum router from collected routes
-    /// 4. Binds to the configured address and port
-    /// 5. Serves requests with graceful shutdown on Ctrl+C
+    /// 3. Creates the database pool (if configured)
+    /// 4. Builds the Axum router from collected routes
+    /// 5. Binds to the configured address and port
+    /// 6. Serves requests with graceful shutdown on Ctrl+C
     ///
     /// # Panics
     ///
@@ -84,15 +86,34 @@ impl AppBuilder {
         // 3. Log banner
         println!("Autumn v{}", env!("CARGO_PKG_VERSION"));
 
-        // 4. Build Axum router, logging each route as it mounts
+        // 4. Create database pool (if configured)
+        let pool = match db::create_pool(&config.database) {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Failed to create database pool: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        if pool.is_some() {
+            println!(
+                "  Database pool: {} max connections",
+                config.database.pool_size
+            );
+        } else {
+            println!("  Database: not configured");
+        }
+
+        // 5. Build Axum router, logging each route as it mounts
         let mut router = axum::Router::new();
         for route in self.routes {
             println!("  {} {} ({})", route.method, route.path, route.name);
             router = router.route(route.path, route.handler);
         }
-        let router = router.layer(RequestIdLayer).with_state(AppState);
+        let state = AppState { pool };
+        let router = router.layer(RequestIdLayer).with_state(state);
 
-        // 5. Bind and serve with graceful shutdown
+        // 6. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);
         println!("Listening on http://{addr}");
 

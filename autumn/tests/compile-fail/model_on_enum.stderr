@@ -1,0 +1,5 @@
+error: #[model] can only be applied to structs
+ --> tests/compile-fail/model_on_enum.rs:4:6
+  |
+4 | enum Status {
+  |      ^^^^^^
