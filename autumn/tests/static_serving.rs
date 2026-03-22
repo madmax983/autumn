@@ -101,3 +101,46 @@ async fn missing_static_directory_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn explicit_route_takes_priority_over_serve_dir() {
+    // Simulate the htmx route priority: an explicit route at the same path
+    // as a file on disk should win.
+    let dir = tempfile::tempdir().unwrap();
+    let js_dir = dir.path().join("js");
+    std::fs::create_dir_all(&js_dir).unwrap();
+    std::fs::write(js_dir.join("htmx.min.js"), b"// disk version").unwrap();
+
+    let embedded: &[u8] = b"// embedded version";
+
+    let app = Router::new()
+        .route(
+            "/static/js/htmx.min.js",
+            axum::routing::get(move || async move {
+                (
+                    [(http::header::CONTENT_TYPE, "application/javascript")],
+                    embedded,
+                )
+            }),
+        )
+        .nest_service("/static", ServeDir::new(dir.path()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/js/htmx.min.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    // Explicit route wins over disk file
+    assert_eq!(&body[..], b"// embedded version");
+}
