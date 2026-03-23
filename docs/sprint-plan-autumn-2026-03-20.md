@@ -109,7 +109,7 @@ This plan breaks Autumn's 11 epics and 48 functional requirements into 45 implem
 | ID | Title | Pts | FRs | Dependencies | Sprint |
 |----|-------|-----|-----|--------------|--------|
 | S-031 | Json<T> re-export + response type integration | 2 | FR-014, FR-015 | S-012 | 7 |
-| S-032 | Static directory serving (tower-http ServeDir) | 2 | FR-023 | S-009 | 7 |
+| S-032 | Static directory serving (tower-http ServeDir) | 2 | FR-023 | S-009 | 7* |
 
 ### Prelude & Integration (2 pts, 1 story)
 
@@ -265,25 +265,26 @@ If any answer is NO: scope cuts happen immediately (see product brief).
 
 ---
 
-### Sprint 7 (Jun 16 – Jun 27) — 13/12 pts
+### Sprint 7 (Jun 16 – Jun 27) — 11/12 pts
 
-**Goal:** Complete rendering stack — Tailwind CSS, htmx, static assets, JSON responses.
+**Goal:** Complete rendering stack — Tailwind CSS, htmx, static file serving.
 
-| Story | Title | Pts |
-|-------|-------|-----|
-| S-021 | Tailwind build.rs template | 5 |
-| S-022 | htmx embedding + serving route | 3 |
-| S-023 | Form<T> extractor with Autumn errors | 2 |
-| S-031 | Json<T> response type integration | 2 |
-| S-024 | Static input.css with Tailwind directives | 1 |
+| Story | Title | Pts | Status |
+|-------|-------|-----|--------|
+| ~~S-023~~ | ~~Form<T> extractor with Autumn errors~~ | ~~2~~ | Done in Sprint 6 |
+| ~~S-031~~ | ~~Json<T> response type integration~~ | ~~2~~ | Done in Sprint 6 |
+| S-024 | Static input.css with Tailwind directives | 1 | Done |
+| S-021 | Tailwind build.rs template | 5 | Done |
+| S-022 | htmx embedding + serving route | 3 | Done |
+| S-032 | Static directory serving (pulled from Sprint 8) | 2 | Done |
 
-**Notes:** After this sprint, the full rendering stack works: Maud templates with Tailwind classes produce styled HTML, htmx is served automatically, forms work, JSON endpoints work.
+**Notes:** S-023 and S-031 were completed ahead of schedule in Sprint 6. S-032 pulled forward to fill capacity and complete the rendering pipeline — without it, Tailwind-generated CSS can't reach the browser. htmx pinned to 2.x.
 
-**Done when:** A page rendered with `html!{ div class="bg-blue-500 p-4" { "styled" } }` actually has blue background. htmx `hx-post` submits work. `Json<Vec<User>>` returns JSON.
+**Done when:** A page rendered with `html!{ div class="bg-blue-500 p-4" { "styled" } }` actually has blue background. htmx `hx-post` submits work. `GET /static/css/autumn.css` returns the generated stylesheet.
 
 ---
 
-### Sprint 8 (Jun 30 – Jul 11) — 14/12 pts (stretch)
+### Sprint 8 (Jun 30 – Jul 11) — 12/12 pts
 
 **Goal:** Production defaults — logging, health check, graceful shutdown. Framework "feels complete."
 
@@ -293,12 +294,9 @@ If any answer is NO: scope cuts happen immediately (see product brief).
 | S-028 | Structured logging setup | 3 |
 | S-029 | Health check endpoint | 3 |
 | S-030 | Graceful shutdown | 3 |
-| S-032 | Static directory serving | 2 |
 | S-033 | autumn::prelude module | 2* |
 
-**Notes:** All straightforward integration work. No proc macros, no hard design problems. Each story is independent. Good sprint for steady velocity after the hard middle.
-
-*S-033 may need to wait until all re-exports are finalized.
+**Notes:** All straightforward integration work. No proc macros, no hard design problems. Each story is independent. S-032 moved to Sprint 7. S-033 may need to wait until all re-exports are finalized.
 
 **Done when:** `GET /health` returns pool status. SIGTERM drains connections. Every request gets a trace span with a request ID. Static files serve from `/static/`.
 
@@ -385,17 +383,19 @@ If any answer is NO: scope cuts happen immediately (see product brief).
 | 4 | May 5 – May 16 | 13 | Error handling + diagnostics | |
 | 5 | May 19 – May 30 | 15 | Database pool + error polish | |
 | 6 | Jun 2 – Jun 13 | 14 | DB extractor + Maud | 🔍 3-Month Gut Check |
-| 7 | Jun 16 – Jun 27 | 13 | Tailwind + htmx + JSON | |
-| 8 | Jun 30 – Jul 11 | 14 | Production defaults | ✅ Feature-complete |
+| 7 | Jun 16 – Jun 27 | 11 | Tailwind + htmx + static serving | |
+| 8 | Jun 30 – Jul 11 | 12 | Production defaults | ✅ Feature-complete |
 | 9 | Jul 14 – Jul 25 | 11 | CLI + CI | |
 | 10 | Jul 28 – Aug 8 | 14 | Example app + README | 🌍 Demoable |
 | 11 | Aug 11 – Aug 22 | 13 | Documentation | |
 | 12 | Aug 25 – Sep 5 | 9 | Tutorial + publish | 🚀 v0.1 shipped |
-| | | **154** | | |
+| | | **152** | | |
 
-**Budget: 154 committed / 144 conservative capacity / 180 stretch capacity**
+**Budget: 152 committed / 144 conservative capacity / 180 stretch capacity**
 
-The plan slightly exceeds conservative capacity (154 vs 144). This is intentional — later sprints (9-12) contain work that's less risky and faster to execute (docs, CI, publication). The hard work (proc macros, error handling, database) is front-loaded where velocity uncertainty is highest, with lower sprint commitments.
+The plan slightly exceeds conservative capacity (152 vs 144). This is intentional — later sprints (9-12) contain work that's less risky and faster to execute (docs, CI, publication). The hard work (proc macros, error handling, database) is front-loaded where velocity uncertainty is highest, with lower sprint commitments.
+
+**Note (Sprint 7, 2026-03-22):** S-023 (Form) and S-031 (Json) completed early in Sprint 6. S-032 (static serving) pulled forward from Sprint 8 to Sprint 7 to complete the rendering pipeline.
 
 ---
 
