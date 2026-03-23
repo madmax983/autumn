@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod extract;
+pub mod health;
 pub(crate) mod htmx;
 pub mod logging;
 pub mod middleware;
