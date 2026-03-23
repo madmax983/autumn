@@ -67,7 +67,7 @@ async fn serves_subdirectories() {
     let dir = tempfile::tempdir().unwrap();
     let img_dir = dir.path().join("images").join("icons");
     std::fs::create_dir_all(&img_dir).unwrap();
-    std::fs::write(img_dir.join("favicon.ico"), &[0u8; 10]).unwrap();
+    std::fs::write(img_dir.join("favicon.ico"), [0u8; 10]).unwrap();
 
     let app = Router::new().nest_service("/static", ServeDir::new(dir.path()));
 

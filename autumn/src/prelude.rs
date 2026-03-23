@@ -41,7 +41,7 @@ mod tests {
 
     // Verify key types are in scope by using them in type position.
     // These are compile-time checks — if this module compiles, the prelude works.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::unnecessary_wraps)]
     fn _handler_using_prelude(_db: Db) -> AutumnResult<Markup> {
         Ok(html! { "test" })
     }

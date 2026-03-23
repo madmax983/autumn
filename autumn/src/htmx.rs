@@ -22,7 +22,7 @@ mod tests {
     fn htmx_js_looks_like_javascript() {
         let start = std::str::from_utf8(&HTMX_JS[..50]).expect("htmx should be valid UTF-8");
         assert!(
-            start.contains("htmx") || start.contains("function") || start.contains("("),
+            start.contains("htmx") || start.contains("function") || start.contains('('),
             "htmx.min.js doesn't look like JavaScript: {start}"
         );
     }

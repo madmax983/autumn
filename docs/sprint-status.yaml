@@ -1,9 +1,9 @@
 version: "6.0.0"
 project_name: "autumn"
 project_level: 4
-current_sprint: 5
+current_sprint: 9
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
-last_updated: "2026-03-22"
+last_updated: "2026-03-23"
 
 sprints:
   - sprint_number: 1
@@ -135,57 +135,64 @@ sprints:
     end_date: "2026-05-30"
     capacity_points: 12
     committed_points: 13
-    completed_points: 0
-    status: "active"
+    completed_points: 13
+    status: "completed"
     goal: "Database foundation — pool, model macro, config integration"
     notes: "S-013/S-014/S-015 were subsumed by S-012 in Sprint 4. Pulled S-019 forward from Sprint 6."
     stories:
       - story_id: "S-016"
         title: "diesel-async connection pool (deadpool)"
         points: 5
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-016.md"
+        completion_date: "2026-03-22"
       - story_id: "S-018"
         title: "#[derive(Model)] macro"
         points: 5
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-018.md"
+        completion_date: "2026-03-22"
       - story_id: "S-019"
         title: "Database URL from config integration"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-019.md"
+        completion_date: "2026-03-22"
 
   - sprint_number: 6
     start_date: "2026-06-02"
     end_date: "2026-06-13"
     capacity_points: 12
     committed_points: 12
-    completed_points: 0
-    status: "planned"
+    completed_points: 12
+    status: "completed"
     goal: "Full stack — Db extraction, Maud rendering, JSON and Form extractors (3-month gut check)"
     notes: "S-018/S-019 moved to Sprint 5. Pulled S-023/S-031 forward from Sprint 7."
     stories:
       - story_id: "S-017"
         title: "Db extractor (FromRequestParts impl)"
         points: 5
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-017.md"
+        completion_date: "2026-03-22"
       - story_id: "S-020"
         title: "Maud re-export + Markup as handler return type"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-020.md"
+        completion_date: "2026-03-22"
       - story_id: "S-023"
         title: "Form<T> extractor re-export"
         points: 2
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-023.md"
+        completion_date: "2026-03-22"
       - story_id: "S-031"
         title: "Json<T> re-export + response type integration"
         points: 2
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-031.md"
+        completion_date: "2026-03-22"
 
   - sprint_number: 7
     start_date: "2026-06-16"
@@ -235,42 +242,76 @@ sprints:
     end_date: "2026-07-11"
     capacity_points: 12
     committed_points: 14
-    completed_points: 0
-    status: "planned"
+    completed_points: 14
+    status: "completed"
     goal: "Production defaults — logging, health check, graceful shutdown. Feature-complete milestone."
     notes: "All straightforward integration work. No proc macros, no hard design problems. Each story is independent."
     stories:
       - story_id: "S-027"
         title: "Environment variable overrides for all config fields"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-027.md"
+        completion_date: "2026-03-22"
       - story_id: "S-028"
         title: "Structured logging with tracing-subscriber"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-028.md"
+        completion_date: "2026-03-22"
       - story_id: "S-029"
         title: "Health check endpoint with pool status"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-029.md"
+        completion_date: "2026-03-22"
       - story_id: "S-030"
         title: "Graceful shutdown (SIGTERM + Ctrl+C)"
         points: 3
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-030.md"
+        completion_date: "2026-03-22"
       - story_id: "S-033"
         title: "autumn::prelude module"
         points: 2
-        status: "defined"
+        status: "completed"
         story_doc: "docs/stories/S-033.md"
+        completion_date: "2026-03-22"
+
+  - sprint_number: 9
+    start_date: "2026-07-14"
+    end_date: "2026-07-25"
+    capacity_points: 12
+    committed_points: 11
+    completed_points: 0
+    status: "active"
+    goal: "CLI scaffolding + CI pipeline — the developer experience sprint"
+    stories:
+      - story_id: "S-034"
+        title: "autumn-cli crate with clap"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-034.md"
+      - story_id: "S-035"
+        title: "autumn new project generation"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-035.md"
+      - story_id: "S-043"
+        title: "GitHub Actions CI (3 OS)"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-043.md"
 
 velocity:
   sprint_1: 12
   sprint_2: 13
   sprint_3: 13
   sprint_4: 13
+  sprint_5: 13
+  sprint_6: 12
+  sprint_7: 13
+  sprint_8: 14
   rolling_average: 13
 
 team:
