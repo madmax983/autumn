@@ -128,6 +128,13 @@ impl AppBuilder {
             "Mounted route"
         );
 
+        // Health check endpoint (auto-mounted)
+        router = router.route(
+            &config.health.path,
+            axum::routing::get(crate::health::handler),
+        );
+        tracing::debug!(path = %config.health.path, "Mounted health check");
+
         // Static file serving from project's static/ directory
         router = router.nest_service("/static", tower_http::services::ServeDir::new("static"));
 
