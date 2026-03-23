@@ -101,7 +101,7 @@ impl FromRequestParts<AppState> for Db {
         let conn = pool.get().await.map_err(|e| {
             eprintln!("Failed to acquire database connection: {e}");
             AutumnError::bad_request(std::io::Error::other(e.to_string()))
-            .with_status(StatusCode::SERVICE_UNAVAILABLE)
+                .with_status(StatusCode::SERVICE_UNAVAILABLE)
         })?;
 
         Ok(Self(conn))

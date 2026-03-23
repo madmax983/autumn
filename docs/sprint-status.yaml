@@ -3,7 +3,7 @@ project_name: "autumn"
 project_level: 4
 current_sprint: 5
 sprint_plan_path: "docs/sprint-plan-autumn-2026-03-20.md"
-last_updated: "2026-03-21"
+last_updated: "2026-03-22"
 
 sprints:
   - sprint_number: 1
@@ -186,6 +186,85 @@ sprints:
         points: 2
         status: "defined"
         story_doc: "docs/stories/S-031.md"
+
+  - sprint_number: 7
+    start_date: "2026-06-16"
+    end_date: "2026-06-27"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 13
+    status: "completed"
+    goal: "Complete rendering stack — Tailwind CSS, htmx, static file serving"
+    notes: "S-023/S-031 completed ahead of schedule in Sprint 6. S-032 pulled forward from Sprint 8."
+    stories:
+      - story_id: "S-024"
+        title: "Static input.css with Tailwind directives"
+        points: 1
+        status: "completed"
+        story_doc: "docs/stories/S-024.md"
+      - story_id: "S-021"
+        title: "Tailwind build.rs template"
+        points: 5
+        status: "completed"
+        story_doc: "docs/stories/S-021.md"
+      - story_id: "S-022"
+        title: "htmx embedding + serving route"
+        points: 3
+        status: "completed"
+        story_doc: "docs/stories/S-022.md"
+      - story_id: "S-032"
+        title: "Static directory serving (ServeDir)"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-032.md"
+      - story_id: "S-023"
+        title: "Form<T> extractor re-export"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-023.md"
+        notes: "Completed early in Sprint 6"
+      - story_id: "S-031"
+        title: "Json<T> re-export + response type integration"
+        points: 2
+        status: "completed"
+        story_doc: "docs/stories/S-031.md"
+        notes: "Completed early in Sprint 6"
+
+  - sprint_number: 8
+    start_date: "2026-06-30"
+    end_date: "2026-07-11"
+    capacity_points: 12
+    committed_points: 14
+    completed_points: 0
+    status: "planned"
+    goal: "Production defaults — logging, health check, graceful shutdown. Feature-complete milestone."
+    notes: "All straightforward integration work. No proc macros, no hard design problems. Each story is independent."
+    stories:
+      - story_id: "S-027"
+        title: "Environment variable overrides for all config fields"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-027.md"
+      - story_id: "S-028"
+        title: "Structured logging with tracing-subscriber"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-028.md"
+      - story_id: "S-029"
+        title: "Health check endpoint with pool status"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-029.md"
+      - story_id: "S-030"
+        title: "Graceful shutdown (SIGTERM + Ctrl+C)"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-030.md"
+      - story_id: "S-033"
+        title: "autumn::prelude module"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-033.md"
 
 velocity:
   sprint_1: 12
