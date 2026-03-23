@@ -77,45 +77,55 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 2. Validate routes
+        // 2. Initialize logging immediately after config (before any tracing calls)
+        crate::logging::init(&config.log);
+
+        // 3. Validate routes
         assert!(
             !self.routes.is_empty(),
             "No routes registered. Did you forget to call .routes()?"
         );
 
-        // 3. Log banner
-        println!("Autumn v{}", env!("CARGO_PKG_VERSION"));
+        // 4. Log banner
+        tracing::info!("Autumn v{}", env!("CARGO_PKG_VERSION"));
 
-        // 4. Create database pool (if configured)
+        // 5. Create database pool (if configured)
         let pool = match db::create_pool(&config.database) {
             Ok(pool) => pool,
             Err(e) => {
-                eprintln!("Failed to create database pool: {e}");
+                tracing::error!("Failed to create database pool: {e}");
                 std::process::exit(1);
             }
         };
 
         if pool.is_some() {
-            println!(
-                "  Database pool: {} max connections",
-                config.database.pool_size
+            tracing::info!(
+                max_connections = config.database.pool_size,
+                "Database pool configured"
             );
         } else {
-            println!("  Database: not configured");
+            tracing::info!("Database not configured");
         }
 
-        // 5. Build Axum router, logging each route as it mounts
+        // 6. Build Axum router, logging each route as it mounts
         let mut router = axum::Router::new();
         for route in self.routes {
-            println!("  {} {} ({})", route.method, route.path, route.name);
+            tracing::debug!(
+                method = %route.method,
+                path = route.path,
+                name = route.name,
+                "Mounted route"
+            );
             router = router.route(route.path, route.handler);
         }
 
         // Framework-provided routes
         router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
-        println!(
-            "  GET /static/js/htmx.min.js (htmx {})",
-            crate::htmx::HTMX_VERSION
+        tracing::debug!(
+            method = "GET",
+            path = "/static/js/htmx.min.js",
+            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+            "Mounted route"
         );
 
         // Static file serving from project's static/ directory
@@ -124,14 +134,14 @@ impl AppBuilder {
         let state = AppState { pool };
         let router = router.layer(RequestIdLayer).with_state(state);
 
-        // 6. Bind and serve with graceful shutdown
+        // 7. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);
-        println!("Listening on http://{addr}");
+        tracing::info!(addr = %addr, "Listening");
 
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Failed to bind to {addr}: {e}");
+                tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
 
@@ -139,7 +149,7 @@ impl AppBuilder {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .unwrap_or_else(|e| {
-                eprintln!("Server error: {e}");
+                tracing::error!("Server error: {e}");
                 std::process::exit(1);
             });
     }
@@ -164,7 +174,7 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to install Ctrl+C handler");
-    println!("\nShutting down gracefully...");
+    tracing::info!("Shutting down gracefully");
 }
 
 #[cfg(test)]

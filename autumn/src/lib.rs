@@ -12,6 +12,7 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub(crate) mod htmx;
+pub mod logging;
 pub mod middleware;
 pub mod route;
 
