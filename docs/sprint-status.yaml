@@ -303,6 +303,37 @@ sprints:
         status: "defined"
         story_doc: "docs/stories/S-043.md"
 
+  - sprint_number: 10
+    start_date: "2026-07-28"
+    end_date: "2026-08-08"
+    capacity_points: 12
+    committed_points: 14
+    completed_points: 0
+    status: "planned"
+    goal: "CLI completion + example app + README — the 'it's real' sprint"
+    notes: "Stretch sprint (14 pts vs 12 capacity). S-037 is the critical integration test."
+    stories:
+      - story_id: "S-036"
+        title: "autumn setup: Tailwind CLI download with checksums"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-036.md"
+      - story_id: "S-037"
+        title: "E2E: generated project compiles + runs"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-037.md"
+      - story_id: "S-041"
+        title: "Example todo application"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-041.md"
+      - story_id: "S-038"
+        title: "README with quickstart + maturity warning"
+        points: 3
+        status: "defined"
+        story_doc: "docs/stories/S-038.md"
+
 velocity:
   sprint_1: 12
   sprint_2: 13
