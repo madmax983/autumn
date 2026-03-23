@@ -608,6 +608,14 @@ path = "/healthz"
         assert_eq!(config.server.port, 3000);
     }
 
+    #[test]
+    fn env_override_invalid_shutdown_timeout_ignored() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "forever");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.server.shutdown_timeout_secs, 30);
+    }
+
     // ── Log env override tests ───────────────────────────────────
 
     #[test]

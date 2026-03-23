@@ -49,7 +49,7 @@ pub fn init(config: &LogConfig) {
     } else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(fmt::layer())
+            .with(fmt::layer().pretty())
             .init();
     }
 }

@@ -39,24 +39,22 @@ pub use crate::AppState;
 mod tests {
     use super::*;
 
-    // Verify types are in scope by using them in type position
+    // Verify key types are in scope by using them in type position.
+    // These are compile-time checks — if this module compiles, the prelude works.
     #[allow(dead_code)]
-    async fn handler_using_prelude(db: Db) -> AutumnResult<Markup> {
+    fn _handler_using_prelude(_db: Db) -> AutumnResult<Markup> {
         Ok(html! { "test" })
     }
 
     #[allow(dead_code)]
-    fn json_handler() -> Json<&'static str> {
+    fn _json_handler() -> Json<&'static str> {
         Json("ok")
     }
 
     #[test]
     fn prelude_types_are_accessible() {
-        // This test exists to verify compilation — if it compiles, the prelude works
-        let _: fn(
-            Db,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = AutumnResult<Markup>> + Send>,
-        > = |_| todo!();
+        // Compilation is the test — verify a few types exist at runtime too
+        let _state = AppState { pool: None };
+        let _err: AutumnResult<()> = Ok(());
     }
 }
