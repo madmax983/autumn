@@ -152,13 +152,33 @@ impl AppBuilder {
                 std::process::exit(1);
             });
 
+        let shutdown_timeout = config.server.shutdown_timeout_secs;
+
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                shutdown_signal().await;
+
+                // Warn if draining takes too long
+                if shutdown_timeout > 5 {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            shutdown_timeout.saturating_sub(5),
+                        ))
+                        .await;
+                        tracing::warn!(
+                            timeout_secs = shutdown_timeout,
+                            "Shutdown draining near timeout, force-kill may be imminent"
+                        );
+                    });
+                }
+            })
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("Server error: {e}");
                 std::process::exit(1);
             });
+
+        tracing::info!("Server shut down cleanly");
     }
 }
 
@@ -177,11 +197,34 @@ async fn htmx_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
+///
+/// Returns when either signal is received. Axum's `with_graceful_shutdown`
+/// then stops accepting new connections and drains in-flight requests.
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to install Ctrl+C handler");
-    tracing::info!("Shutting down gracefully");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        tracing::info!("Received Ctrl+C, starting graceful shutdown");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+        tracing::info!("Received SIGTERM, starting graceful shutdown");
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
 }
 
 #[cfg(test)]
