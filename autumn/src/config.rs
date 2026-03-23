@@ -102,13 +102,48 @@ impl AutumnConfig {
 
     /// Apply environment variable overrides to the loaded config.
     ///
-    /// Database-specific overrides (full `AUTUMN_*` system in S-027):
-    /// - `AUTUMN_DATABASE__URL` -> `database.url`
-    /// - `AUTUMN_DATABASE__POOL_SIZE` -> `database.pool_size`
-    /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` -> `database.connect_timeout_secs`
+    /// All fields can be overridden via `AUTUMN_SECTION__FIELD` environment
+    /// variables. Double underscore `__` separates nested config sections.
     ///
-    /// Double underscore `__` separates nested config sections.
+    /// # Server
+    /// - `AUTUMN_SERVER__PORT` → `server.port` (u16)
+    /// - `AUTUMN_SERVER__HOST` → `server.host` (String)
+    /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
+    ///
+    /// # Database
+    /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
+    /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
+    /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
+    ///
+    /// # Log
+    /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
+    /// - `AUTUMN_LOG__FORMAT` → `log.format` (Auto | Pretty | Json)
+    ///
+    /// # Health
+    /// - `AUTUMN_HEALTH__PATH` → `health.path` (String)
     pub fn apply_env_overrides(&mut self) {
+        // ── Server ──────────────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_SERVER__PORT") {
+            match val.parse::<u16>() {
+                Ok(port) => self.server.port = port,
+                Err(_) => {
+                    eprintln!("Warning: AUTUMN_SERVER__PORT={val:?} is not a valid port, ignoring");
+                }
+            }
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SERVER__HOST") {
+            self.server.host = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS") {
+            match val.parse::<u64>() {
+                Ok(secs) => self.server.shutdown_timeout_secs = secs,
+                Err(_) => eprintln!(
+                    "Warning: AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS={val:?} is not a valid number, ignoring"
+                ),
+            }
+        }
+
+        // ── Database ────────────────────────────────────────────
         if let Ok(val) = std::env::var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
@@ -127,6 +162,27 @@ impl AutumnConfig {
                     "Warning: AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS={val:?} is not a valid number, ignoring"
                 ),
             }
+        }
+
+        // ── Log ─────────────────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_LOG__LEVEL") {
+            self.log.level = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_LOG__FORMAT") {
+            match val.as_str() {
+                "Auto" => self.log.format = LogFormat::Auto,
+                "Pretty" => self.log.format = LogFormat::Pretty,
+                "Json" => self.log.format = LogFormat::Json,
+                _ => eprintln!(
+                    "Warning: AUTUMN_LOG__FORMAT={val:?} is not valid \
+                     (expected Auto, Pretty, or Json), ignoring"
+                ),
+            }
+        }
+
+        // ── Health ──────────────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_HEALTH__PATH") {
+            self.health.path = val;
         }
     }
 }
@@ -516,6 +572,97 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides();
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    // ── Server env override tests ────────────────────────────────
+
+    #[test]
+    fn env_override_server_port() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "8080");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.server.port, 8080);
+    }
+
+    #[test]
+    fn env_override_server_host() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__HOST", "0.0.0.0");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.server.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn env_override_server_shutdown_timeout() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "60");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.server.shutdown_timeout_secs, 60);
+    }
+
+    #[test]
+    fn env_override_invalid_server_port_ignored() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "not_a_port");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.server.port, 3000);
+    }
+
+    // ── Log env override tests ───────────────────────────────────
+
+    #[test]
+    fn env_override_log_level() {
+        let _guard = EnvGuard::set("AUTUMN_LOG__LEVEL", "debug");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.log.level, "debug");
+    }
+
+    #[test]
+    fn env_override_log_format_json() {
+        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Json");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.log.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn env_override_log_format_pretty() {
+        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Pretty");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.log.format, LogFormat::Pretty);
+    }
+
+    #[test]
+    fn env_override_invalid_log_format_ignored() {
+        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "yaml");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.log.format, LogFormat::Auto);
+    }
+
+    // ── Health env override tests ────────────────────────────────
+
+    #[test]
+    fn env_override_health_path() {
+        let _guard = EnvGuard::set("AUTUMN_HEALTH__PATH", "/healthz");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.health.path, "/healthz");
+    }
+
+    // ── Precedence test ──────────────────────────────────────────
+
+    #[test]
+    fn env_overrides_toml_values() {
+        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "9999");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autumn.toml");
+        std::fs::write(&path, "[server]\nport = 4000\n").unwrap();
+        let mut config = AutumnConfig::load_from(&path).unwrap();
+        config.apply_env_overrides();
+        assert_eq!(config.server.port, 9999); // env wins
     }
 
     // ── Validation tests ─────────────────────────────────────────
