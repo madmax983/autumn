@@ -15,6 +15,7 @@ pub mod health;
 pub(crate) mod htmx;
 pub mod logging;
 pub mod middleware;
+pub mod prelude;
 pub mod route;
 
 pub use app::app;
