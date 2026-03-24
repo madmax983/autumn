@@ -1,11 +1,33 @@
 #[test]
 fn compile_fail_tests() {
     let t = trybuild::TestCases::new();
-    t.compile_fail("tests/compile-fail/*.rs");
+
+    // Route macro failures (always available)
+    t.compile_fail("tests/compile-fail/empty_path.rs");
+    t.compile_fail("tests/compile-fail/missing_leading_slash.rs");
+    t.compile_fail("tests/compile-fail/non_async.rs");
+    t.compile_fail("tests/compile-fail/non_async_main.rs");
+    t.compile_fail("tests/compile-fail/non_function.rs");
+    t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
+
+    // Model macro failures (require db feature)
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_on_enum.rs");
 }
 
 #[test]
 fn compile_pass_tests() {
     let t = trybuild::TestCases::new();
-    t.pass("tests/compile-pass/*.rs");
+
+    // Route macro passes (always available)
+    t.pass("tests/compile-pass/valid_handlers.rs");
+    t.pass("tests/compile-pass/async_main.rs");
+
+    // Maud + form/json handlers (require maud feature)
+    #[cfg(feature = "maud")]
+    t.pass("tests/compile-pass/json_form_handlers.rs");
+
+    // Model derive (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_derive.rs");
 }

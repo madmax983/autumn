@@ -20,6 +20,7 @@
 
 use crate::AppState;
 use crate::config::AutumnConfig;
+#[cfg(feature = "db")]
 use crate::db;
 use crate::middleware::RequestIdLayer;
 use crate::route::Route;
@@ -90,6 +91,7 @@ impl AppBuilder {
         tracing::info!("Autumn v{}", env!("CARGO_PKG_VERSION"));
 
         // 5. Create database pool (if configured)
+        #[cfg(feature = "db")]
         let pool = match db::create_pool(&config.database) {
             Ok(pool) => pool,
             Err(e) => {
@@ -98,6 +100,7 @@ impl AppBuilder {
             }
         };
 
+        #[cfg(feature = "db")]
         if pool.is_some() {
             tracing::info!(
                 max_connections = config.database.pool_size,
@@ -120,13 +123,16 @@ impl AppBuilder {
         }
 
         // Framework-provided routes
-        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
-        tracing::debug!(
-            method = "GET",
-            path = "/static/js/htmx.min.js",
-            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-            "Mounted route"
-        );
+        #[cfg(feature = "htmx")]
+        {
+            router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+            tracing::debug!(
+                method = "GET",
+                path = "/static/js/htmx.min.js",
+                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+                "Mounted route"
+            );
+        }
 
         // Health check endpoint (auto-mounted)
         router = router.route(
@@ -138,7 +144,10 @@ impl AppBuilder {
         // Static file serving from project's static/ directory
         router = router.nest_service("/static", tower_http::services::ServeDir::new("static"));
 
-        let state = AppState { pool };
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool,
+        };
         let router = router.layer(RequestIdLayer).with_state(state);
 
         // 7. Bind and serve with graceful shutdown
@@ -182,6 +191,7 @@ impl AppBuilder {
     }
 }
 
+#[cfg(feature = "htmx")]
 async fn htmx_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
@@ -228,6 +238,7 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+#[cfg(feature = "htmx")]
 mod tests {
     use super::*;
     use axum::body::Body;

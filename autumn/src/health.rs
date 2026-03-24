@@ -17,16 +17,11 @@ use crate::AppState;
 ///
 /// - `200 OK` — application is healthy
 /// - `503 Service Unavailable` — database pool is exhausted
+#[allow(unused_variables)]
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
-    state.pool.as_ref().map_or_else(
-        || {
-            let body = serde_json::json!({
-                "status": "ok",
-                "version": env!("CARGO_PKG_VERSION"),
-            });
-            (StatusCode::OK, Json(body))
-        },
-        |pool| {
+    #[cfg(feature = "db")]
+    {
+        if let Some(pool) = state.pool.as_ref() {
             let status = pool.status();
             let available = status.available as u64;
             let size = status.max_size as u64;
@@ -51,9 +46,15 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
                 StatusCode::SERVICE_UNAVAILABLE
             };
 
-            (status_code, Json(body))
-        },
-    )
+            return (status_code, Json(body));
+        }
+    }
+
+    let body = serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    (StatusCode::OK, Json(body))
 }
 
 #[cfg(test)]
@@ -67,7 +68,10 @@ mod tests {
     async fn health_no_database_returns_ok() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState { pool: None });
+            .with_state(AppState {
+                #[cfg(feature = "db")]
+                pool: None,
+            });
 
         let response = app
             .oneshot(
@@ -95,7 +99,10 @@ mod tests {
     async fn health_no_database_returns_json_content_type() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState { pool: None });
+            .with_state(AppState {
+                #[cfg(feature = "db")]
+                pool: None,
+            });
 
         let response = app
             .oneshot(
@@ -123,7 +130,10 @@ mod tests {
     async fn health_response_includes_version() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState { pool: None });
+            .with_state(AppState {
+                #[cfg(feature = "db")]
+                pool: None,
+            });
 
         let response = app
             .oneshot(

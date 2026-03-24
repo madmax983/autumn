@@ -8,10 +8,12 @@
 
 pub mod app;
 pub mod config;
+#[cfg(feature = "db")]
 pub mod db;
 pub mod error;
 pub mod extract;
 pub mod health;
+#[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub mod logging;
 pub mod middleware;
@@ -19,14 +21,19 @@ pub mod prelude;
 pub mod route;
 
 pub use app::app;
+#[cfg(feature = "db")]
 pub use db::Db;
 pub use error::{AutumnError, AutumnResult};
+#[cfg(feature = "htmx")]
 pub use htmx::HTMX_VERSION;
 
 // Re-export proc macros so users can write `use autumn::get;` or `#[autumn::main]`
-pub use autumn_macros::{delete, get, main, model, post, put, routes};
+#[cfg(feature = "db")]
+pub use autumn_macros::model;
+pub use autumn_macros::{delete, get, main, post, put, routes};
 
 // Re-export Maud types for HTML rendering
+#[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
 
 // Re-export Json at root level (commonly used in return types)
@@ -39,6 +46,7 @@ pub use axum::Json;
 /// `autumn::prelude` module over reaching into reexports directly.
 pub mod reexports {
     pub use axum;
+    #[cfg(feature = "db")]
     pub use diesel;
     pub use http;
     pub use tokio;
@@ -53,20 +61,28 @@ pub mod reexports {
 #[derive(Clone)]
 pub struct AppState {
     /// Database connection pool. `None` when no `database.url` is configured.
+    #[cfg(feature = "db")]
     pub pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppState")
-            .field(
-                "pool",
-                &self
-                    .pool
-                    .as_ref()
-                    .map(|p| format!("Pool(max={})", p.status().max_size)),
-            )
-            .finish()
+        #[cfg(feature = "db")]
+        {
+            f.debug_struct("AppState")
+                .field(
+                    "pool",
+                    &self
+                        .pool
+                        .as_ref()
+                        .map(|p| format!("Pool(max={})", p.status().max_size)),
+                )
+                .finish()
+        }
+        #[cfg(not(feature = "db"))]
+        {
+            f.debug_struct("AppState").finish()
+        }
     }
 }

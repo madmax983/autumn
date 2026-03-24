@@ -1,3 +1,5 @@
+#![cfg(feature = "maud")]
+
 use autumn::{Markup, html};
 use axum::Router;
 use axum::body::Body;

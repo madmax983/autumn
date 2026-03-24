@@ -1,3 +1,4 @@
+#![cfg(feature = "htmx")]
 //! Tests for htmx embedding and serving.
 
 #[test]

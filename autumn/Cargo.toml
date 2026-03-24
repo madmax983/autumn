@@ -6,14 +6,21 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["maud", "htmx", "tailwind", "db"]
+maud = ["dep:maud"]
+htmx = []
+tailwind = []
+db = ["dep:diesel", "dep:diesel-async", "dep:libsqlite3-sys"]
+
 [dependencies]
 autumn-macros = { path = "../autumn-macros" }
 axum.workspace = true
-diesel.workspace = true
-diesel-async.workspace = true
+diesel = { workspace = true, optional = true }
+diesel-async = { workspace = true, optional = true }
 http.workspace = true
-libsqlite3-sys.workspace = true
-maud.workspace = true
+libsqlite3-sys = { workspace = true, optional = true }
+maud = { workspace = true, optional = true }
 pin-project-lite = "0.2"
 serde.workspace = true
 serde_json = "1"
