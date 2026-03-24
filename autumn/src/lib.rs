@@ -293,6 +293,7 @@ pub use autumn_macros::routes;
 ///     html! { h1 { "Welcome" } }
 /// }
 /// ```
+#[cfg(feature = "maud")]
 pub use maud::Markup;
 
 /// Wrap a pre-escaped string so Maud renders it verbatim.
@@ -310,6 +311,7 @@ pub use maud::Markup;
 ///
 /// let raw_html = PreEscaped("<em>already escaped</em>".to_string());
 /// ```
+#[cfg(feature = "maud")]
 pub use maud::PreEscaped;
 
 /// Type-safe HTML templating macro.
@@ -328,6 +330,7 @@ pub use maud::PreEscaped;
 ///     h1 { "Hello, " (greeting) "!" }
 /// };
 /// ```
+#[cfg(feature = "maud")]
 pub use maud::html;
 
 /// JSON request body extractor and response type.
