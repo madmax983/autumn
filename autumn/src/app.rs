@@ -207,8 +207,15 @@ impl AppBuilder {
         );
         tracing::debug!(path = %config.health.path, "Mounted health check");
 
-        // Static file serving from project's static/ directory
-        router = router.nest_service("/static", tower_http::services::ServeDir::new("static"));
+        // Static file serving from project's static/ directory.
+        // Resolve relative to the app's crate root (set by #[autumn::main])
+        // so `cargo run -p <example>` works from the workspace root.
+        let static_dir = if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
+            std::path::PathBuf::from(manifest_dir).join("static")
+        } else {
+            std::path::PathBuf::from("static")
+        };
+        router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
         let state = AppState {
             #[cfg(feature = "db")]

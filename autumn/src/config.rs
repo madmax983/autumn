@@ -36,10 +36,23 @@
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+
+/// Locate `autumn.toml` by checking the app's crate directory first, then CWD.
+fn find_config_file() -> PathBuf {
+    // Prefer the app's crate root (set by #[autumn::main]).
+    if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
+        let candidate = PathBuf::from(manifest_dir).join("autumn.toml");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Fall back to CWD.
+    PathBuf::from("autumn.toml")
+}
 
 /// Errors that can occur when loading or validating configuration.
 ///
@@ -119,10 +132,15 @@ pub struct AutumnConfig {
 }
 
 impl AutumnConfig {
-    /// Load configuration from `autumn.toml` in the current directory.
+    /// Load configuration from `autumn.toml`.
+    ///
+    /// Searches for `autumn.toml` in the following order:
+    /// 1. The app's crate directory (set by `#[autumn::main]` via
+    ///    `AUTUMN_MANIFEST_DIR`)
+    /// 2. The current working directory
     ///
     /// Applies environment variable overrides and validates the result.
-    /// Returns defaults if the file doesn't exist.
+    /// Returns defaults if no config file is found.
     ///
     /// # Errors
     ///
@@ -130,7 +148,8 @@ impl AutumnConfig {
     /// [`ConfigError::Parse`] if the file contains invalid TOML, or
     /// [`ConfigError::Validation`] if a value is invalid.
     pub fn load() -> Result<Self, ConfigError> {
-        let mut config = Self::load_from(Path::new("autumn.toml"))?;
+        let config_path = find_config_file();
+        let mut config = Self::load_from(&config_path)?;
         config.apply_env_overrides();
         config.database.validate()?;
         Ok(config)

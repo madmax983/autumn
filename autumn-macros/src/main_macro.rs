@@ -27,6 +27,10 @@ pub fn main_macro(item: TokenStream) -> TokenStream {
     quote! {
         #(#attrs)*
         fn main() {
+            // Tell the framework where autumn.toml lives (the app's crate root).
+            // SAFETY: called at the top of main, before any threads are spawned.
+            unsafe { ::std::env::set_var("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR")); }
+
             ::autumn::reexports::tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

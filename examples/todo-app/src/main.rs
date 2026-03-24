@@ -3,9 +3,22 @@ mod routes;
 mod schema;
 
 use autumn::routes;
+use diesel::Connection;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn::main]
 async fn main() {
+    // Run pending database migrations before starting the server.
+    let config = autumn::config::AutumnConfig::load().expect("load config");
+    if let Some(url) = &config.database.url {
+        let mut conn =
+            diesel::PgConnection::establish(url).expect("connect to database for migrations");
+        conn.run_pending_migrations(MIGRATIONS)
+            .expect("run migrations");
+    }
+
     autumn::app()
         .routes(routes![
             routes::todos::index,
