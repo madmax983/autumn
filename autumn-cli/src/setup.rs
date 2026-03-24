@@ -393,7 +393,7 @@ mod tests {
     // ── Integration test (requires network) ─────────────────────────
 
     #[test]
-    #[ignore]
+    #[ignore = "requires network access to download Tailwind binary"]
     fn download_and_verify_tailwind() {
         let tmp = tempfile::TempDir::new().expect("create temp dir");
         let install_dir = tmp.path().join("target/autumn");
