@@ -334,6 +334,38 @@ sprints:
         status: "defined"
         story_doc: "docs/stories/S-038.md"
 
+  - sprint_number: 11
+    start_date: "2026-08-11"
+    end_date: "2026-08-22"
+    capacity_points: 12
+    committed_points: 13
+    completed_points: 0
+    status: "planned"
+    goal: "Documentation — getting started guide, tutorial, API docs"
+    notes: "S-040 starts here (1pt outline + Chapter 1) and carries into Sprint 12 (7pts remaining). S-044 is mechanical but must land before crates.io publication."
+    stories:
+      - story_id: "S-039"
+        title: "Getting started guide (zero to running app)"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-039.md"
+      - story_id: "S-042"
+        title: "API docs (cargo doc) on all public types"
+        points: 5
+        status: "defined"
+        story_doc: "docs/stories/S-042.md"
+      - story_id: "S-044"
+        title: "Cargo feature flags (tailwind, htmx, maud, db)"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-044.md"
+      - story_id: "S-040"
+        title: "Tutorial: build a todo app (outline + Chapter 1)"
+        points: 1
+        status: "defined"
+        story_doc: "docs/stories/S-040.md"
+        notes: "1pt of 8pt total — outline and anchor chapter. Remaining 7pts in Sprint 12."
+
 velocity:
   sprint_1: 12
   sprint_2: 13
