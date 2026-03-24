@@ -1,0 +1,13 @@
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[database]
+url = "postgres://autumn:autumn@localhost:5432/todos"
+
+[log]
+level = "debug"
+format = "Pretty"
+
+[health]
+path = "/health"

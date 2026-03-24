@@ -1,0 +1,16 @@
+[package]
+name = "todo-app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn = { path = "../../autumn" }
+chrono = { version = "0.4", features = ["serde"] }
+diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel-async = { version = "0.8", features = ["postgres"] }
+diesel_migrations = "2"
+maud = { version = "0.27", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

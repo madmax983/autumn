@@ -1,0 +1,62 @@
+fn main() {
+    println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=tailwind.config.js");
+
+    let Some(tailwind) = find_tailwind_cli() else {
+        println!(
+            "cargo:warning=Tailwind CSS CLI not found — CSS will not be compiled. \
+             Run `autumn setup` or install tailwindcss manually."
+        );
+        return;
+    };
+
+    let status = std::process::Command::new(&tailwind)
+        .args([
+            "-i",
+            "static/css/input.css",
+            "-o",
+            "static/css/autumn.css",
+            "--content",
+            "src/**/*.rs",
+            "--minify",
+        ])
+        .status()
+        .expect("Failed to run Tailwind CLI");
+
+    if !status.success() {
+        panic!("Tailwind CSS compilation failed");
+    }
+}
+
+fn find_tailwind_cli() -> Option<std::path::PathBuf> {
+    // 1. Check local download (from `autumn setup`)
+    let local = std::path::PathBuf::from("target/autumn/tailwindcss");
+    if local.exists() {
+        return Some(local);
+    }
+
+    // 2. Check PATH
+    if let Some(path) = which("tailwindcss") {
+        return Some(path);
+    }
+
+    None
+}
+
+fn which(binary: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(binary);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let candidate_exe = dir.join(format!("{binary}.exe"));
+            if candidate_exe.exists() {
+                return Some(candidate_exe);
+            }
+        }
+    }
+    None
+}
