@@ -1,0 +1,56 @@
+# Chapter 3: Database Setup
+
+**Goal:** By the end of this chapter, you will have a Postgres database running
+in Docker, the Diesel CLI installed, a `todos` table created via migration,
+and your Autumn app connecting to the database on startup.
+
+---
+
+## Sections
+
+### Starting Postgres with Docker Compose
+
+Creating `docker-compose.yml` for a local Postgres instance. Starting and
+verifying the database.
+
+### Installing the Diesel CLI
+
+`cargo install diesel_cli --no-default-features --features postgres` and
+verifying the installation.
+
+### Configuring the Database Connection
+
+Uncommenting the `[database]` section in `autumn.toml` and setting the
+connection URL. How Autumn's config system loads the database URL.
+
+### Creating Your First Migration
+
+`diesel setup` and `diesel migration generate create_todos`. Writing the
+`up.sql` (CREATE TABLE) and `down.sql` (DROP TABLE) scripts.
+
+### Running Migrations
+
+`diesel migration run` to apply the migration. Verifying the table exists.
+
+### The `schema.rs` File
+
+How `diesel print-schema` generates the Diesel schema module. Understanding
+the `diesel::table!` macro output. Why `schema.rs` is generated, not
+hand-written.
+
+### Verifying the Connection
+
+Starting the app with `cargo run` and confirming the "Database pool
+configured" log message.
+
+### Checkpoint
+
+Expected project state with database configured and migration applied.
+
+---
+
+*Content coming in Sprint 12.*
+
+---
+
+Previous: [Chapter 2 — Routes and Handlers](02-routes.md) | Next: [Chapter 4 — Models and Queries](04-models.md)
