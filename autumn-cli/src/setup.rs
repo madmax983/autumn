@@ -1,11 +1,424 @@
+//! Tailwind CSS CLI download and verification for `autumn setup`.
+//!
+//! Downloads the correct platform-specific Tailwind CSS v4.1.0 standalone binary,
+//! verifies its SHA-256 checksum against the `.sha256` file published alongside
+//! each release asset, and installs it to `target/autumn/tailwindcss`.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
+
+/// Pinned Tailwind CSS release version.
+const TAILWIND_VERSION: &str = "v4.1.0";
+
+/// Base URL for Tailwind CSS release assets.
+const RELEASE_BASE_URL: &str = "https://github.com/tailwindlabs/tailwindcss/releases/download";
+
+// ── Errors ──────────────────────────────────────────────────────────────
+
+/// Errors that can occur during the setup process.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    /// The current OS/architecture combination is not supported.
+    #[error("unsupported platform: os={0}, arch={1}")]
+    UnsupportedPlatform(String, String),
+
+    /// A network request failed.
+    #[error("download failed: {0}")]
+    Download(#[from] reqwest::Error),
+
+    /// The downloaded binary does not match its expected checksum.
+    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        /// The checksum we expected (from the `.sha256` sidecar file).
+        expected: String,
+        /// The checksum we actually computed.
+        actual: String,
+    },
+
+    /// An I/O operation failed.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Failed to parse the `.sha256` sidecar file.
+    #[error("failed to parse checksum file: {0}")]
+    ChecksumParse(String),
+}
+
+// ── Public entry point ──────────────────────────────────────────────────
+
 /// Run the `autumn setup` subcommand.
 ///
-/// Downloads and configures external tools (Tailwind CSS).
-/// Full implementation in S-036.
-pub fn run() {
-    eprintln!("autumn setup is planned for a future release.");
-    eprintln!();
-    eprintln!("For now, install Tailwind CSS manually:");
-    eprintln!("  https://tailwindcss.com/blog/standalone-cli");
-    std::process::exit(1);
+/// Downloads Tailwind CSS to `target/autumn/tailwindcss` (or `.exe` on Windows).
+/// If the binary already exists and `force` is false, exits early.
+pub fn run(force: bool) {
+    if let Err(e) = execute(force) {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// Inner implementation so tests can call this without `process::exit`.
+fn execute(force: bool) -> Result<(), SetupError> {
+    let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)?;
+    let install_dir = PathBuf::from("target/autumn");
+    let dest = install_path(&install_dir);
+
+    if !force && dest.exists() {
+        println!("Tailwind CLI already installed at {}", dest.display());
+        return Ok(());
+    }
+
+    fs::create_dir_all(&install_dir)?;
+
+    let download_url = format!("{RELEASE_BASE_URL}/{TAILWIND_VERSION}/{binary_name}");
+    let checksum_url = format!("{download_url}.sha256");
+
+    println!("Downloading Tailwind CSS {TAILWIND_VERSION} ({binary_name})...");
+
+    // Fetch the expected checksum first (small file).
+    let expected_hash = fetch_expected_checksum(&checksum_url)?;
+
+    // Download the binary to a temporary file in the same directory.
+    let tmp_path = install_dir.join(".tailwindcss.tmp");
+    download_with_progress(&download_url, &tmp_path)?;
+
+    // Verify integrity.
+    let actual_hash = sha256_file(&tmp_path)?;
+    verify_checksum(&expected_hash, &actual_hash)?;
+
+    // Atomic-ish move: rename temp file to final destination.
+    fs::rename(&tmp_path, &dest)?;
+
+    // Set executable permissions on Unix.
+    #[cfg(unix)]
+    set_executable(&dest)?;
+
+    println!("Tailwind CLI installed to {}", dest.display());
+    Ok(())
+}
+
+// ── Platform detection ──────────────────────────────────────────────────
+
+/// Return the Tailwind release asset name for the given OS and architecture.
+///
+/// Accepts the values produced by `std::env::consts::OS` and
+/// `std::env::consts::ARCH` so that unit tests can inject arbitrary strings.
+pub fn detect_platform(os: &str, arch: &str) -> Result<String, SetupError> {
+    let platform = match (os, arch) {
+        ("linux", "x86_64") => "tailwindcss-linux-x64",
+        ("linux", "aarch64") => "tailwindcss-linux-arm64",
+        ("macos", "x86_64") => "tailwindcss-macos-x64",
+        ("macos", "aarch64") => "tailwindcss-macos-arm64",
+        ("windows", "x86_64") => "tailwindcss-windows-x64.exe",
+        _ => {
+            return Err(SetupError::UnsupportedPlatform(
+                os.to_owned(),
+                arch.to_owned(),
+            ));
+        }
+    };
+    Ok(platform.to_owned())
+}
+
+/// Return the final install path for the Tailwind binary.
+fn install_path(dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        dir.join("tailwindcss.exe")
+    } else {
+        dir.join("tailwindcss")
+    }
+}
+
+// ── Checksum helpers ────────────────────────────────────────────────────
+
+/// Download the `.sha256` sidecar file and extract the hex digest.
+///
+/// GitHub-published `.sha256` files typically contain a single line of the
+/// form `<hex_digest>  <filename>` (BSD-style) or just the bare hex digest.
+fn fetch_expected_checksum(url: &str) -> Result<String, SetupError> {
+    let body = reqwest::blocking::get(url)?.error_for_status()?.text()?;
+    parse_checksum_file(&body)
+}
+
+/// Parse a `.sha256` sidecar file body into a lowercase hex digest.
+pub fn parse_checksum_file(body: &str) -> Result<String, SetupError> {
+    let line = body.trim();
+    // Could be `<hash>  <filename>` or just `<hash>`.
+    let hash_part = line
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| SetupError::ChecksumParse("empty checksum file".into()))?;
+
+    // Validate it looks like a hex SHA-256 (64 hex chars).
+    if hash_part.len() != 64 || !hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(SetupError::ChecksumParse(format!(
+            "expected 64-char hex digest, got: {hash_part}"
+        )));
+    }
+
+    Ok(hash_part.to_ascii_lowercase())
+}
+
+/// Compute the SHA-256 digest of a file and return it as a lowercase hex string.
+pub fn sha256_file(path: &Path) -> Result<String, SetupError> {
+    let data = fs::read(path)?;
+    Ok(sha256_bytes(&data))
+}
+
+/// Compute the SHA-256 digest of a byte slice and return it as a lowercase hex string.
+pub fn sha256_bytes(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    hex::encode(digest)
+}
+
+/// Compare expected vs actual checksums, returning an error on mismatch.
+pub fn verify_checksum(expected: &str, actual: &str) -> Result<(), SetupError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(SetupError::ChecksumMismatch {
+            expected: expected.to_owned(),
+            actual: actual.to_owned(),
+        })
+    }
+}
+
+// ── Download with progress ──────────────────────────────────────────────
+
+/// Download `url` to `dest`, showing a progress bar on stdout.
+fn download_with_progress(url: &str, dest: &Path) -> Result<(), SetupError> {
+    let response = reqwest::blocking::Client::new()
+        .get(url)
+        .send()?
+        .error_for_status()?;
+
+    let total = response.content_length().unwrap_or(0);
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+            .expect("valid progress template")
+            .progress_chars("=> "),
+    );
+
+    let mut file = fs::File::create(dest)?;
+    let bytes = response.bytes()?;
+    pb.set_length(bytes.len() as u64);
+    file.write_all(&bytes)?;
+    pb.finish_and_clear();
+    Ok(())
+}
+
+// ── Unix permissions ────────────────────────────────────────────────────
+
+/// Set the executable bit on a file (Unix only).
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<(), SetupError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    let mode = perms.mode() | 0o111;
+    perms.set_mode(mode);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Platform detection ──────────────────────────────────────────
+
+    #[test]
+    fn detect_linux_x64() {
+        let name = detect_platform("linux", "x86_64").expect("should be supported");
+        assert_eq!(name, "tailwindcss-linux-x64");
+    }
+
+    #[test]
+    fn detect_linux_arm64() {
+        let name = detect_platform("linux", "aarch64").expect("should be supported");
+        assert_eq!(name, "tailwindcss-linux-arm64");
+    }
+
+    #[test]
+    fn detect_macos_x64() {
+        let name = detect_platform("macos", "x86_64").expect("should be supported");
+        assert_eq!(name, "tailwindcss-macos-x64");
+    }
+
+    #[test]
+    fn detect_macos_arm64() {
+        let name = detect_platform("macos", "aarch64").expect("should be supported");
+        assert_eq!(name, "tailwindcss-macos-arm64");
+    }
+
+    #[test]
+    fn detect_windows_x64() {
+        let name = detect_platform("windows", "x86_64").expect("should be supported");
+        assert_eq!(name, "tailwindcss-windows-x64.exe");
+    }
+
+    #[test]
+    fn detect_unsupported_os() {
+        let err = detect_platform("freebsd", "x86_64").unwrap_err();
+        assert!(matches!(err, SetupError::UnsupportedPlatform(_, _)));
+        assert!(err.to_string().contains("freebsd"));
+    }
+
+    #[test]
+    fn detect_unsupported_arch() {
+        let err = detect_platform("linux", "riscv64").unwrap_err();
+        assert!(matches!(err, SetupError::UnsupportedPlatform(_, _)));
+        assert!(err.to_string().contains("riscv64"));
+    }
+
+    // ── Checksum verification ───────────────────────────────────────
+
+    #[test]
+    fn sha256_known_value() {
+        // SHA-256 of the empty string.
+        let hash = sha256_bytes(b"");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn sha256_hello_world() {
+        let hash = sha256_bytes(b"hello world\n");
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    #[test]
+    fn verify_checksum_match() {
+        let hash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(verify_checksum(hash, hash).is_ok());
+    }
+
+    #[test]
+    fn verify_checksum_mismatch() {
+        let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let actual = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let err = verify_checksum(expected, actual).unwrap_err();
+        assert!(matches!(err, SetupError::ChecksumMismatch { .. }));
+        assert!(err.to_string().contains(expected));
+        assert!(err.to_string().contains(actual));
+    }
+
+    // ── Checksum file parsing ───────────────────────────────────────
+
+    #[test]
+    fn parse_bare_hash() {
+        let body = "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f\n";
+        let hash = parse_checksum_file(body).expect("should parse");
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
+        );
+    }
+
+    #[test]
+    fn parse_bsd_style_hash() {
+        let body = "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f  tailwindcss-linux-x64\n";
+        let hash = parse_checksum_file(body).expect("should parse");
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
+        );
+    }
+
+    #[test]
+    fn parse_uppercase_hex() {
+        let body = "A948904F2F0F479B8F8564E9D7A8F22E32D13E73845F1B0EA0E2975A02C8B87F\n";
+        let hash = parse_checksum_file(body).expect("should parse");
+        // Should be lowercased.
+        assert_eq!(
+            hash,
+            "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
+        );
+    }
+
+    #[test]
+    fn parse_empty_file_fails() {
+        let err = parse_checksum_file("").unwrap_err();
+        assert!(matches!(err, SetupError::ChecksumParse(_)));
+    }
+
+    #[test]
+    fn parse_short_hash_fails() {
+        let err = parse_checksum_file("abcdef").unwrap_err();
+        assert!(matches!(err, SetupError::ChecksumParse(_)));
+    }
+
+    #[test]
+    fn parse_non_hex_fails() {
+        let body = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n";
+        let err = parse_checksum_file(body).unwrap_err();
+        assert!(matches!(err, SetupError::ChecksumParse(_)));
+    }
+
+    // ── File-based checksum ─────────────────────────────────────────
+
+    #[test]
+    fn sha256_file_matches_bytes() {
+        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        fs::write(tmp.path(), b"test data").expect("write temp file");
+        let file_hash = sha256_file(tmp.path()).expect("hash file");
+        let byte_hash = sha256_bytes(b"test data");
+        assert_eq!(file_hash, byte_hash);
+    }
+
+    // ── Install path ────────────────────────────────────────────────
+
+    #[test]
+    fn install_path_is_correct() {
+        let dir = Path::new("target/autumn");
+        let path = install_path(dir);
+        if cfg!(windows) {
+            assert_eq!(path, PathBuf::from("target/autumn/tailwindcss.exe"));
+        } else {
+            assert_eq!(path, PathBuf::from("target/autumn/tailwindcss"));
+        }
+    }
+
+    // ── Integration test (requires network) ─────────────────────────
+
+    #[test]
+    #[ignore]
+    fn download_and_verify_tailwind() {
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let install_dir = tmp.path().join("target/autumn");
+        fs::create_dir_all(&install_dir).expect("create install dir");
+
+        let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("supported platform");
+
+        let download_url = format!("{RELEASE_BASE_URL}/{TAILWIND_VERSION}/{binary_name}");
+        let checksum_url = format!("{download_url}.sha256");
+
+        let expected_hash = fetch_expected_checksum(&checksum_url).expect("fetch checksum");
+
+        let dest = install_dir.join(".tailwindcss.tmp");
+        download_with_progress(&download_url, &dest).expect("download binary");
+
+        let actual_hash = sha256_file(&dest).expect("hash file");
+        verify_checksum(&expected_hash, &actual_hash).expect("checksum match");
+
+        // Binary should be non-empty.
+        let meta = fs::metadata(&dest).expect("metadata");
+        assert!(
+            meta.len() > 1_000_000,
+            "binary too small: {} bytes",
+            meta.len()
+        );
+    }
 }

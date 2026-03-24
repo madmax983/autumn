@@ -20,14 +20,18 @@ enum Commands {
         name: String,
     },
     /// Download and configure external tools (Tailwind CSS)
-    Setup,
+    Setup {
+        /// Re-download even if the binary already exists
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { name } => new::run(&name),
-        Commands::Setup => setup::run(),
+        Commands::Setup { force } => setup::run(force),
     }
 }
 
@@ -40,7 +44,7 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
             Commands::New { ref name } => assert_eq!(name, "my-app"),
-            Commands::Setup => panic!("expected New command"),
+            Commands::Setup { .. } => panic!("expected New command"),
         }
     }
 
@@ -49,14 +53,20 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
             Commands::New { ref name } => assert_eq!(name, "my_app"),
-            Commands::Setup => panic!("expected New command"),
+            Commands::Setup { .. } => panic!("expected New command"),
         }
     }
 
     #[test]
     fn parse_setup_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "setup"]).unwrap();
-        assert!(matches!(cli.command, Commands::Setup));
+        assert!(matches!(cli.command, Commands::Setup { force: false }));
+    }
+
+    #[test]
+    fn parse_setup_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
+        assert!(matches!(cli.command, Commands::Setup { force: true }));
     }
 
     #[test]
