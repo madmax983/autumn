@@ -1,10 +1,16 @@
-//! Application builder — the entry point for configuring and running
+//! Application builder -- the entry point for configuring and running
 //! an Autumn server.
+//!
+//! Every Autumn application follows the same pattern:
+//!
+//! 1. Call [`app()`] to create an [`AppBuilder`].
+//! 2. Register routes with [`.routes()`](AppBuilder::routes).
+//! 3. Call [`.run()`](AppBuilder::run) to start serving.
 //!
 //! # Example
 //!
-//! ```ignore
-//! use autumn::{get, routes};
+//! ```rust,no_run
+//! use autumn::prelude::*;
 //!
 //! #[get("/hello")]
 //! async fn hello() -> &'static str { "Hello!" }
@@ -25,7 +31,28 @@ use crate::db;
 use crate::middleware::RequestIdLayer;
 use crate::route::Route;
 
-/// Create a new application builder.
+/// Create a new [`AppBuilder`].
+///
+/// This is the primary entry point for constructing an Autumn application.
+/// Chain [`.routes()`](AppBuilder::routes) calls to register handlers, then
+/// call [`.run()`](AppBuilder::run) to start the server.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/")]
+/// async fn index() -> &'static str { "hi" }
+///
+/// #[autumn::main]
+/// async fn main() {
+///     autumn::app()
+///         .routes(routes![index])
+///         .run()
+///         .await;
+/// }
+/// ```
 #[must_use]
 pub const fn app() -> AppBuilder {
     AppBuilder { routes: Vec::new() }
@@ -33,23 +60,57 @@ pub const fn app() -> AppBuilder {
 
 /// Builder for configuring and launching an Autumn application.
 ///
-/// Collect routes with [`.routes()`](Self::routes), then call
-/// [`.run()`](Self::run) to start the server.
+/// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
+/// then call [`.run()`](Self::run) to start the HTTP server.
+///
+/// The builder follows the **builder pattern**: each method consumes `self`
+/// and returns a new `AppBuilder`, allowing chained calls.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/a")]
+/// async fn route_a() -> &'static str { "a" }
+///
+/// #[get("/b")]
+/// async fn route_b() -> &'static str { "b" }
+///
+/// #[autumn::main]
+/// async fn main() {
+///     autumn::app()
+///         .routes(routes![route_a])
+///         .routes(routes![route_b])
+///         .run()
+///         .await;
+/// }
+/// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
 }
 
 impl AppBuilder {
-    /// Add a collection of routes to the application.
+    /// Register a collection of routes with the application.
     ///
-    /// Can be called multiple times — routes are combined.
+    /// Can be called multiple times -- routes are combined additively.
+    /// Use the [`routes!`](crate::routes) macro to collect annotated
+    /// handlers into the expected `Vec<Route>`.
     ///
-    /// ```ignore
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// # use autumn::prelude::*;
+    /// # #[get("/users")] async fn list_users() -> &'static str { "" }
+    /// # #[get("/posts")] async fn list_posts() -> &'static str { "" }
+    /// # #[autumn::main]
+    /// # async fn main() {
     /// autumn::app()
-    ///     .routes(users::routes())
-    ///     .routes(posts::routes())
+    ///     .routes(routes![list_users])
+    ///     .routes(routes![list_posts])
     ///     .run()
     ///     .await;
+    /// # }
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
@@ -59,18 +120,23 @@ impl AppBuilder {
 
     /// Start the HTTP server.
     ///
-    /// This method:
-    /// 1. Loads configuration from `autumn.toml` (or defaults)
-    /// 2. Validates that at least one route is registered
-    /// 3. Creates the database pool (if configured)
-    /// 4. Builds the Axum router from collected routes
-    /// 5. Binds to the configured address and port
-    /// 6. Serves requests with graceful shutdown on Ctrl+C
+    /// This method performs the full application lifecycle:
+    ///
+    /// 1. Loads configuration from `autumn.toml` (or defaults).
+    /// 2. Initializes the tracing subscriber.
+    /// 3. Validates that at least one route is registered.
+    /// 4. Creates the database connection pool (if configured).
+    /// 5. Builds the Axum router from collected routes.
+    /// 6. Mounts built-in routes (health check, htmx JS, static files).
+    /// 7. Binds to the configured address and port.
+    /// 8. Serves requests with graceful shutdown on Ctrl+C (or `SIGTERM`
+    ///    on Unix).
     ///
     /// # Panics
     ///
-    /// Panics if no routes are registered. This is a developer error —
-    /// call `.routes()` before `.run()`.
+    /// Panics if no routes have been registered via [`.routes()`](Self::routes).
+    /// This is intentional -- an application with no routes is always a
+    /// developer error.
     pub async fn run(self) {
         // 1. Load configuration
         let config = AutumnConfig::load().unwrap_or_else(|e| {

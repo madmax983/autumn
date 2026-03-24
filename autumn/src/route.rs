@@ -1,8 +1,12 @@
-//! Route types used by macro-generated code.
+//! Route descriptor types used by macro-generated code.
 //!
-//! Each `#[get("/path")]` (or `#[post]`, etc.) macro generates a companion
-//! function that returns a [`Route`]. The `routes![]` macro collects these
-//! into a `Vec<Route>` for the app builder.
+//! Each route macro ([`get`](crate::get), [`post`](crate::post), etc.)
+//! generates a companion function that returns a [`Route`]. The
+//! [`routes!`](crate::routes) macro collects these into a `Vec<Route>`
+//! for the [`AppBuilder`](crate::app::AppBuilder).
+//!
+//! Users do not construct `Route` values directly -- they use the
+//! proc macros and the `routes![]` collection macro.
 
 use axum::routing::MethodRouter;
 use http::Method;
@@ -11,19 +15,34 @@ use crate::AppState;
 
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
-/// Created by the `__autumn_route_info_{name}()` functions that route
-/// macros generate. Users don't construct this directly — they use
-/// `#[get]`, `#[post]`, etc. and the `routes![]` macro.
+/// Created by the `__autumn_route_info_{name}()` companion functions
+/// that route macros ([`get`](crate::get), [`post`](crate::post), etc.)
+/// generate. Users don't construct this directly -- they use the
+/// attribute macros and the [`routes!`](crate::routes) macro.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/hello")]
+/// async fn hello() -> &'static str { "hi" }
+///
+/// // `routes!` expands to a Vec<Route>:
+/// let route_vec: Vec<autumn::route::Route> = routes![hello];
+/// assert_eq!(route_vec.len(), 1);
+/// ```
 pub struct Route {
-    /// HTTP method (GET, POST, PUT, DELETE, etc.).
+    /// HTTP method (`GET`, `POST`, `PUT`, `DELETE`, etc.).
     pub method: Method,
 
     /// URL path pattern (e.g., `"/users/{id}"`).
     pub path: &'static str,
 
-    /// Axum method router that handles requests to this route.
+    /// Axum [`MethodRouter`] that handles requests matching this route.
     pub handler: MethodRouter<AppState>,
 
-    /// Function name, for startup logging (e.g., `"get_user"`).
+    /// Handler function name, used for startup logging
+    /// (e.g., `"hello"`, `"create_item"`).
     pub name: &'static str,
 }

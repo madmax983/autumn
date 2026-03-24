@@ -1,41 +1,83 @@
 //! Framework configuration with sensible defaults.
 //!
-//! Autumn uses a three-layer configuration system:
+//! Autumn uses a three-layer configuration system where each layer
+//! overrides the previous one:
 //!
-//! 1. **Framework defaults** (this module) — compiled into the binary
-//! 2. **`autumn.toml`** — project-level overrides (S-026)
-//! 3. **`AUTUMN_*` environment variables** — deployment overrides (S-019)
+//! 1. **Framework defaults** (this module) -- compiled into the binary.
+//! 2. **`autumn.toml`** -- project-level overrides checked into source control.
+//! 3. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
 //!
-//! This module defines the typed config structs and their defaults.
-//! An Autumn application runs with zero configuration — every field
-//! has a sensible default value.
+//! An Autumn application runs with zero configuration -- every field
+//! has a sensible default value. Override only what you need.
+//!
+//! # Example
+//!
+//! ```rust
+//! use autumn::config::AutumnConfig;
+//!
+//! // All defaults -- no file needed
+//! let config = AutumnConfig::default();
+//! assert_eq!(config.server.port, 3000);
+//! assert_eq!(config.server.host, "127.0.0.1");
+//! assert!(config.database.url.is_none());
+//! ```
+//!
+//! # Environment variable reference
+//!
+//! | Variable | Config field | Type |
+//! |----------|-------------|------|
+//! | `AUTUMN_SERVER__PORT` | `server.port` | `u16` |
+//! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
+//! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
+//! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
+//! | `AUTUMN_DATABASE__POOL_SIZE` | `database.pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
+//! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
+//! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
+//! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 
 use std::path::Path;
 
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Errors that can occur when loading configuration from a file.
+/// Errors that can occur when loading or validating configuration.
+///
+/// Returned by [`AutumnConfig::load`], [`AutumnConfig::load_from`], and
+/// [`DatabaseConfig::validate`].
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::{AutumnConfig, ConfigError};
+/// use std::path::Path;
+///
+/// let result = AutumnConfig::load_from(Path::new("nonexistent.toml"));
+/// // Returns Ok(defaults) when file is missing -- not an error
+/// assert!(result.is_ok());
+/// ```
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// The config file exists but could not be read.
     #[error("failed to read autumn.toml: {0}")]
     Io(#[from] std::io::Error),
 
-    /// The config file contains invalid TOML.
+    /// The config file contains invalid TOML syntax.
     #[error("invalid autumn.toml: {0}")]
     Parse(#[from] toml::de::Error),
 
-    /// A configuration value is invalid.
+    /// A configuration value failed semantic validation (e.g., invalid
+    /// database URL scheme).
     #[error("configuration error: {0}")]
     Validation(String),
 }
 
 /// Top-level framework configuration.
 ///
-/// All sections are optional — missing sections use their defaults.
+/// All sections are optional -- missing sections use their defaults.
+/// Deserialized from `autumn.toml` (TOML format).
 ///
-/// # Example `autumn.toml`
+/// # `autumn.toml` example
 ///
 /// ```toml
 /// [server]
@@ -44,6 +86,18 @@ pub enum ConfigError {
 /// [database]
 /// url = "postgres://user:pass@db:5432/myapp"
 /// pool_size = 20
+/// ```
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::AutumnConfig;
+///
+/// let config = AutumnConfig::default();
+/// assert_eq!(config.server.port, 3000);
+/// assert_eq!(config.database.pool_size, 10);
+/// assert_eq!(config.log.level, "info");
+/// assert_eq!(config.health.path, "/health");
 /// ```
 #[derive(Debug, Default, Deserialize)]
 pub struct AutumnConfig {
@@ -188,6 +242,27 @@ impl AutumnConfig {
 }
 
 /// HTTP server configuration.
+///
+/// Controls which address the server binds to and how graceful shutdown
+/// behaves.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `port` | `3000` |
+/// | `host` | `"127.0.0.1"` |
+/// | `shutdown_timeout_secs` | `30` |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::ServerConfig;
+///
+/// let server = ServerConfig::default();
+/// assert_eq!(server.port, 3000);
+/// assert_eq!(server.host, "127.0.0.1");
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
@@ -195,19 +270,51 @@ pub struct ServerConfig {
     pub port: u16,
 
     /// Host/IP to bind to. Default: `"127.0.0.1"`.
+    ///
+    /// Set to `"0.0.0.0"` to accept connections from all interfaces
+    /// (typical for containerized deployments).
     #[serde(default = "default_host")]
     pub host: String,
 
     /// Seconds to wait for in-flight requests during graceful shutdown.
     /// Default: `30`.
+    ///
+    /// When the server receives a shutdown signal, it stops accepting
+    /// new connections and waits up to this many seconds for in-flight
+    /// requests to complete before forcibly terminating.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout_secs: u64,
 }
 
 /// Database connection configuration.
+///
+/// When `url` is `None` (the default), the application runs without a
+/// database -- useful for static-site or API-gateway use cases. Set a
+/// Postgres URL to enable the connection pool and the [`Db`](crate::Db)
+/// extractor.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `url` | `None` |
+/// | `pool_size` | `10` |
+/// | `connect_timeout_secs` | `5` |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::DatabaseConfig;
+///
+/// let db = DatabaseConfig::default();
+/// assert!(db.url.is_none());
+/// assert_eq!(db.pool_size, 10);
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct DatabaseConfig {
     /// Postgres connection URL. `None` means no database is configured.
+    ///
+    /// Must start with `postgres://` or `postgresql://` when present.
     #[serde(default)]
     pub url: Option<String>,
 
@@ -215,7 +322,8 @@ pub struct DatabaseConfig {
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
 
-    /// Seconds to wait when acquiring a connection. Default: `5`.
+    /// Seconds to wait when acquiring a connection from the pool.
+    /// Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
 }
@@ -240,11 +348,24 @@ impl DatabaseConfig {
 }
 
 /// Logging configuration.
+///
+/// Controls the tracing subscriber's filter level and output format.
+/// See [`LogFormat`] for output format options.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::{LogConfig, LogFormat};
+///
+/// let log = LogConfig::default();
+/// assert_eq!(log.level, "info");
+/// assert_eq!(log.format, LogFormat::Auto);
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct LogConfig {
     /// Tracing filter directive. Default: `"info"`.
     ///
-    /// Supports arbitrary tracing filter syntax, e.g.
+    /// Supports the full `tracing` filter syntax, e.g.
     /// `"autumn=debug,tower_http=trace"`.
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -256,9 +377,22 @@ pub struct LogConfig {
 
 /// Log output format.
 ///
-/// - `Auto` — pretty-print in dev, JSON when `AUTUMN_ENV=production`
-/// - `Pretty` — always human-readable
-/// - `Json` — always structured JSON
+/// Controls how tracing events are rendered. The default ([`Auto`](Self::Auto))
+/// auto-detects based on the `AUTUMN_ENV` environment variable.
+///
+/// | Variant | Behaviour |
+/// |---------|-----------|
+/// | [`Auto`](Self::Auto) | Pretty in dev, JSON when `AUTUMN_ENV=production` |
+/// | [`Pretty`](Self::Pretty) | Always human-readable, colorized |
+/// | [`Json`](Self::Json) | Always structured JSON (for log aggregators) |
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::LogFormat;
+///
+/// assert_eq!(LogFormat::default(), LogFormat::Auto);
+/// ```
 #[derive(Debug, Deserialize, Default, PartialEq, Eq)]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
@@ -266,14 +400,28 @@ pub enum LogFormat {
     Auto,
     /// Human-readable, colorized output.
     Pretty,
-    /// Structured JSON output.
+    /// Structured JSON output suitable for log aggregation pipelines.
     Json,
 }
 
 /// Health check endpoint configuration.
+///
+/// The health check is automatically mounted by [`AppBuilder::run`](crate::app::AppBuilder::run).
+/// See the [`health`](crate::health) module for response format details.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn::config::HealthConfig;
+///
+/// let health = HealthConfig::default();
+/// assert_eq!(health.path, "/health");
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct HealthConfig {
     /// URL path for the health check endpoint. Default: `"/health"`.
+    ///
+    /// Common alternatives: `"/healthz"`, `"/_health"`, `"/ready"`.
     #[serde(default = "default_health_path")]
     pub path: String,
 }

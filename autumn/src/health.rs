@@ -1,7 +1,30 @@
 //! Health check endpoint.
 //!
-//! Automatically mounted at the configured path (default: `/health`).
-//! Returns JSON with application status and optional database pool metrics.
+//! Automatically mounted by [`AppBuilder::run`](crate::app::AppBuilder::run)
+//! at the path configured in [`HealthConfig`](crate::config::HealthConfig)
+//! (default: `/health`).
+//!
+//! # Response format
+//!
+//! **Without a database:**
+//!
+//! ```json
+//! { "status": "ok", "version": "0.1.0" }
+//! ```
+//!
+//! **With a database pool:**
+//!
+//! ```json
+//! {
+//!   "status": "ok",
+//!   "version": "0.1.0",
+//!   "pool": { "size": 10, "available": 8, "waiting": 0 }
+//! }
+//! ```
+//!
+//! Returns `200 OK` when healthy or `503 Service Unavailable` when the
+//! database pool is exhausted (all connections in use **and** requests
+//! are queuing).
 
 use axum::Json;
 use axum::extract::State;
@@ -13,10 +36,16 @@ use crate::AppState;
 /// Health check handler.
 ///
 /// Returns pool status when a database is configured, or a simple
-/// "ok" response when running without a database.
+/// `"ok"` response when running without a database.
 ///
-/// - `200 OK` — application is healthy
-/// - `503 Service Unavailable` — database pool is exhausted
+/// This handler is auto-mounted by the framework and does not need to be
+/// registered manually.
+///
+/// # Response codes
+///
+/// - `200 OK` -- application is healthy.
+/// - `503 Service Unavailable` -- database pool is exhausted (all
+///   connections in use and requests are queuing).
 #[allow(unused_variables)]
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
     #[cfg(feature = "db")]

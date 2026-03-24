@@ -12,15 +12,19 @@ A full-stack reference application demonstrating Autumn's key features:
 
 - Rust (edition 2024)
 - Docker & Docker Compose (for Postgres)
-- Tailwind CSS CLI — run `autumn setup` in this directory, or install manually
 
 ## Quick start
 
-```bash
-# 1. Start Postgres
-docker compose up -d
+From the **workspace root** (`autumn/`):
 
-# 2. Run the application
+```bash
+# 1. Download Tailwind CSS CLI
+cargo run -p autumn-cli -- setup
+
+# 2. Start Postgres
+docker compose -f examples/todo-app/docker-compose.yml up -d
+
+# 3. Run the application
 cargo run -p todo-app
 ```
 

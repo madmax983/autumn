@@ -1,14 +1,38 @@
 //! Framework error type and result alias.
 //!
 //! [`AutumnError`] wraps any `Error + Send + Sync` with an HTTP status code.
-//! The blanket [`From`] impl maps all errors to 500 Internal Server Error,
+//! The blanket [`From`] impl maps all errors to `500 Internal Server Error`,
 //! so the `?` operator works in handlers with zero ceremony.
 //!
-//! For non-500 cases, use the status refinement methods:
-//! [`not_found()`](AutumnError::not_found),
-//! [`bad_request()`](AutumnError::bad_request),
-//! [`unprocessable()`](AutumnError::unprocessable), or
-//! [`with_status()`](AutumnError::with_status).
+//! For non-500 cases, use the status refinement constructors:
+//!
+//! - [`AutumnError::not_found`] -- 404
+//! - [`AutumnError::bad_request`] -- 400
+//! - [`AutumnError::unprocessable`] -- 422
+//! - [`AutumnError::with_status`] -- arbitrary status code
+//!
+//! # Response format
+//!
+//! When an `AutumnError` is returned from a handler, it renders as JSON:
+//!
+//! ```json
+//! { "error": { "status": 404, "message": "user not found" } }
+//! ```
+//!
+//! # Examples
+//!
+//! ```rust
+//! use autumn::error::AutumnError;
+//! use http::StatusCode;
+//!
+//! // Blanket From impl: any Error becomes 500
+//! let err: AutumnError = std::io::Error::other("disk full").into();
+//! assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+//!
+//! // Explicit status constructors
+//! let err = AutumnError::not_found(std::io::Error::other("no such user"));
+//! assert_eq!(err.status(), StatusCode::NOT_FOUND);
+//! ```
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -17,20 +41,32 @@ use axum::response::{IntoResponse, Response};
 ///
 /// # Usage
 ///
-/// The `?` operator converts any `Error` into an `AutumnError` with status 500:
-/// ```ignore
+/// The `?` operator converts any `std::error::Error` into an `AutumnError`
+/// with status `500 Internal Server Error`:
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/")]
 /// async fn handler() -> AutumnResult<&'static str> {
-///     might_fail()?; // becomes 500 on error
+///     std::fs::read_to_string("missing.txt")?; // becomes 500 on error
 ///     Ok("ok")
 /// }
 /// ```
 ///
-/// For expected errors, use status refinement:
-/// ```ignore
-/// async fn get_user(id: Path<i32>) -> AutumnResult<Json<User>> {
-///     let user = find_user(id.0)
-///         .map_err(AutumnError::not_found)?; // 404
-///     Ok(Json(user))
+/// For expected errors, use a status refinement constructor:
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// async fn get_user(axum::extract::Path(id): axum::extract::Path<i32>) -> AutumnResult<String> {
+///     if id < 0 {
+///         return Err(AutumnError::bad_request(
+///             std::io::Error::other("id must be positive"),
+///         ));
+///     }
+///     Ok(format!("user {id}"))
 /// }
 /// ```
 ///
@@ -38,14 +74,28 @@ use axum::response::{IntoResponse, Response};
 ///
 /// `AutumnError` intentionally does **not** implement [`std::error::Error`].
 /// Doing so would conflict with the blanket `From<E: Error>` impl (the
-/// reflexive `From<T> for T` would overlap). This type is a *response* type,
-/// not a propagatable error.
+/// reflexive `From<T> for T` would overlap). This type is a *response*
+/// wrapper, not a propagatable error.
 pub struct AutumnError {
     inner: Box<dyn std::error::Error + Send + Sync>,
     status: StatusCode,
 }
 
-/// Convenience alias — the standard return type for Autumn handlers.
+/// Convenience alias -- the standard return type for Autumn handlers.
+///
+/// Equivalent to `Result<T, AutumnError>`. Use this as the return type
+/// for any handler that might fail.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/")]
+/// async fn index() -> AutumnResult<&'static str> {
+///     Ok("hello")
+/// }
+/// ```
 pub type AutumnResult<T> = Result<T, AutumnError>;
 
 impl<E> From<E> for AutumnError
@@ -62,13 +112,34 @@ where
 
 impl AutumnError {
     /// Override the HTTP status code.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err: AutumnError = std::io::Error::other("forbidden").into();
+    /// let err = err.with_status(StatusCode::FORBIDDEN);
+    /// assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    /// ```
     #[must_use]
     pub const fn with_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
     }
 
-    /// Create a 404 Not Found error.
+    /// Create a `404 Not Found` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::not_found(std::io::Error::other("no such user"));
+    /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    /// ```
     pub fn not_found(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(err),
@@ -76,7 +147,17 @@ impl AutumnError {
         }
     }
 
-    /// Create a 400 Bad Request error.
+    /// Create a `400 Bad Request` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::bad_request(std::io::Error::other("invalid input"));
+    /// assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    /// ```
     pub fn bad_request(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(err),
@@ -84,7 +165,20 @@ impl AutumnError {
         }
     }
 
-    /// Create a 422 Unprocessable Entity error.
+    /// Create a `422 Unprocessable Entity` error.
+    ///
+    /// Use this for validation failures where the request is syntactically
+    /// valid but semantically incorrect.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unprocessable(std::io::Error::other("age must be positive"));
+    /// assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    /// ```
     pub fn unprocessable(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(err),
@@ -92,7 +186,17 @@ impl AutumnError {
         }
     }
 
-    /// Returns the HTTP status code.
+    /// Returns the HTTP status code associated with this error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err: AutumnError = std::io::Error::other("boom").into();
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         self.status

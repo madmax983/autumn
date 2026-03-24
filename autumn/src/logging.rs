@@ -1,26 +1,36 @@
 //! Structured logging initialization via `tracing-subscriber`.
 //!
 //! Call [`init`] once, early in application startup (after loading config),
-//! to install the global tracing subscriber.  The subscriber respects
+//! to install the global tracing subscriber. The subscriber respects
 //! [`LogConfig`] to choose between human-readable and JSON output, and
 //! uses [`EnvFilter`] to parse the configured log level directive.
+//!
+//! In normal usage, [`AppBuilder::run`](crate::app::AppBuilder::run) calls
+//! [`init`] automatically. You only need to call it directly in test
+//! harnesses or custom entry points.
 
 use crate::config::{LogConfig, LogFormat};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Initialize the tracing subscriber based on configuration.
 ///
-/// Must be called **once**, early in application startup — before any
-/// `tracing::info!` / `tracing::debug!` calls.  Calling it a second
-/// time will panic (the global subscriber can only be set once).
+/// Must be called **once**, early in application startup -- before any
+/// `tracing::info!` / `tracing::debug!` calls. In normal usage,
+/// [`AppBuilder::run`](crate::app::AppBuilder::run) calls this
+/// automatically.
+///
+/// # Panics
+///
+/// Panics if called a second time. The global tracing subscriber can
+/// only be set once per process.
 ///
 /// # Format selection
 ///
-/// | `LogFormat` | Behaviour |
+/// | [`LogFormat`] | Behaviour |
 /// |-------------|-----------|
-/// | `Auto`      | JSON when `AUTUMN_ENV=production`, pretty otherwise |
-/// | `Pretty`    | Always human-readable |
-/// | `Json`      | Always structured JSON |
+/// | `Auto` | JSON when `AUTUMN_ENV=production`, pretty otherwise |
+/// | `Pretty` | Always human-readable, colorized |
+/// | `Json` | Always structured JSON |
 ///
 /// # Filter fallback
 ///

@@ -1,8 +1,27 @@
-//! Request ID middleware — assigns a unique UUID to every request.
+//! Request ID middleware -- assigns a unique UUID v4 to every request.
 //!
 //! Each request gets a [`RequestId`] that is:
-//! - Inserted into request extensions (accessible to handlers)
-//! - Added as an `X-Request-Id` response header
+//!
+//! 1. Inserted into request extensions (accessible to handlers via
+//!    `Extension<RequestId>`).
+//! 2. Added as an `X-Request-Id` response header for correlation in
+//!    logs and downstream services.
+//!
+//! The [`RequestIdLayer`] is applied automatically by the framework.
+//! You do not need to register it manually.
+//!
+//! # Examples
+//!
+//! ```rust,no_run
+//! use autumn::prelude::*;
+//! use autumn::middleware::RequestId;
+//! use axum::extract::Extension;
+//!
+//! #[get("/whoami")]
+//! async fn whoami(Extension(req_id): Extension<RequestId>) -> String {
+//!     format!("Your request ID is {req_id}")
+//! }
+//! ```
 
 use std::fmt;
 use std::future::Future;
@@ -17,14 +36,27 @@ use uuid::Uuid;
 /// A unique identifier assigned to each incoming HTTP request.
 ///
 /// Wraps a [`Uuid`] v4 and is inserted into request extensions so handlers
-/// can access it via `Extension<RequestId>`.  It is also added to the
+/// can access it via `Extension<RequestId>`. It is also added to the
 /// response as an `X-Request-Id` header for correlation in logs and
 /// downstream services.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+/// use autumn::middleware::RequestId;
+/// use axum::extract::Extension;
+///
+/// #[get("/trace")]
+/// async fn trace(Extension(req_id): Extension<RequestId>) -> String {
+///     format!("request={}", req_id.as_uuid())
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct RequestId(Uuid);
 
 impl RequestId {
-    /// Returns the underlying UUID value.
+    /// Returns the underlying [`Uuid`] value.
     #[must_use]
     pub const fn as_uuid(&self) -> Uuid {
         self.0
@@ -39,14 +71,14 @@ impl fmt::Display for RequestId {
 
 /// Tower [`Layer`] that wraps a service with [`RequestIdService`].
 ///
-/// Add this layer to an Axum router to automatically assign a UUID
-/// to every request:
+/// Applied automatically by [`AppBuilder::run`](crate::app::AppBuilder::run).
+/// If you are building a custom Axum router, you can add it manually:
 ///
-/// ```ignore
+/// ```rust,no_run
 /// use autumn::middleware::RequestIdLayer;
 ///
-/// let app = axum::Router::new()
-///     .route("/", get(handler))
+/// let app = axum::Router::<()>::new()
+///     .route("/", axum::routing::get(|| async { "ok" }))
 ///     .layer(RequestIdLayer);
 /// ```
 #[derive(Clone, Debug)]
@@ -63,7 +95,9 @@ impl<S> Layer<S> for RequestIdLayer {
 /// Tower [`Service`] produced by [`RequestIdLayer`].
 ///
 /// Generates a [`RequestId`] for each request, inserts it into request
-/// extensions, and adds it as an `X-Request-Id` response header.
+/// extensions, and adds it as an `X-Request-Id` response header. You
+/// do not construct this type directly -- it is created by
+/// [`RequestIdLayer`].
 #[derive(Clone, Debug)]
 pub struct RequestIdService<S> {
     inner: S,

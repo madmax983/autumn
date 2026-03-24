@@ -1,19 +1,27 @@
 //! Database connection pool and extractor.
 //!
-//! Uses `diesel-async` with `deadpool` for async Postgres connections.
-//! The pool is created at startup and stored in [`AppState`](crate::AppState).
+//! This module provides async Postgres connectivity via `diesel-async` with
+//! the `deadpool` connection pool. The pool is created at startup by
+//! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
+//! [`AppState`].
 //!
 //! When no `database.url` is configured, [`create_pool`] returns `Ok(None)`
-//! and the application runs without a database — useful for static-site or
+//! and the application runs without a database -- useful for static-site or
 //! API-gateway use cases.
 //!
-//! The [`Db`] extractor acquires a connection from the pool for each request:
+//! # The [`Db`] extractor
 //!
-//! ```ignore
-//! #[get("/users")]
-//! async fn list(db: Db) -> AutumnResult<Json<Vec<User>>> {
-//!     let users = users::table.load(&mut *db).await?;
-//!     Ok(Json(users))
+//! Declare `db: Db` in your handler signature to get a pooled connection.
+//! The connection is automatically returned to the pool when `Db` is dropped
+//! at the end of the request.
+//!
+//! ```rust,no_run
+//! use autumn::prelude::*;
+//!
+//! #[get("/hello")]
+//! async fn hello(db: Db) -> AutumnResult<String> {
+//!     // Use `db` with Diesel queries...
+//!     Ok("hello from db".to_string())
 //! }
 //! ```
 
@@ -28,6 +36,9 @@ use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
 
 /// Error type for pool creation failures.
+///
+/// Alias for the deadpool `BuildError`. Returned by [`create_pool`] when
+/// the pool cannot be constructed (e.g., invalid max-size configuration).
 pub type PoolError = diesel_async::pooled_connection::deadpool::BuildError;
 
 /// Create a connection pool from the database configuration.
@@ -57,15 +68,28 @@ type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncP
 
 /// Async database connection extractor.
 ///
-/// Declare `db: Db` in your handler signature to get a pooled
-/// connection to Postgres. The connection is returned to the pool
-/// when `Db` is dropped.
+/// Declare `db: Db` in a handler signature to get a pooled connection to
+/// Postgres. The connection is returned to the pool when `Db` is dropped
+/// at the end of the request.
 ///
-/// ```ignore
-/// #[get("/users")]
-/// async fn list(db: Db) -> AutumnResult<Json<Vec<User>>> {
-///     let users = users::table.load(&mut *db).await?;
-///     Ok(Json(users))
+/// `Db` implements [`Deref`](std::ops::Deref) and
+/// [`DerefMut`](std::ops::DerefMut) to
+/// `diesel_async::AsyncPgConnection`, so you can use it directly with
+/// Diesel query methods.
+///
+/// If no database is configured (i.e., `database.url` is absent),
+/// requests that use `Db` will receive a `503 Service Unavailable`
+/// response.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn::prelude::*;
+///
+/// #[get("/ping-db")]
+/// async fn ping_db(db: Db) -> AutumnResult<&'static str> {
+///     // `db` dereferences to AsyncPgConnection
+///     Ok("database is reachable")
 /// }
 /// ```
 pub struct Db(PooledConnection);

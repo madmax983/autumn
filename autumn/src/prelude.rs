@@ -6,10 +6,20 @@
 //! use autumn::prelude::*;
 //! ```
 //!
-//! This brings route macros, rendering types, extractors, and error
-//! types into scope. For less common types (config, middleware,
-//! upstream crate access), use targeted imports from `autumn::config`,
-//! `autumn::middleware`, or `autumn::reexports`.
+//! This brings the following into scope:
+//!
+//! | Category | Items |
+//! |----------|-------|
+//! | Route macros | [`get`], [`post`], [`put`], [`delete`], [`routes`], [`main`] |
+//! | HTML rendering | [`Markup`], [`PreEscaped`], [`html!`](maud::html) |
+//! | Extractors | [`Db`], [`Json`], [`Form`] |
+//! | Error handling | [`AutumnError`], [`AutumnResult`] |
+//! | State | [`AppState`] |
+//!
+//! For less common types (configuration, middleware, upstream crate access),
+//! use targeted imports from [`autumn::config`](crate::config),
+//! [`autumn::middleware`](crate::middleware), or
+//! [`autumn::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.

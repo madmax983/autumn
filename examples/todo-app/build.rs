@@ -29,10 +29,23 @@ fn main() {
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {
-    // 1. Check local download (from `autumn setup`)
-    let local = std::path::PathBuf::from("target/autumn/tailwindcss");
-    if local.exists() {
-        return Some(local);
+    // 1. Check workspace target directory (from `autumn setup`).
+    //    OUT_DIR is <workspace>/target/<profile>/build/<pkg>/out —
+    //    walk up to the target dir and look for autumn/tailwindcss.
+    if let Ok(out_dir) = std::env::var("OUT_DIR") {
+        let out_path = std::path::PathBuf::from(out_dir);
+        // ancestors: out → <pkg> → build → <profile> → target
+        if let Some(target_dir) = out_path.ancestors().nth(4) {
+            let bin_name = if cfg!(windows) {
+                "tailwindcss.exe"
+            } else {
+                "tailwindcss"
+            };
+            let local = target_dir.join("autumn").join(bin_name);
+            if local.exists() {
+                return Some(local);
+            }
+        }
     }
 
     // 2. Check PATH
