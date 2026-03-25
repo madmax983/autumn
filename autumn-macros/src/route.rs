@@ -67,18 +67,18 @@ pub fn route_macro(
 
     // Note: we intentionally do NOT apply #[axum::debug_handler] here.
     // That macro generates code with `::axum::` paths, which don't resolve
-    // when the user only depends on `autumn` (axum is a transitive dep).
+    // when the user only depends on `autumn-web` (axum is a transitive dep).
     // Custom compile_error! diagnostics (S-007) provide error guidance instead.
 
     quote! {
         #input_fn
 
         #[doc(hidden)]
-        #vis fn #route_info_name() -> ::autumn::route::Route {
-            ::autumn::route::Route {
-                method: ::autumn::reexports::http::Method::#method_const,
+        #vis fn #route_info_name() -> ::autumn_web::route::Route {
+            ::autumn_web::route::Route {
+                method: ::autumn_web::reexports::http::Method::#method_const,
                 path: #path,
-                handler: ::autumn::reexports::axum::routing::#routing_fn(#fn_name),
+                handler: ::autumn_web::reexports::axum::routing::#routing_fn(#fn_name),
                 name: ::core::stringify!(#fn_name),
             }
         }

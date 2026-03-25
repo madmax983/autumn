@@ -16,7 +16,7 @@
 //! at the end of the request.
 //!
 //! ```rust,no_run
-//! use autumn::prelude::*;
+//! use autumn_web::prelude::*;
 //!
 //! #[get("/hello")]
 //! async fn hello(db: Db) -> AutumnResult<String> {
@@ -84,7 +84,7 @@ type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncP
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/ping-db")]
 /// async fn ping_db(db: Db) -> AutumnResult<&'static str> {

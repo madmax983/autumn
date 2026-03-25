@@ -23,11 +23,11 @@ The stack: Axum for HTTP. Maud for compile-time HTML templating. Tailwind CSS fo
 ### The Minimal Version
 
 ```rust
-use autumn::prelude::*;
+use autumn_web::prelude::*;
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::run().await;
+    autumn_web::run().await;
 }
 
 #[get("/")]
@@ -38,12 +38,12 @@ async fn index() -> Markup {
 }
 ```
 
-That's it. `autumn::run()` reads config, binds the server, discovers annotated routes, sets up tracing, serves static assets, and starts listening. Zero boilerplate. The response is HTML by default.
+That's it. `autumn_web::run()` reads config, binds the server, discovers annotated routes, sets up tracing, serves static assets, and starts listening. Zero boilerplate. The response is HTML by default.
 
 ### The Realistic Version
 
 ```rust
-use autumn::prelude::*;
+use autumn_web::prelude::*;
 
 #[derive(Model, Serialize, Deserialize)]
 #[table_name = "users"]
@@ -127,9 +127,9 @@ async fn get_user_api(id: Path<i32>, db: Db) -> Json<User> {
     Json(user)
 }
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::run().await;
+    autumn_web::run().await;
 }
 ```
 
@@ -172,7 +172,7 @@ You now have a complete web application — server-rendered HTML with interactiv
 
 Autumn's DX lives in its proc macros. These are the minimum set:
 
-**`#[autumn::main]`** — Entry point. Expands into Tokio runtime setup, config loading, connection pool initialization, route discovery, middleware chain, and server startup. This is where "convention" lives — it makes every decision you didn't.
+**`#[autumn_web::main]`** — Entry point. Expands into Tokio runtime setup, config loading, connection pool initialization, route discovery, middleware chain, and server startup. This is where "convention" lives — it makes every decision you didn't.
 
 **`#[get("/path")]`, `#[post("/path")]`, etc.** — Route annotations. Expand into Axum handler registrations. The macro handles extractor wiring — if your function takes a `Db`, it gets a connection from the pool. If it takes `Form<T>`, the body is deserialized. The return type determines the response format: `Markup` → HTML, `Json<T>` → JSON. Error types auto-convert to responses (HTML error pages or JSON error bodies, matching the handler's output type).
 
@@ -186,7 +186,7 @@ Autumn's DX lives in its proc macros. These are the minimum set:
 
 ### What Happens at Startup
 
-1. `#[autumn::main]` triggers config loading from `autumn.toml` (with env var overrides)
+1. `#[autumn_web::main]` triggers config loading from `autumn.toml` (with env var overrides)
 2. Database connection pool is created from config
 3. Proc macros have registered all annotated handlers into an inventory/linkme-based collector
 4. Axum router is built from collected routes
@@ -269,9 +269,9 @@ connection_timeout_seconds = 30
 Add your own Tower middleware to the stack. Autumn's defaults still apply unless you explicitly replace them.
 
 ```rust
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::run()
+    autumn_web::run()
         .middleware(my_auth_layer())
         .await;
 }
@@ -282,12 +282,12 @@ async fn main() {
 Drop down to raw Axum handlers. They mount alongside Autumn-annotated routes with zero friction.
 
 ```rust
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
     let custom_router = Router::new()
         .route("/legacy", get(my_raw_handler));
 
-    autumn::run()
+    autumn_web::run()
         .merge(custom_router)
         .await;
 }
@@ -423,7 +423,7 @@ Maud (compile-time HTML) + htmx (client-side interactivity) is the default rende
 1. On first `cargo build`, Autumn's `build.rs` auto-downloads the Tailwind standalone CLI binary (platform-appropriate, cached in `target/`)
 2. Tailwind scans `src/**/*.rs` for class names in Maud templates — Tailwind's scanner doesn't care that it's reading Rust files, it just matches string patterns
 3. An optimized, tree-shaken CSS file is output to `static/css/autumn.css`
-4. The `#[autumn::main]` macro auto-includes it in a base HTML wrapper
+4. The `#[autumn_web::main]` macro auto-includes it in a base HTML wrapper
 5. htmx is also bundled and served automatically
 
 `cargo build` does everything. The developer writes Tailwind classes in Maud and never thinks about CSS tooling.
@@ -476,7 +476,7 @@ prefix = "/static"
 
 ### Testing Story — RESOLVED (No Framework Feature Needed)
 
-Rust's built-in testing (`cargo test`, `#[cfg(test)]`, `mod tests`) already solves the problem `@SpringBootTest` exists to solve in Java. No proc macro or framework-level test concept is needed. A convenience `autumn::test::Client` helper that spins up the app against a test database may be worth shipping in v0.2, but it's just a utility, not architecture.
+Rust's built-in testing (`cargo test`, `#[cfg(test)]`, `mod tests`) already solves the problem `@SpringBootTest` exists to solve in Java. No proc macro or framework-level test concept is needed. A convenience `autumn_web::test::Client` helper that spins up the app against a test database may be worth shipping in v0.2, but it's just a utility, not architecture.
 
 ### Migration Management
 

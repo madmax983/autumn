@@ -81,17 +81,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn = "0.1.0"
+autumn-web = "0.1.0"
 ```
 
-This is a standard Rust project manifest. The only dependency is `autumn`
+This is a standard Rust project manifest. The only dependency is `autumn-web`
 itself. Autumn re-exports everything you need (Axum, Maud, Tokio, etc.) so
 you don't manage those crates directly.
 
 ### `src/main.rs`
 
 ```rust
-use autumn::{get, routes};
+use autumn_web::{get, routes};
 
 #[get("/")]
 async fn index() -> &'static str {
@@ -104,13 +104,13 @@ async fn hello() -> &'static str {
 }
 
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn::extract::Path<String>) -> String {
+async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(routes![index, hello, hello_name])
         .run()
         .await;
@@ -124,18 +124,18 @@ There is a lot happening in a small file. Here is what each piece does:
   `#[delete]` macros.
 - **`#[get("/hello/{name}")]`** — a route with a path parameter. The `{name}`
   segment is extracted into the handler's `Path<String>` argument.
-- **`autumn::extract::Path`** — an extractor that pulls typed values from the
+- **`autumn_web::extract::Path`** — an extractor that pulls typed values from the
   URL path. Autumn re-exports Axum's extractors so you don't need `axum` as a
   direct dependency.
-- **`#[autumn::main]`** — sets up the Tokio async runtime. This is equivalent
+- **`#[autumn_web::main]`** — sets up the Tokio async runtime. This is equivalent
   to `#[tokio::main]` with Autumn's preferred configuration.
-- **`autumn::app()`** — creates an application builder. You register routes
+- **`autumn_web::app()`** — creates an application builder. You register routes
   with `.routes()` and start the server with `.run().await`.
 - **`routes![index, hello, hello_name]`** — a macro that collects route
   handlers into a `Vec<Route>` for the app builder.
 
 The pattern is always the same: define handlers with route macros, collect
-them with `routes![]`, and pass them to `autumn::app().routes(...).run()`.
+them with `routes![]`, and pass them to `autumn_web::app().routes(...).run()`.
 
 ### `autumn.toml`
 

@@ -36,7 +36,7 @@ list.
 
 ### The `PreEscaped` Escape Hatch
 
-Using `autumn::PreEscaped` for raw HTML (like `<!DOCTYPE html>`). When and
+Using `autumn_web::PreEscaped` for raw HTML (like `<!DOCTYPE html>`). When and
 why to use it sparingly.
 
 ### Checkpoint

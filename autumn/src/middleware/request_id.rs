@@ -13,8 +13,8 @@
 //! # Examples
 //!
 //! ```rust,no_run
-//! use autumn::prelude::*;
-//! use autumn::middleware::RequestId;
+//! use autumn_web::prelude::*;
+//! use autumn_web::middleware::RequestId;
 //! use axum::extract::Extension;
 //!
 //! #[get("/whoami")]
@@ -43,8 +43,8 @@ use uuid::Uuid;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
-/// use autumn::middleware::RequestId;
+/// use autumn_web::prelude::*;
+/// use autumn_web::middleware::RequestId;
 /// use axum::extract::Extension;
 ///
 /// #[get("/trace")]
@@ -75,7 +75,7 @@ impl fmt::Display for RequestId {
 /// If you are building a custom Axum router, you can add it manually:
 ///
 /// ```rust,no_run
-/// use autumn::middleware::RequestIdLayer;
+/// use autumn_web::middleware::RequestIdLayer;
 ///
 /// let app = axum::Router::<()>::new()
 ///     .route("/", axum::routing::get(|| async { "ok" }))

@@ -1,4 +1,4 @@
-use autumn::model;
+use autumn_web::model;
 
 #[model]
 enum Status {

@@ -243,7 +243,7 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml")).unwrap();
         assert!(content.contains(r#"name = "my-cool-app""#));
-        assert!(content.contains("autumn = "));
+        assert!(content.contains("autumn-web = "));
     }
 
     #[test]
@@ -252,7 +252,7 @@ mod tests {
         generate("ver-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml")).unwrap();
-        let expected = format!(r#"autumn = "{}""#, env!("CARGO_PKG_VERSION"));
+        let expected = format!(r#"autumn-web = "{}""#, env!("CARGO_PKG_VERSION"));
         assert!(content.contains(&expected));
     }
 
@@ -265,8 +265,8 @@ mod tests {
         assert!(content.contains(r#"#[get("/")]"#));
         assert!(content.contains(r#"#[get("/hello")]"#));
         assert!(content.contains(r#"#[get("/hello/{name}")]"#));
-        assert!(content.contains("#[autumn::main]"));
-        assert!(content.contains("autumn::app()"));
+        assert!(content.contains("#[autumn_web::main]"));
+        assert!(content.contains("autumn_web::app()"));
     }
 
     #[test]

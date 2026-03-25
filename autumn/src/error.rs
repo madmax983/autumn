@@ -22,7 +22,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use autumn::error::AutumnError;
+//! use autumn_web::error::AutumnError;
 //! use http::StatusCode;
 //!
 //! // Blanket From impl: any Error becomes 500
@@ -45,7 +45,7 @@ use axum::response::{IntoResponse, Response};
 /// with status `500 Internal Server Error`:
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/")]
 /// async fn handler() -> AutumnResult<&'static str> {
@@ -57,7 +57,7 @@ use axum::response::{IntoResponse, Response};
 /// For expected errors, use a status refinement constructor:
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/users/{id}")]
 /// async fn get_user(axum::extract::Path(id): axum::extract::Path<i32>) -> AutumnResult<String> {
@@ -89,7 +89,7 @@ pub struct AutumnError {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/")]
 /// async fn index() -> AutumnResult<&'static str> {
@@ -116,7 +116,7 @@ impl AutumnError {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::error::AutumnError;
+    /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
     /// let err: AutumnError = std::io::Error::other("forbidden").into();
@@ -134,7 +134,7 @@ impl AutumnError {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::error::AutumnError;
+    /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
     /// let err = AutumnError::not_found(std::io::Error::other("no such user"));
@@ -152,7 +152,7 @@ impl AutumnError {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::error::AutumnError;
+    /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
     /// let err = AutumnError::bad_request(std::io::Error::other("invalid input"));
@@ -173,7 +173,7 @@ impl AutumnError {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::error::AutumnError;
+    /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
     /// let err = AutumnError::unprocessable(std::io::Error::other("age must be positive"));
@@ -191,7 +191,7 @@ impl AutumnError {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::error::AutumnError;
+    /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
     /// let err: AutumnError = std::io::Error::other("boom").into();

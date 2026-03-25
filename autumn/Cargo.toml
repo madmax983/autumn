@@ -1,5 +1,5 @@
 [package]
-name = "autumn"
+name = "autumn-web"
 description = "An opinionated, convention-over-configuration web framework for Rust"
 edition.workspace = true
 version.workspace = true

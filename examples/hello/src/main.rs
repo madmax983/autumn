@@ -1,4 +1,4 @@
-use autumn::{get, routes};
+use autumn_web::{get, routes};
 
 #[get("/")]
 async fn index() -> &'static str {
@@ -11,13 +11,13 @@ async fn hello() -> &'static str {
 }
 
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn::extract::Path<String>) -> String {
+async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(routes![index, hello, hello_name])
         .run()
         .await;

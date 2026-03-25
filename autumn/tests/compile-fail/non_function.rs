@@ -1,4 +1,4 @@
-use autumn::get;
+use autumn_web::get;
 
 #[get("/hello")]
 struct Hello;

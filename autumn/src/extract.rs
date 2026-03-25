@@ -15,7 +15,7 @@
 //! `Content-Type: application/json`).
 //!
 //! For the full set of Axum extractors, use
-//! `autumn::reexports::axum::extract`.
+//! `autumn_web::reexports::axum::extract`.
 
 /// Deserialize `application/x-www-form-urlencoded` request bodies.
 ///
@@ -25,7 +25,7 @@
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 /// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]
@@ -44,7 +44,7 @@ pub use axum::extract::Form;
 /// request body. As a return type, serializes the value with
 /// `Content-Type: application/json`.
 ///
-/// Also available at the crate root as [`autumn::Json`](crate::Json).
+/// Also available at the crate root as [`autumn_web::Json`](crate::Json).
 pub use axum::extract::Json;
 
 /// Extract typed path parameters from the URL.
@@ -55,8 +55,8 @@ pub use axum::extract::Json;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
-/// use autumn::extract::Path;
+/// use autumn_web::prelude::*;
+/// use autumn_web::extract::Path;
 ///
 /// #[get("/users/{id}")]
 /// async fn get_user(Path(id): Path<i32>) -> String {
@@ -73,8 +73,8 @@ pub use axum::extract::Path;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
-/// use autumn::extract::Query;
+/// use autumn_web::prelude::*;
+/// use autumn_web::extract::Query;
 /// use serde::Deserialize;
 ///
 /// #[derive(Deserialize)]

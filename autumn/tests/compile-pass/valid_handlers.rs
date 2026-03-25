@@ -1,5 +1,5 @@
-use autumn::extract::Path;
-use autumn::{delete, get, post, put};
+use autumn_web::extract::Path;
+use autumn_web::{delete, get, post, put};
 
 #[get("/hello")]
 async fn hello() -> &'static str {

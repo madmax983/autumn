@@ -139,7 +139,7 @@ Autumn is organized as a Cargo workspace with separate crates for the framework 
 
 **Acceptance Criteria:**
 - [ ] Workspace contains `autumn` (main crate) and `autumn-macros` (proc macro crate)
-- [ ] `autumn` re-exports macros so users only need `use autumn::prelude::*`
+- [ ] `autumn` re-exports macros so users only need `use autumn_web::prelude::*`
 - [ ] `autumn-macros` is a proc-macro crate (`proc-macro = true` in Cargo.toml)
 - [ ] Both crates compile on stable Rust (no nightly features)
 - [ ] Workspace builds with `cargo build` from root
@@ -208,17 +208,17 @@ A `routes![]` macro (following Rocket's proven pattern) provides explicit, compi
 **Priority:** Must Have
 
 **Description:**
-`#[autumn::main]` on the application's main function sets up the Tokio runtime, loads configuration, creates the database connection pool, collects routes, and starts the Axum server.
+`#[autumn_web::main]` on the application's main function sets up the Tokio runtime, loads configuration, creates the database connection pool, collects routes, and starts the Axum server.
 
 **Acceptance Criteria:**
-- [ ] `#[autumn::main]` configures the Tokio runtime
+- [ ] `#[autumn_web::main]` configures the Tokio runtime
 - [ ] Loads configuration from `autumn.toml` + environment variables
 - [ ] Creates the diesel-async connection pool from config
-- [ ] Accepts route collections via `autumn::app().routes(...)` builder
+- [ ] Accepts route collections via `autumn_web::app().routes(...)` builder
 - [ ] Binds to configured address and port
 - [ ] Logs all mounted routes at startup (method, path, handler name)
 - [ ] Panics with a clear error if zero routes are mounted
-- [ ] Developer writes minimal bootstrap: `autumn::app().routes(my_routes).run().await`
+- [ ] Developer writes minimal bootstrap: `autumn_web::app().routes(my_routes).run().await`
 
 **Dependencies:** FR-005, FR-007, FR-027, FR-030
 
@@ -428,7 +428,7 @@ Handlers declare their response format via return type. `AutumnResult<Markup>` f
 `Markup` (Maud's return type) is a valid handler return type that produces `text/html` responses. Maud's `html!{}` macro is available via Autumn's prelude.
 
 **Acceptance Criteria:**
-- [ ] `use autumn::prelude::*` imports Maud's `html!` macro and `Markup` type
+- [ ] `use autumn_web::prelude::*` imports Maud's `html!` macro and `Markup` type
 - [ ] Returning `Markup` from a handler sends `Content-Type: text/html; charset=utf-8`
 - [ ] Maud templates compile at compile time (no runtime template parsing)
 - [ ] Tailwind CSS classes used in `html!{}` are picked up by the Tailwind build pipeline
@@ -486,7 +486,7 @@ Files in the `static/` project directory are served at `/static/` via tower-http
 - [ ] Files placed in `static/` are accessible at `/static/{filename}`
 - [ ] Subdirectories work: `static/images/logo.png` → `/static/images/logo.png`
 - [ ] Correct MIME types are set based on file extension
-- [ ] Static file serving is configured automatically by `#[autumn::main]`
+- [ ] Static file serving is configured automatically by `#[autumn_web::main]`
 - [ ] The generated CSS file (`static/css/autumn.css`) is served correctly
 
 **Dependencies:** FR-008
@@ -558,7 +558,7 @@ The framework provides sensible defaults for all configuration values, so an Aut
 `tracing` and `tracing-subscriber` are pre-configured at startup with request-level spans, request IDs, and environment-appropriate formatting.
 
 **Acceptance Criteria:**
-- [ ] Logging is configured automatically by `#[autumn::main]`
+- [ ] Logging is configured automatically by `#[autumn_web::main]`
 - [ ] JSON format when profile is production, pretty-print otherwise
 - [ ] Every HTTP request gets a unique request ID in its log span
 - [ ] Request logs include: method, path, status code, and duration
@@ -709,7 +709,7 @@ All public types, traits, and macros have `cargo doc` documentation with example
 - [ ] `cargo doc --open` produces navigable API documentation
 - [ ] All public types have doc comments explaining purpose and usage
 - [ ] Key types (`Db`, `AutumnError`, `AutumnResult`) have code examples in their docs
-- [ ] Macros (`#[get]`, `routes![]`, `#[autumn::main]`) have usage examples
+- [ ] Macros (`#[get]`, `routes![]`, `#[autumn_web::main]`) have usage examples
 - [ ] No `missing_docs` warnings on public items
 
 **Dependencies:** FR-004
@@ -796,7 +796,7 @@ CORS is configurable via `autumn.toml` with sensible defaults: permissive in dev
 Developers can add custom Tower middleware to the Autumn application via a builder method.
 
 **Acceptance Criteria:**
-- [ ] `autumn::app().layer(my_middleware)` adds Tower middleware
+- [ ] `autumn_web::app().layer(my_middleware)` adds Tower middleware
 - [ ] Standard Tower middleware (compression, timeout, rate limiting) works
 - [ ] Middleware ordering is predictable and documented
 - [ ] Custom middleware receives the request ID from FR-030
@@ -813,7 +813,7 @@ Developers can add custom Tower middleware to the Autumn application via a build
 Raw Axum routers can be mounted alongside Autumn's annotated routes via `.merge()`, providing an escape hatch for advanced routing needs.
 
 **Acceptance Criteria:**
-- [ ] `autumn::app().merge(axum_router)` mounts raw Axum routes
+- [ ] `autumn_web::app().merge(axum_router)` mounts raw Axum routes
 - [ ] Axum routes have access to the same shared state (database pool, config)
 - [ ] Autumn middleware (logging, request ID) applies to merged routes
 - [ ] Documentation explains when and how to use this escape hatch
@@ -1223,7 +1223,7 @@ The proc macro system that transforms annotated functions into Axum handlers and
 ### EPIC-003: Application Bootstrap
 
 **Description:**
-The `#[autumn::main]` macro and application builder that wires together configuration, database, routes, and server startup into a single entry point.
+The `#[autumn_web::main]` macro and application builder that wires together configuration, database, routes, and server startup into a single entry point.
 
 **Functional Requirements:**
 - FR-008: Application Entry Point Macro
@@ -1234,7 +1234,7 @@ The `#[autumn::main]` macro and application builder that wires together configur
 **Priority:** Must Have
 
 **Business Value:**
-The entry point macro is what makes Autumn a framework rather than a collection of macros. `autumn::app().routes(my_routes).run().await` is the entire bootstrap — everything else is automatic.
+The entry point macro is what makes Autumn a framework rather than a collection of macros. `autumn_web::app().routes(my_routes).run().await` is the entire bootstrap — everything else is automatic.
 
 ---
 
@@ -1417,7 +1417,7 @@ Detailed user stories will be created during sprint planning (Phase 4). Below ar
 - As a developer debugging a type error, I want the compiler error to point at my code, not at macro-generated code, so that I can fix it without `cargo expand`.
 
 **EPIC-003: Application Bootstrap**
-- As a developer, I want to write `autumn::app().routes(my_routes).run().await` and have everything boot so that I don't write 150 lines of setup in main.rs.
+- As a developer, I want to write `autumn_web::app().routes(my_routes).run().await` and have everything boot so that I don't write 150 lines of setup in main.rs.
 
 **EPIC-004: Database Layer**
 - As a developer, I want to declare `db: Db` in my handler and get a database connection so that I never manually manage connection pools.

@@ -3,7 +3,7 @@
 //! These endpoints provide a REST-style API alongside the HTML routes,
 //! demonstrating that Autumn handlers can return either HTML or JSON.
 
-use autumn::{AutumnError, AutumnResult, Db, Json, get, post};
+use autumn_web::{AutumnError, AutumnResult, Db, Json, get, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 

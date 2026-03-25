@@ -63,7 +63,7 @@ Autumn is a compile-time framework. Most of its value is delivered during compil
 ┌────────────────────────────▼────────────────────────────────────┐
 │                      autumn-macros crate                        │
 │  • Route annotation macros (#[get], #[post], etc.)              │
-│  • #[autumn::main] entry point macro                            │
+│  • #[autumn_web::main] entry point macro                            │
 │  • #[derive(Model)] convenience macro                           │
 │  • routes![] collection macro                                   │
 └────────────────────────────┬────────────────────────────────────┘
@@ -77,7 +77,7 @@ Autumn is a compile-time framework. Most of its value is delivered during compil
 │        │            │            │             │                │
 │  ┌─────▼────────────▼────────────▼─────────────▼──────┐        │
 │  │                  App Builder                        │        │
-│  │  autumn::app().routes(r).run().await                │        │
+│  │  autumn_web::app().routes(r).run().await                │        │
 │  └─────────────────────┬──────────────────────────────┘        │
 │                        │                                        │
 │  ┌─────────────────────▼──────────────────────────────┐        │
@@ -120,7 +120,7 @@ autumn/
 │   ├── build.rs                  # Tailwind CSS pipeline (template, copied to user projects)
 │   └── src/
 │       ├── lib.rs                # Re-exports, prelude
-│       ├── prelude.rs            # use autumn::prelude::*
+│       ├── prelude.rs            # use autumn_web::prelude::*
 │       ├── app.rs                # App builder
 │       ├── config.rs             # Configuration loading
 │       ├── db.rs                 # Db extractor, pool creation
@@ -138,7 +138,7 @@ autumn/
 │   └── src/
 │       ├── lib.rs                # Proc macro entry points
 │       ├── route.rs              # #[get], #[post], etc.
-│       ├── main_macro.rs         # #[autumn::main]
+│       ├── main_macro.rs         # #[autumn_web::main]
 │       ├── model.rs              # #[derive(Model)]
 │       └── routes_macro.rs       # routes![]
 │
@@ -190,8 +190,8 @@ autumn-macros ──────► syn + quote + proc-macro2
 
 **Key decisions:**
 - `autumn-cli` does NOT depend on `autumn` at the crate level. It generates project files from templates. This prevents the CLI from pulling in the entire framework dependency tree for a scaffolding operation.
-- `autumn` re-exports key types from `axum`, `maud`, `diesel`, etc. so users typically only need `use autumn::prelude::*`.
-- `autumn-macros` only depends on proc macro utilities (`syn`, `quote`, `proc-macro2`). It does not depend on `axum` or any runtime crate — it generates code that references `autumn::` paths, not `axum::` paths directly.
+- `autumn` re-exports key types from `axum`, `maud`, `diesel`, etc. so users typically only need `use autumn_web::prelude::*`.
+- `autumn-macros` only depends on proc macro utilities (`syn`, `quote`, `proc-macro2`). It does not depend on `axum` or any runtime crate — it generates code that references `autumn_web::` paths, not `axum::` paths directly.
 
 ---
 
@@ -222,7 +222,7 @@ async fn get_user(id: Path<i32>, db: Db) -> AutumnResult<Markup> {
 **Expansion (simplified):**
 ```rust
 // 1. User's function is preserved, with debug_handler added in debug mode
-#[cfg_attr(debug_assertions, axum::debug_handler(state = autumn::AppState))]
+#[cfg_attr(debug_assertions, axum::debug_handler(state = autumn_web::AppState))]
 async fn get_user(id: Path<i32>, db: Db) -> AutumnResult<Markup> {
     let user = users::table.find(id.0).first(&mut *db).await?;
     Ok(html! {
@@ -232,11 +232,11 @@ async fn get_user(id: Path<i32>, db: Db) -> AutumnResult<Markup> {
 
 // 2. Route info function generated for routes![] macro
 #[doc(hidden)]
-pub fn __autumn_route_info_get_user() -> autumn::route::Route {
-    autumn::route::Route {
-        method: autumn::reexports::http::Method::GET,
+pub fn __autumn_route_info_get_user() -> autumn_web::route::Route {
+    autumn_web::route::Route {
+        method: autumn_web::reexports::http::Method::GET,
         path: "/users/{id}",
-        handler: autumn::reexports::axum::routing::get(get_user),
+        handler: autumn_web::reexports::axum::routing::get(get_user),
         name: "get_user",
     }
 }
@@ -249,7 +249,7 @@ pub fn __autumn_route_info_get_user() -> autumn::route::Route {
    - Item is not an `async fn`
    - Path is empty or malformed
    - Function has no return type
-3. **Add `debug_handler`:** Insert `#[cfg_attr(debug_assertions, axum::debug_handler(state = autumn::AppState))]` on the function
+3. **Add `debug_handler`:** Insert `#[cfg_attr(debug_assertions, axum::debug_handler(state = autumn_web::AppState))]` on the function
 4. **Generate route info:** Create a `__autumn_route_info_{name}()` function that returns a `Route` struct pairing the method + path with an Axum method router pointing to the handler
 5. **Emit both:** Output the (annotated) original function and the route info function
 
@@ -293,14 +293,14 @@ For v0.1, error rendering context is determined by Axum's existing `IntoResponse
 
 **Input:**
 ```rust
-pub fn routes() -> Vec<autumn::route::Route> {
+pub fn routes() -> Vec<autumn_web::route::Route> {
     routes![get_user, list_users, create_user]
 }
 ```
 
 **Expansion:**
 ```rust
-pub fn routes() -> Vec<autumn::route::Route> {
+pub fn routes() -> Vec<autumn_web::route::Route> {
     vec![
         __autumn_route_info_get_user(),
         __autumn_route_info_list_users(),
@@ -318,7 +318,7 @@ pub fn routes() -> Vec<autumn::route::Route> {
 ```rust
 // src/routes/users.rs
 mod users {
-    use autumn::prelude::*;
+    use autumn_web::prelude::*;
 
     #[get("/users")]
     async fn list(db: Db) -> AutumnResult<Json<Vec<User>>> { ... }
@@ -329,15 +329,15 @@ mod users {
     #[post("/users")]
     async fn create(db: Db, body: Json<NewUser>) -> AutumnResult<Json<User>> { ... }
 
-    pub fn routes() -> Vec<autumn::route::Route> {
+    pub fn routes() -> Vec<autumn_web::route::Route> {
         routes![list, get, create]
     }
 }
 
 // src/main.rs
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(users::routes())
         .routes(posts::routes())
         .run()
@@ -345,13 +345,13 @@ async fn main() {
 }
 ```
 
-### #[autumn::main] Macro
+### #[autumn_web::main] Macro
 
 **Input:**
 ```rust
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(users::routes())
         .run()
         .await;
@@ -362,19 +362,19 @@ async fn main() {
 ```rust
 #[tokio::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(users::routes())
         .run()
         .await;
 }
 ```
 
-**v0.1 scope:** `#[autumn::main]` is a thin wrapper around `#[tokio::main]`. Future versions may add:
+**v0.1 scope:** `#[autumn_web::main]` is a thin wrapper around `#[tokio::main]`. Future versions may add:
 - Custom panic handler with request context
 - Runtime configuration (worker threads, stack size)
 - Instrumentation
 
-The real work happens in `autumn::app().run()`, not in the macro. This keeps the macro minimal and the runtime behavior inspectable.
+The real work happens in `autumn_web::app().run()`, not in the macro. This keeps the macro minimal and the runtime behavior inspectable.
 
 ### #[derive(Model)] Macro
 
@@ -420,7 +420,7 @@ pub struct User {
 ### Core Types
 
 ```rust
-// ── autumn::prelude ──────────────────────────────────────────
+// ── autumn_web::prelude ──────────────────────────────────────────
 
 // Re-exports for user convenience
 pub use crate::app;
@@ -442,7 +442,7 @@ pub use autumn_macros::{delete, get, main, post, put, Model};
 ### Error Handling Types
 
 ```rust
-// ── autumn::error ────────────────────────────────────────────
+// ── autumn_web::error ────────────────────────────────────────────
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -582,7 +582,7 @@ async fn create(db: Db, body: Json<NewUser>) -> AutumnResult<Json<User>> {
 ### Route Types
 
 ```rust
-// ── autumn::route ────────────────────────────────────────────
+// ── autumn_web::route ────────────────────────────────────────────
 
 use axum::routing::MethodRouter;
 use axum::http::Method;
@@ -613,7 +613,7 @@ impl Route {
 ### Database Types
 
 ```rust
-// ── autumn::db ───────────────────────────────────────────────
+// ── autumn_web::db ───────────────────────────────────────────────
 
 use axum::extract::FromRequestParts;
 use diesel_async::AsyncPgConnection;
@@ -689,7 +689,7 @@ Priority (highest wins):
 ### Config Schema
 
 ```rust
-// ── autumn::config ───────────────────────────────────────────
+// ── autumn_web::config ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 pub struct AutumnConfig {
@@ -806,7 +806,7 @@ fn apply_env_overrides(config: &mut AutumnConfig) {
 ### App Builder
 
 ```rust
-// ── autumn::app ──────────────────────────────────────────────
+// ── autumn_web::app ──────────────────────────────────────────────
 
 pub fn app() -> AppBuilder {
     AppBuilder {
@@ -914,7 +914,7 @@ impl AppBuilder {
 ### Graceful Shutdown
 
 ```rust
-// ── autumn::server ───────────────────────────────────────────
+// ── autumn_web::server ───────────────────────────────────────────
 
 pub async fn run(router: Router, config: &ServerConfig) {
     let addr: SocketAddr = format!("{}:{}", config.host, config.port)
@@ -1062,7 +1062,7 @@ Response
 ### Request ID Implementation
 
 ```rust
-// ── autumn::middleware::request_id ────────────────────────────
+// ── autumn_web::middleware::request_id ────────────────────────────
 
 use axum::http::{Request, HeaderValue};
 use tower::{Layer, Service};
@@ -1100,7 +1100,7 @@ where
 ## Health Check
 
 ```rust
-// ── autumn::health ───────────────────────────────────────────
+// ── autumn_web::health ───────────────────────────────────────────
 
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
     let pool_status = state.pool.status();
@@ -1137,7 +1137,7 @@ Override any default via `autumn.toml` or `AUTUMN_*` env vars. No code changes n
 ### Level 2: Custom Middleware
 
 ```rust
-autumn::app()
+autumn_web::app()
     .routes(my_routes())
     .layer(tower_http::compression::CompressionLayer::new())
     .layer(tower_http::timeout::TimeoutLayer::new(Duration::from_secs(30)))
@@ -1151,7 +1151,7 @@ autumn::app()
 let custom_router = axum::Router::new()
     .route("/custom", axum::routing::get(custom_handler));
 
-autumn::app()
+autumn_web::app()
     .routes(my_routes())
     .merge(custom_router)
     .run()
@@ -1162,10 +1162,10 @@ autumn::app()
 
 ```rust
 // Replace the database pool provider
-impl autumn::DatabasePoolProvider for MyCustomPool { ... }
+impl autumn_web::DatabasePoolProvider for MyCustomPool { ... }
 
 // Replace the config loader
-impl autumn::ConfigLoader for MyCustomLoader { ... }
+impl autumn_web::ConfigLoader for MyCustomLoader { ... }
 ```
 
 ### Level 5: Don't Use Autumn
@@ -1276,7 +1276,7 @@ Cherry-pick individual crates: Axum, Diesel, Maud, etc. Autumn adds no lock-in b
 
 ```rust
 // tests/compile_fail/missing_async.rs
-#[autumn::get("/test")]
+#[autumn_web::get("/test")]
 fn not_async() -> String { // Should fail: not async
     "hello".to_string()
 }
@@ -1371,29 +1371,29 @@ Integration tests use a real Postgres database (not mocks):
 | FR-005 | Route Macros | autumn-macros::route |
 | FR-006 | Debug Handler | autumn-macros::route |
 | FR-007 | routes![] Macro | autumn-macros::routes_macro |
-| FR-008 | Entry Point | autumn-macros::main_macro + autumn::app |
-| FR-009 | DB Pool | autumn::db |
-| FR-010 | Db Extractor | autumn::db::Db |
+| FR-008 | Entry Point | autumn-macros::main_macro + autumn_web::app |
+| FR-009 | DB Pool | autumn_web::db |
+| FR-010 | Db Extractor | autumn_web::db::Db |
 | FR-011 | #[derive(Model)] | autumn-macros::model |
 | FR-012 | Path Extractor | Re-export from axum |
 | FR-013 | Form Extractor | Re-export from axum |
 | FR-014 | JSON Extractor | Re-export from axum |
 | FR-015 | JSON Response | Re-export from axum |
-| FR-016 | AutumnError | autumn::error |
-| FR-017 | Blanket From | autumn::error |
-| FR-018 | Custom Status | autumn::error |
-| FR-019 | Return Type Contract | autumn::error (AutumnResult) |
+| FR-016 | AutumnError | autumn_web::error |
+| FR-017 | Blanket From | autumn_web::error |
+| FR-018 | Custom Status | autumn_web::error |
+| FR-019 | Return Type Contract | autumn_web::error (AutumnResult) |
 | FR-020 | Maud Integration | Re-export from maud |
 | FR-021 | Tailwind Pipeline | build.rs template |
-| FR-022 | htmx Integration | autumn::vendor (embedded) |
-| FR-023 | Static Assets | autumn::app (tower-http) |
-| FR-024 | Config File | autumn::config |
-| FR-025 | Env Overrides | autumn::config |
-| FR-026 | Defaults | autumn::config |
-| FR-027 | Logging | autumn::logging |
-| FR-028 | Health Check | autumn::health |
-| FR-029 | Graceful Shutdown | autumn::server |
-| FR-030 | Request ID | autumn::middleware::request_id |
+| FR-022 | htmx Integration | autumn_web::vendor (embedded) |
+| FR-023 | Static Assets | autumn_web::app (tower-http) |
+| FR-024 | Config File | autumn_web::config |
+| FR-025 | Env Overrides | autumn_web::config |
+| FR-026 | Defaults | autumn_web::config |
+| FR-027 | Logging | autumn_web::logging |
+| FR-028 | Health Check | autumn_web::health |
+| FR-029 | Graceful Shutdown | autumn_web::server |
+| FR-030 | Request ID | autumn_web::middleware::request_id |
 | FR-031–035 | Documentation | docs/, README, cargo doc |
 | FR-036 | CI | .github/workflows/ |
 | FR-037 | crates.io | Cargo.toml metadata |

@@ -10,14 +10,14 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use autumn::prelude::*;
+//! use autumn_web::prelude::*;
 //!
 //! #[get("/hello")]
 //! async fn hello() -> &'static str { "Hello!" }
 //!
-//! #[autumn::main]
+//! #[autumn_web::main]
 //! async fn main() {
-//!     autumn::app()
+//!     autumn_web::app()
 //!         .routes(routes![hello])
 //!         .run()
 //!         .await;
@@ -40,14 +40,14 @@ use crate::route::Route;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/")]
 /// async fn index() -> &'static str { "hi" }
 ///
-/// #[autumn::main]
+/// #[autumn_web::main]
 /// async fn main() {
-///     autumn::app()
+///     autumn_web::app()
 ///         .routes(routes![index])
 ///         .run()
 ///         .await;
@@ -69,7 +69,7 @@ pub const fn app() -> AppBuilder {
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/a")]
 /// async fn route_a() -> &'static str { "a" }
@@ -77,9 +77,9 @@ pub const fn app() -> AppBuilder {
 /// #[get("/b")]
 /// async fn route_b() -> &'static str { "b" }
 ///
-/// #[autumn::main]
+/// #[autumn_web::main]
 /// async fn main() {
-///     autumn::app()
+///     autumn_web::app()
 ///         .routes(routes![route_a])
 ///         .routes(routes![route_b])
 ///         .run()
@@ -100,12 +100,12 @@ impl AppBuilder {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use autumn::prelude::*;
+    /// # use autumn_web::prelude::*;
     /// # #[get("/users")] async fn list_users() -> &'static str { "" }
     /// # #[get("/posts")] async fn list_posts() -> &'static str { "" }
-    /// # #[autumn::main]
+    /// # #[autumn_web::main]
     /// # async fn main() {
-    /// autumn::app()
+    /// autumn_web::app()
     ///     .routes(routes![list_users])
     ///     .routes(routes![list_posts])
     ///     .run()
@@ -208,13 +208,12 @@ impl AppBuilder {
         tracing::debug!(path = %config.health.path, "Mounted health check");
 
         // Static file serving from project's static/ directory.
-        // Resolve relative to the app's crate root (set by #[autumn::main])
+        // Resolve relative to the app's crate root (set by #[autumn_web::main])
         // so `cargo run -p <example>` works from the workspace root.
-        let static_dir = if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
-            std::path::PathBuf::from(manifest_dir).join("static")
-        } else {
-            std::path::PathBuf::from("static")
-        };
+        let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+            |_| std::path::PathBuf::from("static"),
+            |manifest_dir| std::path::PathBuf::from(manifest_dir).join("static"),
+        );
         router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
         let state = AppState {

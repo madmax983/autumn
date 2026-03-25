@@ -1,10 +1,10 @@
-//! `#[autumn::main]` macro implementation.
+//! `#[autumn_web::main]` macro implementation.
 //!
 //! Generates a synchronous `main()` that builds a tokio runtime and
 //! blocks on the user's async body. We generate the runtime manually
 //! instead of delegating to `#[tokio::main]` because `tokio::main`
 //! emits code with `::tokio::` paths, which don't resolve when the
-//! user only depends on `autumn`.
+//! user only depends on `autumn-web`.
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -31,7 +31,7 @@ pub fn main_macro(item: TokenStream) -> TokenStream {
             // SAFETY: called at the top of main, before any threads are spawned.
             unsafe { ::std::env::set_var("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR")); }
 
-            ::autumn::reexports::tokio::runtime::Builder::new_multi_thread()
+            ::autumn_web::reexports::tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime")

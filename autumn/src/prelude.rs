@@ -3,7 +3,7 @@
 //! Import everything commonly needed with a single glob:
 //!
 //! ```rust,ignore
-//! use autumn::prelude::*;
+//! use autumn_web::prelude::*;
 //! ```
 //!
 //! This brings the following into scope:
@@ -17,9 +17,9 @@
 //! | State | [`AppState`] |
 //!
 //! For less common types (configuration, middleware, upstream crate access),
-//! use targeted imports from [`autumn::config`](crate::config),
-//! [`autumn::middleware`](crate::middleware), or
-//! [`autumn::reexports`](crate::reexports).
+//! use targeted imports from [`autumn_web::config`](crate::config),
+//! [`autumn_web::middleware`](crate::middleware), or
+//! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.

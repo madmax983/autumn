@@ -23,13 +23,13 @@ use crate::AppState;
 /// # Examples
 ///
 /// ```rust,no_run
-/// use autumn::prelude::*;
+/// use autumn_web::prelude::*;
 ///
 /// #[get("/hello")]
 /// async fn hello() -> &'static str { "hi" }
 ///
 /// // `routes!` expands to a Vec<Route>:
-/// let route_vec: Vec<autumn::route::Route> = routes![hello];
+/// let route_vec: Vec<autumn_web::route::Route> = routes![hello];
 /// assert_eq!(route_vec.len(), 1);
 /// ```
 pub struct Route {

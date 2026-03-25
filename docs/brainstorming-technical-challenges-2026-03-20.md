@@ -40,7 +40,7 @@ Proc macros operate on token streams, not typed ASTs. When `#[get("/users")]` re
 3. Macro emits `compile_error!()` for detectable mistakes (missing async, wrong extractor position)
 4. Auto-apply `#[axum::debug_handler]` in debug builds
 5. Require `AutumnResult<T>` explicitly in v0.1 (consider silent rewrite in v0.2)
-6. Consider layered strategy: `#[get]` (minimal) vs `#[autumn::handler]` (full rewrite)
+6. Consider layered strategy: `#[get]` (minimal) vs `#[autumn_web::handler]` (full rewrite)
 
 ### Key Principle
 The macro should be a *thin wrapper*, not a deep rewrite. Ship v0.1 with minimal macro magic and add convenience in v0.2 once error messages are proven solid.
@@ -67,14 +67,14 @@ The macro should be a *thin wrapper*, not a deep rewrite. Ship v0.1 with minimal
 - **Symbol-based approach** — like `wasm-bindgen`'s export mechanism
 - **Named convention** — macro generates known function names, main calls them
 - **`routes![]` macro** — Rocket-style explicit listing (one line per module)
-- **Module-scoped scanning** — `#[autumn::routes]` on a module, no global discovery
+- **Module-scoped scanning** — `#[autumn_web::routes]` on a module, no global discovery
 
 ### Recommended Approach
 **`routes![]` macro (Rocket-style) for v0.1, linker discovery as opt-in feature flag later**
 
 1. `#[get("/users")]` generates the handler + a registration function
 2. Developer writes `routes![list_users, get_user, create_user]` once per module
-3. `#[autumn::main]` collects from modules: `autumn::app().routes(users::routes()).routes(posts::routes())`
+3. `#[autumn_web::main]` collects from modules: `autumn_web::app().routes(users::routes()).routes(posts::routes())`
 4. `routes![]` validates at compile time that listed functions have route annotations
 5. Startup logs every mounted route — empty route list panics with clear error
 6. Add linker-based auto-discovery behind `features = ["auto-discover"]` in v0.2+

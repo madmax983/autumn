@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```rust
-//! use autumn::config::AutumnConfig;
+//! use autumn_web::config::AutumnConfig;
 //!
 //! // All defaults -- no file needed
 //! let config = AutumnConfig::default();
@@ -43,7 +43,7 @@ use thiserror::Error;
 
 /// Locate `autumn.toml` by checking the app's crate directory first, then CWD.
 fn find_config_file() -> PathBuf {
-    // Prefer the app's crate root (set by #[autumn::main]).
+    // Prefer the app's crate root (set by #[autumn_web::main]).
     if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
         let candidate = PathBuf::from(manifest_dir).join("autumn.toml");
         if candidate.exists() {
@@ -62,7 +62,7 @@ fn find_config_file() -> PathBuf {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::{AutumnConfig, ConfigError};
+/// use autumn_web::config::{AutumnConfig, ConfigError};
 /// use std::path::Path;
 ///
 /// let result = AutumnConfig::load_from(Path::new("nonexistent.toml"));
@@ -104,7 +104,7 @@ pub enum ConfigError {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::AutumnConfig;
+/// use autumn_web::config::AutumnConfig;
 ///
 /// let config = AutumnConfig::default();
 /// assert_eq!(config.server.port, 3000);
@@ -135,7 +135,7 @@ impl AutumnConfig {
     /// Load configuration from `autumn.toml`.
     ///
     /// Searches for `autumn.toml` in the following order:
-    /// 1. The app's crate directory (set by `#[autumn::main]` via
+    /// 1. The app's crate directory (set by `#[autumn_web::main]` via
     ///    `AUTUMN_MANIFEST_DIR`)
     /// 2. The current working directory
     ///
@@ -276,7 +276,7 @@ impl AutumnConfig {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::ServerConfig;
+/// use autumn_web::config::ServerConfig;
 ///
 /// let server = ServerConfig::default();
 /// assert_eq!(server.port, 3000);
@@ -323,7 +323,7 @@ pub struct ServerConfig {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::DatabaseConfig;
+/// use autumn_web::config::DatabaseConfig;
 ///
 /// let db = DatabaseConfig::default();
 /// assert!(db.url.is_none());
@@ -374,7 +374,7 @@ impl DatabaseConfig {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::{LogConfig, LogFormat};
+/// use autumn_web::config::{LogConfig, LogFormat};
 ///
 /// let log = LogConfig::default();
 /// assert_eq!(log.level, "info");
@@ -408,7 +408,7 @@ pub struct LogConfig {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::LogFormat;
+/// use autumn_web::config::LogFormat;
 ///
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
@@ -431,7 +431,7 @@ pub enum LogFormat {
 /// # Examples
 ///
 /// ```rust
-/// use autumn::config::HealthConfig;
+/// use autumn_web::config::HealthConfig;
 ///
 /// let health = HealthConfig::default();
 /// assert_eq!(health.path, "/health");

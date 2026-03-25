@@ -5,4 +5,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
-autumn = { path = "../../autumn" }
+autumn-web = { path = "../../autumn" }

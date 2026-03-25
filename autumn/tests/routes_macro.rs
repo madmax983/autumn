@@ -1,4 +1,4 @@
-use autumn::{get, routes};
+use autumn_web::{get, routes};
 
 #[get("/one")]
 async fn one() -> &'static str {
@@ -28,7 +28,7 @@ fn routes_collects_multiple_handlers() {
 
 #[test]
 fn routes_empty_returns_empty_vec() {
-    let r: Vec<autumn::route::Route> = routes![];
+    let r: Vec<autumn_web::route::Route> = routes![];
     assert!(r.is_empty());
 }
 

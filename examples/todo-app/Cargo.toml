@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-autumn = { path = "../../autumn" }
+autumn-web = { path = "../../autumn" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }

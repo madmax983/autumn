@@ -1,5 +1,5 @@
-use autumn::extract::{Form, Json};
-use autumn::{get, html, post, AutumnResult, Markup};
+use autumn_web::extract::{Form, Json};
+use autumn_web::{get, html, post, AutumnResult, Markup};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]

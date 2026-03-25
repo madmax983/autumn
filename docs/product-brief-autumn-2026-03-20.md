@@ -170,7 +170,7 @@ Autumn is an open-source ecosystem play. The goal is to become the default opini
 **v0.1 (6-Month Ship):**
 
 - `autumn` crate with re-exports (`cargo add autumn` compiles)
-- `autumn-macros` proc macro crate (`#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[autumn::main]`, `#[derive(Model)]`)
+- `autumn-macros` proc macro crate (`#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[autumn_web::main]`, `#[derive(Model)]`)
 - `autumn-cli` with `autumn new` project scaffolding
 - Route discovery via `inventory` or `linkme` (zero-registration)
 - `Db` extractor with diesel-async connection pool
@@ -299,7 +299,7 @@ v0.1 on crates.io within 6 months (by September 2026). v1.0 aspirational at 2 ye
 - Workspace setup & crate structure (Week 1)
 - `#[get]`/`#[post]` proc macros → route handler generation (Weeks 2-4) — **HIGHEST RISK**
 - Route discovery via inventory/linkme (Weeks 4-6)
-- `#[autumn::main]` → boots Axum with discovered routes
+- `#[autumn_web::main]` → boots Axum with discovered routes
 
 **Month 2-3: DATABASE LAYER (blocks realistic examples)**
 - diesel-async connection pool integration

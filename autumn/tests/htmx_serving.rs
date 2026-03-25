@@ -3,7 +3,7 @@
 
 #[test]
 fn htmx_version_is_accessible() {
-    let version = autumn::HTMX_VERSION;
+    let version = autumn_web::HTMX_VERSION;
     assert!(!version.is_empty());
     assert!(
         version.starts_with("2."),

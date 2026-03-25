@@ -1,6 +1,6 @@
 #![cfg(feature = "maud")]
 
-use autumn::{Markup, html};
+use autumn_web::{Markup, html};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

@@ -89,7 +89,7 @@ The files that matter right now:
 Open `src/main.rs`. The scaffolded code looks like this:
 
 ```rust
-use autumn::{get, routes};
+use autumn_web::{get, routes};
 
 #[get("/")]
 async fn index() -> &'static str {
@@ -102,13 +102,13 @@ async fn hello() -> &'static str {
 }
 
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn::extract::Path<String>) -> String {
+async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(routes![index, hello, hello_name])
         .run()
         .await;
@@ -120,9 +120,9 @@ The key pieces:
 - **`#[get("/path")]`** -- annotates a handler for GET requests. Also
   available: `#[post]`, `#[put]`, `#[delete]`.
 - **`routes![...]`** -- collects annotated handlers into a `Vec<Route>`.
-- **`autumn::app().routes(...).run().await`** -- the app builder. Load config,
+- **`autumn_web::app().routes(...).run().await`** -- the app builder. Load config,
   create the database pool, mount routes, start the server.
-- **`#[autumn::main]`** -- sets up the Tokio async runtime. It is a thin
+- **`#[autumn_web::main]`** -- sets up the Tokio async runtime. It is a thin
   wrapper around `#[tokio::main]`.
 
 Handlers are regular async functions. They can return any type that Axum can
@@ -168,8 +168,8 @@ Axum-style path parameters use curly braces in the route pattern and the
 `Path<T>` extractor in the handler signature:
 
 ```rust
-use autumn::extract::Path;
-use autumn::get;
+use autumn_web::extract::Path;
+use autumn_web::get;
 
 #[get("/users/{id}")]
 async fn get_user(id: Path<i32>) -> String {
@@ -189,7 +189,7 @@ async fn get_repo(Path((org, repo)): Path<(String, String)>) -> String {
 You can also use `Query<T>` for query string parameters:
 
 ```rust
-use autumn::extract::Query;
+use autumn_web::extract::Query;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -316,7 +316,7 @@ use crate::schema::todos;
 
 // Equivalent to the manual derives above (Queryable, Selectable,
 // Insertable, Serialize, Deserialize) plus #[diesel(table_name = todos)]
-#[autumn::model(table = "todos")]
+#[autumn_web::model(table = "todos")]
 pub struct Todo {
     pub id: i32,
     pub title: String,
@@ -332,7 +332,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn = "0.1.0"
+autumn-web = "0.1.0"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -355,7 +355,7 @@ It implements `Deref<Target = AsyncPgConnection>`, so you can pass `&mut *db`
 directly to Diesel queries:
 
 ```rust
-use autumn::prelude::*;
+use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -402,11 +402,11 @@ Register the new handlers in your `main()`:
 mod models;
 mod schema;
 
-use autumn::routes;
+use autumn_web::routes;
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
-    autumn::app()
+    autumn_web::app()
         .routes(routes![list_todos, create_todo])
         .run()
         .await;
@@ -433,12 +433,12 @@ Autumn re-exports [Maud](https://maud.lambda.xyz/), a compile-time HTML
 templating library. Return `Markup` from a handler to send HTML:
 
 ```rust
-use autumn::prelude::*;
+use autumn_web::prelude::*;
 
 #[get("/")]
 async fn index() -> Markup {
     html! {
-        (autumn::PreEscaped("<!DOCTYPE html>"))
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -471,7 +471,7 @@ Extract reusable layouts into functions:
 ```rust
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
-        (autumn::PreEscaped("<!DOCTYPE html>"))
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -567,8 +567,8 @@ htmx attributes in your Maud templates.
 Here is a toggle button that updates a todo without a full page reload:
 
 ```rust
-use autumn::prelude::*;
-use autumn::extract::Path;
+use autumn_web::prelude::*;
+use autumn_web::extract::Path;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -784,7 +784,7 @@ Here are some things to explore:
 - **Organize routes into modules** -- call `.routes()` multiple times on the
   app builder to compose route groups:
   ```rust
-  autumn::app()
+  autumn_web::app()
       .routes(routes![index])
       .routes(routes![list_todos, create_todo, toggle, delete_todo])
       .run()
@@ -792,7 +792,7 @@ Here are some things to explore:
   ```
 - **Use `Form<T>`** for HTML form submissions instead of JSON:
   ```rust
-  use autumn::extract::Form;
+  use autumn_web::extract::Form;
 
   #[post("/todos")]
   async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {

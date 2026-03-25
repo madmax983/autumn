@@ -1,4 +1,4 @@
-use autumn::{get, routes};
+use autumn_web::{get, routes};
 
 #[get("/test")]
 async fn test_handler() -> &'static str {
@@ -12,7 +12,7 @@ async fn other_handler() -> &'static str {
 
 #[test]
 fn app_builder_accepts_routes() {
-    let builder = autumn::app().routes(routes![test_handler]);
+    let builder = autumn_web::app().routes(routes![test_handler]);
     // Verify it compiles and doesn't panic — we can't call .run()
     // without actually starting a server.
     let _ = builder;
@@ -20,7 +20,7 @@ fn app_builder_accepts_routes() {
 
 #[test]
 fn app_builder_multiple_route_calls() {
-    let builder = autumn::app()
+    let builder = autumn_web::app()
         .routes(routes![test_handler])
         .routes(routes![other_handler]);
     let _ = builder;
@@ -29,5 +29,5 @@ fn app_builder_multiple_route_calls() {
 #[tokio::test]
 #[should_panic(expected = "No routes registered")]
 async fn empty_routes_panics() {
-    autumn::app().run().await;
+    autumn_web::app().run().await;
 }

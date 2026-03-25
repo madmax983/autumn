@@ -1,4 +1,4 @@
-use autumn::model;
+use autumn_web::model;
 
 // Diesel schema definition needed for the macro to work
 diesel::table! {

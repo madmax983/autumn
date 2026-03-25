@@ -1,4 +1,4 @@
-#[autumn::main]
+#[autumn_web::main]
 fn main() {
     println!("not async");
 }

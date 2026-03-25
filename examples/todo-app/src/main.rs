@@ -2,16 +2,16 @@ mod models;
 mod routes;
 mod schema;
 
-use autumn::routes;
+use autumn_web::routes;
 use diesel::Connection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-#[autumn::main]
+#[autumn_web::main]
 async fn main() {
     // Run pending database migrations before starting the server.
-    let config = autumn::config::AutumnConfig::load().expect("load config");
+    let config = autumn_web::config::AutumnConfig::load().expect("load config");
     if let Some(url) = &config.database.url {
         let mut conn =
             diesel::PgConnection::establish(url).expect("connect to database for migrations");
@@ -19,7 +19,7 @@ async fn main() {
             .expect("run migrations");
     }
 
-    autumn::app()
+    autumn_web::app()
         .routes(routes![
             routes::todos::index,
             routes::todos::list,

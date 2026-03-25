@@ -3,8 +3,8 @@
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive toggle/delete behaviour.
 
-use autumn::extract::{Form, Path};
-use autumn::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
+use autumn_web::extract::{Form, Path};
+use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -16,7 +16,7 @@ use crate::schema::todos;
 /// Base HTML layout wrapping page content.
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
-        (autumn::PreEscaped("<!DOCTYPE html>"))
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
             head {
                 meta charset="utf-8";
@@ -90,7 +90,7 @@ fn todo_item(todo: &Todo) -> Markup {
                    class="opacity-0 group-hover:opacity-100 text-stone-400 \
                           hover:text-red-500 transition-all cursor-pointer p-1" {
                 // Trash icon (SVG)
-                (autumn::PreEscaped(r#"<svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>"#))
+                (autumn_web::PreEscaped(r#"<svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" /></svg>"#))
             }
         }
     }
@@ -105,7 +105,7 @@ pub async fn index() -> Markup {
     // We avoid importing axum::response::Redirect to keep the example
     // focused on Autumn's own API surface.
     html! {
-        (autumn::PreEscaped("<!DOCTYPE html>"))
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html {
             head {
                 meta http-equiv="refresh" content="0;url=/todos";
@@ -250,7 +250,7 @@ pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {
 
     // Redirect back to the todo list after creation
     Ok(html! {
-        (autumn::PreEscaped("<!DOCTYPE html>"))
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html {
             head {
                 meta http-equiv="refresh" content="0;url=/todos";

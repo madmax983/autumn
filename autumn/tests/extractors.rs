@@ -1,4 +1,4 @@
-use autumn::extract::{Form, Json};
+use autumn_web::extract::{Form, Json};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};

@@ -5,10 +5,10 @@
 //! This crate provides:
 //! - Route annotation macros (`#[get]`, `#[post]`, etc.)
 //! - The `routes![]` collection macro
-//! - The `#[autumn::main]` entry point macro (S-008)
+//! - The `#[autumn_web::main]` entry point macro (S-008)
 //! - The `#[model]` attribute macro (S-018)
 //!
-//! Users should not depend on this crate directly — use `autumn` instead,
+//! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
 mod main_macro;
@@ -21,7 +21,7 @@ use proc_macro::TokenStream;
 /// Annotate an async function as a GET route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -29,7 +29,7 @@ use proc_macro::TokenStream;
 /// # Example
 ///
 /// ```ignore
-/// use autumn::get;
+/// use autumn_web::get;
 ///
 /// #[get("/hello")]
 /// async fn hello() -> &'static str {
@@ -44,7 +44,7 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a POST route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -52,7 +52,7 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use autumn::post;
+/// use autumn_web::post;
 ///
 /// #[post("/items")]
 /// async fn create_item() -> &'static str {
@@ -67,7 +67,7 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a PUT route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -75,7 +75,7 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use autumn::put;
+/// use autumn_web::put;
 ///
 /// #[put("/items/{id}")]
 /// async fn update_item() -> &'static str {
@@ -90,7 +90,7 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a DELETE route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn::route::Route`] pairing the path with an Axum
+/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -98,7 +98,7 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use autumn::delete;
+/// use autumn_web::delete;
 ///
 /// #[delete("/items/{id}")]
 /// async fn remove_item() -> &'static str {
@@ -119,7 +119,7 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Example
 ///
 /// ```ignore
-/// use autumn::{get, post, routes};
+/// use autumn_web::{get, post, routes};
 ///
 /// #[get("/hello")]
 /// async fn hello() -> &'static str { "hello" }
@@ -137,14 +137,14 @@ pub fn routes(input: TokenStream) -> TokenStream {
 /// Set up the async runtime for an Autumn application.
 ///
 /// This is a thin wrapper around `#[tokio::main]`. The real
-/// framework setup happens in `autumn::app().run()`.
+/// framework setup happens in `autumn_web::app().run()`.
 ///
 /// # Example
 ///
 /// ```ignore
-/// #[autumn::main]
+/// #[autumn_web::main]
 /// async fn main() {
-///     autumn::app()
+///     autumn_web::app()
 ///         .routes(routes![hello])
 ///         .run()
 ///         .await;
@@ -168,7 +168,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Explicit table name:
 ///
 /// ```ignore
-/// use autumn::model;
+/// use autumn_web::model;
 ///
 /// #[model(table = "users")]
 /// pub struct User {
@@ -180,7 +180,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Inferred table name (`BlogPost` -> `blog_posts`):
 ///
 /// ```ignore
-/// use autumn::model;
+/// use autumn_web::model;
 ///
 /// #[model]
 /// pub struct BlogPost {

@@ -60,7 +60,7 @@ This plan breaks Autumn's 11 epics and 48 functional requirements into 45 implem
 
 | ID | Title | Pts | FRs | Dependencies | Sprint |
 |----|-------|-----|-----|--------------|--------|
-| S-008 | #[autumn::main] macro (tokio::main wrapper) | 3 | FR-008 | S-001 | 3 |
+| S-008 | #[autumn_web::main] macro (tokio::main wrapper) | 3 | FR-008 | S-001 | 3 |
 | S-009 | App builder: routes collection → Axum router | 5 | FR-008 | S-005 | 3 |
 | S-010 | Startup route logging + empty-routes panic | 2 | FR-008 | S-009 | 3 |
 | S-011 | Request ID middleware | 3 | FR-030 | S-009 | 4 |
@@ -115,7 +115,7 @@ This plan breaks Autumn's 11 epics and 48 functional requirements into 45 implem
 
 | ID | Title | Pts | FRs | Dependencies | Sprint |
 |----|-------|-----|-----|--------------|--------|
-| S-033 | autumn::prelude module with all re-exports | 2 | FR-004 | S-020, S-031 | 8 |
+| S-033 | autumn_web::prelude module with all re-exports | 2 | FR-004 | S-020, S-031 | 8 |
 
 ### EPIC-001: Project Scaffolding & CLI (14 pts, 4 stories)
 
@@ -193,13 +193,13 @@ This plan breaks Autumn's 11 epics and 48 functional requirements into 45 implem
 | Story | Title | Pts |
 |-------|-------|-----|
 | S-006 | Path parameter extraction in route macros | 3 |
-| S-008 | #[autumn::main] macro | 3 |
+| S-008 | #[autumn_web::main] macro | 3 |
 | S-009 | App builder: routes → Axum router → server | 5 |
 | S-010 | Startup route logging + empty-routes panic | 2 |
 
 **Notes:** This is the "it's alive" sprint. S-009 is where Autumn becomes a framework — the builder that wires routes into a running Axum server.
 
-**Done when:** Write `#[autumn::main]`, call `autumn::app().routes(my_routes).run().await`, visit `http://localhost:3000/hello/world`, see a response. First running Autumn application.
+**Done when:** Write `#[autumn_web::main]`, call `autumn_web::app().routes(my_routes).run().await`, visit `http://localhost:3000/hello/world`, see a response. First running Autumn application.
 
 **🎯 MILESTONE: Autumn serves HTTP responses.**
 
@@ -294,7 +294,7 @@ If any answer is NO: scope cuts happen immediately (see product brief).
 | S-028 | Structured logging setup | 3 |
 | S-029 | Health check endpoint | 3 |
 | S-030 | Graceful shutdown | 3 |
-| S-033 | autumn::prelude module | 2* |
+| S-033 | autumn_web::prelude module | 2* |
 
 **Notes:** All straightforward integration work. No proc macros, no hard design problems. Each story is independent. S-032 moved to Sprint 7. S-033 may need to wait until all re-exports are finalized.
 
