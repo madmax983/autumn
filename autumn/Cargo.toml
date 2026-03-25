@@ -1,13 +1,10 @@
 [package]
-name = "autumn-web"
+name = "autumn"
 description = "An opinionated, convention-over-configuration web framework for Rust"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
-
-[lib]
-name = "autumn"
 
 [features]
 default = ["maud", "htmx", "tailwind", "db"]
