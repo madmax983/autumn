@@ -362,9 +362,32 @@ sprints:
       - story_id: "S-040"
         title: "Tutorial: build a todo app (outline + Chapter 1)"
         points: 1
+        status: "completed"
+        story_doc: "docs/stories/S-040.md"
+        completion_date: "2026-03-24"
+        notes: "1pt of 8pt total — outline and anchor chapter. Remaining 7pts in Sprint 12."
+
+  - sprint_number: 12
+    start_date: "2026-08-25"
+    end_date: "2026-09-05"
+    capacity_points: 12
+    committed_points: 9
+    completed_points: 0
+    status: "planned"
+    goal: "Ship v0.1 to crates.io"
+    notes: "Light sprint on purpose. Tutorial carries over from Sprint 11. Buffer for fixes discovered during doc writing."
+    stories:
+      - story_id: "S-040"
+        title: "Tutorial: build a todo app (Chapters 2-11)"
+        points: 7
         status: "defined"
         story_doc: "docs/stories/S-040.md"
-        notes: "1pt of 8pt total — outline and anchor chapter. Remaining 7pts in Sprint 12."
+        notes: "Remaining 7pts — write Chapters 2-11, test all code examples end-to-end."
+      - story_id: "S-045"
+        title: "crates.io publication (metadata, license, publish)"
+        points: 2
+        status: "defined"
+        story_doc: "docs/stories/S-045.md"
 
 velocity:
   sprint_1: 12
