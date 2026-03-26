@@ -517,28 +517,41 @@ impl Default for HealthConfig {
 mod tests {
     use super::*;
 
+    /// Mutex that serialises all tests which mutate environment variables.
+    /// Env vars are process-global, so concurrent tests that set/restore
+    /// the same key race each other. Locking this mutex prevents that.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard that sets an env var and restores it on drop.
+    /// Holds `ENV_LOCK` for its entire lifetime so concurrent env-mutating
+    /// tests cannot interleave.
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let original = std::env::var(key).ok();
-            // SAFETY: Tests run single-threaded (or with unique keys) so
-            // mutating the environment is acceptable.
+            // SAFETY: Serialised by ENV_LOCK — only one test mutates the
+            // environment at a time.
             unsafe {
                 std::env::set_var(key, value);
             }
-            Self { key, original }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                // SAFETY: Restoring previous env state in test teardown.
+                // SAFETY: Still holding ENV_LOCK via _lock field.
                 Some(val) => unsafe { std::env::set_var(self.key, val) },
                 None => unsafe { std::env::remove_var(self.key) },
             }
