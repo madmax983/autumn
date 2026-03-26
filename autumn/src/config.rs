@@ -533,7 +533,9 @@ mod tests {
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let original = std::env::var(key).ok();
             // SAFETY: Serialised by ENV_LOCK — only one test mutates the
             // environment at a time.
