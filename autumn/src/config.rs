@@ -354,13 +354,12 @@ impl DatabaseConfig {
     ///
     /// Returns a validation error if the URL has an invalid scheme.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref url) = self.url
-            && !url.starts_with("postgres://")
-            && !url.starts_with("postgresql://")
-        {
-            return Err(ConfigError::Validation(format!(
-                "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
-            )));
+        if let Some(ref url) = self.url {
+            if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                return Err(ConfigError::Validation(format!(
+                    "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
+                )));
+            }
         }
         Ok(())
     }
