@@ -173,6 +173,45 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn health_with_pool_returns_pool_status() {
+        // Build a pool from a dummy URL — it won't connect but the pool
+        // status (max_size, available, waiting) is available immediately.
+        let config = crate::config::DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = crate::db::create_pool(&config).unwrap().unwrap();
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(handler))
+            .with_state(AppState { pool: Some(pool) });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ok");
+        assert!(json["version"].is_string());
+        assert_eq!(json["pool"]["size"], 5);
+        assert!(json["pool"]["available"].is_number());
+    }
+
     #[tokio::test]
     async fn health_response_includes_version() {
         let app = axum::Router::new()

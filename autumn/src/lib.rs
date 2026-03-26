@@ -436,3 +436,52 @@ impl std::fmt::Debug for AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_state_debug_without_pool() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+        };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("AppState"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn app_state_debug_with_pool() {
+        let config = config::DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let pool = db::create_pool(&config).unwrap().unwrap();
+        let state = AppState { pool: Some(pool) };
+        let debug = format!("{state:?}");
+        assert!(debug.contains("Pool(max=5)"));
+    }
+
+    fn require_clone<T: Clone>(t: &T) -> T {
+        t.clone()
+    }
+
+    #[test]
+    fn app_state_is_clone() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+        };
+        let _cloned = require_clone(&state);
+    }
+
+    #[test]
+    fn app_fn_creates_builder() {
+        let builder = app::app();
+        // Just verify it compiles and can accept routes
+        let _builder = builder.routes(vec![]);
+    }
+}
