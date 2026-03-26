@@ -359,7 +359,7 @@ pub use maud::html;
 ///     Json(Item { id: 1, name: input.name })
 /// }
 /// ```
-pub use axum::Json;
+pub use crate::extract::Json;
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///

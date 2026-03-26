@@ -34,10 +34,10 @@ pub use maud::{Markup, PreEscaped, html};
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
-/// JSON request/response type.
-pub use axum::Json;
 /// Form data extractor.
-pub use axum::extract::Form;
+pub use crate::extract::Form;
+/// JSON request/response type.
+pub use crate::extract::Json;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.

@@ -30,8 +30,25 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use serde::Serialize;
 
 use crate::AppState;
+
+/// Typed health response — avoids dynamic `serde_json::Value` allocation.
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<PoolStatus>,
+}
+
+#[derive(Serialize)]
+struct PoolStatus {
+    size: u64,
+    available: u64,
+    waiting: u64,
+}
 
 /// Health check handler.
 ///
@@ -59,15 +76,15 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
             // Degraded when all connections are in use AND requests are queuing
             let healthy = available > 0 || waiting == 0;
 
-            let body = serde_json::json!({
-                "status": if healthy { "ok" } else { "degraded" },
-                "version": env!("CARGO_PKG_VERSION"),
-                "pool": {
-                    "size": size,
-                    "available": available,
-                    "waiting": waiting,
-                }
-            });
+            let body = HealthResponse {
+                status: if healthy { "ok" } else { "degraded" },
+                version: env!("CARGO_PKG_VERSION"),
+                pool: Some(PoolStatus {
+                    size,
+                    available,
+                    waiting,
+                }),
+            };
 
             let status_code = if healthy {
                 StatusCode::OK
@@ -79,10 +96,11 @@ pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    let body = serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-    });
+    let body = HealthResponse {
+        status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        pool: None,
+    };
     (StatusCode::OK, Json(body))
 }
 

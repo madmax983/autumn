@@ -9,7 +9,15 @@
 //! - [`AutumnError::not_found`] -- 404
 //! - [`AutumnError::bad_request`] -- 400
 //! - [`AutumnError::unprocessable`] -- 422
+//! - [`AutumnError::service_unavailable`] -- 503
 //! - [`AutumnError::with_status`] -- arbitrary status code
+//!
+//! For simple string messages without wrapping an error type:
+//!
+//! - [`AutumnError::not_found_msg`] -- 404 with a message
+//! - [`AutumnError::bad_request_msg`] -- 400 with a message
+//! - [`AutumnError::unprocessable_msg`] -- 422 with a message
+//! - [`AutumnError::service_unavailable_msg`] -- 503 with a message
 //!
 //! # Response format
 //!
@@ -36,6 +44,34 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
+
+/// Simple error type wrapping a string message.
+///
+/// Used by the `_msg` convenience constructors on [`AutumnError`] so callers
+/// don't need to wrap strings in `std::io::Error`.
+#[derive(Debug)]
+struct StringError(String);
+
+impl std::fmt::Display for StringError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StringError {}
+
+/// Typed JSON body for error responses -- avoids dynamic `serde_json::Value`.
+#[derive(Serialize)]
+struct ErrorBody {
+    error: ErrorInner,
+}
+
+#[derive(Serialize)]
+struct ErrorInner {
+    status: u16,
+    message: String,
+}
 
 /// Framework error type wrapping any error with an HTTP status code.
 ///
@@ -186,6 +222,46 @@ impl AutumnError {
         }
     }
 
+    /// Create a `503 Service Unavailable` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::service_unavailable(std::io::Error::other("pool exhausted"));
+    /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    /// ```
+    pub fn service_unavailable(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    // ── String-message convenience constructors ────────────────
+
+    /// Create a `404 Not Found` error from a plain string message.
+    pub fn not_found_msg(msg: impl Into<String>) -> Self {
+        Self::not_found(StringError(msg.into()))
+    }
+
+    /// Create a `400 Bad Request` error from a plain string message.
+    pub fn bad_request_msg(msg: impl Into<String>) -> Self {
+        Self::bad_request(StringError(msg.into()))
+    }
+
+    /// Create a `422 Unprocessable Entity` error from a plain string message.
+    pub fn unprocessable_msg(msg: impl Into<String>) -> Self {
+        Self::unprocessable(StringError(msg.into()))
+    }
+
+    /// Create a `503 Service Unavailable` error from a plain string message.
+    pub fn service_unavailable_msg(msg: impl Into<String>) -> Self {
+        Self::service_unavailable(StringError(msg.into()))
+    }
+
     /// Returns the HTTP status code associated with this error.
     ///
     /// # Examples
@@ -221,12 +297,12 @@ impl std::fmt::Debug for AutumnError {
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
         let status = self.status;
-        let body = serde_json::json!({
-            "error": {
-                "status": status.as_u16(),
-                "message": self.inner.to_string(),
-            }
-        });
+        let body = ErrorBody {
+            error: ErrorInner {
+                status: status.as_u16(),
+                message: self.inner.to_string(),
+            },
+        };
 
         (status, axum::Json(body)).into_response()
     }
@@ -270,6 +346,38 @@ mod tests {
     fn unprocessable_is_422() {
         let err = AutumnError::unprocessable(TestError("bad entity".into()));
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn service_unavailable_is_503() {
+        let err = AutumnError::service_unavailable(TestError("pool exhausted".into()));
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn not_found_msg_is_404() {
+        let err = AutumnError::not_found_msg("no such user");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert_eq!(err.to_string(), "no such user");
+    }
+
+    #[test]
+    fn bad_request_msg_is_400() {
+        let err = AutumnError::bad_request_msg("invalid input");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn unprocessable_msg_is_422() {
+        let err = AutumnError::unprocessable_msg("title required");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn service_unavailable_msg_is_503() {
+        let err = AutumnError::service_unavailable_msg("db down");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.to_string(), "db down");
     }
 
     #[test]
