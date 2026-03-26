@@ -29,9 +29,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use axum::http::{HeaderValue, Request, Response};
+use http::header::HeaderName;
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 use uuid::Uuid;
+
+/// Header name for the request ID, added to every response.
+static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// A unique identifier assigned to each incoming HTTP request.
 ///
@@ -146,8 +150,11 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(mut response)) => {
                 if let Some(id) = this.request_id.take() {
-                    if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
-                        response.headers_mut().insert("x-request-id", value);
+                    // Format UUID directly into a stack buffer to avoid a String allocation.
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    let s = id.0.as_hyphenated().encode_lower(&mut buf);
+                    if let Ok(value) = HeaderValue::from_bytes(s.as_bytes()) {
+                        response.headers_mut().insert(X_REQUEST_ID.clone(), value);
                     }
                 }
                 Poll::Ready(Ok(response))

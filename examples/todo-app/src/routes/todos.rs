@@ -11,6 +11,17 @@ use diesel_async::RunQueryDsl;
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
 
+/// Render a meta-refresh redirect page targeting the given URL.
+fn redirect_to(url: &str) -> Markup {
+    html! {
+        (autumn_web::PreEscaped("<!DOCTYPE html>"))
+        html {
+            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
+            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────
 
 /// Base HTML layout wrapping page content.
@@ -101,30 +112,15 @@ fn todo_item(todo: &Todo) -> Markup {
 /// Redirect the root path to `/todos`.
 #[get("/")]
 pub async fn index() -> Markup {
-    // Return a minimal page that redirects via meta refresh.
     // We avoid importing axum::response::Redirect to keep the example
     // focused on Autumn's own API surface.
-    html! {
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {
-            head {
-                meta http-equiv="refresh" content="0;url=/todos";
-            }
-            body {
-                p { "Redirecting to " a href="/todos" { "/todos" } "..." }
-            }
-        }
-    }
+    redirect_to("/todos")
 }
 
 /// List all todos.
 #[get("/todos")]
 pub async fn list(mut db: Db) -> AutumnResult<Markup> {
-    let all_todos: Vec<Todo> = todos::table
-        .order(todos::created_at.desc())
-        .select(Todo::as_select())
-        .load(&mut *db)
-        .await?;
+    let all_todos = Todo::all(&mut db).await?;
 
     let done_count = all_todos.iter().filter(|t| t.completed).count();
     let total = all_todos.len();
@@ -190,12 +186,7 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
 /// Show a single todo by ID.
 #[get("/todos/{id}")]
 pub async fn detail(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
-    let todo: Todo = todos::table
-        .find(*id)
-        .select(Todo::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(AutumnError::not_found)?;
+    let todo = Todo::find(*id, &mut db).await?;
 
     Ok(layout(
         &format!("Todo: {}", todo.title),
@@ -232,58 +223,26 @@ pub async fn detail(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
 /// Create a new todo from a form submission, then redirect to the list.
 #[post("/todos")]
 pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {
-    let new_todo = form.0;
-
-    if new_todo.title.trim().is_empty() {
-        return Err(AutumnError::unprocessable(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Title must not be empty",
-        )));
-    }
+    let new_todo = form.0.validated()?;
 
     diesel::insert_into(todos::table)
-        .values(&NewTodo {
-            title: new_todo.title.trim().to_owned(),
-        })
+        .values(&new_todo)
         .execute(&mut *db)
         .await?;
 
-    // Redirect back to the todo list after creation
-    Ok(html! {
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {
-            head {
-                meta http-equiv="refresh" content="0;url=/todos";
-            }
-            body {
-                p { "Redirecting to " a href="/todos" { "/todos" } "..." }
-            }
-        }
-    })
+    Ok(redirect_to("/todos"))
 }
 
 /// Toggle the completion status of a todo (htmx endpoint).
 ///
-/// Returns the updated todo item HTML fragment for htmx to swap in.
+/// Uses a single `UPDATE ... SET completed = NOT completed RETURNING *`
+/// query — one round-trip instead of three.
 #[post("/todos/{id}/toggle")]
 pub async fn toggle(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
-    let todo: Todo = todos::table
-        .find(*id)
-        .select(Todo::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(AutumnError::not_found)?;
-
-    diesel::update(todos::table.find(*id))
-        .set(todos::completed.eq(!todo.completed))
-        .execute(&mut *db)
-        .await?;
-
-    // Reload the updated todo for rendering
-    let updated: Todo = todos::table
-        .find(*id)
-        .select(Todo::as_select())
-        .first(&mut *db)
+    let updated: Todo = diesel::update(todos::table.find(*id))
+        .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
+        .returning(Todo::as_returning())
+        .get_result(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
 
@@ -300,9 +259,9 @@ pub async fn delete_todo(id: Path<i32>, mut db: Db) -> AutumnResult<String> {
         .await?;
 
     if deleted == 0 {
-        return Err(AutumnError::not_found(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Todo with id {} not found", *id),
+        return Err(AutumnError::not_found_msg(format!(
+            "Todo with id {} not found",
+            *id
         )));
     }
 

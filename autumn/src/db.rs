@@ -26,7 +26,6 @@
 //! ```
 
 use axum::extract::FromRequestParts;
-use axum::http::StatusCode;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
@@ -114,18 +113,14 @@ impl FromRequestParts<AppState> for Db {
         _parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let pool = state.pool.as_ref().ok_or_else(|| {
-            AutumnError::bad_request(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Database not configured",
-            ))
-            .with_status(StatusCode::SERVICE_UNAVAILABLE)
-        })?;
+        let pool = state
+            .pool
+            .as_ref()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
         let conn = pool.get().await.map_err(|e| {
-            eprintln!("Failed to acquire database connection: {e}");
-            AutumnError::bad_request(std::io::Error::other(e.to_string()))
-                .with_status(StatusCode::SERVICE_UNAVAILABLE)
+            tracing::error!("Failed to acquire database connection: {e}");
+            AutumnError::service_unavailable_msg(e.to_string())
         })?;
 
         Ok(Self(conn))
@@ -175,7 +170,7 @@ mod tests {
     async fn db_extractor_rejects_when_no_pool() {
         use axum::Router;
         use axum::body::Body;
-        use axum::http::Request;
+        use axum::http::{Request, StatusCode};
         use axum::routing::get;
         use tower::ServiceExt;
 

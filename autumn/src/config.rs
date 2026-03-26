@@ -165,12 +165,11 @@ impl AutumnConfig {
     /// Returns [`ConfigError::Io`] if the file cannot be read, or
     /// [`ConfigError::Parse`] if the file contains invalid TOML.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Ok(toml::from_str(&contents)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(ConfigError::Io(e)),
         }
-        let contents = std::fs::read_to_string(path)?;
-        let config: Self = toml::from_str(&contents)?;
-        Ok(config)
     }
 
     /// Apply environment variable overrides to the loaded config.
@@ -196,46 +195,24 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__PATH` → `health.path` (String)
     pub fn apply_env_overrides(&mut self) {
         // ── Server ──────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_SERVER__PORT") {
-            match val.parse::<u16>() {
-                Ok(port) => self.server.port = port,
-                Err(_) => {
-                    eprintln!("Warning: AUTUMN_SERVER__PORT={val:?} is not a valid port, ignoring");
-                }
-            }
-        }
+        parse_env("AUTUMN_SERVER__PORT", &mut self.server.port);
         if let Ok(val) = std::env::var("AUTUMN_SERVER__HOST") {
             self.server.host = val;
         }
-        if let Ok(val) = std::env::var("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS") {
-            match val.parse::<u64>() {
-                Ok(secs) => self.server.shutdown_timeout_secs = secs,
-                Err(_) => eprintln!(
-                    "Warning: AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS={val:?} is not a valid number, ignoring"
-                ),
-            }
-        }
+        parse_env(
+            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
+            &mut self.server.shutdown_timeout_secs,
+        );
 
         // ── Database ────────────────────────────────────────────
         if let Ok(val) = std::env::var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
-        if let Ok(val) = std::env::var("AUTUMN_DATABASE__POOL_SIZE") {
-            match val.parse::<usize>() {
-                Ok(size) => self.database.pool_size = size,
-                Err(_) => eprintln!(
-                    "Warning: AUTUMN_DATABASE__POOL_SIZE={val:?} is not a valid number, ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = std::env::var("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS") {
-            match val.parse::<u64>() {
-                Ok(secs) => self.database.connect_timeout_secs = secs,
-                Err(_) => eprintln!(
-                    "Warning: AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS={val:?} is not a valid number, ignoring"
-                ),
-            }
-        }
+        parse_env("AUTUMN_DATABASE__POOL_SIZE", &mut self.database.pool_size);
+        parse_env(
+            "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
+            &mut self.database.connect_timeout_secs,
+        );
 
         // ── Log ─────────────────────────────────────────────────
         if let Ok(val) = std::env::var("AUTUMN_LOG__LEVEL") {
@@ -442,6 +419,16 @@ pub struct HealthConfig {
     /// Common alternatives: `"/healthz"`, `"/_health"`, `"/ready"`.
     #[serde(default = "default_health_path")]
     pub path: String,
+}
+
+/// Parse an environment variable into a typed target, logging a warning on failure.
+fn parse_env<T: std::str::FromStr>(key: &str, target: &mut T) {
+    if let Ok(val) = std::env::var(key) {
+        match val.parse::<T>() {
+            Ok(v) => *target = v,
+            Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
+        }
+    }
 }
 
 // ── Default functions ──────────────────────────────────────────────
