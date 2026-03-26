@@ -1,5 +1,10 @@
 # Autumn 🍂
 
+[![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![Rust: 1.86.0+](https://img.shields.io/badge/rust-1.86.0%2B-orange.svg)](https://www.rust-lang.org)
+
 > Spring Boot-style web framework for Rust. Built on [Axum](https://github.com/tokio-rs/axum).
 
 Autumn assembles proven Rust crates into a convention-over-configuration web
