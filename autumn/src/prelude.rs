@@ -51,26 +51,32 @@ pub use crate::AppState;
 mod tests {
     use super::*;
 
-    // Verify key types are in scope by using them in type position.
-    // These are compile-time checks — if this module compiles, the prelude works.
-    #[cfg(all(feature = "db", feature = "maud"))]
-    #[allow(dead_code, clippy::unnecessary_wraps)]
-    fn _handler_using_prelude(_db: Db) -> AutumnResult<Markup> {
-        Ok(html! { "test" })
-    }
-
-    #[allow(dead_code)]
-    fn _json_handler() -> Json<&'static str> {
-        Json("ok")
-    }
-
     #[test]
     fn prelude_types_are_accessible() {
-        // Compilation is the test — verify a few types exist at runtime too
         #[cfg(feature = "db")]
         let _state = AppState { pool: None };
         #[cfg(not(feature = "db"))]
         let _state = AppState {};
         let _err: AutumnResult<()> = Ok(());
+    }
+
+    #[test]
+    fn json_type_works_through_prelude() {
+        let json: Json<&str> = Json("ok");
+        assert_eq!(json.0, "ok");
+    }
+
+    #[test]
+    fn error_types_work_through_prelude() {
+        let err = AutumnError::bad_request_msg("test");
+        let result: AutumnResult<()> = Err(err);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn maud_types_work_through_prelude() {
+        let markup: Markup = html! { "hello" };
+        assert!(markup.into_string().contains("hello"));
     }
 }

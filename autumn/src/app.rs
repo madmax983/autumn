@@ -176,51 +176,12 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 6. Build Axum router, logging each route as it mounts
-        let mut router = axum::Router::new();
-        for route in self.routes {
-            tracing::debug!(
-                method = %route.method,
-                path = route.path,
-                name = route.name,
-                "Mounted route"
-            );
-            router = router.route(route.path, route.handler);
-        }
-
-        // Framework-provided routes
-        #[cfg(feature = "htmx")]
-        {
-            router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
-            tracing::debug!(
-                method = "GET",
-                path = "/static/js/htmx.min.js",
-                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-                "Mounted route"
-            );
-        }
-
-        // Health check endpoint (auto-mounted)
-        router = router.route(
-            &config.health.path,
-            axum::routing::get(crate::health::handler),
-        );
-        tracing::debug!(path = %config.health.path, "Mounted health check");
-
-        // Static file serving from project's static/ directory.
-        // Resolve relative to the app's crate root (set by #[autumn_web::main])
-        // so `cargo run -p <example>` works from the workspace root.
-        let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
-            |_| std::path::PathBuf::from("static"),
-            |manifest_dir| std::path::PathBuf::from(manifest_dir).join("static"),
-        );
-        router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
-
+        // 6. Build the router
         let state = AppState {
             #[cfg(feature = "db")]
             pool,
         };
-        let router = router.layer(RequestIdLayer).with_state(state);
+        let router = build_router(self.routes, &config, state);
 
         // 7. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);
@@ -261,6 +222,55 @@ impl AppBuilder {
 
         tracing::info!("Server shut down cleanly");
     }
+}
+
+/// Build the fully-configured Axum router from routes, config, and state.
+///
+/// Extracted from `AppBuilder::run` so the router construction logic is
+/// testable without binding a real TCP listener.
+pub(crate) fn build_router(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+) -> axum::Router {
+    let mut router = axum::Router::new();
+    for route in route_list {
+        tracing::debug!(
+            method = %route.method,
+            path = route.path,
+            name = route.name,
+            "Mounted route"
+        );
+        router = router.route(route.path, route.handler);
+    }
+
+    // Framework-provided routes
+    #[cfg(feature = "htmx")]
+    {
+        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+        tracing::debug!(
+            method = "GET",
+            path = "/static/js/htmx.min.js",
+            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+            "Mounted route"
+        );
+    }
+
+    // Health check endpoint (auto-mounted)
+    router = router.route(
+        &config.health.path,
+        axum::routing::get(crate::health::handler),
+    );
+    tracing::debug!(path = %config.health.path, "Mounted health check");
+
+    // Static file serving from project's static/ directory.
+    let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+        |_| std::path::PathBuf::from("static"),
+        |manifest_dir| std::path::PathBuf::from(manifest_dir).join("static"),
+    );
+    router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+
+    router.layer(RequestIdLayer).with_state(state)
 }
 
 #[cfg(feature = "htmx")]
@@ -310,13 +320,165 @@ async fn shutdown_signal() {
 }
 
 #[cfg(test)]
-#[cfg(feature = "htmx")]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    /// Helper to build a test router with default config and no database.
+    fn test_router(routes: Vec<Route>) -> axum::Router {
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+        };
+        build_router(routes, &config, state)
+    }
+
+    /// Helper to create a simple GET route for testing.
+    fn test_get_route(path: &'static str, name: &'static str) -> Route {
+        Route {
+            method: http::Method::GET,
+            path,
+            handler: axum::routing::get(|| async { "ok" }),
+            name,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_user_routes() {
+        let router = test_router(vec![test_get_route("/test", "test_handler")]);
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_health_check_at_default_path() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_health_check_at_custom_path() {
+        let mut config = AutumnConfig::default();
+        config.health.path = "/healthz".to_owned();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+        };
+        let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_adds_request_id_header() {
+        let router = test_router(vec![test_get_route("/test", "test")]);
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.headers().contains_key("x-request-id"));
+    }
+
+    #[tokio::test]
+    async fn build_router_unknown_route_returns_404() {
+        let router = test_router(vec![test_get_route("/exists", "exists")]);
+
+        let response = router
+            .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn build_router_multiple_routes() {
+        let router = test_router(vec![test_get_route("/a", "a"), test_get_route("/b", "b")]);
+
+        let resp_a = router
+            .clone()
+            .oneshot(Request::builder().uri("/a").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp_a.status(), StatusCode::OK);
+
+        let resp_b = router
+            .oneshot(Request::builder().uri("/b").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp_b.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_post_route() {
+        let post_routes = vec![Route {
+            method: http::Method::POST,
+            path: "/submit",
+            handler: axum::routing::post(|| async { "posted" }),
+            name: "submit",
+        }];
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+        };
+        let router = build_router(post_routes, &config, state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "htmx")]
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
         let app =
@@ -369,5 +531,30 @@ mod tests {
             start.contains("htmx") || start.contains("function"),
             "Response doesn't look like htmx JavaScript: {start}"
         );
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
+    async fn build_router_serves_htmx_js() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/static/js/htmx.min.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let ct = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.contains("javascript"));
     }
 }
