@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      rust-deps:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "axum*"
+          - "diesel*"
+          - "tokio"
+        update-types:
+          - minor
+          - patch
+      axum-ecosystem:
+        patterns:
+          - "axum*"
+          - "tower*"
+          - "http"
+      diesel-ecosystem:
+        patterns:
+          - "diesel*"
+          - "libsqlite3-sys"
+    labels:
+      - dependencies
+      - automated
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - ci
+      - automated

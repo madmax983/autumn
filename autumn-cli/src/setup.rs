@@ -331,8 +331,7 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ./tailwindcss-
 a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f  ./tailwindcss-windows-x64.exe
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-macos-arm64
 ";
-        let hash =
-            parse_checksum_file(body, "tailwindcss-windows-x64.exe").expect("should parse");
+        let hash = parse_checksum_file(body, "tailwindcss-windows-x64.exe").expect("should parse");
         assert_eq!(
             hash,
             "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
@@ -352,8 +351,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
 
     #[test]
     fn parse_uppercase_hex() {
-        let body =
-            "A948904F2F0F479B8F8564E9D7A8F22E32D13E73845F1B0EA0E2975A02C8B87F  tailwindcss-linux-x64\n";
+        let body = "A948904F2F0F479B8F8564E9D7A8F22E32D13E73845F1B0EA0E2975A02C8B87F  tailwindcss-linux-x64\n";
         let hash = parse_checksum_file(body, "tailwindcss-linux-x64").expect("should parse");
         assert_eq!(
             hash,
@@ -369,8 +367,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
 
     #[test]
     fn parse_missing_binary_fails() {
-        let body =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  tailwindcss-linux-x64\n";
+        let body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  tailwindcss-linux-x64\n";
         let err = parse_checksum_file(body, "tailwindcss-windows-x64.exe").unwrap_err();
         assert!(matches!(err, SetupError::ChecksumParse(_)));
         assert!(err.to_string().contains("tailwindcss-windows-x64.exe"));

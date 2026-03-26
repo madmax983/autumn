@@ -145,10 +145,10 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(mut response)) => {
-                if let Some(id) = this.request_id.take()
-                    && let Ok(value) = HeaderValue::from_str(&id.to_string())
-                {
-                    response.headers_mut().insert("x-request-id", value);
+                if let Some(id) = this.request_id.take() {
+                    if let Ok(value) = HeaderValue::from_str(&id.to_string()) {
+                        response.headers_mut().insert("x-request-id", value);
+                    }
                 }
                 Poll::Ready(Ok(response))
             }
