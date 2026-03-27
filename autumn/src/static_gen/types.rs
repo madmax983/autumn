@@ -160,9 +160,10 @@ mod tests {
             name: "test_handler",
             revalidate: Some(60),
         };
-        let cloned = meta.clone();
-        assert_eq!(cloned.path, "/test");
-        assert_eq!(cloned.name, "test_handler");
-        assert_eq!(cloned.revalidate, Some(60));
+        // Verify Clone works by cloning into a Vec (prevents redundant_clone lint)
+        let items = vec![meta.clone()];
+        assert_eq!(items[0].path, "/test");
+        assert_eq!(items[0].name, "test_handler");
+        assert_eq!(items[0].revalidate, Some(60));
     }
 }

@@ -711,15 +711,15 @@ mod tests {
         std::fs::write(dist.join("about/index.html"), "<h1>Static About</h1>").expect("write");
         std::fs::write(dist.join("index.html"), "<h1>Static Home</h1>").expect("write");
 
-        let mut routes = HashMap::new();
-        routes.insert(
+        let mut manifest_routes = HashMap::new();
+        manifest_routes.insert(
             "/".to_owned(),
             crate::static_gen::ManifestEntry {
                 file: "index.html".to_owned(),
                 revalidate: None,
             },
         );
-        routes.insert(
+        manifest_routes.insert(
             "/about".to_owned(),
             crate::static_gen::ManifestEntry {
                 file: "about/index.html".to_owned(),
@@ -729,7 +729,7 @@ mod tests {
         let manifest = crate::static_gen::StaticManifest {
             generated_at: "2026-03-27T00:00:00Z".to_owned(),
             autumn_version: "0.2.0".to_owned(),
-            routes,
+            routes: manifest_routes,
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
