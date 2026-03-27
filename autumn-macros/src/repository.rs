@@ -18,22 +18,30 @@ use crate::model::infer_table_name;
 struct RepoConfig {
     model_name: Ident,
     table_name: String,
+    hooks_type: Option<Ident>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;
+    let mut hooks_type: Option<Ident> = None;
 
     syn::meta::parser(|meta| {
-        if meta.path.get_ident().is_some() && model_name.is_none() && !meta.path.is_ident("table") {
-            model_name = Some(meta.path.get_ident().unwrap().clone());
+        // `hooks = Ident` must be checked before the catch-all model_name case,
+        // otherwise "hooks" would be parsed as the model name.
+        if meta.path.is_ident("hooks") {
+            let value: Ident = meta.value()?.parse()?;
+            hooks_type = Some(value);
             Ok(())
         } else if meta.path.is_ident("table") {
             let value: LitStr = meta.value()?.parse()?;
             table_name = Some(value.value());
             Ok(())
+        } else if meta.path.get_ident().is_some() && model_name.is_none() {
+            model_name = Some(meta.path.get_ident().unwrap().clone());
+            Ok(())
         } else {
-            Err(meta.error("expected model name or table = \"...\""))
+            Err(meta.error("expected model name, table = \"...\", or hooks = Type"))
         }
     })
     .parse2(attr)?;
@@ -49,6 +57,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     Ok(RepoConfig {
         model_name: model,
         table_name: table,
+        hooks_type,
     })
 }
 
@@ -407,5 +416,37 @@ mod tests {
     #[test]
     fn mixed_and_or_returns_none() {
         assert!(parse_query_name("find_by_a_and_b_or_c").is_none());
+    }
+
+    #[test]
+    fn parse_repo_args_with_hooks() {
+        let tokens: proc_macro2::TokenStream = "Post, hooks = PostHooks".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert_eq!(
+            config.hooks_type.as_ref().map(|h| h.to_string()),
+            Some("PostHooks".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_without_hooks() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.hooks_type.is_none());
+    }
+
+    #[test]
+    fn parse_repo_args_with_table_and_hooks() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, table = "blog_posts", hooks = PostHooks"#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert_eq!(config.table_name, "blog_posts");
+        assert_eq!(
+            config.hooks_type.as_ref().map(|h| h.to_string()),
+            Some("PostHooks".to_string())
+        );
     }
 }
