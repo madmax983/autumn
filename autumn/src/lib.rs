@@ -60,6 +60,7 @@
 //! [Maud]: https://maud.lambda.xyz
 //! [Diesel]: https://diesel.rs
 
+pub mod actuator;
 pub mod app;
 pub mod config;
 #[cfg(feature = "db")]
@@ -73,6 +74,8 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod task;
+pub mod validation;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -108,12 +111,23 @@ pub use db::Db;
 /// [`AutumnResult<T>`] is `Result<T, AutumnError>`.
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
+
+/// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
+/// and validates via `validator::Validate` before the handler runs.
+/// Returns 422 with structured error details on validation failure.
+pub use validation::Valid;
+
+/// Proof that `T` has passed validation. See [`validation`] module.
+pub use validation::Validated;
+
 /// htmx version string embedded in the binary.
 ///
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::HTMX_VERSION;
+/// Extension trait adding `.validate()` to all `validator::Validate` types.
+pub use validation::ValidateExt;
 
 // ── Proc-macro re-exports ──────────────────────────────────────────
 
@@ -213,6 +227,12 @@ pub use autumn_macros::main;
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
 
+/// Derive a repository with CRUD operations and derived queries.
+///
+/// See [`repository`](autumn_macros::repository) for details.
+#[cfg(feature = "db")]
+pub use autumn_macros::repository;
+
 /// Annotate an async function as a `POST` route handler.
 ///
 /// Generates a companion function that returns a [`route::Route`]
@@ -275,6 +295,12 @@ pub use autumn_macros::put;
 /// # }
 /// ```
 pub use autumn_macros::routes;
+
+/// Declare a scheduled background task. See [`task`] module.
+pub use autumn_macros::scheduled;
+
+/// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
+pub use autumn_macros::tasks;
 
 // ── Maud re-exports ────────────────────────────────────────────────
 
@@ -384,8 +410,11 @@ pub mod reexports {
     pub use axum;
     #[cfg(feature = "db")]
     pub use diesel;
+    #[cfg(feature = "db")]
+    pub use diesel_async;
     pub use http;
     pub use tokio;
+    pub use validator;
 }
 
 /// Shared application state passed to all route handlers.
@@ -406,7 +435,12 @@ pub mod reexports {
 /// use autumn_web::AppState;
 ///
 /// // State without a database (e.g., for testing)
-/// let state = AppState { pool: None };
+/// let state = AppState {
+///     pool: None,
+///     profile: Some("dev".into()),
+///     started_at: std::time::Instant::now(),
+///     health_detailed: true,
+/// };
 /// ```
 #[derive(Clone)]
 pub struct AppState {
@@ -414,26 +448,61 @@ pub struct AppState {
     #[cfg(feature = "db")]
     pub pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+
+    /// Active profile name (e.g., "dev", "prod", "staging").
+    pub profile: Option<String>,
+
+    /// When the application started. Used for uptime calculation.
+    pub started_at: std::time::Instant,
+
+    /// Whether the health endpoint should include detailed info.
+    pub health_detailed: bool,
+}
+
+impl AppState {
+    /// Returns the active profile name, or `"default"` if none is set.
+    #[must_use]
+    pub fn profile(&self) -> &str {
+        self.profile.as_deref().unwrap_or("default")
+    }
+
+    /// Returns how long the application has been running.
+    #[must_use]
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
+    }
+
+    /// Format uptime as a human-readable string (e.g., "2h 15m").
+    #[must_use]
+    pub fn uptime_display(&self) -> String {
+        let secs = self.started_at.elapsed().as_secs();
+        if secs < 60 {
+            format!("{secs}s")
+        } else if secs < 3600 {
+            format!("{}m {}s", secs / 60, secs % 60)
+        } else {
+            let hours = secs / 3600;
+            let mins = (secs % 3600) / 60;
+            format!("{hours}h {mins}m")
+        }
+    }
 }
 
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("AppState");
         #[cfg(feature = "db")]
-        {
-            f.debug_struct("AppState")
-                .field(
-                    "pool",
-                    &self
-                        .pool
-                        .as_ref()
-                        .map(|p| format!("Pool(max={})", p.status().max_size)),
-                )
-                .finish()
-        }
-        #[cfg(not(feature = "db"))]
-        {
-            f.debug_struct("AppState").finish()
-        }
+        s.field(
+            "pool",
+            &self
+                .pool
+                .as_ref()
+                .map(|p| format!("Pool(max={})", p.status().max_size)),
+        );
+        s.field("profile", &self.profile)
+            .field("started_at", &self.started_at)
+            .field("health_detailed", &self.health_detailed)
+            .finish()
     }
 }
 
@@ -446,9 +515,13 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: Some("dev".into()),
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let debug = format!("{state:?}");
         assert!(debug.contains("AppState"));
+        assert!(debug.contains("dev"));
     }
 
     #[cfg(feature = "db")]
@@ -460,7 +533,12 @@ mod tests {
             ..Default::default()
         };
         let pool = db::create_pool(&config).unwrap().unwrap();
-        let state = AppState { pool: Some(pool) };
+        let state = AppState {
+            pool: Some(pool),
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
     }
@@ -474,8 +552,51 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let _cloned = require_clone(&state);
+    }
+
+    #[test]
+    fn app_state_profile_accessor() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: Some("staging".into()),
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        assert_eq!(state.profile(), "staging");
+    }
+
+    #[test]
+    fn app_state_profile_default() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        assert_eq!(state.profile(), "default");
+    }
+
+    #[test]
+    fn app_state_uptime_display() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let display = state.uptime_display();
+        assert!(
+            display.contains('s'),
+            "uptime should contain 's': {display}"
+        );
     }
 
     #[test]

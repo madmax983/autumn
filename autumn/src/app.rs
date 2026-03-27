@@ -55,7 +55,10 @@ use crate::route::Route;
 /// ```
 #[must_use]
 pub const fn app() -> AppBuilder {
-    AppBuilder { routes: Vec::new() }
+    AppBuilder {
+        routes: Vec::new(),
+        tasks: Vec::new(),
+    }
 }
 
 /// Builder for configuring and launching an Autumn application.
@@ -88,6 +91,7 @@ pub const fn app() -> AppBuilder {
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    tasks: Vec<crate::task::TaskInfo>,
 }
 
 impl AppBuilder {
@@ -118,6 +122,17 @@ impl AppBuilder {
         self
     }
 
+    /// Register scheduled background tasks with the application.
+    ///
+    /// Tasks run alongside the HTTP server and are stopped during
+    /// graceful shutdown. Use the [`tasks!`](crate::tasks) macro
+    /// to collect `#[scheduled]` handlers.
+    #[must_use]
+    pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
     /// Start the HTTP server.
     ///
     /// This method performs the full application lifecycle:
@@ -138,7 +153,7 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     pub async fn run(self) {
-        // 1. Load configuration
+        // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
             std::process::exit(1);
@@ -153,8 +168,13 @@ impl AppBuilder {
             "No routes registered. Did you forget to call .routes()?"
         );
 
-        // 4. Log banner
-        tracing::info!("Autumn v{}", env!("CARGO_PKG_VERSION"));
+        // 4. Log banner with profile info
+        let profile_display = config.profile.as_deref().unwrap_or("none");
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            profile = profile_display,
+            "Autumn starting"
+        );
 
         // 5. Create database pool (if configured)
         #[cfg(feature = "db")]
@@ -180,10 +200,28 @@ impl AppBuilder {
         let state = AppState {
             #[cfg(feature = "db")]
             pool,
+            profile: config.profile.clone(),
+            started_at: std::time::Instant::now(),
+            health_detailed: config.health.detailed,
         };
-        let router = build_router(self.routes, &config, state);
+        let router = build_router(self.routes, &config, state.clone());
 
-        // 7. Bind and serve with graceful shutdown
+        // 7. Start scheduled tasks (if any)
+        if !self.tasks.is_empty() {
+            tracing::info!(count = self.tasks.len(), "Starting scheduled tasks");
+            for task_info in &self.tasks {
+                let schedule_desc = match &task_info.schedule {
+                    crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+                    crate::task::Schedule::Cron { expression, .. } => {
+                        format!("cron {expression}")
+                    }
+                };
+                tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+            }
+            start_task_scheduler(self.tasks, &state);
+        }
+
+        // 8. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);
         tracing::info!(addr = %addr, "Listening");
 
@@ -221,6 +259,40 @@ impl AppBuilder {
             });
 
         tracing::info!("Server shut down cleanly");
+    }
+}
+
+/// Start scheduled tasks in background Tokio tasks.
+///
+/// Each task runs in its own spawned task with error logging.
+/// Uses simple `tokio::time` for fixed-delay scheduling.
+fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
+    for task_info in tasks {
+        let state = state.clone();
+        let name = task_info.name.clone();
+        let handler = task_info.handler;
+
+        match task_info.schedule {
+            crate::task::Schedule::FixedDelay(delay) => {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        tracing::debug!(task = %name, "Running scheduled task");
+                        match (handler)(state.clone()).await {
+                            Ok(()) => tracing::debug!(task = %name, "Task completed"),
+                            Err(e) => tracing::warn!(task = %name, error = %e, "Task failed"),
+                        }
+                    }
+                });
+            }
+            crate::task::Schedule::Cron { expression, .. } => {
+                tracing::info!(
+                    task = %name,
+                    cron = %expression,
+                    "Cron scheduling not yet implemented; task registered but will not run"
+                );
+            }
+        }
     }
 }
 
@@ -262,6 +334,14 @@ pub(crate) fn build_router(
         axum::routing::get(crate::health::handler),
     );
     tracing::debug!(path = %config.health.path, "Mounted health check");
+
+    // Actuator endpoints
+    let actuator_sensitive = config.actuator.sensitive;
+    router = router.merge(crate::actuator::actuator_router(actuator_sensitive));
+    tracing::debug!(
+        sensitive = actuator_sensitive,
+        "Mounted actuator endpoints at /actuator/*"
+    );
 
     // Static file serving from project's static/ directory.
     let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
@@ -332,6 +412,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         build_router(routes, &config, state)
     }
@@ -391,6 +474,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
@@ -461,6 +547,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let router = build_router(post_routes, &config, state);
 

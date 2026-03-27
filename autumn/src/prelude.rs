@@ -23,7 +23,7 @@
 
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.
-pub use autumn_macros::{delete, get, main, post, put, routes};
+pub use autumn_macros::{delete, get, main, post, put, routes, scheduled, tasks};
 
 // ── Rendering ────────────────────────────────────────────────────
 /// Maud HTML templating types.
@@ -43,6 +43,10 @@ pub use crate::extract::Json;
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
 
+// ── Validation ──────────────────────────────────────────────────
+/// Auto-validating extractor and proof-of-validation newtype.
+pub use crate::validation::{Valid, ValidateExt, Validated};
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::AppState;
@@ -54,9 +58,18 @@ mod tests {
     #[test]
     fn prelude_types_are_accessible() {
         #[cfg(feature = "db")]
-        let _state = AppState { pool: None };
+        let _state = AppState {
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
         #[cfg(not(feature = "db"))]
-        let _state = AppState {};
+        let _state = AppState {
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
         let _err: AutumnResult<()> = Ok(());
     }
 

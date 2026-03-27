@@ -31,6 +31,17 @@ pub fn main_macro(item: TokenStream) -> TokenStream {
             // SAFETY: called at the top of main, before any threads are spawned.
             unsafe { ::std::env::set_var("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR")); }
 
+            // Tell the framework whether the *user's* crate was built in debug mode.
+            // cfg!(debug_assertions) evaluates here — in the user's crate context —
+            // so it reflects their build mode, not autumn-web's library build mode.
+            // SAFETY: called at the top of main, before any threads are spawned.
+            unsafe {
+                ::std::env::set_var(
+                    "AUTUMN_IS_DEBUG",
+                    if cfg!(debug_assertions) { "1" } else { "0" },
+                );
+            }
+
             ::autumn_web::reexports::tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

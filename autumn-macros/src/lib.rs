@@ -13,8 +13,11 @@
 
 mod main_macro;
 mod model;
+mod repository;
 mod route;
 mod routes_macro;
+mod scheduled;
+mod tasks_macro;
 
 use proc_macro::TokenStream;
 
@@ -191,4 +194,50 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
+}
+
+/// Derive a repository with CRUD operations and derived queries.
+///
+/// Generates a `PgXxxRepository` struct implementing the annotated trait,
+/// with auto-generated CRUD methods and query-by-name derived methods.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::repository;
+///
+/// #[repository(Post)]
+/// trait PostRepository {
+///     fn find_by_published(published: bool) -> Vec<Post>;
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
+    repository::repository_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a scheduled background task.
+///
+/// # Examples
+///
+/// ```ignore
+/// #[scheduled(every = "5m", name = "cleanup")]
+/// async fn cleanup(state: AppState) -> AutumnResult<()> { Ok(()) }
+///
+/// #[scheduled(cron = "0 0 0 * * *", name = "nightly")]
+/// async fn nightly(state: AppState) -> AutumnResult<()> { Ok(()) }
+/// ```
+#[proc_macro_attribute]
+pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
+    scheduled::scheduled_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
+///
+/// ```ignore
+/// let all_tasks = tasks![cleanup, nightly];
+/// ```
+#[proc_macro]
+pub fn tasks(input: TokenStream) -> TokenStream {
+    tasks_macro::tasks_macro(input.into()).into()
 }
