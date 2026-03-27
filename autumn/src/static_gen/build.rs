@@ -200,21 +200,17 @@ mod tests {
     }
 
     fn echo_router() -> axum::Router {
-        axum::Router::new().fallback(axum::routing::get(
-            |uri: axum::http::Uri| async move { format!("Hello from {}", uri.path()) },
-        ))
+        axum::Router::new().fallback(axum::routing::get(|uri: axum::http::Uri| async move {
+            format!("Hello from {}", uri.path())
+        }))
     }
 
     #[tokio::test]
     async fn renders_single_route_to_dist() {
         let tmp = tempfile::tempdir().unwrap();
         let dist = tmp.path().join("dist");
-        let result = render_static_routes(
-            echo_router(),
-            &[test_meta("/about", "about")],
-            &dist,
-        )
-        .await;
+        let result =
+            render_static_routes(echo_router(), &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_ok(), "render failed: {:?}", result.err());
         let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
         assert_eq!(html, "Hello from /about");
@@ -227,12 +223,7 @@ mod tests {
     async fn renders_root_route() {
         let tmp = tempfile::tempdir().unwrap();
         let dist = tmp.path().join("dist");
-        let result = render_static_routes(
-            echo_router(),
-            &[test_meta("/", "index")],
-            &dist,
-        )
-        .await;
+        let result = render_static_routes(echo_router(), &[test_meta("/", "index")], &dist).await;
         assert!(result.is_ok());
         let html = std::fs::read_to_string(dist.join("index.html")).unwrap();
         assert_eq!(html, "Hello from /");
@@ -240,16 +231,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_2xx_response() {
-        let router = axum::Router::new()
-            .fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") });
+        let router =
+            axum::Router::new().fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") });
         let tmp = tempfile::tempdir().unwrap();
         let dist = tmp.path().join("dist");
-        let result = render_static_routes(
-            router,
-            &[test_meta("/about", "about")],
-            &dist,
-        )
-        .await;
+        let result = render_static_routes(router, &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_err());
         assert!(!dist.exists(), "dist should not exist after failed build");
         let staging = dist.with_extension("staging");
@@ -265,12 +251,8 @@ mod tests {
         let dist = tmp.path().join("dist");
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(dist.join("stale.html"), "old").unwrap();
-        let result = render_static_routes(
-            echo_router(),
-            &[test_meta("/about", "about")],
-            &dist,
-        )
-        .await;
+        let result =
+            render_static_routes(echo_router(), &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_ok());
         assert!(!dist.join("stale.html").exists());
         assert!(dist.join("about/index.html").exists());

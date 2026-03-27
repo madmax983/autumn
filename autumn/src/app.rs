@@ -165,6 +165,14 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     pub async fn run(self) {
+        // ── Build mode ─────────────────────────────────────────────────
+        // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
+        // instead of starting the HTTP server. This is triggered by `autumn build`.
+        if std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1") {
+            self.run_build_mode().await;
+            return;
+        }
+
         // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
@@ -281,6 +289,68 @@ impl AppBuilder {
 
         tracing::info!("Server shut down cleanly");
     }
+
+    /// Render all registered static routes to `dist/` and exit.
+    ///
+    /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
+    /// Builds the Axum router, renders each static route through it, and
+    /// writes HTML + manifest to the `dist/` directory.
+    async fn run_build_mode(self) {
+        // Load config (same as normal startup)
+        let config = AutumnConfig::load().unwrap_or_else(|e| {
+            eprintln!("Failed to load configuration: {e}");
+            std::process::exit(1);
+        });
+        crate::logging::init(&config.log);
+
+        if self.static_metas.is_empty() {
+            eprintln!("No static routes registered. Nothing to build.");
+            eprintln!("Hint: use .static_routes(static_routes![...]) on your AppBuilder.");
+            std::process::exit(1);
+        }
+
+        // Build state (with DB if configured)
+        #[cfg(feature = "db")]
+        let pool = match db::create_pool(&config.database) {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Failed to create database pool: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool,
+            profile: config.profile.clone(),
+            started_at: std::time::Instant::now(),
+            health_detailed: config.health.detailed,
+        };
+
+        // Build the full router (same as production)
+        let router = build_router(self.routes, &config, state);
+
+        // Determine output directory
+        let dist_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+            |_| std::path::PathBuf::from("dist"),
+            |d| std::path::PathBuf::from(d).join("dist"),
+        );
+
+        eprintln!("Building {} static route(s)...", self.static_metas.len());
+
+        match crate::static_gen::render_static_routes(router, &self.static_metas, &dist_dir).await {
+            Ok(()) => {
+                eprintln!(
+                    "\n  \u{2713} Static build complete \u{2192} {}",
+                    dist_dir.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("\n  \u{2717} Static build failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -321,7 +391,7 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 ///
 /// Extracted from `AppBuilder::run` so the router construction logic is
 /// testable without binding a real TCP listener.
-pub(crate) fn build_router(
+pub fn build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
