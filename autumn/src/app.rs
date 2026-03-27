@@ -371,7 +371,9 @@ pub(crate) fn build_router(
 ///
 /// When `dist_dir` is `None` or the manifest is missing, the returned
 /// router is identical to [`build_router`].
-pub(crate) fn build_router_with_static(
+///
+/// This function is public primarily for integration testing.
+pub fn build_router_with_static(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
