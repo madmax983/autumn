@@ -77,6 +77,8 @@ pub mod route;
 pub mod static_gen;
 pub mod task;
 pub mod validation;
+#[cfg(feature = "db")]
+pub mod hooks;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
