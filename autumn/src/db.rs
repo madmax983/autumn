@@ -178,9 +178,12 @@ mod tests {
             "ok"
         }
 
-        let app = Router::new()
-            .route("/", get(handler))
-            .with_state(AppState { pool: None });
+        let app = Router::new().route("/", get(handler)).with_state(AppState {
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        });
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

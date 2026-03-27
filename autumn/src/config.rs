@@ -1,14 +1,23 @@
-//! Framework configuration with sensible defaults.
+//! Framework configuration with sensible defaults and profile-based layering.
 //!
-//! Autumn uses a three-layer configuration system where each layer
+//! Autumn uses a five-layer configuration system where each layer
 //! overrides the previous one:
 //!
 //! 1. **Framework defaults** (this module) -- compiled into the binary.
-//! 2. **`autumn.toml`** -- project-level overrides checked into source control.
-//! 3. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
+//! 2. **Profile smart defaults** -- per-profile values for `dev`/`prod`.
+//! 3. **`autumn.toml`** -- project-level overrides checked into source control.
+//! 4. **`autumn-{profile}.toml`** -- profile-specific overrides.
+//! 5. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
 //!
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
+//!
+//! # Profiles
+//!
+//! Profiles are resolved in precedence order:
+//! 1. `AUTUMN_PROFILE` environment variable
+//! 2. `--profile` CLI flag
+//! 3. Auto-detect from debug/release build mode
 //!
 //! # Example
 //!
@@ -35,23 +44,169 @@
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
+//! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
+//! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Locate `autumn.toml` by checking the app's crate directory first, then CWD.
-fn find_config_file() -> PathBuf {
-    // Prefer the app's crate root (set by #[autumn_web::main]).
+/// Locate a config file by checking the app's crate directory first, then CWD.
+fn find_config_file_named(filename: &str) -> PathBuf {
     if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
-        let candidate = PathBuf::from(manifest_dir).join("autumn.toml");
+        let candidate = PathBuf::from(manifest_dir).join(filename);
         if candidate.exists() {
             return candidate;
         }
     }
-    // Fall back to CWD.
-    PathBuf::from("autumn.toml")
+    PathBuf::from(filename)
+}
+
+/// Load a TOML file as a raw `toml::Value` table.
+/// Returns `Ok(None)` if the file doesn't exist.
+fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents.parse::<toml::Value>()?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ConfigError::Io(e)),
+    }
+}
+
+/// Resolve the active profile using the three-mechanism precedence chain.
+///
+/// 1. `AUTUMN_PROFILE` env var (highest priority)
+/// 2. `--profile <name>` CLI flag
+/// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
+fn resolve_profile() -> Option<String> {
+    // 1. Env var
+    if let Ok(profile) = std::env::var("AUTUMN_PROFILE") {
+        if !profile.is_empty() {
+            return Some(profile);
+        }
+    }
+
+    // 2. CLI flag
+    let args: Vec<String> = std::env::args().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--profile" {
+            if let Some(profile) = args.get(i + 1) {
+                return Some(profile.clone());
+            }
+        }
+        if let Some(profile) = arg.strip_prefix("--profile=") {
+            return Some(profile.to_owned());
+        }
+    }
+
+    // 3. Auto-detect from build mode
+    match std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() {
+        Some("1") => Some("dev".to_owned()),
+        Some("0") => Some("prod".to_owned()),
+        _ => None,
+    }
+}
+
+/// Profile-specific smart defaults as a TOML table.
+///
+/// Only `dev` and `prod` have smart defaults. Custom profiles
+/// (staging, test, etc.) get no smart defaults — they rely on
+/// their profile TOML file and env overrides.
+fn profile_defaults_as_toml(profile: &str) -> toml::Value {
+    let mut table = toml::map::Map::new();
+
+    match profile {
+        "dev" => {
+            let mut log = toml::map::Map::new();
+            log.insert("level".into(), "debug".into());
+            log.insert("format".into(), "Pretty".into());
+            table.insert("log".into(), toml::Value::Table(log));
+
+            let mut server = toml::map::Map::new();
+            server.insert("host".into(), "127.0.0.1".into());
+            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
+            table.insert("server".into(), toml::Value::Table(server));
+
+            let mut health = toml::map::Map::new();
+            health.insert("detailed".into(), toml::Value::Boolean(true));
+            table.insert("health".into(), toml::Value::Table(health));
+        }
+        "prod" => {
+            let mut log = toml::map::Map::new();
+            log.insert("level".into(), "info".into());
+            log.insert("format".into(), "Json".into());
+            table.insert("log".into(), toml::Value::Table(log));
+
+            let mut server = toml::map::Map::new();
+            server.insert("host".into(), "0.0.0.0".into());
+            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(30));
+            table.insert("server".into(), toml::Value::Table(server));
+
+            let mut health = toml::map::Map::new();
+            health.insert("detailed".into(), toml::Value::Boolean(false));
+            table.insert("health".into(), toml::Value::Table(health));
+        }
+        _ => {} // Custom profiles get no smart defaults
+    }
+
+    toml::Value::Table(table)
+}
+
+/// Deep-merge two TOML values. Tables are merged recursively;
+/// non-table values in `overlay` replace those in `base`.
+fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
+    if base.is_table() && overlay.is_table() {
+        if let toml::Value::Table(overlay_table) = overlay {
+            let base_table = base.as_table_mut().expect("checked is_table above");
+            for (key, overlay_val) in overlay_table {
+                if overlay_val.is_table() {
+                    if let Some(base_val) = base_table.get_mut(&key) {
+                        if base_val.is_table() {
+                            deep_merge(base_val, overlay_val);
+                            continue;
+                        }
+                    }
+                }
+                base_table.insert(key, overlay_val);
+            }
+        }
+    }
+}
+
+/// Warn when a custom profile has no TOML file, suggesting close matches.
+fn warn_profile_typo(profile: &str) {
+    let known = ["dev", "prod"];
+    let mut suggestions: Vec<(&str, usize)> = known
+        .iter()
+        .map(|k| (*k, levenshtein(profile, k)))
+        .filter(|(_, d)| *d <= 2)
+        .collect();
+    suggestions.sort_by_key(|(_, d)| *d);
+
+    if let Some((suggestion, _)) = suggestions.first() {
+        eprintln!(
+            "Warning: profile \"{profile}\" has no config file (autumn-{profile}.toml) \
+             and no smart defaults. Did you mean \"{suggestion}\"?"
+        );
+    }
+}
+
+/// Levenshtein edit distance between two strings.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let n = b.len();
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for (i, a_ch) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, b_ch) in b.iter().enumerate() {
+            let cost = usize::from(a_ch != b_ch);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
 }
 
 /// Errors that can occur when loading or validating configuration.
@@ -114,6 +269,11 @@ pub enum ConfigError {
 /// ```
 #[derive(Debug, Default, Deserialize)]
 pub struct AutumnConfig {
+    /// Active profile name (e.g., "dev", "prod", "staging").
+    /// Resolved at load time, not deserialized from TOML.
+    #[serde(skip)]
+    pub profile: Option<String>,
+
     /// HTTP server settings (port, host, shutdown behavior).
     #[serde(default)]
     pub server: ServerConfig,
@@ -132,32 +292,66 @@ pub struct AutumnConfig {
 }
 
 impl AutumnConfig {
-    /// Load configuration from `autumn.toml`.
+    /// Load configuration with profile-aware layering.
     ///
-    /// Searches for `autumn.toml` in the following order:
-    /// 1. The app's crate directory (set by `#[autumn_web::main]` via
-    ///    `AUTUMN_MANIFEST_DIR`)
-    /// 2. The current working directory
-    ///
-    /// Applies environment variable overrides and validates the result.
-    /// Returns defaults if no config file is found.
+    /// Applies the five-layer configuration system:
+    /// 1. Framework defaults
+    /// 2. Profile smart defaults (dev/prod)
+    /// 3. `autumn.toml` (base config)
+    /// 4. `autumn-{profile}.toml` (profile overrides)
+    /// 5. `AUTUMN_*` environment variables
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Io`] if the file cannot be read,
-    /// [`ConfigError::Parse`] if the file contains invalid TOML, or
+    /// Returns [`ConfigError::Io`] if a config file cannot be read,
+    /// [`ConfigError::Parse`] if a file contains invalid TOML, or
     /// [`ConfigError::Validation`] if a value is invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internally-built TOML table fails to re-serialize
+    /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
-        let config_path = find_config_file();
-        let mut config = Self::load_from(&config_path)?;
+        let profile = resolve_profile();
+
+        // Build merged TOML: profile smart defaults ← autumn.toml ← autumn-{profile}.toml
+        let mut merged = profile.as_ref().map_or_else(
+            || toml::Value::Table(toml::map::Map::new()),
+            |p| profile_defaults_as_toml(p),
+        );
+
+        // Layer 3: base autumn.toml
+        if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml"))? {
+            deep_merge(&mut merged, base);
+        }
+
+        // Layer 4: autumn-{profile}.toml
+        if let Some(ref p) = profile {
+            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"));
+            match load_raw_toml(&profile_path)? {
+                Some(profile_toml) => deep_merge(&mut merged, profile_toml),
+                None if p != "dev" && p != "prod" => warn_profile_typo(p),
+                None => {}
+            }
+        }
+
+        // Deserialize the merged TOML table into AutumnConfig
+        let toml_str =
+            toml::to_string(&merged).expect("internal error: failed to serialize merged config");
+        let mut config: Self = toml::from_str(&toml_str)?;
+        config.profile = profile;
+
+        // Layer 5: env var overrides (highest priority)
         config.apply_env_overrides();
+
         config.database.validate()?;
         Ok(config)
     }
 
-    /// Load configuration from a specific path.
+    /// Load configuration from a specific TOML file path.
     ///
-    /// Used internally and for testing. Prefer [`load()`](Self::load)
+    /// Used internally and for testing. Does **not** apply profile
+    /// layering or environment overrides. Prefer [`load()`](Self::load)
     /// in application code.
     ///
     /// # Errors
@@ -234,6 +428,22 @@ impl AutumnConfig {
         if let Ok(val) = std::env::var("AUTUMN_HEALTH__PATH") {
             self.health.path = val;
         }
+        if let Ok(val) = std::env::var("AUTUMN_HEALTH__DETAILED") {
+            match val.as_str() {
+                "true" | "1" => self.health.detailed = true,
+                "false" | "0" => self.health.detailed = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_HEALTH__DETAILED={val:?} is not valid \
+                     (expected true/false), ignoring"
+                ),
+            }
+        }
+    }
+
+    /// Returns the active profile name, if any.
+    #[must_use]
+    pub fn profile_name(&self) -> Option<&str> {
+        self.profile.as_deref()
     }
 }
 
@@ -411,6 +621,7 @@ pub enum LogFormat {
 ///
 /// let health = HealthConfig::default();
 /// assert_eq!(health.path, "/health");
+/// assert!(!health.detailed);
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct HealthConfig {
@@ -419,6 +630,12 @@ pub struct HealthConfig {
     /// Common alternatives: `"/healthz"`, `"/_health"`, `"/ready"`.
     #[serde(default = "default_health_path")]
     pub path: String,
+
+    /// When `true`, the health endpoint includes detailed info (profile,
+    /// uptime, pool stats). Default: `false` (overridden to `true` for
+    /// `dev` profile via smart defaults).
+    #[serde(default)]
+    pub detailed: bool,
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -496,6 +713,7 @@ impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             path: default_health_path(),
+            detailed: false,
         }
     }
 }
@@ -528,6 +746,22 @@ mod tests {
             // environment at a time.
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
+        }
+
+        /// Remove an env var for the test duration. Restores on drop.
+        fn remove(key: &'static str) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
             }
             Self {
                 key,
@@ -574,6 +808,7 @@ mod tests {
     fn health_defaults() {
         let config = HealthConfig::default();
         assert_eq!(config.path, "/health");
+        assert!(!config.detailed);
     }
 
     #[test]
@@ -881,5 +1116,178 @@ path = "/healthz"
     fn validate_accepts_no_url() {
         let config = DatabaseConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    // ── Profile tests ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_profile_from_env() {
+        let _guard = EnvGuard::set("AUTUMN_PROFILE", "staging");
+        let profile = resolve_profile();
+        assert_eq!(profile.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn resolve_profile_auto_detect_debug() {
+        // EnvGuard::remove holds the lock, so set AUTUMN_IS_DEBUG manually
+        // while already holding it via _clear.
+        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
+        // SAFETY: lock already held by _clear
+        unsafe { std::env::set_var("AUTUMN_IS_DEBUG", "1") };
+        let profile = resolve_profile();
+        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        assert_eq!(profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_profile_auto_detect_release() {
+        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
+        unsafe { std::env::set_var("AUTUMN_IS_DEBUG", "0") };
+        let profile = resolve_profile();
+        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn dev_profile_smart_defaults() {
+        let defaults = profile_defaults_as_toml("dev");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(config.log.level, "debug");
+        assert_eq!(config.log.format, LogFormat::Pretty);
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.shutdown_timeout_secs, 1);
+        assert!(config.health.detailed);
+    }
+
+    #[test]
+    fn prod_profile_smart_defaults() {
+        let defaults = profile_defaults_as_toml("prod");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(config.log.level, "info");
+        assert_eq!(config.log.format, LogFormat::Json);
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.shutdown_timeout_secs, 30);
+        assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn custom_profile_no_smart_defaults() {
+        let defaults = profile_defaults_as_toml("staging");
+        assert_eq!(defaults, toml::Value::Table(toml::map::Map::new()));
+    }
+
+    #[test]
+    fn deep_merge_tables() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            port = 3000
+            host = "127.0.0.1"
+            [database]
+            pool_size = 10
+            "#,
+        )
+        .unwrap();
+
+        let overlay: toml::Value = toml::from_str(
+            r#"
+            [server]
+            port = 8080
+            [database]
+            url = "postgres://localhost/test"
+            "#,
+        )
+        .unwrap();
+
+        deep_merge(&mut base, overlay);
+
+        // Overlay value wins
+        assert_eq!(base["server"]["port"], toml::Value::Integer(8080));
+        // Base value preserved when not in overlay
+        assert_eq!(
+            base["server"]["host"],
+            toml::Value::String("127.0.0.1".into())
+        );
+        // New key from overlay added
+        assert_eq!(
+            base["database"]["url"],
+            toml::Value::String("postgres://localhost/test".into())
+        );
+        // Base key preserved
+        assert_eq!(base["database"]["pool_size"], toml::Value::Integer(10));
+    }
+
+    #[test]
+    fn profile_toml_overrides_base_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        let dev_path = dir.path().join("autumn-dev.toml");
+
+        std::fs::write(
+            &base_path,
+            r#"
+            [server]
+            port = 3000
+            [database]
+            pool_size = 10
+            "#,
+        )
+        .unwrap();
+
+        std::fs::write(
+            &dev_path,
+            r#"
+            [database]
+            url = "postgres://localhost/myapp_dev"
+            "#,
+        )
+        .unwrap();
+
+        // Load base
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        let base = load_raw_toml(&base_path).unwrap().unwrap();
+        deep_merge(&mut merged, base);
+        let profile = load_raw_toml(&dev_path).unwrap().unwrap();
+        deep_merge(&mut merged, profile);
+
+        let toml_str = toml::to_string(&merged).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(config.server.port, 3000); // from base
+        assert_eq!(config.database.pool_size, 10); // from base, preserved
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://localhost/myapp_dev")
+        ); // from profile
+    }
+
+    #[test]
+    fn levenshtein_basic() {
+        assert_eq!(levenshtein("dev", "dev"), 0);
+        assert_eq!(levenshtein("dev", "dve"), 2); // swap = 2 edits (del + ins)
+        assert_eq!(levenshtein("prod", "prodd"), 1);
+        assert_eq!(levenshtein("prod", "prd"), 1);
+        assert_eq!(levenshtein("staging", "dev"), 7);
+    }
+
+    #[test]
+    fn env_override_health_detailed() {
+        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert!(config.health.detailed);
+    }
+
+    #[test]
+    fn profile_name_accessor() {
+        let mut config = AutumnConfig::default();
+        assert!(config.profile_name().is_none());
+
+        config.profile = Some("dev".to_owned());
+        assert_eq!(config.profile_name(), Some("dev"));
     }
 }

@@ -54,9 +54,18 @@ mod tests {
     #[test]
     fn prelude_types_are_accessible() {
         #[cfg(feature = "db")]
-        let _state = AppState { pool: None };
+        let _state = AppState {
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
         #[cfg(not(feature = "db"))]
-        let _state = AppState {};
+        let _state = AppState {
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
         let _err: AutumnResult<()> = Ok(());
     }
 

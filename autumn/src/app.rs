@@ -138,7 +138,7 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     pub async fn run(self) {
-        // 1. Load configuration
+        // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
             std::process::exit(1);
@@ -153,8 +153,13 @@ impl AppBuilder {
             "No routes registered. Did you forget to call .routes()?"
         );
 
-        // 4. Log banner
-        tracing::info!("Autumn v{}", env!("CARGO_PKG_VERSION"));
+        // 4. Log banner with profile info
+        let profile_display = config.profile.as_deref().unwrap_or("none");
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            profile = profile_display,
+            "Autumn starting"
+        );
 
         // 5. Create database pool (if configured)
         #[cfg(feature = "db")]
@@ -180,6 +185,9 @@ impl AppBuilder {
         let state = AppState {
             #[cfg(feature = "db")]
             pool,
+            profile: config.profile.clone(),
+            started_at: std::time::Instant::now(),
+            health_detailed: config.health.detailed,
         };
         let router = build_router(self.routes, &config, state);
 
@@ -332,6 +340,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         build_router(routes, &config, state)
     }
@@ -391,6 +402,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
@@ -461,6 +475,9 @@ mod tests {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
         };
         let router = build_router(post_routes, &config, state);
 

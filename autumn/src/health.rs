@@ -38,7 +38,12 @@ use crate::AppState;
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pool: Option<PoolStatus>,
 }
@@ -63,45 +68,59 @@ struct PoolStatus {
 /// - `200 OK` -- application is healthy.
 /// - `503 Service Unavailable` -- database pool is exhausted (all
 ///   connections in use and requests are queuing).
-#[allow(unused_variables)]
+#[allow(
+    unused_variables,
+    clippy::if_not_else,
+    clippy::needless_pass_by_value,
+    clippy::useless_let_if_seq
+)]
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut healthy = true;
+    let mut pool_status = None;
+
     #[cfg(feature = "db")]
-    {
-        if let Some(pool) = state.pool.as_ref() {
-            let status = pool.status();
-            let available = status.available as u64;
-            let size = status.max_size as u64;
-            let waiting = status.waiting as u64;
+    if let Some(pool) = state.pool.as_ref() {
+        let status = pool.status();
+        let available = status.available as u64;
+        let size = status.max_size as u64;
+        let waiting = status.waiting as u64;
 
-            // Degraded when all connections are in use AND requests are queuing
-            let healthy = available > 0 || waiting == 0;
-
-            let body = HealthResponse {
-                status: if healthy { "ok" } else { "degraded" },
-                version: env!("CARGO_PKG_VERSION"),
-                pool: Some(PoolStatus {
-                    size,
-                    available,
-                    waiting,
-                }),
-            };
-
-            let status_code = if healthy {
-                StatusCode::OK
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            };
-
-            return (status_code, Json(body));
-        }
+        healthy = available > 0 || waiting == 0;
+        pool_status = Some(PoolStatus {
+            size,
+            available,
+            waiting,
+        });
     }
 
+    let detailed = state.health_detailed;
     let body = HealthResponse {
-        status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
-        pool: None,
+        status: if healthy { "ok" } else { "degraded" },
+        version: if detailed {
+            Some(env!("CARGO_PKG_VERSION"))
+        } else {
+            None
+        },
+        profile: if detailed {
+            Some(state.profile().to_owned())
+        } else {
+            None
+        },
+        uptime: if detailed {
+            Some(state.uptime_display())
+        } else {
+            None
+        },
+        pool: if detailed { pool_status } else { None },
     };
-    (StatusCode::OK, Json(body))
+
+    let status_code = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (status_code, Json(body))
 }
 
 #[cfg(test)]
@@ -111,14 +130,21 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    fn test_state() -> AppState {
+        AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: Some("dev".into()),
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        }
+    }
+
     #[tokio::test]
     async fn health_no_database_returns_ok() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState {
-                #[cfg(feature = "db")]
-                pool: None,
-            });
+            .with_state(test_state());
 
         let response = app
             .oneshot(
@@ -139,6 +165,8 @@ mod tests {
 
         assert_eq!(json["status"], "ok");
         assert!(json["version"].is_string());
+        assert_eq!(json["profile"], "dev");
+        assert!(json["uptime"].is_string());
         assert!(json.get("pool").is_none());
     }
 
@@ -146,10 +174,7 @@ mod tests {
     async fn health_no_database_returns_json_content_type() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState {
-                #[cfg(feature = "db")]
-                pool: None,
-            });
+            .with_state(test_state());
 
         let response = app
             .oneshot(
@@ -176,8 +201,6 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn health_with_pool_returns_pool_status() {
-        // Build a pool from a dummy URL — it won't connect but the pool
-        // status (max_size, available, waiting) is available immediately.
         let config = crate::config::DatabaseConfig {
             url: Some("postgres://localhost/test".into()),
             pool_size: 5,
@@ -187,7 +210,12 @@ mod tests {
 
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState { pool: Some(pool) });
+            .with_state(AppState {
+                pool: Some(pool),
+                profile: Some("prod".into()),
+                started_at: std::time::Instant::now(),
+                health_detailed: true,
+            });
 
         let response = app
             .oneshot(
@@ -216,10 +244,7 @@ mod tests {
     async fn health_response_includes_version() {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
-            .with_state(AppState {
-                #[cfg(feature = "db")]
-                pool: None,
-            });
+            .with_state(test_state());
 
         let response = app
             .oneshot(
