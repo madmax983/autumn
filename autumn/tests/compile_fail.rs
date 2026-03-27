@@ -17,6 +17,10 @@ fn compile_fail_tests() {
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
+
+    // Repository hooks failures (require db feature)
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_hooks_not_default.rs");
 }
 
 #[test]
