@@ -196,7 +196,7 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 6. Build the router
+        // 6. Build the router (with optional static-file layer)
         let state = AppState {
             #[cfg(feature = "db")]
             pool,
@@ -204,7 +204,16 @@ impl AppBuilder {
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
         };
-        let router = build_router(self.routes, &config, state.clone());
+        let dist_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+            |_| std::path::PathBuf::from("dist"),
+            |d| std::path::PathBuf::from(d).join("dist"),
+        );
+        let dist_ref = if dist_dir.exists() {
+            Some(dist_dir.as_path())
+        } else {
+            None
+        };
+        let router = build_router_with_static(self.routes, &config, state.clone(), dist_ref);
 
         // 7. Start scheduled tasks (if any)
         if !self.tasks.is_empty() {
@@ -351,6 +360,48 @@ pub(crate) fn build_router(
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
     router.layer(RequestIdLayer).with_state(state)
+}
+
+/// Build the router with optional static-file-first serving.
+///
+/// If `dist_dir` is `Some` and contains a valid `manifest.json`, the
+/// returned router uses `ServeDir` to serve pre-built HTML files first
+/// and falls back to the dynamic Axum router for any path not found on
+/// disk.  This is the "static-first, SSR-fallback" pattern.
+///
+/// When `dist_dir` is `None` or the manifest is missing, the returned
+/// router is identical to [`build_router`].
+pub(crate) fn build_router_with_static(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
+) -> axum::Router {
+    let app_router = build_router(route_list, config, state);
+
+    let Some(dist) = dist_dir else {
+        return app_router;
+    };
+
+    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
+        tracing::debug!(
+            dist = %dist.display(),
+            "No valid manifest.json in dist dir; skipping static file layer"
+        );
+        return app_router;
+    };
+
+    for (route, entry) in &layer.manifest().routes {
+        tracing::info!(
+            route = %route,
+            file = %entry.file,
+            revalidate = ?entry.revalidate,
+            "Static route"
+        );
+    }
+
+    let serve_dir = tower_http::services::ServeDir::new(dist).fallback(app_router);
+    axum::Router::new().fallback_service(serve_dir)
 }
 
 #[cfg(feature = "htmx")]
@@ -645,5 +696,74 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("javascript"));
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_static_files_from_dist() {
+        use std::collections::HashMap;
+
+        // Create a temp dist/ with about/index.html and manifest.json
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("about")).expect("mkdir");
+        std::fs::write(dist.join("about/index.html"), "<h1>Static About</h1>").expect("write");
+        std::fs::write(dist.join("index.html"), "<h1>Static Home</h1>").expect("write");
+
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        routes.insert(
+            "/about".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "about/index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-03-27T00:00:00Z".to_owned(),
+            autumn_version: "0.2.0".to_owned(),
+            routes,
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
+
+        // Build router with a dynamic /about handler that we expect to be
+        // shadowed by the static file.
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router_with_static(
+            vec![test_get_route("/about", "about_dynamic")],
+            &config,
+            state,
+            Some(dist.as_path()),
+        );
+
+        // GET /about/index.html should return the static file content
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/about/index.html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static About</h1>");
     }
 }
