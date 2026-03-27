@@ -22,7 +22,7 @@ async fn main() {
     autumn_web::app()
         .routes(routes![
             // Public routes
-            routes::about::about,  // #[static_get] — pre-rendered
+            routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
             // Admin routes
