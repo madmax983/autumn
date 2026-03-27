@@ -224,10 +224,7 @@ impl AppBuilder {
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
         };
-        let dist_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
-            |_| std::path::PathBuf::from("dist"),
-            |d| std::path::PathBuf::from(d).join("dist"),
-        );
+        let dist_dir = project_dir("dist");
         let dist_ref = if dist_dir.exists() {
             Some(dist_dir.as_path())
         } else {
@@ -330,11 +327,7 @@ impl AppBuilder {
         // Build the full router (same as production)
         let router = build_router(self.routes, &config, state);
 
-        // Determine output directory
-        let dist_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
-            |_| std::path::PathBuf::from("dist"),
-            |d| std::path::PathBuf::from(d).join("dist"),
-        );
+        let dist_dir = project_dir("dist");
 
         eprintln!("Building {} static route(s)...", self.static_metas.len());
 
@@ -390,6 +383,15 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 /// Build the fully-configured Axum router from routes, config, and state.
 ///
 /// Extracted from `AppBuilder::run` so the router construction logic is
+/// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
+/// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
+fn project_dir(subdir: &str) -> std::path::PathBuf {
+    std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+        |_| std::path::PathBuf::from(subdir),
+        |d| std::path::PathBuf::from(d).join(subdir),
+    )
+}
+
 /// testable without binding a real TCP listener.
 pub fn build_router(
     route_list: Vec<Route>,
@@ -435,10 +437,7 @@ pub fn build_router(
     );
 
     // Static file serving from project's static/ directory.
-    let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
-        |_| std::path::PathBuf::from("static"),
-        |manifest_dir| std::path::PathBuf::from(manifest_dir).join("static"),
-    );
+    let static_dir = project_dir("static");
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
     router.layer(RequestIdLayer).with_state(state)

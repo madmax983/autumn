@@ -111,11 +111,5 @@ fn find_binary(debug: bool) -> std::path::PathBuf {
         path.set_extension("exe");
     }
 
-    if !path.exists() {
-        eprintln!("\u{2717} Binary not found at {}", path.display());
-        eprintln!("  Expected after `cargo build --{profile_dir}`");
-        std::process::exit(1);
-    }
-
     path
 }

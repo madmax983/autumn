@@ -11,6 +11,7 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod collect;
 mod main_macro;
 mod model;
 mod parse;
