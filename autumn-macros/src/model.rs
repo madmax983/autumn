@@ -47,8 +47,8 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
         .collect()
 }
 
-/// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`)
-/// that shouldn't be on the query struct (they'd confuse Diesel derives).
+/// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
+/// `#[default]`) that shouldn't be on the query struct (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
         .attrs
@@ -57,8 +57,15 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
             !a.path().is_ident("id")
                 && !a.path().is_ident("indexed")
                 && !a.path().is_ident("validate")
+                && !a.path().is_ident("default")
         })
         .collect()
+}
+
+/// True if a field has `#[id]` or `#[default]` — either way it's excluded
+/// from the `NewX` insert type.
+fn excluded_from_new(field: &Field) -> bool {
+    has_attr(field, "id") || has_attr(field, "default")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -96,7 +103,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
     let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
-    let non_id_fields: Vec<&&Field> = all_fields.iter().filter(|f| !has_attr(f, "id")).collect();
 
     // If no explicit #[id], default to first i32/i64 field
     let id_field_names: Vec<&syn::Ident> = if id_fields.is_empty() {
@@ -116,19 +122,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         id_fields.iter().filter_map(|f| f.ident.as_ref()).collect()
     };
 
-    let non_id_for_new: Vec<&&Field> = if id_fields.is_empty() {
-        // When auto-detecting ID, exclude the auto-detected field
-        all_fields
-            .iter()
-            .filter(|f| {
-                f.ident
+    // Fields for NewX: exclude #[id], #[default], and auto-detected ID fields
+    let fields_for_new: Vec<&&Field> = all_fields
+        .iter()
+        .filter(|f| {
+            !excluded_from_new(f)
+                && f.ident
                     .as_ref()
                     .is_some_and(|id| !id_field_names.contains(&id))
-            })
-            .collect()
-    } else {
-        non_id_fields.clone()
-    };
+        })
+        .collect();
+
+    // Fields for UpdateX: same set as NewX (all become Option<T>)
 
     // Check if any field has #[validate(...)]
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
@@ -145,7 +150,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Build NewX fields (non-ID, propagate #[validate])
-    let new_fields: Vec<TokenStream> = non_id_for_new
+    let new_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
@@ -156,7 +161,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Build UpdateX fields (non-ID, all Option<T>, propagate #[validate])
-    let update_fields: Vec<TokenStream> = non_id_for_new
+    let update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;

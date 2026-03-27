@@ -11,6 +11,8 @@ pub struct Bookmark {
     pub title: String,
     #[indexed]
     pub tag: String,
+    #[default]
     pub alive: bool,
+    #[default]
     pub created_at: chrono::NaiveDateTime,
 }
