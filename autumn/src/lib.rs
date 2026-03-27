@@ -68,6 +68,10 @@ pub mod db;
 pub mod error;
 pub mod extract;
 pub mod health;
+#[cfg(feature = "db")]
+pub mod hooks;
+#[cfg(feature = "db")]
+pub use hooks::{FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch};
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub mod logging;
@@ -77,8 +81,6 @@ pub mod route;
 pub mod static_gen;
 pub mod task;
 pub mod validation;
-#[cfg(feature = "db")]
-pub mod hooks;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -436,11 +438,13 @@ pub use crate::extract::Json;
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
     pub use axum;
+    pub use chrono;
     #[cfg(feature = "db")]
     pub use diesel;
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
+    pub use smallvec;
     pub use tokio;
     pub use validator;
 }

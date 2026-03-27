@@ -68,6 +68,125 @@ impl MutationContext {
     }
 }
 
+// ── Mutation hooks trait ─────────────────────────────────────────────
+
+use crate::AutumnResult;
+use std::future::Future;
+
+/// Repository-scoped mutation lifecycle hooks.
+///
+/// All methods have default no-op implementations, so you only need to
+/// override the callbacks you care about. Each method receives a
+/// [`MutationContext`] (mutable for "before" hooks) and the relevant
+/// model/changeset.
+///
+/// # Associated types
+///
+/// - `Model` -- the read model returned by queries (e.g., `User`).
+/// - `NewModel` -- the insertable changeset (e.g., `NewUser`).
+/// - `UpdateModel` -- the partial-update changeset (e.g., `UpdateUser`).
+pub trait MutationHooks: Send + Sync + 'static {
+    /// The read model (e.g., the `Queryable` struct).
+    type Model: Send + Sync;
+    /// The insertable changeset for new records.
+    type NewModel: Send + Sync;
+    /// The partial-update changeset.
+    type UpdateModel: Send + Sync;
+
+    /// Called before a new record is inserted.
+    fn before_create(
+        &self,
+        _ctx: &mut MutationContext,
+        _new: &mut Self::NewModel,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a new record has been inserted.
+    fn after_create(
+        &self,
+        _ctx: &MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called before an existing record is updated.
+    fn before_update(
+        &self,
+        _ctx: &mut MutationContext,
+        _current: &Self::Model,
+        _changes: &mut Self::UpdateModel,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after an existing record has been updated.
+    fn after_update(
+        &self,
+        _ctx: &MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called before an existing record is deleted.
+    fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a record has been deleted.
+    fn after_delete(
+        &self,
+        _ctx: &MutationContext,
+        _id: i32,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after the transaction has been committed for any operation.
+    fn after_commit(
+        &self,
+        _ctx: &MutationContext,
+        _op: MutationOp,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+}
+
+// ── Default no-op hooks ──────────────────────────────────────────────
+
+/// Zero-cost no-op implementation of [`MutationHooks`].
+///
+/// Used by generated repository code when the user has not configured any
+/// hooks. All methods use the trait defaults (immediate `Ok(())`).
+pub struct NoHooks<M, N, U> {
+    _phantom: std::marker::PhantomData<(M, N, U)>,
+}
+
+impl<M, N, U> Default for NoHooks<M, N, U> {
+    fn default() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<M, N, U> MutationHooks for NoHooks<M, N, U>
+where
+    M: Send + Sync + 'static,
+    N: Send + Sync + 'static,
+    U: Send + Sync + 'static,
+{
+    type Model = M;
+    type NewModel = N;
+    type UpdateModel = U;
+}
+
 /// Tri-state sparse update value.
 ///
 /// `Patch<T>` distinguishes between "field not mentioned" ([`Unchanged`](Patch::Unchanged)),
@@ -328,5 +447,29 @@ mod tests {
         let mut ctx = MutationContext::new(MutationOp::Update);
         ctx.actor = Some("user-123".into());
         assert_eq!(ctx.actor.as_deref(), Some("user-123"));
+    }
+
+    // ── MutationHooks / NoHooks tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn no_hooks_all_methods_are_noop() {
+        let hooks: NoHooks<(), (), ()> = NoHooks::default();
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        let mut new_model = ();
+        let model = ();
+        let mut update_model = ();
+
+        assert!(hooks.before_create(&mut ctx, &mut new_model).await.is_ok());
+        assert!(hooks.after_create(&ctx, &model).await.is_ok());
+        assert!(
+            hooks
+                .before_update(&mut ctx, &model, &mut update_model)
+                .await
+                .is_ok()
+        );
+        assert!(hooks.after_update(&ctx, &model).await.is_ok());
+        assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
+        assert!(hooks.after_delete(&ctx, 1).await.is_ok());
+        assert!(hooks.after_commit(&ctx, MutationOp::Create).await.is_ok());
     }
 }
