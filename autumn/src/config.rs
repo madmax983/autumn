@@ -1267,12 +1267,12 @@ path = "/healthz"
 
         std::fs::write(
             &base_path,
-            r#"
+            r"
             [server]
             port = 3000
             [database]
             pool_size = 10
-            "#,
+            ",
         )
         .unwrap();
 
