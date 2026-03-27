@@ -1,7 +1,7 @@
 //! `autumn build` -- compile the app and pre-render static routes.
 //!
 //! Orchestrates two steps:
-//! 1. `cargo build [--release]` to compile the user's binary.
+//! 1. `cargo build [--release] [-p <package>]` to compile the user's binary.
 //! 2. Run the binary with `AUTUMN_BUILD_STATIC=1` -- the runtime
 //!    detects this and renders static routes to `dist/` instead of
 //!    starting the HTTP server.
@@ -9,7 +9,7 @@
 use std::process::Command;
 
 /// Run the static build pipeline.
-pub fn run(debug: bool) {
+pub fn run(debug: bool, package: Option<&str>) {
     eprintln!("\u{1F342} autumn build\n");
 
     // Step 1: Compile
@@ -18,6 +18,9 @@ pub fn run(debug: bool) {
     cargo.arg("build");
     if !debug {
         cargo.arg("--release");
+    }
+    if let Some(pkg) = package {
+        cargo.args(["-p", pkg]);
     }
 
     eprintln!("Compiling ({profile} profile)...");
@@ -28,7 +31,7 @@ pub fn run(debug: bool) {
     }
 
     // Step 2: Find the binary
-    let binary = find_binary(debug);
+    let binary = find_binary(debug, package);
     eprintln!("\nRunning static renderer...\n");
 
     // Step 3: Run with AUTUMN_BUILD_STATIC=1
@@ -50,9 +53,10 @@ pub fn run(debug: bool) {
 
 /// Locate the compiled binary using `cargo metadata`.
 ///
-/// Parses `cargo metadata` to find the workspace target directory and
-/// the binary name from the current package's `[[bin]]` targets.
-fn find_binary(debug: bool) -> std::path::PathBuf {
+/// When `package` is `Some`, matches by package name directly.
+/// Otherwise falls back to matching the package whose manifest is in
+/// the current directory.
+fn find_binary(debug: bool, package: Option<&str>) -> std::path::PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -70,20 +74,29 @@ fn find_binary(debug: bool) -> std::path::PathBuf {
         .as_str()
         .expect("target_directory in metadata");
 
-    // Find the current package's binary name.
-    // The "default" workspace member is identified by resolve.root, or we can
-    // find the package whose manifest_path is in the current directory.
     let packages = metadata["packages"].as_array().expect("packages array");
 
-    let cwd = std::env::current_dir().expect("current dir");
-    let bin_name = packages
+    // Filter packages: by name if -p was given, otherwise by cwd
+    let matching_packages: Vec<_> = if let Some(pkg_name) = package {
+        packages
+            .iter()
+            .filter(|pkg| pkg["name"].as_str() == Some(pkg_name))
+            .collect()
+    } else {
+        let cwd = std::env::current_dir().expect("current dir");
+        packages
+            .iter()
+            .filter(|pkg| {
+                let manifest = pkg["manifest_path"].as_str().unwrap_or("");
+                std::path::Path::new(manifest)
+                    .parent()
+                    .is_some_and(|dir| dir.starts_with(&cwd))
+            })
+            .collect()
+    };
+
+    let bin_name = matching_packages
         .iter()
-        .filter(|pkg| {
-            let manifest = pkg["manifest_path"].as_str().unwrap_or("");
-            std::path::Path::new(manifest)
-                .parent()
-                .is_some_and(|dir| dir.starts_with(&cwd))
-        })
         .flat_map(|pkg| {
             pkg["targets"]
                 .as_array()
@@ -98,7 +111,12 @@ fn find_binary(debug: bool) -> std::path::PathBuf {
         })
         .next()
         .unwrap_or_else(|| {
-            eprintln!("\u{2717} No binary target found in current package");
+            if let Some(pkg_name) = package {
+                eprintln!("\u{2717} No binary target found in package '{pkg_name}'");
+            } else {
+                eprintln!("\u{2717} No binary target found in current package");
+                eprintln!("  Hint: use -p <package> to specify the target package");
+            }
             std::process::exit(1);
         });
 

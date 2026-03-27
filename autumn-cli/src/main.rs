@@ -25,6 +25,9 @@ enum Commands {
         /// Build in debug mode instead of release
         #[arg(long)]
         debug: bool,
+        /// Package to build (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -37,7 +40,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Build { debug } => build::run(debug),
+        Commands::Build { debug, package } => build::run(debug, package.as_deref()),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -90,13 +93,49 @@ mod tests {
     #[test]
     fn parse_build_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "build"]).unwrap();
-        assert!(matches!(cli.command, Commands::Build { debug: false }));
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: false,
+                package: None
+            }
+        ));
     }
 
     #[test]
     fn parse_build_debug() {
         let cli = Cli::try_parse_from(["autumn", "build", "--debug"]).unwrap();
-        assert!(matches!(cli.command, Commands::Build { debug: true }));
+        assert!(matches!(
+            cli.command,
+            Commands::Build {
+                debug: true,
+                package: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_build_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "build", "-p", "blog"]).unwrap();
+        match cli.command {
+            Commands::Build { debug, package } => {
+                assert!(!debug);
+                assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_long_package() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--package", "blog", "--debug"]).unwrap();
+        match cli.command {
+            Commands::Build { debug, package } => {
+                assert!(debug);
+                assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
     }
 
     #[test]
