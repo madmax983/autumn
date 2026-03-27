@@ -43,6 +43,10 @@ pub use crate::extract::Json;
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
 
+// ── Validation ──────────────────────────────────────────────────
+/// Auto-validating extractor and proof-of-validation newtype.
+pub use crate::validation::{Valid, ValidateExt, Validated};
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::AppState;

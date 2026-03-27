@@ -71,6 +71,8 @@ struct ErrorBody {
 struct ErrorInner {
     status: u16,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// Framework error type wrapping any error with an HTTP status code.
@@ -115,6 +117,7 @@ struct ErrorInner {
 pub struct AutumnError {
     inner: Box<dyn std::error::Error + Send + Sync>,
     status: StatusCode,
+    details: Option<std::collections::HashMap<String, Vec<String>>>,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -142,6 +145,7 @@ where
         Self {
             inner: Box::new(err),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            details: None,
         }
     }
 }
@@ -180,6 +184,7 @@ impl AutumnError {
         Self {
             inner: Box::new(err),
             status: StatusCode::NOT_FOUND,
+            details: None,
         }
     }
 
@@ -198,6 +203,7 @@ impl AutumnError {
         Self {
             inner: Box::new(err),
             status: StatusCode::BAD_REQUEST,
+            details: None,
         }
     }
 
@@ -219,6 +225,7 @@ impl AutumnError {
         Self {
             inner: Box::new(err),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            details: None,
         }
     }
 
@@ -237,6 +244,18 @@ impl AutumnError {
         Self {
             inner: Box::new(err),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            details: None,
+        }
+    }
+
+    /// Create a `422 Unprocessable Entity` error with field-level
+    /// validation details.
+    #[must_use]
+    pub fn validation(details: std::collections::HashMap<String, Vec<String>>) -> Self {
+        Self {
+            inner: Box::new(StringError("Validation failed".into())),
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            details: Some(details),
         }
     }
 
@@ -290,6 +309,7 @@ impl std::fmt::Debug for AutumnError {
         f.debug_struct("AutumnError")
             .field("status", &self.status)
             .field("inner", &self.inner)
+            .field("details", &self.details)
             .finish()
     }
 }
@@ -301,6 +321,7 @@ impl IntoResponse for AutumnError {
             error: ErrorInner {
                 status: status.as_u16(),
                 message: self.inner.to_string(),
+                details: self.details,
             },
         };
 

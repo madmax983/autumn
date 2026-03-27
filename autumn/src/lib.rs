@@ -73,6 +73,7 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod validation;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -108,12 +109,23 @@ pub use db::Db;
 /// [`AutumnResult<T>`] is `Result<T, AutumnError>`.
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
+
+/// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
+/// and validates via `validator::Validate` before the handler runs.
+/// Returns 422 with structured error details on validation failure.
+pub use validation::Valid;
+
+/// Proof that `T` has passed validation. See [`validation`] module.
+pub use validation::Validated;
+
 /// htmx version string embedded in the binary.
 ///
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::HTMX_VERSION;
+/// Extension trait adding `.validate()` to all `validator::Validate` types.
+pub use validation::ValidateExt;
 
 // ── Proc-macro re-exports ──────────────────────────────────────────
 
@@ -386,6 +398,7 @@ pub mod reexports {
     pub use diesel;
     pub use http;
     pub use tokio;
+    pub use validator;
 }
 
 /// Shared application state passed to all route handlers.
