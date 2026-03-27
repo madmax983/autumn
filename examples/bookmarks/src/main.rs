@@ -39,6 +39,7 @@ async fn main() {
             routes::bookmarks::list,
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
+            routes::bookmarks::create,
             routes::api::list_json,
             routes::api::create_json,
             routes::api::delete_json,

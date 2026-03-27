@@ -1,7 +1,7 @@
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 
-use crate::models::Bookmark;
+use crate::models::{Bookmark, NewBookmark};
 use crate::repositories::{BookmarkRepository, PgBookmarkRepository};
 
 fn layout(title: &str, content: Markup) -> Markup {
@@ -104,7 +104,7 @@ pub async fn new_form() -> Markup {
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
-            form action="/api/bookmarks" method="post" class="space-y-4" {
+            form action="/bookmarks" method="post" class="space-y-4" {
                 div {
                     label for="url" class="block text-sm font-medium" { "URL" }
                     input type="url" id="url" name="url" required
@@ -129,4 +129,17 @@ pub async fn new_form() -> Markup {
             }
         },
     )
+}
+
+#[post("/bookmarks")]
+pub async fn create(repo: PgBookmarkRepository, form: Form<NewBookmark>) -> AutumnResult<Markup> {
+    repo.save(&form).await?;
+    // Redirect to listing via meta refresh (same pattern as blog example)
+    Ok(html! {
+        (PreEscaped("<!DOCTYPE html>"))
+        html {
+            head { meta http-equiv="refresh" content="0;url=/"; }
+            body { p { "Redirecting to " a href="/" { "/" } "..." } }
+        }
+    })
 }
