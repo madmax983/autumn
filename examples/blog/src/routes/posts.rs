@@ -25,7 +25,7 @@ fn redirect_to(url: &str) -> Markup {
 // ── Layout ──────────────────────────────────────────────────────
 
 /// Base HTML layout wrapping page content.
-fn layout(title: &str, content: Markup) -> Markup {
+pub fn layout(title: &str, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -46,6 +46,7 @@ fn layout(title: &str, content: Markup) -> Markup {
                         }
                         div class="flex items-center gap-4" {
                             a href="/" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Home" }
+                            a href="/about" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "About" }
                             a href="/admin" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Admin" }
                             a href="/admin/new" class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { "New Post" }
                         }
@@ -166,9 +167,9 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
                 }
             }
 
-            // Published toggle
+            // Published toggle (no hidden field — unchecked checkbox is
+            // absent from form data; #[serde(default)] handles it as false)
             div class="flex items-center gap-3" {
-                input type="hidden" name="published" value="false";
                 input type="checkbox" id="published" name="published" value="true"
                       checked[published]
                       class="w-4 h-4 rounded border-stone-300 text-amber-600 \

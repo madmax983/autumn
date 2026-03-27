@@ -5,8 +5,6 @@
 //! route attribute macros.
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
-use syn::{Path, Token, punctuated::Punctuated};
 
 /// Expand a comma-separated list of handler paths into a `Vec<Route>`.
 ///
@@ -14,32 +12,5 @@ use syn::{Path, Token, punctuated::Punctuated};
 /// `__autumn_route_info_name`, so module-qualified paths like `users::list`
 /// become `users::__autumn_route_info_list`.
 pub fn routes_macro(input: TokenStream) -> TokenStream {
-    // Handle empty input
-    if input.is_empty() {
-        return quote! { ::std::vec::Vec::new() };
-    }
-
-    // Parse comma-separated list of paths (trailing comma ok)
-    let paths: Punctuated<Path, Token![,]> =
-        match syn::parse::Parser::parse2(Punctuated::parse_terminated, input) {
-            Ok(paths) => paths,
-            Err(err) => return err.to_compile_error(),
-        };
-
-    // Transform each path's last segment to __autumn_route_info_{name}
-    let route_info_calls: Vec<_> = paths
-        .iter()
-        .map(|path| {
-            let mut info_path = path.clone();
-            if let Some(last) = info_path.segments.last_mut() {
-                let info_name = format_ident!("__autumn_route_info_{}", last.ident);
-                last.ident = info_name;
-            }
-            quote! { #info_path() }
-        })
-        .collect();
-
-    quote! {
-        vec![#(#route_info_calls),*]
-    }
+    crate::collect::collect_companions(input, "__autumn_route_info_")
 }

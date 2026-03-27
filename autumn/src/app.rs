@@ -58,6 +58,7 @@ pub const fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
+        static_metas: Vec::new(),
     }
 }
 
@@ -92,6 +93,7 @@ pub const fn app() -> AppBuilder {
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
 }
 
 impl AppBuilder {
@@ -133,6 +135,16 @@ impl AppBuilder {
         self
     }
 
+    /// Register static route metadata for build-time rendering.
+    ///
+    /// Use the [`static_routes!`](crate::static_routes) macro to collect
+    /// `#[static_get]` handlers' metadata.
+    #[must_use]
+    pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
+        self.static_metas.extend(metas);
+        self
+    }
+
     /// Start the HTTP server.
     ///
     /// This method performs the full application lifecycle:
@@ -153,6 +165,14 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     pub async fn run(self) {
+        // ── Build mode ─────────────────────────────────────────────────
+        // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
+        // instead of starting the HTTP server. This is triggered by `autumn build`.
+        if std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1") {
+            self.run_build_mode().await;
+            return;
+        }
+
         // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
@@ -196,7 +216,7 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 6. Build the router
+        // 6. Build the router (with optional static-file layer)
         let state = AppState {
             #[cfg(feature = "db")]
             pool,
@@ -204,7 +224,13 @@ impl AppBuilder {
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
         };
-        let router = build_router(self.routes, &config, state.clone());
+        let dist_dir = project_dir("dist");
+        let dist_ref = if dist_dir.exists() {
+            Some(dist_dir.as_path())
+        } else {
+            None
+        };
+        let router = build_router_with_static(self.routes, &config, state.clone(), dist_ref);
 
         // 7. Start scheduled tasks (if any)
         if !self.tasks.is_empty() {
@@ -260,6 +286,64 @@ impl AppBuilder {
 
         tracing::info!("Server shut down cleanly");
     }
+
+    /// Render all registered static routes to `dist/` and exit.
+    ///
+    /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
+    /// Builds the Axum router, renders each static route through it, and
+    /// writes HTML + manifest to the `dist/` directory.
+    async fn run_build_mode(self) {
+        // Load config (same as normal startup)
+        let config = AutumnConfig::load().unwrap_or_else(|e| {
+            eprintln!("Failed to load configuration: {e}");
+            std::process::exit(1);
+        });
+        crate::logging::init(&config.log);
+
+        if self.static_metas.is_empty() {
+            eprintln!("No static routes registered. Nothing to build.");
+            eprintln!("Hint: use .static_routes(static_routes![...]) on your AppBuilder.");
+            std::process::exit(1);
+        }
+
+        // Build state (with DB if configured)
+        #[cfg(feature = "db")]
+        let pool = match db::create_pool(&config.database) {
+            Ok(pool) => pool,
+            Err(e) => {
+                eprintln!("Failed to create database pool: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool,
+            profile: config.profile.clone(),
+            started_at: std::time::Instant::now(),
+            health_detailed: config.health.detailed,
+        };
+
+        // Build the full router (same as production)
+        let router = build_router(self.routes, &config, state);
+
+        let dist_dir = project_dir("dist");
+
+        eprintln!("Building {} static route(s)...", self.static_metas.len());
+
+        match crate::static_gen::render_static_routes(router, &self.static_metas, &dist_dir).await {
+            Ok(()) => {
+                eprintln!(
+                    "\n  \u{2713} Static build complete \u{2192} {}",
+                    dist_dir.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("\n  \u{2717} Static build failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -299,21 +383,47 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 /// Build the fully-configured Axum router from routes, config, and state.
 ///
 /// Extracted from `AppBuilder::run` so the router construction logic is
+/// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
+/// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
+fn project_dir(subdir: &str) -> std::path::PathBuf {
+    std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+        |_| std::path::PathBuf::from(subdir),
+        |d| std::path::PathBuf::from(d).join(subdir),
+    )
+}
+
 /// testable without binding a real TCP listener.
-pub(crate) fn build_router(
+pub fn build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
-    let mut router = axum::Router::new();
-    for route in route_list {
+    // Group routes by path so multiple methods on the same path
+    // (e.g. GET /admin + POST /admin) are merged into a single
+    // MethodRouter. Axum 0.7+ panics if .route() is called twice
+    // with the same path — merging avoids this.
+    let mut grouped: indexmap::IndexMap<&str, axum::routing::MethodRouter<AppState>> =
+        indexmap::IndexMap::new();
+    for route in &route_list {
         tracing::debug!(
             method = %route.method,
             path = route.path,
             name = route.name,
             "Mounted route"
         );
-        router = router.route(route.path, route.handler);
+    }
+    for route in route_list {
+        grouped
+            .entry(route.path)
+            .and_modify(|existing| {
+                *existing = existing.clone().merge(route.handler.clone());
+            })
+            .or_insert(route.handler);
+    }
+
+    let mut router = axum::Router::new();
+    for (path, method_router) in grouped {
+        router = router.route(path, method_router);
     }
 
     // Framework-provided routes
@@ -344,13 +454,63 @@ pub(crate) fn build_router(
     );
 
     // Static file serving from project's static/ directory.
-    let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
-        |_| std::path::PathBuf::from("static"),
-        |manifest_dir| std::path::PathBuf::from(manifest_dir).join("static"),
-    );
+    let static_dir = project_dir("static");
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
     router.layer(RequestIdLayer).with_state(state)
+}
+
+/// Build the router with optional static-file-first serving.
+///
+/// If `dist_dir` is `Some` and contains a valid `manifest.json`, the
+/// returned router uses `ServeDir` to serve pre-built HTML files first
+/// and falls back to the dynamic Axum router for any path not found on
+/// disk.  This is the "static-first, SSR-fallback" pattern.
+///
+/// When `dist_dir` is `None` or the manifest is missing, the returned
+/// router is identical to [`build_router`].
+///
+/// This function is public primarily for integration testing.
+pub fn build_router_with_static(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
+) -> axum::Router {
+    let app_router = build_router(route_list, config, state);
+
+    let Some(dist) = dist_dir else {
+        return app_router;
+    };
+
+    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
+        tracing::debug!(
+            dist = %dist.display(),
+            "No valid manifest.json in dist dir; skipping static file layer"
+        );
+        return app_router;
+    };
+
+    for (route, entry) in &layer.manifest().routes {
+        tracing::debug!(
+            route = %route,
+            file = %entry.file,
+            revalidate = ?entry.revalidate,
+            "Static route"
+        );
+    }
+
+    // Mount static files as a fallback on the app router rather than
+    // wrapping the app behind ServeDir. The previous approach
+    // (ServeDir.fallback(app)) caused 405 errors for POST/PUT/DELETE
+    // because ServeDir only handles GET/HEAD — non-GET requests never
+    // reached the app router's fallback.
+    //
+    // With this approach: explicit routes (GET, POST, etc.) always win.
+    // Only requests that match NO dynamic route fall through to ServeDir,
+    // which then serves static files (e.g. /about/ → dist/about/index.html).
+    let serve_dir = tower_http::services::ServeDir::new(dist);
+    app_router.fallback_service(serve_dir)
 }
 
 #[cfg(feature = "htmx")]
@@ -567,6 +727,67 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn build_router_merges_methods_on_same_path() {
+        let route_list = vec![
+            Route {
+                method: http::Method::GET,
+                path: "/admin",
+                handler: axum::routing::get(|| async { "list" }),
+                name: "admin_list",
+            },
+            Route {
+                method: http::Method::POST,
+                path: "/admin",
+                handler: axum::routing::post(|| async { "created" }),
+                name: "create",
+            },
+        ];
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router(route_list, &config, state);
+
+        // GET /admin should return "list"
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"list");
+
+        // POST /admin should return "created" (not 405!)
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"created");
+    }
+
     #[cfg(feature = "htmx")]
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
@@ -645,5 +866,138 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("javascript"));
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_static_files_for_unmatched_paths() {
+        use std::collections::HashMap;
+
+        // Create a temp dist/ with a static page
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(dist.join("docs")).expect("mkdir");
+        std::fs::write(dist.join("docs/index.html"), "<h1>Static Docs</h1>").expect("write");
+
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-03-27T00:00:00Z".to_owned(),
+            autumn_version: "0.2.0".to_owned(),
+            routes: HashMap::from([(
+                "/docs".to_owned(),
+                crate::static_gen::ManifestEntry {
+                    file: "docs/index.html".to_owned(),
+                    revalidate: None,
+                },
+            )]),
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
+
+        // No dynamic route for /docs — only a static file.
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router_with_static(
+            vec![test_get_route("/other", "other_page")],
+            &config,
+            state,
+            Some(dist.as_path()),
+        );
+
+        // GET /docs/ should serve the static file via ServeDir fallback
+        // (no dynamic route competes for this path).
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/docs/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    #[test]
+    fn app_builder_accepts_static_routes() {
+        use crate::static_gen::StaticRouteMeta;
+        let metas = vec![StaticRouteMeta {
+            path: "/about",
+            name: "about",
+            revalidate: None,
+        }];
+        let builder = app().static_routes(metas);
+        assert_eq!(builder.static_metas.len(), 1);
+    }
+
+    #[test]
+    fn project_dir_defaults_to_subdir() {
+        // When AUTUMN_MANIFEST_DIR is not set, project_dir returns the
+        // subdir name as-is (relative to cwd).
+        // SAFETY: called in a single-threaded test context.
+        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+        let dir = super::project_dir("dist");
+        assert_eq!(dir, std::path::PathBuf::from("dist"));
+    }
+
+    #[tokio::test]
+    async fn build_router_with_static_skips_without_manifest() {
+        // When dist/ exists but has no manifest.json, fall back to
+        // the app router without the static layer.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir");
+        // No manifest.json — just an empty dist/
+
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router_with_static(
+            vec![test_get_route("/test", "test")],
+            &config,
+            state,
+            Some(dist.as_path()),
+        );
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_with_static_none_dist() {
+        // When dist_dir is None, return the app router directly.
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router =
+            build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

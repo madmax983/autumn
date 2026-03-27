@@ -68,6 +68,9 @@ pub struct NewPost {
     pub title: String,
     pub slug: String,
     pub body: String,
+    /// Defaults to `false` when the checkbox is unchecked (browser
+    /// omits unchecked checkboxes from form data entirely).
+    #[serde(default)]
     pub published: bool,
 }
 
@@ -108,6 +111,10 @@ pub struct UpdatePost {
     pub title: Option<String>,
     pub slug: Option<String>,
     pub body: Option<String>,
+    /// HTML checkboxes: absent when unchecked → `None` via `#[serde(default)]`.
+    /// The handler converts `None` → `Some(false)` before saving so
+    /// unchecking the checkbox actually unpublishes the post.
+    #[serde(default)]
     pub published: Option<bool>,
 }
 

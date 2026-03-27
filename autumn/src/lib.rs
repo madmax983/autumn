@@ -74,6 +74,7 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod static_gen;
 pub mod task;
 pub mod validation;
 
@@ -301,6 +302,31 @@ pub use autumn_macros::scheduled;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
+
+/// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
+pub use autumn_macros::static_routes;
+
+/// Annotate an async function as a statically pre-rendered GET route.
+///
+/// Like [`get`], this generates a route companion for Axum routing.
+/// Additionally, it emits a `__autumn_static_meta_{name}()` companion
+/// that registers the route for static HTML generation at build time
+/// (`autumn build`).
+///
+/// Phase 1 restriction: path parameters (`{id}`) are **not** supported.
+/// Use [`get`] for parameterized routes.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[static_get("/about")]
+/// async fn about() -> &'static str {
+///     "About us"
+/// }
+/// ```
+pub use autumn_macros::static_get;
 
 // ── Maud re-exports ────────────────────────────────────────────────
 
