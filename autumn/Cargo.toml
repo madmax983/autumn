@@ -18,6 +18,7 @@ autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
 axum.workspace = true
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
+futures.workspace = true
 http.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
 maud = { workspace = true, optional = true }

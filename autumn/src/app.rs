@@ -58,6 +58,7 @@ pub const fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
+        static_metas: Vec::new(),
     }
 }
 
@@ -92,6 +93,7 @@ pub const fn app() -> AppBuilder {
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
 }
 
 impl AppBuilder {
@@ -130,6 +132,16 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register static route metadata for build-time rendering.
+    ///
+    /// Use the [`static_routes!`](crate::static_routes) macro to collect
+    /// `#[static_get]` handlers' metadata.
+    #[must_use]
+    pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
+        self.static_metas.extend(metas);
         self
     }
 
@@ -769,5 +781,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static About</h1>");
+    }
+
+    #[test]
+    fn app_builder_accepts_static_routes() {
+        use crate::static_gen::StaticRouteMeta;
+        let metas = vec![StaticRouteMeta {
+            path: "/about",
+            name: "about",
+            revalidate: None,
+        }];
+        let builder = app().static_routes(metas);
+        assert_eq!(builder.static_metas.len(), 1);
     }
 }
