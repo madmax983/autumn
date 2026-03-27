@@ -10,6 +10,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
 
+    // Static route macro failures
+    t.compile_fail("tests/compile-fail/static_get_path_params.rs");
+    t.compile_fail("tests/compile-fail/static_get_non_async.rs");
+
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
@@ -22,6 +26,7 @@ fn compile_pass_tests() {
     // Route macro passes (always available)
     t.pass("tests/compile-pass/valid_handlers.rs");
     t.pass("tests/compile-pass/async_main.rs");
+    t.pass("tests/compile-pass/static_get_basic.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
