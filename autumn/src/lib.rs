@@ -60,6 +60,7 @@
 //! [Maud]: https://maud.lambda.xyz
 //! [Diesel]: https://diesel.rs
 
+pub mod actuator;
 pub mod app;
 pub mod config;
 #[cfg(feature = "db")]

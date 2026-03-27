@@ -335,6 +335,14 @@ pub(crate) fn build_router(
     );
     tracing::debug!(path = %config.health.path, "Mounted health check");
 
+    // Actuator endpoints
+    let actuator_sensitive = config.actuator.sensitive;
+    router = router.merge(crate::actuator::actuator_router(actuator_sensitive));
+    tracing::debug!(
+        sensitive = actuator_sensitive,
+        "Mounted actuator endpoints at /actuator/*"
+    );
+
     // Static file serving from project's static/ directory.
     let static_dir = std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
         |_| std::path::PathBuf::from("static"),

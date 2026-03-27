@@ -130,6 +130,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut health = toml::map::Map::new();
             health.insert("detailed".into(), toml::Value::Boolean(true));
             table.insert("health".into(), toml::Value::Table(health));
+
+            let mut actuator = toml::map::Map::new();
+            actuator.insert("sensitive".into(), toml::Value::Boolean(true));
+            table.insert("actuator".into(), toml::Value::Table(actuator));
         }
         "prod" => {
             let mut log = toml::map::Map::new();
@@ -289,6 +293,10 @@ pub struct AutumnConfig {
     /// Health check endpoint settings.
     #[serde(default)]
     pub health: HealthConfig,
+
+    /// Actuator endpoint settings.
+    #[serde(default)]
+    pub actuator: ActuatorConfig,
 }
 
 impl AutumnConfig {
@@ -636,6 +644,36 @@ pub struct HealthConfig {
     /// `dev` profile via smart defaults).
     #[serde(default)]
     pub detailed: bool,
+}
+
+/// Actuator endpoint configuration.
+///
+/// Controls which operational endpoints are exposed. The `sensitive` flag
+/// determines whether sensitive endpoints (env, configprops, loggers,
+/// tasks) are available. Defaults to `true` for `dev`, `false` for `prod`.
+#[derive(Debug, Deserialize)]
+pub struct ActuatorConfig {
+    /// URL prefix for actuator endpoints. Default: `"/actuator"`.
+    #[serde(default = "default_actuator_prefix")]
+    pub prefix: String,
+
+    /// When `true`, expose sensitive endpoints (env, loggers, tasks).
+    /// Defaults vary by profile: `true` for dev, `false` for prod.
+    #[serde(default)]
+    pub sensitive: bool,
+}
+
+impl Default for ActuatorConfig {
+    fn default() -> Self {
+        Self {
+            prefix: default_actuator_prefix(),
+            sensitive: false,
+        }
+    }
+}
+
+fn default_actuator_prefix() -> String {
+    "/actuator".to_owned()
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
