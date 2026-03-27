@@ -5,6 +5,69 @@
 
 use serde::{Deserialize, Serialize};
 
+// ── Mutation operation & context ─────────────────────────────────────
+
+/// The kind of mutation being performed on a repository record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationOp {
+    /// A new record is being created.
+    Create,
+    /// An existing record is being updated.
+    Update,
+    /// An existing record is being deleted.
+    Delete,
+}
+
+impl MutationOp {
+    /// Returns the operation name as a static string slice.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+impl std::fmt::Display for MutationOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Context available to mutation hooks.
+///
+/// Carries actor identity, request metadata, and timestamps so that
+/// hook implementations can perform auditing, validation, or enrichment.
+#[derive(Debug, Clone)]
+pub struct MutationContext {
+    /// The mutation operation type.
+    pub op: MutationOp,
+    /// Actor identity (user ID or service name). `None` for anonymous.
+    pub actor: Option<String>,
+    /// Correlation / request ID for tracing.
+    pub request_id: Option<String>,
+    /// Timestamp of the mutation.
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+impl MutationContext {
+    /// Create a new context for the given operation.
+    ///
+    /// Auto-populates `now` with `Utc::now()` and `request_id` with a
+    /// freshly generated UUID v4.
+    #[must_use]
+    pub fn new(op: MutationOp) -> Self {
+        Self {
+            op,
+            actor: None,
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            now: chrono::Utc::now(),
+        }
+    }
+}
+
 /// Tri-state sparse update value.
 ///
 /// `Patch<T>` distinguishes between "field not mentioned" ([`Unchanged`](Patch::Unchanged)),
@@ -232,5 +295,38 @@ mod tests {
     fn field_diff_option_was_cleared() {
         let diff = FieldDiff::new(Some(42), None);
         assert!(diff.was_cleared());
+    }
+
+    // ── MutationOp tests ────────────────────────────────────────────
+
+    #[test]
+    fn mutation_op_as_str() {
+        assert_eq!(MutationOp::Create.as_str(), "create");
+        assert_eq!(MutationOp::Update.as_str(), "update");
+        assert_eq!(MutationOp::Delete.as_str(), "delete");
+    }
+
+    #[test]
+    fn mutation_op_display() {
+        assert_eq!(format!("{}", MutationOp::Create), "create");
+    }
+
+    // ── MutationContext tests ───────────────────────────────────────
+
+    #[test]
+    fn mutation_context_auto_populates() {
+        let ctx = MutationContext::new(MutationOp::Create);
+        assert!(ctx.actor.is_none());
+        assert!(ctx.request_id.is_some());
+        // UUID v4 format: 8-4-4-4-12 = 36 chars
+        assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
+        assert!(matches!(ctx.op, MutationOp::Create));
+    }
+
+    #[test]
+    fn mutation_context_with_actor() {
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        ctx.actor = Some("user-123".into());
+        assert_eq!(ctx.actor.as_deref(), Some("user-123"));
     }
 }
