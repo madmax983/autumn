@@ -75,6 +75,7 @@ pub mod middleware;
 pub mod prelude;
 pub mod route;
 pub mod task;
+pub mod static_gen;
 pub mod validation;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
