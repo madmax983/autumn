@@ -2,7 +2,7 @@ mod models;
 mod routes;
 mod schema;
 
-use autumn_web::routes;
+use autumn_web::{routes, static_routes};
 use diesel::Connection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
@@ -36,6 +36,7 @@ async fn main() {
             routes::api::list_json,
             routes::api::create_json,
         ])
+        .static_routes(static_routes![routes::about::about,])
         .run()
         .await;
 }
