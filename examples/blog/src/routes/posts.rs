@@ -167,9 +167,9 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
                 }
             }
 
-            // Published toggle
+            // Published toggle (no hidden field — unchecked checkbox is
+            // absent from form data; #[serde(default)] handles it as false)
             div class="flex items-center gap-3" {
-                input type="hidden" name="published" value="false";
                 input type="checkbox" id="published" name="published" value="true"
                       checked[published]
                       class="w-4 h-4 rounded border-stone-300 text-amber-600 \
