@@ -1,47 +1,23 @@
-// ── Repository layer ────────────────────────────────────────────
+// ── v0.2 Feature: #[repository] macro ───────────────────────────
 //
-// Manual Diesel queries using the Db extractor. The #[repository]
-// macro will generate this boilerplate automatically once macro path
-// resolution is fully stabilized for downstream crates.
+// Generates PgBookmarkRepository with:
+//   - 7 auto-generated CRUD methods (find_by_id, find_all, save, etc.)
+//   - Derived queries parsed from method names below
+//   - FromRequestParts extractor (use as handler parameter)
+//
+// The trait stays alive for mockability in tests.
+//
+// Types that must be in scope: Bookmark, NewBookmark, UpdateBookmark,
+// and the diesel schema module (bookmarks).
 
-use diesel::prelude::*;
-use diesel_async::RunQueryDsl;
-
-use autumn_web::prelude::*;
-
-use crate::models::{Bookmark, NewBookmark};
+use crate::models::{Bookmark, NewBookmark, UpdateBookmark};
 use crate::schema::bookmarks;
 
-impl Bookmark {
-    pub async fn all(db: &mut Db) -> AutumnResult<Vec<Self>> {
-        Ok(bookmarks::table
-            .order(bookmarks::created_at.desc())
-            .select(Self::as_select())
-            .load(&mut **db)
-            .await?)
-    }
+#[autumn_web::repository(Bookmark)]
+pub trait BookmarkRepository {
+    // Derived query: SELECT * FROM bookmarks WHERE tag = $1
+    fn find_by_tag(tag: String) -> Vec<Bookmark>;
 
-    pub async fn find_by_tag(tag: &str, db: &mut Db) -> AutumnResult<Vec<Self>> {
-        Ok(bookmarks::table
-            .filter(bookmarks::tag.eq(tag))
-            .order(bookmarks::created_at.desc())
-            .select(Self::as_select())
-            .load(&mut **db)
-            .await?)
-    }
-
-    pub async fn create(new: &NewBookmark, db: &mut Db) -> AutumnResult<Self> {
-        Ok(diesel::insert_into(bookmarks::table)
-            .values(new)
-            .returning(Self::as_returning())
-            .get_result(&mut **db)
-            .await?)
-    }
-
-    pub async fn delete(id: i32, db: &mut Db) -> AutumnResult<()> {
-        diesel::delete(bookmarks::table.find(id))
-            .execute(&mut **db)
-            .await?;
-        Ok(())
-    }
+    // Derived query: SELECT * FROM bookmarks WHERE alive = $1
+    fn find_by_alive(alive: bool) -> Vec<Bookmark>;
 }

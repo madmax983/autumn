@@ -11,24 +11,27 @@
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 
-use crate::models::{Bookmark, NewBookmark};
+use crate::models::NewBookmark;
+use crate::repositories::{BookmarkRepository, PgBookmarkRepository};
 
 #[get("/api/bookmarks")]
-pub async fn list_json(mut db: Db) -> AutumnResult<Json<Vec<Bookmark>>> {
-    Ok(Json(Bookmark::all(&mut db).await?))
+pub async fn list_json(
+    repo: PgBookmarkRepository,
+) -> AutumnResult<Json<Vec<crate::models::Bookmark>>> {
+    Ok(Json(repo.find_all().await?))
 }
 
 #[post("/api/bookmarks")]
 pub async fn create_json(
-    mut db: Db,
+    repo: PgBookmarkRepository,
     Valid(Json(new)): Valid<Json<NewBookmark>>,
-) -> AutumnResult<Json<Bookmark>> {
+) -> AutumnResult<Json<crate::models::Bookmark>> {
     // `new` is guaranteed valid — url format and title length already checked
-    Ok(Json(Bookmark::create(&new, &mut db).await?))
+    Ok(Json(repo.save(&new).await?))
 }
 
 #[delete("/api/bookmarks/{id}")]
-pub async fn delete_json(id: Path<i32>, mut db: Db) -> AutumnResult<String> {
-    Bookmark::delete(*id, &mut db).await?;
+pub async fn delete_json(Path(id): Path<i32>, repo: PgBookmarkRepository) -> AutumnResult<String> {
+    repo.delete_by_id(id).await?;
     Ok(String::new())
 }
