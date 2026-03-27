@@ -444,7 +444,6 @@ pub mod reexports {
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
-    pub use smallvec;
     pub use tokio;
     pub use tracing;
     pub use validator;

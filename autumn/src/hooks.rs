@@ -60,6 +60,7 @@
 //! - [`MutationContext`] -- carries actor identity, request ID, and
 //!   timestamp into every hook invocation.
 
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
 // ── Mutation operation & context ─────────────────────────────────────
@@ -253,8 +254,7 @@ where
 /// This is the building block for partial-update (PATCH) payloads where
 /// omitting a field means "leave it alone" rather than "set it to its
 /// default".
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Patch<T> {
     /// The field was not included in the update payload.
     #[default]
@@ -305,6 +305,27 @@ impl<T> Patch<T> {
             Self::Clear => Some(None),
             Self::Unchanged => None,
         }
+    }
+}
+
+impl<T: Serialize> Serialize for Patch<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Patch::Unchanged | Patch::Clear => serializer.serialize_none(),
+            Patch::Set(v) => v.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // When this method is called, the field WAS present in the JSON.
+        // Absent fields use the Default impl (→ Unchanged) via #[serde(default)].
+        let opt: Option<T> = Option::deserialize(deserializer)?;
+        Ok(match opt {
+            Some(v) => Patch::Set(v),
+            None => Patch::Clear,
+        })
     }
 }
 
@@ -528,5 +549,54 @@ mod tests {
         assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
         assert!(hooks.after_delete(&ctx, 1).await.is_ok());
         assert!(hooks.after_commit(&ctx, MutationOp::Create).await.is_ok());
+    }
+
+    // ── Patch serde tests ──────────────────────────────────────────
+
+    #[test]
+    fn patch_serde_set_roundtrip() {
+        let p = Patch::Set(42);
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, "42");
+        let back: Patch<i32> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Patch::Set(42));
+    }
+
+    #[test]
+    fn patch_serde_clear_serializes_as_null() {
+        let p: Patch<i32> = Patch::Clear;
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, "null");
+    }
+
+    #[test]
+    fn patch_serde_null_deserializes_as_clear() {
+        let p: Patch<i32> = serde_json::from_str("null").unwrap();
+        assert_eq!(p, Patch::Clear);
+    }
+
+    #[test]
+    fn patch_serde_absent_field_is_unchanged() {
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Payload {
+            #[serde(default)]
+            name: Patch<String>,
+            #[serde(default)]
+            age: Patch<i32>,
+        }
+        let p: Payload = serde_json::from_str(r#"{"name": "Alice"}"#).unwrap();
+        assert_eq!(p.name, Patch::Set("Alice".to_string()));
+        assert_eq!(p.age, Patch::Unchanged);
+    }
+
+    #[test]
+    fn patch_serde_explicit_null_is_clear() {
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Payload {
+            #[serde(default)]
+            name: Patch<String>,
+        }
+        let p: Payload = serde_json::from_str(r#"{"name": null}"#).unwrap();
+        assert_eq!(p.name, Patch::Clear);
     }
 }
