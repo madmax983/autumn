@@ -1,4 +1,4 @@
-error: #[model] can only be applied to structs
+error: #[model] can only be applied to structs with named fields
  --> tests/compile-fail/model_on_enum.rs:4:6
   |
 4 | enum Status {
