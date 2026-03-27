@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod build;
 mod new;
 mod setup;
 
@@ -19,6 +20,12 @@ enum Commands {
         /// Project name (must be a valid Rust package name)
         name: String,
     },
+    /// Pre-render static routes to dist/
+    Build {
+        /// Build in debug mode instead of release
+        #[arg(long)]
+        debug: bool,
+    },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
         /// Re-download even if the binary already exists
@@ -30,6 +37,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Build { debug } => build::run(debug),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -44,7 +52,7 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
             Commands::New { ref name } => assert_eq!(name, "my-app"),
-            Commands::Setup { .. } => panic!("expected New command"),
+            _ => panic!("expected New command"),
         }
     }
 
@@ -53,7 +61,7 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
             Commands::New { ref name } => assert_eq!(name, "my_app"),
-            Commands::Setup { .. } => panic!("expected New command"),
+            _ => panic!("expected New command"),
         }
     }
 
@@ -77,6 +85,18 @@ mod tests {
     #[test]
     fn new_missing_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "new"]).is_err());
+    }
+
+    #[test]
+    fn parse_build_subcommand() {
+        let cli = Cli::try_parse_from(["autumn", "build"]).unwrap();
+        assert!(matches!(cli.command, Commands::Build { debug: false }));
+    }
+
+    #[test]
+    fn parse_build_debug() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--debug"]).unwrap();
+        assert!(matches!(cli.command, Commands::Build { debug: true }));
     }
 
     #[test]
