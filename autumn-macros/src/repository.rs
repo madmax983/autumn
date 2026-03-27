@@ -4,6 +4,9 @@
 //! - Auto-generated CRUD (`find_by_id`, `find_all`, save, update, `delete_by_id`, count, `exists_by_id`)
 //! - Derived queries parsed from trait method names (`find_by_field`, `count_by_field`, etc.)
 //! - `FromRequestParts` extractor impl
+//!
+//! Uses native async fn in traits (Rust 1.75+) — no `async_trait` crate needed.
+//! Uses `diesel-async` `RunQueryDsl` for async queries — no sync `interact()`.
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -99,58 +102,53 @@ fn generate_derived_query(
         .iter()
         .zip(param_names.iter())
         .map(|(field, param)| {
-            quote! { .filter(#table_ident::#field.eq(#param)) }
+            quote! { .filter(#table_ident::#field.eq(&#param)) }
         })
         .collect();
 
     match query.prefix.as_str() {
         "find" => {
             quote! {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    #table_ident::table
-                        #(#filters)*
-                        .load::<#model_name>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    #(#filters)*
+                    .load::<#model_name>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
         }
         "count" => {
             quote! {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    #table_ident::table
-                        #(#filters)*
-                        .count()
-                        .get_result::<i64>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    #(#filters)*
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
         }
         "delete" => {
             quote! {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::delete(#table_ident::table #(#filters)*)
-                        .execute(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::delete(#table_ident::table #(#filters)*)
+                    .execute(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)?;
                 Ok(())
             }
         }
         "exists" => {
             quote! {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::select(::autumn_web::reexports::diesel::dsl::exists(
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::select(
+                    ::autumn_web::reexports::diesel::dsl::exists(
                         #table_ident::table #(#filters)*
-                    )).get_result::<bool>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
-                    .map_err(::autumn_web::AutumnError::from)
+                    )
+                )
+                .get_result::<bool>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)
             }
         }
         _ => quote! { todo!() },
@@ -188,14 +186,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             if let Some(query) = parse_query_name(&method_name) {
                 let fn_ident = &method.sig.ident;
 
-                // Generate parameter list from query fields
-                let params: Vec<TokenStream> = query
-                    .fields
+                // Use the user's actual parameter types from the trait signature.
+                // The user writes: fn find_by_tag(tag: String) -> Vec<Bookmark>
+                // We extract the (name: Type) pairs directly.
+                let user_params: Vec<TokenStream> = method
+                    .sig
+                    .inputs
                     .iter()
-                    .map(|f| {
-                        let field_ident = format_ident!("{f}");
-                        // Use generic owned types for interact closure compatibility
-                        quote! { #field_ident: String }
+                    .filter_map(|arg| {
+                        if let syn::FnArg::Typed(pat_type) = arg {
+                            let pat = &pat_type.pat;
+                            let ty = &pat_type.ty;
+                            Some(quote! { #pat: #ty })
+                        } else {
+                            None // skip `self`
+                        }
                     })
                     .collect();
 
@@ -207,14 +212,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => quote! { () }, // delete + unknown
                 };
 
+                let params = &user_params;
+
                 let body = generate_derived_query(&query, &table_ident, model_name);
 
                 derived_trait_methods.push(quote! {
-                    async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type>;
+                    fn #fn_ident(&self, #(#params),*) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#return_type>> + Send;
                 });
 
                 derived_impl_methods.push(quote! {
                     async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                        use ::autumn_web::reexports::diesel::prelude::*;
+                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                         #body
                     }
                 });
@@ -222,119 +231,129 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // Generate the trait, impl, and extractor.
+    //
+    // Key design decisions:
+    // - Native async fn (no #[async_trait]) — Rust 1.75+ supports this
+    // - Trait methods use `-> impl Future` for object safety with Send bound
+    // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
+    // - Table/New/Update types must be in scope where the macro is invoked
+    //   (the user brings them in via `use crate::models::*` or similar)
     quote! {
         /// Generated repository trait with CRUD + derived queries.
-        #[::autumn_web::reexports::axum::async_trait]
         #vis trait #trait_name: Send + Sync {
-            async fn find_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<Option<#model_name>>;
-            async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>>;
-            async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name>;
-            async fn update(&self, id: i32, changes: &#update_name) -> ::autumn_web::AutumnResult<#model_name>;
-            async fn delete_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<()>;
-            async fn count(&self) -> ::autumn_web::AutumnResult<i64>;
-            async fn exists_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<bool>;
+            fn find_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Option<#model_name>>> + Send;
+            fn find_all(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
+            fn save(&self, new: &#new_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#model_name>> + Send;
+            fn update(&self, id: i32, changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#model_name>> + Send;
+            fn delete_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+            fn count(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<i64>> + Send;
+            fn exists_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
             #(#derived_trait_methods)*
         }
 
         /// Postgres implementation of the repository.
         #[derive(Clone)]
         #vis struct #pg_name {
-            pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<::autumn_web::reexports::diesel_async::AsyncPgConnection>,
+            pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            >,
         }
 
-        #[::autumn_web::reexports::axum::async_trait]
         impl #trait_name for #pg_name {
             async fn find_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<Option<#model_name>> {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    #table_ident::table.find(id).first::<#model_name>(conn).optional()
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    .find(id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+                    .optional()
                     .map_err(::autumn_web::AutumnError::from)
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(|conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    #table_ident::table.load::<#model_name>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    .load::<#model_name>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                let new = new.clone();
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(&new)
-                        .get_result::<#model_name>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(new)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
 
             async fn update(&self, id: i32, changes: &#update_name) -> ::autumn_web::AutumnResult<#model_name> {
-                let changes = changes.clone();
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                        .set(&changes)
-                        .get_result::<#model_name>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(changes)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
 
             async fn delete_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<()> {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id)).execute(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)?;
                 Ok(())
             }
 
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(|conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    #table_ident::table.count().get_result::<i64>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                #table_ident::table
+                    .count()
+                    .get_result::<i64>(&mut conn)
+                    .await
                     .map_err(::autumn_web::AutumnError::from)
             }
 
             async fn exists_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<bool> {
-                let conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                conn.interact(move |conn| {
-                    use ::autumn_web::reexports::diesel::prelude::*;
-                    ::autumn_web::reexports::diesel::select(::autumn_web::reexports::diesel::dsl::exists(#table_ident::table.find(id)))
-                        .get_result::<bool>(conn)
-                }).await.map_err(|e| ::autumn_web::AutumnError::from(::std::io::Error::other(e.to_string())))?
-                    .map_err(::autumn_web::AutumnError::from)
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::select(
+                    ::autumn_web::reexports::diesel::dsl::exists(#table_ident::table.find(id))
+                )
+                .get_result::<bool>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)
             }
 
             #(#derived_impl_methods)*
         }
 
-        // Extractor: extract from AppState's pool
-        #[::autumn_web::reexports::axum::async_trait]
-        impl<S> ::autumn_web::reexports::axum::extract::FromRequestParts<S> for #pg_name
-        where
-            S: Send + Sync,
-            ::autumn_web::AppState: ::autumn_web::reexports::axum::extract::FromRef<S>,
-        {
+        // Extractor: pull pool from AppState (same pattern as Db extractor)
+        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
             type Rejection = ::autumn_web::AutumnError;
 
             async fn from_request_parts(
                 _parts: &mut ::autumn_web::reexports::http::request::Parts,
-                state: &S,
+                state: &::autumn_web::AppState,
             ) -> Result<Self, Self::Rejection> {
-                use ::autumn_web::reexports::axum::extract::FromRef;
-                let app_state = ::autumn_web::AppState::from_ref(state);
-                let pool = app_state.pool
-                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?;
+                let pool = state.pool
+                    .as_ref()
+                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                    .clone();
                 Ok(#pg_name { pool })
             }
         }

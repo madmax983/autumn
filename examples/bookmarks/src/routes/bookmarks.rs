@@ -2,6 +2,7 @@ use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 
 use crate::models::Bookmark;
+use crate::repositories::{BookmarkRepository, PgBookmarkRepository};
 
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
@@ -59,8 +60,8 @@ fn bookmark_card(b: &Bookmark) -> Markup {
 }
 
 #[get("/")]
-pub async fn list(mut db: Db) -> AutumnResult<Markup> {
-    let all = Bookmark::all(&mut db).await?;
+pub async fn list(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
+    let all = repo.find_all().await?;
     Ok(layout(
         "All",
         html! {
@@ -84,8 +85,8 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
 }
 
 #[get("/tag/{tag}")]
-pub async fn by_tag(Path(tag): Path<String>, mut db: Db) -> AutumnResult<Markup> {
-    let tagged = Bookmark::find_by_tag(&tag, &mut db).await?;
+pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> AutumnResult<Markup> {
+    let tagged = repo.find_by_tag(tag.clone()).await?;
     Ok(layout(
         &format!("#{tag}"),
         html! {
