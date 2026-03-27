@@ -74,11 +74,31 @@ async fn static_files_served_over_dynamic_routes() {
         Some(dist.as_path()),
     );
 
-    // 3. GET /about should return the static content, not the dynamic handler.
+    // 3. GET /about redirects to /about/ (307), then serves index.html.
+    //    ServeDir issues a 307 redirect for directory paths without
+    //    trailing slash, then serves the index.html on the redirected
+    //    request. Browsers follow this automatically.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/about")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TEMPORARY_REDIRECT,
+        "ServeDir should redirect /about to /about/"
+    );
+
+    // 4. Following the redirect: GET /about/ returns the static content.
     let resp = router
         .oneshot(
             Request::builder()
-                .uri("/about/index.html")
+                .uri("/about/")
                 .body(Body::empty())
                 .unwrap(),
         )

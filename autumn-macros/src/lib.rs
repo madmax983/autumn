@@ -13,6 +13,7 @@
 
 mod main_macro;
 mod model;
+mod parse;
 mod repository;
 mod route;
 mod routes_macro;

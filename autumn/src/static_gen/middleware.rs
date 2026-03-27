@@ -43,20 +43,16 @@ impl StaticFileLayer {
         &self.dist_dir
     }
 
-    /// Check whether `request_path` (e.g. `"/about"`) maps to a known
-    /// manifest route **and** the corresponding file exists on disk.
+    /// Map a request path (e.g. `"/about"`) to its filesystem path
+    /// within `dist/`, based on the manifest.
     ///
-    /// Returns the absolute path to the file if both conditions hold,
-    /// or `None` otherwise.
+    /// Returns `None` if the path is not in the manifest. Does **not**
+    /// check whether the file exists on disk — callers (e.g. `ServeDir`)
+    /// handle missing files gracefully.
     #[must_use]
     pub fn resolve(&self, request_path: &str) -> Option<PathBuf> {
         let entry = self.manifest.routes.get(request_path)?;
-        let file_path = self.dist_dir.join(&entry.file);
-        if file_path.exists() {
-            Some(file_path)
-        } else {
-            None
-        }
+        Some(self.dist_dir.join(&entry.file))
     }
 }
 

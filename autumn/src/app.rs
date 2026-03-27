@@ -394,7 +394,7 @@ pub fn build_router_with_static(
     };
 
     for (route, entry) in &layer.manifest().routes {
-        tracing::info!(
+        tracing::debug!(
             route = %route,
             file = %entry.file,
             revalidate = ?entry.revalidate,
@@ -751,11 +751,13 @@ mod tests {
             Some(dist.as_path()),
         );
 
-        // GET /about/index.html should return the static file content
+        // GET /about/ should serve the static file (ServeDir appends index.html).
+        // (GET /about without trailing slash returns a 307 redirect to /about/,
+        //  which browsers follow automatically.)
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/about/index.html")
+                    .uri("/about/")
                     .body(Body::empty())
                     .unwrap(),
             )
