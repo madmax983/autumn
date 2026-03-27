@@ -303,6 +303,9 @@ pub use autumn_macros::scheduled;
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
 
+/// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
+pub use autumn_macros::static_routes;
+
 /// Annotate an async function as a statically pre-rendered GET route.
 ///
 /// Like [`get`], this generates a route companion for Axum routing.

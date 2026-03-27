@@ -19,6 +19,7 @@ mod route;
 mod routes_macro;
 mod scheduled;
 mod static_route;
+mod static_routes_macro;
 mod tasks_macro;
 
 use proc_macro::TokenStream;
@@ -266,4 +267,19 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
     tasks_macro::tasks_macro(input.into()).into()
+}
+
+/// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[static_get("/about")]
+/// async fn about() -> &'static str { "About" }
+///
+/// let metas = static_routes![about];
+/// ```
+#[proc_macro]
+pub fn static_routes(input: TokenStream) -> TokenStream {
+    static_routes_macro::static_routes_macro(input.into()).into()
 }

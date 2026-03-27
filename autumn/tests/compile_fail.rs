@@ -27,6 +27,7 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/valid_handlers.rs");
     t.pass("tests/compile-pass/async_main.rs");
     t.pass("tests/compile-pass/static_get_basic.rs");
+    t.pass("tests/compile-pass/static_routes_basic.rs");
 
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
