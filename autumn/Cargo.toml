@@ -20,6 +20,7 @@ diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 futures.workspace = true
 http.workspace = true
+indexmap.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
 maud = { workspace = true, optional = true }
 pin-project-lite = "0.2"

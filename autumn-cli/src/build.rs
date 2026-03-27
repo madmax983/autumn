@@ -77,23 +77,26 @@ fn find_binary(debug: bool, package: Option<&str>) -> std::path::PathBuf {
     let packages = metadata["packages"].as_array().expect("packages array");
 
     // Filter packages: by name if -p was given, otherwise by cwd
-    let matching_packages: Vec<_> = if let Some(pkg_name) = package {
-        packages
-            .iter()
-            .filter(|pkg| pkg["name"].as_str() == Some(pkg_name))
-            .collect()
-    } else {
-        let cwd = std::env::current_dir().expect("current dir");
-        packages
-            .iter()
-            .filter(|pkg| {
-                let manifest = pkg["manifest_path"].as_str().unwrap_or("");
-                std::path::Path::new(manifest)
-                    .parent()
-                    .is_some_and(|dir| dir.starts_with(&cwd))
-            })
-            .collect()
-    };
+    let matching_packages: Vec<_> = package.map_or_else(
+        || {
+            let cwd = std::env::current_dir().expect("current dir");
+            packages
+                .iter()
+                .filter(|pkg| {
+                    let manifest = pkg["manifest_path"].as_str().unwrap_or("");
+                    std::path::Path::new(manifest)
+                        .parent()
+                        .is_some_and(|dir| dir.starts_with(&cwd))
+                })
+                .collect()
+        },
+        |pkg_name| {
+            packages
+                .iter()
+                .filter(|pkg| pkg["name"].as_str() == Some(pkg_name))
+                .collect()
+        },
+    );
 
     let bin_name = matching_packages
         .iter()

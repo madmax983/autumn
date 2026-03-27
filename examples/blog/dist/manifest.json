@@ -1,0 +1,10 @@
+{
+  "generated_at": "1774630772",
+  "autumn_version": "0.1.0",
+  "routes": {
+    "/about": {
+      "file": "about/index.html",
+      "revalidate": null
+    }
+  }
+}

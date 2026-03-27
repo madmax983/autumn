@@ -398,15 +398,32 @@ pub fn build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
-    let mut router = axum::Router::new();
-    for route in route_list {
+    // Group routes by path so multiple methods on the same path
+    // (e.g. GET /admin + POST /admin) are merged into a single
+    // MethodRouter. Axum 0.7+ panics if .route() is called twice
+    // with the same path — merging avoids this.
+    let mut grouped: indexmap::IndexMap<&str, axum::routing::MethodRouter<AppState>> =
+        indexmap::IndexMap::new();
+    for route in &route_list {
         tracing::debug!(
             method = %route.method,
             path = route.path,
             name = route.name,
             "Mounted route"
         );
-        router = router.route(route.path, route.handler);
+    }
+    for route in route_list {
+        grouped
+            .entry(route.path)
+            .and_modify(|existing| {
+                *existing = existing.clone().merge(route.handler.clone());
+            })
+            .or_insert(route.handler);
+    }
+
+    let mut router = axum::Router::new();
+    for (path, method_router) in grouped {
+        router = router.route(path, method_router);
     }
 
     // Framework-provided routes
@@ -699,6 +716,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_merges_methods_on_same_path() {
+        let routes = vec![
+            Route {
+                method: http::Method::GET,
+                path: "/admin",
+                handler: axum::routing::get(|| async { "list" }),
+                name: "admin_list",
+            },
+            Route {
+                method: http::Method::POST,
+                path: "/admin",
+                handler: axum::routing::post(|| async { "created" }),
+                name: "create",
+            },
+        ];
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router(routes, &config, state);
+
+        // GET /admin should return "list"
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"list");
+
+        // POST /admin should return "created" (not 405!)
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"created");
     }
 
     #[cfg(feature = "htmx")]
