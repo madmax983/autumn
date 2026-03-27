@@ -190,7 +190,7 @@ async fn unknown_routes_fall_through_to_dynamic() {
     );
 }
 
-/// POST requests must pass through ServeDir to the dynamic router,
+/// POST requests must pass through `ServeDir` to the dynamic router,
 /// even when a dist/ directory is active.
 #[tokio::test]
 async fn post_requests_pass_through_static_layer() {

@@ -1,4 +1,4 @@
-//! Integration test: verify render_static_routes works with a real
+//! Integration test: verify `render_static_routes` works with a real
 //! Autumn router (not just a mock fallback handler).
 
 use autumn_web::app::build_router;
@@ -15,7 +15,7 @@ fn about_route() -> Route {
     }
 }
 
-fn about_meta() -> StaticRouteMeta {
+const fn about_meta() -> StaticRouteMeta {
     StaticRouteMeta {
         path: "/about",
         name: "about",

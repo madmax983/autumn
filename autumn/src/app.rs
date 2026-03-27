@@ -729,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_router_merges_methods_on_same_path() {
-        let routes = vec![
+        let route_list = vec![
             Route {
                 method: http::Method::GET,
                 path: "/admin",
@@ -751,7 +751,7 @@ mod tests {
             started_at: std::time::Instant::now(),
             health_detailed: true,
         };
-        let router = build_router(routes, &config, state);
+        let router = build_router(route_list, &config, state);
 
         // GET /admin should return "list"
         let resp = router
