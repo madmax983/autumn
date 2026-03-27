@@ -86,7 +86,11 @@ impl NewPost {
         }
 
         // Auto-generate slug from title if not provided
-        let slug = if slug.is_empty() { slugify(&title) } else { slugify(&slug) };
+        let slug = if slug.is_empty() {
+            slugify(&title)
+        } else {
+            slugify(&slug)
+        };
 
         Ok(Self {
             title,

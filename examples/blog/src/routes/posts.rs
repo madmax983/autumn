@@ -78,11 +78,7 @@ fn layout(title: &str, content: Markup) -> Markup {
 /// Render a single post card for the listing page.
 fn post_card(post: &Post) -> Markup {
     let date = post.created_at.format("%b %d, %Y");
-    let preview: String = post
-        .body
-        .chars()
-        .take(200)
-        .collect::<String>();
+    let preview: String = post.body.chars().take(200).collect::<String>();
     let preview = if post.body.len() > 200 {
         format!("{preview}...")
     } else {
