@@ -23,7 +23,7 @@
 
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.
-pub use autumn_macros::{delete, get, main, post, put, routes, scheduled, tasks};
+pub use autumn_macros::{delete, get, main, post, put, routes, scheduled, static_get, tasks};
 
 // ── Rendering ────────────────────────────────────────────────────
 /// Maud HTML templating types.

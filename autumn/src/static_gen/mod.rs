@@ -1,3 +1,3 @@
 mod types;
 
-pub use types::{url_to_file_path, ManifestEntry, StaticManifest, StaticRouteMeta};
+pub use types::{ManifestEntry, StaticManifest, StaticRouteMeta, url_to_file_path};

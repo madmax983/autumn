@@ -17,6 +17,7 @@ mod repository;
 mod route;
 mod routes_macro;
 mod scheduled;
+mod static_route;
 mod tasks_macro;
 
 use proc_macro::TokenStream;
@@ -230,6 +231,30 @@ pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     scheduled::scheduled_macro(attr.into(), item.into()).into()
+}
+
+/// Annotate an async function as a statically pre-rendered GET route.
+///
+/// Like `#[get]`, this generates a route companion function. Additionally,
+/// it generates a `__autumn_static_meta_{name}()` companion that registers
+/// the route for static HTML generation at build time.
+///
+/// Phase 1: path parameters are **not** supported. Use `#[get]` for
+/// parameterized routes.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::static_get;
+///
+/// #[static_get("/about")]
+/// async fn about() -> &'static str {
+///     "About us"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
+    static_route::static_get_macro(attr.into(), item.into()).into()
 }
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
