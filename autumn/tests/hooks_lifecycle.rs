@@ -65,10 +65,12 @@ async fn no_hooks_methods_are_all_ok() {
 
     assert!(hooks.before_create(&mut ctx, &mut new).await.is_ok());
     assert!(hooks.after_create(&ctx, &model).await.is_ok());
-    assert!(hooks
-        .before_update(&mut ctx, &model, &mut update)
-        .await
-        .is_ok());
+    assert!(
+        hooks
+            .before_update(&mut ctx, &model, &mut update)
+            .await
+            .is_ok()
+    );
     assert!(hooks.after_update(&ctx, &model).await.is_ok());
     assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
     assert!(hooks.after_delete(&ctx, 1).await.is_ok());
