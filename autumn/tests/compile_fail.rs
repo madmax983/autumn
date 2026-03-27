@@ -36,4 +36,8 @@ fn compile_pass_tests() {
     // Model derive (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_derive.rs");
+
+    // Repository with hooks (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_with_hooks.rs");
 }

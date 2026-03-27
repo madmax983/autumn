@@ -446,6 +446,7 @@ pub mod reexports {
     pub use http;
     pub use smallvec;
     pub use tokio;
+    pub use tracing;
     pub use validator;
 }
 
