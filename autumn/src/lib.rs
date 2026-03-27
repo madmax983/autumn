@@ -73,6 +73,7 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod task;
 pub mod validation;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
@@ -293,6 +294,12 @@ pub use autumn_macros::put;
 /// # }
 /// ```
 pub use autumn_macros::routes;
+
+/// Declare a scheduled background task. See [`task`] module.
+pub use autumn_macros::scheduled;
+
+/// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
+pub use autumn_macros::tasks;
 
 // ── Maud re-exports ────────────────────────────────────────────────
 

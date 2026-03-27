@@ -55,7 +55,10 @@ use crate::route::Route;
 /// ```
 #[must_use]
 pub const fn app() -> AppBuilder {
-    AppBuilder { routes: Vec::new() }
+    AppBuilder {
+        routes: Vec::new(),
+        tasks: Vec::new(),
+    }
 }
 
 /// Builder for configuring and launching an Autumn application.
@@ -88,6 +91,7 @@ pub const fn app() -> AppBuilder {
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    tasks: Vec<crate::task::TaskInfo>,
 }
 
 impl AppBuilder {
@@ -115,6 +119,17 @@ impl AppBuilder {
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
+        self
+    }
+
+    /// Register scheduled background tasks with the application.
+    ///
+    /// Tasks run alongside the HTTP server and are stopped during
+    /// graceful shutdown. Use the [`tasks!`](crate::tasks) macro
+    /// to collect `#[scheduled]` handlers.
+    #[must_use]
+    pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
+        self.tasks.extend(tasks);
         self
     }
 
@@ -189,9 +204,24 @@ impl AppBuilder {
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
         };
-        let router = build_router(self.routes, &config, state);
+        let router = build_router(self.routes, &config, state.clone());
 
-        // 7. Bind and serve with graceful shutdown
+        // 7. Start scheduled tasks (if any)
+        if !self.tasks.is_empty() {
+            tracing::info!(count = self.tasks.len(), "Starting scheduled tasks");
+            for task_info in &self.tasks {
+                let schedule_desc = match &task_info.schedule {
+                    crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+                    crate::task::Schedule::Cron { expression, .. } => {
+                        format!("cron {expression}")
+                    }
+                };
+                tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+            }
+            start_task_scheduler(self.tasks, &state);
+        }
+
+        // 8. Bind and serve with graceful shutdown
         let addr = format!("{}:{}", config.server.host, config.server.port);
         tracing::info!(addr = %addr, "Listening");
 
@@ -229,6 +259,40 @@ impl AppBuilder {
             });
 
         tracing::info!("Server shut down cleanly");
+    }
+}
+
+/// Start scheduled tasks in background Tokio tasks.
+///
+/// Each task runs in its own spawned task with error logging.
+/// Uses simple `tokio::time` for fixed-delay scheduling.
+fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
+    for task_info in tasks {
+        let state = state.clone();
+        let name = task_info.name.clone();
+        let handler = task_info.handler;
+
+        match task_info.schedule {
+            crate::task::Schedule::FixedDelay(delay) => {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        tracing::debug!(task = %name, "Running scheduled task");
+                        match (handler)(state.clone()).await {
+                            Ok(()) => tracing::debug!(task = %name, "Task completed"),
+                            Err(e) => tracing::warn!(task = %name, error = %e, "Task failed"),
+                        }
+                    }
+                });
+            }
+            crate::task::Schedule::Cron { expression, .. } => {
+                tracing::info!(
+                    task = %name,
+                    cron = %expression,
+                    "Cron scheduling not yet implemented; task registered but will not run"
+                );
+            }
+        }
     }
 }
 
