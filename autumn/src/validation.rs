@@ -218,8 +218,6 @@ mod tests {
 
     #[test]
     fn validation_errors_to_map_basic() {
-        use validator::Validate;
-
         #[derive(validator::Validate)]
         struct TestForm {
             #[validate(length(min = 5))]
