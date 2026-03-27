@@ -13,6 +13,7 @@
 
 mod main_macro;
 mod model;
+mod repository;
 mod route;
 mod routes_macro;
 
@@ -191,4 +192,24 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     model::model_macro(attr.into(), item.into()).into()
+}
+
+/// Derive a repository with CRUD operations and derived queries.
+///
+/// Generates a `PgXxxRepository` struct implementing the annotated trait,
+/// with auto-generated CRUD methods and query-by-name derived methods.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::repository;
+///
+/// #[repository(Post)]
+/// trait PostRepository {
+///     fn find_by_published(published: bool) -> Vec<Post>;
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
+    repository::repository_macro(attr.into(), item.into()).into()
 }

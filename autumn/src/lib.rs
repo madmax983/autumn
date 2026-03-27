@@ -225,6 +225,12 @@ pub use autumn_macros::main;
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
 
+/// Derive a repository with CRUD operations and derived queries.
+///
+/// See [`repository`](autumn_macros::repository) for details.
+#[cfg(feature = "db")]
+pub use autumn_macros::repository;
+
 /// Annotate an async function as a `POST` route handler.
 ///
 /// Generates a companion function that returns a [`route::Route`]
@@ -396,6 +402,8 @@ pub mod reexports {
     pub use axum;
     #[cfg(feature = "db")]
     pub use diesel;
+    #[cfg(feature = "db")]
+    pub use diesel_async;
     pub use http;
     pub use tokio;
     pub use validator;

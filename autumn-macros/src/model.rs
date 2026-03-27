@@ -1,17 +1,18 @@
 //! `#[model]` attribute macro implementation.
 //!
-//! Emits Diesel + Serde derives and a `#[diesel(table_name)]` attribute
-//! on the annotated struct.
+//! Generates three types from a single struct:
+//! - The query type (original struct) with `Queryable`, `Selectable`
+//! - A `NewX` insert type with `Insertable` (ID fields excluded)
+//! - An `UpdateX` changeset type with `AsChangeset` (ID fields excluded, all `Option<T>`)
+//!
+//! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::Parser as _;
-use syn::{DeriveInput, LitStr};
+use syn::{DeriveInput, Field, LitStr};
 
 /// Process `#[model]` or `#[model(table = "...")]` attribute arguments.
-///
-/// Returns `Some(table_name)` if a `table = "..."` key was given, or
-/// `None` to fall back to inference from the struct name.
 fn parse_attr_args(attr: TokenStream) -> syn::Result<Option<String>> {
     if attr.is_empty() {
         return Ok(None);
@@ -32,53 +33,180 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<Option<String>> {
     Ok(table)
 }
 
+/// Check if a field has the `#[id]` attribute.
+fn has_attr(field: &Field, name: &str) -> bool {
+    field.attrs.iter().any(|a| a.path().is_ident(name))
+}
+
+/// Extract `#[validate(...)]` attributes from a field (verbatim pass-through).
+fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
+    field
+        .attrs
+        .iter()
+        .filter(|a| a.path().is_ident("validate"))
+        .collect()
+}
+
+/// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`)
+/// that shouldn't be on the query struct (they'd confuse Diesel derives).
+fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
+    field
+        .attrs
+        .iter()
+        .filter(|a| {
+            !a.path().is_ident("id")
+                && !a.path().is_ident("indexed")
+                && !a.path().is_ident("validate")
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
 pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input: DeriveInput = match syn::parse2(item) {
         Ok(input) => input,
         Err(err) => return err.to_compile_error(),
     };
 
-    // Must be a struct
-    let fields = match &input.data {
-        syn::Data::Struct(data) => &data.fields,
-        _ => {
-            return syn::Error::new_spanned(
-                &input.ident,
-                "#[model] can only be applied to structs",
-            )
-            .to_compile_error();
-        }
+    let syn::Data::Struct(syn::DataStruct {
+        fields: syn::Fields::Named(ref fields),
+        ..
+    }) = input.data
+    else {
+        return syn::Error::new_spanned(
+            &input.ident,
+            "#[model] can only be applied to structs with named fields",
+        )
+        .to_compile_error();
     };
 
-    // Extract table name from attribute args, or infer from struct name
     let table_name = match parse_attr_args(attr) {
         Ok(explicit) => explicit.unwrap_or_else(|| infer_table_name(&input.ident)),
         Err(err) => return err.to_compile_error(),
     };
 
     let table_ident = syn::Ident::new(&table_name, input.ident.span());
-
     let name = &input.ident;
     let vis = &input.vis;
-    let generics = &input.generics;
-    let attrs = &input.attrs;
+    let outer_attrs = &input.attrs;
+
+    let new_name = format_ident!("New{name}");
+    let update_name = format_ident!("Update{name}");
+
+    // Classify fields
+    let all_fields: Vec<&Field> = fields.named.iter().collect();
+    let id_fields: Vec<&&Field> = all_fields.iter().filter(|f| has_attr(f, "id")).collect();
+    let non_id_fields: Vec<&&Field> = all_fields.iter().filter(|f| !has_attr(f, "id")).collect();
+
+    // If no explicit #[id], default to first i32/i64 field
+    let id_field_names: Vec<&syn::Ident> = if id_fields.is_empty() {
+        all_fields
+            .iter()
+            .filter(|f| {
+                if let syn::Type::Path(tp) = &f.ty {
+                    tp.path.is_ident("i32") || tp.path.is_ident("i64")
+                } else {
+                    false
+                }
+            })
+            .take(1)
+            .filter_map(|f| f.ident.as_ref())
+            .collect()
+    } else {
+        id_fields.iter().filter_map(|f| f.ident.as_ref()).collect()
+    };
+
+    let non_id_for_new: Vec<&&Field> = if id_fields.is_empty() {
+        // When auto-detecting ID, exclude the auto-detected field
+        all_fields
+            .iter()
+            .filter(|f| {
+                f.ident
+                    .as_ref()
+                    .is_some_and(|id| !id_field_names.contains(&id))
+            })
+            .collect()
+    } else {
+        non_id_fields.clone()
+    };
+
+    // Check if any field has #[validate(...)]
+    let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
+
+    // Build query struct fields (strip #[id], #[indexed], #[validate])
+    let query_fields: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            let attrs = user_attrs(f);
+            quote! { #(#attrs)* pub #ident: #ty }
+        })
+        .collect();
+
+    // Build NewX fields (non-ID, propagate #[validate])
+    let new_fields: Vec<TokenStream> = non_id_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            let val_attrs = validate_attrs(f);
+            quote! { #(#val_attrs)* pub #ident: #ty }
+        })
+        .collect();
+
+    // Build UpdateX fields (non-ID, all Option<T>, propagate #[validate])
+    let update_fields: Vec<TokenStream> = non_id_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            let val_attrs = validate_attrs(f);
+            quote! { #(#val_attrs)* pub #ident: Option<#ty> }
+        })
+        .collect();
+
+    // Conditional Validate derive
+    let validate_derive = if has_validation {
+        quote! { #[derive(::autumn_web::reexports::validator::Validate)] }
+    } else {
+        quote! {}
+    };
 
     quote! {
-        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::Insertable)]
+        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
-        #(#attrs)*
-        #vis struct #name #generics #fields
+        #(#outer_attrs)*
+        #vis struct #name {
+            #(#query_fields,)*
+        }
+
+        #[derive(Debug, Clone, ::diesel::Insertable)]
+        #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #validate_derive
+        #[diesel(table_name = #table_ident)]
+        #vis struct #new_name {
+            #(#new_fields,)*
+        }
+
+        #[derive(Debug, Clone, ::diesel::AsChangeset)]
+        #[derive(::serde::Serialize, ::serde::Deserialize)]
+        #validate_derive
+        #[diesel(table_name = #table_ident)]
+        #vis struct #update_name {
+            #(#update_fields,)*
+        }
     }
 }
 
-fn infer_table_name(ident: &syn::Ident) -> String {
+pub fn infer_table_name(ident: &syn::Ident) -> String {
     let name = ident.to_string();
     let snake = pascal_to_snake(&name);
     format!("{snake}s")
 }
 
-fn pascal_to_snake(s: &str) -> String {
+pub fn pascal_to_snake(s: &str) -> String {
     let mut result = String::new();
     for (i, ch) in s.chars().enumerate() {
         if ch.is_uppercase() && i > 0 {
