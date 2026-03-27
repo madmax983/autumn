@@ -938,4 +938,66 @@ mod tests {
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);
     }
+
+    #[test]
+    fn project_dir_defaults_to_subdir() {
+        // When AUTUMN_MANIFEST_DIR is not set, project_dir returns the
+        // subdir name as-is (relative to cwd).
+        // SAFETY: called in a single-threaded test context.
+        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+        let dir = super::project_dir("dist");
+        assert_eq!(dir, std::path::PathBuf::from("dist"));
+    }
+
+    #[tokio::test]
+    async fn build_router_with_static_skips_without_manifest() {
+        // When dist/ exists but has no manifest.json, fall back to
+        // the app router without the static layer.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("mkdir");
+        // No manifest.json — just an empty dist/
+
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router = build_router_with_static(
+            vec![test_get_route("/test", "test")],
+            &config,
+            state,
+            Some(dist.as_path()),
+        );
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_router_with_static_none_dist() {
+        // When dist_dir is None, return the app router directly.
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        let router =
+            build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);
+
+        let response = router
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
