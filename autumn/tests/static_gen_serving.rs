@@ -34,11 +34,11 @@ fn dynamic_get_route(
     }
 }
 
-/// When a `dist/` directory contains a static file for a route, the static
-/// file takes priority over a dynamic handler registered at the same path.
+/// Dynamic routes take priority over static files. When both exist,
+/// the dynamic handler runs (SSR). Static files in dist/ are served
+/// only for paths with NO matching dynamic route.
 #[tokio::test]
-async fn static_files_served_over_dynamic_routes() {
-    // 1. Set up a temp dist/ with about/index.html and a valid manifest.json
+async fn dynamic_routes_take_priority_over_static_files() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dist = tmp.path().join("dist");
     std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
@@ -61,7 +61,7 @@ async fn static_files_served_over_dynamic_routes() {
     )
     .expect("write manifest");
 
-    // 2. Build a router where the dynamic handler would return different text.
+    // Dynamic handler registered at the same path as the static file.
     let config = autumn_web::config::AutumnConfig::default();
     let router = autumn_web::app::build_router_with_static(
         vec![dynamic_get_route(
@@ -74,31 +74,11 @@ async fn static_files_served_over_dynamic_routes() {
         Some(dist.as_path()),
     );
 
-    // 3. GET /about redirects to /about/ (307), then serves index.html.
-    //    ServeDir issues a 307 redirect for directory paths without
-    //    trailing slash, then serves the index.html on the redirected
-    //    request. Browsers follow this automatically.
+    // Dynamic handler wins — GET /about returns the SSR response, not the static file.
     let resp = router
-        .clone()
         .oneshot(
             Request::builder()
                 .uri("/about")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::TEMPORARY_REDIRECT,
-        "ServeDir should redirect /about to /about/"
-    );
-
-    // 4. Following the redirect: GET /about/ returns the static content.
-    let resp = router
-        .oneshot(
-            Request::builder()
-                .uri("/about/")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -111,8 +91,8 @@ async fn static_files_served_over_dynamic_routes() {
         .unwrap();
     let text = std::str::from_utf8(&body).expect("valid utf-8");
     assert!(
-        text.contains("Static About"),
-        "Expected static file content, got: {text}"
+        text.contains("Dynamic About"),
+        "Dynamic handler should take priority, got: {text}"
     );
 }
 
@@ -208,4 +188,70 @@ async fn unknown_routes_fall_through_to_dynamic() {
         text.contains("Admin Panel"),
         "Expected dynamic handler response, got: {text}"
     );
+}
+
+/// POST requests must pass through ServeDir to the dynamic router,
+/// even when a dist/ directory is active.
+#[tokio::test]
+async fn post_requests_pass_through_static_layer() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dist = tmp.path().join("dist");
+    std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
+    std::fs::write(dist.join("about/index.html"), "<h1>Static About</h1>").expect("write html");
+
+    let manifest = autumn_web::static_gen::StaticManifest {
+        generated_at: "2026-03-27T00:00:00Z".to_owned(),
+        autumn_version: "0.1.0".to_owned(),
+        routes: HashMap::from([(
+            "/about".to_owned(),
+            autumn_web::static_gen::ManifestEntry {
+                file: "about/index.html".to_owned(),
+                revalidate: None,
+            },
+        )]),
+    };
+    std::fs::write(
+        dist.join("manifest.json"),
+        serde_json::to_string(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+
+    // Register both GET and POST on /admin
+    let config = autumn_web::config::AutumnConfig::default();
+    let router = autumn_web::app::build_router_with_static(
+        vec![
+            dynamic_get_route("/admin", "admin_list", "Admin Panel"),
+            autumn_web::route::Route {
+                method: http::Method::POST,
+                path: "/admin",
+                handler: axum::routing::post(|| async { "Created" }),
+                name: "create",
+            },
+        ],
+        &config,
+        test_state(),
+        Some(dist.as_path()),
+    );
+
+    // POST /admin should reach the dynamic handler, not get 405 from ServeDir
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "POST /admin should return 200, not 405 — ServeDir must not eat non-GET requests"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(std::str::from_utf8(&body).unwrap(), "Created");
 }

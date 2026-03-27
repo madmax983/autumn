@@ -500,8 +500,17 @@ pub fn build_router_with_static(
         );
     }
 
-    let serve_dir = tower_http::services::ServeDir::new(dist).fallback(app_router);
-    axum::Router::new().fallback_service(serve_dir)
+    // Mount static files as a fallback on the app router rather than
+    // wrapping the app behind ServeDir. The previous approach
+    // (ServeDir.fallback(app)) caused 405 errors for POST/PUT/DELETE
+    // because ServeDir only handles GET/HEAD — non-GET requests never
+    // reached the app router's fallback.
+    //
+    // With this approach: explicit routes (GET, POST, etc.) always win.
+    // Only requests that match NO dynamic route fall through to ServeDir,
+    // which then serves static files (e.g. /about/ → dist/about/index.html).
+    let serve_dir = tower_http::services::ServeDir::new(dist);
+    app_router.fallback_service(serve_dir)
 }
 
 #[cfg(feature = "htmx")]
@@ -860,41 +869,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_router_serves_static_files_from_dist() {
+    async fn build_router_serves_static_files_for_unmatched_paths() {
         use std::collections::HashMap;
 
-        // Create a temp dist/ with about/index.html and manifest.json
+        // Create a temp dist/ with a static page
         let tmp = tempfile::tempdir().expect("tempdir");
         let dist = tmp.path().join("dist");
-        std::fs::create_dir_all(dist.join("about")).expect("mkdir");
-        std::fs::write(dist.join("about/index.html"), "<h1>Static About</h1>").expect("write");
-        std::fs::write(dist.join("index.html"), "<h1>Static Home</h1>").expect("write");
+        std::fs::create_dir_all(dist.join("docs")).expect("mkdir");
+        std::fs::write(dist.join("docs/index.html"), "<h1>Static Docs</h1>").expect("write");
 
-        let mut manifest_routes = HashMap::new();
-        manifest_routes.insert(
-            "/".to_owned(),
-            crate::static_gen::ManifestEntry {
-                file: "index.html".to_owned(),
-                revalidate: None,
-            },
-        );
-        manifest_routes.insert(
-            "/about".to_owned(),
-            crate::static_gen::ManifestEntry {
-                file: "about/index.html".to_owned(),
-                revalidate: None,
-            },
-        );
         let manifest = crate::static_gen::StaticManifest {
             generated_at: "2026-03-27T00:00:00Z".to_owned(),
             autumn_version: "0.2.0".to_owned(),
-            routes: manifest_routes,
+            routes: HashMap::from([(
+                "/docs".to_owned(),
+                crate::static_gen::ManifestEntry {
+                    file: "docs/index.html".to_owned(),
+                    revalidate: None,
+                },
+            )]),
         };
         let json = serde_json::to_string(&manifest).expect("serialize");
         std::fs::write(dist.join("manifest.json"), json).expect("write manifest");
 
-        // Build router with a dynamic /about handler that we expect to be
-        // shadowed by the static file.
+        // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
             #[cfg(feature = "db")]
@@ -904,19 +902,18 @@ mod tests {
             health_detailed: true,
         };
         let router = build_router_with_static(
-            vec![test_get_route("/about", "about_dynamic")],
+            vec![test_get_route("/other", "other_page")],
             &config,
             state,
             Some(dist.as_path()),
         );
 
-        // GET /about/ should serve the static file (ServeDir appends index.html).
-        // (GET /about without trailing slash returns a 307 redirect to /about/,
-        //  which browsers follow automatically.)
+        // GET /docs/ should serve the static file via ServeDir fallback
+        // (no dynamic route competes for this path).
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/about/")
+                    .uri("/docs/")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -927,7 +924,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static About</h1>");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
     }
 
     #[test]
