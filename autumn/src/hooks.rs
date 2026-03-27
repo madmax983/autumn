@@ -69,6 +69,80 @@ impl<T> Patch<T> {
     }
 }
 
+/// Per-field before/after diff accessor for mutation hooks.
+///
+/// `FieldDiff<T>` holds the previous and proposed values for a single field,
+/// allowing hook authors to inspect what changed and optionally override the
+/// new value via [`set`](FieldDiff::set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldDiff<T> {
+    before: T,
+    after: T,
+}
+
+impl<T: PartialEq> FieldDiff<T> {
+    /// Create a new diff from before and after values.
+    #[must_use]
+    pub const fn new(before: T, after: T) -> Self {
+        Self { before, after }
+    }
+
+    /// Reference to the value before the mutation.
+    #[must_use]
+    pub const fn before(&self) -> &T {
+        &self.before
+    }
+
+    /// Reference to the (possibly overridden) value after the mutation.
+    #[must_use]
+    pub const fn after(&self) -> &T {
+        &self.after
+    }
+
+    /// Returns `true` if the field value changed.
+    #[must_use]
+    pub fn changed(&self) -> bool {
+        self.before != self.after
+    }
+
+    /// Returns `true` if the field value did not change.
+    #[must_use]
+    pub fn unchanged(&self) -> bool {
+        self.before == self.after
+    }
+
+    /// Returns `true` if the field changed **and** the new value equals `value`.
+    #[must_use]
+    pub fn changed_to(&self, value: &T) -> bool {
+        self.changed() && self.after == *value
+    }
+
+    /// Returns `true` if the field changed **and** the old value equals `value`.
+    #[must_use]
+    pub fn changed_from(&self, value: &T) -> bool {
+        self.changed() && self.before == *value
+    }
+
+    /// Override the after value. Does not affect `before`.
+    pub fn set(&mut self, value: T) {
+        self.after = value;
+    }
+}
+
+impl<T: PartialEq> FieldDiff<Option<T>> {
+    /// Returns `true` if the field went from `None` to `Some`.
+    #[must_use]
+    pub const fn was_set(&self) -> bool {
+        self.before.is_none() && self.after.is_some()
+    }
+
+    /// Returns `true` if the field went from `Some` to `None`.
+    #[must_use]
+    pub const fn was_cleared(&self) -> bool {
+        self.before.is_some() && self.after.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +183,54 @@ mod tests {
     #[test]
     fn patch_into_option_unchanged() {
         assert_eq!(Patch::<i32>::Unchanged.into_option(), None);
+    }
+
+    // ── FieldDiff tests ──────────────────────────────────────────
+
+    #[test]
+    fn field_diff_unchanged() {
+        let diff = FieldDiff::new(1, 1);
+        assert!(diff.unchanged());
+        assert!(!diff.changed());
+    }
+
+    #[test]
+    fn field_diff_changed() {
+        let diff = FieldDiff::new(1, 2);
+        assert!(diff.changed());
+    }
+
+    #[test]
+    fn field_diff_changed_to() {
+        let diff = FieldDiff::new(1, 2);
+        assert!(diff.changed_to(&2));
+    }
+
+    #[test]
+    fn field_diff_changed_from() {
+        let diff = FieldDiff::new(1, 2);
+        assert!(diff.changed_from(&1));
+    }
+
+    #[test]
+    fn field_diff_set_updates_after() {
+        let mut diff = FieldDiff::new(1, 1);
+        assert!(diff.unchanged());
+        diff.set(5);
+        assert!(diff.changed());
+        assert_eq!(diff.after(), &5);
+        assert_eq!(diff.before(), &1);
+    }
+
+    #[test]
+    fn field_diff_option_was_set() {
+        let diff = FieldDiff::new(None, Some(42));
+        assert!(diff.was_set());
+    }
+
+    #[test]
+    fn field_diff_option_was_cleared() {
+        let diff = FieldDiff::new(Some(42), None);
+        assert!(diff.was_cleared());
     }
 }
