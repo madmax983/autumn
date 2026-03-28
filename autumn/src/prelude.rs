@@ -56,6 +56,12 @@ pub use crate::hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, Patch, UpdateDraft,
 };
 
+// ── Session & Auth ──────────────────────────────────────────────
+/// Session extractor for accessing per-user session data.
+pub use crate::session::Session;
+/// Auth extractor for retrieving the authenticated user.
+pub use crate::auth::Auth;
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::AppState;

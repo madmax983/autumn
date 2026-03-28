@@ -16,6 +16,7 @@ db = ["dep:diesel", "dep:diesel-async", "dep:libsqlite3-sys"]
 [dependencies]
 autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
 axum.workspace = true
+bcrypt.workspace = true
 diesel = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 futures.workspace = true

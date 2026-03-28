@@ -62,6 +62,7 @@
 
 pub mod actuator;
 pub mod app;
+pub mod auth;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
@@ -80,6 +81,7 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod session;
 pub mod static_gen;
 pub mod task;
 pub mod validation;
