@@ -1,4 +1,6 @@
+mod hooks;
 mod models;
+mod repositories;
 mod schema;
 mod slugify;
 
