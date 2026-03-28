@@ -15,16 +15,33 @@ use syn::{Ident, ItemTrait, LitStr, TraitItem};
 
 use crate::model::infer_table_name;
 
+fn to_snake_case(name: &str) -> String {
+    let mut result = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i > 0 {
+                result.push('_');
+            }
+            result.push(ch.to_ascii_lowercase());
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 struct RepoConfig {
     model_name: Ident,
     table_name: String,
     hooks_type: Option<Ident>,
+    api_path: Option<String>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;
     let mut hooks_type: Option<Ident> = None;
+    let mut api_path: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -37,11 +54,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: LitStr = meta.value()?.parse()?;
             table_name = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("api") {
+            let value: LitStr = meta.value()?.parse()?;
+            api_path = Some(value.value());
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
-            Err(meta.error("expected model name, table = \"...\", or hooks = Type"))
+            Err(meta
+                .error("expected model name, table = \"...\", hooks = Type, or api = \"/path\""))
         }
     })
     .parse2(attr)?;
@@ -58,6 +80,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         model_name: model,
         table_name: table,
         hooks_type,
+        api_path,
     })
 }
 
@@ -468,6 +491,121 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // ── Build API handlers (when `api = "/path"` is present) ────────────
+    let api_handlers = if let Some(ref api_path) = config.api_path {
+        let prefix = to_snake_case(&model_name.to_string());
+
+        let list_fn = format_ident!("{prefix}_api_list");
+        let get_fn = format_ident!("{prefix}_api_get");
+        let create_fn = format_ident!("{prefix}_api_create");
+        let update_fn = format_ident!("{prefix}_api_update");
+        let delete_fn = format_ident!("{prefix}_api_delete");
+
+        let list_info = format_ident!("__autumn_route_info_{prefix}_api_list");
+        let get_info = format_ident!("__autumn_route_info_{prefix}_api_get");
+        let create_info = format_ident!("__autumn_route_info_{prefix}_api_create");
+        let update_info = format_ident!("__autumn_route_info_{prefix}_api_update");
+        let delete_info = format_ident!("__autumn_route_info_{prefix}_api_delete");
+
+        let id_path = format!("{api_path}/{{id}}");
+
+        quote! {
+            // ── Auto-generated REST API handlers ─────────────────
+
+            #vis async fn #list_fn(
+                repo: #pg_name,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<Vec<#model_name>>> {
+                Ok(::autumn_web::prelude::Json(repo.find_all().await?))
+            }
+
+            #[doc(hidden)]
+            #vis fn #list_info() -> ::autumn_web::route::Route {
+                ::autumn_web::route::Route {
+                    method: ::autumn_web::reexports::http::Method::GET,
+                    path: #api_path,
+                    handler: ::autumn_web::reexports::axum::routing::get(#list_fn),
+                    name: ::core::stringify!(#list_fn),
+                }
+            }
+
+            #vis async fn #get_fn(
+                ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
+                repo: #pg_name,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>> {
+                let record = repo.find_by_id(id).await?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
+                Ok(::autumn_web::prelude::Json(record))
+            }
+
+            #[doc(hidden)]
+            #vis fn #get_info() -> ::autumn_web::route::Route {
+                ::autumn_web::route::Route {
+                    method: ::autumn_web::reexports::http::Method::GET,
+                    path: #id_path,
+                    handler: ::autumn_web::reexports::axum::routing::get(#get_fn),
+                    name: ::core::stringify!(#get_fn),
+                }
+            }
+
+            #vis async fn #create_fn(
+                repo: #pg_name,
+                ::autumn_web::prelude::Json(new): ::autumn_web::prelude::Json<#new_name>,
+            ) -> ::autumn_web::AutumnResult<(::autumn_web::reexports::http::StatusCode, ::autumn_web::prelude::Json<#model_name>)> {
+                let record = repo.save(&new).await?;
+                Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
+            }
+
+            #[doc(hidden)]
+            #vis fn #create_info() -> ::autumn_web::route::Route {
+                ::autumn_web::route::Route {
+                    method: ::autumn_web::reexports::http::Method::POST,
+                    path: #api_path,
+                    handler: ::autumn_web::reexports::axum::routing::post(#create_fn),
+                    name: ::core::stringify!(#create_fn),
+                }
+            }
+
+            #vis async fn #update_fn(
+                ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
+                repo: #pg_name,
+                ::autumn_web::prelude::Json(patch): ::autumn_web::prelude::Json<#update_name>,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>> {
+                let record = repo.update(id, &patch).await?;
+                Ok(::autumn_web::prelude::Json(record))
+            }
+
+            #[doc(hidden)]
+            #vis fn #update_info() -> ::autumn_web::route::Route {
+                ::autumn_web::route::Route {
+                    method: ::autumn_web::reexports::http::Method::PUT,
+                    path: #id_path,
+                    handler: ::autumn_web::reexports::axum::routing::put(#update_fn),
+                    name: ::core::stringify!(#update_fn),
+                }
+            }
+
+            #vis async fn #delete_fn(
+                ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
+                repo: #pg_name,
+            ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::http::StatusCode> {
+                repo.delete_by_id(id).await?;
+                Ok(::autumn_web::reexports::http::StatusCode::NO_CONTENT)
+            }
+
+            #[doc(hidden)]
+            #vis fn #delete_info() -> ::autumn_web::route::Route {
+                ::autumn_web::route::Route {
+                    method: ::autumn_web::reexports::http::Method::DELETE,
+                    path: #id_path,
+                    handler: ::autumn_web::reexports::axum::routing::delete(#delete_fn),
+                    name: ::core::stringify!(#delete_fn),
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     // Generate the trait, impl, and extractor.
     //
     // Key design decisions:
@@ -571,6 +709,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #extractor_init
             }
         }
+
+        #api_handlers
     }
 }
 
@@ -659,5 +799,45 @@ mod tests {
                 .map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
+    }
+
+    #[test]
+    fn parse_repo_args_with_api() {
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_with_hooks_and_api() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, hooks = PostHooks, api = "/api/v1/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.hooks_type.is_some());
+        assert_eq!(config.api_path.as_deref(), Some("/api/v1/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_without_api() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.api_path.is_none());
+    }
+
+    #[test]
+    fn snake_case_simple() {
+        assert_eq!(to_snake_case("Bookmark"), "bookmark");
+    }
+
+    #[test]
+    fn snake_case_multi_word() {
+        assert_eq!(to_snake_case("PageRevision"), "page_revision");
+    }
+
+    #[test]
+    fn snake_case_already_lower() {
+        assert_eq!(to_snake_case("widget"), "widget");
     }
 }

@@ -591,6 +591,17 @@ fn build_router_inner(
         router = router.nest(&group.prefix, sub_router);
     }
 
+    // CORS middleware (only applied when allowed_origins is non-empty)
+    if !config.cors.allowed_origins.is_empty() {
+        let cors = build_cors_layer(&config.cors);
+        tracing::info!(
+            origins = ?config.cors.allowed_origins,
+            credentials = config.cors.allow_credentials,
+            "CORS enabled"
+        );
+        router = router.layer(cors);
+    }
+
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
     let router = router.layer(RequestIdLayer);
@@ -667,6 +678,43 @@ fn build_router_with_static_inner(
     // which then serves static files (e.g. /about/ → dist/about/index.html).
     let serve_dir = tower_http::services::ServeDir::new(dist);
     app_router.fallback_service(serve_dir)
+}
+
+/// Build a `tower_http::cors::CorsLayer` from the framework's [`CorsConfig`].
+///
+/// Called only when `config.cors.allowed_origins` is non-empty.
+fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::CorsLayer {
+    use http::header::HeaderName;
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+
+    let layer = if cors.allowed_origins.iter().any(|o| o == "*") {
+        CorsLayer::new().allow_origin(AllowOrigin::any())
+    } else {
+        let origins: Vec<http::HeaderValue> = cors
+            .allowed_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(origins)
+    };
+
+    let methods: Vec<http::Method> = cors
+        .allowed_methods
+        .iter()
+        .filter_map(|m| m.parse().ok())
+        .collect();
+
+    let headers: Vec<HeaderName> = cors
+        .allowed_headers
+        .iter()
+        .filter_map(|h| h.parse().ok())
+        .collect();
+
+    layer
+        .allow_methods(methods)
+        .allow_headers(headers)
+        .allow_credentials(cors.allow_credentials)
+        .max_age(std::time::Duration::from_secs(cors.max_age_secs))
 }
 
 #[cfg(feature = "htmx")]
@@ -1103,6 +1151,125 @@ mod tests {
         unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
         let dir = super::project_dir("dist");
         assert_eq!(dir, std::path::PathBuf::from("dist"));
+    }
+
+    /// Helper to build a test router with custom config.
+    fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+        };
+        build_router(routes, config, state)
+    }
+
+    #[tokio::test]
+    async fn cors_wildcard_allows_any_origin() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        let router = test_router_with_config(vec![test_get_route("/test", "test")], &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "*"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_specific_origin_reflected() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://example.com".to_owned()];
+        let router = test_router_with_config(vec![test_get_route("/test", "test")], &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_disabled_when_no_origins() {
+        let config = AutumnConfig::default();
+        assert!(config.cors.allowed_origins.is_empty());
+        let router = test_router_with_config(vec![test_get_route("/test", "test")], &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_returns_204() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://example.com".to_owned()];
+        let router = test_router_with_config(vec![test_get_route("/test", "test")], &config);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-methods")
+        );
     }
 
     #[tokio::test]
