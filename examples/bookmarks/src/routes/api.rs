@@ -31,7 +31,7 @@ pub async fn create_json(
 }
 
 #[delete("/api/bookmarks/{id}")]
-pub async fn delete_json(Path(id): Path<i32>, repo: PgBookmarkRepository) -> AutumnResult<String> {
+pub async fn delete_json(Path(id): Path<i64>, repo: PgBookmarkRepository) -> AutumnResult<String> {
     repo.delete_by_id(id).await?;
     Ok(String::new())
 }

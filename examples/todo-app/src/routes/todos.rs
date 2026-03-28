@@ -185,7 +185,7 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
 
 /// Show a single todo by ID.
 #[get("/todos/{id}")]
-pub async fn detail(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let todo = Todo::find(*id, &mut db).await?;
 
     Ok(layout(
@@ -238,7 +238,7 @@ pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {
 /// Uses a single `UPDATE ... SET completed = NOT completed RETURNING *`
 /// query — one round-trip instead of three.
 #[post("/todos/{id}/toggle")]
-pub async fn toggle(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let updated: Todo = diesel::update(todos::table.find(*id))
         .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
         .returning(Todo::as_returning())
@@ -253,7 +253,7 @@ pub async fn toggle(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
 ///
 /// Returns an empty string so htmx removes the element from the DOM.
 #[delete("/todos/{id}")]
-pub async fn delete_todo(id: Path<i32>, mut db: Db) -> AutumnResult<String> {
+pub async fn delete_todo(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
     let deleted = diesel::delete(todos::table.find(*id))
         .execute(&mut *db)
         .await?;

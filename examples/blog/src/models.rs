@@ -10,7 +10,7 @@ use crate::schema::posts;
 #[diesel(table_name = posts)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Post {
-    pub id: i32,
+    pub id: i64,
     pub title: String,
     pub slug: String,
     pub body: String,
@@ -40,7 +40,7 @@ impl Post {
     }
 
     /// Find a single post by ID, returning 404 if not found.
-    pub async fn find(id: i32, db: &mut AsyncPgConnection) -> AutumnResult<Self> {
+    pub async fn find(id: i64, db: &mut AsyncPgConnection) -> AutumnResult<Self> {
         posts::table
             .find(id)
             .select(Self::as_select())

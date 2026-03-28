@@ -1,0 +1,2 @@
+[database]
+url = "postgres://autumn:autumn@localhost:5433/wiki"

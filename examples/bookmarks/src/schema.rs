@@ -1,6 +1,6 @@
 diesel::table! {
     bookmarks (id) {
-        id -> Int4,
+        id -> Int8,
         url -> Text,
         title -> Text,
         tag -> Text,

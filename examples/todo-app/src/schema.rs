@@ -1,6 +1,6 @@
 diesel::table! {
     todos (id) {
-        id -> Int4,
+        id -> Int8,
         title -> Text,
         completed -> Bool,
         created_at -> Timestamp,

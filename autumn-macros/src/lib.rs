@@ -179,7 +179,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// #[model(table = "users")]
 /// pub struct User {
-///     pub id: i32,
+///     pub id: i64,
 ///     pub name: String,
 /// }
 /// ```
@@ -191,7 +191,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// #[model]
 /// pub struct BlogPost {
-///     pub id: i32,
+///     pub id: i64,
 ///     pub title: String,
 /// }
 /// ```

@@ -215,7 +215,7 @@ pub use autumn_macros::main;
 ///
 /// #[model(table = "users")]
 /// pub struct User {
-///     pub id: i32,
+///     pub id: i64,
 ///     pub name: String,
 /// }
 /// ```
@@ -227,7 +227,7 @@ pub use autumn_macros::main;
 ///
 /// #[model]
 /// pub struct BlogPost {
-///     pub id: i32,
+///     pub id: i64,
 ///     pub title: String,
 /// }
 /// ```
@@ -410,7 +410,7 @@ pub use maud::html;
 /// struct CreateItem { name: String }
 ///
 /// #[derive(Serialize)]
-/// struct Item { id: i32, name: String }
+/// struct Item { id: i64, name: String }
 ///
 /// #[post("/items")]
 /// async fn create(Json(input): Json<CreateItem>) -> Json<Item> {
@@ -440,12 +440,14 @@ pub use crate::extract::Json;
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
     pub use axum;
+    pub use chrono;
     #[cfg(feature = "db")]
     pub use diesel;
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
     pub use tokio;
+    pub use tracing;
     pub use validator;
 }
 
