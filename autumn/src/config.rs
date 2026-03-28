@@ -550,7 +550,12 @@ impl AutumnConfig {
             self.auth.session_key = val;
         }
 
-        // ── Security headers ──────────────────────────────────
+        // ── Security ────────────────────────────────────────
+        self.apply_security_env_overrides();
+    }
+
+    /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
+    fn apply_security_env_overrides(&mut self) {
         if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS") {
             self.security.headers.x_frame_options = val;
         }
@@ -588,7 +593,7 @@ impl AutumnConfig {
             self.security.headers.permissions_policy = val;
         }
 
-        // ── Security CSRF ─────────────────────────────────────
+        // CSRF
         if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__ENABLED") {
             match val.as_str() {
                 "true" | "1" => self.security.csrf.enabled = true,

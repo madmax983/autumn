@@ -46,7 +46,7 @@ use serde::Deserialize;
 /// assert!(config.headers.x_content_type_options);
 /// assert!(!config.csrf.enabled);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SecurityConfig {
     /// HTTP security headers applied to all responses.
     #[serde(default)]
@@ -55,15 +55,6 @@ pub struct SecurityConfig {
     /// CSRF (Cross-Site Request Forgery) protection.
     #[serde(default)]
     pub csrf: CsrfConfig,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            headers: HeadersConfig::default(),
-            csrf: CsrfConfig::default(),
-        }
-    }
 }
 
 /// Security response headers configuration.
@@ -94,6 +85,7 @@ impl Default for SecurityConfig {
 /// strict_transport_security = true
 /// ```
 #[derive(Debug, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct HeadersConfig {
     /// `X-Frame-Options` header value. Default: `"DENY"`.
     ///
@@ -236,7 +228,7 @@ impl Default for CsrfConfig {
 
 // ── Default value functions ────────────────────────────────────────
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
@@ -244,7 +236,7 @@ fn default_x_frame_options() -> String {
     "DENY".to_owned()
 }
 
-fn default_hsts_max_age() -> u64 {
+const fn default_hsts_max_age() -> u64 {
     31_536_000 // 1 year
 }
 

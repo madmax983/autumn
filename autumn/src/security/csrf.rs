@@ -107,7 +107,7 @@ where
     ) -> Result<Self, Self::Rejection> {
         parts
             .extensions
-            .get::<CsrfToken>()
+            .get::<Self>()
             .cloned()
             .ok_or((
                 StatusCode::INTERNAL_SERVER_ERROR,
