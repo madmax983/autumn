@@ -66,10 +66,9 @@ async fn no_hooks_methods_are_all_ok() {
     let mut draft = UpdateDraft::new(String::new());
 
     assert!(hooks.before_create(&mut ctx, &mut new).await.is_ok());
-    assert!(hooks.after_create(&ctx, &model).await.is_ok());
+    // after_create, after_update, after_delete require &mut AsyncPgConnection
+    // and are covered by compile-pass and db_hooks_lifecycle tests.
     assert!(hooks.before_update(&mut ctx, &mut draft).await.is_ok());
-    assert!(hooks.after_update(&ctx, &model).await.is_ok());
     assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
-    assert!(hooks.after_delete(&ctx, 1).await.is_ok());
     assert!(hooks.after_commit(&ctx, MutationOp::Create).await.is_ok());
 }

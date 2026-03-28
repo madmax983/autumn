@@ -295,7 +295,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_create(ctx_ref, &record).await?;
+                    hooks.after_create(ctx_ref, &record, conn).await?;
                     Ok(record)
                 }.scope_boxed()
             }).await?;
@@ -348,7 +348,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_update(ctx_ref, &record).await?;
+                    hooks.after_update(ctx_ref, &record, conn).await?;
                     Ok(record)
                 }.scope_boxed()
             }).await?;
@@ -393,7 +393,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .execute(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_delete(ctx_ref, id).await?;
+                    hooks.after_delete(ctx_ref, id, conn).await?;
                     Ok(())
                 }.scope_boxed()
             }).await?;

@@ -5,11 +5,11 @@
 //!
 //! **Requires Docker** to be running.
 
-use autumn_web::hooks::{MutationContext, MutationHooks, MutationOp, UpdateDraft};
 use autumn_web::AutumnResult;
+use autumn_web::hooks::{MutationContext, MutationHooks, MutationOp, UpdateDraft};
 use diesel::prelude::*;
-use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
@@ -104,6 +104,7 @@ impl MutationHooks for FailAfterCreateHooks {
         &self,
         _ctx: &MutationContext,
         _record: &Article,
+        _conn: &mut AsyncPgConnection,
     ) -> AutumnResult<()> {
         Err(autumn_web::AutumnError::bad_request_msg(
             "after_create intentionally failed",
@@ -120,11 +121,7 @@ impl MutationHooks for FailAfterCommitHooks {
     type NewModel = NewArticle;
     type UpdateModel = ();
 
-    async fn after_commit(
-        &self,
-        _ctx: &MutationContext,
-        _op: MutationOp,
-    ) -> AutumnResult<()> {
+    async fn after_commit(&self, _ctx: &MutationContext, _op: MutationOp) -> AutumnResult<()> {
         Err(autumn_web::AutumnError::bad_request_msg(
             "after_commit intentionally failed",
         ))
@@ -277,7 +274,7 @@ async fn after_create_rejection_rolls_back() {
                     .await?;
 
                 // after_create returns Err -> we map to diesel error to trigger rollback.
-                if let Err(_e) = hooks.after_create(&ctx, &record).await {
+                if let Err(_e) = hooks.after_create(&ctx, &record, conn).await {
                     return Err(diesel::result::Error::RollbackTransaction);
                 }
 
