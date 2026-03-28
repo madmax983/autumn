@@ -111,7 +111,7 @@ struct ScopedGroup {
     prefix: String,
     routes: Vec<Route>,
     /// Closure that applies the layer to a sub-router.
-    apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState>>,
+    apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
 impl AppBuilder {
@@ -341,16 +341,6 @@ impl AppBuilder {
 
         // 7. Start scheduled tasks (if any)
         if !self.tasks.is_empty() {
-            tracing::info!(count = self.tasks.len(), "Starting scheduled tasks");
-            for task_info in &self.tasks {
-                let schedule_desc = match &task_info.schedule {
-                    crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-                    crate::task::Schedule::Cron { expression, .. } => {
-                        format!("cron {expression}")
-                    }
-                };
-                tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
-            }
             start_task_scheduler(self.tasks, &state);
         }
 
@@ -458,6 +448,14 @@ impl AppBuilder {
 /// Each task runs in its own spawned task with error logging.
 /// Uses simple `tokio::time` for fixed-delay scheduling.
 fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
+    tracing::info!(count = tasks.len(), "Starting scheduled tasks");
+    for task_info in &tasks {
+        let schedule_desc = match &task_info.schedule {
+            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+            crate::task::Schedule::Cron { expression, .. } => format!("cron {expression}"),
+        };
+        tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+    }
     for task_info in tasks {
         let state = state.clone();
         let name = task_info.name.clone();
