@@ -1,0 +1,25 @@
+diesel::table! {
+    pages (id) {
+        id -> Int8,
+        title -> Text,
+        slug -> Text,
+        body -> Text,
+        status -> Text,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    revisions (id) {
+        id -> Int8,
+        page_id -> Int8,
+        op -> Text,
+        title -> Text,
+        body -> Text,
+        status -> Text,
+        changed_by -> Nullable<Text>,
+        summary -> Nullable<Text>,
+        created_at -> Timestamp,
+    }
+}
