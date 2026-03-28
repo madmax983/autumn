@@ -51,15 +51,14 @@ async fn exception_filter_on_error_response() {
     let called = Arc::new(AtomicBool::new(false));
     let config = AutumnConfig::default();
 
-    let router = autumn_web::app::build_router(
-        routes![ok_handler, fail_handler],
-        &config,
-        test_state(),
-    );
+    let router =
+        autumn_web::app::build_router(routes![ok_handler, fail_handler], &config, test_state());
     // Manually layer the exception filter (build_router doesn't take filters)
-    let router = router.layer(ExceptionFilterLayer::new(vec![Arc::new(MarkCalledFilter {
-        called: called.clone(),
-    })]));
+    let router = router.layer(ExceptionFilterLayer::new(vec![Arc::new(
+        MarkCalledFilter {
+            called: called.clone(),
+        },
+    )]));
 
     // Error path: filter should fire
     let resp = router
@@ -100,15 +99,19 @@ struct AddHeaderService<S> {
 
 impl<S> tower::Service<axum::http::Request<Body>> for AddHeaderService<S>
 where
-    S: tower::Service<axum::http::Request<Body>, Response = Response, Error = std::convert::Infallible>
-        + Clone
+    S: tower::Service<
+            axum::http::Request<Body>,
+            Response = Response,
+            Error = std::convert::Infallible,
+        > + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
 {
     type Response = Response;
     type Error = std::convert::Infallible;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, Self::Error>> + Send>>;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, Self::Error>> + Send>>;
 
     fn poll_ready(
         &mut self,
@@ -121,7 +124,8 @@ where
         let mut inner = self.inner.clone();
         Box::pin(async move {
             let mut resp = inner.call(req).await?;
-            resp.headers_mut().insert("x-scoped", "true".parse().unwrap());
+            resp.headers_mut()
+                .insert("x-scoped", "true".parse().unwrap());
             Ok(resp)
         })
     }
@@ -139,9 +143,11 @@ async fn public_page() -> &'static str {
 
 #[tokio::test]
 async fn scoped_middleware_applies_only_to_group() {
-    let _builder = autumn_web::app()
-        .routes(routes![public_page])
-        .scoped("/api", AddHeaderLayer, routes![list_users]);
+    let _builder = autumn_web::app().routes(routes![public_page]).scoped(
+        "/api",
+        AddHeaderLayer,
+        routes![list_users],
+    );
 
     let state = test_state();
 
@@ -196,9 +202,11 @@ async fn scoped_middleware_applies_only_to_group() {
 
 #[test]
 fn app_builder_scoped_compiles() {
-    let _builder = autumn_web::app()
-        .routes(routes![ok_handler])
-        .scoped("/api", AddHeaderLayer, routes![list_users]);
+    let _builder = autumn_web::app().routes(routes![ok_handler]).scoped(
+        "/api",
+        AddHeaderLayer,
+        routes![list_users],
+    );
 }
 
 // ── AppBuilder::exception_filter compiles ──────────────────────────

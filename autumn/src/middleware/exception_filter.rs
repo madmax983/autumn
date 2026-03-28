@@ -243,7 +243,9 @@ mod tests {
         let app = Router::new()
             .route(
                 "/",
-                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("not here")) }),
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::not_found_msg("not here"))
+                }),
             )
             .layer(ExceptionFilterLayer::new(vec![Arc::new(TestFilter)]));
 
@@ -268,9 +270,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/",
-                get(|| async {
-                    Err::<String, AutumnError>(AutumnError::not_found_msg("gone"))
-                }),
+                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("gone")) }),
             )
             .layer(ExceptionFilterLayer::new(vec![Arc::new(ReplaceFilter)]));
 
@@ -333,9 +333,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/",
-                get(|| async {
-                    Err::<String, AutumnError>(AutumnError::bad_request_msg("oops"))
-                }),
+                get(|| async { Err::<String, AutumnError>(AutumnError::bad_request_msg("oops")) }),
             )
             .layer(ExceptionFilterLayer::new(vec![
                 Arc::new(OrderFilter(0)),

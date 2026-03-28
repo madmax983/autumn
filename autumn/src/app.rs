@@ -30,8 +30,8 @@ use crate::AppState;
 use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
-use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::middleware::RequestIdLayer;
+use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 
 /// Create a new [`AppBuilder`].
@@ -609,9 +609,7 @@ fn build_router_inner(
 
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
-    let router = router
-        .layer(RequestIdLayer)
-        .layer(session_layer);
+    let router = router.layer(RequestIdLayer).layer(session_layer);
     let router = if exception_filters.is_empty() {
         router
     } else {
@@ -651,7 +649,8 @@ fn build_router_with_static_inner(
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
 ) -> axum::Router {
-    let app_router = build_router_inner(route_list, config, state, exception_filters, scoped_groups);
+    let app_router =
+        build_router_inner(route_list, config, state, exception_filters, scoped_groups);
 
     let Some(dist) = dist_dir else {
         return app_router;
