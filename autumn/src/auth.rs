@@ -115,6 +115,44 @@ pub fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> 
     })
 }
 
+// ── Runtime check for #[secured] macro ──────────────────────────
+
+/// Runtime authentication and authorization check used by the
+/// `#[secured]` proc macro. **Not intended for direct use** -- use
+/// `#[secured]` instead.
+///
+/// Checks the session for the configured auth key (default: `"user_id"`).
+/// If `roles` is non-empty, also checks that the session's `"role"` value
+/// matches at least one of the given roles.
+///
+/// Returns `401 Unauthorized` if not authenticated, or `403 Forbidden`
+/// if the user lacks the required role.
+#[doc(hidden)]
+pub async fn __check_secured(
+    session: &crate::session::Session,
+    roles: &[&str],
+) -> crate::AutumnResult<()> {
+    // Check authentication: session must contain the auth key
+    if session.get("user_id").await.is_none() {
+        return Err(crate::AutumnError::unauthorized_msg(
+            "authentication required",
+        ));
+    }
+
+    // Check authorization: if roles are specified, the session's "role"
+    // must match at least one of them
+    if !roles.is_empty() {
+        let user_role = session.get("role").await.unwrap_or_default();
+        if !roles.iter().any(|&r| r == user_role) {
+            return Err(crate::AutumnError::forbidden_msg(
+                "insufficient permissions",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 // ── Auth<T> extractor ───────────────────────────────────────────
 
 /// Extractor that retrieves the authenticated user from request extensions.
@@ -490,6 +528,267 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── __check_secured tests ────────────────────────────────
+
+    #[tokio::test]
+    async fn check_secured_rejects_unauthenticated() {
+        let session =
+            crate::session::Session::new_for_test(String::new(), std::collections::HashMap::new());
+        let result = __check_secured(&session, &[]).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn check_secured_allows_authenticated() {
+        let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+        let result = __check_secured(&session, &[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_secured_rejects_wrong_role() {
+        let data = std::collections::HashMap::from([
+            ("user_id".into(), "42".into()),
+            ("role".into(), "viewer".into()),
+        ]);
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+        let result = __check_secured(&session, &["admin"]).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_secured_allows_matching_role() {
+        let data = std::collections::HashMap::from([
+            ("user_id".into(), "42".into()),
+            ("role".into(), "admin".into()),
+        ]);
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+        let result = __check_secured(&session, &["admin"]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_secured_allows_any_of_multiple_roles() {
+        let data = std::collections::HashMap::from([
+            ("user_id".into(), "42".into()),
+            ("role".into(), "editor".into()),
+        ]);
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+        let result = __check_secured(&session, &["admin", "editor"]).await;
+        assert!(result.is_ok());
+    }
+
+    // ── #[secured] macro integration tests ──────────────────────
+
+    #[tokio::test]
+    async fn secured_macro_rejects_unauthenticated() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer};
+
+        #[autumn_macros::secured]
+        async fn protected_handler() -> crate::AutumnResult<&'static str> {
+            Ok("secret")
+        }
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
+
+        let app = Router::new()
+            .route("/", get(protected_handler))
+            .layer(SessionLayer::new(MemoryStore::new(), SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn secured_macro_allows_authenticated() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        #[autumn_macros::secured]
+        async fn protected_handler() -> crate::AutumnResult<&'static str> {
+            Ok("secret")
+        }
+
+        let store = MemoryStore::new();
+        store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([("user_id".into(), "42".into())]),
+            )
+            .await;
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
+
+        let app = Router::new()
+            .route("/", get(protected_handler))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=sess1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn secured_macro_with_role_rejects_wrong_role() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        #[autumn_macros::secured("admin")]
+        async fn admin_only() -> crate::AutumnResult<&'static str> {
+            Ok("admin area")
+        }
+
+        let store = MemoryStore::new();
+        store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([
+                    ("user_id".into(), "42".into()),
+                    ("role".into(), "viewer".into()),
+                ]),
+            )
+            .await;
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
+
+        let app = Router::new()
+            .route("/", get(admin_only))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=sess1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn secured_macro_with_multiple_roles_allows_match() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use axum::Router;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        #[autumn_macros::secured("admin", "editor")]
+        async fn content_handler() -> crate::AutumnResult<&'static str> {
+            Ok("content")
+        }
+
+        let store = MemoryStore::new();
+        store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([
+                    ("user_id".into(), "42".into()),
+                    ("role".into(), "editor".into()),
+                ]),
+            )
+            .await;
+
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+        };
+
+        let app = Router::new()
+            .route("/", get(content_handler))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=sess1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "content");
     }
 
     #[tokio::test]

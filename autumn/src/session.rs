@@ -95,6 +95,13 @@ struct SessionInner {
 }
 
 impl Session {
+    /// Create a session for testing purposes.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_for_test(id: String, data: HashMap<String, String>) -> Self {
+        Self::new(id, data)
+    }
+
     fn new(id: String, data: HashMap<String, String>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {

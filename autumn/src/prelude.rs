@@ -24,7 +24,7 @@
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    delete, get, main, post, put, routes, scheduled, static_get, static_routes, tasks,
+    delete, get, main, post, put, routes, scheduled, secured, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
