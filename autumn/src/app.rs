@@ -1028,7 +1028,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.headers().get("access-control-allow-origin").unwrap(),
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
             "*"
         );
     }
@@ -1078,7 +1081,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("access-control-allow-origin").is_none());
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1101,7 +1109,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().contains_key("access-control-allow-methods"));
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-methods")
+        );
     }
 
     #[tokio::test]
