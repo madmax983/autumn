@@ -19,12 +19,14 @@ struct RepoConfig {
     model_name: Ident,
     table_name: String,
     hooks_type: Option<Ident>,
+    api_path: Option<String>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut model_name: Option<Ident> = None;
     let mut table_name: Option<String> = None;
     let mut hooks_type: Option<Ident> = None;
+    let mut api_path: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -37,11 +39,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: LitStr = meta.value()?.parse()?;
             table_name = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("api") {
+            let value: LitStr = meta.value()?.parse()?;
+            api_path = Some(value.value());
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
-            Err(meta.error("expected model name, table = \"...\", or hooks = Type"))
+            Err(meta.error("expected model name, table = \"...\", hooks = Type, or api = \"/path\""))
         }
     })
     .parse2(attr)?;
@@ -58,6 +64,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         model_name: model,
         table_name: table,
         hooks_type,
+        api_path,
     })
 }
 
@@ -659,5 +666,31 @@ mod tests {
                 .map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
+    }
+
+    #[test]
+    fn parse_repo_args_with_api() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_with_hooks_and_api() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, hooks = PostHooks, api = "/api/v1/posts""#.parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.hooks_type.is_some());
+        assert_eq!(config.api_path.as_deref(), Some("/api/v1/posts"));
+    }
+
+    #[test]
+    fn parse_repo_args_without_api() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.api_path.is_none());
     }
 }
