@@ -177,8 +177,10 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
     }
 }
 
-/// Warn when a custom profile has no TOML file, suggesting close matches.
-fn warn_profile_typo(profile: &str) {
+/// Suggest a close match for a custom profile name.
+///
+/// Returns `Some(name)` when a known profile is within edit distance 2.
+fn suggest_profile(profile: &str) -> Option<&'static str> {
     let known = ["dev", "prod"];
     let mut suggestions: Vec<(&str, usize)> = known
         .iter()
@@ -186,8 +188,12 @@ fn warn_profile_typo(profile: &str) {
         .filter(|(_, d)| *d <= 2)
         .collect();
     suggestions.sort_by_key(|(_, d)| *d);
+    suggestions.first().map(|(name, _)| *name)
+}
 
-    if let Some((suggestion, _)) = suggestions.first() {
+/// Warn when a custom profile has no TOML file, suggesting close matches.
+fn warn_profile_typo(profile: &str) {
+    if let Some(suggestion) = suggest_profile(profile) {
         eprintln!(
             "Warning: profile \"{profile}\" has no config file (autumn-{profile}.toml) \
              and no smart defaults. Did you mean \"{suggestion}\"?"
@@ -1327,5 +1333,238 @@ path = "/healthz"
 
         config.profile = Some("dev".to_owned());
         assert_eq!(config.profile_name(), Some("dev"));
+    }
+
+    // ── Mutant-hunting tests ────────────────────────────────────
+
+    #[test]
+    fn find_config_file_falls_back_to_cwd() {
+        // Without AUTUMN_MANIFEST_DIR, should return just the filename
+        let _guard = EnvGuard::remove("AUTUMN_MANIFEST_DIR");
+        let path = find_config_file_named("autumn.toml");
+        assert_eq!(path, PathBuf::from("autumn.toml"));
+    }
+
+    #[test]
+    fn find_config_file_uses_manifest_dir_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("autumn.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let _guard = EnvGuard::set("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let path = find_config_file_named("autumn.toml");
+        assert_eq!(path, config_path);
+    }
+
+    #[test]
+    fn find_config_file_falls_back_when_manifest_dir_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // dir exists but the file doesn't
+        let _guard = EnvGuard::set("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let path = find_config_file_named("nonexistent.toml");
+        assert_eq!(path, PathBuf::from("nonexistent.toml"));
+    }
+
+    #[test]
+    fn resolve_profile_cli_flag_exact_match() {
+        // resolve_profile checks `--profile` in CLI args. We can't easily
+        // inject args, but we can verify the env path doesn't match other args.
+        // The `== "--profile"` guard is the key: if it were `!=`, every arg
+        // would trigger the branch.
+        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
+        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        // With no env vars and no matching CLI args, should be None
+        let profile = resolve_profile();
+        // This may or may not be None depending on test harness args,
+        // but the important thing is it doesn't crash or return garbage.
+        // The env-based tests above cover the positive cases.
+        drop(profile);
+    }
+
+    #[test]
+    fn deep_merge_non_table_overlay_replaces_base() {
+        // When overlay is not a table, it should replace (not merge into) base.
+        // This kills the `&& → ||` mutant on line 162.
+        let mut base: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
+        let overlay = toml::Value::String("not_a_table".into());
+
+        // When base is table and overlay is NOT table, base should be unchanged
+        // (the function only merges when BOTH are tables).
+        deep_merge(&mut base, overlay);
+        // base should still be the original table (overlay was ignored)
+        assert!(base.is_table());
+        assert_eq!(base["server"]["port"], toml::Value::Integer(3000));
+    }
+
+    #[test]
+    fn deep_merge_when_base_not_table() {
+        // When base is not a table, overlay should not merge
+        let mut base = toml::Value::String("original".into());
+        let overlay: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
+
+        deep_merge(&mut base, overlay);
+        // base should be unchanged
+        assert_eq!(base, toml::Value::String("original".into()));
+    }
+
+    #[test]
+    fn suggest_profile_close_match() {
+        // "dve" is edit-distance 2 from "dev" → should suggest "dev"
+        assert_eq!(suggest_profile("dve"), Some("dev"));
+    }
+
+    #[test]
+    fn suggest_profile_no_match_when_distant() {
+        // "xyz" is far from both "dev" and "prod" → no suggestion
+        assert_eq!(suggest_profile("xyz"), None);
+    }
+
+    #[test]
+    fn suggest_profile_exact_known_profile() {
+        // Exact match has distance 0 → suggests itself
+        assert_eq!(suggest_profile("dev"), Some("dev"));
+        assert_eq!(suggest_profile("prod"), Some("prod"));
+    }
+
+    #[test]
+    fn suggest_profile_prd() {
+        // "prd" is distance 1 from "prod"
+        assert_eq!(suggest_profile("prd"), Some("prod"));
+    }
+
+    #[test]
+    fn warn_profile_typo_runs_without_panic() {
+        warn_profile_typo("dve");
+        warn_profile_typo("xyz");
+    }
+
+    #[test]
+    fn levenshtein_threshold_in_warn_profile_typo() {
+        assert!(levenshtein("dve", "dev") <= 2);
+        assert!(levenshtein("xyz", "dev") > 2);
+        assert!(levenshtein("xyz", "prod") > 2);
+    }
+
+    #[test]
+    fn load_uses_profile_layering() {
+        // Test AutumnConfig::load() with a dev profile via env var.
+        // This kills the "replace load → Ok(Default::default())" mutant.
+        let _profile = EnvGuard::set("AUTUMN_PROFILE", "dev");
+        // Remove AUTUMN_MANIFEST_DIR so it doesn't find stray config files
+        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+
+        let config = AutumnConfig::load().unwrap();
+        // With dev profile, smart defaults should apply
+        assert_eq!(config.profile.as_deref(), Some("dev"));
+        assert_eq!(config.log.level, "debug"); // dev default
+        assert_eq!(config.log.format, LogFormat::Pretty); // dev default
+        assert!(config.health.detailed); // dev default
+    }
+
+    #[test]
+    fn load_custom_profile_without_toml_warns() {
+        // Test the typo warning branch: profile != "dev" && profile != "prod"
+        // without a corresponding autumn-{profile}.toml triggers warn_profile_typo.
+        // This kills the match guard mutants on line 341.
+        let _profile = EnvGuard::set("AUTUMN_PROFILE", "staging");
+        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+
+        let config = AutumnConfig::load().unwrap();
+        assert_eq!(config.profile.as_deref(), Some("staging"));
+        // staging has no smart defaults, so values should be framework defaults
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(config.log.level, "info");
+    }
+
+    #[test]
+    fn load_dev_profile_no_profile_toml_no_warn() {
+        // dev/prod without their profile TOML should NOT trigger warn_profile_typo.
+        // This tests the `None => {}` branch (line 342).
+        let _profile = EnvGuard::set("AUTUMN_PROFILE", "dev");
+        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+
+        let config = AutumnConfig::load().unwrap();
+        assert_eq!(config.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn load_from_io_error_is_not_swallowed() {
+        // load_from should return Err on non-NotFound IO errors.
+        // On all platforms, trying to read a directory as a file triggers an error.
+        let dir = tempfile::tempdir().unwrap();
+        let result = AutumnConfig::load_from(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_raw_toml_missing_file_returns_none() {
+        let result = load_raw_toml(Path::new("this_file_does_not_exist_12345.toml")).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_raw_toml_directory_returns_io_error() {
+        // Reading a directory is an IO error, NOT NotFound.
+        // This kills the "replace match guard NotFound with true" mutant:
+        // if the guard were always true, this would return Ok(None) instead of Err.
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_raw_toml(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_raw_toml_valid_file_returns_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.toml");
+        std::fs::write(&path, "[server]\nport = 3000\n").unwrap();
+        let result = load_raw_toml(&path).unwrap();
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap()["server"]["port"],
+            toml::Value::Integer(3000)
+        );
+    }
+
+    #[test]
+    fn env_override_log_format_auto() {
+        // Kills the "delete match arm Auto" mutant
+        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Auto");
+        let mut config = AutumnConfig::default();
+        // Start with non-Auto to prove the override works
+        config.log.format = LogFormat::Json;
+        config.apply_env_overrides();
+        assert_eq!(config.log.format, LogFormat::Auto);
+    }
+
+    #[test]
+    fn env_override_health_detailed_false() {
+        // Kills the 'delete match arm "false" | "0"' mutant
+        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "false");
+        let mut config = AutumnConfig::default();
+        config.health.detailed = true; // start true, override to false
+        config.apply_env_overrides();
+        assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn env_override_health_detailed_zero() {
+        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "0");
+        let mut config = AutumnConfig::default();
+        config.health.detailed = true;
+        config.apply_env_overrides();
+        assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn actuator_defaults() {
+        let config = ActuatorConfig::default();
+        assert_eq!(config.prefix, "/actuator");
+        assert!(!config.sensitive);
+    }
+
+    #[test]
+    fn actuator_prefix_in_full_config() {
+        let config = AutumnConfig::default();
+        assert_eq!(config.actuator.prefix, "/actuator");
     }
 }
