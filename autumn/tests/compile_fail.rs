@@ -45,6 +45,10 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_field_enum.rs");
 
+    // Model draft accessors (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_draft_accessors.rs");
+
     // Repository compile-pass (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_no_hooks.rs");

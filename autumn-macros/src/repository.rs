@@ -336,10 +336,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Transaction: persist + after_update
             let hooks = &self.hooks;
             let ctx_ref = &ctx;
+            let diesel_changeset = changeset.__to_changeset();
             let record = conn.transaction::<#model_name, ::autumn_web::AutumnError, _>(|conn| {
                 async move {
                     let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                        .set(&changeset)
+                        .set(&diesel_changeset)
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
@@ -435,8 +436,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+            let diesel_changeset = changes.__to_changeset();
             ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                .set(changes)
+                .set(&diesel_changeset)
                 .get_result::<#model_name>(&mut conn)
                 .await
                 .map_err(::autumn_web::AutumnError::from)
@@ -623,7 +625,10 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(
-            config.hooks_type.as_ref().map(std::string::ToString::to_string),
+            config
+                .hooks_type
+                .as_ref()
+                .map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
     }
@@ -644,7 +649,10 @@ mod tests {
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.table_name, "blog_posts");
         assert_eq!(
-            config.hooks_type.as_ref().map(std::string::ToString::to_string),
+            config
+                .hooks_type
+                .as_ref()
+                .map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
     }

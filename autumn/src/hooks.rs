@@ -422,8 +422,16 @@ impl<T: PartialEq> FieldDiff<Option<T>> {
 /// ```
 #[derive(Debug, Clone)]
 pub struct UpdateDraft<T: Clone> {
-    before: T,
-    after: T,
+    /// The original (pre-mutation) model state.
+    ///
+    /// Public so that `#[model]`-generated per-field `DraftField` accessors
+    /// can split-borrow `before` and `after` simultaneously.
+    pub before: T,
+    /// The proposed (post-mutation) model state.
+    ///
+    /// Public so that `#[model]`-generated per-field `DraftField` accessors
+    /// can split-borrow `before` and `after` simultaneously.
+    pub after: T,
 }
 
 impl<T: Clone> UpdateDraft<T> {
