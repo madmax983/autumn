@@ -1,9 +1,10 @@
 //! `#[model]` attribute macro implementation.
 //!
-//! Generates three types from a single struct:
+//! Generates four types from a single struct:
 //! - The query type (original struct) with `Queryable`, `Selectable`
 //! - A `NewX` insert type with `Insertable` (ID fields excluded)
 //! - An `UpdateX` changeset type with `AsChangeset` (ID fields excluded, all `Option<T>`)
+//! - A `XField` enum with one variant per mutable field (for audit/CDC payloads)
 //!
 //! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
@@ -66,6 +67,18 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// from the `NewX` insert type.
 fn excluded_from_new(field: &Field) -> bool {
     has_attr(field, "id") || has_attr(field, "default")
+}
+
+/// Convert a `snake_case` identifier to `PascalCase`.
+fn pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + &chars.collect::<String>()
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -171,6 +184,17 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // Build XField enum variants (one per mutable field, PascalCase)
+    let field_enum_name = format_ident!("{name}Field");
+    let field_enum_variants: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let variant = format_ident!("{}", pascal_case(&ident.to_string()));
+            quote! { #variant }
+        })
+        .collect();
+
     // Conditional Validate derive
     let validate_derive = if has_validation {
         quote! { #[derive(::autumn_web::reexports::validator::Validate)] }
@@ -201,6 +225,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[diesel(table_name = #table_ident)]
         #vis struct #update_name {
             #(#update_fields,)*
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #vis enum #field_enum_name {
+            #(#field_enum_variants,)*
         }
     }
 }
@@ -242,6 +271,21 @@ mod tests {
             pascal_to_snake("UserProfileSettings"),
             "user_profile_settings"
         );
+    }
+
+    #[test]
+    fn pascal_case_simple() {
+        assert_eq!(pascal_case("title"), "Title");
+    }
+
+    #[test]
+    fn pascal_case_multi_word() {
+        assert_eq!(pascal_case("approved_at"), "ApprovedAt");
+    }
+
+    #[test]
+    fn pascal_case_single_char() {
+        assert_eq!(pascal_case("x"), "X");
     }
 
     #[test]

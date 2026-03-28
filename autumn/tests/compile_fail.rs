@@ -41,6 +41,10 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_derive.rs");
 
+    // Model field enum (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_field_enum.rs");
+
     // Repository compile-pass (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_no_hooks.rs");
