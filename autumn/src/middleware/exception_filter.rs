@@ -123,6 +123,7 @@ pub struct ExceptionFilterLayer {
 
 impl ExceptionFilterLayer {
     /// Create a new layer with the given filter chain.
+    #[must_use]
     pub fn new(filters: Vec<Arc<dyn ExceptionFilter>>) -> Self {
         Self {
             filters: Arc::new(filters),
@@ -314,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_filters_run_in_order() {
-        use std::sync::{Mutex, atomic::{AtomicU32, Ordering}};
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         static COUNTER: AtomicU32 = AtomicU32::new(0);
 
