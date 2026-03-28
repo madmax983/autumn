@@ -311,8 +311,8 @@ impl<T> Patch<T> {
 impl<T: Serialize> Serialize for Patch<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
-            Patch::Unchanged | Patch::Clear => serializer.serialize_none(),
-            Patch::Set(v) => v.serialize(serializer),
+            Self::Unchanged | Self::Clear => serializer.serialize_none(),
+            Self::Set(v) => v.serialize(serializer),
         }
     }
 }
@@ -322,10 +322,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
         // When this method is called, the field WAS present in the JSON.
         // Absent fields use the Default impl (→ Unchanged) via #[serde(default)].
         let opt: Option<T> = Option::deserialize(deserializer)?;
-        Ok(match opt {
-            Some(v) => Patch::Set(v),
-            None => Patch::Clear,
-        })
+        Ok(opt.map_or_else(|| Self::Clear, Self::Set))
     }
 }
 

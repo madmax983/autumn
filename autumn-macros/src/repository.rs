@@ -623,7 +623,7 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(
-            config.hooks_type.as_ref().map(|h| h.to_string()),
+            config.hooks_type.as_ref().map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
     }
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.table_name, "blog_posts");
         assert_eq!(
-            config.hooks_type.as_ref().map(|h| h.to_string()),
+            config.hooks_type.as_ref().map(std::string::ToString::to_string),
             Some("PostHooks".to_string())
         );
     }
