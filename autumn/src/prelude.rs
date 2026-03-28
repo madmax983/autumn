@@ -49,6 +49,13 @@ pub use crate::error::{AutumnError, AutumnResult};
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
 
+// ── Hooks ───────────────────────────────────────────────────────
+/// Mutation hook types for repository lifecycle callbacks.
+#[cfg(feature = "db")]
+pub use crate::hooks::{
+    DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, Patch, UpdateDraft,
+};
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::AppState;
