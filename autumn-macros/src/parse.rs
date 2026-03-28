@@ -1,7 +1,7 @@
 //! Shared parsing and validation helpers for route macros.
 
 use proc_macro2::TokenStream;
-use syn::{ItemFn, LitStr};
+use syn::{Attribute, ItemFn, LitStr};
 
 /// Parse and validate a route path from macro attributes.
 ///
@@ -45,4 +45,23 @@ pub fn parse_async_handler(item: TokenStream) -> Result<ItemFn, TokenStream> {
     }
 
     Ok(input_fn)
+}
+
+/// Extract `#[intercept(LayerType)]` attributes from a function's attribute
+/// list, removing them so they don't appear on the emitted function.
+///
+/// Returns the type paths in the order they appeared.
+pub fn extract_interceptors(attrs: &mut Vec<Attribute>) -> Vec<syn::Path> {
+    let mut interceptors = Vec::new();
+    attrs.retain(|attr| {
+        if attr.path().is_ident("intercept") {
+            if let Ok(path) = attr.parse_args::<syn::Path>() {
+                interceptors.push(path);
+            }
+            false // remove from the attribute list
+        } else {
+            true // keep
+        }
+    });
+    interceptors
 }

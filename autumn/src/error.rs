@@ -317,15 +317,27 @@ impl std::fmt::Debug for AutumnError {
 impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
         let status = self.status;
+        let message = self.inner.to_string();
+
+        // Stash error metadata for exception filters to inspect without
+        // parsing the response body.
+        let error_info = crate::middleware::AutumnErrorInfo {
+            status,
+            message: message.clone(),
+            details: self.details.clone(),
+        };
+
         let body = ErrorBody {
             error: ErrorInner {
                 status: status.as_u16(),
-                message: self.inner.to_string(),
+                message,
                 details: self.details,
             },
         };
 
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        response.extensions_mut().insert(error_info);
+        response
     }
 }
 
