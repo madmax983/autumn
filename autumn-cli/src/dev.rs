@@ -72,18 +72,10 @@ pub fn run(package: Option<&str>) {
     loop {
         match rx.recv() {
             Ok(Ok(events)) => {
-                let dominated_by_relevant =
-                    events.iter().any(|e| is_relevant_change(&e.path, e.kind));
-
-                if !dominated_by_relevant {
+                let changed = collect_relevant_changes(&events);
+                if changed.is_empty() {
                     continue;
                 }
-
-                let changed: Vec<_> = events
-                    .iter()
-                    .filter(|e| is_relevant_change(&e.path, e.kind))
-                    .map(|e| e.path.display().to_string())
-                    .collect();
 
                 eprintln!("\n  Changed: {}", changed.join(", "));
 
@@ -110,6 +102,17 @@ pub fn run(package: Option<&str>) {
     }
 
     stop_server(&mut child);
+}
+
+/// Collect display paths for all relevant file changes from a debounced batch.
+///
+/// Returns an empty vec if no changes are relevant.
+fn collect_relevant_changes(events: &[notify_debouncer_mini::DebouncedEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| is_relevant_change(&e.path, e.kind))
+        .map(|e| e.path.display().to_string())
+        .collect()
 }
 
 /// Build a `cargo build` command for the given package.
@@ -144,8 +147,8 @@ fn cargo_build(package: Option<&str>) -> bool {
 fn start_server(binary: &Path) -> Option<Child> {
     eprintln!("  Starting server...\n");
     match Command::new(binary)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
     {
         Ok(child) => Some(child),
@@ -473,6 +476,52 @@ mod tests {
         ));
     }
 
+    // ── collect_relevant_changes tests ─────────────────────────────
+
+    #[test]
+    fn collect_changes_filters_irrelevant() {
+        let events = vec![
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("src/main.rs"),
+                kind: DebouncedEventKind::Any,
+            },
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("README.md"),
+                kind: DebouncedEventKind::Any,
+            },
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("src/lib.rs"),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+        let changed = collect_relevant_changes(&events);
+        assert_eq!(changed.len(), 2);
+        assert!(changed.iter().any(|c| c.contains("main.rs")));
+        assert!(changed.iter().any(|c| c.contains("lib.rs")));
+    }
+
+    #[test]
+    fn collect_changes_returns_empty_for_no_relevant() {
+        let events = vec![
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("README.md"),
+                kind: DebouncedEventKind::Any,
+            },
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("target/debug/app"),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+        let changed = collect_relevant_changes(&events);
+        assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn collect_changes_handles_empty_events() {
+        let changed = collect_relevant_changes(&[]);
+        assert!(changed.is_empty());
+    }
+
     // ── build_cargo_command tests ──────────────────────────────────
 
     #[test]
@@ -489,6 +538,25 @@ mod tests {
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build", "-p", "my-app"]);
+    }
+
+    // ── start_server tests ─────────────────────────────────────────
+
+    #[test]
+    fn start_server_returns_none_for_missing_binary() {
+        let result = start_server(Path::new("/nonexistent/binary/path"));
+        assert!(result.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_server_returns_child_for_valid_binary() {
+        let child = start_server(Path::new("/bin/sleep"));
+        assert!(child.is_some());
+        // Clean up
+        let mut child = child.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // ── resolve_binary_from_metadata tests ─────────────────────────
@@ -641,6 +709,7 @@ mod tests {
         assert!(child.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_server_terminates_child() {
         // Spawn a long-running process, then stop it
@@ -683,7 +752,23 @@ mod tests {
         let _ = child.wait();
     }
 
+    // ── find_binary tests ──────────────────────────────────────────
+
+    #[test]
+    fn find_binary_resolves_workspace_package() {
+        // We're running inside the autumn workspace, so this should find
+        // the hello example's binary.
+        let path = find_binary(Some("hello"));
+        assert!(path.ends_with("debug/hello") || path.ends_with("debug/hello.exe"));
+    }
+
     // ── constants tests ────────────────────────────────────────────
+
+    #[test]
+    fn debounce_interval_is_reasonable() {
+        const { assert!(DEBOUNCE_MS >= 100, "debounce too short, would thrash") };
+        const { assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX") };
+    }
 
     #[test]
     fn watch_extensions_are_non_empty() {
@@ -711,11 +796,5 @@ mod tests {
         for f in WATCH_FILES {
             assert!(!f.is_empty());
         }
-    }
-
-    #[test]
-    fn debounce_interval_is_reasonable() {
-        const { assert!(DEBOUNCE_MS >= 100, "debounce too short, would thrash") };
-        const { assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX") };
     }
 }
