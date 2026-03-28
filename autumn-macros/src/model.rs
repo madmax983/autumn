@@ -240,7 +240,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     match &patch.#ident {
                         ::autumn_web::hooks::Patch::Set(v) => after.#ident = v.clone(),
                         ::autumn_web::hooks::Patch::Clear => {
-                            panic!("Cannot clear non-nullable field `{}`", stringify!(#ident));
+                            return Err(::autumn_web::AutumnError::bad_request_msg(
+                                format!("Cannot clear non-nullable field `{}`", stringify!(#ident))
+                            ));
                         }
                         ::autumn_web::hooks::Patch::Unchanged => {}
                     }
@@ -353,12 +355,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #[derive(Debug, Clone, ::diesel::AsChangeset)]
         #[diesel(table_name = #table_ident)]
-        #vis struct #changeset_name {
+        pub struct #changeset_name {
             #(#changeset_fields,)*
         }
 
         impl #update_name {
-            /// Convert this `Patch`-based update into a Diesel-compatible changeset.
             #[doc(hidden)]
             #[must_use]
             pub fn __to_changeset(&self) -> #changeset_name {
@@ -380,16 +381,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// field accessor methods on `UpdateDraft<#name>`.
         #vis trait #draft_ext_name {
             /// Build a draft by merging the current record with a patch.
-            fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::hooks::UpdateDraft<#name>;
+            ///
+            /// Returns `Err` if a non-nullable field has `Patch::Clear`.
+            fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::AutumnResult<::autumn_web::hooks::UpdateDraft<#name>>;
 
             #(#draft_accessor_sigs)*
         }
 
         impl #draft_ext_name for ::autumn_web::hooks::UpdateDraft<#name> {
-            fn from_patch(current: &#name, patch: &#update_name) -> Self {
+            fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::AutumnResult<Self> {
                 let mut after = current.clone();
                 #(#merge_arms)*
-                Self::new_with_changes(current.clone(), after)
+                Ok(Self::new_with_changes(current.clone(), after))
             }
 
             #(#draft_accessors)*

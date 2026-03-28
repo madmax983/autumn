@@ -45,7 +45,7 @@ fn main() {
         slug: Patch::Unchanged,
         subtitle: Patch::Unchanged,
     };
-    let mut draft = UpdateDraft::<Article>::from_patch(&current, &patch);
+    let mut draft = UpdateDraft::<Article>::from_patch(&current, &patch).unwrap();
 
     // Verify per-field accessors work
     assert!(draft.title().changed());
@@ -65,6 +65,6 @@ fn main() {
         slug: Patch::Unchanged,
         subtitle: Patch::Clear,
     };
-    let draft2 = UpdateDraft::<Article>::from_patch(&current, &clear_patch);
+    let draft2 = UpdateDraft::<Article>::from_patch(&current, &clear_patch).unwrap();
     assert_eq!(draft2.after().subtitle, None);
 }

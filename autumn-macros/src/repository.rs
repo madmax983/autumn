@@ -332,7 +332,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ))?;
 
             // Build merged draft from current + patch
-            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes);
+            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
 
             // before_update can inspect/rewrite via draft field accessors
             self.hooks.before_update(&mut ctx, &mut draft).await?;
