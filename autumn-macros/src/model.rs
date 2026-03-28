@@ -1,9 +1,14 @@
 //! `#[model]` attribute macro implementation.
 //!
-//! Generates three types from a single struct:
+//! Generates four types from a single struct:
 //! - The query type (original struct) with `Queryable`, `Selectable`
 //! - A `NewX` insert type with `Insertable` (ID fields excluded)
-//! - An `UpdateX` changeset type with `AsChangeset` (ID fields excluded, all `Option<T>`)
+//! - An `UpdateX` patch type with `Default` (ID fields excluded, all `Patch<T>`)
+//! - A `XField` enum with one variant per mutable field (for audit/CDC payloads)
+//!
+//! Also generates on `UpdateDraft<Model>`:
+//! - `from_patch(current, patch)` — merges a `Patch`-based update into a draft
+//! - Per-field `DraftField` accessor methods for inspecting/overriding changes
 //!
 //! Recognises `#[id]`, `#[indexed]`, and `#[validate(...)]` field attributes.
 
@@ -66,6 +71,30 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// from the `NewX` insert type.
 fn excluded_from_new(field: &Field) -> bool {
     has_attr(field, "id") || has_attr(field, "default")
+}
+
+/// Convert a `snake_case` identifier to `PascalCase`.
+fn pascal_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + &chars.collect::<String>()
+            })
+        })
+        .collect()
+}
+
+/// Check whether a type is `Option<...>`.
+fn is_option_type(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(tp) = ty {
+        tp.path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "Option")
+    } else {
+        false
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -133,7 +162,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Fields for UpdateX: same set as NewX (all become Option<T>)
+    // Fields for UpdateX: same set as NewX (all become Patch<T>)
 
     // Check if any field has #[validate(...)]
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
@@ -160,14 +189,28 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Build UpdateX fields (non-ID, all Option<T>, propagate #[validate])
+    // Build UpdateX fields (non-ID, all Patch<T>; no #[validate] — validation
+    // doesn't apply to Patch<T> fields, only to NewX and the merged model)
     let update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
             let ty = &f.ty;
-            let val_attrs = validate_attrs(f);
-            quote! { #(#val_attrs)* pub #ident: Option<#ty> }
+            quote! {
+                #[serde(default)]
+                pub #ident: ::autumn_web::hooks::Patch<#ty>
+            }
+        })
+        .collect();
+
+    // Build XField enum variants (one per mutable field, PascalCase)
+    let field_enum_name = format_ident!("{name}Field");
+    let field_enum_variants: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let variant = format_ident!("{}", pascal_case(&ident.to_string()));
+            quote! { #variant }
         })
         .collect();
 
@@ -178,8 +221,112 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
+    let merge_arms: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let is_option = is_option_type(&f.ty);
+            if is_option {
+                quote! {
+                    match &patch.#ident {
+                        ::autumn_web::hooks::Patch::Set(v) => after.#ident = v.clone(),
+                        ::autumn_web::hooks::Patch::Clear => after.#ident = None,
+                        ::autumn_web::hooks::Patch::Unchanged => {}
+                    }
+                }
+            } else {
+                quote! {
+                    match &patch.#ident {
+                        ::autumn_web::hooks::Patch::Set(v) => after.#ident = v.clone(),
+                        ::autumn_web::hooks::Patch::Clear => {
+                            return Err(::autumn_web::AutumnError::bad_request_msg(
+                                format!("Cannot clear non-nullable field `{}`", stringify!(#ident))
+                            ));
+                        }
+                        ::autumn_web::hooks::Patch::Unchanged => {}
+                    }
+                }
+            }
+        })
+        .collect();
+
+    // Build per-field DraftField accessor method signatures (for the trait)
+    let draft_accessor_sigs: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+            quote! {
+                fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty>;
+            }
+        })
+        .collect();
+
+    // Build per-field DraftField accessor method implementations
+    let draft_accessors: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+            quote! {
+                fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty> {
+                    ::autumn_web::hooks::DraftField::new(&self.before.#ident, &mut self.after.#ident)
+                }
+            }
+        })
+        .collect();
+
+    // Trait name for draft extension methods
+    let draft_ext_name = format_ident!("{name}DraftExt");
+
+    // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
+    let changeset_name = format_ident!("__{}Changeset", name);
+
+    let changeset_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            // For both nullable and non-nullable columns, Diesel's AsChangeset
+            // treats Option<T> as "skip if None, set if Some". For nullable
+            // columns (Option<Inner>), this becomes Option<Option<Inner>> which
+            // also handles "set to NULL" via Some(None).
+            quote! { pub #ident: Option<#ty> }
+        })
+        .collect();
+
+    let changeset_conversions: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let is_option = is_option_type(&f.ty);
+            if is_option {
+                // For nullable fields: Set(v) -> Some(v), Clear -> Some(None), Unchanged -> None
+                quote! {
+                    #ident: match &self.#ident {
+                        ::autumn_web::hooks::Patch::Set(v) => Some(v.clone()),
+                        ::autumn_web::hooks::Patch::Clear => Some(None),
+                        ::autumn_web::hooks::Patch::Unchanged => None,
+                    }
+                }
+            } else {
+                // For non-nullable fields: Set(v) -> Some(v), Unchanged -> None, Clear -> panic
+                quote! {
+                    #ident: match &self.#ident {
+                        ::autumn_web::hooks::Patch::Set(v) => Some(v.clone()),
+                        ::autumn_web::hooks::Patch::Clear => {
+                            panic!("Cannot clear non-nullable field `{}`", stringify!(#ident));
+                        }
+                        ::autumn_web::hooks::Patch::Unchanged => None,
+                    }
+                }
+            }
+        })
+        .collect();
+
     quote! {
-        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable)]
+        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
         #(#outer_attrs)*
@@ -195,12 +342,60 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#new_fields,)*
         }
 
-        #[derive(Debug, Clone, ::diesel::AsChangeset)]
+        #[derive(Debug, Clone, Default)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
-        #validate_derive
-        #[diesel(table_name = #table_ident)]
         #vis struct #update_name {
             #(#update_fields,)*
+        }
+
+        /// Diesel-compatible changeset derived from `Patch<T>` fields.
+        ///
+        /// This type bridges the `Patch`-based `UpdateX` and Diesel's
+        /// `AsChangeset` trait. Use `UpdateX::__to_changeset()` to convert.
+        #[doc(hidden)]
+        #[derive(Debug, Clone, ::diesel::AsChangeset)]
+        #[diesel(table_name = #table_ident)]
+        pub struct #changeset_name {
+            #(#changeset_fields,)*
+        }
+
+        impl #update_name {
+            #[doc(hidden)]
+            #[must_use]
+            pub fn __to_changeset(&self) -> #changeset_name {
+                #changeset_name {
+                    #(#changeset_conversions,)*
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #vis enum #field_enum_name {
+            #(#field_enum_variants,)*
+        }
+
+        /// Extension trait providing `from_patch` and per-field `DraftField` accessors
+        /// for `UpdateDraft<#name>`.
+        ///
+        /// Generated by `#[model]`. Import this trait to call `from_patch()` or
+        /// field accessor methods on `UpdateDraft<#name>`.
+        #vis trait #draft_ext_name {
+            /// Build a draft by merging the current record with a patch.
+            ///
+            /// Returns `Err` if a non-nullable field has `Patch::Clear`.
+            fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::AutumnResult<::autumn_web::hooks::UpdateDraft<#name>>;
+
+            #(#draft_accessor_sigs)*
+        }
+
+        impl #draft_ext_name for ::autumn_web::hooks::UpdateDraft<#name> {
+            fn from_patch(current: &#name, patch: &#update_name) -> ::autumn_web::AutumnResult<Self> {
+                let mut after = current.clone();
+                #(#merge_arms)*
+                Ok(Self::new_with_changes(current.clone(), after))
+            }
+
+            #(#draft_accessors)*
         }
     }
 }
@@ -242,6 +437,21 @@ mod tests {
             pascal_to_snake("UserProfileSettings"),
             "user_profile_settings"
         );
+    }
+
+    #[test]
+    fn pascal_case_simple() {
+        assert_eq!(pascal_case("title"), "Title");
+    }
+
+    #[test]
+    fn pascal_case_multi_word() {
+        assert_eq!(pascal_case("approved_at"), "ApprovedAt");
+    }
+
+    #[test]
+    fn pascal_case_single_char() {
+        assert_eq!(pascal_case("x"), "X");
     }
 
     #[test]

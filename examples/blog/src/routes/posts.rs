@@ -398,7 +398,7 @@ pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
 
 /// Show the edit form for a post.
 #[get("/admin/{id}/edit")]
-pub async fn edit_form(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let p = Post::find(*id, &mut db).await?;
 
     Ok(layout(
@@ -419,7 +419,7 @@ pub async fn edit_form(id: Path<i32>, mut db: Db) -> AutumnResult<Markup> {
 
 /// Update a post from a form submission.
 #[post("/admin/{id}")]
-pub async fn update(id: Path<i32>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
+pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
     // Validate
     let validated = form.0.validated()?;
 
@@ -447,7 +447,7 @@ pub async fn update(id: Path<i32>, mut db: Db, form: Form<NewPost>) -> AutumnRes
 
 /// Delete a post by ID (htmx endpoint).
 #[delete("/admin/{id}")]
-pub async fn delete_post(id: Path<i32>, mut db: Db) -> AutumnResult<String> {
+pub async fn delete_post(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
     let deleted = diesel::delete(posts::table.find(*id))
         .execute(&mut *db)
         .await?;

@@ -10,7 +10,7 @@ use crate::schema::todos;
 #[diesel(table_name = todos)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Todo {
-    pub id: i32,
+    pub id: i64,
     pub title: String,
     pub completed: bool,
     pub created_at: chrono::NaiveDateTime,
@@ -27,7 +27,7 @@ impl Todo {
     }
 
     /// Find a single todo by ID, returning 404 if not found.
-    pub async fn find(id: i32, db: &mut AsyncPgConnection) -> AutumnResult<Self> {
+    pub async fn find(id: i64, db: &mut AsyncPgConnection) -> AutumnResult<Self> {
         todos::table
             .find(id)
             .select(Self::as_select())

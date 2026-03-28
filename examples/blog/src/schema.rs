@@ -1,6 +1,6 @@
 diesel::table! {
     posts (id) {
-        id -> Int4,
+        id -> Int8,
         title -> Text,
         slug -> Text,
         body -> Text,
