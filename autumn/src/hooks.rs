@@ -201,7 +201,7 @@ pub trait MutationHooks: Send + Sync + 'static {
     fn after_delete(
         &self,
         _ctx: &MutationContext,
-        _id: i32,
+        _id: i64,
     ) -> impl Future<Output = AutumnResult<()>> + Send {
         async { Ok(()) }
     }

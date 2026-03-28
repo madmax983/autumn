@@ -3,7 +3,7 @@ use crate::schema::bookmarks;
 #[autumn_web::model]
 pub struct Bookmark {
     #[id]
-    pub id: i32,
+    pub id: i64,
     #[indexed]
     #[validate(url)]
     pub url: String,

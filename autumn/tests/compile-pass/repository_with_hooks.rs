@@ -1,7 +1,7 @@
 mod schema {
     autumn_web::reexports::diesel::table! {
         articles (id) {
-            id -> Int4,
+            id -> Int8,
             title -> Text,
             body -> Text,
         }
@@ -14,7 +14,7 @@ use autumn_web::prelude::*;
 #[autumn_web::model]
 pub struct Article {
     #[id]
-    pub id: i32,
+    pub id: i64,
     pub title: String,
     pub body: String,
 }

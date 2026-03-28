@@ -3,7 +3,7 @@
 mod schema {
     autumn_web::reexports::diesel::table! {
         notes (id) {
-            id -> Int4,
+            id -> Int8,
             content -> Text,
         }
     }
@@ -14,7 +14,7 @@ use schema::notes;
 #[autumn_web::model]
 pub struct Note {
     #[id]
-    pub id: i32,
+    pub id: i64,
     pub content: String,
 }
 

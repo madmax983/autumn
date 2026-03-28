@@ -24,7 +24,7 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
     // Load all bookmarks currently marked alive
-    let alive: Vec<(i32, String)> = bookmarks::table
+    let alive: Vec<(i64, String)> = bookmarks::table
         .filter(bookmarks::alive.eq(true))
         .select((bookmarks::id, bookmarks::url))
         .load(&mut conn)

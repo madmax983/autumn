@@ -473,13 +473,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
-            fn find_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Option<#model_name>>> + Send;
+            fn find_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Option<#model_name>>> + Send;
             fn find_all(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send;
             fn save(&self, new: &#new_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#model_name>> + Send;
-            fn update(&self, id: i32, changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#model_name>> + Send;
-            fn delete_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
+            fn update(&self, id: i64, changes: &#update_name) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#model_name>> + Send;
+            fn delete_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<()>> + Send;
             fn count(&self) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<i64>> + Send;
-            fn exists_by_id(&self, id: i32) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
+            fn exists_by_id(&self, id: i64) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<bool>> + Send;
             #(#derived_trait_methods)*
         }
 
@@ -490,7 +490,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl #trait_name for #pg_name {
-            async fn find_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<Option<#model_name>> {
+            async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
@@ -516,11 +516,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #save_body
             }
 
-            async fn update(&self, id: i32, changes: &#update_name) -> ::autumn_web::AutumnResult<#model_name> {
+            async fn update(&self, id: i64, changes: &#update_name) -> ::autumn_web::AutumnResult<#model_name> {
                 #update_body
             }
 
-            async fn delete_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<()> {
+            async fn delete_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                 #delete_body
             }
 
@@ -535,7 +535,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(::autumn_web::AutumnError::from)
             }
 
-            async fn exists_by_id(&self, id: i32) -> ::autumn_web::AutumnResult<bool> {
+            async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;

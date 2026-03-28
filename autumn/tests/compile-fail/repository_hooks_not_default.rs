@@ -3,7 +3,7 @@
 mod schema {
     autumn_web::reexports::diesel::table! {
         items (id) {
-            id -> Int4,
+            id -> Int8,
             name -> Text,
         }
     }
@@ -14,7 +14,7 @@ use schema::items;
 #[autumn_web::model]
 pub struct Item {
     #[id]
-    pub id: i32,
+    pub id: i64,
     pub name: String,
 }
 
