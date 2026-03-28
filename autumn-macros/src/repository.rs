@@ -62,7 +62,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
-            Err(meta.error("expected model name, table = \"...\", hooks = Type, or api = \"/path\""))
+            Err(meta
+                .error("expected model name, table = \"...\", hooks = Type, or api = \"/path\""))
         }
     })
     .parse2(attr)?;
@@ -802,8 +803,7 @@ mod tests {
 
     #[test]
     fn parse_repo_args_with_api() {
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, api = "/api/posts""#.parse().unwrap();
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
