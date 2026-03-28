@@ -45,6 +45,11 @@
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
+//! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
+//! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
+//! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
+//! | `AUTUMN_CORS__ALLOW_CREDENTIALS` | `cors.allow_credentials` | `bool` |
+//! | `AUTUMN_CORS__MAX_AGE_SECS` | `cors.max_age_secs` | `u64` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -134,6 +139,13 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut actuator = toml::map::Map::new();
             actuator.insert("sensitive".into(), toml::Value::Boolean(true));
             table.insert("actuator".into(), toml::Value::Table(actuator));
+
+            let mut cors = toml::map::Map::new();
+            cors.insert(
+                "allowed_origins".into(),
+                toml::Value::Array(vec![toml::Value::String("*".to_owned())]),
+            );
+            table.insert("cors".into(), toml::Value::Table(cors));
         }
         "prod" => {
             let mut log = toml::map::Map::new();
@@ -303,6 +315,10 @@ pub struct AutumnConfig {
     /// Actuator endpoint settings.
     #[serde(default)]
     pub actuator: ActuatorConfig,
+
+    /// CORS (Cross-Origin Resource Sharing) settings.
+    #[serde(default)]
+    pub cors: CorsConfig,
 }
 
 impl AutumnConfig {
@@ -452,6 +468,28 @@ impl AutumnConfig {
                 ),
             }
         }
+
+        // ── CORS ────────────────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_ORIGINS") {
+            self.cors.allowed_origins = val.split(',').map(|s| s.trim().to_owned()).collect();
+        }
+        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_METHODS") {
+            self.cors.allowed_methods = val.split(',').map(|s| s.trim().to_owned()).collect();
+        }
+        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_HEADERS") {
+            self.cors.allowed_headers = val.split(',').map(|s| s.trim().to_owned()).collect();
+        }
+        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOW_CREDENTIALS") {
+            match val.as_str() {
+                "true" | "1" => self.cors.allow_credentials = true,
+                "false" | "0" => self.cors.allow_credentials = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_CORS__ALLOW_CREDENTIALS={val:?} is not valid \
+                     (expected true/false), ignoring"
+                ),
+            }
+        }
+        parse_env("AUTUMN_CORS__MAX_AGE_SECS", &mut self.cors.max_age_secs);
     }
 
     /// Returns the active profile name, if any.
@@ -680,6 +718,103 @@ impl Default for ActuatorConfig {
 
 fn default_actuator_prefix() -> String {
     "/actuator".to_owned()
+}
+
+/// CORS (Cross-Origin Resource Sharing) configuration.
+///
+/// Controls which origins, methods, and headers are allowed for
+/// cross-origin requests. Disabled by default -- enable by setting
+/// `allowed_origins` in `autumn.toml` or via environment variables.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `allowed_origins` | `[]` (CORS disabled) |
+/// | `allowed_methods` | `["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]` |
+/// | `allowed_headers` | `["Content-Type", "Authorization"]` |
+/// | `allow_credentials` | `false` |
+/// | `max_age_secs` | `86400` (24 hours) |
+///
+/// # Profile smart defaults
+///
+/// The `dev` profile enables permissive CORS (`allowed_origins = ["*"]`)
+/// so local front-end development works out of the box.
+///
+/// # Examples
+///
+/// ```toml
+/// [cors]
+/// allowed_origins = ["https://example.com", "https://app.example.com"]
+/// allow_credentials = true
+/// ```
+///
+/// ```rust
+/// use autumn_web::config::CorsConfig;
+///
+/// let cors = CorsConfig::default();
+/// assert!(cors.allowed_origins.is_empty());
+/// assert!(!cors.allow_credentials);
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct CorsConfig {
+    /// Origins allowed to make cross-origin requests.
+    ///
+    /// Use `["*"]` to allow any origin (not recommended for production
+    /// with credentials). When empty, CORS middleware is not applied.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+
+    /// HTTP methods allowed for cross-origin requests.
+    /// Default: `["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"]`.
+    #[serde(default = "default_cors_methods")]
+    pub allowed_methods: Vec<String>,
+
+    /// Headers allowed in cross-origin requests.
+    /// Default: `["Content-Type", "Authorization"]`.
+    #[serde(default = "default_cors_headers")]
+    pub allowed_headers: Vec<String>,
+
+    /// Whether to include `Access-Control-Allow-Credentials: true`.
+    /// Default: `false`.
+    #[serde(default)]
+    pub allow_credentials: bool,
+
+    /// How long (in seconds) browsers may cache preflight responses.
+    /// Default: `86400` (24 hours).
+    #[serde(default = "default_cors_max_age")]
+    pub max_age_secs: u64,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            allowed_origins: Vec::new(),
+            allowed_methods: default_cors_methods(),
+            allowed_headers: default_cors_headers(),
+            allow_credentials: false,
+            max_age_secs: default_cors_max_age(),
+        }
+    }
+}
+
+fn default_cors_methods() -> Vec<String> {
+    vec![
+        "GET".to_owned(),
+        "POST".to_owned(),
+        "PUT".to_owned(),
+        "DELETE".to_owned(),
+        "PATCH".to_owned(),
+        "OPTIONS".to_owned(),
+    ]
+}
+
+fn default_cors_headers() -> Vec<String> {
+    vec!["Content-Type".to_owned(), "Authorization".to_owned()]
+}
+
+const fn default_cors_max_age() -> u64 {
+    86400
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
@@ -1203,6 +1338,7 @@ path = "/healthz"
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.shutdown_timeout_secs, 1);
         assert!(config.health.detailed);
+        assert_eq!(config.cors.allowed_origins, vec!["*"]);
     }
 
     #[test]
@@ -1446,6 +1582,36 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_cors_allowed_origins() {
+        let _guard = EnvGuard::set(
+            "AUTUMN_CORS__ALLOWED_ORIGINS",
+            "https://a.com, https://b.com",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(
+            config.cors.allowed_origins,
+            vec!["https://a.com", "https://b.com"]
+        );
+    }
+
+    #[test]
+    fn env_override_cors_allow_credentials() {
+        let _guard = EnvGuard::set("AUTUMN_CORS__ALLOW_CREDENTIALS", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert!(config.cors.allow_credentials);
+    }
+
+    #[test]
+    fn env_override_cors_max_age() {
+        let _guard = EnvGuard::set("AUTUMN_CORS__MAX_AGE_SECS", "3600");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.cors.max_age_secs, 3600);
+    }
+
+    #[test]
     fn load_uses_profile_layering() {
         // Test AutumnConfig::load() with a dev profile via env var.
         // This kills the "replace load → Ok(Default::default())" mutant.
@@ -1553,6 +1719,23 @@ path = "/healthz"
         config.health.detailed = true;
         config.apply_env_overrides();
         assert!(!config.health.detailed);
+    }
+
+    #[test]
+    fn cors_defaults() {
+        let cors = CorsConfig::default();
+        assert!(cors.allowed_origins.is_empty());
+        assert_eq!(cors.allowed_methods.len(), 6);
+        assert!(cors.allowed_methods.contains(&"GET".to_owned()));
+        assert!(cors.allowed_headers.contains(&"Content-Type".to_owned()));
+        assert!(!cors.allow_credentials);
+        assert_eq!(cors.max_age_secs, 86400);
+    }
+
+    #[test]
+    fn cors_in_full_config_defaults() {
+        let config = AutumnConfig::default();
+        assert!(config.cors.allowed_origins.is_empty());
     }
 
     #[test]

@@ -30,6 +30,11 @@ async fn main() {
             routes::pages::edit_form,
             routes::pages::update,
             routes::pages::history,
+            repositories::page_api_list,
+            repositories::page_api_get,
+            repositories::page_api_create,
+            repositories::page_api_update,
+            repositories::page_api_delete,
         ])
         .run()
         .await;

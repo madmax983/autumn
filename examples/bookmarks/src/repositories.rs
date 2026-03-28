@@ -13,7 +13,7 @@
 use crate::models::{Bookmark, NewBookmark, UpdateBookmark};
 use crate::schema::bookmarks;
 
-#[autumn_web::repository(Bookmark)]
+#[autumn_web::repository(Bookmark, api = "/api/bookmarks")]
 pub trait BookmarkRepository {
     // Derived query: SELECT * FROM bookmarks WHERE tag = $1
     fn find_by_tag(tag: String) -> Vec<Bookmark>;
