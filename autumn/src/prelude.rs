@@ -24,7 +24,7 @@
 // ── Route macros ─────────────────────────────────────────────────
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    delete, get, main, post, put, routes, scheduled, static_get, static_routes, tasks,
+    delete, get, main, post, put, routes, scheduled, secured, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -55,6 +55,12 @@ pub use crate::validation::{Valid, ValidateExt, Validated};
 pub use crate::hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, Patch, UpdateDraft,
 };
+
+// ── Session & Auth ──────────────────────────────────────────────
+/// Auth extractor for retrieving the authenticated user.
+pub use crate::auth::Auth;
+/// Session extractor for accessing per-user session data.
+pub use crate::session::Session;
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).

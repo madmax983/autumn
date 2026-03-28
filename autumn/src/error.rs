@@ -248,6 +248,44 @@ impl AutumnError {
         }
     }
 
+    /// Create a `401 Unauthorized` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unauthorized(std::io::Error::other("not logged in"));
+    /// assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    /// ```
+    pub fn unauthorized(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::UNAUTHORIZED,
+            details: None,
+        }
+    }
+
+    /// Create a `403 Forbidden` error.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::forbidden(std::io::Error::other("not allowed"));
+    /// assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    /// ```
+    pub fn forbidden(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::FORBIDDEN,
+            details: None,
+        }
+    }
+
     /// Create a `422 Unprocessable Entity` error with field-level
     /// validation details.
     #[must_use]
@@ -274,6 +312,16 @@ impl AutumnError {
     /// Create a `422 Unprocessable Entity` error from a plain string message.
     pub fn unprocessable_msg(msg: impl Into<String>) -> Self {
         Self::unprocessable(StringError(msg.into()))
+    }
+
+    /// Create a `401 Unauthorized` error from a plain string message.
+    pub fn unauthorized_msg(msg: impl Into<String>) -> Self {
+        Self::unauthorized(StringError(msg.into()))
+    }
+
+    /// Create a `403 Forbidden` error from a plain string message.
+    pub fn forbidden_msg(msg: impl Into<String>) -> Self {
+        Self::forbidden(StringError(msg.into()))
     }
 
     /// Create a `503 Service Unavailable` error from a plain string message.

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod build;
+mod dev;
 mod new;
 mod setup;
 
@@ -29,6 +30,12 @@ enum Commands {
         #[arg(short, long)]
         package: Option<String>,
     },
+    /// Start the dev server with hot reload (watch mode)
+    Dev {
+        /// Package to run (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
+    },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
         /// Re-download even if the binary already exists
@@ -41,6 +48,7 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
+        Commands::Dev { package } => dev::run(package.as_deref()),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -135,6 +143,23 @@ mod tests {
                 assert_eq!(package.as_deref(), Some("blog"));
             }
             _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_dev_subcommand() {
+        let cli = Cli::try_parse_from(["autumn", "dev"]).unwrap();
+        assert!(matches!(cli.command, Commands::Dev { package: None }));
+    }
+
+    #[test]
+    fn parse_dev_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "dev", "-p", "hello"]).unwrap();
+        match cli.command {
+            Commands::Dev { package } => {
+                assert_eq!(package.as_deref(), Some("hello"));
+            }
+            _ => panic!("expected Dev command"),
         }
     }
 

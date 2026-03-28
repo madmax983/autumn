@@ -602,9 +602,18 @@ fn build_router_inner(
         router = router.layer(cors);
     }
 
+    // Session management layer (always enabled with default in-memory store)
+    let session_layer = crate::session::SessionLayer::new(
+        crate::session::MemoryStore::new(),
+        config.session.clone(),
+    );
+    tracing::debug!("Session management enabled (in-memory store)");
+
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
-    let router = router.layer(RequestIdLayer);
+    let router = router
+        .layer(RequestIdLayer)
+        .layer(session_layer);
     let router = if exception_filters.is_empty() {
         router
     } else {
