@@ -561,6 +561,15 @@ mod tests {
 
     // ── resolve_binary_from_metadata tests ─────────────────────────
 
+    /// Build the expected binary path, accounting for `.exe` on Windows.
+    fn expected_binary(path: &str) -> PathBuf {
+        let mut p = PathBuf::from(path);
+        if cfg!(target_os = "windows") {
+            p.set_extension("exe");
+        }
+        p
+    }
+
     fn sample_metadata(target_dir: &str, pkg_name: &str, manifest_dir: &str) -> serde_json::Value {
         serde_json::json!({
             "target_directory": target_dir,
@@ -583,7 +592,7 @@ mod tests {
             resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects/hello"));
         assert!(result.is_ok());
         let path = result.unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/target/debug/hello"));
+        assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
     }
 
     #[test]
@@ -592,7 +601,7 @@ mod tests {
         let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
         assert!(result.is_ok());
         let path = result.unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/target/debug/hello"));
+        assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
     }
 
     #[test]
@@ -675,7 +684,7 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("multi"), Path::new("/projects/multi"));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp/target/debug/server"));
+        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
     }
 
     #[test]
@@ -697,7 +706,7 @@ mod tests {
         });
         let result = resolve_binary_from_metadata(&metadata, Some("app-b"), Path::new("/projects"));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), PathBuf::from("/tmp/target/debug/app-b"));
+        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/app-b"));
     }
 
     // ── stop_server tests ──────────────────────────────────────────
