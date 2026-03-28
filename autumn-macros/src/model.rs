@@ -324,7 +324,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     quote! {
-        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable)]
+        #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
         #[diesel(table_name = #table_ident)]
         #(#outer_attrs)*

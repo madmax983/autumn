@@ -309,18 +309,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
 
         // ── update (hooked) ───────────────────────────────
+        let draft_ext_trait = format_ident!("{}DraftExt", model_name);
         let update_body = quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
             use ::autumn_web::reexports::diesel_async::AsyncConnection;
             use ::autumn_web::reexports::diesel_async::scoped_futures::ScopedFutureExt;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
 
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let mut changeset = changes.clone();
             let mut ctx = MutationContext::new(MutationOp::Update);
 
-            // Load current record for hook context
+            // Load current record
             let current = #table_ident::table
                 .find(id)
                 .first::<#model_name>(&mut conn)
@@ -331,16 +331,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     format!("{} with id {} not found", stringify!(#model_name), id)
                 ))?;
 
-            self.hooks.before_update(&mut ctx, &current, &mut changeset).await?;
+            // Build merged draft from current + patch
+            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes);
 
-            // Transaction: persist + after_update
+            // before_update can inspect/rewrite via draft field accessors
+            self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+            // Persist the proposed state
+            let proposed = draft.into_after();
             let hooks = &self.hooks;
             let ctx_ref = &ctx;
-            let diesel_changeset = changeset.__to_changeset();
             let record = conn.transaction::<#model_name, ::autumn_web::AutumnError, _>(|conn| {
                 async move {
                     let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                        .set(&diesel_changeset)
+                        .set(&proposed)
                         .get_result::<#model_name>(conn)
                         .await
                         .map_err(::autumn_web::AutumnError::from)?;
