@@ -105,14 +105,10 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<Self>()
-            .cloned()
-            .ok_or((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "CSRF token not found in request extensions. Is CsrfLayer enabled?",
-            ))
+        parts.extensions.get::<Self>().cloned().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CSRF token not found in request extensions. Is CsrfLayer enabled?",
+        ))
     }
 }
 
@@ -226,9 +222,7 @@ where
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned);
 
-            if cookie_token.is_none()
-                || header_token.as_deref() != cookie_token.as_deref()
-            {
+            if cookie_token.is_none() || header_token.as_deref() != cookie_token.as_deref() {
                 // CSRF validation failed -- reject via flag in the future
                 return CsrfFuture {
                     inner: self.inner.call(req),
@@ -288,9 +282,7 @@ where
                 // Add Set-Cookie header for new CSRF tokens
                 if let Some(cookie) = this.set_cookie.take() {
                     if let Ok(val) = http::HeaderValue::from_str(&cookie) {
-                        response
-                            .headers_mut()
-                            .append(http::header::SET_COOKIE, val);
+                        response.headers_mut().append(http::header::SET_COOKIE, val);
                     }
                 }
                 Poll::Ready(Ok(response))
@@ -441,12 +433,7 @@ mod tests {
             .layer(CsrfLayer::from_config(&default_csrf_config()));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 

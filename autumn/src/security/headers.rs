@@ -82,10 +82,7 @@ impl ComputedHeaders {
                 hsts.push_str("; includeSubDomains");
             }
             if let Ok(val) = HeaderValue::from_str(&hsts) {
-                pairs.push((
-                    HeaderName::from_static("strict-transport-security"),
-                    val,
-                ));
+                pairs.push((HeaderName::from_static("strict-transport-security"), val));
             }
         }
 
@@ -219,19 +216,11 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(
-            response.headers().get("x-frame-options").unwrap(),
-            "DENY"
-        );
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
         assert_eq!(
             response.headers().get("x-content-type-options").unwrap(),
             "nosniff"
@@ -245,7 +234,12 @@ mod tests {
             "strict-origin-when-cross-origin"
         );
         // HSTS not present by default
-        assert!(response.headers().get("strict-transport-security").is_none());
+        assert!(
+            response
+                .headers()
+                .get("strict-transport-security")
+                .is_none()
+        );
         // CSP not present by default
         assert!(response.headers().get("content-security-policy").is_none());
     }
@@ -263,20 +257,12 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(
-            response
-                .headers()
-                .get("strict-transport-security")
-                .unwrap(),
+            response.headers().get("strict-transport-security").unwrap(),
             "max-age=86400; includeSubDomains"
         );
     }
@@ -292,12 +278,7 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -318,12 +299,7 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -341,12 +317,7 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -369,20 +340,12 @@ mod tests {
             .layer(SecurityHeadersLayer::from_config(&config));
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(
-            response
-                .headers()
-                .get("strict-transport-security")
-                .unwrap(),
+            response.headers().get("strict-transport-security").unwrap(),
             "max-age=3600"
         );
     }
