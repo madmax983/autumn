@@ -175,6 +175,7 @@ async fn setup_pool() -> (
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn before_update_rewrites_derived_field() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.unwrap();
@@ -223,6 +224,7 @@ async fn before_update_rewrites_derived_field() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn before_create_rejection_prevents_insert() {
     let (pool, _container) = setup_pool().await;
     let conn = pool.get().await.unwrap();
@@ -249,6 +251,7 @@ async fn before_create_rejection_prevents_insert() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn after_create_rejection_rolls_back() {
     use diesel_async::scoped_futures::ScopedFutureExt;
 
@@ -297,6 +300,7 @@ async fn after_create_rejection_rolls_back() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn after_commit_failure_does_not_rollback() {
     use diesel_async::scoped_futures::ScopedFutureExt;
 
@@ -343,6 +347,7 @@ async fn after_commit_failure_does_not_rollback() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
 async fn draft_field_accessors_match_persisted_diff() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.unwrap();

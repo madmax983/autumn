@@ -39,6 +39,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace
+      - name: Run Docker-dependent tests
+        if: runner.os == 'Linux'
+        run: cargo test --workspace -- --ignored
 
   coverage:
     name: Coverage
