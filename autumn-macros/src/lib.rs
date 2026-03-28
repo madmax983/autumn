@@ -19,6 +19,7 @@ mod repository;
 mod route;
 mod routes_macro;
 mod scheduled;
+mod secured;
 mod static_route;
 mod static_routes_macro;
 mod tasks_macro;
@@ -268,6 +269,38 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
     tasks_macro::tasks_macro(input.into()).into()
+}
+
+/// Secure a route handler with authentication and optional role checks.
+///
+/// Applied before a route macro (`#[get]`, `#[post]`, etc.), this macro
+/// injects an authentication guard at the top of the handler. The guard
+/// checks the session for the configured auth key (default: `"user_id"`)
+/// and, when roles are specified, verifies the user's role matches.
+///
+/// Returns `401 Unauthorized` if not authenticated, or `403 Forbidden`
+/// if the user lacks the required role.
+///
+/// # Forms
+///
+/// - `#[secured]` -- require authentication only
+/// - `#[secured("admin")]` -- require a specific role
+/// - `#[secured("admin", "editor")]` -- require any of the listed roles
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/admin")]
+/// #[secured("admin")]
+/// async fn admin_panel() -> AutumnResult<&'static str> {
+///     Ok("welcome, admin")
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
+    secured::secured_macro(attr.into(), item.into()).into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.

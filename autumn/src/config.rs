@@ -319,6 +319,14 @@ pub struct AutumnConfig {
     /// CORS (Cross-Origin Resource Sharing) settings.
     #[serde(default)]
     pub cors: CorsConfig,
+
+    /// Session management settings.
+    #[serde(default)]
+    pub session: crate::session::SessionConfig,
+
+    /// Authentication settings.
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl AutumnConfig {
@@ -490,6 +498,34 @@ impl AutumnConfig {
             }
         }
         parse_env("AUTUMN_CORS__MAX_AGE_SECS", &mut self.cors.max_age_secs);
+
+        // ── Session ────────────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_SESSION__COOKIE_NAME") {
+            self.session.cookie_name = val;
+        }
+        parse_env(
+            "AUTUMN_SESSION__MAX_AGE_SECS",
+            &mut self.session.max_age_secs,
+        );
+        if let Ok(val) = std::env::var("AUTUMN_SESSION__SECURE") {
+            match val.as_str() {
+                "true" | "1" => self.session.secure = true,
+                "false" | "0" => self.session.secure = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_SESSION__SECURE={val:?} is not valid \
+                     (expected true/false), ignoring"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SESSION__SAME_SITE") {
+            self.session.same_site = val;
+        }
+
+        // ── Auth ───────────────────────────────────────────────
+        parse_env("AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
+        if let Ok(val) = std::env::var("AUTUMN_AUTH__SESSION_KEY") {
+            self.auth.session_key = val;
+        }
     }
 
     /// Returns the active profile name, if any.

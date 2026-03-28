@@ -468,7 +468,17 @@ pub fn build_router(
         router = router.layer(cors);
     }
 
-    router.layer(RequestIdLayer).with_state(state)
+    // Session management layer (always enabled with default in-memory store)
+    let session_layer = crate::session::SessionLayer::new(
+        crate::session::MemoryStore::new(),
+        config.session.clone(),
+    );
+    tracing::debug!("Session management enabled (in-memory store)");
+
+    router
+        .layer(RequestIdLayer)
+        .layer(session_layer)
+        .with_state(state)
 }
 
 /// Build the router with optional static-file-first serving.
