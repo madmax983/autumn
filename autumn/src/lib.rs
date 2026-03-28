@@ -86,6 +86,7 @@ pub mod logging;
 pub mod middleware;
 pub mod prelude;
 pub mod route;
+pub mod security;
 pub mod session;
 pub mod static_gen;
 pub mod task;

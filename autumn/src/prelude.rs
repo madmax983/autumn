@@ -62,6 +62,10 @@ pub use crate::auth::Auth;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 
+// ── Security ───────────────────────────────────────────────────
+/// CSRF token extractor for embedding in forms.
+pub use crate::security::CsrfToken;
+
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::AppState;

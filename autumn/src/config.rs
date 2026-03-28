@@ -146,6 +146,8 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
                 toml::Value::Array(vec![toml::Value::String("*".to_owned())]),
             );
             table.insert("cors".into(), toml::Value::Table(cors));
+
+            // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
             let mut log = toml::map::Map::new();
@@ -161,6 +163,23 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut health = toml::map::Map::new();
             health.insert("detailed".into(), toml::Value::Boolean(false));
             table.insert("health".into(), toml::Value::Table(health));
+
+            // Prod: strict security -- HSTS on, CSRF enabled, secure cookies
+            let mut security = toml::map::Map::new();
+            let mut headers = toml::map::Map::new();
+            headers.insert(
+                "strict_transport_security".into(),
+                toml::Value::Boolean(true),
+            );
+            security.insert("headers".into(), toml::Value::Table(headers));
+            let mut csrf = toml::map::Map::new();
+            csrf.insert("enabled".into(), toml::Value::Boolean(true));
+            security.insert("csrf".into(), toml::Value::Table(csrf));
+            table.insert("security".into(), toml::Value::Table(security));
+
+            let mut session = toml::map::Map::new();
+            session.insert("secure".into(), toml::Value::Boolean(true));
+            table.insert("session".into(), toml::Value::Table(session));
         }
         _ => {} // Custom profiles get no smart defaults
     }
@@ -327,6 +346,10 @@ pub struct AutumnConfig {
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
+
+    /// Security settings (headers, CSRF).
+    #[serde(default)]
+    pub security: crate::security::config::SecurityConfig,
 }
 
 impl AutumnConfig {
@@ -525,6 +548,62 @@ impl AutumnConfig {
         parse_env("AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         if let Ok(val) = std::env::var("AUTUMN_AUTH__SESSION_KEY") {
             self.auth.session_key = val;
+        }
+
+        // ── Security headers ──────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS") {
+            self.security.headers.x_frame_options = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS") {
+            match val.as_str() {
+                "true" | "1" => self.security.headers.x_content_type_options = true,
+                "false" | "0" => self.security.headers.x_content_type_options = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS={val:?} \
+                     is not valid (expected true/false), ignoring"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY") {
+            match val.as_str() {
+                "true" | "1" => self.security.headers.strict_transport_security = true,
+                "false" | "0" => self.security.headers.strict_transport_security = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY={val:?} \
+                     is not valid (expected true/false), ignoring"
+                ),
+            }
+        }
+        parse_env(
+            "AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS",
+            &mut self.security.headers.hsts_max_age_secs,
+        );
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY") {
+            self.security.headers.content_security_policy = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__REFERRER_POLICY") {
+            self.security.headers.referrer_policy = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY") {
+            self.security.headers.permissions_policy = val;
+        }
+
+        // ── Security CSRF ─────────────────────────────────────
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__ENABLED") {
+            match val.as_str() {
+                "true" | "1" => self.security.csrf.enabled = true,
+                "false" | "0" => self.security.csrf.enabled = false,
+                _ => eprintln!(
+                    "Warning: AUTUMN_SECURITY__CSRF__ENABLED={val:?} \
+                     is not valid (expected true/false), ignoring"
+                ),
+            }
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__TOKEN_HEADER") {
+            self.security.csrf.token_header = val;
+        }
+        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__COOKIE_NAME") {
+            self.security.csrf.cookie_name = val;
         }
     }
 

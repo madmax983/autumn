@@ -600,6 +600,13 @@ fn build_router_inner(
         router = router.layer(cors);
     }
 
+    // CSRF middleware (only applied when enabled)
+    if config.security.csrf.enabled {
+        let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        tracing::info!("CSRF protection enabled");
+        router = router.layer(csrf_layer);
+    }
+
     // Session management layer (always enabled with default in-memory store)
     let session_layer = crate::session::SessionLayer::new(
         crate::session::MemoryStore::new(),
@@ -607,9 +614,17 @@ fn build_router_inner(
     );
     tracing::debug!("Session management enabled (in-memory store)");
 
+    // Security headers layer (always applied)
+    let security_headers =
+        crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
+    tracing::debug!("Security headers enabled");
+
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
-    let router = router.layer(RequestIdLayer).layer(session_layer);
+    let router = router
+        .layer(RequestIdLayer)
+        .layer(security_headers)
+        .layer(session_layer);
     let router = if exception_filters.is_empty() {
         router
     } else {
