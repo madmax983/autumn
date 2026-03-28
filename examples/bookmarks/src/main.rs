@@ -40,9 +40,11 @@ async fn main() {
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
             routes::bookmarks::create,
-            routes::api::list_json,
-            routes::api::create_json,
-            routes::api::delete_json,
+            repositories::bookmark_api_list,
+            repositories::bookmark_api_get,
+            repositories::bookmark_api_create,
+            repositories::bookmark_api_update,
+            repositories::bookmark_api_delete,
         ])
         .tasks(tasks![tasks::check_links])
         .run()
