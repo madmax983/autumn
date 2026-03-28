@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn debounce_interval_is_reasonable() {
-        assert!(DEBOUNCE_MS >= 100, "debounce too short, would thrash");
-        assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX");
+        const { assert!(DEBOUNCE_MS >= 100, "debounce too short, would thrash") };
+        const { assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX") };
     }
 }
