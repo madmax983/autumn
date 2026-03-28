@@ -54,4 +54,6 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_no_hooks.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_with_api.rs");
 }
