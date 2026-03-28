@@ -112,13 +112,19 @@ pub fn run(package: Option<&str>) {
     stop_server(&mut child);
 }
 
-/// Run `cargo build` for the given package. Returns true on success.
-fn cargo_build(package: Option<&str>) -> bool {
+/// Build a `cargo build` command for the given package.
+fn build_cargo_command(package: Option<&str>) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
     if let Some(pkg) = package {
         cmd.args(["-p", pkg]);
     }
+    cmd
+}
+
+/// Run `cargo build` for the given package. Returns true on success.
+fn cargo_build(package: Option<&str>) -> bool {
+    let mut cmd = build_cargo_command(package);
 
     eprintln!("  Compiling...");
     match cmd.status() {
@@ -227,40 +233,32 @@ fn is_relevant_change(path: &Path, kind: DebouncedEventKind) -> bool {
     false
 }
 
-/// Locate the compiled binary using `cargo metadata`.
+/// Resolve a binary path from parsed cargo metadata JSON.
 ///
-/// Reuses the same approach as `build.rs` but always targets the debug
-/// profile since `autumn dev` is for development.
-fn find_binary(package: Option<&str>) -> PathBuf {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()
-        .expect("failed to run cargo metadata");
-
-    if !output.status.success() {
-        eprintln!("\u{2717} Failed to read cargo metadata");
-        std::process::exit(1);
-    }
-
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
-
+/// Extracted from `find_binary` for testability. Takes the parsed
+/// `cargo metadata` output and returns the path to the debug binary.
+fn resolve_binary_from_metadata(
+    metadata: &serde_json::Value,
+    package: Option<&str>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
-        .expect("target_directory in metadata");
+        .ok_or("missing target_directory in metadata")?;
 
-    let packages = metadata["packages"].as_array().expect("packages array");
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("missing packages array in metadata")?;
 
     let matching_packages: Vec<_> = package.map_or_else(
         || {
-            let cwd = std::env::current_dir().expect("current dir");
             packages
                 .iter()
                 .filter(|pkg| {
                     let manifest = pkg["manifest_path"].as_str().unwrap_or("");
-                    std::path::Path::new(manifest)
+                    Path::new(manifest)
                         .parent()
-                        .is_some_and(|dir| dir.starts_with(&cwd))
+                        .is_some_and(|dir| dir.starts_with(cwd))
                 })
                 .collect()
         },
@@ -287,15 +285,12 @@ fn find_binary(package: Option<&str>) -> PathBuf {
                 .filter_map(|t| t["name"].as_str().map(String::from))
         })
         .next()
-        .unwrap_or_else(|| {
-            if let Some(pkg_name) = package {
-                eprintln!("\u{2717} No binary target found in package '{pkg_name}'");
-            } else {
-                eprintln!("\u{2717} No binary target found in current package");
-                eprintln!("  Hint: use -p <package> to specify the target package");
-            }
-            std::process::exit(1);
-        });
+        .ok_or_else(|| {
+            package.map_or_else(
+                || "no binary target found in current package".to_owned(),
+                |pkg_name| format!("no binary target found in package '{pkg_name}'"),
+            )
+        })?;
 
     let mut path = PathBuf::from(target_dir);
     path.push("debug");
@@ -305,12 +300,42 @@ fn find_binary(package: Option<&str>) -> PathBuf {
         path.set_extension("exe");
     }
 
-    path
+    Ok(path)
+}
+
+/// Locate the compiled binary using `cargo metadata`.
+///
+/// Always targets the debug profile since `autumn dev` is for development.
+fn find_binary(package: Option<&str>) -> PathBuf {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .expect("failed to run cargo metadata");
+
+    if !output.status.success() {
+        eprintln!("\u{2717} Failed to read cargo metadata");
+        std::process::exit(1);
+    }
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
+
+    let cwd = std::env::current_dir().expect("current dir");
+
+    resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|e| {
+        eprintln!("\u{2717} {e}");
+        if package.is_none() {
+            eprintln!("  Hint: use -p <package> to specify the target package");
+        }
+        std::process::exit(1);
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_relevant_change tests ───────────────────────────────────
 
     #[test]
     fn relevant_rust_file() {
@@ -361,6 +386,22 @@ mod tests {
     }
 
     #[test]
+    fn relevant_js_file() {
+        assert!(is_relevant_change(
+            Path::new("static/js/app.js"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    #[test]
+    fn relevant_nested_rust_file() {
+        assert!(is_relevant_change(
+            Path::new("src/routes/api/handlers.rs"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    #[test]
     fn ignores_target_directory() {
         assert!(!is_relevant_change(
             Path::new("target/debug/build/main.rs"),
@@ -372,6 +413,14 @@ mod tests {
     fn ignores_hidden_files() {
         assert!(!is_relevant_change(
             Path::new(".git/config"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    #[test]
+    fn ignores_hidden_directory_nested() {
+        assert!(!is_relevant_change(
+            Path::new("src/.hidden/module.rs"),
             DebouncedEventKind::Any,
         ));
     }
@@ -398,5 +447,275 @@ mod tests {
             Path::new("Cargo.lock"),
             DebouncedEventKind::Any,
         ));
+    }
+
+    #[test]
+    fn ignores_file_without_extension() {
+        assert!(!is_relevant_change(
+            Path::new("src/Makefile"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    #[test]
+    fn ignores_image_files() {
+        assert!(!is_relevant_change(
+            Path::new("static/logo.png"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    #[test]
+    fn ignores_target_nested_deeply() {
+        assert!(!is_relevant_change(
+            Path::new("target/release/deps/libfoo.rs"),
+            DebouncedEventKind::Any,
+        ));
+    }
+
+    // ── build_cargo_command tests ──────────────────────────────────
+
+    #[test]
+    fn build_command_without_package() {
+        let cmd = build_cargo_command(None);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(cmd.get_program(), "cargo");
+        assert_eq!(args, &["build"]);
+    }
+
+    #[test]
+    fn build_command_with_package() {
+        let cmd = build_cargo_command(Some("my-app"));
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(cmd.get_program(), "cargo");
+        assert_eq!(args, &["build", "-p", "my-app"]);
+    }
+
+    // ── resolve_binary_from_metadata tests ─────────────────────────
+
+    fn sample_metadata(target_dir: &str, pkg_name: &str, manifest_dir: &str) -> serde_json::Value {
+        serde_json::json!({
+            "target_directory": target_dir,
+            "packages": [{
+                "name": pkg_name,
+                "manifest_path": format!("{manifest_dir}/Cargo.toml"),
+                "targets": [{
+                    "name": pkg_name,
+                    "kind": ["bin"],
+                    "src_path": format!("{manifest_dir}/src/main.rs")
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn resolve_binary_by_package_name() {
+        let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
+        let result =
+            resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects/hello"));
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/target/debug/hello"));
+    }
+
+    #[test]
+    fn resolve_binary_by_cwd() {
+        let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/target/debug/hello"));
+    }
+
+    #[test]
+    fn resolve_binary_package_not_found() {
+        let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            Some("nonexistent"),
+            Path::new("/projects/hello"),
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("no binary target found in package 'nonexistent'")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_no_match_by_cwd() {
+        let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/other/directory"));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("no binary target found in current package")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_missing_target_directory() {
+        let metadata = serde_json::json!({"packages": []});
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/tmp"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("target_directory"));
+    }
+
+    #[test]
+    fn resolve_binary_missing_packages() {
+        let metadata = serde_json::json!({"target_directory": "/tmp/target"});
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/tmp"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("packages"));
+    }
+
+    #[test]
+    fn resolve_binary_skips_lib_targets() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "mylib",
+                "manifest_path": "/projects/mylib/Cargo.toml",
+                "targets": [{
+                    "name": "mylib",
+                    "kind": ["lib"],
+                    "src_path": "/projects/mylib/src/lib.rs"
+                }]
+            }]
+        });
+        let result =
+            resolve_binary_from_metadata(&metadata, Some("mylib"), Path::new("/projects/mylib"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_binary_picks_first_bin_in_multi_target() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "multi",
+                "manifest_path": "/projects/multi/Cargo.toml",
+                "targets": [
+                    {"name": "multi", "kind": ["lib"]},
+                    {"name": "server", "kind": ["bin"]},
+                    {"name": "cli", "kind": ["bin"]}
+                ]
+            }]
+        });
+        let result =
+            resolve_binary_from_metadata(&metadata, Some("multi"), Path::new("/projects/multi"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PathBuf::from("/tmp/target/debug/server"));
+    }
+
+    #[test]
+    fn resolve_binary_with_multiple_packages() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [
+                {
+                    "name": "app-a",
+                    "manifest_path": "/projects/a/Cargo.toml",
+                    "targets": [{"name": "app-a", "kind": ["bin"]}]
+                },
+                {
+                    "name": "app-b",
+                    "manifest_path": "/projects/b/Cargo.toml",
+                    "targets": [{"name": "app-b", "kind": ["bin"]}]
+                }
+            ]
+        });
+        let result = resolve_binary_from_metadata(&metadata, Some("app-b"), Path::new("/projects"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PathBuf::from("/tmp/target/debug/app-b"));
+    }
+
+    // ── stop_server tests ──────────────────────────────────────────
+
+    #[test]
+    fn stop_server_with_none_is_noop() {
+        let mut child: Option<Child> = None;
+        stop_server(&mut child);
+        assert!(child.is_none());
+    }
+
+    #[test]
+    fn stop_server_terminates_child() {
+        // Spawn a long-running process, then stop it
+        let proc = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let mut child = Some(proc);
+        stop_server(&mut child);
+        assert!(child.is_none());
+    }
+
+    // ── wait_with_timeout tests ────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_timeout_succeeds_for_fast_process() {
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        // Give it a moment to exit
+        std::thread::sleep(Duration::from_millis(50));
+        let result = wait_with_timeout(&mut child, Duration::from_secs(2));
+        assert!(result.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_timeout_times_out_for_long_process() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let result = wait_with_timeout(&mut child, Duration::from_millis(100));
+        assert!(result.is_err());
+        // Clean up
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // ── constants tests ────────────────────────────────────────────
+
+    #[test]
+    fn watch_extensions_are_non_empty() {
+        assert!(!WATCH_EXTENSIONS.is_empty());
+        for ext in WATCH_EXTENSIONS {
+            assert!(!ext.is_empty());
+            assert!(
+                !ext.starts_with('.'),
+                "extensions should not have leading dot"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_dirs_are_non_empty() {
+        assert!(!WATCH_DIRS.is_empty());
+        for dir in WATCH_DIRS {
+            assert!(!dir.is_empty());
+        }
+    }
+
+    #[test]
+    fn watch_files_are_non_empty() {
+        assert!(!WATCH_FILES.is_empty());
+        for f in WATCH_FILES {
+            assert!(!f.is_empty());
+        }
+    }
+
+    #[test]
+    fn debounce_interval_is_reasonable() {
+        assert!(DEBOUNCE_MS >= 100, "debounce too short, would thrash");
+        assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX");
     }
 }
