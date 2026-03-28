@@ -24,8 +24,7 @@ fn parse_secured_args(attr: TokenStream) -> syn::Result<Vec<String>> {
     }
 
     let roles =
-        syn::punctuated::Punctuated::<LitStr, syn::Token![,]>::parse_terminated
-            .parse2(attr)?;
+        syn::punctuated::Punctuated::<LitStr, syn::Token![,]>::parse_terminated.parse2(attr)?;
     Ok(roles.iter().map(LitStr::value).collect())
 }
 

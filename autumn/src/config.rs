@@ -503,7 +503,10 @@ impl AutumnConfig {
         if let Ok(val) = std::env::var("AUTUMN_SESSION__COOKIE_NAME") {
             self.session.cookie_name = val;
         }
-        parse_env("AUTUMN_SESSION__MAX_AGE_SECS", &mut self.session.max_age_secs);
+        parse_env(
+            "AUTUMN_SESSION__MAX_AGE_SECS",
+            &mut self.session.max_age_secs,
+        );
         if let Ok(val) = std::env::var("AUTUMN_SESSION__SECURE") {
             match val.as_str() {
                 "true" | "1" => self.session.secure = true,

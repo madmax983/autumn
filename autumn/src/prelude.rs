@@ -57,10 +57,10 @@ pub use crate::hooks::{
 };
 
 // ── Session & Auth ──────────────────────────────────────────────
-/// Session extractor for accessing per-user session data.
-pub use crate::session::Session;
 /// Auth extractor for retrieving the authenticated user.
 pub use crate::auth::Auth;
+/// Session extractor for accessing per-user session data.
+pub use crate::session::Session;
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).

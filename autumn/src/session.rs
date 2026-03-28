@@ -63,9 +63,9 @@ use std::task::{Context, Poll};
 
 use axum::extract::{FromRequestParts, Request};
 use axum::response::Response;
+use http::HeaderValue;
 use http::header::{COOKIE, SET_COOKIE};
 use http::request::Parts;
-use http::HeaderValue;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
@@ -187,17 +187,10 @@ impl FromRequestParts<AppState> for Session {
 pub trait SessionStore: Send + Sync + 'static {
     /// Load session data for the given ID. Returns `None` if the session
     /// does not exist or has expired.
-    fn load(
-        &self,
-        id: &str,
-    ) -> impl Future<Output = Option<HashMap<String, String>>> + Send;
+    fn load(&self, id: &str) -> impl Future<Output = Option<HashMap<String, String>>> + Send;
 
     /// Save session data under the given ID.
-    fn save(
-        &self,
-        id: &str,
-        data: HashMap<String, String>,
-    ) -> impl Future<Output = ()> + Send;
+    fn save(&self, id: &str, data: HashMap<String, String>) -> impl Future<Output = ()> + Send;
 
     /// Delete session data for the given ID.
     fn destroy(&self, id: &str) -> impl Future<Output = ()> + Send;
@@ -228,10 +221,7 @@ impl SessionStore for MemoryStore {
     }
 
     async fn save(&self, id: &str, data: HashMap<String, String>) {
-        self.sessions
-            .write()
-            .await
-            .insert(id.to_owned(), data);
+        self.sessions.write().await.insert(id.to_owned(), data);
     }
 
     async fn destroy(&self, id: &str) {
@@ -315,16 +305,14 @@ impl Default for SessionConfig {
 fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     headers.get_all(COOKIE).iter().find_map(|value| {
         value.to_str().ok().and_then(|s| {
-            s.split(';')
-                .map(str::trim)
-                .find_map(|pair| {
-                    let (k, v) = pair.split_once('=')?;
-                    if k.trim() == name {
-                        Some(v.trim().to_owned())
-                    } else {
-                        None
-                    }
-                })
+            s.split(';').map(str::trim).find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                if k.trim() == name {
+                    Some(v.trim().to_owned())
+                } else {
+                    None
+                }
+            })
         })
     })
 }
@@ -332,7 +320,10 @@ fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
 /// Build a Set-Cookie header value.
 fn build_set_cookie(config: &SessionConfig, session_id: &str) -> String {
     use std::fmt::Write;
-    let mut cookie = format!("{}={}; Path={}", config.cookie_name, session_id, config.path);
+    let mut cookie = format!(
+        "{}={}; Path={}",
+        config.cookie_name, session_id, config.path
+    );
     let _ = write!(cookie, "; Max-Age={}", config.max_age_secs);
     if config.http_only {
         cookie.push_str("; HttpOnly");
@@ -467,9 +458,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use axum::Router;
     use http::Request as HttpRequest;
     use tower::ServiceExt;
 
@@ -542,8 +533,11 @@ mod tests {
         session.insert("key", "value").await;
         session.destroy().await;
         let inner = session.inner.read().await;
-        assert!(inner.destroyed);
-        assert!(inner.data.is_empty());
+        let destroyed = inner.destroyed;
+        let empty = inner.data.is_empty();
+        drop(inner);
+        assert!(destroyed);
+        assert!(empty);
     }
 
     #[test]
@@ -589,6 +583,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
+        async fn handler(session: Session) -> String {
+            session.insert("visited", "true").await;
+            "ok".to_owned()
+        }
+
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
@@ -596,11 +595,6 @@ mod tests {
             started_at: std::time::Instant::now(),
             health_detailed: false,
         };
-
-        async fn handler(session: Session) -> String {
-            session.insert("visited", "true").await;
-            "ok".to_owned()
-        }
 
         let app = Router::new()
             .route("/", get(handler))
@@ -626,6 +620,15 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_persists_data_across_requests() {
+        async fn write_handler(session: Session) -> String {
+            session.insert("user", "alice").await;
+            "saved".to_owned()
+        }
+
+        async fn read_handler(session: Session) -> String {
+            session.get("user").await.unwrap_or_default()
+        }
+
         let store = MemoryStore::new();
         let config = SessionConfig::default();
         let state = AppState {
@@ -635,15 +638,6 @@ mod tests {
             started_at: std::time::Instant::now(),
             health_detailed: false,
         };
-
-        async fn write_handler(session: Session) -> String {
-            session.insert("user", "alice").await;
-            "saved".to_owned()
-        }
-
-        async fn read_handler(session: Session) -> String {
-            session.get("user").await.unwrap_or_default()
-        }
 
         let app = Router::new()
             .route("/write", get(write_handler))
@@ -693,6 +687,11 @@ mod tests {
 
     #[tokio::test]
     async fn session_destroy_expires_cookie() {
+        async fn handler(session: Session) -> String {
+            session.destroy().await;
+            "destroyed".to_owned()
+        }
+
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
@@ -700,11 +699,6 @@ mod tests {
             started_at: std::time::Instant::now(),
             health_detailed: false,
         };
-
-        async fn handler(session: Session) -> String {
-            session.destroy().await;
-            "destroyed".to_owned()
-        }
 
         let store = MemoryStore::new();
         store

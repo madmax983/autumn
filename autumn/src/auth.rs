@@ -60,8 +60,8 @@ use std::task::{Context, Poll};
 
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
-use http::request::Parts;
 use http::StatusCode;
+use http::request::Parts;
 
 use crate::AppState;
 
@@ -87,9 +87,8 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// assert!(hashed.starts_with("$2b$"));
 /// ```
 pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
-    bcrypt::hash(password, DEFAULT_BCRYPT_COST).map_err(|e| {
-        crate::AutumnError::from(std::io::Error::other(e.to_string()))
-    })
+    bcrypt::hash(password, DEFAULT_BCRYPT_COST)
+        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
 }
 
 /// Verify a plaintext password against a bcrypt hash.
@@ -110,9 +109,8 @@ pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
 /// assert!(!verify_password("wrong_password", &hashed).unwrap());
 /// ```
 pub fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
-    bcrypt::verify(password, hash).map_err(|e| {
-        crate::AutumnError::from(std::io::Error::other(e.to_string()))
-    })
+    bcrypt::verify(password, hash)
+        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
 }
 
 // ── Runtime check for #[secured] macro ──────────────────────────
@@ -277,7 +275,10 @@ pub struct RequireAuthService<S> {
 
 impl<S, ResBody> tower::Service<axum::extract::Request> for RequireAuthService<S>
 where
-    S: tower::Service<axum::extract::Request, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: tower::Service<axum::extract::Request, Response = Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
     ResBody: From<String> + Default + Send + 'static,
@@ -317,7 +318,9 @@ where
                 let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
                     .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(ResBody::from(serde_json::to_string(&body).unwrap_or_default()))
+                    .body(ResBody::from(
+                        serde_json::to_string(&body).unwrap_or_default(),
+                    ))
                     .unwrap_or_default();
                 Ok(response)
             }
@@ -402,9 +405,9 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use tower::ServiceExt;
 
         #[derive(Clone)]
@@ -424,9 +427,7 @@ mod tests {
             health_detailed: false,
         };
 
-        let app = Router::new()
-            .route("/", get(handler))
-            .with_state(state);
+        let app = Router::new().route("/", get(handler)).with_state(state);
 
         let response = app
             .oneshot(
@@ -443,9 +444,9 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use tower::ServiceExt;
 
         #[derive(Clone)]
@@ -468,10 +469,14 @@ mod tests {
         // Middleware that inserts a user into extensions
         let app = Router::new()
             .route("/", get(handler))
-            .layer(axum::middleware::from_fn(|mut req: axum::extract::Request, next: axum::middleware::Next| async move {
-                req.extensions_mut().insert(TestUser { name: "alice".into() });
-                next.run(req).await
-            }))
+            .layer(axum::middleware::from_fn(
+                |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    req.extensions_mut().insert(TestUser {
+                        name: "alice".into(),
+                    });
+                    next.run(req).await
+                },
+            ))
             .with_state(state);
 
         let response = app
@@ -493,9 +498,9 @@ mod tests {
 
     #[tokio::test]
     async fn require_auth_rejects_unauthenticated() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
@@ -589,9 +594,9 @@ mod tests {
 
     #[tokio::test]
     async fn secured_macro_rejects_unauthenticated() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
@@ -611,7 +616,10 @@ mod tests {
 
         let app = Router::new()
             .route("/", get(protected_handler))
-            .layer(SessionLayer::new(MemoryStore::new(), SessionConfig::default()))
+            .layer(SessionLayer::new(
+                MemoryStore::new(),
+                SessionConfig::default(),
+            ))
             .with_state(state);
 
         let response = app
@@ -629,9 +637,9 @@ mod tests {
 
     #[tokio::test]
     async fn secured_macro_allows_authenticated() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use http::header::COOKIE;
         use tower::ServiceExt;
 
@@ -683,9 +691,9 @@ mod tests {
 
     #[tokio::test]
     async fn secured_macro_with_role_rejects_wrong_role() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use http::header::COOKIE;
         use tower::ServiceExt;
 
@@ -736,9 +744,9 @@ mod tests {
 
     #[tokio::test]
     async fn secured_macro_with_multiple_roles_allows_match() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use http::header::COOKIE;
         use tower::ServiceExt;
 
@@ -793,9 +801,9 @@ mod tests {
 
     #[tokio::test]
     async fn require_auth_allows_authenticated() {
+        use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
-        use axum::Router;
         use http::header::COOKIE;
         use tower::ServiceExt;
 
