@@ -36,6 +36,7 @@ tracing-subscriber.workspace = true
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 http.workspace = true
