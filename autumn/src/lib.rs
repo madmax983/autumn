@@ -247,7 +247,7 @@ pub use autumn_macros::model;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
-/// See [`repository`](autumn_macros::repository) for details.
+/// See [`repository`] for details.
 #[cfg(feature = "db")]
 pub use autumn_macros::repository;
 

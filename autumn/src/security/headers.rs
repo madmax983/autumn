@@ -1,7 +1,7 @@
 //! Security response headers middleware.
 //!
 //! Applies OWASP-recommended security headers to every HTTP response.
-//! The headers are configured via [`HeadersConfig`](super::config::HeadersConfig)
+//! The headers are configured via [`HeadersConfig`]
 //! in `autumn.toml` under `[security.headers]`.
 //!
 //! # Headers applied
