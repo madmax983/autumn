@@ -12,8 +12,9 @@ repository = "https://github.com/madmax983/autumn"
 [workspace.dependencies]
 # Runtime
 axum = { version = "0.8", features = ["macros"] }
-diesel = { version = "2", features = ["sqlite"] }
+diesel = { version = "2", features = ["sqlite", "postgres"] }
 diesel-async = { version = "0.8", features = ["deadpool", "postgres"] }
+diesel_migrations = "2"
 http = "1"
 libsqlite3-sys = { version = "0.36", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }

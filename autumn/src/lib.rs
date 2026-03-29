@@ -71,7 +71,10 @@ pub mod auth;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
+#[cfg(feature = "db")]
+pub mod migrate;
 pub mod error;
+pub mod error_pages;
 pub mod extract;
 pub mod health;
 #[cfg(feature = "db")]
@@ -553,6 +556,10 @@ pub mod reexports {
 ///     profile: Some("dev".into()),
 ///     started_at: std::time::Instant::now(),
 ///     health_detailed: true,
+///     metrics: autumn_web::middleware::MetricsCollector::new(),
+///     log_levels: autumn_web::actuator::LogLevels::new("info"),
+///     task_registry: autumn_web::actuator::TaskRegistry::new(),
+///     config_props: Default::default(),
 /// };
 /// ```
 #[derive(Clone)]
@@ -570,6 +577,18 @@ pub struct AppState {
 
     /// Whether the health endpoint should include detailed info.
     pub health_detailed: bool,
+
+    /// In-memory metrics collector for the `/actuator/metrics` endpoint.
+    pub metrics: middleware::MetricsCollector,
+
+    /// Runtime log level state for the `/actuator/loggers` endpoint.
+    pub log_levels: actuator::LogLevels,
+
+    /// Scheduled task registry for the `/actuator/tasks` endpoint.
+    pub task_registry: actuator::TaskRegistry,
+
+    /// Resolved config properties with source tracking for `/actuator/configprops`.
+    pub config_props: actuator::ConfigProperties,
 }
 
 impl AppState {
@@ -599,6 +618,23 @@ impl AppState {
             format!("{hours}h {mins}m")
         }
     }
+
+    /// Create an `AppState` suitable for testing, with sensible defaults
+    /// for all fields. Database pool is `None`.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: Default::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -615,6 +651,9 @@ impl std::fmt::Debug for AppState {
         s.field("profile", &self.profile)
             .field("started_at", &self.started_at)
             .field("health_detailed", &self.health_detailed)
+            .field("metrics", &"MetricsCollector")
+            .field("log_levels", &"LogLevels")
+            .field("task_registry", &"TaskRegistry")
             .finish()
     }
 }
@@ -631,6 +670,10 @@ mod tests {
             profile: Some("dev".into()),
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         let debug = format!("{state:?}");
         assert!(debug.contains("AppState"));
@@ -651,6 +694,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
@@ -668,6 +715,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         let _cloned = require_clone(&state);
     }
@@ -680,6 +731,10 @@ mod tests {
             profile: Some("staging".into()),
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         assert_eq!(state.profile(), "staging");
     }
@@ -692,6 +747,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         assert_eq!(state.profile(), "default");
     }
@@ -704,6 +763,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: middleware::MetricsCollector::new(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
         };
         let display = state.uptime_display();
         assert!(

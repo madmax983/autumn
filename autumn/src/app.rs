@@ -30,6 +30,9 @@ use crate::AppState;
 use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
+use crate::error_pages::{self, ErrorPageRenderer, SharedRenderer};
+#[cfg(feature = "db")]
+use crate::migrate;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
@@ -64,6 +67,11 @@ pub fn app() -> AppBuilder {
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
+        merge_routers: Vec::new(),
+        nest_routers: Vec::new(),
+        error_page_renderer: None,
+        #[cfg(feature = "db")]
+        migrations: None,
     }
 }
 
@@ -101,6 +109,13 @@ pub struct AppBuilder {
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Custom error page renderer (overrides built-in pages).
+    error_page_renderer: Option<SharedRenderer>,
+    /// Embedded Diesel migrations, registered via `.migrations()`.
+    #[cfg(feature = "db")]
+    migrations: Option<migrate::EmbeddedMigrations>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -200,6 +215,48 @@ impl AppBuilder {
         self
     }
 
+    /// Register a custom error page renderer.
+    ///
+    /// The renderer replaces the built-in default error pages (404, 422, 500,
+    /// and generic errors). Implement [`ErrorPageRenderer`] to provide your
+    /// own branded error pages.
+    ///
+    /// Only one renderer can be active. Calling this method multiple times
+    /// replaces the previous renderer.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::error_pages::{ErrorPageRenderer, ErrorContext};
+    /// use maud::{Markup, html};
+    ///
+    /// struct MyErrors;
+    ///
+    /// impl ErrorPageRenderer for MyErrors {
+    ///     fn render_error(&self, ctx: &ErrorContext) -> Markup {
+    ///         html! {
+    ///             h1 { (ctx.status.as_u16()) " - Custom error page" }
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// # use autumn_web::prelude::*;
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .error_pages(MyErrors)
+    ///     .routes(routes![index])
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn error_pages(mut self, renderer: impl ErrorPageRenderer) -> Self {
+        self.error_page_renderer = Some(Arc::new(renderer));
+        self
+    }
+
     /// Register a group of routes with a shared path prefix and middleware.
     ///
     /// The `layer` is applied only to routes within this group, not to the
@@ -242,6 +299,116 @@ impl AppBuilder {
             routes,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
+        self
+    }
+
+    /// Merge a raw Axum router into the application.
+    ///
+    /// This is an escape hatch for when Autumn's route macros are not
+    /// sufficient -- for example, when integrating a third-party Axum
+    /// middleware crate or mounting a hand-built WebSocket handler.
+    ///
+    /// The merged router shares the same [`AppState`] (database pool,
+    /// config, etc.) and Autumn's global middleware (request IDs,
+    /// security headers, session management) applies to its routes.
+    ///
+    /// Merged routes are added **after** Autumn's annotated routes, so
+    /// if both define the same path, the annotated route takes precedence.
+    ///
+    /// Can be called multiple times -- routers are accumulated.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::AppState;
+    ///
+    /// #[get("/")]
+    /// async fn index() -> &'static str { "hi" }
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     let raw = axum::Router::<AppState>::new()
+    ///         .route("/ws", axum::routing::get(|| async { "websocket" }));
+    ///
+    ///     autumn_web::app()
+    ///         .routes(routes![index])
+    ///         .merge(raw)
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[must_use]
+    pub fn merge(mut self, router: axum::Router<AppState>) -> Self {
+        self.merge_routers.push(router);
+        self
+    }
+
+    /// Mount a raw Axum router under a path prefix.
+    ///
+    /// This is an escape hatch similar to [`merge`](Self::merge), but the
+    /// router's routes are nested under the given `path` prefix. Useful
+    /// for mounting a self-contained API version or third-party router.
+    ///
+    /// The nested router shares the same [`AppState`] and Autumn's global
+    /// middleware applies to its routes.
+    ///
+    /// Can be called multiple times with different prefixes.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::AppState;
+    ///
+    /// #[get("/")]
+    /// async fn index() -> &'static str { "hi" }
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     let v2 = axum::Router::<AppState>::new()
+    ///         .route("/users", axum::routing::get(|| async { "v2 users" }));
+    ///
+    ///     autumn_web::app()
+    ///         .routes(routes![index])
+    ///         .nest("/api/v2", v2)
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[must_use]
+    pub fn nest(mut self, path: &str, router: axum::Router<AppState>) -> Self {
+        self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    /// Register embedded Diesel migrations with the application.
+    ///
+    /// When migrations are registered:
+    /// - In **dev** mode, pending migrations run automatically on startup.
+    /// - In **prod** mode, pending migrations are logged as warnings but
+    ///   not applied -- use `autumn migrate` to apply them explicitly.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+    ///
+    /// const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     autumn_web::app()
+    ///         .routes(routes![...])
+    ///         .migrations(MIGRATIONS)
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
+        self.migrations = Some(migrations);
         self
     }
 
@@ -316,6 +483,12 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
+        // 5b. Run migrations if registered
+        #[cfg(feature = "db")]
+        if let (Some(migrations), Some(url)) = (self.migrations, &config.database.url) {
+            migrate::auto_migrate(url, config.profile.as_deref(), migrations);
+        }
+
         // 6. Build the router (with optional static-file layer)
         let state = AppState {
             #[cfg(feature = "db")]
@@ -323,6 +496,10 @@ impl AppBuilder {
             profile: config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new(&config.log.level),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::from_config(&config),
         };
         let dist_dir = project_dir("dist");
         let dist_ref = if dist_dir.exists() {
@@ -337,6 +514,9 @@ impl AppBuilder {
             dist_ref,
             self.exception_filters,
             self.scoped_groups,
+            self.merge_routers,
+            self.nest_routers,
+            self.error_page_renderer,
         );
 
         // 7. Start scheduled tasks (if any)
@@ -419,6 +599,10 @@ impl AppBuilder {
             profile: config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new(&config.log.level),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::from_config(&config),
         };
 
         // Build the full router (same as production)
@@ -463,18 +647,38 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
+                // Register with the task registry for /actuator/tasks
+                let schedule_desc = format!("every {}s", delay.as_secs());
+                state.task_registry.register(&name, &schedule_desc);
+
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(delay).await;
                         tracing::debug!(task = %name, "Running scheduled task");
+                        state.task_registry.record_start(&name);
+                        let start = std::time::Instant::now();
                         match (handler)(state.clone()).await {
-                            Ok(()) => tracing::debug!(task = %name, "Task completed"),
-                            Err(e) => tracing::warn!(task = %name, error = %e, "Task failed"),
+                            Ok(()) => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                state.task_registry.record_success(&name, duration_ms);
+                                tracing::debug!(task = %name, "Task completed");
+                            }
+                            Err(e) => {
+                                let duration_ms = start.elapsed().as_millis() as u64;
+                                state
+                                    .task_registry
+                                    .record_failure(&name, duration_ms, &e.to_string());
+                                tracing::warn!(task = %name, error = %e, "Task failed");
+                            }
                         }
                     }
                 });
             }
             crate::task::Schedule::Cron { expression, .. } => {
+                // Register with the task registry even though cron is not yet implemented
+                let schedule_desc = format!("cron {expression}");
+                state.task_registry.register(&name, &schedule_desc);
+
                 tracing::info!(
                     task = %name,
                     cron = %expression,
@@ -503,7 +707,40 @@ pub fn build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
-    build_router_inner(route_list, config, state, Vec::new(), Vec::new())
+    build_router_inner(
+        route_list,
+        config,
+        state,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+}
+
+/// Build a router that includes user-supplied raw Axum routers.
+///
+/// Like [`build_router`], but also merges and nests additional raw
+/// Axum routers. This is primarily useful for integration testing;
+/// in production, use [`AppBuilder::merge`] and [`AppBuilder::nest`].
+pub fn build_router_merged(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+) -> axum::Router {
+    build_router_inner(
+        route_list,
+        config,
+        state,
+        Vec::new(),
+        Vec::new(),
+        merge_routers,
+        nest_routers,
+        None,
+    )
 }
 
 fn build_router_inner(
@@ -512,6 +749,9 @@ fn build_router_inner(
     state: AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    error_page_renderer: Option<SharedRenderer>,
 ) -> axum::Router {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -589,6 +829,19 @@ fn build_router_inner(
         router = router.nest(&group.prefix, sub_router);
     }
 
+    // Merge user-supplied raw Axum routers (escape hatch).
+    // Merged after annotated routes so annotated routes take precedence.
+    for raw_router in merge_routers {
+        tracing::debug!("Merged raw Axum router");
+        router = router.merge(raw_router);
+    }
+
+    // Nest user-supplied raw Axum routers under path prefixes.
+    for (prefix, raw_router) in nest_routers {
+        tracing::debug!(prefix = %prefix, "Nested raw Axum router");
+        router = router.nest(&prefix, raw_router);
+    }
+
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -619,19 +872,43 @@ fn build_router_inner(
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
 
+    // 404 fallback handler for unmatched routes
+    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
     let router = router
         .layer(RequestIdLayer)
         .layer(security_headers)
         .layer(session_layer);
-    let router = if exception_filters.is_empty() {
-        router
-    } else {
-        let count = exception_filters.len();
-        tracing::debug!(count, "Registered exception filters");
-        router.layer(ExceptionFilterLayer::new(exception_filters))
+
+    // Error page filter: renders HTML error pages for browser requests.
+    // Always registered (uses default renderer if no custom one is provided).
+    let is_dev = config
+        .profile
+        .as_deref()
+        .map_or(cfg!(debug_assertions), |p| p == "dev");
+    let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
+    let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
+        renderer,
+        is_dev,
     };
+
+    // Combine the error page filter with user exception filters.
+    // The error page filter runs first (innermost), then user filters.
+    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![Arc::new(error_page_filter)];
+    all_filters.extend(exception_filters);
+
+    let count = all_filters.len();
+    tracing::debug!(count, "Registered exception filters (including error page filter)");
+
+    // Error page context layer must be inner to the exception filter so
+    // WantsHtml is set on the response before the filter inspects it.
+    // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
+    let router = router
+        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
+        .layer(ExceptionFilterLayer::new(all_filters))
+        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 
     router.with_state(state)
 }
@@ -653,7 +930,17 @@ pub fn build_router_with_static(
     state: AppState,
     dist_dir: Option<&std::path::Path>,
 ) -> axum::Router {
-    build_router_with_static_inner(route_list, config, state, dist_dir, Vec::new(), Vec::new())
+    build_router_with_static_inner(
+        route_list,
+        config,
+        state,
+        dist_dir,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
 }
 
 fn build_router_with_static_inner(
@@ -663,9 +950,20 @@ fn build_router_with_static_inner(
     dist_dir: Option<&std::path::Path>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    error_page_renderer: Option<SharedRenderer>,
 ) -> axum::Router {
-    let app_router =
-        build_router_inner(route_list, config, state, exception_filters, scoped_groups);
+    let app_router = build_router_inner(
+        route_list,
+        config,
+        state,
+        exception_filters,
+        scoped_groups,
+        merge_routers,
+        nest_routers,
+        error_page_renderer,
+    );
 
     let Some(dist) = dist_dir else {
         return app_router;
@@ -679,6 +977,20 @@ fn build_router_with_static_inner(
         return app_router;
     };
 
+    // Enable ISR regeneration by attaching the app router to the static layer.
+    // Routes with `revalidate` set will spawn background re-render tasks
+    // when their files become stale.
+    let has_isr = layer
+        .manifest()
+        .routes
+        .values()
+        .any(|e| e.revalidate.is_some());
+    let layer = if has_isr {
+        layer.with_router(app_router.clone())
+    } else {
+        layer
+    };
+
     for (route, entry) in &layer.manifest().routes {
         tracing::debug!(
             route = %route,
@@ -687,6 +999,9 @@ fn build_router_with_static_inner(
             "Static route"
         );
     }
+
+    // Store the layer in an Arc so the ISR check middleware can use it.
+    let layer = Arc::new(layer);
 
     // Mount static files as a fallback on the app router rather than
     // wrapping the app behind ServeDir. The previous approach
@@ -697,8 +1012,27 @@ fn build_router_with_static_inner(
     // With this approach: explicit routes (GET, POST, etc.) always win.
     // Only requests that match NO dynamic route fall through to ServeDir,
     // which then serves static files (e.g. /about/ → dist/about/index.html).
+    //
+    // ISR staleness checking: before ServeDir handles the request, we
+    // trigger resolve() on the StaticFileLayer to check for stale pages
+    // and spawn background regeneration tasks if needed.
+    let isr_layer = layer.clone();
     let serve_dir = tower_http::services::ServeDir::new(dist);
-    app_router.fallback_service(serve_dir)
+    app_router
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let isr_layer = isr_layer.clone();
+                async move {
+                    // Trigger ISR check for GET requests (resolves the path
+                    // and spawns background regeneration if stale)
+                    if req.method() == http::Method::GET {
+                        isr_layer.resolve(req.uri().path());
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
+        .fallback_service(serve_dir)
 }
 
 /// Build a `tower_http::cors::CorsLayer` from the framework's [`CorsConfig`].
@@ -800,6 +1134,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         build_router(routes, &config, state)
     }
@@ -862,6 +1200,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
@@ -935,6 +1277,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router = build_router(post_routes, &config, state);
 
@@ -975,6 +1321,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router = build_router(route_list, &config, state);
 
@@ -1125,6 +1475,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -1159,6 +1513,7 @@ mod tests {
             path: "/about",
             name: "about",
             revalidate: None,
+            params_fn: None,
         }];
         let builder = app().static_routes(metas);
         assert_eq!(builder.static_metas.len(), 1);
@@ -1182,6 +1537,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         build_router(routes, config, state)
     }
@@ -1309,6 +1668,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -1334,6 +1697,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let router =
             build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);

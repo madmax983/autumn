@@ -83,12 +83,20 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

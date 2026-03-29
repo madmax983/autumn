@@ -16,25 +16,16 @@ mod routes;
 mod schema;
 mod tasks;
 
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
-use diesel::Connection;
-use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
-    // Run pending migrations on startup
-    let config = autumn_web::config::AutumnConfig::load().expect("load config");
-    if let Some(url) = &config.database.url {
-        let mut conn =
-            diesel::PgConnection::establish(url).expect("connect to database for migrations");
-        conn.run_pending_migrations(MIGRATIONS)
-            .expect("run migrations");
-    }
-
     // ── v0.2: .tasks() registers scheduled background tasks ─────
     autumn_web::app()
+        .migrations(MIGRATIONS)
         .routes(routes![
             routes::bookmarks::list,
             routes::bookmarks::by_tag,

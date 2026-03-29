@@ -17,6 +17,10 @@ fn test_state() -> autumn_web::AppState {
         profile: None,
         started_at: std::time::Instant::now(),
         health_detailed: true,
+        metrics: autumn_web::middleware::MetricsCollector::new(),
+        log_levels: autumn_web::actuator::LogLevels::new("info"),
+        task_registry: autumn_web::actuator::TaskRegistry::new(),
+        config_props: autumn_web::actuator::ConfigProperties::default(),
     }
 }
 

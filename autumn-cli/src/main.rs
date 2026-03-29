@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod dev;
+mod migrate;
 mod new;
 mod setup;
 
@@ -42,6 +43,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Run or inspect database migrations
+    Migrate {
+        #[command(subcommand)]
+        action: Option<MigrateCommands>,
+    },
+}
+
+/// Subcommands for `autumn migrate`.
+#[derive(Subcommand)]
+enum MigrateCommands {
+    /// Show migration status (applied and pending)
+    Status,
 }
 
 fn main() {
@@ -49,6 +62,13 @@ fn main() {
     match cli.command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
         Commands::Dev { package } => dev::run(package.as_deref()),
+        Commands::Migrate { action } => {
+            let action = match action {
+                Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
+                None => migrate::MigrateAction::Run,
+            };
+            migrate::run(action);
+        }
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -161,6 +181,26 @@ mod tests {
             }
             _ => panic!("expected Dev command"),
         }
+    }
+
+    #[test]
+    fn parse_migrate_subcommand() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate { action: None }
+        ));
+    }
+
+    #[test]
+    fn parse_migrate_status() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate {
+                action: Some(MigrateCommands::Status)
+            }
+        ));
     }
 
     #[test]
