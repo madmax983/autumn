@@ -187,20 +187,20 @@ mod tests {
     #[test]
     fn concurrent_access() {
         let c = MokaCache::new(1000, None);
-        let handles: Vec<_> = (0..10)
+        let handles: Vec<_> = (0_i32..10)
             .map(|i| {
                 let c = c.clone();
                 thread::spawn(move || {
                     let key = format!("key-{i}");
                     cache::insert(&c, &key, i * 10);
-                    cache::get::<i32>(&c, &key)
+                    (i, cache::get::<i32>(&c, &key))
                 })
             })
             .collect();
 
-        for (i, h) in handles.into_iter().enumerate() {
-            let val = h.join().unwrap();
-            assert_eq!(val, Some((i as i32) * 10));
+        for h in handles {
+            let (i, val) = h.join().unwrap();
+            assert_eq!(val, Some(i * 10));
         }
     }
 
