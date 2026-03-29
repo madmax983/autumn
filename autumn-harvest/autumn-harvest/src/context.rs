@@ -433,7 +433,7 @@ pub struct ActivityContext {
 impl ActivityContext {
     /// Production constructor -- creates a context with heartbeat channel and
     /// cancellation token.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
         state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,

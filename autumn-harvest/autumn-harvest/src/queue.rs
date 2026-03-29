@@ -11,7 +11,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
 
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
 
 // ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .values(&row)
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(task_id)
 }
@@ -158,7 +158,7 @@ pub async fn claim_task(
     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
     .load(conn)
     .await
-    .map_err(|e| HarvestError::Database(e.to_string()))?;
+    .map_err(crate::error::database_error)?;
 
     Ok(result.into_iter().next())
 }
@@ -183,7 +183,7 @@ pub async fn complete_task(
         ))
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }
@@ -208,7 +208,7 @@ pub async fn fail_task(
         ))
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }
@@ -225,7 +225,7 @@ pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> Ha
         .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }
@@ -253,7 +253,7 @@ pub async fn requeue_for_retry(
         ))
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }

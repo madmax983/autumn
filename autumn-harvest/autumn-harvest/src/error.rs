@@ -77,6 +77,13 @@ pub enum HarvestError {
 /// Standard result type for internal harvest engine operations.
 pub type HarvestResult<T> = Result<T, HarvestError>;
 
+/// Wrap any displayable error into [`HarvestError::Database`].
+///
+/// Use with `.map_err(database_error)` to reduce boilerplate on diesel calls.
+pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
+    HarvestError::Database(e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

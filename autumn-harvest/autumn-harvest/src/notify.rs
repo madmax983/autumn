@@ -74,7 +74,7 @@ pub async fn notify_task_enqueued(
     diesel::sql_query(sql)
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
 
     Ok(())
 }

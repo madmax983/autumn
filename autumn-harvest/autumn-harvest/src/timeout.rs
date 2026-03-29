@@ -17,7 +17,7 @@ use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::HarvestResult;
 use crate::models::TaskQueueItem;
 
 /// The reason a task was identified as timed out.
@@ -104,7 +104,7 @@ pub async fn find_timed_out_tasks(
     let heartbeat_tasks: Vec<TaskQueueItem> = diesel::sql_query(heartbeat_timeout_query())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
     for task in heartbeat_tasks {
         results.push((task, TimeoutReason::Heartbeat));
     }
@@ -113,7 +113,7 @@ pub async fn find_timed_out_tasks(
     let start_close_tasks: Vec<TaskQueueItem> = diesel::sql_query(start_to_close_timeout_query())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
     for task in start_close_tasks {
         results.push((task, TimeoutReason::StartToClose));
     }
@@ -123,7 +123,7 @@ pub async fn find_timed_out_tasks(
         diesel::sql_query(schedule_to_start_timeout_query())
             .load(conn)
             .await
-            .map_err(|e| HarvestError::Database(e.to_string()))?;
+            .map_err(crate::error::database_error)?;
     for task in sched_start_tasks {
         results.push((task, TimeoutReason::ScheduleToStart));
     }
