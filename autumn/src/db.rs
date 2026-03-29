@@ -30,9 +30,9 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 
-use crate::AppState;
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
+use crate::state::AppState;
 
 /// Error type for pool creation failures.
 ///

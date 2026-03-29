@@ -63,7 +63,7 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
 
-use crate::AppState;
+use crate::state::AppState;
 
 // ── Password hashing ────────────────────────────────────────────
 

@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use crate::AppState;
+use crate::state::AppState;
 
 /// Handler function type for scheduled tasks.
 pub type TaskHandler =

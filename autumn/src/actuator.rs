@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use crate::AppState;
+use crate::state::AppState;
 
 // ── Shared types for AppState ──────────────────────────────────
 
