@@ -1060,6 +1060,67 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn test_state() -> DashboardState {
+        let mut state = DashboardState::new("http://localhost:3000".to_string());
+        state.connected = true;
+        state.health = HealthResponse {
+            status: "ok".to_string(),
+            version: "0.1.0".to_string(),
+            profile: "dev".to_string(),
+            uptime: "1h 23m".to_string(),
+            checks: None,
+        };
+        state.metrics = MetricsResponse {
+            http: HttpMetrics {
+                requests_total: 1500,
+                requests_active: 3,
+                latency_ms: LatencySnapshot {
+                    p50: 5,
+                    p95: 25,
+                    p99: 100,
+                },
+                by_route: HashMap::from([
+                    (
+                        "GET /".to_string(),
+                        RouteSnapshot {
+                            count: 1000,
+                            p50_ms: 3,
+                            p95_ms: 10,
+                            p99_ms: 50,
+                        },
+                    ),
+                    (
+                        "POST /api/users".to_string(),
+                        RouteSnapshot {
+                            count: 500,
+                            p50_ms: 15,
+                            p95_ms: 80,
+                            p99_ms: 250,
+                        },
+                    ),
+                ]),
+                by_status: StatusSnapshot {
+                    s2xx: 1400,
+                    s3xx: 50,
+                    s4xx: 30,
+                    s5xx: 20,
+                },
+            },
+            database: Some(DbPoolMetrics {
+                pool_size: 10,
+                active_connections: 3,
+                idle_connections: 7,
+            }),
+        };
+        state.throughput_history = vec![10, 20, 30, 25, 15, 42];
+        state.latency_p50_history = vec![3, 4, 5, 3, 4];
+        state.latency_p99_history = vec![50, 80, 100, 90, 70];
+        state
+    }
+
+    // ── Helper function tests ─────────────────────────────────
 
     #[test]
     fn format_number_plain() {
@@ -1079,18 +1140,50 @@ mod tests {
     }
 
     #[test]
+    fn format_number_boundary() {
+        assert_eq!(format_number(1_000), "1.0K");
+        assert_eq!(format_number(1_000_000), "1.0M");
+    }
+
+    #[test]
     fn latency_color_green_for_fast() {
+        assert_eq!(latency_color(0), Color::Green);
         assert_eq!(latency_color(5), Color::Green);
+        assert_eq!(latency_color(10), Color::Green);
+    }
+
+    #[test]
+    fn latency_color_cyan_for_moderate() {
+        assert_eq!(latency_color(11), Color::Cyan);
+        assert_eq!(latency_color(50), Color::Cyan);
+    }
+
+    #[test]
+    fn latency_color_yellow_for_slow() {
+        assert_eq!(latency_color(51), Color::Yellow);
+        assert_eq!(latency_color(200), Color::Yellow);
+    }
+
+    #[test]
+    fn latency_color_orange_for_very_slow() {
+        assert_eq!(latency_color(201), Color::Rgb(255, 150, 50));
+        assert_eq!(latency_color(1000), Color::Rgb(255, 150, 50));
     }
 
     #[test]
     fn latency_color_red_for_slow() {
+        assert_eq!(latency_color(1001), Color::Red);
         assert_eq!(latency_color(5000), Color::Red);
     }
 
     #[test]
     fn truncate_short_string() {
         assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
     }
 
     #[test]
@@ -1101,10 +1194,26 @@ mod tests {
     #[test]
     fn status_color_mapping() {
         assert_eq!(status_color("ok"), Color::Green);
+        assert_eq!(status_color("up"), Color::Green);
         assert_eq!(status_color("degraded"), Color::Yellow);
         assert_eq!(status_color("down"), Color::Red);
         assert_eq!(status_color("unknown"), Color::DarkGray);
     }
+
+    #[test]
+    fn info_line_produces_two_spans() {
+        let line = info_line("Status", "ok", Color::Green);
+        assert_eq!(line.spans.len(), 2);
+    }
+
+    #[test]
+    fn make_card_block_has_title() {
+        let block = make_card_block("Test");
+        // Verify it doesn't panic and produces a block
+        let _ = block;
+    }
+
+    // ── Dashboard state tests ─────────────────────────────────
 
     #[test]
     fn dashboard_state_initial() {
@@ -1112,7 +1221,21 @@ mod tests {
         assert!(!state.connected);
         assert_eq!(state.prev_requests_total, 0);
         assert!(state.throughput_history.is_empty());
+        assert!(state.latency_p50_history.is_empty());
+        assert!(state.latency_p99_history.is_empty());
+        assert_eq!(state.active_tab, 0);
+        assert_eq!(state.route_scroll, 0);
+        assert_eq!(state.tick, 0);
+        assert!(state.last_error.is_none());
     }
+
+    #[test]
+    fn dashboard_state_with_trailing_slash() {
+        let state = DashboardState::new("http://localhost:3000/".to_string());
+        assert_eq!(state.base_url, "http://localhost:3000/");
+    }
+
+    // ── Deserialization tests ─────────────────────────────────
 
     #[test]
     fn deserialize_health_response() {
@@ -1120,6 +1243,31 @@ mod tests {
         let health: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(health.status, "ok");
         assert_eq!(health.profile, "dev");
+        assert_eq!(health.version, "0.1.0");
+        assert_eq!(health.uptime, "1h 23m");
+        assert!(health.checks.is_none());
+    }
+
+    #[test]
+    fn deserialize_health_with_db_check() {
+        let json = r#"{
+            "status":"ok","version":"0.1.0","profile":"dev","uptime":"1h",
+            "checks":{"database":{"status":"ok","pool_size":10,"active_connections":3,"idle_connections":7}}
+        }"#;
+        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        let db = health.checks.unwrap().database.unwrap();
+        assert_eq!(db.status, "ok");
+        assert_eq!(db.pool_size, 10);
+        assert_eq!(db.active_connections, 3);
+        assert_eq!(db.idle_connections, 7);
+    }
+
+    #[test]
+    fn deserialize_health_minimal() {
+        let json = r#"{"status":"up"}"#;
+        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(health.status, "up");
+        assert!(health.version.is_empty());
     }
 
     #[test]
@@ -1137,8 +1285,41 @@ mod tests {
         }"#;
         let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
         assert_eq!(metrics.http.requests_total, 150);
+        assert_eq!(metrics.http.requests_active, 3);
+        assert_eq!(metrics.http.latency_ms.p50, 5);
+        assert_eq!(metrics.http.latency_ms.p95, 25);
+        assert_eq!(metrics.http.latency_ms.p99, 100);
         assert_eq!(metrics.http.by_status.s2xx, 140);
+        assert_eq!(metrics.http.by_status.s3xx, 5);
+        assert_eq!(metrics.http.by_status.s4xx, 3);
+        assert_eq!(metrics.http.by_status.s5xx, 2);
         assert_eq!(metrics.http.by_route["GET /"].count, 100);
+        assert_eq!(metrics.http.by_route["GET /"].p50_ms, 3);
+        assert_eq!(metrics.http.by_route["GET /"].p95_ms, 10);
+        assert_eq!(metrics.http.by_route["GET /"].p99_ms, 50);
+    }
+
+    #[test]
+    fn deserialize_metrics_with_db() {
+        let json = r#"{
+            "http": {"requests_total": 0, "requests_active": 0,
+                     "latency_ms": {"p50": 0, "p95": 0, "p99": 0},
+                     "by_route": {}, "by_status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}},
+            "database": {"pool_size": 10, "active_connections": 2, "idle_connections": 8}
+        }"#;
+        let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
+        let db = metrics.database.unwrap();
+        assert_eq!(db.pool_size, 10);
+        assert_eq!(db.active_connections, 2);
+        assert_eq!(db.idle_connections, 8);
+    }
+
+    #[test]
+    fn deserialize_metrics_minimal() {
+        let json = r#"{"http":{}}"#;
+        let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(metrics.http.requests_total, 0);
+        assert!(metrics.database.is_none());
     }
 
     #[test]
@@ -1146,5 +1327,240 @@ mod tests {
         let json = r#"{"scheduled_tasks":{"cleanup":{"schedule":"every 5m","status":"idle","total_runs":10,"total_failures":1}}}"#;
         let tasks: TasksResponse = serde_json::from_str(json).unwrap();
         assert_eq!(tasks.scheduled_tasks["cleanup"].total_runs, 10);
+        assert_eq!(tasks.scheduled_tasks["cleanup"].total_failures, 1);
+        assert_eq!(tasks.scheduled_tasks["cleanup"].schedule, "every 5m");
+        assert_eq!(tasks.scheduled_tasks["cleanup"].status, "idle");
+    }
+
+    #[test]
+    fn deserialize_tasks_with_error() {
+        let json = r#"{"scheduled_tasks":{"sync":{"schedule":"cron 0 * * * *","status":"idle",
+            "last_run":"2026-01-01T00:00:00Z","last_duration_ms":150,"last_result":"failed",
+            "last_error":"connection refused","total_runs":5,"total_failures":2}}}"#;
+        let tasks: TasksResponse = serde_json::from_str(json).unwrap();
+        let sync = &tasks.scheduled_tasks["sync"];
+        assert_eq!(sync.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(sync.total_failures, 2);
+    }
+
+    #[test]
+    fn deserialize_tasks_empty() {
+        let json = r#"{"scheduled_tasks":{}}"#;
+        let tasks: TasksResponse = serde_json::from_str(json).unwrap();
+        assert!(tasks.scheduled_tasks.is_empty());
+    }
+
+    #[test]
+    fn default_types() {
+        let _h = HealthResponse::default();
+        let _m = MetricsResponse::default();
+        let _t = TasksResponse::default();
+        let _l = LatencySnapshot::default();
+        let _s = StatusSnapshot::default();
+        let _r = RouteSnapshot::default();
+        let _hm = HttpMetrics::default();
+        let _ts = TaskStatus::default();
+        let _hc = HealthChecks::default();
+        let _dc = DatabaseCheck::default();
+        let _db = DbPoolMetrics::default();
+    }
+
+    // ── Rendering tests (TestBackend) ─────────────────────────
+
+    fn render_frame(state: &DashboardState, width: u16, height: u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, state)).unwrap();
+    }
+
+    #[test]
+    fn render_overview_tab() {
+        let state = test_state();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_routes_tab() {
+        let mut state = test_state();
+        state.active_tab = 1;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_disconnected() {
+        let mut state = DashboardState::new("http://localhost:3000".to_string());
+        state.connected = false;
+        state.last_error = Some("Connection refused".to_string());
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_degraded_health() {
+        let mut state = test_state();
+        state.health.status = "degraded".to_string();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_empty_profile() {
+        let mut state = test_state();
+        state.health.profile = String::new();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_no_routes() {
+        let mut state = test_state();
+        state.active_tab = 1;
+        state.metrics.http.by_route.clear();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_no_tasks() {
+        let mut state = test_state();
+        state.tasks.scheduled_tasks.clear();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_with_tasks() {
+        let mut state = test_state();
+        state.tasks.scheduled_tasks.insert(
+            "cleanup".to_string(),
+            TaskStatus {
+                schedule: "every 5m".to_string(),
+                status: "idle".to_string(),
+                last_run: None,
+                last_duration_ms: None,
+                last_result: None,
+                last_error: None,
+                total_runs: 42,
+                total_failures: 0,
+            },
+        );
+        state.tasks.scheduled_tasks.insert(
+            "sync".to_string(),
+            TaskStatus {
+                schedule: "cron 0 * * * *".to_string(),
+                status: "running".to_string(),
+                last_run: Some("2026-01-01T00:00:00Z".to_string()),
+                last_duration_ms: Some(150),
+                last_result: Some("failed".to_string()),
+                last_error: Some("connection refused".to_string()),
+                total_runs: 10,
+                total_failures: 3,
+            },
+        );
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_with_health_checks_db() {
+        let mut state = test_state();
+        state.metrics.database = None;
+        state.health.checks = Some(HealthChecks {
+            database: Some(DatabaseCheck {
+                status: "ok".to_string(),
+                pool_size: 10,
+                active_connections: 3,
+                idle_connections: 7,
+            }),
+        });
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_no_db_info() {
+        let mut state = test_state();
+        state.metrics.database = None;
+        state.health.checks = None;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_zero_throughput() {
+        let mut state = test_state();
+        state.throughput_history = vec![0, 0, 0];
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_with_error_in_footer() {
+        let mut state = test_state();
+        state.last_error = Some(
+            "Something went wrong with a really long error message that should be truncated"
+                .to_string(),
+        );
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_small_terminal() {
+        let state = test_state();
+        render_frame(&state, 60, 20);
+    }
+
+    #[test]
+    fn render_wide_terminal() {
+        let state = test_state();
+        render_frame(&state, 200, 50);
+    }
+
+    #[test]
+    fn render_task_unknown_status() {
+        let mut state = test_state();
+        state.tasks.scheduled_tasks.insert(
+            "mystery".to_string(),
+            TaskStatus {
+                schedule: "every 1h".to_string(),
+                status: "unknown".to_string(),
+                total_runs: 0,
+                total_failures: 0,
+                ..TaskStatus::default()
+            },
+        );
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_invalid_tab_does_not_panic() {
+        let mut state = test_state();
+        state.active_tab = 99;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_all_zero_status_codes() {
+        let mut state = test_state();
+        state.metrics.http.by_status = StatusSnapshot::default();
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_high_latency_values() {
+        let mut state = test_state();
+        state.metrics.http.latency_ms = LatencySnapshot {
+            p50: 500,
+            p95: 2000,
+            p99: 5000,
+        };
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_large_request_counts() {
+        let mut state = test_state();
+        state.metrics.http.requests_total = 2_500_000;
+        state.metrics.http.by_route.insert(
+            "GET /popular".to_string(),
+            RouteSnapshot {
+                count: 1_500_000,
+                p50_ms: 2,
+                p95_ms: 8,
+                p99_ms: 30,
+            },
+        );
+        render_frame(&state, 120, 40);
     }
 }
