@@ -1,0 +1,41 @@
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::{Ident, Token, parse::Parser, punctuated::Punctuated};
+
+pub fn workflows_macro(input: TokenStream) -> TokenStream {
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_workflow_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
+}
+
+pub fn activities_macro(input: TokenStream) -> TokenStream {
+    let names = match Punctuated::<Ident, Token![,]>::parse_terminated.parse2(input) {
+        Ok(n) => n,
+        Err(e) => return e.to_compile_error(),
+    };
+
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| {
+            let companion = quote::format_ident!("__autumn_activity_info_{name}");
+            quote! { #companion() }
+        })
+        .collect();
+
+    quote! {
+        vec![ #(#calls),* ]
+    }
+}
