@@ -47,14 +47,14 @@ async fn update_user(
 }
 
 #[delete("/users/{id}")]
-async fn delete_user(
-    axum::extract::Path(_id): axum::extract::Path<i64>,
-) -> StatusCode {
+async fn delete_user(axum::extract::Path(_id): axum::extract::Path<i64>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
 #[post("/validate")]
-async fn validate_input(Json(body): Json<serde_json::Value>) -> Result<Json<serde_json::Value>, AutumnError> {
+async fn validate_input(
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, AutumnError> {
     let name = body["name"]
         .as_str()
         .ok_or_else(|| AutumnError::bad_request_msg("name is required"))?;
@@ -86,7 +86,10 @@ fn app() -> autumn_web::test::TestClient {
 #[tokio::test]
 async fn get_index_returns_200() {
     let client = app();
-    client.get("/").send().await
+    client
+        .get("/")
+        .send()
+        .await
         .assert_ok()
         .assert_body_contains("Welcome");
 }
@@ -94,7 +97,10 @@ async fn get_index_returns_200() {
 #[tokio::test]
 async fn health_endpoint_returns_json() {
     let client = app();
-    client.get("/api/health").send().await
+    client
+        .get("/api/health")
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|v| {
             assert_eq!(v["status"], "UP");
@@ -106,9 +112,11 @@ async fn post_echo_returns_same_body() {
     let client = app();
     let payload = serde_json::json!({"message": "hello", "count": 42});
 
-    client.post("/echo")
+    client
+        .post("/echo")
         .json(&payload)
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_body_contains("hello")
         .assert_body_contains("42");
@@ -118,9 +126,11 @@ async fn post_echo_returns_same_body() {
 async fn create_user_returns_201() {
     let client = app();
 
-    client.post("/users")
+    client
+        .post("/users")
         .json(&serde_json::json!({"name": "Bob"}))
-        .send().await
+        .send()
+        .await
         .assert_status(201)
         .assert_json::<serde_json::Value, _>(|user| {
             assert_eq!(user["name"], "Bob");
@@ -132,7 +142,10 @@ async fn create_user_returns_201() {
 async fn get_user_by_id_test() {
     let client = app();
 
-    client.get("/users/42").send().await
+    client
+        .get("/users/42")
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|user| {
             assert_eq!(user["id"], 42);
@@ -144,9 +157,11 @@ async fn get_user_by_id_test() {
 async fn update_user_by_id() {
     let client = app();
 
-    client.put("/users/1")
+    client
+        .put("/users/1")
         .json(&serde_json::json!({"name": "Updated"}))
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|user| {
             assert_eq!(user["id"], 1);
@@ -158,7 +173,10 @@ async fn update_user_by_id() {
 async fn delete_user_returns_204() {
     let client = app();
 
-    client.delete("/users/1").send().await
+    client
+        .delete("/users/1")
+        .send()
+        .await
         .assert_status(204)
         .assert_body_empty();
 }
@@ -173,9 +191,11 @@ async fn not_found_returns_404() {
 async fn validation_error_returns_400() {
     let client = app();
 
-    client.post("/validate")
+    client
+        .post("/validate")
         .json(&serde_json::json!({"wrong_field": "value"}))
-        .send().await
+        .send()
+        .await
         .assert_status(400);
 }
 
@@ -183,9 +203,11 @@ async fn validation_error_returns_400() {
 async fn validation_success() {
     let client = app();
 
-    client.post("/validate")
+    client
+        .post("/validate")
         .json(&serde_json::json!({"name": "Alice"}))
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|v| {
             assert_eq!(v["valid"], true);
@@ -200,31 +222,41 @@ async fn full_crud_lifecycle() {
     let client = app();
 
     // Create
-    let resp = client.post("/users")
+    let resp = client
+        .post("/users")
         .json(&serde_json::json!({"name": "Charlie"}))
-        .send().await;
+        .send()
+        .await;
     resp.assert_status(201);
     let user: serde_json::Value = resp.json();
     let id = user["id"].as_i64().unwrap();
 
     // Read
-    client.get(&format!("/users/{id}")).send().await
+    client
+        .get(&format!("/users/{id}"))
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|u| {
             assert_eq!(u["id"], id);
         });
 
     // Update
-    client.put(&format!("/users/{id}"))
+    client
+        .put(&format!("/users/{id}"))
         .json(&serde_json::json!({"name": "Charlie Updated"}))
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_json::<serde_json::Value, _>(|u| {
             assert_eq!(u["name"], "Charlie Updated");
         });
 
     // Delete
-    client.delete(&format!("/users/{id}")).send().await
+    client
+        .delete(&format!("/users/{id}"))
+        .send()
+        .await
         .assert_status(204);
 }
 
@@ -259,9 +291,11 @@ async fn response_has_request_id_header() {
 async fn json_response_has_content_type() {
     let client = app();
 
-    client.post("/echo")
+    client
+        .post("/echo")
         .json(&serde_json::json!({"test": true}))
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_header_contains("content-type", "application/json");
 }
@@ -269,19 +303,21 @@ async fn json_response_has_content_type() {
 // ── Form submission test ───────────────────────────────────────
 
 #[post("/form-echo")]
-async fn form_echo(Form(data): Form<std::collections::HashMap<String, String>>) -> Json<serde_json::Value> {
+async fn form_echo(
+    Form(data): Form<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
     Json(serde_json::json!(data))
 }
 
 #[tokio::test]
 async fn form_submission() {
-    let client = TestApp::new()
-        .routes(routes![form_echo])
-        .build();
+    let client = TestApp::new().routes(routes![form_echo]).build();
 
-    client.post("/form-echo")
+    client
+        .post("/form-echo")
         .form("name=Alice&age=30")
-        .send().await
+        .send()
+        .await
         .assert_ok()
         .assert_body_contains("Alice")
         .assert_body_contains("30");

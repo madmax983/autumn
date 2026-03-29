@@ -71,9 +71,9 @@ use crate::route::Route;
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
-use diesel_async::pooled_connection::deadpool::Pool;
-#[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
+#[cfg(feature = "db")]
+use diesel_async::pooled_connection::deadpool::Pool;
 
 // ── TestApp ────────────────────────────────────────────────────
 
@@ -328,11 +328,7 @@ impl RequestBuilder {
 
         let request = builder.body(self.body).expect("failed to build request");
 
-        let response = self
-            .router
-            .oneshot(request)
-            .await
-            .expect("request failed");
+        let response = self.router.oneshot(request).await.expect("request failed");
 
         let status = response.status();
         let headers: Vec<(String, String)> = response
@@ -736,10 +732,9 @@ mod tests {
             .send()
             .await;
 
-        resp.assert_ok()
-            .assert_json::<serde_json::Value, _>(|v| {
-                assert_eq!(v["count"], 42);
-            });
+        resp.assert_ok().assert_json::<serde_json::Value, _>(|v| {
+            assert_eq!(v["count"], 42);
+        });
     }
 
     #[tokio::test]
