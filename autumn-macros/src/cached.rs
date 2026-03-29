@@ -1,15 +1,16 @@
 //! `#[cached]` proc macro implementation.
 //!
 //! Wraps an async (or sync) function with an in-memory cache backed by
-//! `autumn_web::cache::CacheStore`. Each annotated function gets its own
-//! `static` cache instance, keyed by a tuple of the function arguments.
+//! `autumn_web::cache::MokaCache` (default) via the `autumn_web::cache::Cache`
+//! trait. Each annotated function gets its own `static` cache instance,
+//! keyed by a hash of the function arguments.
 //!
 //! # Supported attributes
 //!
 //! | Attribute | Example | Description |
 //! |-----------|---------|-------------|
 //! | `ttl` | `"5m"` | Time-to-live per entry (parsed at startup) |
-//! | `max` | `1000` | Max entries; oldest evicted on overflow |
+//! | `max` | `1000` | Max entries; LRU eviction via moka |
 //! | `result` | (flag) | Only cache `Ok` values; pass `Err` through |
 
 use proc_macro2::TokenStream;
@@ -83,15 +84,14 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &input_fn.vis;
     let sig = &input_fn.sig;
     let fn_name = &sig.ident;
+    let fn_name_str = fn_name.to_string();
     let fn_attrs = &input_fn.attrs;
     let fn_block = &input_fn.block;
     let ret_ty = &sig.output;
     let is_async = sig.asyncness.is_some();
 
     // Collect function parameters for cache key construction.
-    // We need the parameter names and types for the key tuple.
     let mut param_names = Vec::new();
-    let mut param_types = Vec::new();
     for arg in &sig.inputs {
         match arg {
             syn::FnArg::Receiver(_) => {
@@ -103,28 +103,18 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             syn::FnArg::Typed(pat_type) => {
                 param_names.push(&*pat_type.pat);
-                param_types.push(&*pat_type.ty);
             }
         }
     }
 
-    // Build the key type as a tuple: (T1, T2, ...)
-    let key_type = if param_types.is_empty() {
-        quote! { () }
+    // Build the key expression: make_cache_key("fn_name", &(arg1.clone(), ...))
+    let key_args = if param_names.is_empty() {
+        quote! { &() }
     } else {
-        quote! { (#(#param_types,)*) }
-    };
-
-    // Build the key expression: (arg1.clone(), arg2.clone(), ...)
-    let key_expr = if param_names.is_empty() {
-        quote! { () }
-    } else {
-        quote! { (#(#param_names.clone(),)*) }
+        quote! { &(#(#param_names.clone(),)*) }
     };
 
     // Build the value type from the return type.
-    // For `result` mode, we use the CacheableResult trait to extract
-    // the Ok type at the type level, avoiding syntactic parsing of generics.
     let ret_type = match ret_ty {
         syn::ReturnType::Default => quote! { () },
         syn::ReturnType::Type(_, ty) => quote! { #ty },
@@ -150,18 +140,17 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { None },
     };
 
-    // Max expression
+    // Max capacity (default 10_000 if not specified)
     let max_expr = match attrs.max {
         Some(max) => {
             let max_lit = LitInt::new(&max.to_string(), proc_macro2::Span::call_site());
-            quote! { Some(#max_lit) }
+            quote! { #max_lit }
         }
-        None => quote! { None },
+        None => quote! { 10_000 },
     };
 
     // Generate the body depending on result mode and async.
     let body = if attrs.result {
-        // Result mode: only cache Ok values via the CacheableResult trait.
         let compute = if is_async {
             quote! { (|| async move #fn_block)().await }
         } else {
@@ -169,19 +158,19 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         quote! {
             static __AUTUMN_CACHE: ::std::sync::OnceLock<
-                ::autumn_web::cache::CacheStore<#key_type, #value_type>
+                ::autumn_web::cache::MokaCache
             > = ::std::sync::OnceLock::new();
             let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-                ::autumn_web::cache::CacheStore::new(#ttl_expr, #max_expr)
+                ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
             });
-            let __autumn_key = #key_expr;
-            if let Some(__autumn_cached) = __autumn_cache.get(&__autumn_key) {
+            let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
+            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    __autumn_cache.insert(__autumn_key, __autumn_val.clone());
+                    ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -189,38 +178,25 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     } else {
         // Standard mode: cache the full return value.
-        if is_async {
-            quote! {
-                static __AUTUMN_CACHE: ::std::sync::OnceLock<
-                    ::autumn_web::cache::CacheStore<#key_type, #value_type>
-                > = ::std::sync::OnceLock::new();
-                let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-                    ::autumn_web::cache::CacheStore::new(#ttl_expr, #max_expr)
-                });
-                let __autumn_key = #key_expr;
-                if let Some(__autumn_cached) = __autumn_cache.get(&__autumn_key) {
-                    return __autumn_cached;
-                }
-                let __autumn_result = (|| async move #fn_block)().await;
-                __autumn_cache.insert(__autumn_key, __autumn_result.clone());
-                __autumn_result
-            }
+        let compute = if is_async {
+            quote! { (|| async move #fn_block)().await }
         } else {
-            quote! {
-                static __AUTUMN_CACHE: ::std::sync::OnceLock<
-                    ::autumn_web::cache::CacheStore<#key_type, #value_type>
-                > = ::std::sync::OnceLock::new();
-                let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-                    ::autumn_web::cache::CacheStore::new(#ttl_expr, #max_expr)
-                });
-                let __autumn_key = #key_expr;
-                if let Some(__autumn_cached) = __autumn_cache.get(&__autumn_key) {
-                    return __autumn_cached;
-                }
-                let __autumn_result = (|| #fn_block)();
-                __autumn_cache.insert(__autumn_key, __autumn_result.clone());
-                __autumn_result
+            quote! { (|| #fn_block)() }
+        };
+        quote! {
+            static __AUTUMN_CACHE: ::std::sync::OnceLock<
+                ::autumn_web::cache::MokaCache
+            > = ::std::sync::OnceLock::new();
+            let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
+                ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
+            });
+            let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
+            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+                return __autumn_cached;
             }
+            let __autumn_result = #compute;
+            ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
+            __autumn_result
         }
     };
 
@@ -284,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_output_contains_cache_store() {
+    fn generated_output_uses_moka() {
         let attr: TokenStream = quote! { ttl = "5m" };
         let item: TokenStream = quote! {
             async fn get_user(id: i64) -> String {
@@ -293,7 +269,8 @@ mod tests {
         };
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
-        assert!(output_str.contains("CacheStore"), "should reference CacheStore");
+        assert!(output_str.contains("MokaCache"), "should reference MokaCache");
+        assert!(output_str.contains("make_cache_key"), "should use make_cache_key");
         assert!(output_str.contains("OnceLock"), "should use OnceLock for static");
     }
 
@@ -308,8 +285,8 @@ mod tests {
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
         assert!(
-            output_str.contains("Ok"),
-            "result mode should pattern-match on Ok"
+            output_str.contains("CacheableResult"),
+            "result mode should use CacheableResult trait"
         );
     }
 
@@ -323,7 +300,7 @@ mod tests {
         };
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
-        assert!(output_str.contains("CacheStore"), "should still generate cache");
+        assert!(output_str.contains("MokaCache"), "should still generate cache");
     }
 
     #[test]
@@ -340,5 +317,16 @@ mod tests {
             output_str.contains("compile_error"),
             "should produce compile error for self"
         );
+    }
+
+    #[test]
+    fn default_max_capacity() {
+        let attr: TokenStream = quote! {};
+        let item: TokenStream = quote! {
+            fn compute(x: i32) -> i32 { x }
+        };
+        let output = cached_macro(attr, item);
+        let output_str = output.to_string();
+        assert!(output_str.contains("10_000"), "default max should be 10_000");
     }
 }
