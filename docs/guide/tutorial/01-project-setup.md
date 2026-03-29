@@ -9,8 +9,8 @@ compiles, runs, and responds to HTTP requests at `http://localhost:3000`.
 
 Before you start, make sure you have:
 
-- **Rust** (edition 2024) — install from <https://rustup.rs> if you haven't already
-- **The Autumn CLI** — install with `cargo install autumn-cli`
+- **Rust** (edition 2024) � install from <https://rustup.rs> if you haven't already
+- **The Autumn CLI** � install from this workspace with `cargo install --path autumn-cli`
 - A terminal and a text editor
 
 Docker is not needed until Chapter 3 (Database Setup). For now, you only need
@@ -56,18 +56,18 @@ Let's look at what was generated.
 
 ```
 todo-app/
-├── Cargo.toml
-├── autumn.toml
-├── build.rs
-├── src/
-│   └── main.rs
-├── static/
-│   └── css/
-│       └── input.css
-├── tailwind.config.js
-├── migrations/
-│   └── .gitkeep
-└── .gitignore
++-- Cargo.toml
++-- autumn.toml
++-- build.rs
++-- src/
+�   +-- main.rs
++-- static/
+�   +-- css/
+�       +-- input.css
++-- tailwind.config.js
++-- migrations/
+�   +-- .gitkeep
++-- .gitignore
 ```
 
 Each file has a specific role. Let's walk through them.
@@ -119,19 +119,19 @@ async fn main() {
 
 There is a lot happening in a small file. Here is what each piece does:
 
-- **`#[get("/")]`** — a route macro that registers `index` as a GET handler
+- **`#[get("/")]`** � a route macro that registers `index` as a GET handler
   for the root path. Autumn provides `#[get]`, `#[post]`, `#[put]`, and
   `#[delete]` macros.
-- **`#[get("/hello/{name}")]`** — a route with a path parameter. The `{name}`
+- **`#[get("/hello/{name}")]`** � a route with a path parameter. The `{name}`
   segment is extracted into the handler's `Path<String>` argument.
-- **`autumn_web::extract::Path`** — an extractor that pulls typed values from the
+- **`autumn_web::extract::Path`** � an extractor that pulls typed values from the
   URL path. Autumn re-exports Axum's extractors so you don't need `axum` as a
   direct dependency.
-- **`#[autumn_web::main]`** — sets up the Tokio async runtime. This is equivalent
+- **`#[autumn_web::main]`** � sets up the Tokio async runtime. This is equivalent
   to `#[tokio::main]` with Autumn's preferred configuration.
-- **`autumn_web::app()`** — creates an application builder. You register routes
+- **`autumn_web::app()`** � creates an application builder. You register routes
   with `.routes()` and start the server with `.run().await`.
-- **`routes![index, hello, hello_name]`** — a macro that collects route
+- **`routes![index, hello, hello_name]`** � a macro that collects route
   handlers into a `Vec<Route>` for the app builder.
 
 The pattern is always the same: define handlers with route macros, collect
@@ -141,7 +141,7 @@ them with `routes![]`, and pass them to `autumn_web::app().routes(...).run()`.
 
 ```toml
 # Autumn configuration
-# All values shown are defaults — uncomment and change as needed.
+# All values shown are defaults � uncomment and change as needed.
 
 [server]
 host = "127.0.0.1"
@@ -162,12 +162,14 @@ path = "/health"
 # connect_timeout_secs = 5
 ```
 
-Autumn uses a three-layer configuration system:
+Autumn uses a five-layer configuration system:
 
-1. **Framework defaults** — compiled into the binary (port 3000, log level
+1. **Framework defaults** � compiled into the binary (port 3000, log level
    info, etc.)
-2. **`autumn.toml`** — project-level overrides (this file)
-3. **`AUTUMN_*` environment variables** — deployment overrides (e.g.,
+2. **Profile smart defaults** � built-in `dev` / `prod` behavior
+3. **`autumn.toml`** � project-level overrides (this file)
+4. **`autumn-{profile}.toml`** � profile-specific overrides
+5. **`AUTUMN_*` environment variables** � deployment overrides (e.g.,
    `AUTUMN_SERVER__PORT=8080`)
 
 Every value has a sensible default. You can delete `autumn.toml` entirely and
@@ -271,7 +273,7 @@ This downloads the Tailwind CLI to `target/autumn/tailwindcss` (or
 is about 50 MB.
 
 If you prefer to install Tailwind globally or already have it on your PATH,
-you can skip this step — `build.rs` checks both locations.
+you can skip this step � `build.rs` checks both locations.
 
 ## Run the Application
 
@@ -285,12 +287,11 @@ The first build will take a minute or two as Cargo downloads and compiles
 dependencies. Subsequent builds are fast. You will see output like:
 
 ```
-  INFO Autumn v0.1.0
   INFO Database not configured
   INFO Listening addr=127.0.0.1:3000
 ```
 
-The "Database not configured" message is expected — you have not set up
+The "Database not configured" message is expected � you have not set up
 Postgres yet.
 
 Open your browser and visit <http://localhost:3000>. You should see:
@@ -301,10 +302,12 @@ Welcome to Autumn!
 
 Try the other routes:
 
-- <http://localhost:3000/hello> — "Hello, Autumn!"
-- <http://localhost:3000/hello/world> — "Hello, world!"
-- <http://localhost:3000/health> — a JSON health check response (auto-mounted
+- <http://localhost:3000/hello> � "Hello, Autumn!"
+- <http://localhost:3000/hello/world> � "Hello, world!"
+- <http://localhost:3000/health> � a JSON health check response (auto-mounted
   by the framework)
+- <http://localhost:3000/actuator/health> � the actuator health view
+- <http://localhost:3000/actuator/info> � build and runtime information
 
 Press `Ctrl+C` in your terminal to stop the server. You will see:
 
@@ -313,7 +316,7 @@ Press `Ctrl+C` in your terminal to stop the server. You will see:
   INFO Server shut down cleanly
 ```
 
-Autumn handles graceful shutdown automatically — in-flight requests drain
+Autumn handles graceful shutdown automatically � in-flight requests drain
 before the process exits.
 
 ## What Just Happened
@@ -325,8 +328,8 @@ Here is what Autumn did when you called `.run().await`:
 2. **Initialized structured logging** based on the `[log]` section
 3. **Skipped database pool creation** (no `[database]` section configured)
 4. **Built an Axum router** from the routes you registered with `.routes()`
-5. **Mounted framework routes** — the health check endpoint and the bundled
-   htmx JavaScript
+5. **Mounted framework routes** � the health check endpoint, actuator
+   endpoints, and the bundled htmx JavaScript
 6. **Served static files** from the `static/` directory
 7. **Bound to `127.0.0.1:3000`** and started accepting connections
 
@@ -339,31 +342,31 @@ Your project should look like this:
 
 ```
 todo-app/
-├── Cargo.toml
-├── autumn.toml
-├── build.rs
-├── src/
-│   └── main.rs
-├── static/
-│   └── css/
-│       ├── input.css
-│       └── autumn.css   ← generated by build.rs
-├── tailwind.config.js
-├── migrations/
-│   └── .gitkeep
-├── target/
-│   └── autumn/
-│       └── tailwindcss  ← downloaded by `autumn setup`
-└── .gitignore
++-- Cargo.toml
++-- autumn.toml
++-- build.rs
++-- src/
+�   +-- main.rs
++-- static/
+�   +-- css/
+�       +-- input.css
+�       +-- autumn.css   ? generated by build.rs
++-- tailwind.config.js
++-- migrations/
+�   +-- .gitkeep
++-- target/
+�   +-- autumn/
+�       +-- tailwindcss  ? downloaded by `autumn setup`
++-- .gitignore
 ```
 
 `cargo run` starts a server that responds at `http://localhost:3000` with
-three routes (`/`, `/hello`, `/hello/{name}`) plus the framework-provided
-`/health` endpoint.
+three routes (`/`, `/hello`, `/hello/{name}`) plus framework-provided
+`/health` and `/actuator/*` endpoints.
 
 This is your foundation. In the next chapter, you will replace the placeholder
 routes with the beginnings of a todo application.
 
 ---
 
-Next: [Chapter 2 — Routes and Handlers](02-routes.md)
+Next: [Chapter 2 � Routes and Handlers](02-routes.md)

@@ -1,45 +1,50 @@
 # Chapter 10: Configuration and Production Defaults
 
-**Goal:** By the end of this chapter, you will understand Autumn's three-layer
-configuration system, know how to override settings with environment
-variables, and have configured structured logging and the health check
-endpoint.
+**Goal:** By the end of this chapter, you will understand Autumn's profile-aware
+configuration system, know how to override settings with environment variables,
+and have a clear mental model for logging, health checks, and actuator
+endpoints in development and production.
 
 ---
 
 ## Sections
 
-### The Three Configuration Layers
+### The Five Configuration Layers
 
-1. Framework defaults (compiled in)
-2. `autumn.toml` (project-level)
-3. `AUTUMN_*` environment variables (deployment-level)
+1. Framework defaults
+2. Profile smart defaults for `dev` / `prod`
+3. `autumn.toml`
+4. `autumn-{profile}.toml`
+5. `AUTUMN_*` environment variables
 
-How the layers merge and why each exists.
+How the layers merge, how the active profile is resolved, and why Autumn keeps
+shared config separate from environment-specific overrides.
 
 ### `autumn.toml` Sections
 
 Walking through every section: `[server]` (host, port, shutdown timeout),
 `[database]` (URL, pool size, connect timeout), `[log]` (level, format),
-`[health]` (path).
+`[health]` (path, detail level), `[actuator]` (sensitive endpoint exposure),
+and the security/session sections that matter once you leave toy apps behind.
 
 ### Environment Variable Overrides
 
 The `AUTUMN_SECTION__FIELD` naming convention (double underscore separates
 sections). Examples: `AUTUMN_SERVER__PORT=8080`,
-`AUTUMN_DATABASE__URL=postgres://...`. Env vars always win over the TOML
-file.
+`AUTUMN_DATABASE__URL=postgres://...`, `AUTUMN_LOG__FORMAT=Json`,
+`AUTUMN_PROFILE=prod`. Env vars always win over TOML layers.
 
 ### Structured Logging
 
-The `LogFormat` enum: `Auto`, `Pretty`, `Json`. Auto picks Pretty in
-development and JSON in production (based on `AUTUMN_ENV`). Configuring log
-levels with tracing filter syntax.
+The `LogFormat` enum: `Auto`, `Pretty`, `Json`. How profile smart defaults and
+runtime environment interact, and when to force JSON for deployment logs.
 
-### The Health Check Endpoint
+### Health and Actuator
 
-Auto-mounted at `/health` by default. Customizing the path. What to check in
-a production health endpoint.
+Auto-mounted `/health` for simple probes plus `/actuator/health`,
+`/actuator/info`, `/actuator/metrics`, and the sensitive endpoints exposed in
+development. Customizing the health path and reasoning about what should stay
+visible in production.
 
 ### Graceful Shutdown
 
@@ -48,12 +53,14 @@ setting. Draining in-flight requests.
 
 ### Checkpoint
 
-Expected project state with production-ready configuration.
+Expected project state with profile-aware config, environment overrides, and a
+clear dev-vs-prod operational story.
 
 ---
 
-*Content coming in Sprint 12.*
+*This chapter still needs the full walkthrough, but the outline above reflects
+the current framework rather than the old pre-profile configuration model.*
 
 ---
 
-Previous: [Chapter 9 â€” Error Handling](09-errors.md) | Next: [Chapter 11 â€” What's Next](11-whats-next.md)
+Previous: [Chapter 9 — Error Handling](09-errors.md) | Next: [Chapter 11 — What's Next](11-whats-next.md)
