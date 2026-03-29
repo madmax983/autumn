@@ -1086,20 +1086,20 @@ mod tests {
     }
 }
 
-    #[cfg(test)]
-    mod havoc_proptest {
-        use super::*;
-        use proptest::prelude::*;
+#[cfg(test)]
+mod havoc_proptest {
+    use super::*;
+    use proptest::prelude::*;
 
-        proptest! {
-            #![proptest_config(ProptestConfig::with_cases(1))]
-            #[test]
-            fn log_levels_memory_exhaustion(names in proptest::collection::vec(".*", 5000)) {
-                let levels = LogLevels::new("info");
-                for name in names {
-                    let _ = levels.set_logger_level(&name, "debug");
-                }
-                assert!(levels.logger_overrides().len() <= 1000, "Memory leak: unbounded loggers inserted");
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1))]
+        #[test]
+        fn log_levels_memory_exhaustion(names in proptest::collection::vec(".*", 5000)) {
+            let levels = LogLevels::new("info");
+            for name in names {
+                let _ = levels.set_logger_level(&name, "debug");
             }
+            assert!(levels.logger_overrides().len() <= 1000, "Memory leak: unbounded loggers inserted");
         }
     }
+}
