@@ -20,6 +20,7 @@ mod route;
 mod routes_macro;
 mod scheduled;
 mod secured;
+mod service;
 mod static_route;
 mod static_routes_macro;
 mod tasks_macro;
@@ -316,4 +317,46 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn static_routes(input: TokenStream) -> TokenStream {
     static_routes_macro::static_routes_macro(input.into()).into()
+}
+
+/// Define a service for cross-model orchestration and non-DB side effects.
+///
+/// Generates a `XxxServiceImpl` struct with dependency injection via
+/// `FromRequestParts`, so it can be used as a handler parameter just
+/// like repositories.
+///
+/// Use `#[service]` when your logic orchestrates **multiple repositories**
+/// or involves **non-DB side effects** (email, API calls, etc.).
+/// For single-model CRUD and validation, use `#[repository]` instead.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::service;
+///
+/// #[service]
+/// pub trait OrderService {
+///     fn deps(order_repo: PgOrderRepository, inventory_repo: PgInventoryRepository);
+///
+///     async fn place_order(&self, req: PlaceOrderRequest) -> AutumnResult<Order>;
+/// }
+///
+/// // You implement the business logic:
+/// impl OrderServiceImpl {
+///     pub async fn place_order(&self, req: PlaceOrderRequest) -> AutumnResult<Order> {
+///         let order = self.order_repo.save(&req.into()).await?;
+///         self.inventory_repo.reserve(order.id).await?;
+///         Ok(order)
+///     }
+/// }
+///
+/// // Then use it in handlers, just like a repository:
+/// #[get("/orders/{id}")]
+/// async fn get_order(svc: OrderServiceImpl) -> AutumnResult<Json<Order>> {
+///     // ...
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
+    service::service_macro(attr.into(), item.into()).into()
 }

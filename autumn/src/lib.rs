@@ -248,6 +248,33 @@ pub use autumn_macros::model;
 #[cfg(feature = "db")]
 pub use autumn_macros::repository;
 
+/// Define a service for cross-model orchestration and non-DB side effects.
+///
+/// Generates a `XxxServiceImpl` struct with dependency injection.
+/// Use when logic spans multiple repositories or involves non-DB work.
+/// For single-model CRUD, use [`repository`] instead.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::service;
+///
+/// #[service]
+/// pub trait OrderService {
+///     fn deps(order_repo: PgOrderRepository, inventory_repo: PgInventoryRepository);
+/// }
+///
+/// impl OrderServiceImpl {
+///     pub async fn place_order(&self, req: PlaceOrderRequest) -> AutumnResult<Order> {
+///         let order = self.order_repo.save(&req.into()).await?;
+///         self.inventory_repo.reserve(order.id).await?;
+///         Ok(order)
+///     }
+/// }
+/// ```
+#[cfg(feature = "db")]
+pub use autumn_macros::service;
+
 /// Annotate an async function as a `POST` route handler.
 ///
 /// Generates a companion function that returns a [`route::Route`]
