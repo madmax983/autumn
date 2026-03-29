@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
 
     let Some(tailwind) = find_tailwind_cli() else {
