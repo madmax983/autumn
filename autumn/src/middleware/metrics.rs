@@ -6,7 +6,7 @@
 //!
 //! Metrics are exposed via the `/actuator/metrics` endpoint.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +37,7 @@ struct MetricsInner {
     /// Status code buckets: 2xx, 3xx, 4xx, 5xx.
     by_status: StatusBuckets,
     /// Global latency samples (bounded ring buffer).
-    latencies_ms: RwLock<Vec<u64>>,
+    latencies_ms: RwLock<VecDeque<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -49,10 +49,19 @@ struct StatusBuckets {
     status_5xx: AtomicU64,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct RouteMetrics {
     count: u64,
-    latencies_ms: Vec<u64>,
+    latencies_ms: VecDeque<u64>,
+}
+
+impl Default for RouteMetrics {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            latencies_ms: VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
+        }
+    }
 }
 
 /// Maximum number of latency samples to keep per route.
@@ -68,7 +77,7 @@ impl MetricsCollector {
                 requests_active: AtomicU64::new(0),
                 by_route: RwLock::new(HashMap::new()),
                 by_status: StatusBuckets::default(),
-                latencies_ms: RwLock::new(Vec::new()),
+                latencies_ms: RwLock::new(VecDeque::with_capacity(MAX_LATENCY_SAMPLES)),
             }),
         }
     }
@@ -105,9 +114,9 @@ impl MetricsCollector {
         // Global latency
         if let Ok(mut latencies) = self.inner.latencies_ms.write() {
             if latencies.len() >= MAX_LATENCY_SAMPLES {
-                latencies.remove(0);
+                latencies.pop_front();
             }
-            latencies.push(latency_ms);
+            latencies.push_back(latency_ms);
         }
 
         // Per-route
@@ -116,9 +125,9 @@ impl MetricsCollector {
             let entry = routes.entry(key).or_default();
             entry.count += 1;
             if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                entry.latencies_ms.remove(0);
+                entry.latencies_ms.pop_front();
             }
-            entry.latencies_ms.push(latency_ms);
+            entry.latencies_ms.push_back(latency_ms);
         }
     }
 
@@ -239,11 +248,11 @@ struct Percentiles {
     p99: u64,
 }
 
-fn compute_percentiles(latencies: &[u64]) -> Percentiles {
+fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     if latencies.is_empty() {
         return Percentiles::default();
     }
-    let mut sorted = latencies.to_vec();
+    let mut sorted: Vec<u64> = latencies.iter().copied().collect();
     sorted.sort_unstable();
     let len = sorted.len();
     Percentiles {
@@ -395,7 +404,8 @@ mod tests {
 
     #[test]
     fn percentiles_computed_correctly() {
-        let pcts = compute_percentiles(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let latencies: VecDeque<u64> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into();
+        let pcts = compute_percentiles(&latencies);
         assert_eq!(pcts.p50, 6); // sorted[10*50/100] = sorted[5] = 6
         assert_eq!(pcts.p99, 10); // sorted[min(9, 10*99/100)] = sorted[9] = 10
     }
