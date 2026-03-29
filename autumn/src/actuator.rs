@@ -69,6 +69,11 @@ impl LogLevels {
     #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
         if let Ok(mut guard) = self.inner.write() {
+            // Prevent unbounded memory growth from arbitrary logger names
+            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+                return None;
+            }
+
             let previous = guard.logger_overrides.get(name).cloned();
             guard
                 .logger_overrides
@@ -1078,5 +1083,23 @@ mod tests {
     fn task_registry_empty_snapshot() {
         let registry = TaskRegistry::new();
         assert!(registry.snapshot().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod havoc_proptest {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1))]
+        #[test]
+        fn log_levels_memory_exhaustion(names in proptest::collection::vec(".*", 5000)) {
+            let levels = LogLevels::new("info");
+            for name in names {
+                let _ = levels.set_logger_level(&name, "debug");
+            }
+            assert!(levels.logger_overrides().len() <= 1000, "Memory leak: unbounded loggers inserted");
+        }
     }
 }

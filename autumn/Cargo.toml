@@ -59,6 +59,7 @@ tower.workspace = true
 trybuild = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+proptest = "1.4"
 
 [lints]
 workspace = true
