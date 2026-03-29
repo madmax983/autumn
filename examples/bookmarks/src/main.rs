@@ -1,9 +1,9 @@
-// Bookmarks — an Autumn example showcasing the post-v0.1.0 feature set:
+// Bookmarks - an Autumn example showcasing the post-v0.1.0 feature set:
 //
-//   Profiles        ? autumn.toml + autumn-dev.toml (dev auto-detected)
-//   CRUD API        ? #[repository(api = "/api/bookmarks")] generates REST handlers
-//   Scheduled tasks ? #[scheduled(every = "1h")] link health checker
-//   Actuator        ? /actuator/health, /actuator/info, /actuator/env
+//   Profiles        -> autumn.toml + autumn-dev.toml (dev auto-detected)
+//   CRUD API        -> #[repository(api = "/api/bookmarks")] generates REST handlers
+//   Scheduled tasks -> #[scheduled(every = "1h")] link health checker
+//   Actuator        -> /actuator/health, /actuator/info, /actuator/env
 //
 // Run with:  cargo run -p bookmarks
 // API test:  curl -X POST http://localhost:3000/api/bookmarks \
