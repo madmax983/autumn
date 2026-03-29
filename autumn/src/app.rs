@@ -2007,4 +2007,26 @@ mod tests {
         let output = format_config_summary(&config);
         assert!(output.contains("profile:    prod"));
     }
+
+    #[test]
+    fn log_startup_transparency_runs_without_panic() {
+        // Exercises the tracing::info! calls inside log_startup_transparency.
+        // No subscriber installed, so output is discarded -- we just verify
+        // the function doesn't panic.
+        let routes = vec![test_get_route("/", "index")];
+        let tasks = vec![crate::task::TaskInfo {
+            name: "cleanup".into(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            handler: |_| Box::pin(async { Ok(()) }),
+        }];
+        let config = AutumnConfig::default();
+        log_startup_transparency(&routes, &tasks, &[], &config);
+    }
+
+    #[test]
+    fn log_startup_transparency_no_tasks() {
+        let routes = vec![test_get_route("/health", "check")];
+        let config = AutumnConfig::default();
+        log_startup_transparency(&routes, &[], &[], &config);
+    }
 }
