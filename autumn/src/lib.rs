@@ -534,6 +534,12 @@ pub mod reexports {
 }
 
 pub mod state;
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::field_reassign_with_default
+)]
+pub mod test;
 pub use state::AppState;
 
 #[cfg(test)]

@@ -149,7 +149,11 @@ impl DevReloadState {
 }
 
 /// Run the dev server with file watching.
-pub fn run(package: Option<&str>) {
+pub fn run(package: Option<&str>, show_config: bool) {
+    if show_config {
+        // SAFETY: called before spawning any threads; single-threaded at this point.
+        unsafe { std::env::set_var("AUTUMN_SHOW_CONFIG", "1") };
+    }
     eprintln!("\u{1F342} autumn dev\n");
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -315,7 +319,9 @@ fn cargo_build(package: Option<&str>) -> bool {
 fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child> {
     eprintln!("  Starting server...\n");
     let mut command = Command::new(binary);
-    command.stdout(Stdio::null()).stderr(Stdio::null());
+    // Inherit stdio so tracing output (including --show-config) is visible.
+    // Previously used Stdio::null(), but server logs are valuable during dev.
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if let Some(path) = reload_state_path {
         command.env(DEV_RELOAD_ENV, "1");
         command.env(DEV_RELOAD_STATE_ENV, path);
