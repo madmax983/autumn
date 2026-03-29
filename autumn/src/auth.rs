@@ -43,8 +43,8 @@
 //! ## The `Auth<T>` extractor
 //!
 //! [`Auth<T>`] extracts the authenticated user from request extensions.
-//! It is typically populated by a custom middleware or by calling
-//! [`Auth::set`] in a login handler. Returns `401 Unauthorized` if no
+//! It is typically populated by a custom middleware which might call
+//! `request.extensions_mut().insert(user)` in a handler. Returns `401 Unauthorized` if no
 //! user is present.
 //!
 //! ## Route protection with `RequireAuth`
@@ -223,7 +223,7 @@ impl std::fmt::Display for AuthRejection {
 
 // ── RequireAuth middleware ───────────────────────────────────────
 
-/// Tower [`Layer`] that rejects unauthenticated requests with `401`.
+/// Tower [`tower::Layer`] that rejects unauthenticated requests with `401`.
 ///
 /// Checks for a specific key in the session to determine if the request
 /// is authenticated. If the key is missing, the request is rejected before
@@ -266,7 +266,7 @@ impl<S> tower::Layer<S> for RequireAuth {
     }
 }
 
-/// Tower [`Service`] produced by [`RequireAuth`].
+/// Tower [`tower::Service`] produced by [`RequireAuth`].
 #[derive(Clone)]
 pub struct RequireAuthService<S> {
     inner: S,

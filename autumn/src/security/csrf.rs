@@ -15,7 +15,7 @@
 //!
 //! # Configuration
 //!
-//! See [`CsrfConfig`](super::config::CsrfConfig) for available settings.
+//! See [`CsrfConfig`] for available settings.
 //!
 //! # Examples
 //!
