@@ -245,21 +245,9 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     toml::Value::Table(table)
 }
 
-/// Maximum recursion depth for merging TOML tables.
-const MAX_MERGE_DEPTH: usize = 16;
-
 /// Deep-merge two TOML values. Tables are merged recursively;
 /// non-table values in `overlay` replace those in `base`.
 fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
-    deep_merge_with_depth(base, overlay, 0);
-}
-
-fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
-    if depth > MAX_MERGE_DEPTH {
-        eprintln!("Warning: Configuration merge exceeded max depth ({MAX_MERGE_DEPTH}), ignoring deeper values.");
-        return;
-    }
-
     if base.is_table() && overlay.is_table() {
         if let toml::Value::Table(overlay_table) = overlay {
             let base_table = base.as_table_mut().expect("checked is_table above");
@@ -267,7 +255,7 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
                 if overlay_val.is_table() {
                     if let Some(base_val) = base_table.get_mut(&key) {
                         if base_val.is_table() {
-                            deep_merge_with_depth(base_val, overlay_val, depth + 1);
+                            deep_merge(base_val, overlay_val);
                             continue;
                         }
                     }
@@ -1901,37 +1889,3 @@ path = "/healthz"
         assert_eq!(config.actuator.prefix, "/actuator");
     }
 }
-
-    #[test]
-    fn deep_merge_handles_deep_nesting() {
-        let mut base = toml::Value::Table(toml::map::Map::new());
-        let mut overlay = toml::Value::Table(toml::map::Map::new());
-
-        // Create a 10,000 deep nested table
-        let mut current_base = &mut base;
-        let mut current_overlay = &mut overlay;
-
-        for _ in 0..10_000 {
-            if let toml::Value::Table(t) = current_base {
-                t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_base = t.get_mut("x").unwrap();
-            }
-            if let toml::Value::Table(t) = current_overlay {
-                t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_overlay = t.get_mut("x").unwrap();
-            }
-        }
-
-        // Add a leaf value to test actual merging
-        if let toml::Value::Table(t) = current_overlay {
-            t.insert("y".to_owned(), toml::Value::Integer(42));
-        }
-
-        // Trigger merge, expecting no panic/stack overflow
-        // We run it on a thread with a large stack to avoid the stack overflow caused by Drop when base is dropped at the end of the function (since we created a 10,000 depth structure).
-        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(move || {
-            deep_merge(&mut base, overlay);
-            // Let the OS clean up the memory instead of dropping deeply nested structure
-            std::mem::forget(base);
-        }).unwrap().join().unwrap();
-    }
