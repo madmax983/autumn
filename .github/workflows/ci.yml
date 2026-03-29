@@ -20,6 +20,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -37,8 +39,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+      - name: Run tests (Linux — all features)
+        if: runner.os == 'Linux'
         run: cargo test --workspace
+      - name: Run tests (non-Linux — no db feature)
+        if: runner.os != 'Linux'
+        run: cargo test -p autumn-web --no-default-features --features maud,htmx,tailwind && cargo test -p autumn-macros && cargo test -p autumn-cli
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
@@ -51,6 +60,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
@@ -70,5 +81,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
       - name: Check MSRV compiles
         run: cargo check --workspace
