@@ -51,10 +51,7 @@ fn parse_deps(trait_def: &ItemTrait) -> syn::Result<Vec<DepField>> {
     for arg in &method.sig.inputs {
         match arg {
             FnArg::Receiver(_) => {
-                return Err(syn::Error::new_spanned(
-                    arg,
-                    "`deps` must not take `self`",
-                ));
+                return Err(syn::Error::new_spanned(arg, "`deps` must not take `self`"));
             }
             FnArg::Typed(pat_type) => {
                 let name = match pat_type.pat.as_ref() {
@@ -221,8 +218,14 @@ mod tests {
         );
         let output = service_macro(TokenStream::new(), quote! { #t });
         let output_str = output.to_string();
-        assert!(output_str.contains("OrderServiceImpl"), "should contain struct name");
-        assert!(output_str.contains("FromRequestParts"), "should contain extractor impl");
+        assert!(
+            output_str.contains("OrderServiceImpl"),
+            "should contain struct name"
+        );
+        assert!(
+            output_str.contains("FromRequestParts"),
+            "should contain extractor impl"
+        );
         assert!(output_str.contains("repo"), "should contain field name");
     }
 }
