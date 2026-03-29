@@ -720,7 +720,11 @@ fn log_startup_transparency(
 
     let mut route_lines = String::new();
     for route in routes {
-        let _ = write!(route_lines, "\n    {} {:<8} -> {}", route.path, route.method, route.name);
+        let _ = write!(
+            route_lines,
+            "\n    {} {:<8} -> {}",
+            route.path, route.method, route.name
+        );
     }
     for group in scoped_groups {
         for route in &group.routes {
@@ -732,7 +736,11 @@ fn log_startup_transparency(
         }
     }
     // Framework routes (always present)
-    let _ = write!(route_lines, "\n    {} {:<8} -> health", config.health.path, "GET");
+    let _ = write!(
+        route_lines,
+        "\n    {} {:<8} -> health",
+        config.health.path, "GET"
+    );
     route_lines.push_str("\n    /actuator/* GET      -> actuator");
     #[cfg(feature = "htmx")]
     route_lines.push_str("\n    /static/js/htmx.min.js GET -> htmx");
@@ -753,7 +761,12 @@ fn log_startup_transparency(
     }
 
     // ── Middleware ─────────────────────────────────────────────────
-    let mut middleware = vec!["RequestId", "SecurityHeaders", "Session (in-memory)", "ErrorPages"];
+    let mut middleware = vec![
+        "RequestId",
+        "SecurityHeaders",
+        "Session (in-memory)",
+        "ErrorPages",
+    ];
     if !config.cors.allowed_origins.is_empty() {
         middleware.push("CORS");
     }
@@ -772,7 +785,12 @@ fn log_startup_transparency(
             // Mask password in URL for safe logging
             if let Some(at_pos) = url.find('@') {
                 if let Some(colon_pos) = url[..at_pos].rfind(':') {
-                    return format!("{}:****@{} (pool_size={})", &url[..colon_pos], &url[at_pos + 1..], config.database.pool_size);
+                    return format!(
+                        "{}:****@{} (pool_size={})",
+                        &url[..colon_pos],
+                        &url[at_pos + 1..],
+                        config.database.pool_size
+                    );
                 }
             }
             format!("{url} (pool_size={})", config.database.pool_size)
