@@ -28,7 +28,11 @@ const WATCH_FILES: &[&str] = &["autumn.toml", "Cargo.toml", "Cargo.lock"];
 const WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
 
 /// Run the dev server with file watching.
-pub fn run(package: Option<&str>) {
+pub fn run(package: Option<&str>, show_config: bool) {
+    if show_config {
+        // SAFETY: called before spawning any threads; single-threaded at this point.
+        unsafe { std::env::set_var("AUTUMN_SHOW_CONFIG", "1") };
+    }
     eprintln!("\u{1F342} autumn dev\n");
 
     // Initial build
@@ -146,9 +150,11 @@ fn cargo_build(package: Option<&str>) -> bool {
 /// Start the application binary. Returns the child process handle.
 fn start_server(binary: &Path) -> Option<Child> {
     eprintln!("  Starting server...\n");
+    // Inherit stdio so tracing output (including --show-config) is visible.
+    // Previously used Stdio::null(), but server logs are valuable during dev.
     match Command::new(binary)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(child) => Some(child),

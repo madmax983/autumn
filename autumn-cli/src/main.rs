@@ -37,6 +37,9 @@ enum Commands {
         /// Package to run (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Log all registered routes, tasks, middleware, and config at startup
+        #[arg(long)]
+        show_config: bool,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -71,7 +74,10 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
-        Commands::Dev { package } => dev::run(package.as_deref()),
+        Commands::Dev {
+            package,
+            show_config,
+        } => dev::run(package.as_deref(), show_config),
         Commands::Migrate { action } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -180,18 +186,40 @@ mod tests {
     #[test]
     fn parse_dev_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "dev"]).unwrap();
-        assert!(matches!(cli.command, Commands::Dev { package: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Dev {
+                package: None,
+                show_config: false
+            }
+        ));
     }
 
     #[test]
     fn parse_dev_with_package() {
         let cli = Cli::try_parse_from(["autumn", "dev", "-p", "hello"]).unwrap();
         match cli.command {
-            Commands::Dev { package } => {
+            Commands::Dev {
+                package,
+                show_config,
+            } => {
                 assert_eq!(package.as_deref(), Some("hello"));
+                assert!(!show_config);
             }
             _ => panic!("expected Dev command"),
         }
+    }
+
+    #[test]
+    fn parse_dev_with_show_config() {
+        let cli = Cli::try_parse_from(["autumn", "dev", "--show-config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Dev {
+                package: None,
+                show_config: true
+            }
+        ));
     }
 
     #[test]
