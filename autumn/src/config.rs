@@ -528,9 +528,7 @@ impl AutumnConfig {
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         // ── Server ──────────────────────────────────────────────
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
-        if let Ok(val) = env.var("AUTUMN_SERVER__HOST") {
-            self.server.host = val;
-        }
+        parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
             env,
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
@@ -553,9 +551,7 @@ impl AutumnConfig {
         );
 
         // ── Log ─────────────────────────────────────────────────
-        if let Ok(val) = env.var("AUTUMN_LOG__LEVEL") {
-            self.log.level = val;
-        }
+        parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
         if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
                 "Auto" => self.log.format = LogFormat::Auto,
@@ -569,40 +565,30 @@ impl AutumnConfig {
         }
 
         // ── Health ──────────────────────────────────────────────
-        if let Ok(val) = env.var("AUTUMN_HEALTH__PATH") {
-            self.health.path = val;
-        }
-        if let Ok(val) = env.var("AUTUMN_HEALTH__DETAILED") {
-            match val.as_str() {
-                "true" | "1" => self.health.detailed = true,
-                "false" | "0" => self.health.detailed = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_HEALTH__DETAILED={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
+        parse_env_string(env, "AUTUMN_HEALTH__PATH", &mut self.health.path);
+        parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
 
         // ── CORS ────────────────────────────────────────────────
-        if let Ok(val) = env.var("AUTUMN_CORS__ALLOWED_ORIGINS") {
-            self.cors.allowed_origins = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = env.var("AUTUMN_CORS__ALLOWED_METHODS") {
-            self.cors.allowed_methods = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = env.var("AUTUMN_CORS__ALLOWED_HEADERS") {
-            self.cors.allowed_headers = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = env.var("AUTUMN_CORS__ALLOW_CREDENTIALS") {
-            match val.as_str() {
-                "true" | "1" => self.cors.allow_credentials = true,
-                "false" | "0" => self.cors.allow_credentials = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_CORS__ALLOW_CREDENTIALS={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_ORIGINS",
+            &mut self.cors.allowed_origins,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_METHODS",
+            &mut self.cors.allowed_methods,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_HEADERS",
+            &mut self.cors.allowed_headers,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_CORS__ALLOW_CREDENTIALS",
+            &mut self.cors.allow_credentials,
+        );
         parse_env(
             env,
             "AUTUMN_CORS__MAX_AGE_SECS",
@@ -610,33 +596,26 @@ impl AutumnConfig {
         );
 
         // ── Session ────────────────────────────────────────────
-        if let Ok(val) = env.var("AUTUMN_SESSION__COOKIE_NAME") {
-            self.session.cookie_name = val;
-        }
+        parse_env_string(
+            env,
+            "AUTUMN_SESSION__COOKIE_NAME",
+            &mut self.session.cookie_name,
+        );
         parse_env(
             env,
             "AUTUMN_SESSION__MAX_AGE_SECS",
             &mut self.session.max_age_secs,
         );
-        if let Ok(val) = env.var("AUTUMN_SESSION__SECURE") {
-            match val.as_str() {
-                "true" | "1" => self.session.secure = true,
-                "false" | "0" => self.session.secure = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SESSION__SECURE={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = env.var("AUTUMN_SESSION__SAME_SITE") {
-            self.session.same_site = val;
-        }
+        parse_env_bool(env, "AUTUMN_SESSION__SECURE", &mut self.session.secure);
+        parse_env_string(
+            env,
+            "AUTUMN_SESSION__SAME_SITE",
+            &mut self.session.same_site,
+        );
 
         // ── Auth ───────────────────────────────────────────────
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
-        if let Ok(val) = env.var("AUTUMN_AUTH__SESSION_KEY") {
-            self.auth.session_key = val;
-        }
+        parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
 
         // ── Security ────────────────────────────────────────
         self.apply_security_env_overrides_with_env(env);
@@ -644,61 +623,58 @@ impl AutumnConfig {
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
     fn apply_security_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS") {
-            self.security.headers.x_frame_options = val;
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS") {
-            match val.as_str() {
-                "true" | "1" => self.security.headers.x_content_type_options = true,
-                "false" | "0" => self.security.headers.x_content_type_options = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY") {
-            match val.as_str() {
-                "true" | "1" => self.security.headers.strict_transport_security = true,
-                "false" | "0" => self.security.headers.strict_transport_security = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS",
+            &mut self.security.headers.x_frame_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS",
+            &mut self.security.headers.x_content_type_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY",
+            &mut self.security.headers.strict_transport_security,
+        );
         parse_env(
             env,
             "AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS",
             &mut self.security.headers.hsts_max_age_secs,
         );
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY") {
-            self.security.headers.content_security_policy = val;
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__REFERRER_POLICY") {
-            self.security.headers.referrer_policy = val;
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY") {
-            self.security.headers.permissions_policy = val;
-        }
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY",
+            &mut self.security.headers.content_security_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__REFERRER_POLICY",
+            &mut self.security.headers.referrer_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY",
+            &mut self.security.headers.permissions_policy,
+        );
 
         // CSRF
-        if let Ok(val) = env.var("AUTUMN_SECURITY__CSRF__ENABLED") {
-            match val.as_str() {
-                "true" | "1" => self.security.csrf.enabled = true,
-                "false" | "0" => self.security.csrf.enabled = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__CSRF__ENABLED={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__CSRF__TOKEN_HEADER") {
-            self.security.csrf.token_header = val;
-        }
-        if let Ok(val) = env.var("AUTUMN_SECURITY__CSRF__COOKIE_NAME") {
-            self.security.csrf.cookie_name = val;
-        }
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__CSRF__ENABLED",
+            &mut self.security.csrf.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__TOKEN_HEADER",
+            &mut self.security.csrf.token_header,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
+            &mut self.security.csrf.cookie_name,
+        );
     }
 
     /// Returns the active profile name, if any.
@@ -1033,6 +1009,28 @@ fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
             Ok(v) => *target = v,
             Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
         }
+    }
+}
+
+fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
+    if let Ok(val) = env.var(key) {
+        *target = val;
+    }
+}
+
+fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
+    if let Ok(val) = env.var(key) {
+        match val.as_str() {
+            "true" | "1" => *target = true,
+            "false" | "0" => *target = false,
+            _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
+        }
+    }
+}
+
+fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = val.split(',').map(|s| s.trim().to_owned()).collect();
     }
 }
 
