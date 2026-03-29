@@ -11,13 +11,14 @@ default = ["maud", "htmx", "tailwind", "db"]
 maud = ["dep:maud"]
 htmx = []
 tailwind = []
-db = ["dep:diesel", "dep:diesel-async", "dep:diesel_migrations", "dep:libsqlite3-sys"]
+db = ["dep:diesel", "dep:diesel-async", "dep:diesel_migrations", "dep:libsqlite3-sys", "dep:pq-sys", "diesel/postgres"]
 
 [dependencies]
 autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
 axum.workspace = true
 bcrypt.workspace = true
 diesel = { workspace = true, optional = true }
+pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 futures.workspace = true
