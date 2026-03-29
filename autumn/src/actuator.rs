@@ -655,6 +655,105 @@ pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_
     }))
 }
 
+#[cfg(feature = "dashboard")]
+/// `GET /actuator` -- HTML dashboard of system health, metrics, and tasks.
+pub(crate) async fn dashboard_endpoint(State(state): State<AppState>) -> maud::Markup {
+    use maud::{DOCTYPE, html};
+
+    let uptime = state.uptime_display();
+    let profile = state.profile();
+    let metrics = state.metrics.snapshot();
+    let tasks = state.task_registry.snapshot();
+
+    html! {
+        (DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1.0";
+                title { "Autumn Actuator Dashboard" }
+                style {
+                    "body { font-family: system-ui, -apple-system, sans-serif; background-color: #f3f4f6; color: #111827; margin: 0; padding: 2rem; }"
+                    "h1, h2 { color: #1f2937; }"
+                    ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }"
+                    ".card { background: white; padding: 1.5rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+                    ".stat-value { font-size: 2rem; font-weight: bold; color: #4f46e5; }"
+                    ".stat-label { font-size: 0.875rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.5rem; }"
+                    "table { width: 100%; border-collapse: collapse; margin-top: 1rem; }"
+                    "th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #e5e7eb; }"
+                    "th { font-weight: 600; color: #374151; }"
+                }
+            }
+            body {
+                h1 style="margin-bottom: 2rem;" { "🍂 Autumn Actuator Dashboard" }
+
+                div class="grid" {
+                    div class="card" {
+                        div class="stat-value" { (profile) }
+                        div class="stat-label" { "Active Profile" }
+                    }
+                    div class="card" {
+                        div class="stat-value" { (uptime) }
+                        div class="stat-label" { "Uptime" }
+                    }
+                    div class="card" {
+                        div class="stat-value" { (metrics.http.requests_total) }
+                        div class="stat-label" { "Total Requests" }
+                    }
+                    div class="card" {
+                        div class="stat-value" { (metrics.http.requests_active) }
+                        div class="stat-label" { "Active Requests" }
+                    }
+                }
+
+                div class="grid" style="margin-top: 2rem;" {
+                    div class="card" {
+                        h2 { "HTTP Metrics" }
+                        table {
+                            tr { th { "Route" } th { "Count" } th { "p50 (ms)" } th { "p99 (ms)" } }
+                            @for (route, stat) in &metrics.http.by_route {
+                                tr {
+                                    td { (route) }
+                                    td { (stat.count) }
+                                    td { (stat.p50_ms) }
+                                    td { (stat.p99_ms) }
+                                }
+                            }
+                            @if metrics.http.by_route.is_empty() {
+                                tr { td colspan="4" style="text-align: center; color: #6b7280;" { "No request data yet" } }
+                            }
+                        }
+                    }
+
+                    div class="card" {
+                        h2 { "Scheduled Tasks" }
+                        table {
+                            tr { th { "Task" } th { "Schedule" } th { "Total Runs" } th { "Status" } }
+                            @for (name, status) in &tasks {
+                                tr {
+                                    td { (name) }
+                                    td { (status.schedule) }
+                                    td { (status.total_runs) }
+                                    td {
+                                        @if status.status == "running" {
+                                            span style="color: #059669;" { "Running" }
+                                        } @else {
+                                            span style="color: #6b7280;" { (status.status) }
+                                        }
+                                    }
+                                }
+                            }
+                            @if tasks.is_empty() {
+                                tr { td colspan="4" style="text-align: center; color: #6b7280;" { "No tasks registered" } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Router builder ──────────────────────────────────────────────
 
 /// Build the actuator router with profile-aware endpoint exposure.
@@ -668,6 +767,11 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
         .route("/actuator/metrics", axum::routing::get(metrics_endpoint));
 
     if sensitive {
+        #[cfg(feature = "dashboard")]
+        {
+            router = router.route("/actuator", axum::routing::get(dashboard_endpoint));
+        }
+
         router = router
             .route("/actuator/env", axum::routing::get(env_endpoint))
             .route(
@@ -701,6 +805,47 @@ mod tests {
             task_registry: TaskRegistry::new(),
             config_props: ConfigProperties::default(),
         }
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[tokio::test]
+    async fn actuator_dashboard_returns_html() {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body).unwrap();
+        assert!(body_str.contains("Autumn Actuator Dashboard"));
+        assert!(body_str.contains("HTTP Metrics"));
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[tokio::test]
+    async fn actuator_dashboard_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
