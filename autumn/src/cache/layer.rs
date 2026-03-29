@@ -166,7 +166,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cache-moka"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
