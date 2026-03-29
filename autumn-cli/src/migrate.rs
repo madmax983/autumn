@@ -167,6 +167,56 @@ fn show_status(database_url: &str, migrations_dir: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env mutex poisoned");
+
+            let mut previous = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                previous.push((*key, std::env::var(key).ok()));
+                match value {
+                    Some(value) => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                    None => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::remove_var(key) };
+                    }
+                }
+            }
+
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                if let Some(previous) = previous {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::set_var(key, previous) };
+                } else {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
 
     #[test]
     fn migrate_action_eq() {
@@ -183,29 +233,21 @@ mod tests {
     #[test]
     fn resolve_database_url_from_env() {
         // AUTUMN_DATABASE__URL takes priority
-        unsafe {
-            std::env::set_var("AUTUMN_DATABASE__URL", "postgres://test:5432/mydb");
-        }
+        let _env = EnvGuard::set_many(&[
+            ("AUTUMN_DATABASE__URL", Some("postgres://test:5432/mydb")),
+            ("DATABASE_URL", None),
+        ]);
         let url = resolve_database_url();
         assert_eq!(url, "postgres://test:5432/mydb");
-        unsafe {
-            std::env::remove_var("AUTUMN_DATABASE__URL");
-        }
     }
 
     #[test]
     fn resolve_database_url_from_database_url_env() {
-        // Make sure AUTUMN_DATABASE__URL is not set
-        unsafe {
-            std::env::remove_var("AUTUMN_DATABASE__URL");
-        }
-        unsafe {
-            std::env::set_var("DATABASE_URL", "postgres://fallback:5432/db");
-        }
+        let _env = EnvGuard::set_many(&[
+            ("AUTUMN_DATABASE__URL", None),
+            ("DATABASE_URL", Some("postgres://fallback:5432/db")),
+        ]);
         let url = resolve_database_url();
         assert_eq!(url, "postgres://fallback:5432/db");
-        unsafe {
-            std::env::remove_var("DATABASE_URL");
-        }
     }
 }

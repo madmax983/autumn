@@ -91,7 +91,7 @@ impl ChangePlan {
         }
     }
 
-    fn finalize(mut self) -> Self {
+    const fn finalize(mut self) -> Self {
         if self.build {
             self.tailwind = false;
         }
@@ -466,11 +466,13 @@ fn has_component(path: &Path, target: &str) -> bool {
 
 fn is_profile_config_file(file_name: &str) -> bool {
     file_name.starts_with("autumn-")
-        && file_name.ends_with(".toml")
+        && Path::new(file_name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
         && file_name.len() > "autumn-.toml".len()
 }
 
-fn describe_plan(plan: ChangePlan) -> &'static str {
+const fn describe_plan(plan: ChangePlan) -> &'static str {
     match plan {
         ChangePlan {
             build: true,
