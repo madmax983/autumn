@@ -165,3 +165,165 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::{ServiceBuilder, ServiceExt};
+
+    /// Build a test service that returns a fixed body and counts calls.
+    fn counting_service(
+        counter: Arc<AtomicUsize>,
+        body: &'static str,
+    ) -> impl Service<
+        Request<Body>,
+        Response = axum::response::Response,
+        Error = Infallible,
+        Future = impl std::future::Future<Output = Result<axum::response::Response, Infallible>> + Send,
+    > + Clone
+    + Send
+    + 'static {
+        let body = body.to_owned();
+        tower::service_fn(move |_req: Request<Body>| {
+            let counter = counter.clone();
+            let body = body.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(body))
+                    .unwrap())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn caches_get_responses() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "hello"));
+
+        // First request — cache miss
+        let req = Request::get("/test").body(Body::empty()).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Second request — cache hit, inner service NOT called
+        let req = Request::get("/test").body(Body::empty()).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"hello");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "inner should not be called again"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_cache_post_requests() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "created"));
+
+        let req = Request::post("/items").body(Body::empty()).unwrap();
+        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let req = Request::post("/items").body(Body::empty()).unwrap();
+        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "POST should not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_cache_non_200_responses() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let svc_inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |_req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(
+                        axum::response::Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(Body::from("not found"))
+                            .unwrap(),
+                    )
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(svc_inner);
+
+        let req = Request::get("/missing").body(Body::empty()).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let req = Request::get("/missing").body(Body::empty()).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "404 should not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_uris_cached_separately() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "ok"));
+
+        let req = Request::get("/a").body(Body::empty()).unwrap();
+        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/b").body(Body::empty()).unwrap();
+        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "different URIs should miss"
+        );
+
+        // But repeating /a should hit
+        let req = Request::get("/a").body(Body::empty()).unwrap();
+        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "/a should be cached");
+    }
+
+    #[test]
+    fn from_shared_accepts_arc() {
+        let store = Arc::new(super::super::MokaCache::new(100, None));
+        // Just verify from_shared compiles and the layer can be used
+        let _layer = CacheResponseLayer::from_shared(store);
+    }
+}

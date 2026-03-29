@@ -21,11 +21,11 @@ use super::Cache;
 /// # Examples
 ///
 /// ```rust
-/// use autumn_web::cache::{Cache, MokaCache};
+/// use autumn_web::cache::{self, MokaCache};
 ///
-/// let cache = MokaCache::builder().max_capacity(100).build();
-/// super::insert(cache,"key", 42_i32);
-/// assert_eq!(cache.get::<i32>("key"), Some(42));
+/// let c = MokaCache::builder().max_capacity(100).build();
+/// cache::insert(&c, "key", 42_i32);
+/// assert_eq!(cache::get::<i32>(&c, "key"), Some(42));
 /// ```
 #[derive(Clone)]
 pub struct MokaCache {
