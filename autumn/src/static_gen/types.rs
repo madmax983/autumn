@@ -31,6 +31,7 @@ pub type StaticParams = HashMap<String, String>;
 #[macro_export]
 macro_rules! static_params {
     ($($key:expr => $value:expr),* $(,)?) => {{
+        #[allow(unused_mut)]
         let mut map = ::std::collections::HashMap::new();
         $(map.insert($key.to_owned(), $value.to_owned());)*
         map
@@ -43,8 +44,7 @@ macro_rules! static_params {
 /// This is the type stored inside [`StaticRouteMeta::params_fn`]. The
 /// build engine calls it to enumerate all parameter combinations that
 /// should be pre-rendered.
-pub type ParamsFn =
-    fn(axum::Router) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>>;
+pub type ParamsFn = fn(axum::Router) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>>;
 
 /// Metadata for a route that should be statically generated at build time.
 ///

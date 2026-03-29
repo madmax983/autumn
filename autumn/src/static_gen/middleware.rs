@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::StaticManifest;
@@ -121,11 +121,7 @@ impl StaticFileLayer {
     /// Check if a file is stale and trigger background regeneration if needed.
     fn maybe_trigger_isr(&self, url_path: &str, file_path: &Path, revalidate_secs: u64) {
         // Check file age
-        let is_stale = match file_mtime_age_secs(file_path) {
-            Some(age) => age > revalidate_secs,
-            // File missing or unreadable -- treat as stale
-            None => true,
-        };
+        let is_stale = file_mtime_age_secs(file_path).is_none_or(|age| age > revalidate_secs);
 
         if !is_stale {
             return;
@@ -226,12 +222,7 @@ async fn regenerate_page(
         .expect("router infallible");
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Handler returned HTTP {} for {}",
-            response.status(),
-            url
-        )
-        .into());
+        return Err(format!("Handler returned HTTP {} for {}", response.status(), url).into());
     }
 
     let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -318,10 +309,8 @@ mod tests {
         std::fs::create_dir_all(dist.join("posts/world")).expect("mkdir posts/world");
 
         // Create HTML files
-        std::fs::write(dist.join("posts/hello/index.html"), "<h1>Hello</h1>")
-            .expect("write hello");
-        std::fs::write(dist.join("posts/world/index.html"), "<h1>World</h1>")
-            .expect("write world");
+        std::fs::write(dist.join("posts/hello/index.html"), "<h1>Hello</h1>").expect("write hello");
+        std::fs::write(dist.join("posts/world/index.html"), "<h1>World</h1>").expect("write world");
 
         // Build and write manifest
         let mut routes = HashMap::new();
@@ -515,18 +504,12 @@ mod tests {
         // Make the file old by setting mtime to the past
         let file = dist.join("about/index.html");
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
-        filetime::set_file_mtime(
-            &file,
-            filetime::FileTime::from_system_time(old_time),
-        )
-        .unwrap_or_else(|_| {
-            // filetime may not be available; skip test gracefully
-        });
+        filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time))
+            .unwrap_or(());
 
         // Create a router that returns fresh content
-        let router = axum::Router::new().fallback(axum::routing::get(|| async {
-            "<h1>About (fresh)</h1>"
-        }));
+        let router =
+            axum::Router::new().fallback(axum::routing::get(|| async { "<h1>About (fresh)</h1>" }));
 
         let layer = StaticFileLayer::new(&dist)
             .expect("layer")
@@ -567,19 +550,16 @@ mod tests {
         // Make file stale
         let file = dist.join("about/index.html");
         let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
-        let _ = filetime::set_file_mtime(
-            &file,
-            filetime::FileTime::from_system_time(old_time),
-        );
+        let _ = filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time));
 
         // First resolve triggers ISR
-        layer.resolve("/about");
+        let _ = layer.resolve("/about");
 
         // Check in-flight flag
         let state = layer.isr_state.get("/about").expect("isr state");
         // May or may not be true depending on timing, but second resolve
         // should not panic or double-trigger
-        layer.resolve("/about");
+        let _ = layer.resolve("/about");
 
         // Wait for background task
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
@@ -615,9 +595,8 @@ mod tests {
         let dest = tmp.path().join("page.html");
         std::fs::write(&dest, "old content").expect("write old");
 
-        let router = axum::Router::new().fallback(|| async {
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error")
-        });
+        let router = axum::Router::new()
+            .fallback(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "error") });
 
         let result = regenerate_page(&router, "/test", &dest).await;
         assert!(result.is_err());

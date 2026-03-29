@@ -71,14 +71,14 @@ pub mod auth;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
-#[cfg(feature = "db")]
-pub mod migrate;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
+#[cfg(feature = "db")]
+pub mod migrate;
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
@@ -622,6 +622,7 @@ impl AppState {
     /// Create an `AppState` suitable for testing, with sensible defaults
     /// for all fields. Database pool is `None`.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn for_test() -> Self {
         Self {
             #[cfg(feature = "db")]
@@ -632,7 +633,7 @@ impl AppState {
             metrics: middleware::MetricsCollector::new(),
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
-            config_props: Default::default(),
+            config_props: actuator::ConfigProperties::default(),
         }
     }
 }
@@ -654,7 +655,7 @@ impl std::fmt::Debug for AppState {
             .field("metrics", &"MetricsCollector")
             .field("log_levels", &"LogLevels")
             .field("task_registry", &"TaskRegistry")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

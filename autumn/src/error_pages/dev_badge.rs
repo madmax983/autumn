@@ -11,7 +11,7 @@ use maud::{Markup, PreEscaped, html};
 
 /// Context for the dev error badge.
 #[derive(Debug, Clone)]
-pub(crate) struct DevBadgeContext {
+pub struct DevBadgeContext {
     /// HTTP status code.
     pub status_code: u16,
     /// Status reason phrase (e.g., "Not Found").
@@ -33,7 +33,7 @@ pub(crate) struct DevBadgeContext {
 ///
 /// Uses inline CSS (not Tailwind) so it works even if the CSS build fails.
 /// Styled like Next.js: dark overlay, monospace font, red accent, expandable.
-pub(crate) fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
+pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
     let status = ctx.status_code;
     let reason = &ctx.status_reason;
     let message = &ctx.message;
@@ -93,7 +93,7 @@ pub(crate) fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
 
 /// All inline CSS for the dev badge. Uses a unique prefix to avoid
 /// colliding with application styles.
-const DEV_BADGE_STYLES: &str = r##"<style>
+const DEV_BADGE_STYLES: &str = r#"<style>
 #autumn-dev-error-badge {
     position: fixed;
     bottom: 16px;
@@ -203,7 +203,7 @@ const DEV_BADGE_STYLES: &str = r##"<style>
     font-size: 12px;
     color: #a0aec0;
 }
-</style>"##;
+</style>"#;
 
 #[cfg(test)]
 mod tests {

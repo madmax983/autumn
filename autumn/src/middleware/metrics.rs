@@ -41,6 +41,7 @@ struct MetricsInner {
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_field_names)]
 struct StatusBuckets {
     status_2xx: AtomicU64,
     status_3xx: AtomicU64,
@@ -78,10 +79,26 @@ impl MetricsCollector {
 
         // Status bucket
         match status / 100 {
-            2 => self.inner.by_status.status_2xx.fetch_add(1, Ordering::Relaxed),
-            3 => self.inner.by_status.status_3xx.fetch_add(1, Ordering::Relaxed),
-            4 => self.inner.by_status.status_4xx.fetch_add(1, Ordering::Relaxed),
-            5 => self.inner.by_status.status_5xx.fetch_add(1, Ordering::Relaxed),
+            2 => self
+                .inner
+                .by_status
+                .status_2xx
+                .fetch_add(1, Ordering::Relaxed),
+            3 => self
+                .inner
+                .by_status
+                .status_3xx
+                .fetch_add(1, Ordering::Relaxed),
+            4 => self
+                .inner
+                .by_status
+                .status_4xx
+                .fetch_add(1, Ordering::Relaxed),
+            5 => self
+                .inner
+                .by_status
+                .status_5xx
+                .fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
 
@@ -250,7 +267,7 @@ pub struct MetricsLayer {
 impl MetricsLayer {
     /// Create a new metrics layer backed by the given collector.
     #[must_use]
-    pub fn new(collector: MetricsCollector) -> Self {
+    pub const fn new(collector: MetricsCollector) -> Self {
         Self { collector }
     }
 }
@@ -290,8 +307,7 @@ where
         let route = req
             .extensions()
             .get::<MatchedPath>()
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|| "_unmatched".to_owned());
+            .map_or_else(|| "_unmatched".to_owned(), |p| p.as_str().to_owned());
 
         self.collector.increment_active();
 
@@ -328,7 +344,8 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
                 if let Some(collector) = this.collector.take() {
-                    let latency_ms = this.start.elapsed().as_millis() as u64;
+                    let latency_ms =
+                        u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let method = this.method.take().unwrap_or_default();
                     let route = this.route.take().unwrap_or_default();
                     let status = response.status().as_u16();

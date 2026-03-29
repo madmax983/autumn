@@ -53,8 +53,7 @@ impl LogLevels {
     pub fn current_level(&self) -> String {
         self.inner
             .read()
-            .map(|guard| guard.current_level.clone())
-            .unwrap_or_else(|_| "info".to_string())
+            .map_or_else(|_| "info".to_string(), |guard| guard.current_level.clone())
     }
 
     /// Get all per-logger overrides.
@@ -67,6 +66,7 @@ impl LogLevels {
     }
 
     /// Set the level for a specific logger. Returns the previous level if any.
+    #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
         if let Ok(mut guard) = self.inner.write() {
             let previous = guard.logger_overrides.get(name).cloned();
@@ -264,12 +264,7 @@ impl ConfigProperties {
         );
 
         // Database properties
-        let db_url = config
-            .database
-            .url
-            .as_deref()
-            .unwrap_or("")
-            .to_string();
+        let db_url = config.database.url.as_deref().unwrap_or("").to_string();
         Self::track_property(&mut props, "database.url", &db_url, "", &profile_str);
         Self::track_property(
             &mut props,
@@ -553,9 +548,7 @@ pub(crate) async fn env_endpoint(State(state): State<AppState>) -> Json<Actuator
 
 /// `GET /actuator/metrics` -- request metrics, latency, status codes, DB pool stats.
 #[allow(unused_variables, unused_mut)]
-pub(crate) async fn metrics_endpoint(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let snapshot = state.metrics.snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
@@ -579,9 +572,7 @@ pub(crate) async fn metrics_endpoint(
 // ── Config Properties (sensitive) ──────────────────────────────
 
 /// `GET /actuator/configprops` -- all config properties with source tracking.
-pub(crate) async fn configprops_endpoint(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn configprops_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let props = state.config_props.snapshot();
 
     Json(serde_json::json!({
@@ -656,9 +647,7 @@ pub(crate) async fn loggers_put(
 // ── Tasks (sensitive) ──────────────────────────────────────────
 
 /// `GET /actuator/tasks` -- scheduled task status.
-pub(crate) async fn tasks_endpoint(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let tasks = state.task_registry.snapshot();
 
     Json(serde_json::json!({
@@ -686,10 +675,7 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
                 axum::routing::get(configprops_endpoint),
             )
             .route("/actuator/loggers", axum::routing::get(loggers_get))
-            .route(
-                "/actuator/loggers/{name}",
-                axum::routing::put(loggers_put),
-            )
+            .route("/actuator/loggers/{name}", axum::routing::put(loggers_put))
             .route("/actuator/tasks", axum::routing::get(tasks_endpoint));
     }
 
@@ -1010,12 +996,9 @@ mod tests {
         let levels = LogLevels::new("info");
         assert_eq!(levels.current_level(), "info");
 
-        levels.set_logger_level("my_crate", "debug");
+        let _ = levels.set_logger_level("my_crate", "debug");
         let overrides = levels.logger_overrides();
-        assert_eq!(
-            overrides.get("my_crate").map(String::as_str),
-            Some("debug")
-        );
+        assert_eq!(overrides.get("my_crate").map(String::as_str), Some("debug"));
     }
 
     #[test]

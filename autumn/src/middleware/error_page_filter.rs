@@ -22,7 +22,7 @@ use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
 /// response is replaced with a styled HTML page.
 ///
 /// In dev profile, the HTML page includes a floating error badge overlay.
-pub(crate) struct ErrorPageFilter {
+pub struct ErrorPageFilter {
     pub renderer: SharedRenderer,
     pub is_dev: bool,
 }
@@ -34,7 +34,7 @@ impl ExceptionFilter for ErrorPageFilter {
         let wants_html = response
             .extensions()
             .get::<WantsHtml>()
-            .map_or(false, |w| w.0);
+            .is_some_and(|w| w.0);
 
         if !wants_html {
             return response;
@@ -60,8 +60,9 @@ impl ExceptionFilter for ErrorPageFilter {
             is_dev: self.is_dev,
         };
 
-        let mut html_body = error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
-            .into_string();
+        let mut html_body =
+            error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
+                .into_string();
 
         // In dev mode, inject the error badge before </body>
         if self.is_dev {
@@ -73,7 +74,7 @@ impl ExceptionFilter for ErrorPageFilter {
                     .unwrap_or("Error")
                     .to_string(),
                 message: error.message.clone(),
-                path: ctx.path.clone(),
+                path: ctx.path,
                 request_id,
                 source_location: None,
             };
@@ -87,10 +88,7 @@ impl ExceptionFilter for ErrorPageFilter {
 
         let mut resp = (
             error.status,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "text/html; charset=utf-8",
-            )],
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
             html_body,
         )
             .into_response();
@@ -105,11 +103,11 @@ impl ExceptionFilter for ErrorPageFilter {
 /// Marker stored in response extensions to indicate the original request
 /// preferred HTML responses.
 #[derive(Clone, Debug)]
-pub(crate) struct WantsHtml(pub bool);
+pub struct WantsHtml(pub bool);
 
 /// Request context stored in response extensions for the error page filter.
 #[derive(Clone, Debug)]
-pub(crate) struct ErrorPageRequestContext {
+pub struct ErrorPageRequestContext {
     pub path: String,
     pub request_id: Option<String>,
 }
@@ -120,7 +118,7 @@ pub(crate) struct ErrorPageRequestContext {
 /// This layer runs before the exception filter and stores [`WantsHtml`]
 /// and [`ErrorPageRequestContext`] in the response extensions.
 #[derive(Clone)]
-pub(crate) struct ErrorPageContextLayer;
+pub struct ErrorPageContextLayer;
 
 impl<S> tower::Layer<S> for ErrorPageContextLayer {
     type Service = ErrorPageContextService<S>;
@@ -131,7 +129,7 @@ impl<S> tower::Layer<S> for ErrorPageContextLayer {
 }
 
 #[derive(Clone)]
-pub(crate) struct ErrorPageContextService<S> {
+pub struct ErrorPageContextService<S> {
     inner: S,
 }
 
@@ -156,7 +154,7 @@ where
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .map(|id| id.to_string());
+            .map(std::string::ToString::to_string);
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -168,7 +166,7 @@ where
 }
 
 pin_project_lite::pin_project! {
-    pub(crate) struct ErrorPageContextFuture<F> {
+    pub struct ErrorPageContextFuture<F> {
         #[pin]
         inner: F,
         wants_html: bool,
@@ -190,7 +188,9 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             std::task::Poll::Ready(Ok(mut response)) => {
-                response.extensions_mut().insert(WantsHtml(*this.wants_html));
+                response
+                    .extensions_mut()
+                    .insert(WantsHtml(*this.wants_html));
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     path: this.path.clone(),
                     request_id: this.request_id.clone(),
@@ -236,9 +236,7 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
 /// error pages instead of Axum's default plain-text "Not Found".
-pub(crate) async fn fallback_404_handler(
-    uri: axum::http::Uri,
-) -> crate::error::AutumnError {
+pub async fn fallback_404_handler(uri: axum::http::Uri) -> crate::error::AutumnError {
     crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
 }
 
@@ -315,10 +313,7 @@ mod tests {
     /// Helper: build a router with the error page filter and context layer.
     fn test_router_with_error_pages(is_dev: bool) -> Router {
         let renderer = error_pages::default_renderer();
-        let error_page_filter = ErrorPageFilter {
-            renderer,
-            is_dev,
-        };
+        let error_page_filter = ErrorPageFilter { renderer, is_dev };
         let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
             vec![Arc::new(error_page_filter)];
 
@@ -331,9 +326,9 @@ mod tests {
             .route(
                 "/boom",
                 get(|| async {
-                    Err::<String, AutumnError>(
-                        AutumnError::from(std::io::Error::other("internal failure")),
-                    )
+                    Err::<String, AutumnError>(AutumnError::from(std::io::Error::other(
+                        "internal failure",
+                    )))
                 }),
             )
             .fallback(fallback_404_handler)
@@ -501,9 +496,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/err",
-                get(|| async {
-                    Err::<String, AutumnError>(AutumnError::not_found_msg("nope"))
-                }),
+                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
             )
             .layer(ErrorPageContextLayer)
             .layer(ExceptionFilterLayer::new(filters));

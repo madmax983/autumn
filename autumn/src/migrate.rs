@@ -102,7 +102,10 @@ pub fn pending_migrations(
         .pending_migrations(migrations)
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    Ok(pending.iter().map(|m| m.name().version().to_string()).collect())
+    Ok(pending
+        .iter()
+        .map(|m| m.name().version().to_string())
+        .collect())
 }
 
 /// Run migrations according to the active profile.

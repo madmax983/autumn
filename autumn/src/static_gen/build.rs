@@ -12,7 +12,7 @@ use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use tower::ServiceExt;
 
-use super::{ManifestEntry, StaticManifest, StaticRouteMeta, StaticParams, url_to_file_path};
+use super::{ManifestEntry, StaticManifest, StaticParams, StaticRouteMeta, url_to_file_path};
 
 /// Default number of routes rendered concurrently.
 const DEFAULT_CONCURRENCY: usize = 8;
@@ -164,11 +164,7 @@ pub async fn render_static_routes(
     let mut jobs = Vec::new();
     for meta in metas {
         let expanded = expand_route(meta, &router).await?;
-        eprintln!(
-            "  Route {} -> {} page(s)",
-            meta.path,
-            expanded.len()
-        );
+        eprintln!("  Route {} -> {} page(s)", meta.path, expanded.len());
         jobs.extend(expanded);
     }
 
@@ -197,7 +193,7 @@ pub async fn render_static_routes(
             let url = job.url.clone();
             let revalidate = job.revalidate;
             async move {
-                eprintln!("  Rendering {} ...", url);
+                eprintln!("  Rendering {url} ...");
 
                 let response = router
                     .oneshot(
@@ -352,9 +348,7 @@ mod tests {
     fn slug_params_hello(
         _router: axum::Router,
     ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
-        Box::pin(async {
-            vec![crate::static_params! { "slug" => "hello" }]
-        })
+        Box::pin(async { vec![crate::static_params! { "slug" => "hello" }] })
     }
 
     fn echo_router() -> axum::Router {

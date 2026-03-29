@@ -58,7 +58,7 @@ impl Parse for StaticGetAttrs {
             }
         }
 
-        Ok(StaticGetAttrs {
+        Ok(Self {
             path,
             params_fn,
             revalidate,
@@ -128,25 +128,27 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let vis = &input_fn.vis;
 
     // Build the revalidate expression
-    let revalidate_expr = match attrs.revalidate {
-        Some(secs) => quote! { ::core::option::Option::Some(#secs) },
-        None => quote! { ::core::option::Option::None },
-    };
+    let revalidate_expr = attrs.revalidate.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |secs| quote! { ::core::option::Option::Some(#secs) },
+    );
 
     // Build the params_fn expression
-    let params_fn_expr = match &attrs.params_fn {
-        Some(pf) => quote! {
-            ::core::option::Option::Some(
-                |router: ::autumn_web::reexports::axum::Router|
-                    -> ::core::pin::Pin<Box<dyn ::core::future::Future<
-                        Output = Vec<::autumn_web::static_gen::StaticParams>
-                    > + Send>> {
-                    Box::pin(#pf(router))
-                }
-            )
+    let params_fn_expr = attrs.params_fn.as_ref().map_or_else(
+        || quote! { ::core::option::Option::None },
+        |pf| {
+            quote! {
+                ::core::option::Option::Some(
+                    |router: ::autumn_web::reexports::axum::Router|
+                        -> ::core::pin::Pin<Box<dyn ::core::future::Future<
+                            Output = Vec<::autumn_web::static_gen::StaticParams>
+                        > + Send>> {
+                        Box::pin(#pf(router))
+                    }
+                )
+            }
         },
-        None => quote! { ::core::option::Option::None },
-    };
+    );
 
     quote! {
         #input_fn

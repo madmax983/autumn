@@ -14,129 +14,141 @@ pub struct DefaultErrorPages;
 
 impl ErrorPageRenderer for DefaultErrorPages {
     fn render_404(&self, ctx: &ErrorContext) -> Markup {
-        error_page_layout(ctx, html! {
-            div class="text-center" {
-                div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
-                    "404"
-                }
-                h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
-                    "Page not found"
-                }
-                p class="mt-2 text-gray-600 dark:text-gray-400" {
-                    "The page "
-                    code class="px-2 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-sm font-mono text-gray-800 dark:text-gray-300" {
-                        (ctx.path)
+        error_page_layout(
+            ctx,
+            &html! {
+                div class="text-center" {
+                    div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
+                        "404"
                     }
-                    " could not be found."
-                }
-                div class="mt-8" {
-                    a href="/"
-                      class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                        "Go to homepage"
+                    h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
+                        "Page not found"
+                    }
+                    p class="mt-2 text-gray-600 dark:text-gray-400" {
+                        "The page "
+                        code class="px-2 py-0.5 bg-gray-100 dark:bg-gray-800 rounded text-sm font-mono text-gray-800 dark:text-gray-300" {
+                            (ctx.path)
+                        }
+                        " could not be found."
+                    }
+                    div class="mt-8" {
+                        a href="/"
+                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
+                            "Go to homepage"
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     fn render_500(&self, ctx: &ErrorContext) -> Markup {
-        error_page_layout(ctx, html! {
-            div class="text-center" {
-                div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
-                    "500"
-                }
-                h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
-                    "Internal server error"
-                }
-                p class="mt-2 text-gray-600 dark:text-gray-400" {
-                    "Something went wrong. Please try again later."
-                }
-                @if let Some(ref req_id) = ctx.request_id {
-                    p class="mt-4 text-xs text-gray-400 dark:text-gray-500 font-mono" {
-                        "Request ID: " (req_id)
+        error_page_layout(
+            ctx,
+            &html! {
+                div class="text-center" {
+                    div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
+                        "500"
+                    }
+                    h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
+                        "Internal server error"
+                    }
+                    p class="mt-2 text-gray-600 dark:text-gray-400" {
+                        "Something went wrong. Please try again later."
+                    }
+                    @if let Some(ref req_id) = ctx.request_id {
+                        p class="mt-4 text-xs text-gray-400 dark:text-gray-500 font-mono" {
+                            "Request ID: " (req_id)
+                        }
+                    }
+                    div class="mt-8" {
+                        a href="/"
+                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
+                            "Go to homepage"
+                        }
                     }
                 }
-                div class="mt-8" {
-                    a href="/"
-                      class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                        "Go to homepage"
-                    }
-                }
-            }
-        })
+            },
+        )
     }
 
     fn render_422(&self, ctx: &ErrorContext) -> Markup {
-        error_page_layout(ctx, html! {
-            div class="text-center" {
-                div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
-                    "422"
-                }
-                h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
-                    "Validation error"
-                }
-                p class="mt-2 text-gray-600 dark:text-gray-400" {
-                    (ctx.message)
-                }
-                @if let Some(ref details) = ctx.details {
-                    div class="mt-6 max-w-md mx-auto text-left" {
-                        @for (field, errors) in details {
-                            div class="mb-3" {
-                                p class="text-sm font-medium text-gray-700 dark:text-gray-300" {
-                                    (field)
-                                }
-                                @for error in errors {
-                                    p class="text-sm text-red-600 dark:text-red-400 ml-2" {
-                                        "- " (error)
+        error_page_layout(
+            ctx,
+            &html! {
+                div class="text-center" {
+                    div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
+                        "422"
+                    }
+                    h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
+                        "Validation error"
+                    }
+                    p class="mt-2 text-gray-600 dark:text-gray-400" {
+                        (ctx.message)
+                    }
+                    @if let Some(ref details) = ctx.details {
+                        div class="mt-6 max-w-md mx-auto text-left" {
+                            @for (field, errors) in details {
+                                div class="mb-3" {
+                                    p class="text-sm font-medium text-gray-700 dark:text-gray-300" {
+                                        (field)
+                                    }
+                                    @for error in errors {
+                                        p class="text-sm text-red-600 dark:text-red-400 ml-2" {
+                                            "- " (error)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                div class="mt-8" {
-                    a href="javascript:history.back()"
-                      class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                        "Go back"
+                    div class="mt-8" {
+                        a href="javascript:history.back()"
+                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
+                            "Go back"
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     fn render_error(&self, ctx: &ErrorContext) -> Markup {
         let status_code = ctx.status.as_u16();
         let reason = ctx.status.canonical_reason().unwrap_or("Error");
 
-        error_page_layout(ctx, html! {
-            div class="text-center" {
-                div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
-                    (status_code)
-                }
-                h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
-                    (reason)
-                }
-                p class="mt-2 text-gray-600 dark:text-gray-400" {
-                    (ctx.message)
-                }
-                @if let Some(ref req_id) = ctx.request_id {
-                    p class="mt-4 text-xs text-gray-400 dark:text-gray-500 font-mono" {
-                        "Request ID: " (req_id)
+        error_page_layout(
+            ctx,
+            &html! {
+                div class="text-center" {
+                    div class="text-8xl font-bold text-gray-200 dark:text-gray-700 select-none" {
+                        (status_code)
+                    }
+                    h1 class="mt-4 text-2xl font-semibold text-gray-900 dark:text-gray-100" {
+                        (reason)
+                    }
+                    p class="mt-2 text-gray-600 dark:text-gray-400" {
+                        (ctx.message)
+                    }
+                    @if let Some(ref req_id) = ctx.request_id {
+                        p class="mt-4 text-xs text-gray-400 dark:text-gray-500 font-mono" {
+                            "Request ID: " (req_id)
+                        }
+                    }
+                    div class="mt-8" {
+                        a href="/"
+                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
+                            "Go to homepage"
+                        }
                     }
                 }
-                div class="mt-8" {
-                    a href="/"
-                      class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                        "Go to homepage"
-                    }
-                }
-            }
-        })
+            },
+        )
     }
 }
 
 /// Shared HTML layout wrapper for all error pages.
-fn error_page_layout(ctx: &ErrorContext, content: Markup) -> Markup {
+fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
     let status_code = ctx.status.as_u16();
     let reason = ctx.status.canonical_reason().unwrap_or("Error");
     let title = format!("{status_code} {reason}");
@@ -163,7 +175,7 @@ fn error_page_layout(ctx: &ErrorContext, content: Markup) -> Markup {
 
 /// Minimal inline CSS fallback so error pages look reasonable even without
 /// Tailwind CSS loaded. Provides the essential layout and dark mode styling.
-const FALLBACK_STYLES: &str = r#"<style>
+const FALLBACK_STYLES: &str = r"<style>
 :root { color-scheme: light dark; }
 body {
     font-family: system-ui, -apple-system, sans-serif;
@@ -196,7 +208,7 @@ a {
     transition: opacity 0.15s;
 }
 a:hover { opacity: 0.8; }
-</style>"#;
+</style>";
 
 #[cfg(test)]
 mod tests {
@@ -219,7 +231,10 @@ mod tests {
         let pages = DefaultErrorPages;
         let html = pages.render_404(&make_ctx(StatusCode::NOT_FOUND));
         let s = html.into_string();
-        assert!(s.contains("/test/path"), "404 page should show request path");
+        assert!(
+            s.contains("/test/path"),
+            "404 page should show request path"
+        );
         assert!(s.contains("Page not found"));
         assert!(s.contains("404"));
     }

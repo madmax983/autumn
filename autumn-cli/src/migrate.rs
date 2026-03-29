@@ -107,7 +107,9 @@ fn check_diesel_cli() {
         }
         _ => {
             eprintln!("\u{2717} diesel CLI not found on PATH.");
-            eprintln!("  Install it with: cargo install diesel_cli --no-default-features --features postgres");
+            eprintln!(
+                "  Install it with: cargo install diesel_cli --no-default-features --features postgres"
+            );
             std::process::exit(1);
         }
     }
@@ -118,12 +120,7 @@ fn run_migrations(database_url: &str, migrations_dir: &str) {
     eprintln!("  Running pending migrations...\n");
 
     let status = Command::new("diesel")
-        .args([
-            "migration",
-            "run",
-            "--migration-dir",
-            migrations_dir,
-        ])
+        .args(["migration", "run", "--migration-dir", migrations_dir])
         .env("DATABASE_URL", database_url)
         .status();
 
@@ -132,7 +129,9 @@ fn run_migrations(database_url: &str, migrations_dir: &str) {
             eprintln!("\n\u{2713} Migrations applied successfully.");
         }
         Ok(_) => {
-            eprintln!("\n\u{2717} Migration failed. Check the error output above for the failing SQL.");
+            eprintln!(
+                "\n\u{2717} Migration failed. Check the error output above for the failing SQL."
+            );
             std::process::exit(1);
         }
         Err(e) => {
@@ -148,12 +147,7 @@ fn show_status(database_url: &str, migrations_dir: &str) {
 
     // `diesel migration list` shows all migrations and their status
     let status = Command::new("diesel")
-        .args([
-            "migration",
-            "list",
-            "--migration-dir",
-            migrations_dir,
-        ])
+        .args(["migration", "list", "--migration-dir", migrations_dir])
         .env("DATABASE_URL", database_url)
         .status();
 

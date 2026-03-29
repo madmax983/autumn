@@ -31,10 +31,10 @@ use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
 use crate::error_pages::{self, ErrorPageRenderer, SharedRenderer};
-#[cfg(feature = "db")]
-use crate::migrate;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
+#[cfg(feature = "db")]
+use crate::migrate;
 use crate::route::Route;
 
 /// Create a new [`AppBuilder`].
@@ -407,7 +407,7 @@ impl AppBuilder {
     /// ```
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
+    pub const fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
         self.migrations = Some(migrations);
         self
     }
@@ -431,6 +431,7 @@ impl AppBuilder {
     /// Panics if no routes have been registered via [`.routes()`](Self::routes).
     /// This is intentional -- an application with no routes is always a
     /// developer error.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self) {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
@@ -631,6 +632,7 @@ impl AppBuilder {
 ///
 /// Each task runs in its own spawned task with error logging.
 /// Uses simple `tokio::time` for fixed-delay scheduling.
+#[allow(clippy::cast_possible_truncation)]
 fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
@@ -659,15 +661,19 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                         let start = std::time::Instant::now();
                         match (handler)(state.clone()).await {
                             Ok(()) => {
-                                let duration_ms = start.elapsed().as_millis() as u64;
+                                let duration_ms =
+                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 state.task_registry.record_success(&name, duration_ms);
                                 tracing::debug!(task = %name, "Task completed");
                             }
                             Err(e) => {
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                state
-                                    .task_registry
-                                    .record_failure(&name, duration_ms, &e.to_string());
+                                let duration_ms =
+                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                                state.task_registry.record_failure(
+                                    &name,
+                                    duration_ms,
+                                    &e.to_string(),
+                                );
                                 tracing::warn!(task = %name, error = %e, "Task failed");
                             }
                         }
@@ -743,6 +749,7 @@ pub fn build_router_merged(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -889,10 +896,8 @@ fn build_router_inner(
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
     let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
-    let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
-        renderer,
-        is_dev,
-    };
+    let error_page_filter =
+        crate::middleware::error_page_filter::ErrorPageFilter { renderer, is_dev };
 
     // Combine the error page filter with user exception filters.
     // The error page filter runs first (innermost), then user filters.
@@ -900,7 +905,10 @@ fn build_router_inner(
     all_filters.extend(exception_filters);
 
     let count = all_filters.len();
-    tracing::debug!(count, "Registered exception filters (including error page filter)");
+    tracing::debug!(
+        count,
+        "Registered exception filters (including error page filter)"
+    );
 
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
@@ -943,6 +951,7 @@ pub fn build_router_with_static(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -1016,7 +1025,7 @@ fn build_router_with_static_inner(
     // ISR staleness checking: before ServeDir handles the request, we
     // trigger resolve() on the StaticFileLayer to check for stale pages
     // and spawn background regeneration tasks if needed.
-    let isr_layer = layer.clone();
+    let isr_layer = layer;
     let serve_dir = tower_http::services::ServeDir::new(dist);
     app_router
         .layer(axum::middleware::from_fn(
@@ -1026,7 +1035,7 @@ fn build_router_with_static_inner(
                     // Trigger ISR check for GET requests (resolves the path
                     // and spawns background regeneration if stale)
                     if req.method() == http::Method::GET {
-                        isr_layer.resolve(req.uri().path());
+                        let _ = isr_layer.resolve(req.uri().path());
                     }
                     next.run(req).await
                 }

@@ -186,10 +186,7 @@ mod tests {
     #[test]
     fn parse_migrate_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Migrate { action: None }
-        ));
+        assert!(matches!(cli.command, Commands::Migrate { action: None }));
     }
 
     #[test]
