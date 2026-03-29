@@ -28,6 +28,53 @@ If you omit the database:
 Every line tells you something Autumn decided on your behalf. No silent
 configuration -- if the framework did it, it logged it.
 
+### Full transparency mode: `--show-config`
+
+For a complete dump of everything Autumn configured -- every route, every
+scheduled task, every middleware layer, and all resolved configuration values
+-- use the `--show-config` flag:
+
+```bash
+autumn dev --show-config
+```
+
+Or with `cargo run`:
+
+```bash
+AUTUMN_SHOW_CONFIG=1 cargo run
+```
+
+This produces output like:
+
+```
+  INFO autumn: Autumn starting version="0.1.0" profile="dev"
+  INFO autumn: Registered routes:
+    /            GET      -> index
+    /todos       GET      -> list_todos
+    /todos       POST     -> create_todo
+    /todos/{id}  DELETE   -> delete_todo
+    /health      GET      -> health
+    /actuator/*  GET      -> actuator
+  INFO autumn: Scheduled tasks:
+    cleanup (every 300s)
+  INFO autumn: Active middleware: RequestId, SecurityHeaders, Session (in-memory), CORS, Metrics
+  INFO autumn: Configuration:
+    profile:    dev
+    server:     127.0.0.1:3000
+    database:   localhost/mydb (pool_size=10)
+    log_level:  debug
+    log_format: Pretty
+    health:     /health (detailed=true)
+    actuator:   sensitive=true
+    shutdown:   1s
+  INFO autumn: Database pool configured max_connections=10
+  INFO autumn: Listening addr=127.0.0.1:3000
+```
+
+Database passwords are masked in the output. The log shows the fully resolved
+configuration after all 5 layers have been merged, so you can verify that your
+env vars, profile overrides, and TOML settings are all taking effect.
+
 ### What happens at startup (step by step)
 
 1. **Load configuration** -- 5-layer merge (defaults → profile smart defaults

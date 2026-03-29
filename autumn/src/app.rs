@@ -464,6 +464,12 @@ impl AppBuilder {
             "Autumn starting"
         );
 
+        // 4b. Startup transparency log (AUTUMN_SHOW_CONFIG=1 or log level <= DEBUG)
+        let show_config = std::env::var("AUTUMN_SHOW_CONFIG").as_deref() == Ok("1");
+        if show_config {
+            log_startup_transparency(&self.routes, &self.tasks, &self.scoped_groups, &config);
+        }
+
         // 5. Create database pool (if configured)
         #[cfg(feature = "db")]
         let pool = match db::create_pool(&config.database) {
@@ -695,6 +701,99 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
             }
         }
     }
+}
+
+/// Log a structured startup transparency report.
+///
+/// Activated by setting `AUTUMN_SHOW_CONFIG=1` (or `autumn dev --show-config`).
+/// Prints all registered routes, scheduled tasks, active middleware, and
+/// resolved configuration to the `INFO` log so developers can see exactly
+/// what the macros and conventions configured.
+fn log_startup_transparency(
+    routes: &[Route],
+    tasks: &[crate::task::TaskInfo],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) {
+    // ── Routes ────────────────────────────────────────────────────
+    let mut route_lines = String::new();
+    for route in routes {
+        route_lines.push_str(&format!("\n    {} {:<8} -> {}", route.path, route.method, route.name));
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            route_lines.push_str(&format!(
+                "\n    {}{} {:<8} -> {} (scoped)",
+                group.prefix, route.path, route.method, route.name
+            ));
+        }
+    }
+    // Framework routes (always present)
+    route_lines.push_str(&format!("\n    {} {:<8} -> health", config.health.path, "GET"));
+    route_lines.push_str("\n    /actuator/* GET      -> actuator");
+    #[cfg(feature = "htmx")]
+    route_lines.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+
+    tracing::info!("Registered routes:{route_lines}");
+
+    // ── Scheduled tasks ───────────────────────────────────────────
+    if !tasks.is_empty() {
+        let mut task_lines = String::new();
+        for task in tasks {
+            let schedule = match &task.schedule {
+                crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+                crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
+            };
+            task_lines.push_str(&format!("\n    {} ({})", task.name, schedule));
+        }
+        tracing::info!("Scheduled tasks:{task_lines}");
+    }
+
+    // ── Middleware ─────────────────────────────────────────────────
+    let mut middleware = vec!["RequestId", "SecurityHeaders", "Session (in-memory)", "ErrorPages"];
+    if !config.cors.allowed_origins.is_empty() {
+        middleware.push("CORS");
+    }
+    if config.security.csrf.enabled {
+        middleware.push("CSRF");
+    }
+    middleware.push("Metrics");
+    let mw_str = middleware.join(", ");
+    tracing::info!("Active middleware: {mw_str}");
+
+    // ── Configuration ─────────────────────────────────────────────
+    let profile = config.profile.as_deref().unwrap_or("none");
+    let db_status = config.database.url.as_deref().map_or(
+        "not configured".to_owned(),
+        |url| {
+            // Mask password in URL for safe logging
+            if let Some(at_pos) = url.find('@') {
+                if let Some(colon_pos) = url[..at_pos].rfind(':') {
+                    return format!("{}:****@{} (pool_size={})", &url[..colon_pos], &url[at_pos + 1..], config.database.pool_size);
+                }
+            }
+            format!("{url} (pool_size={})", config.database.pool_size)
+        },
+    );
+    tracing::info!(
+        "Configuration:\
+        \n    profile:    {profile}\
+        \n    server:     {}:{}\
+        \n    database:   {db_status}\
+        \n    log_level:  {}\
+        \n    log_format: {:?}\
+        \n    health:     {} (detailed={})\
+        \n    actuator:   sensitive={}\
+        \n    shutdown:   {}s",
+        config.server.host,
+        config.server.port,
+        config.log.level,
+        config.log.format,
+        config.health.path,
+        config.health.detailed,
+        config.actuator.sensitive,
+        config.server.shutdown_timeout_secs,
+    );
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
