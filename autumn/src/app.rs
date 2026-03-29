@@ -716,20 +716,23 @@ fn log_startup_transparency(
     config: &AutumnConfig,
 ) {
     // ── Routes ────────────────────────────────────────────────────
+    use std::fmt::Write as _;
+
     let mut route_lines = String::new();
     for route in routes {
-        route_lines.push_str(&format!("\n    {} {:<8} -> {}", route.path, route.method, route.name));
+        let _ = write!(route_lines, "\n    {} {:<8} -> {}", route.path, route.method, route.name);
     }
     for group in scoped_groups {
         for route in &group.routes {
-            route_lines.push_str(&format!(
+            let _ = write!(
+                route_lines,
                 "\n    {}{} {:<8} -> {} (scoped)",
                 group.prefix, route.path, route.method, route.name
-            ));
+            );
         }
     }
     // Framework routes (always present)
-    route_lines.push_str(&format!("\n    {} {:<8} -> health", config.health.path, "GET"));
+    let _ = write!(route_lines, "\n    {} {:<8} -> health", config.health.path, "GET");
     route_lines.push_str("\n    /actuator/* GET      -> actuator");
     #[cfg(feature = "htmx")]
     route_lines.push_str("\n    /static/js/htmx.min.js GET -> htmx");
@@ -744,7 +747,7 @@ fn log_startup_transparency(
                 crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
                 crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
             };
-            task_lines.push_str(&format!("\n    {} ({})", task.name, schedule));
+            let _ = write!(task_lines, "\n    {} ({schedule})", task.name);
         }
         tracing::info!("Scheduled tasks:{task_lines}");
     }
@@ -763,8 +766,8 @@ fn log_startup_transparency(
 
     // ── Configuration ─────────────────────────────────────────────
     let profile = config.profile.as_deref().unwrap_or("none");
-    let db_status = config.database.url.as_deref().map_or(
-        "not configured".to_owned(),
+    let db_status = config.database.url.as_deref().map_or_else(
+        || "not configured".to_owned(),
         |url| {
             // Mask password in URL for safe logging
             if let Some(at_pos) = url.find('@') {
