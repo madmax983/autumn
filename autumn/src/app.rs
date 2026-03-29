@@ -26,7 +26,6 @@
 
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
@@ -37,6 +36,7 @@ use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer}
 #[cfg(feature = "db")]
 use crate::migrate;
 use crate::route::Route;
+use crate::state::AppState;
 
 /// Create a new [`AppBuilder`].
 ///
@@ -503,7 +503,8 @@ impl AppBuilder {
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::from_config(&config),
         };
-        let dist_dir = project_dir("dist");
+        let env = crate::config::OsEnv;
+        let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
             Some(dist_dir.as_path())
         } else {
@@ -610,7 +611,8 @@ impl AppBuilder {
         // Build the full router (same as production)
         let router = build_router(self.routes, &config, state);
 
-        let dist_dir = project_dir("dist");
+        let env = crate::config::OsEnv;
+        let dist_dir = project_dir("dist", &env);
 
         eprintln!("Building {} static route(s)...", self.static_metas.len());
 
@@ -701,8 +703,8 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 /// Extracted from `AppBuilder::run` so the router construction logic is
 /// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
 /// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
-fn project_dir(subdir: &str) -> std::path::PathBuf {
-    std::env::var("AUTUMN_MANIFEST_DIR").map_or_else(
+fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
+    env.var("AUTUMN_MANIFEST_DIR").map_or_else(
         |_| std::path::PathBuf::from(subdir),
         |d| std::path::PathBuf::from(d).join(subdir),
     )
@@ -830,7 +832,8 @@ fn build_router_inner(
     );
 
     // Static file serving from project's static/ directory.
-    let static_dir = project_dir("static");
+    let env = crate::config::OsEnv;
+    let static_dir = project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
     // Mount scoped route groups (each with its own middleware layer).
@@ -1704,9 +1707,8 @@ mod tests {
     fn project_dir_defaults_to_subdir() {
         // When AUTUMN_MANIFEST_DIR is not set, project_dir returns the
         // subdir name as-is (relative to cwd).
-        // SAFETY: called in a single-threaded test context.
-        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
-        let dir = super::project_dir("dist");
+        let env = crate::config::MockEnv::new();
+        let dir = super::project_dir("dist", &env);
         assert_eq!(dir, std::path::PathBuf::from("dist"));
     }
 

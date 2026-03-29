@@ -30,7 +30,7 @@ use proc_macro::TokenStream;
 /// Annotate an async function as a GET route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
+/// returns a `Route` pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -53,7 +53,7 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a POST route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
+/// returns a `Route` pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -76,7 +76,7 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a PUT route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
+/// returns a `Route` pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.
@@ -99,7 +99,7 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Annotate an async function as a DELETE route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
-/// returns an [`autumn_web::route::Route`] pairing the path with an Axum
+/// returns a `Route` pairing the path with an Axum
 /// handler. In debug builds, `#[axum::debug_handler]` is automatically
 /// applied for improved error messages. This has zero cost in release
 /// builds.

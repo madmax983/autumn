@@ -69,7 +69,7 @@ pub use crate::security::CsrfToken;
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
-pub use crate::AppState;
+pub use crate::state::AppState;
 
 #[cfg(test)]
 mod tests {

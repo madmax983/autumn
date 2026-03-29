@@ -52,13 +52,20 @@ pub fn run(action: MigrateAction) {
 /// 2. `DATABASE_URL` environment variable
 /// 3. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
+    resolve_database_url_with_env(|key| std::env::var(key))
+}
+
+fn resolve_database_url_with_env<F>(env_var: F) -> String
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     // Check env overrides first
-    if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL") {
+    if let Ok(url) = env_var("AUTUMN_DATABASE__URL") {
         if !url.is_empty() {
             return url;
         }
     }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
+    if let Ok(url) = env_var("DATABASE_URL") {
         if !url.is_empty() {
             return url;
         }
@@ -167,56 +174,6 @@ fn show_status(database_url: &str, migrations_dir: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
 
     #[test]
     fn migrate_action_eq() {
@@ -233,21 +190,28 @@ mod tests {
     #[test]
     fn resolve_database_url_from_env() {
         // AUTUMN_DATABASE__URL takes priority
-        let _env = EnvGuard::set_many(&[
-            ("AUTUMN_DATABASE__URL", Some("postgres://test:5432/mydb")),
-            ("DATABASE_URL", None),
-        ]);
-        let url = resolve_database_url();
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            if key == "AUTUMN_DATABASE__URL" {
+                Ok("postgres://test:5432/mydb".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let url = resolve_database_url_with_env(env_var);
         assert_eq!(url, "postgres://test:5432/mydb");
     }
 
     #[test]
     fn resolve_database_url_from_database_url_env() {
-        let _env = EnvGuard::set_many(&[
-            ("AUTUMN_DATABASE__URL", None),
-            ("DATABASE_URL", Some("postgres://fallback:5432/db")),
-        ]);
-        let url = resolve_database_url();
+        // Make sure AUTUMN_DATABASE__URL is not set, but DATABASE_URL is
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            if key == "DATABASE_URL" {
+                Ok("postgres://fallback:5432/db".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let url = resolve_database_url_with_env(env_var);
         assert_eq!(url, "postgres://fallback:5432/db");
     }
 }

@@ -57,9 +57,67 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
+/// Abstraction for reading environment variables, supporting dependency injection for testing.
+pub trait Env {
+    /// Read an environment variable.
+    ///
+    /// # Errors
+    /// Returns [`std::env::VarError`] if the variable is not present or is not valid Unicode.
+    fn var(&self, key: &str) -> Result<String, std::env::VarError>;
+}
+
+/// Production implementation of `Env` that reads from the OS environment.
+#[derive(Clone, Default)]
+pub struct OsEnv;
+
+impl Env for OsEnv {
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        std::env::var(key)
+    }
+}
+
+/// Mock implementation of `Env` for testing.
+#[derive(Clone, Default)]
+pub struct MockEnv {
+    vars: std::collections::HashMap<String, String>,
+}
+
+impl MockEnv {
+    /// Create a new, empty `MockEnv`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            vars: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Set an environment variable in the mock.
+    #[must_use]
+    pub fn with(mut self, key: &str, value: &str) -> Self {
+        self.vars.insert(key.to_owned(), value.to_owned());
+        self
+    }
+
+    /// Remove an environment variable from the mock.
+    #[must_use]
+    pub fn without(mut self, key: &str) -> Self {
+        self.vars.remove(key);
+        self
+    }
+}
+
+impl Env for MockEnv {
+    fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        self.vars
+            .get(key)
+            .cloned()
+            .ok_or(std::env::VarError::NotPresent)
+    }
+}
+
 /// Locate a config file by checking the app's crate directory first, then CWD.
-fn find_config_file_named(filename: &str) -> PathBuf {
-    if let Ok(manifest_dir) = std::env::var("AUTUMN_MANIFEST_DIR") {
+fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
+    if let Ok(manifest_dir) = env.var("AUTUMN_MANIFEST_DIR") {
         let candidate = PathBuf::from(manifest_dir).join(filename);
         if candidate.exists() {
             return candidate;
@@ -83,9 +141,9 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
 /// 1. `AUTUMN_PROFILE` env var (highest priority)
 /// 2. `--profile <name>` CLI flag
 /// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
-fn resolve_profile() -> Option<String> {
+fn resolve_profile(env: &dyn Env) -> Option<String> {
     // 1. Env var
-    if let Ok(profile) = std::env::var("AUTUMN_PROFILE") {
+    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
         if !profile.is_empty() {
             return Some(profile);
         }
@@ -105,7 +163,7 @@ fn resolve_profile() -> Option<String> {
     }
 
     // 3. Auto-detect from build mode
-    match std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() {
+    match env.var("AUTUMN_IS_DEBUG").ok().as_deref() {
         Some("1") => Some("dev".to_owned()),
         Some("0") => Some("prod".to_owned()),
         _ => None,
@@ -373,7 +431,21 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize
     /// (should never happen with well-formed profile defaults).
     pub fn load() -> Result<Self, ConfigError> {
-        let profile = resolve_profile();
+        Self::load_with_env(&OsEnv)
+    }
+
+    /// Load configuration with profile-aware layering, using a provided
+    /// environment abstraction instead of the OS environment. Useful for testing.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Io`] if a config file cannot be read,
+    /// [`ConfigError::Parse`] if a file contains invalid TOML, or
+    /// [`ConfigError::Validation`] if a value is invalid.
+    ///
+    /// # Panics
+    /// Panics if the internally-built TOML table fails to re-serialize.
+    pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
+        let profile = resolve_profile(env);
 
         // Build merged TOML: profile smart defaults ← autumn.toml ← autumn-{profile}.toml
         let mut merged = profile.as_ref().map_or_else(
@@ -382,13 +454,13 @@ impl AutumnConfig {
         );
 
         // Layer 3: base autumn.toml
-        if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml"))? {
+        if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
             deep_merge(&mut merged, base);
         }
 
         // Layer 4: autumn-{profile}.toml
         if let Some(ref p) = profile {
-            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"));
+            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
             match load_raw_toml(&profile_path)? {
                 Some(profile_toml) => deep_merge(&mut merged, profile_toml),
                 None if p != "dev" && p != "prod" => warn_profile_typo(p),
@@ -403,7 +475,7 @@ impl AutumnConfig {
         config.profile = profile;
 
         // Layer 5: env var overrides (highest priority)
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(env);
 
         config.database.validate()?;
         Ok(config)
@@ -449,31 +521,38 @@ impl AutumnConfig {
     /// # Health
     /// - `AUTUMN_HEALTH__PATH` → `health.path` (String)
     pub fn apply_env_overrides(&mut self) {
+        self.apply_env_overrides_with_env(&OsEnv);
+    }
+
+    /// Apply environment overrides using the provided env abstraction.
+    pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         // ── Server ──────────────────────────────────────────────
-        parse_env("AUTUMN_SERVER__PORT", &mut self.server.port);
-        if let Ok(val) = std::env::var("AUTUMN_SERVER__HOST") {
-            self.server.host = val;
-        }
+        parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
+        parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
+            env,
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
         );
 
         // ── Database ────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_DATABASE__URL") {
+        if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
-        parse_env("AUTUMN_DATABASE__POOL_SIZE", &mut self.database.pool_size);
         parse_env(
+            env,
+            "AUTUMN_DATABASE__POOL_SIZE",
+            &mut self.database.pool_size,
+        );
+        parse_env(
+            env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
         );
 
         // ── Log ─────────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_LOG__LEVEL") {
-            self.log.level = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_LOG__FORMAT") {
+        parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
+        if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
                 "Auto" => self.log.format = LogFormat::Auto,
                 "Pretty" => self.log.format = LogFormat::Pretty,
@@ -486,130 +565,116 @@ impl AutumnConfig {
         }
 
         // ── Health ──────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_HEALTH__PATH") {
-            self.health.path = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_HEALTH__DETAILED") {
-            match val.as_str() {
-                "true" | "1" => self.health.detailed = true,
-                "false" | "0" => self.health.detailed = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_HEALTH__DETAILED={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
+        parse_env_string(env, "AUTUMN_HEALTH__PATH", &mut self.health.path);
+        parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
 
         // ── CORS ────────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_ORIGINS") {
-            self.cors.allowed_origins = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_METHODS") {
-            self.cors.allowed_methods = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOWED_HEADERS") {
-            self.cors.allowed_headers = val.split(',').map(|s| s.trim().to_owned()).collect();
-        }
-        if let Ok(val) = std::env::var("AUTUMN_CORS__ALLOW_CREDENTIALS") {
-            match val.as_str() {
-                "true" | "1" => self.cors.allow_credentials = true,
-                "false" | "0" => self.cors.allow_credentials = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_CORS__ALLOW_CREDENTIALS={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
-        parse_env("AUTUMN_CORS__MAX_AGE_SECS", &mut self.cors.max_age_secs);
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_ORIGINS",
+            &mut self.cors.allowed_origins,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_METHODS",
+            &mut self.cors.allowed_methods,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_CORS__ALLOWED_HEADERS",
+            &mut self.cors.allowed_headers,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_CORS__ALLOW_CREDENTIALS",
+            &mut self.cors.allow_credentials,
+        );
+        parse_env(
+            env,
+            "AUTUMN_CORS__MAX_AGE_SECS",
+            &mut self.cors.max_age_secs,
+        );
 
         // ── Session ────────────────────────────────────────────
-        if let Ok(val) = std::env::var("AUTUMN_SESSION__COOKIE_NAME") {
-            self.session.cookie_name = val;
-        }
+        parse_env_string(
+            env,
+            "AUTUMN_SESSION__COOKIE_NAME",
+            &mut self.session.cookie_name,
+        );
         parse_env(
+            env,
             "AUTUMN_SESSION__MAX_AGE_SECS",
             &mut self.session.max_age_secs,
         );
-        if let Ok(val) = std::env::var("AUTUMN_SESSION__SECURE") {
-            match val.as_str() {
-                "true" | "1" => self.session.secure = true,
-                "false" | "0" => self.session.secure = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SESSION__SECURE={val:?} is not valid \
-                     (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SESSION__SAME_SITE") {
-            self.session.same_site = val;
-        }
+        parse_env_bool(env, "AUTUMN_SESSION__SECURE", &mut self.session.secure);
+        parse_env_string(
+            env,
+            "AUTUMN_SESSION__SAME_SITE",
+            &mut self.session.same_site,
+        );
 
         // ── Auth ───────────────────────────────────────────────
-        parse_env("AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
-        if let Ok(val) = std::env::var("AUTUMN_AUTH__SESSION_KEY") {
-            self.auth.session_key = val;
-        }
+        parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
+        parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
 
         // ── Security ────────────────────────────────────────
-        self.apply_security_env_overrides();
+        self.apply_security_env_overrides_with_env(env);
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
-    fn apply_security_env_overrides(&mut self) {
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS") {
-            self.security.headers.x_frame_options = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS") {
-            match val.as_str() {
-                "true" | "1" => self.security.headers.x_content_type_options = true,
-                "false" | "0" => self.security.headers.x_content_type_options = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY") {
-            match val.as_str() {
-                "true" | "1" => self.security.headers.strict_transport_security = true,
-                "false" | "0" => self.security.headers.strict_transport_security = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
+    fn apply_security_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_FRAME_OPTIONS",
+            &mut self.security.headers.x_frame_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__X_CONTENT_TYPE_OPTIONS",
+            &mut self.security.headers.x_content_type_options,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__HEADERS__STRICT_TRANSPORT_SECURITY",
+            &mut self.security.headers.strict_transport_security,
+        );
         parse_env(
+            env,
             "AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS",
             &mut self.security.headers.hsts_max_age_secs,
         );
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY") {
-            self.security.headers.content_security_policy = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__REFERRER_POLICY") {
-            self.security.headers.referrer_policy = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY") {
-            self.security.headers.permissions_policy = val;
-        }
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY",
+            &mut self.security.headers.content_security_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__REFERRER_POLICY",
+            &mut self.security.headers.referrer_policy,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__HEADERS__PERMISSIONS_POLICY",
+            &mut self.security.headers.permissions_policy,
+        );
 
         // CSRF
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__ENABLED") {
-            match val.as_str() {
-                "true" | "1" => self.security.csrf.enabled = true,
-                "false" | "0" => self.security.csrf.enabled = false,
-                _ => eprintln!(
-                    "Warning: AUTUMN_SECURITY__CSRF__ENABLED={val:?} \
-                     is not valid (expected true/false), ignoring"
-                ),
-            }
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__TOKEN_HEADER") {
-            self.security.csrf.token_header = val;
-        }
-        if let Ok(val) = std::env::var("AUTUMN_SECURITY__CSRF__COOKIE_NAME") {
-            self.security.csrf.cookie_name = val;
-        }
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__CSRF__ENABLED",
+            &mut self.security.csrf.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__TOKEN_HEADER",
+            &mut self.security.csrf.token_header,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
+            &mut self.security.csrf.cookie_name,
+        );
     }
 
     /// Returns the active profile name, if any.
@@ -938,12 +1003,34 @@ const fn default_cors_max_age() -> u64 {
 }
 
 /// Parse an environment variable into a typed target, logging a warning on failure.
-fn parse_env<T: std::str::FromStr>(key: &str, target: &mut T) {
-    if let Ok(val) = std::env::var(key) {
+fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
+    if let Ok(val) = env.var(key) {
         match val.parse::<T>() {
             Ok(v) => *target = v,
             Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
         }
+    }
+}
+
+fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
+    if let Ok(val) = env.var(key) {
+        *target = val;
+    }
+}
+
+fn parse_env_bool(env: &dyn Env, key: &str, target: &mut bool) {
+    if let Ok(val) = env.var(key) {
+        match val.as_str() {
+            "true" | "1" => *target = true,
+            "false" | "0" => *target = false,
+            _ => eprintln!("Warning: {key}={val:?} is not valid (expected true/false), ignoring"),
+        }
+    }
+}
+
+fn parse_env_csv(env: &dyn Env, key: &str, target: &mut Vec<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = val.split(',').map(|s| s.trim().to_owned()).collect();
     }
 }
 
@@ -1020,65 +1107,6 @@ impl Default for HealthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Mutex that serialises all tests which mutate environment variables.
-    /// Env vars are process-global, so concurrent tests that set/restore
-    /// the same key race each other. Locking this mutex prevents that.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard that sets an env var and restores it on drop.
-    /// Holds `ENV_LOCK` for its entire lifetime so concurrent env-mutating
-    /// tests cannot interleave.
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let lock = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let original = std::env::var(key).ok();
-            // SAFETY: Serialised by ENV_LOCK — only one test mutates the
-            // environment at a time.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                key,
-                original,
-                _lock: lock,
-            }
-        }
-
-        /// Remove an env var for the test duration. Restores on drop.
-        fn remove(key: &'static str) -> Self {
-            let lock = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self {
-                key,
-                original,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                // SAFETY: Still holding ENV_LOCK via _lock field.
-                Some(val) => unsafe { std::env::set_var(self.key, val) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     #[test]
     fn server_defaults() {
@@ -1243,9 +1271,9 @@ path = "/healthz"
 
     #[test]
     fn env_override_database_url() {
-        let _guard = EnvGuard::set("AUTUMN_DATABASE__URL", "postgres://override:5432/test");
+        let env = MockEnv::new().with("AUTUMN_DATABASE__URL", "postgres://override:5432/test");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
@@ -1254,25 +1282,25 @@ path = "/healthz"
 
     #[test]
     fn env_override_pool_size() {
-        let _guard = EnvGuard::set("AUTUMN_DATABASE__POOL_SIZE", "25");
+        let env = MockEnv::new().with("AUTUMN_DATABASE__POOL_SIZE", "25");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 25);
     }
 
     #[test]
     fn env_override_connect_timeout() {
-        let _guard = EnvGuard::set("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "15");
+        let env = MockEnv::new().with("AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS", "15");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.connect_timeout_secs, 15);
     }
 
     #[test]
     fn env_override_invalid_pool_size_ignored() {
-        let _guard = EnvGuard::set("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
+        let env = MockEnv::new().with("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
     }
 
@@ -1280,41 +1308,41 @@ path = "/healthz"
 
     #[test]
     fn env_override_server_port() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "8080");
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "8080");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.port, 8080);
     }
 
     #[test]
     fn env_override_server_host() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__HOST", "0.0.0.0");
+        let env = MockEnv::new().with("AUTUMN_SERVER__HOST", "0.0.0.0");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.host, "0.0.0.0");
     }
 
     #[test]
     fn env_override_server_shutdown_timeout() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "60");
+        let env = MockEnv::new().with("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "60");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.shutdown_timeout_secs, 60);
     }
 
     #[test]
     fn env_override_invalid_server_port_ignored() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "not_a_port");
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "not_a_port");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.port, 3000);
     }
 
     #[test]
     fn env_override_invalid_shutdown_timeout_ignored() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "forever");
+        let env = MockEnv::new().with("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "forever");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.shutdown_timeout_secs, 30);
     }
 
@@ -1322,33 +1350,33 @@ path = "/healthz"
 
     #[test]
     fn env_override_log_level() {
-        let _guard = EnvGuard::set("AUTUMN_LOG__LEVEL", "debug");
+        let env = MockEnv::new().with("AUTUMN_LOG__LEVEL", "debug");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.level, "debug");
     }
 
     #[test]
     fn env_override_log_format_json() {
-        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Json");
+        let env = MockEnv::new().with("AUTUMN_LOG__FORMAT", "Json");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.format, LogFormat::Json);
     }
 
     #[test]
     fn env_override_log_format_pretty() {
-        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Pretty");
+        let env = MockEnv::new().with("AUTUMN_LOG__FORMAT", "Pretty");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.format, LogFormat::Pretty);
     }
 
     #[test]
     fn env_override_invalid_log_format_ignored() {
-        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "yaml");
+        let env = MockEnv::new().with("AUTUMN_LOG__FORMAT", "yaml");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.format, LogFormat::Auto);
     }
 
@@ -1356,9 +1384,9 @@ path = "/healthz"
 
     #[test]
     fn env_override_health_path() {
-        let _guard = EnvGuard::set("AUTUMN_HEALTH__PATH", "/healthz");
+        let env = MockEnv::new().with("AUTUMN_HEALTH__PATH", "/healthz");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.health.path, "/healthz");
     }
 
@@ -1366,12 +1394,12 @@ path = "/healthz"
 
     #[test]
     fn env_overrides_toml_values() {
-        let _guard = EnvGuard::set("AUTUMN_SERVER__PORT", "9999");
+        let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "9999");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("autumn.toml");
         std::fs::write(&path, "[server]\nport = 4000\n").unwrap();
         let mut config = AutumnConfig::load_from(&path).unwrap();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.port, 9999); // env wins
     }
 
@@ -1421,29 +1449,22 @@ path = "/healthz"
 
     #[test]
     fn resolve_profile_from_env() {
-        let _guard = EnvGuard::set("AUTUMN_PROFILE", "staging");
-        let profile = resolve_profile();
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
+        let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("staging"));
     }
 
     #[test]
     fn resolve_profile_auto_detect_debug() {
-        // EnvGuard::remove holds the lock, so set AUTUMN_IS_DEBUG manually
-        // while already holding it via _clear.
-        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
-        // SAFETY: lock already held by _clear
-        unsafe { std::env::set_var("AUTUMN_IS_DEBUG", "1") };
-        let profile = resolve_profile();
-        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "1");
+        let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("dev"));
     }
 
     #[test]
     fn resolve_profile_auto_detect_release() {
-        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
-        unsafe { std::env::set_var("AUTUMN_IS_DEBUG", "0") };
-        let profile = resolve_profile();
-        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "0");
+        let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("prod"));
     }
 
@@ -1576,9 +1597,9 @@ path = "/healthz"
 
     #[test]
     fn env_override_health_detailed() {
-        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "true");
+        let env = MockEnv::new().with("AUTUMN_HEALTH__DETAILED", "true");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert!(config.health.detailed);
     }
 
@@ -1596,8 +1617,8 @@ path = "/healthz"
     #[test]
     fn find_config_file_falls_back_to_cwd() {
         // Without AUTUMN_MANIFEST_DIR, should return just the filename
-        let _guard = EnvGuard::remove("AUTUMN_MANIFEST_DIR");
-        let path = find_config_file_named("autumn.toml");
+        let env = MockEnv::new();
+        let path = find_config_file_named("autumn.toml", &env);
         assert_eq!(path, PathBuf::from("autumn.toml"));
     }
 
@@ -1607,8 +1628,8 @@ path = "/healthz"
         let config_path = dir.path().join("autumn.toml");
         std::fs::write(&config_path, "").unwrap();
 
-        let _guard = EnvGuard::set("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
-        let path = find_config_file_named("autumn.toml");
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let path = find_config_file_named("autumn.toml", &env);
         assert_eq!(path, config_path);
     }
 
@@ -1616,8 +1637,8 @@ path = "/healthz"
     fn find_config_file_falls_back_when_manifest_dir_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         // dir exists but the file doesn't
-        let _guard = EnvGuard::set("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
-        let path = find_config_file_named("nonexistent.toml");
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let path = find_config_file_named("nonexistent.toml", &env);
         assert_eq!(path, PathBuf::from("nonexistent.toml"));
     }
 
@@ -1627,10 +1648,9 @@ path = "/healthz"
         // inject args, but we can verify the env path doesn't match other args.
         // The `== "--profile"` guard is the key: if it were `!=`, every arg
         // would trigger the branch.
-        let _clear = EnvGuard::remove("AUTUMN_PROFILE");
-        unsafe { std::env::remove_var("AUTUMN_IS_DEBUG") };
+        let env = MockEnv::new();
         // With no env vars and no matching CLI args, should be None
-        let profile = resolve_profile();
+        let profile = resolve_profile(&env);
         // This may or may not be None depending on test harness args,
         // but the important thing is it doesn't crash or return garbage.
         // The env-based tests above cover the positive cases.
@@ -1703,12 +1723,12 @@ path = "/healthz"
 
     #[test]
     fn env_override_cors_allowed_origins() {
-        let _guard = EnvGuard::set(
+        let env = MockEnv::new().with(
             "AUTUMN_CORS__ALLOWED_ORIGINS",
             "https://a.com, https://b.com",
         );
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(
             config.cors.allowed_origins,
             vec!["https://a.com", "https://b.com"]
@@ -1717,29 +1737,27 @@ path = "/healthz"
 
     #[test]
     fn env_override_cors_allow_credentials() {
-        let _guard = EnvGuard::set("AUTUMN_CORS__ALLOW_CREDENTIALS", "true");
+        let env = MockEnv::new().with("AUTUMN_CORS__ALLOW_CREDENTIALS", "true");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert!(config.cors.allow_credentials);
     }
 
     #[test]
     fn env_override_cors_max_age() {
-        let _guard = EnvGuard::set("AUTUMN_CORS__MAX_AGE_SECS", "3600");
+        let env = MockEnv::new().with("AUTUMN_CORS__MAX_AGE_SECS", "3600");
         let mut config = AutumnConfig::default();
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.cors.max_age_secs, 3600);
     }
 
     #[test]
     fn load_uses_profile_layering() {
-        // Test AutumnConfig::load() with a dev profile via env var.
+        // Test AutumnConfig::load_with_env() with a dev profile via env var.
         // This kills the "replace load → Ok(Default::default())" mutant.
-        let _profile = EnvGuard::set("AUTUMN_PROFILE", "dev");
-        // Remove AUTUMN_MANIFEST_DIR so it doesn't find stray config files
-        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
-        let config = AutumnConfig::load().unwrap();
+        let config = AutumnConfig::load_with_env(&env).unwrap();
         // With dev profile, smart defaults should apply
         assert_eq!(config.profile.as_deref(), Some("dev"));
         assert_eq!(config.log.level, "debug"); // dev default
@@ -1752,10 +1770,9 @@ path = "/healthz"
         // Test the typo warning branch: profile != "dev" && profile != "prod"
         // without a corresponding autumn-{profile}.toml triggers warn_profile_typo.
         // This kills the match guard mutants on line 341.
-        let _profile = EnvGuard::set("AUTUMN_PROFILE", "staging");
-        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
 
-        let config = AutumnConfig::load().unwrap();
+        let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("staging"));
         // staging has no smart defaults, so values should be framework defaults
         assert_eq!(config.server.port, 3000);
@@ -1766,10 +1783,9 @@ path = "/healthz"
     fn load_dev_profile_no_profile_toml_no_warn() {
         // dev/prod without their profile TOML should NOT trigger warn_profile_typo.
         // This tests the `None => {}` branch (line 342).
-        let _profile = EnvGuard::set("AUTUMN_PROFILE", "dev");
-        unsafe { std::env::remove_var("AUTUMN_MANIFEST_DIR") };
+        let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
-        let config = AutumnConfig::load().unwrap();
+        let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("dev"));
     }
 
@@ -1814,30 +1830,30 @@ path = "/healthz"
     #[test]
     fn env_override_log_format_auto() {
         // Kills the "delete match arm Auto" mutant
-        let _guard = EnvGuard::set("AUTUMN_LOG__FORMAT", "Auto");
+        let env = MockEnv::new().with("AUTUMN_LOG__FORMAT", "Auto");
         let mut config = AutumnConfig::default();
         // Start with non-Auto to prove the override works
         config.log.format = LogFormat::Json;
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert_eq!(config.log.format, LogFormat::Auto);
     }
 
     #[test]
     fn env_override_health_detailed_false() {
         // Kills the 'delete match arm "false" | "0"' mutant
-        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "false");
+        let env = MockEnv::new().with("AUTUMN_HEALTH__DETAILED", "false");
         let mut config = AutumnConfig::default();
         config.health.detailed = true; // start true, override to false
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
     }
 
     #[test]
     fn env_override_health_detailed_zero() {
-        let _guard = EnvGuard::set("AUTUMN_HEALTH__DETAILED", "0");
+        let env = MockEnv::new().with("AUTUMN_HEALTH__DETAILED", "0");
         let mut config = AutumnConfig::default();
         config.health.detailed = true;
-        config.apply_env_overrides();
+        config.apply_env_overrides_with_env(&env);
         assert!(!config.health.detailed);
     }
 
