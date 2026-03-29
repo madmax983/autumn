@@ -42,7 +42,7 @@ jobs:
         run: cargo test --workspace
       - name: Run tests (Windows — no db feature)
         if: runner.os == 'Windows'
-        run: cargo test -p autumn-web --lib --no-default-features --features maud,htmx,tailwind && cargo test -p autumn-macros && cargo test -p autumn-cli
+        run: cargo test -p autumn-web --lib --no-default-features --features maud,htmx,tailwind
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
