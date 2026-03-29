@@ -14,9 +14,9 @@
 //! struct MyErrorPages;
 //!
 //! impl ErrorPageRenderer for MyErrorPages {
-//!     fn render_404(&self, ctx: &ErrorContext) -> Markup {
+//!     fn render_error(&self, ctx: &ErrorContext) -> Markup {
 //!         html! {
-//!             h1 { "Custom 404 - " (ctx.path) " not found" }
+//!             h1 { (ctx.status.as_u16()) " - " (ctx.path) }
 //!         }
 //!     }
 //! }

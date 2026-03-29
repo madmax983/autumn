@@ -41,11 +41,11 @@ pub struct ErrorContext {
 /// struct BrandedErrors;
 ///
 /// impl ErrorPageRenderer for BrandedErrors {
-///     fn render_404(&self, ctx: &ErrorContext) -> Markup {
+///     fn render_error(&self, ctx: &ErrorContext) -> Markup {
 ///         html! {
 ///             html {
 ///                 body {
-///                     h1 { "Oops! " (ctx.path) " was not found." }
+///                     h1 { (ctx.status.as_u16()) " — " (ctx.path) }
 ///                     a href="/" { "Go home" }
 ///                 }
 ///             }
