@@ -106,8 +106,7 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         // Only cache GET requests
         if req.method() != Method::GET {
-            let future = self.inner.call(req);
-            return Box::pin(async move { future.await });
+            return Box::pin(self.inner.call(req));
         }
 
         let cache_key = format!("http:{}", req.uri());
@@ -118,7 +117,7 @@ where
             return Box::pin(async move {
                 let mut builder = axum::response::Response::builder().status(cached.status);
                 if let Some(headers) = builder.headers_mut() {
-                    headers.extend(cached.headers.into_iter());
+                    headers.extend(cached.headers);
                 }
                 let resp = builder
                     .body(Body::from(cached.body))
@@ -145,17 +144,14 @@ where
             let (parts, body) = response.into_parts();
 
             // Buffer the body
-            let body_bytes = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(_) => {
-                    // If we can't buffer, return a 500
-                    let resp = axum::response::Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .unwrap();
-                    return Ok(resp);
-                }
+            let Ok(collected) = body.collect().await else {
+                let resp = axum::response::Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .unwrap();
+                return Ok(resp);
             };
+            let body_bytes = collected.to_bytes();
 
             // Store in cache
             let cached = CachedResponse {

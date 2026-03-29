@@ -41,7 +41,7 @@ pub struct MokaCacheBuilder {
 impl MokaCacheBuilder {
     /// Set the maximum number of entries (default: 10,000).
     #[must_use]
-    pub fn max_capacity(mut self, max: u64) -> Self {
+    pub const fn max_capacity(mut self, max: u64) -> Self {
         self.max_capacity = max;
         self
     }
@@ -49,7 +49,7 @@ impl MokaCacheBuilder {
     /// Set the time-to-live for entries. `None` means entries never expire
     /// based on time (only evicted by capacity pressure).
     #[must_use]
-    pub fn ttl(mut self, ttl: Duration) -> Self {
+    pub const fn ttl(mut self, ttl: Duration) -> Self {
         self.ttl = Some(ttl);
         self
     }
@@ -70,7 +70,7 @@ impl MokaCacheBuilder {
 impl MokaCache {
     /// Start building a new `MokaCache`.
     #[must_use]
-    pub fn builder() -> MokaCacheBuilder {
+    pub const fn builder() -> MokaCacheBuilder {
         MokaCacheBuilder {
             max_capacity: 10_000,
             ttl: None,

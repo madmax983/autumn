@@ -70,6 +70,81 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
     Ok(result)
 }
 
+/// Generate the cache wrapper body for a single function.
+fn generate_cache_body(
+    attrs: &CachedAttrs,
+    fn_name_str: &str,
+    fn_block: &syn::Block,
+    is_async: bool,
+    key_args: &TokenStream,
+    ret_type: &TokenStream,
+    value_type: &TokenStream,
+) -> TokenStream {
+    let ttl_expr = attrs.ttl.as_ref().map_or_else(
+        || quote! { None },
+        |ttl| {
+            let ttl_str = ttl.clone();
+            quote! {
+                Some(
+                    ::autumn_web::task::parse_duration(#ttl_str)
+                        .expect(concat!("invalid duration in #[cached(ttl = \"", #ttl_str, "\")]"))
+                )
+            }
+        },
+    );
+
+    let max_expr = attrs.max.map_or_else(
+        || quote! { 10_000 },
+        |max| {
+            let max_lit = LitInt::new(&max.to_string(), proc_macro2::Span::call_site());
+            quote! { #max_lit }
+        },
+    );
+
+    let compute = if is_async {
+        quote! { (|| async move #fn_block)().await }
+    } else {
+        quote! { (|| #fn_block)() }
+    };
+
+    let cache_init = quote! {
+        static __AUTUMN_CACHE: ::std::sync::OnceLock<
+            ::autumn_web::cache::MokaCache
+        > = ::std::sync::OnceLock::new();
+        let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
+            ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
+        });
+        let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
+    };
+
+    if attrs.result {
+        quote! {
+            #cache_init
+            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+                return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
+            }
+            let __autumn_result = #compute;
+            match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
+                Ok(__autumn_val) => {
+                    ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
+                    <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
+                }
+                Err(__autumn_err) => Err(__autumn_err),
+            }
+        }
+    } else {
+        quote! {
+            #cache_init
+            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+                return __autumn_cached;
+            }
+            let __autumn_result = #compute;
+            ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
+            __autumn_result
+        }
+    }
+}
+
 pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_cached_args(attr) {
         Ok(a) => a,
@@ -87,7 +162,6 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let fn_attrs = &input_fn.attrs;
     let fn_block = &input_fn.block;
-    let ret_ty = &sig.output;
     let is_async = sig.asyncness.is_some();
 
     // Collect function parameters for cache key construction.
@@ -107,15 +181,13 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Build the key expression: make_cache_key("fn_name", &(arg1.clone(), ...))
     let key_args = if param_names.is_empty() {
         quote! { &() }
     } else {
         quote! { &(#(#param_names.clone(),)*) }
     };
 
-    // Build the value type from the return type.
-    let ret_type = match ret_ty {
+    let ret_type = match &sig.output {
         syn::ReturnType::Default => quote! { () },
         syn::ReturnType::Type(_, ty) => quote! { #ty },
     };
@@ -126,81 +198,10 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         ret_type.clone()
     };
 
-    // TTL expression
-    let ttl_expr = match &attrs.ttl {
-        Some(ttl) => {
-            let ttl_str = ttl.clone();
-            quote! {
-                Some(
-                    ::autumn_web::task::parse_duration(#ttl_str)
-                        .expect(concat!("invalid duration in #[cached(ttl = \"", #ttl_str, "\")]"))
-                )
-            }
-        }
-        None => quote! { None },
-    };
+    let body = generate_cache_body(
+        &attrs, &fn_name_str, fn_block, is_async, &key_args, &ret_type, &value_type,
+    );
 
-    // Max capacity (default 10_000 if not specified)
-    let max_expr = match attrs.max {
-        Some(max) => {
-            let max_lit = LitInt::new(&max.to_string(), proc_macro2::Span::call_site());
-            quote! { #max_lit }
-        }
-        None => quote! { 10_000 },
-    };
-
-    // Generate the body depending on result mode and async.
-    let body = if attrs.result {
-        let compute = if is_async {
-            quote! { (|| async move #fn_block)().await }
-        } else {
-            quote! { (|| #fn_block)() }
-        };
-        quote! {
-            static __AUTUMN_CACHE: ::std::sync::OnceLock<
-                ::autumn_web::cache::MokaCache
-            > = ::std::sync::OnceLock::new();
-            let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-                ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
-            });
-            let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
-                return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
-            }
-            let __autumn_result = #compute;
-            match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
-                Ok(__autumn_val) => {
-                    ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
-                    <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
-                }
-                Err(__autumn_err) => Err(__autumn_err),
-            }
-        }
-    } else {
-        // Standard mode: cache the full return value.
-        let compute = if is_async {
-            quote! { (|| async move #fn_block)().await }
-        } else {
-            quote! { (|| #fn_block)() }
-        };
-        quote! {
-            static __AUTUMN_CACHE: ::std::sync::OnceLock<
-                ::autumn_web::cache::MokaCache
-            > = ::std::sync::OnceLock::new();
-            let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-                ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
-            });
-            let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
-                return __autumn_cached;
-            }
-            let __autumn_result = #compute;
-            ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
-            __autumn_result
-        }
-    };
-
-    // Rebuild the function with the caching wrapper body.
     quote! {
         #(#fn_attrs)*
         #vis #sig {

@@ -103,6 +103,10 @@ pub trait CacheableResult {
     type Err;
 
     /// Convert into a standard `Result` for pattern matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the original result was an error.
     fn into_result(self) -> Result<Self::Ok, Self::Err>;
     /// Wrap a cached `Ok` value back into the original result type.
     fn from_ok(ok: Self::Ok) -> Self;
@@ -112,7 +116,7 @@ impl<T: Clone, E> CacheableResult for Result<T, E> {
     type Ok = T;
     type Err = E;
 
-    fn into_result(self) -> Result<T, E> {
+    fn into_result(self) -> Self {
         self
     }
 
