@@ -1,0 +1,32 @@
+//! Durable workflow orchestration engine for the Autumn web framework.
+
+pub mod builder;
+pub mod context;
+pub mod error;
+pub mod event;
+pub mod info;
+pub mod models;
+pub mod policy;
+pub mod prelude;
+pub mod schema;
+pub mod types;
+
+pub use builder::{HarvestBuilder, WorkerConfig};
+pub use context::{ActivityContext, WorkflowContext};
+pub use error::{HarvestError, HarvestResult, TimeoutType, compute_retry_delay};
+pub use event::WorkflowEvent;
+pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
+pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
+
+// Allow macro-generated code to use ::autumn_harvest::serde_json
+pub use serde_json;
+
+/// Parse a human-readable duration string like `"5m"`, `"30s"`, `"1h"`.
+///
+/// Used by macro-generated code — not intended for direct use.
+#[doc(hidden)]
+#[must_use]
+pub fn task_duration(s: &str) -> Option<std::time::Duration> {
+    autumn_web::task::parse_duration(s)
+}
