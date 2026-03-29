@@ -106,7 +106,6 @@ impl Cache for MokaCache {
     fn clear(&self) {
         self.inner.invalidate_all();
     }
-
 }
 
 #[cfg(test)]
@@ -213,7 +212,10 @@ mod tests {
         cache::insert(&c, "vec", vec![1_u8, 2, 3]);
 
         assert_eq!(cache::get::<i32>(&c, "int"), Some(42));
-        assert_eq!(cache::get::<String>(&c, "string"), Some("hello".to_string()));
+        assert_eq!(
+            cache::get::<String>(&c, "string"),
+            Some("hello".to_string())
+        );
         assert_eq!(cache::get::<Vec<u8>>(&c, "vec"), Some(vec![1, 2, 3]));
     }
 

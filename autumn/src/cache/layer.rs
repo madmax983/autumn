@@ -119,14 +119,12 @@ where
                 if let Some(headers) = builder.headers_mut() {
                     headers.extend(cached.headers);
                 }
-                let resp = builder
-                    .body(Body::from(cached.body))
-                    .unwrap_or_else(|_| {
-                        axum::response::Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Body::empty())
-                            .unwrap()
-                    });
+                let resp = builder.body(Body::from(cached.body)).unwrap_or_else(|_| {
+                    axum::response::Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::empty())
+                        .unwrap()
+                });
                 Ok(resp)
             });
         }

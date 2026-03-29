@@ -30,12 +30,16 @@ fn parse_max_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<usize> 
     match &expr {
         Expr::Lit(lit) => match &lit.lit {
             syn::Lit::Int(int) => int.base10_parse::<usize>(),
-            syn::Lit::Str(s) => s.value().parse::<usize>().map_err(|_| {
-                syn::Error::new_spanned(s, "max must be a positive integer")
-            }),
+            syn::Lit::Str(s) => s
+                .value()
+                .parse::<usize>()
+                .map_err(|_| syn::Error::new_spanned(s, "max must be a positive integer")),
             _ => Err(syn::Error::new_spanned(&expr, "max must be an integer")),
         },
-        _ => Err(syn::Error::new_spanned(&expr, "max must be a literal integer")),
+        _ => Err(syn::Error::new_spanned(
+            &expr,
+            "max must be a literal integer",
+        )),
     }
 }
 
@@ -199,7 +203,13 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let body = generate_cache_body(
-        &attrs, &fn_name_str, fn_block, is_async, &key_args, &ret_type, &value_type,
+        &attrs,
+        &fn_name_str,
+        fn_block,
+        is_async,
+        &key_args,
+        &ret_type,
+        &value_type,
     );
 
     quote! {
@@ -270,9 +280,18 @@ mod tests {
         };
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
-        assert!(output_str.contains("MokaCache"), "should reference MokaCache");
-        assert!(output_str.contains("make_cache_key"), "should use make_cache_key");
-        assert!(output_str.contains("OnceLock"), "should use OnceLock for static");
+        assert!(
+            output_str.contains("MokaCache"),
+            "should reference MokaCache"
+        );
+        assert!(
+            output_str.contains("make_cache_key"),
+            "should use make_cache_key"
+        );
+        assert!(
+            output_str.contains("OnceLock"),
+            "should use OnceLock for static"
+        );
     }
 
     #[test]
@@ -301,7 +320,10 @@ mod tests {
         };
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
-        assert!(output_str.contains("MokaCache"), "should still generate cache");
+        assert!(
+            output_str.contains("MokaCache"),
+            "should still generate cache"
+        );
     }
 
     #[test]
@@ -328,6 +350,9 @@ mod tests {
         };
         let output = cached_macro(attr, item);
         let output_str = output.to_string();
-        assert!(output_str.contains("10_000"), "default max should be 10_000");
+        assert!(
+            output_str.contains("10_000"),
+            "default max should be 10_000"
+        );
     }
 }
