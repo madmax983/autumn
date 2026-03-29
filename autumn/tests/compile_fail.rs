@@ -33,6 +33,9 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/static_get_basic.rs");
     t.pass("tests/compile-pass/static_routes_basic.rs");
 
+    // Interceptor macro
+    t.pass("tests/compile-pass/intercept_basic.rs");
+
     // Maud + form/json handlers (require maud feature)
     #[cfg(feature = "maud")]
     t.pass("tests/compile-pass/json_form_handlers.rs");

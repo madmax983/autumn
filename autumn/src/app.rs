@@ -24,11 +24,14 @@
 //! }
 //! ```
 
+use std::sync::Arc;
+
 use crate::AppState;
 use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
 use crate::middleware::RequestIdLayer;
+use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 
 /// Create a new [`AppBuilder`].
@@ -54,11 +57,13 @@ use crate::route::Route;
 /// }
 /// ```
 #[must_use]
-pub const fn app() -> AppBuilder {
+pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
         static_metas: Vec::new(),
+        exception_filters: Vec::new(),
+        scoped_groups: Vec::new(),
     }
 }
 
@@ -94,6 +99,19 @@ pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    scoped_groups: Vec<ScopedGroup>,
+}
+
+/// A group of routes sharing a common path prefix and middleware layer.
+///
+/// Created by [`AppBuilder::scoped`]. The routes are mounted under the
+/// prefix with the middleware applied only to this group.
+struct ScopedGroup {
+    prefix: String,
+    routes: Vec<Route>,
+    /// Closure that applies the layer to a sub-router.
+    apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
 impl AppBuilder {
@@ -142,6 +160,88 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register a global exception filter.
+    ///
+    /// Exception filters intercept error responses produced by
+    /// [`AutumnError`](crate::AutumnError) before they are sent to the
+    /// client. Filters run in registration order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::middleware::{ExceptionFilter, AutumnErrorInfo};
+    /// use axum::response::Response;
+    ///
+    /// struct LogFilter;
+    /// impl ExceptionFilter for LogFilter {
+    ///     fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
+    ///         eprintln!("Error: {}", error.message);
+    ///         response
+    ///     }
+    /// }
+    ///
+    /// # use autumn_web::prelude::*;
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .exception_filter(LogFilter)
+    ///     .routes(routes![index])
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn exception_filter(mut self, filter: impl ExceptionFilter) -> Self {
+        self.exception_filters.push(Arc::new(filter));
+        self
+    }
+
+    /// Register a group of routes with a shared path prefix and middleware.
+    ///
+    /// The `layer` is applied only to routes within this group, not to the
+    /// rest of the application. The routes are mounted under `prefix`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::middleware::RequestIdLayer; // any Tower Layer
+    ///
+    /// # #[get("/")]  async fn index() -> &'static str { "" }
+    /// # #[get("/users")] async fn list_users() -> &'static str { "" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .scoped("/api", RequestIdLayer, routes![list_users])
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn scoped<L>(mut self, prefix: &str, layer: L, routes: Vec<Route>) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.scoped_groups.push(ScopedGroup {
+            prefix: prefix.to_owned(),
+            routes,
+            apply_layer: Box::new(move |router| router.layer(layer)),
+        });
         self
     }
 
@@ -230,20 +330,17 @@ impl AppBuilder {
         } else {
             None
         };
-        let router = build_router_with_static(self.routes, &config, state.clone(), dist_ref);
+        let router = build_router_with_static_inner(
+            self.routes,
+            &config,
+            state.clone(),
+            dist_ref,
+            self.exception_filters,
+            self.scoped_groups,
+        );
 
         // 7. Start scheduled tasks (if any)
         if !self.tasks.is_empty() {
-            tracing::info!(count = self.tasks.len(), "Starting scheduled tasks");
-            for task_info in &self.tasks {
-                let schedule_desc = match &task_info.schedule {
-                    crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-                    crate::task::Schedule::Cron { expression, .. } => {
-                        format!("cron {expression}")
-                    }
-                };
-                tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
-            }
             start_task_scheduler(self.tasks, &state);
         }
 
@@ -351,6 +448,14 @@ impl AppBuilder {
 /// Each task runs in its own spawned task with error logging.
 /// Uses simple `tokio::time` for fixed-delay scheduling.
 fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
+    tracing::info!(count = tasks.len(), "Starting scheduled tasks");
+    for task_info in &tasks {
+        let schedule_desc = match &task_info.schedule {
+            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+            crate::task::Schedule::Cron { expression, .. } => format!("cron {expression}"),
+        };
+        tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+    }
     for task_info in tasks {
         let state = state.clone();
         let name = task_info.name.clone();
@@ -397,6 +502,16 @@ pub fn build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
+) -> axum::Router {
+    build_router_inner(route_list, config, state, Vec::new(), Vec::new())
+}
+
+fn build_router_inner(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    scoped_groups: Vec<ScopedGroup>,
 ) -> axum::Router {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -457,6 +572,23 @@ pub fn build_router(
     let static_dir = project_dir("static");
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
+    // Mount scoped route groups (each with its own middleware layer).
+    for group in scoped_groups {
+        let mut sub_router = axum::Router::new();
+        for route in group.routes {
+            tracing::debug!(
+                method = %route.method,
+                path = route.path,
+                name = route.name,
+                scope = %group.prefix,
+                "Mounted scoped route"
+            );
+            sub_router = sub_router.route(route.path, route.handler);
+        }
+        sub_router = (group.apply_layer)(sub_router);
+        router = router.nest(&group.prefix, sub_router);
+    }
+
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -475,10 +607,18 @@ pub fn build_router(
     );
     tracing::debug!("Session management enabled (in-memory store)");
 
-    router
-        .layer(RequestIdLayer)
-        .layer(session_layer)
-        .with_state(state)
+    // Apply framework middleware. Exception filters wrap outermost so they
+    // see all error responses regardless of scoping or interceptors.
+    let router = router.layer(RequestIdLayer).layer(session_layer);
+    let router = if exception_filters.is_empty() {
+        router
+    } else {
+        let count = exception_filters.len();
+        tracing::debug!(count, "Registered exception filters");
+        router.layer(ExceptionFilterLayer::new(exception_filters))
+    };
+
+    router.with_state(state)
 }
 
 /// Build the router with optional static-file-first serving.
@@ -498,7 +638,19 @@ pub fn build_router_with_static(
     state: AppState,
     dist_dir: Option<&std::path::Path>,
 ) -> axum::Router {
-    let app_router = build_router(route_list, config, state);
+    build_router_with_static_inner(route_list, config, state, dist_dir, Vec::new(), Vec::new())
+}
+
+fn build_router_with_static_inner(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    scoped_groups: Vec<ScopedGroup>,
+) -> axum::Router {
+    let app_router =
+        build_router_inner(route_list, config, state, exception_filters, scoped_groups);
 
     let Some(dist) = dist_dir else {
         return app_router;

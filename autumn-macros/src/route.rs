@@ -24,10 +24,13 @@ pub fn route_macro(
         Err(err) => return err,
     };
 
-    let input_fn = match parse::parse_async_handler(item) {
+    let mut input_fn = match parse::parse_async_handler(item) {
         Ok(f) => f,
         Err(err) => return err,
     };
+
+    // Extract #[intercept(LayerType)] attributes from the handler.
+    let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
 
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
@@ -35,6 +38,22 @@ pub fn route_macro(
 
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
+
+    // Build the handler expression, chaining .layer() for each interceptor.
+    // Interceptors are applied in reverse attribute order so that the first
+    // #[intercept(...)] listed is the outermost layer (runs first).
+    let mut handler_expr: TokenStream =
+        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#fn_name) };
+
+    for interceptor in interceptors.iter().rev() {
+        // Explicit error type annotation avoids inference ambiguity when
+        // multiple .layer() calls are chained on MethodRouter.
+        handler_expr = quote! {
+            ::autumn_web::reexports::axum::routing::MethodRouter::<
+                ::autumn_web::AppState, ::core::convert::Infallible
+            >::layer(#handler_expr, #interceptor)
+        };
+    }
 
     // Note: we intentionally do NOT apply #[axum::debug_handler] here.
     // That macro generates code with `::axum::` paths, which don't resolve
@@ -49,7 +68,7 @@ pub fn route_macro(
             ::autumn_web::route::Route {
                 method: ::autumn_web::reexports::http::Method::#method_const,
                 path: #path,
-                handler: ::autumn_web::reexports::axum::routing::#routing_fn(#fn_name),
+                handler: #handler_expr,
                 name: ::core::stringify!(#fn_name),
             }
         }
