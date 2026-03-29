@@ -1,17 +1,18 @@
 # Autumn Bookmarks Example
 
-A bookmark manager showcasing **Autumn v0.2 features** — profiles, validation,
-the `#[model]` / `#[repository]` macros, scheduled tasks, and actuator endpoints.
+A bookmark manager showcasing the newer Autumn feature set: profile-aware
+configuration, `#[model]`, `#[repository(api = ...)]`, scheduled tasks,
+embedded migrations, and actuator endpoints.
 
-## v0.2 Features Demonstrated
+## What it demonstrates
 
 | Feature | Where | What it does |
 |---------|-------|--------------|
 | **Profiles** | `autumn.toml` + `autumn-dev.toml` | Dev profile auto-detected; DB URL only in dev config |
-| **Validation** | `routes/api.rs` | `Valid<Json<NewBookmark>>` checks URL format + title length |
 | **`#[model]`** | `models.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
-| **`#[repository]`** | `repositories.rs` | Generates `PgBookmarkRepository` with CRUD + `find_by_tag` |
+| **`#[repository]`** | `repositories.rs` | Generates `PgBookmarkRepository` with CRUD + `find_by_tag` + REST handlers |
 | **Scheduled tasks** | `tasks.rs` | `#[scheduled(every = "1h")]` link health checker |
+| **Embedded migrations** | `main.rs` | Runs Diesel migrations at startup |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
 
 ## Prerequisites
@@ -48,11 +49,15 @@ The server starts at <http://localhost:3000>.
 
 ### JSON API
 
-| Method | Path                   | Description                           |
-|--------|------------------------|---------------------------------------|
-| GET    | `/api/bookmarks`       | List all bookmarks (JSON)             |
-| POST   | `/api/bookmarks`       | Create bookmark (validated JSON body) |
-| DELETE | `/api/bookmarks/{id}`  | Delete bookmark                       |
+These routes are generated from `#[autumn_web::repository(Bookmark, api = "/api/bookmarks")]`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/bookmarks` | List all bookmarks |
+| GET | `/api/bookmarks/{id}` | Fetch one bookmark |
+| POST | `/api/bookmarks` | Create a bookmark |
+| PUT | `/api/bookmarks/{id}` | Update a bookmark |
+| DELETE | `/api/bookmarks/{id}` | Delete a bookmark |
 
 ### Framework
 
@@ -60,20 +65,24 @@ The server starts at <http://localhost:3000>.
 |--------|--------------------------|------------------------|
 | GET    | `/actuator/health`       | Health + profile info  |
 | GET    | `/actuator/info`         | Build & runtime info   |
+| GET    | `/actuator/metrics`      | Request and pool stats |
 | GET    | `/health`                | Health check           |
 | GET    | `/static/js/htmx.min.js` | Bundled htmx          |
 | GET    | `/static/css/autumn.css` | Compiled Tailwind CSS  |
 
-## Try the validation
+## Try the generated CRUD API
 
 ```bash
-# Valid request
+# Create
 curl -X POST http://localhost:3000/api/bookmarks \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://rust-lang.org","title":"Rust","tag":"lang"}'
+  -d '{"url":"https://rust-lang.org","title":"Rust","tag":"lang","alive":true}'
 
-# Invalid URL → 422 with field errors
-curl -X POST http://localhost:3000/api/bookmarks \
+# List
+curl http://localhost:3000/api/bookmarks
+
+# Update
+curl -X PUT http://localhost:3000/api/bookmarks/1 \
   -H 'Content-Type: application/json' \
-  -d '{"url":"not-a-url","title":"","tag":"bad"}'
+  -d '{"title":"Rust Lang","tag":"rust","alive":true}'
 ```

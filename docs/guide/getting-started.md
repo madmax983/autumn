@@ -1,18 +1,25 @@
 # Getting Started with Autumn
 
 This guide takes you from zero to a running Autumn web app with routes, a
-database, HTML templates, and interactive UI. Budget about 30 minutes.
+database, HTML templates, interactive UI, and the current post-`v0.1.0`
+framework surface on `trunk`. Budget about 30 minutes.
 
 Autumn is a convention-over-configuration web framework for Rust, built on
 [Axum](https://github.com/tokio-rs/axum). It bundles Diesel (database), Maud
-(HTML), Tailwind CSS (styling), and htmx (interactivity) behind a
-Spring Boot-style developer experience.
+(HTML), Tailwind CSS (styling), htmx (interactivity), actuator endpoints,
+profile-aware configuration, and newer CLI workflows behind a Spring Boot-style
+developer experience.
+
+> **Version note:** `v0.1.0` was tagged on 2026-03-26. This guide tracks the
+> current `trunk` branch, which already includes unreleased post-`v0.1.0`
+> features like `autumn dev`, `autumn build`, profiles, actuator, and static
+> generation.
 
 ---
 
 ## Prerequisites
 
-- **Rust 1.85.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
+- **Rust 1.86.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
 - **PostgreSQL** -- only needed if you want database features; Autumn runs
   fine without one
 - A terminal and a text editor
@@ -35,12 +42,15 @@ from source (crates.io publication is not yet available):
 cargo install --path autumn-cli
 ```
 
-This gives you the `autumn` binary with two commands:
+This gives you the `autumn` binary with the core workflow commands:
 
 | Command         | What it does                                |
 |-----------------|---------------------------------------------|
 | `autumn new`    | Scaffold a new project                      |
 | `autumn setup`  | Download Tailwind CSS (with checksum verify) |
+| `autumn dev`    | Run the dev server with file watching        |
+| `autumn build`  | Pre-render `#[static_get]` routes into `dist/` |
+| `autumn migrate`| Run migrations or inspect migration status   |
 
 ---
 
@@ -134,13 +144,18 @@ or your own `impl IntoResponse`.
 ## Run It
 
 ```bash
+autumn dev
+```
+
+If you prefer not to use watch mode:
+
+```bash
 cargo run
 ```
 
 You will see log output like:
 
 ```
-  INFO autumn: Autumn v0.1.0
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -151,7 +166,13 @@ Visit [http://localhost:3000](http://localhost:3000) -- you should see
 path parameter route.
 
 A health check is automatically mounted at
-[http://localhost:3000/health](http://localhost:3000/health) and returns JSON:
+[http://localhost:3000/health](http://localhost:3000/health). Actuator
+endpoints are also auto-mounted at
+[http://localhost:3000/actuator/health](http://localhost:3000/actuator/health),
+[http://localhost:3000/actuator/info](http://localhost:3000/actuator/info), and
+[http://localhost:3000/actuator/metrics](http://localhost:3000/actuator/metrics).
+
+The `/health` response looks like:
 
 ```json
 { "status": "ok", "version": "0.1.0" }
@@ -713,11 +734,13 @@ Error responses are JSON:
 
 ## Configuration
 
-Autumn uses a three-layer configuration system:
+Autumn uses a five-layer configuration system:
 
 1. **Framework defaults** -- compiled into the binary, zero-config start
-2. **`autumn.toml`** -- project-level overrides
-3. **`AUTUMN_*` environment variables** -- deployment overrides (highest priority)
+2. **Profile smart defaults** -- built-in `dev` / `prod` behavior
+3. **`autumn.toml`** -- project-level overrides
+4. **`autumn-{profile}.toml`** -- profile-specific overrides
+5. **`AUTUMN_*` environment variables** -- deployment overrides (highest priority)
 
 ### `autumn.toml` reference
 
@@ -738,6 +761,9 @@ format = "Auto"              # Auto | Pretty | Json
 
 [health]
 path = "/health"             # default
+
+[actuator]
+sensitive = false            # prod default; dev smart defaults enable sensitive endpoints
 ```
 
 ### Environment variable overrides
@@ -756,6 +782,17 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_LOG__LEVEL`                  | `log.level`            |
 | `AUTUMN_LOG__FORMAT`                 | `log.format`           |
 | `AUTUMN_HEALTH__PATH`               | `health.path`          |
+| `AUTUMN_PROFILE`                     | active profile         |
+
+Profiles resolve in this order:
+
+1. `AUTUMN_PROFILE`
+2. `--profile <name>`
+3. debug/release auto-detection (`dev` for debug, `prod` for release)
+
+That means you can keep shared defaults in `autumn.toml`, put local dev
+settings in `autumn-dev.toml`, and override the final few things in CI or
+deployment with env vars.
 
 ### Log format behavior
 
@@ -777,7 +814,8 @@ database, or during early development.
 ## What's Next?
 
 You now have a working Autumn application with routes, database access,
-HTML rendering, Tailwind styling, and htmx interactivity.
+HTML rendering, Tailwind styling, htmx interactivity, health checks, and
+actuator endpoints.
 
 Here are some things to explore:
 
@@ -800,14 +838,15 @@ Here are some things to explore:
       // ...
   }
   ```
-- **Check the health endpoint** at `/health` -- it reports pool status when a
-  database is configured, showing available connections and queue depth.
+- **Check `/health` and `/actuator/*`** -- `/health` gives a small health
+  response, while actuator adds info, metrics, env/configprops, loggers, and
+  scheduled task visibility depending on the active profile.
 - **Inspect request IDs** -- every response includes an `X-Request-Id` header
   (UUID v4) for log correlation.
-- **Look at the full example** -- the
-  [`examples/todo-app`](https://github.com/your-org/autumn/tree/trunk/examples/todo-app)
-  directory has a complete todo application with Maud templates, htmx, Tailwind
-  styling, and a JSON API alongside the HTML routes.
+- **Look at the example apps** -- [`examples/todo-app`](../../examples/todo-app),
+  [`examples/blog`](../../examples/blog), [`examples/bookmarks`](../../examples/bookmarks),
+  and [`examples/wiki`](../../examples/wiki) each exercise different parts of
+  the current framework.
 
-Autumn is v0.1 -- APIs will evolve. File issues, ask questions, and ship
-something.
+Autumn is still pre-1.0 and evolving quickly. File issues, break glass when you
+need Axum escape hatches, and ship something.

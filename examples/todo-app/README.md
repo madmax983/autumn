@@ -1,12 +1,14 @@
 # Autumn Todo App
 
-A full-stack reference application demonstrating Autumn's key features:
+A full-stack reference application demonstrating the classic Autumn stack:
 
 - **Diesel + diesel-async** for Postgres database access
 - **Maud** templates with **Tailwind CSS** styling
 - **htmx** for interactive toggle and delete without page reloads
 - **JSON API** alongside server-rendered HTML
 - **AutumnError** for consistent error handling (404, 422, 500)
+- **Embedded migrations** so the schema comes up with the app
+- **Framework ops endpoints** via `/health` and `/actuator/*`
 
 ## Prerequisites
 
@@ -55,5 +57,8 @@ The server starts at <http://localhost:3000>.
 | Method | Path                      | Description              |
 |--------|---------------------------|--------------------------|
 | GET    | `/health`                 | Health check             |
+| GET    | `/actuator/health`        | Detailed health view     |
+| GET    | `/actuator/info`          | Build and runtime info   |
+| GET    | `/actuator/metrics`       | Request and pool metrics |
 | GET    | `/static/js/htmx.min.js` | Bundled htmx             |
 | GET    | `/static/css/autumn.css`  | Compiled Tailwind CSS    |

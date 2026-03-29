@@ -17,22 +17,28 @@ one framework dependency.
 ### Comparing to the Reference Implementation
 
 Your code vs. `examples/todo-app/`. Any polish the example includes that the
-tutorial omitted. Using the example as a continued reference.
+tutorial omitted. Then branch out into the newer example apps:
+
+- `examples/blog/` for hybrid rendering and a richer admin UI
+- `examples/bookmarks/` for repository macros, generated CRUD APIs, and scheduled tasks
+- `examples/wiki/` for mutation hooks and revision history
 
 ### Ideas for Extending the App
 
-- **Authentication** â€” add user accounts with session cookies
-- **Categories** â€” associate todos with categories (a second table, foreign keys)
-- **Search** â€” add a search bar with `ILIKE` queries
-- **Pagination** â€” limit the list with `.limit()` and `.offset()`
-- **Testing** â€” write integration tests with Autumn's test utilities
+- **Authentication** — add user accounts with session cookies
+- **Actuator hardening** — tune which operational endpoints stay visible in prod
+- **Background work** — add a `#[scheduled]` task for cleanup or polling
+- **Categories** — associate todos with categories (a second table, foreign keys)
+- **Search** — add a search bar with `ILIKE` queries
+- **Pagination** — limit the list with `.limit()` and `.offset()`
+- **Testing** — write integration tests with Autumn's test utilities
 
 ### Further Reading
 
-- [API Reference](../../api/) â€” generated Rust docs for every public type
-- [Getting Started Guide](../getting-started.md) â€” quick overview of all features
-- [Example App](../../../examples/todo-app/) â€” the reference implementation
-- [Autumn on crates.io](https://crates.io/crates/autumn) â€” versioned releases
+- [API Reference](https://docs.rs/autumn-web) — generated Rust docs for every public type
+- [Getting Started Guide](../getting-started.md) — quick overview of all features
+- [Example App](../../../examples/todo-app/) — the reference implementation
+- [Autumn on crates.io](https://crates.io/crates/autumn-web) — versioned releases
 
 ### Community
 
@@ -44,4 +50,4 @@ Where to ask questions, report bugs, and contribute.
 
 ---
 
-Previous: [Chapter 10 â€” Configuration and Production Defaults](10-configuration.md) | Back to [Tutorial Index](index.md)
+Previous: [Chapter 10 — Configuration and Production Defaults](10-configuration.md) | Back to [Tutorial Index](index.md)

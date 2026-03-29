@@ -1,59 +1,60 @@
-# Autumn ðŸ‚
+# Autumn ??
 
 [![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.86.0+](https://img.shields.io/badge/rust-1.86.0%2B-orange.svg)](https://www.rust-lang.org)
 
-> Spring Boot-style web framework for Rust. Built on [Axum](https://github.com/tokio-rs/axum).
+> Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
 Autumn assembles proven Rust crates into a convention-over-configuration web
-framework. It gives you route macros, HTML templating, database access, and a
-Tailwind CSS build pipeline out of the box â€” so you can focus on your
-application instead of wiring together middleware. If you've used Spring Boot,
-Rails, or Laravel, the shape will feel familiar.
+stack with proc-macro ergonomics, framework defaults, and escape hatches when
+you need them. If Spring Boot, Rails, or Laravel feels familiar, Autumn aims
+for that same "ship the app, not the plumbing" shape in Rust.
 
-> **Autumn is v0.1 â€” experimental.** APIs will change. Not recommended for production use.
+> **Status:** the latest tagged release is `v0.1.0` (2026-03-26), but `trunk`
+> already contains substantial post-`v0.1.0` work. This README documents the
+> current `trunk` branch, not just the `v0.1.0` tag. The framework is still
+> experimental and not recommended for production use yet.
 
 ## Features
 
-- **Route macros** â€” `#[get("/")]`, `#[post("/")]`, `#[put("/")]`, `#[delete("/")]`
-- **Route collection** â€” `routes![handler1, handler2]` macro
-- **Application bootstrap** â€” `#[autumn_web::main]` + `autumn_web::app().routes(...).run().await`
-- **Configuration** â€” `autumn.toml` with `[server]`, `[database]`, `[log]`, `[health]` sections
-- **Environment overrides** â€” `AUTUMN_SERVER__PORT`, `AUTUMN_DATABASE__URL`, etc.
-- **Database pool** â€” Diesel + diesel-async + deadpool (Postgres)
-- **Db extractor** â€” `db: autumn_web::Db` in handlers for an `AsyncPgConnection`
-- **HTML rendering** â€” Maud (`autumn_web::html!`, `autumn_web::Markup`)
-- **htmx integration** â€” auto-served at `/static/js/htmx.min.js`
-- **Tailwind CSS** â€” build pipeline via `build.rs` + `autumn setup` CLI command
-- **Health check** â€” auto-mounted JSON endpoint at `/health` (configurable)
-- **Structured logging** â€” tracing with Pretty / JSON / Auto formats
-- **Graceful shutdown** â€” Ctrl+C / SIGTERM with configurable drain timeout
-- **Static file serving** â€” auto-served from `static/` directory
-- **Error handling** â€” `AutumnError` with status refinement (`.not_found()`, `.bad_request()`, etc.)
-- **JSON support** â€” `autumn_web::Json<T>` for request parsing and responses
-- **Form support** â€” `autumn_web::extract::Form<T>` for form data
-- **Path extraction** â€” `autumn_web::extract::Path<T>` for URL parameters
+- **Route and app macros** — `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
+- **Hybrid rendering** — `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
+- **Application builder** — `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
+- **Configuration and profiles** — defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
+- **Database ergonomics** — async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
+- **HTML stack** — Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Operations** — `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
+- **Background work** — `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Security primitives** — session cookies, auth extractor, security headers, CSRF, and `#[secured]`
+- **CLI workflow** — `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
 
 ## Quickstart
 
 ```bash
-# Install the CLI (from source â€” crates.io publication is not yet available)
+# Install the CLI from this workspace
 cargo install --path autumn-cli
 
 # Create a new project
 autumn new my-app
 cd my-app
 
-# Download Tailwind CSS (optional â€” only needed for styled CSS)
+# Optional: download Tailwind CSS for styled builds
 autumn setup
 
-# Run it
-cargo run
+# Development server with file watching
+autumn dev
 
-# Visit http://localhost:3000
+# Or run without watch mode
+# cargo run
 ```
+
+Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
+`/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
+
+If you add `#[static_get]` routes, `autumn build` pre-renders them into
+`dist/`.
 
 ## Example
 
@@ -83,32 +84,37 @@ async fn main() {
 
 ## Built On
 
-Autumn stands on the shoulders of these excellent crates:
-
-- [Axum](https://github.com/tokio-rs/axum) â€” async web framework
-- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) â€” ORM and query builder (Postgres)
-- [Maud](https://maud.lambda.xyz/) â€” compile-time HTML templating
-- [htmx](https://htmx.org/) â€” HTML-driven interactivity
-- [Tailwind CSS](https://tailwindcss.com/) â€” utility-first CSS
-- [Tokio](https://tokio.rs/) â€” async runtime
-- [Tracing](https://github.com/tokio-rs/tracing) â€” structured logging
+- [Axum](https://github.com/tokio-rs/axum) — async HTTP routing and middleware
+- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) — database access
+- [Maud](https://maud.lambda.xyz/) — compiled HTML templates
+- [htmx](https://htmx.org/) — HTML-first interactivity
+- [Tailwind CSS](https://tailwindcss.com/) — utility-first styling
+- [Tokio](https://tokio.rs/) — async runtime
+- [Tracing](https://github.com/tokio-rs/tracing) — structured logging
 
 ## Examples
 
 | Example | Description |
 |---------|-------------|
-| [`examples/hello`](examples/hello) | Minimal hello-world app â€” three routes, no database |
-| [`examples/todo-app`](examples/todo-app) | Full reference app with Diesel, Maud, htmx, Tailwind, and a JSON API |
+| [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
+| [`examples/todo-app`](examples/todo-app) | Classic full-stack CRUD app with Diesel, Maud, htmx, Tailwind, and JSON endpoints |
+| [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and hybrid rendering via `#[static_get]` |
+| [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
+| [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
 
 ## Documentation
 
-- [Getting Started Guide](docs/guide/) *(coming soon)*
-- [API Reference](https://docs.rs/autumn-web) *(coming soon)*
+- [Getting Started Guide](docs/guide/getting-started.md)
+- [Todo Tutorial](docs/guide/tutorial/index.md)
+- [API Reference](https://docs.rs/autumn-web)
+- [Hybrid Rendering Design Notes](docs/design/hybrid-rendering.md)
 
 ## Requirements
 
-- Rust 1.85.0+ (edition 2024)
-- PostgreSQL *(optional â€” Autumn runs without a database)*
+- Rust 1.86.0+ (edition 2024)
+- PostgreSQL for database-backed apps
+
+Autumn can still run without a database if you omit the `[database]` section.
 
 ## License
 

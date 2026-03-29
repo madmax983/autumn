@@ -1,9 +1,9 @@
-// Bookmarks — an Autumn v0.2 example showcasing all new features:
+// Bookmarks - an Autumn example showcasing the post-v0.1.0 feature set:
 //
-//   Profiles        → autumn.toml + autumn-dev.toml (dev auto-detected)
-//   Validation      → Valid<Json<NewBookmark>> with #[validate] rules
-//   Scheduled tasks → #[scheduled(every = "1h")] link health checker
-//   Actuator        → /actuator/health, /actuator/info, /actuator/env
+//   Profiles        -> autumn.toml + autumn-dev.toml (dev auto-detected)
+//   CRUD API        -> #[repository(api = "/api/bookmarks")] generates REST handlers
+//   Scheduled tasks -> #[scheduled(every = "1h")] link health checker
+//   Actuator        -> /actuator/health, /actuator/info, /actuator/env
 //
 // Run with:  cargo run -p bookmarks
 // API test:  curl -X POST http://localhost:3000/api/bookmarks \
@@ -23,7 +23,7 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[autumn_web::main]
 async fn main() {
-    // ── v0.2: .tasks() registers scheduled background tasks ─────
+    // -- v0.2: .tasks() registers scheduled background tasks -----
     autumn_web::app()
         .migrations(MIGRATIONS)
         .routes(routes![
