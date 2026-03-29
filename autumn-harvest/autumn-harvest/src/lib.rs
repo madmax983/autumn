@@ -9,6 +9,7 @@ pub mod models;
 pub mod policy;
 pub mod prelude;
 pub mod schema;
+pub mod store;
 pub mod types;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
@@ -17,6 +18,9 @@ pub use error::{HarvestError, HarvestResult, TimeoutType, compute_retry_delay};
 pub use event::WorkflowEvent;
 pub use info::{ActivityHandlerFn, ActivityInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
+pub use store::{
+    EventHistory, append_events, events_to_insert_rows, events_to_insert_rows_from, load_history,
+};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
 // Allow macro-generated code to use ::autumn_harvest::serde_json
