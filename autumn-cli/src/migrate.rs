@@ -52,13 +52,20 @@ pub fn run(action: MigrateAction) {
 /// 2. `DATABASE_URL` environment variable
 /// 3. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
+    resolve_database_url_with_env(|key| std::env::var(key))
+}
+
+fn resolve_database_url_with_env<F>(env_var: F) -> String
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     // Check env overrides first
-    if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL") {
+    if let Ok(url) = env_var("AUTUMN_DATABASE__URL") {
         if !url.is_empty() {
             return url;
         }
     }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
+    if let Ok(url) = env_var("DATABASE_URL") {
         if !url.is_empty() {
             return url;
         }
@@ -183,29 +190,28 @@ mod tests {
     #[test]
     fn resolve_database_url_from_env() {
         // AUTUMN_DATABASE__URL takes priority
-        unsafe {
-            std::env::set_var("AUTUMN_DATABASE__URL", "postgres://test:5432/mydb");
-        }
-        let url = resolve_database_url();
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            if key == "AUTUMN_DATABASE__URL" {
+                Ok("postgres://test:5432/mydb".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let url = resolve_database_url_with_env(env_var);
         assert_eq!(url, "postgres://test:5432/mydb");
-        unsafe {
-            std::env::remove_var("AUTUMN_DATABASE__URL");
-        }
     }
 
     #[test]
     fn resolve_database_url_from_database_url_env() {
-        // Make sure AUTUMN_DATABASE__URL is not set
-        unsafe {
-            std::env::remove_var("AUTUMN_DATABASE__URL");
-        }
-        unsafe {
-            std::env::set_var("DATABASE_URL", "postgres://fallback:5432/db");
-        }
-        let url = resolve_database_url();
+        // Make sure AUTUMN_DATABASE__URL is not set, but DATABASE_URL is
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            if key == "DATABASE_URL" {
+                Ok("postgres://fallback:5432/db".to_string())
+            } else {
+                Err(std::env::VarError::NotPresent)
+            }
+        };
+        let url = resolve_database_url_with_env(env_var);
         assert_eq!(url, "postgres://fallback:5432/db");
-        unsafe {
-            std::env::remove_var("DATABASE_URL");
-        }
     }
 }
