@@ -715,13 +715,32 @@ fn log_startup_transparency(
     scoped_groups: &[ScopedGroup],
     config: &AutumnConfig,
 ) {
-    // ── Routes ────────────────────────────────────────────────────
+    tracing::info!(
+        "Registered routes:{}",
+        format_route_lines(routes, scoped_groups, config)
+    );
+
+    if let Some(task_lines) = format_task_lines(tasks) {
+        tracing::info!("Scheduled tasks:{task_lines}");
+    }
+
+    tracing::info!("Active middleware: {}", format_middleware_list(config));
+
+    tracing::info!("Configuration:{}", format_config_summary(config));
+}
+
+/// Build the route listing string for the transparency log.
+fn format_route_lines(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> String {
     use std::fmt::Write as _;
 
-    let mut route_lines = String::new();
+    let mut out = String::new();
     for route in routes {
         let _ = write!(
-            route_lines,
+            out,
             "\n    {} {:<8} -> {}",
             route.path, route.method, route.name
         );
@@ -729,75 +748,79 @@ fn log_startup_transparency(
     for group in scoped_groups {
         for route in &group.routes {
             let _ = write!(
-                route_lines,
+                out,
                 "\n    {}{} {:<8} -> {} (scoped)",
                 group.prefix, route.path, route.method, route.name
             );
         }
     }
-    // Framework routes (always present)
-    let _ = write!(
-        route_lines,
-        "\n    {} {:<8} -> health",
-        config.health.path, "GET"
-    );
-    route_lines.push_str("\n    /actuator/* GET      -> actuator");
+    let _ = write!(out, "\n    {} {:<8} -> health", config.health.path, "GET");
+    out.push_str("\n    /actuator/* GET      -> actuator");
     #[cfg(feature = "htmx")]
-    route_lines.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+    out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+    out
+}
 
-    tracing::info!("Registered routes:{route_lines}");
+/// Build the scheduled task listing string. Returns `None` if there are no tasks.
+fn format_task_lines(tasks: &[crate::task::TaskInfo]) -> Option<String> {
+    use std::fmt::Write as _;
 
-    // ── Scheduled tasks ───────────────────────────────────────────
-    if !tasks.is_empty() {
-        let mut task_lines = String::new();
-        for task in tasks {
-            let schedule = match &task.schedule {
-                crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-                crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
-            };
-            let _ = write!(task_lines, "\n    {} ({schedule})", task.name);
-        }
-        tracing::info!("Scheduled tasks:{task_lines}");
+    if tasks.is_empty() {
+        return None;
     }
 
-    // ── Middleware ─────────────────────────────────────────────────
-    let mut middleware = vec![
+    let mut out = String::new();
+    for task in tasks {
+        let schedule = match &task.schedule {
+            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
+            crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
+        };
+        let _ = write!(out, "\n    {} ({schedule})", task.name);
+    }
+    Some(out)
+}
+
+/// Build the active middleware listing string.
+fn format_middleware_list(config: &AutumnConfig) -> String {
+    let mut items = vec![
         "RequestId",
         "SecurityHeaders",
         "Session (in-memory)",
         "ErrorPages",
     ];
     if !config.cors.allowed_origins.is_empty() {
-        middleware.push("CORS");
+        items.push("CORS");
     }
     if config.security.csrf.enabled {
-        middleware.push("CSRF");
+        items.push("CSRF");
     }
-    middleware.push("Metrics");
-    let mw_str = middleware.join(", ");
-    tracing::info!("Active middleware: {mw_str}");
+    items.push("Metrics");
+    items.join(", ")
+}
 
-    // ── Configuration ─────────────────────────────────────────────
+/// Mask a database URL password for safe logging.
+fn mask_database_url(url: &str, pool_size: usize) -> String {
+    if let Some(at_pos) = url.find('@') {
+        if let Some(colon_pos) = url[..at_pos].rfind(':') {
+            return format!(
+                "{}:****@{} (pool_size={pool_size})",
+                &url[..colon_pos],
+                &url[at_pos + 1..],
+            );
+        }
+    }
+    format!("{url} (pool_size={pool_size})")
+}
+
+/// Build the configuration summary string.
+fn format_config_summary(config: &AutumnConfig) -> String {
     let profile = config.profile.as_deref().unwrap_or("none");
     let db_status = config.database.url.as_deref().map_or_else(
         || "not configured".to_owned(),
-        |url| {
-            // Mask password in URL for safe logging
-            if let Some(at_pos) = url.find('@') {
-                if let Some(colon_pos) = url[..at_pos].rfind(':') {
-                    return format!(
-                        "{}:****@{} (pool_size={})",
-                        &url[..colon_pos],
-                        &url[at_pos + 1..],
-                        config.database.pool_size
-                    );
-                }
-            }
-            format!("{url} (pool_size={})", config.database.pool_size)
-        },
+        |url| mask_database_url(url, config.database.pool_size),
     );
-    tracing::info!(
-        "Configuration:\
+    format!(
+        "\
         \n    profile:    {profile}\
         \n    server:     {}:{}\
         \n    database:   {db_status}\
@@ -814,7 +837,7 @@ fn log_startup_transparency(
         config.health.detailed,
         config.actuator.sensitive,
         config.server.shutdown_timeout_secs,
-    );
+    )
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -1841,5 +1864,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Startup transparency helper tests ─────────────────────────
+
+    #[test]
+    fn format_route_lines_lists_user_routes() {
+        let routes = vec![
+            test_get_route("/", "index"),
+            test_get_route("/users/{id}", "get_user"),
+        ];
+        let config = AutumnConfig::default();
+        let output = format_route_lines(&routes, &[], &config);
+        assert!(output.contains("-> index"));
+        assert!(output.contains("/ GET"));
+        assert!(output.contains("/users/{id}"));
+        assert!(output.contains("-> get_user"));
+    }
+
+    #[test]
+    fn format_route_lines_includes_framework_routes() {
+        let config = AutumnConfig::default();
+        let output = format_route_lines(&[], &[], &config);
+        assert!(output.contains("-> health"));
+        assert!(output.contains("/actuator/*"));
+    }
+
+    #[test]
+    fn format_task_lines_none_when_empty() {
+        assert!(format_task_lines(&[]).is_none());
+    }
+
+    #[test]
+    fn format_task_lines_fixed_delay() {
+        let tasks = vec![crate::task::TaskInfo {
+            name: "cleanup".into(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(300)),
+            handler: |_| Box::pin(async { Ok(()) }),
+        }];
+        let output = format_task_lines(&tasks).unwrap();
+        assert!(output.contains("cleanup (every 300s)"));
+    }
+
+    #[test]
+    fn format_task_lines_cron() {
+        let tasks = vec![crate::task::TaskInfo {
+            name: "nightly".into(),
+            schedule: crate::task::Schedule::Cron {
+                expression: "0 0 * * *".into(),
+                timezone: None,
+            },
+            handler: |_| Box::pin(async { Ok(()) }),
+        }];
+        let output = format_task_lines(&tasks).unwrap();
+        assert!(output.contains("nightly (cron \"0 0 * * *\")"));
+    }
+
+    #[test]
+    fn format_middleware_list_default() {
+        let config = AutumnConfig::default();
+        let output = format_middleware_list(&config);
+        assert!(output.contains("RequestId"));
+        assert!(output.contains("SecurityHeaders"));
+        assert!(output.contains("Session (in-memory)"));
+        assert!(output.contains("Metrics"));
+        // CORS and CSRF should not be present with defaults
+        assert!(!output.contains("CORS"));
+        assert!(!output.contains("CSRF"));
+    }
+
+    #[test]
+    fn format_middleware_list_with_cors_and_csrf() {
+        let config = AutumnConfig {
+            cors: crate::config::CorsConfig {
+                allowed_origins: vec!["https://example.com".into()],
+                ..crate::config::CorsConfig::default()
+            },
+            security: crate::security::config::SecurityConfig {
+                csrf: crate::security::config::CsrfConfig {
+                    enabled: true,
+                    ..crate::security::config::CsrfConfig::default()
+                },
+                ..crate::security::config::SecurityConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let output = format_middleware_list(&config);
+        assert!(output.contains("CORS"));
+        assert!(output.contains("CSRF"));
+    }
+
+    #[test]
+    fn mask_database_url_with_password() {
+        let masked = mask_database_url("postgres://user:secret@localhost:5432/mydb", 10);
+        assert!(masked.contains("****"));
+        assert!(!masked.contains("secret"));
+        assert!(masked.contains("postgres://user:****@localhost:5432/mydb"));
+        assert!(masked.contains("pool_size=10"));
+    }
+
+    #[test]
+    fn mask_database_url_without_password() {
+        let masked = mask_database_url("postgres://localhost/mydb", 5);
+        assert!(!masked.contains("****"));
+        assert!(masked.contains("postgres://localhost/mydb"));
+        assert!(masked.contains("pool_size=5"));
+    }
+
+    #[test]
+    fn format_config_summary_defaults() {
+        let config = AutumnConfig::default();
+        let output = format_config_summary(&config);
+        assert!(output.contains("profile:    none"));
+        assert!(output.contains("server:     127.0.0.1:3000"));
+        assert!(output.contains("database:   not configured"));
+        assert!(output.contains("log_level:"));
+        assert!(output.contains("health:     /health"));
+    }
+
+    #[test]
+    fn format_config_summary_with_db() {
+        let config = AutumnConfig {
+            database: crate::config::DatabaseConfig {
+                url: Some("postgres://user:pass@host/db".into()),
+                pool_size: 20,
+                ..crate::config::DatabaseConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let output = format_config_summary(&config);
+        assert!(output.contains("user:****@host/db"));
+        assert!(output.contains("pool_size=20"));
+        assert!(!output.contains("pass"));
+    }
+
+    #[test]
+    fn format_config_summary_with_profile() {
+        let config = AutumnConfig {
+            profile: Some("prod".into()),
+            ..AutumnConfig::default()
+        };
+        let output = format_config_summary(&config);
+        assert!(output.contains("profile:    prod"));
     }
 }
