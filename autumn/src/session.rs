@@ -70,7 +70,7 @@ use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::state::AppState;
 
 // ── Session data ────────────────────────────────────────────────
 

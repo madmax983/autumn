@@ -32,7 +32,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
-use crate::AppState;
+use crate::state::AppState;
 
 /// Typed health response — avoids dynamic `serde_json::Value` allocation.
 #[derive(Serialize)]

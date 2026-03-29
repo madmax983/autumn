@@ -26,7 +26,6 @@
 
 use std::sync::Arc;
 
-use crate::AppState;
 use crate::config::AutumnConfig;
 #[cfg(feature = "db")]
 use crate::db;
@@ -36,6 +35,7 @@ use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer}
 #[cfg(feature = "db")]
 use crate::migrate;
 use crate::route::Route;
+use crate::state::AppState;
 
 /// Create a new [`AppBuilder`].
 ///

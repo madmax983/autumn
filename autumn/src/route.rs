@@ -11,7 +11,7 @@
 use axum::routing::MethodRouter;
 use http::Method;
 
-use crate::AppState;
+use crate::state::AppState;
 
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
