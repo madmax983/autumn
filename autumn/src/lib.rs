@@ -68,6 +68,7 @@ extern crate self as autumn_web;
 pub mod actuator;
 pub mod app;
 pub mod auth;
+pub mod cache;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
@@ -340,6 +341,28 @@ pub use autumn_macros::put;
 /// # }
 /// ```
 pub use autumn_macros::routes;
+
+/// Cache the return value of a function based on its arguments.
+///
+/// Wraps a function with an in-memory cache backed by a static
+/// [`MokaCache`](cache::MokaCache) (default) via the [`Cache`](cache::Cache)
+/// trait. Arguments must implement `Hash + Clone`; the return type must
+/// be `Clone + Send + Sync + 'static`.
+///
+/// Use `result` to only cache `Ok` values from `Result`-returning
+/// functions (common with [`AutumnResult`]).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::cached;
+///
+/// #[cached(ttl = "5m", max = 100, result)]
+/// async fn get_user(id: i64) -> AutumnResult<User> {
+///     db.find(id).await
+/// }
+/// ```
+pub use autumn_macros::cached;
 
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;

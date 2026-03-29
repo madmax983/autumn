@@ -22,6 +22,9 @@ fn compile_fail_tests() {
     // Repository hooks failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_hooks_not_default.rs");
+
+    // Cached macro failures
+    t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
 }
 
 #[test]
@@ -63,4 +66,8 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_with_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");
+
+    // Cached macro
+    t.pass("tests/compile-pass/cached_basic.rs");
+    t.pass("tests/compile-pass/cached_result.rs");
 }

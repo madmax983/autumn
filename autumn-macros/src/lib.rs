@@ -11,6 +11,7 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod cached;
 mod collect;
 mod main_macro;
 mod model;
@@ -359,4 +360,40 @@ pub fn static_routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     service::service_macro(attr.into(), item.into()).into()
+}
+
+/// Cache the return value of a function based on its arguments.
+///
+/// Wraps a function with an in-memory cache backed by a per-function
+/// static [`CacheStore`](autumn_web::cache::CacheStore). Arguments
+/// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
+///
+/// # Attributes
+///
+/// | Attribute | Example | Description |
+/// |-----------|---------|-------------|
+/// | `ttl` | `"5m"` | Time-to-live per entry (uses `parse_duration` syntax) |
+/// | `max` | `1000` | Max entries; oldest evicted on overflow |
+/// | `result` | (flag) | Only cache `Ok` values; pass `Err` through uncached |
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::cached;
+///
+/// // Cache with 5-minute TTL, max 100 entries, only cache Ok values
+/// #[cached(ttl = "5m", max = 100, result)]
+/// async fn get_user(id: i64) -> AutumnResult<User> {
+///     db.find(id).await
+/// }
+///
+/// // Cache forever with no size limit
+/// #[cached]
+/// async fn get_config() -> Vec<String> {
+///     load_config_from_disk()
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
+    cached::cached_macro(attr.into(), item.into()).into()
 }
