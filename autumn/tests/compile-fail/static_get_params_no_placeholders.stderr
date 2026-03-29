@@ -1,0 +1,5 @@
+error: Static route has no path parameters but a `params` function was provided. Either add path parameters or remove the `params` attribute.
+ --> tests/compile-fail/static_get_params_no_placeholders.rs:8:14
+  |
+8 | #[static_get("/about", params = list_slugs)]
+  |              ^^^^^^^^

@@ -1,4 +1,4 @@
-error: static_get does not support path parameters yet. Use #[get] for parameterized routes.
+error: Parameterized static routes require a `params` function. Example: #[static_get("/posts/{slug}", params = list_slugs)]
  --> tests/compile-fail/static_get_path_params.rs:3:14
   |
 3 | #[static_get("/posts/{slug}")]

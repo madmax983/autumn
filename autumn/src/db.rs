@@ -183,6 +183,10 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
         });
 
         let response = app

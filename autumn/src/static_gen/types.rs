@@ -1,6 +1,50 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
+
+/// A set of path parameter values for a parameterized static route.
+///
+/// Maps parameter names (e.g. `"slug"`) to their values (e.g. `"hello-world"`).
+///
+/// # Example
+///
+/// ```
+/// use autumn_web::static_gen::StaticParams;
+///
+/// let mut params = StaticParams::new();
+/// params.insert("slug".to_owned(), "hello-world".to_owned());
+/// ```
+pub type StaticParams = HashMap<String, String>;
+
+/// Convenience macro for building a [`StaticParams`] map.
+///
+/// # Example
+///
+/// ```
+/// use autumn_web::static_params;
+///
+/// let params = static_params! { "slug" => "hello-world" };
+/// assert_eq!(params.get("slug").unwrap(), "hello-world");
+/// ```
+#[macro_export]
+macro_rules! static_params {
+    ($($key:expr => $value:expr),* $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut map = ::std::collections::HashMap::new();
+        $(map.insert($key.to_owned(), $value.to_owned());)*
+        map
+    }};
+}
+
+/// The type-erased async function that returns parameter sets for a
+/// parameterized static route.
+///
+/// This is the type stored inside [`StaticRouteMeta::params_fn`]. The
+/// build engine calls it to enumerate all parameter combinations that
+/// should be pre-rendered.
+pub type ParamsFn = fn(axum::Router) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>>;
 
 /// Metadata for a route that should be statically generated at build time.
 ///
@@ -8,15 +52,29 @@ use std::path::Path;
 /// static-site build step. The `revalidate` field controls ISR
 /// (Incremental Static Regeneration): if set, the pre-rendered page
 /// will be refreshed after the given number of seconds.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StaticRouteMeta {
-    /// The URL path pattern, e.g. `"/"` or `"/about"`.
+    /// The URL path pattern, e.g. `"/"` or `"/posts/{slug}"`.
     pub path: &'static str,
     /// The handler function name (used for diagnostics and manifest keys).
     pub name: &'static str,
     /// Optional ISR revalidation interval in seconds.
     /// `None` means the page is generated once and never refreshed.
     pub revalidate: Option<u64>,
+    /// Optional async function that returns parameter sets for
+    /// parameterized routes. `None` for simple (non-parameterized) routes.
+    pub params_fn: Option<ParamsFn>,
+}
+
+impl std::fmt::Debug for StaticRouteMeta {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticRouteMeta")
+            .field("path", &self.path)
+            .field("name", &self.name)
+            .field("revalidate", &self.revalidate)
+            .field("params_fn", &self.params_fn.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 /// Persistent manifest written by `autumn build` and read at runtime
@@ -159,11 +217,67 @@ mod tests {
             path: "/test",
             name: "test_handler",
             revalidate: Some(60),
+            params_fn: None,
         };
         let copy = meta.clone();
         // Use original after clone to prove it's a real copy, not a move
         assert_eq!(meta.path, copy.path);
         assert_eq!(copy.name, "test_handler");
         assert_eq!(copy.revalidate, Some(60));
+    }
+
+    #[test]
+    fn static_params_macro() {
+        let params = static_params! { "slug" => "hello-world" };
+        assert_eq!(params.get("slug").unwrap(), "hello-world");
+    }
+
+    #[test]
+    fn static_params_macro_multiple() {
+        let params = static_params! {
+            "year" => "2026",
+            "month" => "03",
+            "slug" => "hello",
+        };
+        assert_eq!(params.len(), 3);
+        assert_eq!(params.get("year").unwrap(), "2026");
+        assert_eq!(params.get("month").unwrap(), "03");
+        assert_eq!(params.get("slug").unwrap(), "hello");
+    }
+
+    #[test]
+    fn static_params_macro_empty() {
+        let params: StaticParams = static_params! {};
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn static_route_meta_with_params_fn() {
+        fn dummy_params(
+            _router: axum::Router,
+        ) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
+            Box::pin(async { vec![static_params! { "slug" => "test" }] })
+        }
+
+        let meta = StaticRouteMeta {
+            path: "/posts/{slug}",
+            name: "show_post",
+            revalidate: None,
+            params_fn: Some(dummy_params),
+        };
+        assert!(meta.params_fn.is_some());
+        assert_eq!(meta.path, "/posts/{slug}");
+    }
+
+    #[test]
+    fn static_route_meta_debug() {
+        let meta = StaticRouteMeta {
+            path: "/test",
+            name: "test",
+            revalidate: None,
+            params_fn: None,
+        };
+        let debug = format!("{meta:?}");
+        assert!(debug.contains("test"));
     }
 }

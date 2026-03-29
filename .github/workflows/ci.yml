@@ -37,8 +37,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests
+      - name: Run tests (full)
+        if: runner.os != 'Windows'
         run: cargo test --workspace
+      - name: Run tests (Windows — no db feature)
+        if: runner.os == 'Windows'
+        run: cargo test -p autumn-web --lib --no-default-features --features maud,htmx,tailwind
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored

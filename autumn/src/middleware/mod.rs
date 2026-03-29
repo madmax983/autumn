@@ -15,8 +15,11 @@
 //! when at least one exception filter is registered via
 //! [`AppBuilder::exception_filter`](crate::app::AppBuilder::exception_filter).
 
+pub(crate) mod error_page_filter;
 pub mod exception_filter;
+pub mod metrics;
 pub mod request_id;
 
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
+pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};

@@ -13,6 +13,7 @@ fn compile_fail_tests() {
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
+    t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
 
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
@@ -32,6 +33,7 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/async_main.rs");
     t.pass("tests/compile-pass/static_get_basic.rs");
     t.pass("tests/compile-pass/static_routes_basic.rs");
+    t.pass("tests/compile-pass/static_get_parameterized.rs");
 
     // Interceptor macro
     t.pass("tests/compile-pass/intercept_basic.rs");
