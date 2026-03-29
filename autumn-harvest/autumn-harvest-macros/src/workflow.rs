@@ -25,6 +25,8 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let companion_name = format_ident!("__autumn_workflow_info_{fn_name}");
 
+    // Collect parameter names after the first (ctx is first, rest are inputs).
+    // For Phase 1 we pass all non-ctx args as a single JSON value.
     let params: Vec<_> = input_fn.sig.inputs.iter().skip(1).collect();
     let param_names: Vec<_> = params
         .iter()
@@ -41,9 +43,11 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let dispatch = if param_names.is_empty() {
         quote! {
             let result = #fn_name(ctx).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else if param_names.len() == 1 {
         let name = &param_names[0];
@@ -51,13 +55,16 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::autumn_harvest::serde_json::from_value(input)
                 .map_err(|e| e.to_string())?;
             let result = #fn_name(ctx, #name).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else {
+        // Multiple params: expect input to be a JSON array [arg1, arg2, ...]
         let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = &param_names;
+        let names = param_names.clone();
         quote! {
             let args: ::autumn_harvest::serde_json::Value = input;
             #(
@@ -65,9 +72,11 @@ pub fn workflow_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| e.to_string())?;
             )*
             let result = #fn_name(ctx, #(#names),*).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     };
 

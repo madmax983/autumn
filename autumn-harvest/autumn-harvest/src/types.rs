@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub struct WorkflowId(String);
 
 impl WorkflowId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -41,12 +42,13 @@ impl fmt::Display for WorkflowId {
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -75,12 +77,13 @@ impl FromStr for ExecutionId {
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -109,8 +112,14 @@ impl FromStr for ActivityExecId {
 pub struct TimerId(String);
 
 impl TimerId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -125,8 +134,14 @@ impl fmt::Display for TimerId {
 pub struct WorkerId(String);
 
 impl WorkerId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
