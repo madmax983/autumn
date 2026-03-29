@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, cursor};
+use crossterm::{cursor, execute};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,7 +20,6 @@ use ratatui::widgets::{
     Bar, BarChart, BarGroup, Block, Borders, Cell, Padding, Paragraph, Row, Sparkline, Table, Tabs,
     Wrap,
 };
-use ratatui::Terminal;
 use serde::Deserialize;
 
 // ── Actuator response types ───────────────────────────────────
@@ -241,7 +241,10 @@ impl DashboardState {
         {
             if let Ok(m) = resp.json::<MetricsResponse>() {
                 // Compute throughput delta
-                let delta = m.http.requests_total.saturating_sub(self.prev_requests_total);
+                let delta = m
+                    .http
+                    .requests_total
+                    .saturating_sub(self.prev_requests_total);
                 if self.prev_requests_total > 0 || !self.throughput_history.is_empty() {
                     self.throughput_history.push(delta);
                     if self.throughput_history.len() > SPARKLINE_DEPTH {
@@ -361,7 +364,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(10),  // body
+            Constraint::Min(10),   // body
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -382,7 +385,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(30), // logo
-            Constraint::Min(20),   // tabs
+            Constraint::Min(20),    // tabs
             Constraint::Length(28), // connection status
         ])
         .split(area);
@@ -406,7 +409,11 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         ),
         Span::styled(" monitor", Style::default().fg(Color::Gray)),
     ]))
-    .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(title, chunks[0]);
 
     // Tabs
@@ -420,7 +427,11 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
                 .add_modifier(Modifier::BOLD),
         )
         .divider(Span::raw(" | "))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     frame.render_widget(tabs, chunks[1]);
 
     // Connection status
@@ -447,7 +458,11 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         ),
     ]))
     .alignment(Alignment::Right)
-    .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+    .block(
+        Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
     frame.render_widget(conn, chunks[2]);
 }
 
@@ -458,7 +473,7 @@ fn draw_overview_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
         .constraints([
             Constraint::Length(9),  // stats cards row
             Constraint::Length(10), // sparklines
-            Constraint::Min(8),    // status codes + tasks
+            Constraint::Min(8),     // status codes + tasks
         ])
         .split(area);
 
@@ -509,14 +524,15 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
         Line::from(Span::styled(
             format!("{rps}"),
             Style::default()
-                .fg(if rps > 0 { Color::Green } else { Color::DarkGray })
+                .fg(if rps > 0 {
+                    Color::Green
+                } else {
+                    Color::DarkGray
+                })
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
-        Line::from(Span::styled(
-            "req/s",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("req/s", Style::default().fg(Color::DarkGray))),
     ]))
     .alignment(Alignment::Center)
     .block(rps_block);
@@ -673,7 +689,11 @@ fn draw_status_codes(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
         .data(bar_group)
         .bar_width(5)
         .bar_gap(2)
-        .value_style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+        .value_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
 
     frame.render_widget(chart, area);
 }
@@ -690,7 +710,11 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
         .border_style(Style::default().fg(Color::DarkGray));
 
     let mut lines = vec![
-        info_line("Status", &state.health.status, status_color(&state.health.status)),
+        info_line(
+            "Status",
+            &state.health.status,
+            status_color(&state.health.status),
+        ),
         info_line("Version", &state.health.version, Color::White),
         info_line("Profile", &state.health.profile, Color::Cyan),
         info_line("Uptime", &state.health.uptime, Color::White),
@@ -705,9 +729,21 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
                 .fg(Color::Rgb(204, 120, 50))
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         )));
-        lines.push(info_line("Pool Size", &db.pool_size.to_string(), Color::White));
-        lines.push(info_line("Active", &db.active_connections.to_string(), Color::Yellow));
-        lines.push(info_line("Idle", &db.idle_connections.to_string(), Color::Green));
+        lines.push(info_line(
+            "Pool Size",
+            &db.pool_size.to_string(),
+            Color::White,
+        ));
+        lines.push(info_line(
+            "Active",
+            &db.active_connections.to_string(),
+            Color::Yellow,
+        ));
+        lines.push(info_line(
+            "Idle",
+            &db.idle_connections.to_string(),
+            Color::Green,
+        ));
     } else if let Some(checks) = &state.health.checks {
         if let Some(db) = &checks.database {
             lines.push(Line::raw(""));
@@ -718,9 +754,21 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )));
             lines.push(info_line("DB Status", &db.status, status_color(&db.status)));
-            lines.push(info_line("Pool Size", &db.pool_size.to_string(), Color::White));
-            lines.push(info_line("Active", &db.active_connections.to_string(), Color::Yellow));
-            lines.push(info_line("Idle", &db.idle_connections.to_string(), Color::Green));
+            lines.push(info_line(
+                "Pool Size",
+                &db.pool_size.to_string(),
+                Color::White,
+            ));
+            lines.push(info_line(
+                "Active",
+                &db.active_connections.to_string(),
+                Color::Yellow,
+            ));
+            lines.push(info_line(
+                "Idle",
+                &db.idle_connections.to_string(),
+                Color::Green,
+            ));
         }
     }
 
@@ -763,7 +811,12 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
 
         lines.push(Line::from(vec![
             status_icon,
-            Span::styled(name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -788,7 +841,9 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
                 Span::raw("  "),
                 Span::styled(
                     truncate(err, 40),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
@@ -811,12 +866,36 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
         .padding(Padding::new(1, 1, 0, 0));
 
     let header = Row::new(vec![
-        Cell::from("Route").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
-        Cell::from("Count").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
-        Cell::from("p50").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
-        Cell::from("p95").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
-        Cell::from("p99").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
-        Cell::from("Bar").style(Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
+        Cell::from("Route").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Count").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("p50").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("p95").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("p99").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Bar").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
     ])
     .height(1)
     .bottom_margin(1);
@@ -830,7 +909,11 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
         .iter()
         .enumerate()
         .map(|(i, (name, snap))| {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
             let bar_width = ((snap.count as f64 / max_count as f64) * 20.0) as usize;
             let bar = "█".repeat(bar_width);
 
@@ -843,9 +926,12 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
             Row::new(vec![
                 Cell::from((*name).clone()).style(Style::default().fg(Color::White)),
                 Cell::from(format_number(snap.count)).style(Style::default().fg(Color::Cyan)),
-                Cell::from(format!("{}ms", snap.p50_ms)).style(Style::default().fg(latency_color(snap.p50_ms))),
-                Cell::from(format!("{}ms", snap.p95_ms)).style(Style::default().fg(latency_color(snap.p95_ms))),
-                Cell::from(format!("{}ms", snap.p99_ms)).style(Style::default().fg(latency_color(snap.p99_ms))),
+                Cell::from(format!("{}ms", snap.p50_ms))
+                    .style(Style::default().fg(latency_color(snap.p50_ms))),
+                Cell::from(format!("{}ms", snap.p95_ms))
+                    .style(Style::default().fg(latency_color(snap.p95_ms))),
+                Cell::from(format!("{}ms", snap.p99_ms))
+                    .style(Style::default().fg(latency_color(snap.p99_ms))),
                 Cell::from(bar).style(Style::default().fg(Color::Green)),
             ])
             .style(Style::default().bg(bg))
@@ -873,11 +959,26 @@ fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let elapsed = state.last_poll.elapsed().as_secs();
 
     let mut spans = vec![
-        Span::styled(" q", Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " q",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Tab", Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Tab",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" switch view  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("j/k", Style::default().fg(Color::Rgb(204, 120, 50)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "j/k",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
     ];
 
@@ -913,10 +1014,7 @@ fn make_card_block(title: &str) -> Block<'_> {
 
 fn info_line(label: &str, value: &str, color: Color) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {label}: "),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {label}: "), Style::default().fg(Color::DarkGray)),
         Span::styled(value.to_string(), Style::default().fg(color)),
     ])
 }

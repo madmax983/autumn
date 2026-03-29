@@ -225,9 +225,8 @@ mod tests {
 
     #[test]
     fn parse_monitor_custom_url() {
-        let cli =
-            Cli::try_parse_from(["autumn", "monitor", "-u", "http://prod:8080", "-i", "5"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "monitor", "-u", "http://prod:8080", "-i", "5"])
+            .unwrap();
         match cli.command {
             Commands::Monitor { url, interval } => {
                 assert_eq!(url, "http://prod:8080");
