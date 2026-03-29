@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod build;
 mod dev;
 mod migrate;
+mod monitor;
 mod new;
 mod setup;
 
@@ -48,6 +49,15 @@ enum Commands {
         #[command(subcommand)]
         action: Option<MigrateCommands>,
     },
+    /// Live monitoring dashboard for a running Autumn application
+    Monitor {
+        /// URL of the running Autumn application
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
+        /// Polling interval in seconds
+        #[arg(short, long, default_value = "1")]
+        interval: u64,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -69,6 +79,7 @@ fn main() {
             };
             migrate::run(action);
         }
+        Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -198,6 +209,31 @@ mod tests {
                 action: Some(MigrateCommands::Status)
             }
         ));
+    }
+
+    #[test]
+    fn parse_monitor_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "monitor"]).unwrap();
+        match cli.command {
+            Commands::Monitor { url, interval } => {
+                assert_eq!(url, "http://localhost:3000");
+                assert_eq!(interval, 1);
+            }
+            _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn parse_monitor_custom_url() {
+        let cli = Cli::try_parse_from(["autumn", "monitor", "-u", "http://prod:8080", "-i", "5"])
+            .unwrap();
+        match cli.command {
+            Commands::Monitor { url, interval } => {
+                assert_eq!(url, "http://prod:8080");
+                assert_eq!(interval, 5);
+            }
+            _ => panic!("expected Monitor command"),
+        }
     }
 
     #[test]
