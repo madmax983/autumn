@@ -256,7 +256,9 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
 
 fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: usize) {
     if depth > MAX_MERGE_DEPTH {
-        eprintln!("Warning: Configuration merge exceeded max depth ({MAX_MERGE_DEPTH}), ignoring deeper values.");
+        eprintln!(
+            "Warning: Configuration merge exceeded max depth ({MAX_MERGE_DEPTH}), ignoring deeper values."
+        );
         return;
     }
 
@@ -1928,10 +1930,15 @@ path = "/healthz"
 
         // Trigger merge, expecting no panic/stack overflow
         // We run it on a thread with a large stack to avoid the stack overflow caused by Drop when base is dropped at the end of the function (since we created a 10,000 depth structure).
-        std::thread::Builder::new().stack_size(32 * 1024 * 1024).spawn(move || {
-            deep_merge(&mut base, overlay);
-            // Let the OS clean up the memory instead of dropping deeply nested structure
-            std::mem::forget(base);
-        }).unwrap().join().unwrap();
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                deep_merge(&mut base, overlay);
+                // Let the OS clean up the memory instead of dropping deeply nested structure
+                std::mem::forget(base);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
