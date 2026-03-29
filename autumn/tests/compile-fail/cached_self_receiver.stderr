@@ -1,0 +1,5 @@
+error: #[cached] does not support methods with `self`
+ --> tests/compile-fail/cached_self_receiver.rs:7:24
+  |
+7 |     async fn get_thing(&self) -> String {
+  |                        ^^^^^
