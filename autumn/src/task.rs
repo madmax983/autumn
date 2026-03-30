@@ -123,4 +123,21 @@ mod tests {
     fn empty() {
         assert!(parse_duration("").is_none());
     }
+
+    #[test]
+    fn invalid_char_returns_none() {
+        assert!(parse_duration("5m !").is_none());
+        assert!(parse_duration("-5m").is_none());
+    }
+
+    #[test]
+    fn zero_duration_returns_none() {
+        assert!(parse_duration("0s").is_none());
+        assert!(parse_duration("0h 0m").is_none());
+    }
+
+    #[test]
+    fn multiple_spaces() {
+        assert_eq!(parse_duration("1h   30m"), Some(Duration::from_secs(5400)));
+    }
 }

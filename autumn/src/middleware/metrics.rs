@@ -397,7 +397,24 @@ mod tests {
     fn percentiles_computed_correctly() {
         let pcts = compute_percentiles(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(pcts.p50, 6); // sorted[10*50/100] = sorted[5] = 6
+        assert_eq!(pcts.p95, 10); // sorted[min(9, 10*95/100)] = sorted[9] = 10
         assert_eq!(pcts.p99, 10); // sorted[min(9, 10*99/100)] = sorted[9] = 10
+    }
+
+    #[test]
+    fn percentiles_empty_slice() {
+        let pcts = compute_percentiles(&[]);
+        assert_eq!(pcts.p50, 0);
+        assert_eq!(pcts.p95, 0);
+        assert_eq!(pcts.p99, 0);
+    }
+
+    #[test]
+    fn percentiles_single_element() {
+        let pcts = compute_percentiles(&[42]);
+        assert_eq!(pcts.p50, 42);
+        assert_eq!(pcts.p95, 42);
+        assert_eq!(pcts.p99, 42);
     }
 
     #[test]
