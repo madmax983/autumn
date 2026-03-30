@@ -30,3 +30,42 @@ impl WasmManifest {
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_reads_manifest_from_disk() {
+        let temp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            temp.path(),
+            r#"{"entry_js":"/static/client.js","entry_wasm":"/static/client_bg.wasm","islands":{"counter":{"mount_id":"counter-root"}}}"#,
+        )
+        .expect("write manifest");
+
+        let manifest = WasmManifest::load(temp.path()).expect("load manifest");
+
+        assert_eq!(manifest.entry_js.as_deref(), Some("/static/client.js"));
+        assert_eq!(
+            manifest.entry_wasm.as_deref(),
+            Some("/static/client_bg.wasm")
+        );
+        assert_eq!(manifest.islands["counter"].mount_id, "counter-root");
+    }
+
+    #[test]
+    fn load_rejects_invalid_json() {
+        let temp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(temp.path(), "{ not json").expect("write manifest");
+
+        assert!(WasmManifest::load(temp.path()).is_err());
+    }
+
+    #[test]
+    fn load_missing_manifest_returns_error() {
+        let missing = std::path::Path::new("definitely-not-a-real-manifest.json");
+
+        assert!(WasmManifest::load(missing).is_err());
+    }
+}

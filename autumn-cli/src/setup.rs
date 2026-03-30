@@ -110,10 +110,7 @@ fn validate_wasm_target() -> Result<(), SetupError> {
         .args(["target", "list", "--installed"])
         .output()?;
     let installed = String::from_utf8_lossy(&output.stdout);
-    if installed
-        .lines()
-        .any(|line| line.trim() == "wasm32-unknown-unknown")
-    {
+    if has_installed_target(&installed, "wasm32-unknown-unknown") {
         println!("WASM target installed: wasm32-unknown-unknown");
         return Ok(());
     }
@@ -122,6 +119,10 @@ fn validate_wasm_target() -> Result<(), SetupError> {
         "missing wasm32-unknown-unknown target. Run: rustup target add wasm32-unknown-unknown"
             .to_owned(),
     ))
+}
+
+fn has_installed_target(installed: &str, target: &str) -> bool {
+    installed.lines().any(|line| line.trim() == target)
 }
 
 // ── Platform detection ──────────────────────────────────────────────────
@@ -425,6 +426,20 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
         } else {
             assert_eq!(path, PathBuf::from("target/autumn/tailwindcss"));
         }
+    }
+
+    #[test]
+    fn detects_installed_wasm_target_in_rustup_output() {
+        let installed = "x86_64-unknown-linux-gnu\nwasm32-unknown-unknown\n";
+
+        assert!(has_installed_target(installed, "wasm32-unknown-unknown"));
+    }
+
+    #[test]
+    fn reports_missing_wasm_target_in_rustup_output() {
+        let installed = "x86_64-unknown-linux-gnu\nthumbv7em-none-eabihf\n";
+
+        assert!(!has_installed_target(installed, "wasm32-unknown-unknown"));
     }
 
     // ── Integration test (requires network) ─────────────────────────

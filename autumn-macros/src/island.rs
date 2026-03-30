@@ -95,4 +95,31 @@ mod tests {
         assert!(out.contains("fn counter"));
         assert!(out.contains("__autumn_island_meta_counter"));
     }
+
+    #[test]
+    fn rejects_functions_without_island_context_argument() {
+        let out = island_macro(quote! {
+            fn counter() {}
+        });
+
+        assert!(out.to_string().contains("requires first argument"));
+    }
+
+    #[test]
+    fn rejects_non_island_context_first_argument() {
+        let out = island_macro(quote! {
+            fn counter(props: Props) {}
+        });
+
+        assert!(out.to_string().contains("expected IslandCx<Props>"));
+    }
+
+    #[test]
+    fn rejects_method_receivers() {
+        let out = island_macro(quote! {
+            fn counter(&self, cx: IslandCx<Props>) {}
+        });
+
+        assert!(out.to_string().contains("does not support methods"));
+    }
 }

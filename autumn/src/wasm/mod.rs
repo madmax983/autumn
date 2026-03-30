@@ -56,6 +56,42 @@ pub fn island<P: serde::Serialize>(meta: IslandMeta, props: P, fallback: Markup)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let guard = ENV_LOCK.lock().expect("env lock poisoned");
+            let previous = std::env::var_os(key);
+            // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key,
+                previous,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     #[test]
     fn manifest_round_trip() {
@@ -73,6 +109,22 @@ mod tests {
         let json = serde_json::to_string(&manifest).expect("serialize");
         let decoded: WasmManifest = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, manifest);
+    }
+
+    #[test]
+    fn load_manifest_uses_env_override() {
+        let temp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            temp.path(),
+            r#"{"entry_js":"/static/client.js","entry_wasm":null,"islands":{}}"#,
+        )
+        .expect("write manifest");
+        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", temp.path());
+
+        let manifest = load_manifest().expect("load manifest");
+
+        assert_eq!(manifest.entry_js.as_deref(), Some("/static/client.js"));
+        assert_eq!(manifest.entry_wasm, None);
     }
 
     #[cfg(feature = "maud")]
@@ -111,5 +163,34 @@ mod tests {
 
         assert!(markup.contains("&lt;/script&gt;&lt;img"));
         assert!(!markup.contains("</script><img"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn assets_render_entrypoints_from_manifest() {
+        let temp = tempfile::NamedTempFile::new().expect("temp file");
+        std::fs::write(
+            temp.path(),
+            r#"{"entry_js":"/static/client.js","entry_wasm":"/static/client_bg.wasm","islands":{}}"#,
+        )
+        .expect("write manifest");
+        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", temp.path());
+
+        let markup = assets().into_string();
+
+        assert!(markup.contains("src=\"/static/client.js\""));
+        assert!(markup.contains("href=\"/static/client_bg.wasm\""));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn assets_return_empty_markup_when_manifest_is_missing() {
+        let missing = tempfile::tempdir()
+            .expect("temp dir")
+            .path()
+            .join("missing-manifest.json");
+        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", &missing);
+
+        assert_eq!(assets().into_string(), "");
     }
 }

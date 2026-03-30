@@ -1429,6 +1429,25 @@ mod tests {
         assert_eq!(&body[..], b"ok");
     }
 
+    #[test]
+    fn app_builder_tracks_wasm_metadata() {
+        let app = app()
+            .islands(vec![crate::wasm::IslandMeta {
+                name: "counter",
+                mount_id: "counter-root",
+                props_type: "CounterProps",
+            }])
+            .actions(vec![crate::wasm::ActionMeta {
+                name: "increment",
+                path: "/actions/increment",
+            }]);
+
+        assert_eq!(app.islands.len(), 1);
+        assert_eq!(app.actions.len(), 1);
+        assert_eq!(app.islands[0].mount_id, "counter-root");
+        assert_eq!(app.actions[0].path, "/actions/increment");
+    }
+
     #[tokio::test]
     async fn build_router_mounts_health_check_at_default_path() {
         let router = test_router(vec![test_get_route("/dummy", "dummy")]);

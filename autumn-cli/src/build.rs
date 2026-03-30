@@ -271,6 +271,7 @@ fn find_binary(debug: bool, package: Option<&str>) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn wasm_build_command_targets_client_bin_instead_of_lib() {
@@ -311,5 +312,106 @@ mod tests {
             args.iter().any(|arg| arg == "--release"),
             "release WASM builds should pass --release: {args:?}",
         );
+    }
+
+    #[test]
+    fn resolve_wasm_client_target_by_package_name() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "alpha",
+                    "manifest_path": "/repo/alpha/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "client",
+                            "kind": ["bin"],
+                            "src_path": "/repo/alpha/src/client.rs"
+                        }
+                    ]
+                },
+                {
+                    "name": "beta",
+                    "manifest_path": "/repo/beta/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "server",
+                            "kind": ["bin"],
+                            "src_path": "/repo/beta/src/main.rs"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let target =
+            resolve_wasm_client_target_from_metadata(&metadata, Some("alpha"), Path::new("/repo"))
+                .expect("resolve wasm client target");
+
+        assert_eq!(target, "client");
+    }
+
+    #[test]
+    fn resolve_wasm_client_target_by_current_directory() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "outside",
+                    "manifest_path": "/elsewhere/outside/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "client",
+                            "kind": ["bin"],
+                            "src_path": "/elsewhere/outside/src/client.rs"
+                        }
+                    ]
+                },
+                {
+                    "name": "inside",
+                    "manifest_path": "/repo/app/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "client-app",
+                            "kind": ["bin"],
+                            "src_path": "/repo/app/src/client.rs"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let target =
+            resolve_wasm_client_target_from_metadata(&metadata, None, Path::new("/repo/app"))
+                .expect("resolve wasm client target");
+
+        assert_eq!(target, "client-app");
+    }
+
+    #[test]
+    fn resolve_wasm_client_target_reports_missing_client_bin() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "demo",
+                    "manifest_path": "/repo/demo/Cargo.toml",
+                    "targets": [
+                        {
+                            "name": "server",
+                            "kind": ["bin"],
+                            "src_path": "/repo/demo/src/main.rs"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let error = resolve_wasm_client_target_from_metadata(
+            &metadata,
+            Some("demo"),
+            Path::new("/repo/demo"),
+        )
+        .expect_err("missing client target should error");
+
+        assert!(error.contains("package 'demo'"));
+        assert!(error.contains("src/client.rs"));
     }
 }

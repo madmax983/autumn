@@ -46,3 +46,29 @@ pub fn boot(registry: &[IslandRegistration]) {
         let _ = registry;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CALLED: AtomicBool = AtomicBool::new(false);
+
+    fn record_mount(_: crate::Element, _: String) {
+        CALLED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn boot_is_a_noop_on_non_wasm_targets() {
+        CALLED.store(false, Ordering::SeqCst);
+        let registry = [IslandRegistration::new(
+            "counter",
+            "counter-root",
+            record_mount,
+        )];
+
+        boot(&registry);
+
+        assert!(!CALLED.load(Ordering::SeqCst));
+    }
+}
