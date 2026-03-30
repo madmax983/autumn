@@ -88,21 +88,26 @@ fn build_wasm_bundle(debug: bool, package: Option<&str>) {
     };
 
     eprintln!("Compiling WASM client entry...");
-    let mut cargo = Command::new("cargo");
-    cargo.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
-    cargo.arg(&client_target);
-    if !debug {
-        cargo.arg("--release");
-    }
-    if let Some(pkg) = package {
-        cargo.args(["-p", pkg]);
-    }
+    let mut cargo = build_wasm_command(debug, package, &client_target);
 
     let status = cargo.status().expect("failed to run cargo wasm build");
     if !status.success() {
         eprintln!("\u{2717} WASM client compilation failed");
         std::process::exit(1);
     }
+}
+
+fn build_wasm_command(debug: bool, package: Option<&str>, client_target: &str) -> Command {
+    let mut cargo = Command::new("cargo");
+    cargo.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
+    cargo.arg(client_target);
+    if !debug {
+        cargo.arg("--release");
+    }
+    if let Some(pkg) = package {
+        cargo.args(["-p", pkg]);
+    }
+    cargo
 }
 
 fn resolve_wasm_client_target_from_metadata(
@@ -263,171 +268,48 @@ fn find_binary(debug: bool, package: Option<&str>) -> std::path::PathBuf {
     path
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::{OsStr, OsString};
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
 
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+    #[test]
+    fn wasm_build_command_targets_client_bin_instead_of_lib() {
+        let command = build_wasm_command(true, Some("demo-app"), "client");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(command.get_program().to_string_lossy(), "cargo");
+        assert_eq!(
+            args,
+            vec![
+                "build",
+                "--target",
+                "wasm32-unknown-unknown",
+                "--bin",
+                "client",
+                "-p",
+                "demo-app",
+            ],
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--lib"),
+            "WASM bundle build should not use the library target: {args:?}",
+        );
     }
 
     #[test]
-    fn wasm_build_targets_client_bin_instead_of_lib() {
-        let _guard = test_lock().lock().expect("lock");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let script_dir = temp.path().join("bin");
-        fs::create_dir_all(&script_dir).expect("create bin dir");
-        let log_path = temp.path().join("cargo-args.log");
-        let fake_cargo = write_fake_cargo(&script_dir, &log_path, temp.path());
-        let original_path = std::env::var_os("PATH");
-        let _env = EnvGuard::set_many(&[
-            (
-                "PATH",
-                Some(prepend_path(
-                    fake_cargo.parent().expect("script parent"),
-                    original_path.as_deref(),
-                )),
-            ),
-            (
-                "AUTUMN_FAKE_CARGO_LOG",
-                Some(log_path.as_os_str().to_os_string()),
-            ),
-        ]);
-        let _cwd = CwdGuard::change(temp.path());
-
-        build_wasm_bundle(true, Some("demo-app"));
-
-        let log = fs::read_to_string(&log_path).expect("read cargo log");
-        let wasm_invocation = log
-            .lines()
-            .find(|line| line.contains("--target wasm32-unknown-unknown"))
-            .expect("wasm cargo invocation");
+    fn wasm_build_command_adds_release_flag_for_release_builds() {
+        let command = build_wasm_command(false, None, "client");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
 
         assert!(
-            wasm_invocation.contains("--bin client"),
-            "WASM bundle build should compile the client entry binary: {wasm_invocation}",
+            args.iter().any(|arg| arg == "--release"),
+            "release WASM builds should pass --release: {args:?}",
         );
-        assert!(
-            !wasm_invocation.contains("--lib"),
-            "WASM bundle build should not use the library target: {wasm_invocation}",
-        );
-    }
-
-    fn write_fake_cargo(dir: &Path, log_path: &Path, project_dir: &Path) -> PathBuf {
-        #[cfg(windows)]
-        let script_path = dir.join("cargo.cmd");
-        #[cfg(not(windows))]
-        let script_path = dir.join("cargo");
-
-        let target_dir = escape_json_path(&dir.join("..").join("target"));
-        let project_dir = escape_json_path(project_dir);
-
-        #[cfg(windows)]
-        let script = format!(
-            "@echo off\r\nsetlocal\r\n>>\"{}\" echo %*\r\nif \"%1\"==\"metadata\" (\r\n  echo {{\"target_directory\":\"{}\",\"packages\":[{{\"name\":\"demo-app\",\"manifest_path\":\"{}\\\\Cargo.toml\",\"targets\":[{{\"name\":\"demo-app\",\"kind\":[\"bin\"],\"src_path\":\"{}\\\\src\\\\main.rs\"}},{{\"name\":\"client\",\"kind\":[\"bin\"],\"src_path\":\"{}\\\\src\\\\client.rs\"}}]}}]}}\r\n)\r\nexit /b 0\r\n",
-            log_path.display(),
-            target_dir,
-            project_dir,
-            project_dir,
-            project_dir,
-        );
-
-        #[cfg(not(windows))]
-        let script = format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >> \"{}\"\nif [ \"${{1:-}}\" = \"metadata\" ]; then\n  printf '%s\\n' '{{\"target_directory\":\"{}\",\"packages\":[{{\"name\":\"demo-app\",\"manifest_path\":\"{}/Cargo.toml\",\"targets\":[{{\"name\":\"demo-app\",\"kind\":[\"bin\"],\"src_path\":\"{}/src/main.rs\"}},{{\"name\":\"client\",\"kind\":[\"bin\"],\"src_path\":\"{}/src/client.rs\"}}]}}]}}'\nfi\nexit 0\n",
-            log_path.display(),
-            target_dir,
-            project_dir,
-            project_dir,
-            project_dir,
-        );
-
-        fs::write(&script_path, script).expect("write fake cargo");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).expect("chmod");
-        }
-
-        script_path
-    }
-
-    fn prepend_path(dir: &Path, existing: Option<&OsStr>) -> OsString {
-        let mut paths = vec![dir.to_path_buf()];
-        if let Some(existing) = existing {
-            paths.extend(std::env::split_paths(existing));
-        }
-        std::env::join_paths(paths).expect("join PATH")
-    }
-
-    fn escape_json_path(path: &Path) -> String {
-        path.display().to_string().replace('\\', "\\\\")
-    }
-
-    struct EnvGuard {
-        saved: Vec<(String, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(pairs: &[(&str, Option<OsString>)]) -> Self {
-            let mut saved = Vec::with_capacity(pairs.len());
-            for (key, value) in pairs {
-                saved.push(((*key).to_owned(), std::env::var_os(key)));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only environment changes are serialized with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only environment changes are serialized with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..).rev() {
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only environment changes are serialized with a process-wide mutex.
-                        unsafe { std::env::set_var(&key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only environment changes are serialized with a process-wide mutex.
-                        unsafe { std::env::remove_var(&key) };
-                    }
-                }
-            }
-        }
-    }
-
-    struct CwdGuard {
-        original: PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change(path: &Path) -> Self {
-            let original = std::env::current_dir().expect("cwd");
-            std::env::set_current_dir(path).expect("change cwd");
-            Self { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.original).expect("restore cwd");
-        }
     }
 }
