@@ -599,7 +599,7 @@ impl TestDb {
         // Two-phase init: OnceLock for the OnceCell, OnceCell for the async init.
         static CELL: OnceLock<OnceCell<TestDb>> = OnceLock::new();
         let once = CELL.get_or_init(OnceCell::new);
-        once.get_or_init(|| Self::new()).await
+        once.get_or_init(Self::new).await
     }
 
     /// Get the database connection pool.
