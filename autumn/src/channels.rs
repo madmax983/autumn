@@ -333,9 +333,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn channels_is_clone() {
         let channels = Channels::new(16);
-        let _cloned = channels;
+        let _cloned = channels.clone();
     }
 
     #[test]
