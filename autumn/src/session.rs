@@ -156,7 +156,9 @@ impl Session {
     pub async fn rotate_id(&self) {
         let mut inner = self.inner.write().await;
         let new_id = Uuid::new_v4().to_string();
-        inner.old_id = Some(inner.id.clone());
+        if inner.old_id.is_none() {
+            inner.old_id = Some(inner.id.clone());
+        }
         inner.id = new_id;
         inner.dirty = true;
     }
