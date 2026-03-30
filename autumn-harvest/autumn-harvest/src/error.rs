@@ -3,8 +3,10 @@
 //! `HarvestError` is a proper `std::error::Error` (via thiserror) so it can be
 //! propagated with `?` through internal engine code and wrapped in `AutumnError`
 //! at the boundary where workflow/activity results leave the engine.
-
-use std::time::Duration;
+//!
+//! Note: `AutumnError` (from autumn-web) is intentionally NOT `std::error::Error`
+//! — it's an HTTP response wrapper. `HarvestError` converts to `AutumnError` via
+//! the blanket `From<E: Error> for AutumnError` impl automatically.
 
 /// The kind of timeout that fired.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,7 +34,6 @@ impl std::fmt::Display for TimeoutType {
 
 /// Errors produced by the autumn-harvest workflow engine.
 #[derive(Debug, thiserror::Error)]
-#[allow(clippy::module_name_repetitions)]
 pub enum HarvestError {
     #[error("activity failed: {name} (attempt {attempt}): {source}")]
     ActivityFailed {
@@ -76,18 +77,11 @@ pub enum HarvestError {
 /// Standard result type for internal harvest engine operations.
 pub type HarvestResult<T> = Result<T, HarvestError>;
 
-/// Compute the next retry delay using exponential backoff.
+/// Wrap any displayable error into [`HarvestError::Database`].
 ///
-/// `attempt` is 1-based (attempt 1 = first retry, gets `initial`).
-#[must_use]
-pub fn compute_retry_delay(
-    initial: Duration,
-    backoff_coefficient: f64,
-    max_interval: Duration,
-    attempt: u32,
-) -> Duration {
-    let secs = initial.as_secs_f64() * backoff_coefficient.powi((attempt - 1) as i32);
-    Duration::from_secs_f64(secs.min(max_interval.as_secs_f64()))
+/// Use with `.map_err(database_error)` to reduce boilerplate on diesel calls.
+pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
+    HarvestError::Database(e.to_string())
 }
 
 #[cfg(test)]
@@ -111,8 +105,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn harvest_result_ok() {
         let r: HarvestResult<i32> = Ok(42);
-        assert!(r.is_ok());
+        assert_eq!(r.unwrap(), 42);
     }
 }

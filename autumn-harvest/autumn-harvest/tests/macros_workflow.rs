@@ -1,8 +1,9 @@
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
 
 #[workflow]
-async fn test_workflow(ctx: &WorkflowContext, _input: String) -> Result<String, String> {
-    let _ = ctx;
+async fn test_workflow(_ctx: &WorkflowContext, _input: String) -> Result<String, String> {
     Ok("done".into())
 }
 

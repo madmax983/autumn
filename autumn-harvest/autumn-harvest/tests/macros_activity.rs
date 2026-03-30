@@ -1,9 +1,10 @@
+#![allow(clippy::unused_async)]
+
 use autumn_harvest::prelude::*;
 use std::time::Duration;
 
 #[activity]
-async fn simple_activity(ctx: &ActivityContext, name: String) -> Result<String, String> {
-    let _ = ctx;
+async fn simple_activity(_ctx: &ActivityContext, name: String) -> Result<String, String> {
     Ok(format!("hello {name}"))
 }
 
@@ -12,8 +13,7 @@ async fn simple_activity(ctx: &ActivityContext, name: String) -> Result<String, 
     start_to_close = "30s",
     queue = "email-workers"
 )]
-async fn configured_activity(ctx: &ActivityContext, input: String) -> Result<String, String> {
-    let _ = ctx;
+async fn configured_activity(_ctx: &ActivityContext, input: String) -> Result<String, String> {
     Ok(input)
 }
 

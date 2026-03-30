@@ -5,7 +5,10 @@ use std::time::Duration;
 use crate::info::{ActivityInfo, WorkflowInfo};
 
 /// Fluent builder for configuring the autumn-harvest engine.
-#[derive(Default)]
+///
+/// In a full Autumn app, this is consumed by the `HarvestExt` trait on
+/// `AppBuilder`. In tests or standalone use, call `.build()` directly.
+#[derive(Default, Debug)]
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
@@ -13,6 +16,7 @@ pub struct HarvestBuilder {
 }
 
 impl HarvestBuilder {
+    /// Create a new empty builder.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
