@@ -344,6 +344,9 @@ fn stop_server(child: &mut Option<Child>) {
         {
             #[allow(clippy::cast_possible_wrap)]
             let pid = proc.id() as libc::pid_t;
+            // SAFETY: `pid` is retrieved directly from `proc.id()`, representing a valid child
+            // process we own. `libc::SIGTERM` is a standard, valid signal. Sending it to our
+            // own child process is safe.
             unsafe {
                 libc::kill(pid, libc::SIGTERM);
             }
