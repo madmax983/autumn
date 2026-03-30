@@ -89,6 +89,7 @@ pub struct Session {
 #[derive(Debug)]
 struct SessionInner {
     id: String,
+    old_id: Option<String>,
     data: HashMap<String, String>,
     dirty: bool,
     destroyed: bool,
@@ -106,6 +107,7 @@ impl Session {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
+                old_id: None,
                 data,
                 dirty: false,
                 destroyed: false,
@@ -144,6 +146,20 @@ impl Session {
     pub async fn clear(&self) {
         let mut inner = self.inner.write().await;
         inner.data.clear();
+        inner.dirty = true;
+    }
+
+    /// Rotate the session ID, generating a new ID for the same data.
+    ///
+    /// This is critical to call during privilege elevation (e.g., login)
+    /// to prevent Session Fixation attacks.
+    pub async fn rotate_id(&self) {
+        let mut inner = self.inner.write().await;
+        let new_id = Uuid::new_v4().to_string();
+        if inner.old_id.is_none() {
+            inner.old_id = Some(inner.id.clone());
+        }
+        inner.id = new_id;
         inner.dirty = true;
     }
 
@@ -419,10 +435,17 @@ where
         Box::pin(async move {
             // 1. Extract or create session ID
             let existing_id = get_cookie(req.headers(), &config.cookie_name);
+            let mut generated_new_id = false;
             let (session_id, data) = if let Some(ref id) = existing_id {
-                let data = store.load(id).await.unwrap_or_default();
-                (id.clone(), data)
+                store.load(id).await.map_or_else(
+                    || {
+                        generated_new_id = true;
+                        (Uuid::new_v4().to_string(), HashMap::new())
+                    },
+                    |data| (id.clone(), data),
+                )
             } else {
+                generated_new_id = true;
                 (Uuid::new_v4().to_string(), HashMap::new())
             };
 
@@ -440,9 +463,12 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
-            } else if inner_guard.dirty || existing_id.is_none() {
+            } else if inner_guard.dirty || generated_new_id {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
+                if let Some(ref old_id) = inner_guard.old_id {
+                    store.destroy(old_id).await;
+                }
                 drop(inner_guard);
                 store.save(&sid, data).await;
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &sid)) {

@@ -50,7 +50,7 @@ use std::task::{Context, Poll};
 use axum::extract::FromRequestParts;
 use axum::http::{Request, Response, StatusCode};
 use http::header::HeaderName;
-use pin_project_lite::pin_project;
+
 use tower::{Layer, Service};
 use uuid::Uuid;
 
@@ -117,6 +117,7 @@ where
 struct CsrfSettings {
     cookie_name: String,
     token_header: HeaderName,
+    form_field: String,
     safe_methods: Vec<http::Method>,
 }
 
@@ -147,6 +148,7 @@ impl CsrfLayer {
             settings: Arc::new(CsrfSettings {
                 cookie_name: config.cookie_name.clone(),
                 token_header,
+                form_field: config.form_field.clone(),
                 safe_methods,
             }),
         }
@@ -189,20 +191,22 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
         })
 }
 
-impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CsrfService<S>
+impl<S, ResBody> Service<Request<axum::body::Body>> for CsrfService<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
-    ResBody: Default,
+    S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ResBody: Default + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = CsrfFuture<S::Future>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         let is_safe = self.settings.safe_methods.contains(req.method());
         let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -214,25 +218,7 @@ where
         // Insert CsrfToken into request extensions for handler access
         req.extensions_mut().insert(CsrfToken(token.clone()));
 
-        if !is_safe {
-            // Validate: the header token must match the cookie token
-            let header_token = req
-                .headers()
-                .get(&self.settings.token_header)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-
-            if cookie_token.is_none() || header_token.as_deref() != cookie_token.as_deref() {
-                // CSRF validation failed -- reject via flag in the future
-                return CsrfFuture {
-                    inner: self.inner.call(req),
-                    csrf_rejected: true,
-                    set_cookie: None,
-                };
-            }
-        }
-
-        // Set cookie if not already present
+        // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {
             Some(format!(
                 "{}={}; Path=/; SameSite=Lax; HttpOnly",
@@ -242,54 +228,85 @@ where
             None
         };
 
-        CsrfFuture {
-            inner: self.inner.call(req),
-            csrf_rejected: false,
-            set_cookie,
-        }
-    }
-}
+        let settings = Arc::clone(&self.settings);
+        let mut inner = self.inner.clone();
 
-pin_project! {
-    /// Future for the CSRF middleware.
-    pub struct CsrfFuture<F> {
-        #[pin]
-        inner: F,
-        csrf_rejected: bool,
-        set_cookie: Option<String>,
-    }
-}
+        // Swap to ensure correct poll_ready semantics
+        std::mem::swap(&mut self.inner, &mut inner);
 
-impl<F, ResBody, E> Future for CsrfFuture<F>
-where
-    F: Future<Output = Result<Response<ResBody>, E>>,
-    ResBody: Default,
-{
-    type Output = Result<Response<ResBody>, E>;
+        Box::pin(async move {
+            if !is_safe {
+                // 1. Check header
+                let mut token_found = false;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
+                let header_token = req
+                    .headers()
+                    .get(&settings.token_header)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
 
-        if *this.csrf_rejected {
-            // Build a 403 response
-            let mut response = Response::new(ResBody::default());
-            *response.status_mut() = StatusCode::FORBIDDEN;
-            return Poll::Ready(Ok(response));
-        }
-
-        match this.inner.poll(cx) {
-            Poll::Ready(Ok(mut response)) => {
-                // Add Set-Cookie header for new CSRF tokens
-                if let Some(cookie) = this.set_cookie.take() {
-                    if let Ok(val) = http::HeaderValue::from_str(&cookie) {
-                        response.headers_mut().append(http::header::SET_COOKIE, val);
+                if let (Some(c), Some(h)) = (&cookie_token, &header_token) {
+                    if c == h {
+                        token_found = true;
                     }
                 }
-                Poll::Ready(Ok(response))
+
+                // 2. Check form field (if not found in header)
+                if !token_found {
+                    let content_type = req
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default();
+
+                    if content_type.starts_with("application/x-www-form-urlencoded") {
+                        let (parts, body) = req.into_parts();
+                        // Limit body size to avoid DoS when extracting form field
+                        let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
+                            .await
+                            .unwrap_or_else(|_| axum::body::Bytes::new());
+
+                        if let Ok(body_str) = std::str::from_utf8(&bytes) {
+                            for pair in body_str.split('&') {
+                                if let Some((key, value)) = pair.split_once('=') {
+                                    if key == settings.form_field {
+                                        // Simple URL decoding by replacing + with space and % encoded chars
+                                        // Note: CSRF tokens are UUIDs, so they shouldn't contain special chars anyway
+                                        if let Some(c) = &cookie_token {
+                                            if c == value {
+                                                token_found = true;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Reconstruct request
+                        req = Request::from_parts(parts, axum::body::Body::from(bytes));
+                    }
+                }
+
+                if !token_found {
+                    // Validation failed, reject immediately
+                    let mut response = Response::new(ResBody::default());
+                    *response.status_mut() = StatusCode::FORBIDDEN;
+                    return Ok(response);
+                }
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+
+            // Validation passed (or method is safe)
+            let mut response = inner.call(req).await?;
+
+            if let Some(cookie) = set_cookie {
+                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(http::header::SET_COOKIE, val);
+                }
+            }
+
+            Ok(response)
+        })
     }
 }
 
