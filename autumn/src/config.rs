@@ -1939,4 +1939,49 @@ path = "/healthz"
             .join()
             .unwrap();
     }
+
+    #[test]
+    fn deep_merge_stops_at_max_depth() {
+        let mut base = toml::Value::Table(toml::map::Map::new());
+        let mut overlay = toml::Value::Table(toml::map::Map::new());
+
+        // Create structures nested exactly to MAX_MERGE_DEPTH + 1
+        let mut current_base = &mut base;
+        let mut current_overlay = &mut overlay;
+
+        for _ in 0..=MAX_MERGE_DEPTH {
+            if let toml::Value::Table(t) = current_base {
+                t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
+                current_base = t.get_mut("x").unwrap();
+            }
+            if let toml::Value::Table(t) = current_overlay {
+                t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
+                current_overlay = t.get_mut("x").unwrap();
+            }
+        }
+
+        // Add a value deep in the overlay
+        if let toml::Value::Table(t) = current_overlay {
+            t.insert("deep_value".to_owned(), toml::Value::Integer(123));
+        }
+
+        deep_merge(&mut base, overlay);
+
+        // Verify the value was NOT merged due to max depth limit
+        let mut current_base_check = &base;
+        for _ in 0..=MAX_MERGE_DEPTH {
+            if let toml::Value::Table(t) = current_base_check {
+                current_base_check = t.get("x").unwrap();
+            }
+        }
+
+        if let toml::Value::Table(t) = current_base_check {
+            assert!(
+                !t.contains_key("deep_value"),
+                "Value beyond MAX_MERGE_DEPTH should not be merged"
+            );
+        } else {
+            panic!("Expected a table");
+        }
+    }
 }
