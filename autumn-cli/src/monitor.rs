@@ -156,7 +156,6 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
 
-
     /// OPTIMIZATION: Uses VecDeque instead of Vec to avoid O(N) shifts on pop_front().
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
