@@ -3,7 +3,13 @@ fn main() {
     println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
 
-    let tailwind = find_tailwind_cli();
+    let Some(tailwind) = find_tailwind_cli() else {
+        println!(
+            "cargo:warning=Tailwind CSS CLI not found — CSS will not be compiled. \
+             Run `autumn setup` or install tailwindcss manually."
+        );
+        return;
+    };
 
     let status = std::process::Command::new(&tailwind)
         .args([
@@ -23,27 +29,27 @@ fn main() {
     }
 }
 
-fn find_tailwind_cli() -> std::path::PathBuf {
+fn find_tailwind_cli() -> Option<std::path::PathBuf> {
     // 1. Check local download (from `autumn setup`)
     let local = std::path::PathBuf::from("target/autumn/tailwindcss");
     if local.exists() {
-        return local;
+        return Some(local);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let local_exe = std::path::PathBuf::from("target/autumn/tailwindcss.exe");
+        if local_exe.exists() {
+            return Some(local_exe);
+        }
     }
 
     // 2. Check PATH
     if let Some(path) = which("tailwindcss") {
-        return path;
+        return Some(path);
     }
 
-    // 3. Fail with clear message
-    panic!(
-        "\n\nTailwind CSS CLI not found!\n\n\
-         Install it using one of:\n\
-         1. Run `autumn setup` to download it automatically\n\
-         2. Install manually: https://tailwindcss.com/blog/standalone-cli\n\
-         3. Add `tailwindcss` to your PATH\n\n\
-         To skip Tailwind, delete build.rs from your project.\n"
-    );
+    None
 }
 
 fn which(binary: &str) -> Option<std::path::PathBuf> {
