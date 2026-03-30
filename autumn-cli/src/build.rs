@@ -30,6 +30,10 @@ pub fn run(debug: bool, package: Option<&str>) {
         std::process::exit(1);
     }
 
+    if has_wasm_client() {
+        build_wasm_bundle(debug, package);
+    }
+
     // Step 2: Find the binary
     let binary = find_binary(debug, package);
     eprintln!("\nRunning static renderer...\n");
@@ -49,6 +53,41 @@ pub fn run(debug: bool, package: Option<&str>) {
     }
 
     eprintln!("\n\u{1F342} Build complete!");
+}
+
+fn has_wasm_client() -> bool {
+    std::path::Path::new("src/client.rs").exists()
+}
+
+fn build_wasm_bundle(debug: bool, package: Option<&str>) {
+    eprintln!("Building WASM client bundle...");
+    let mut cargo = Command::new("cargo");
+    cargo.args(["build", "--target", "wasm32-unknown-unknown", "--lib"]);
+    if !debug {
+        cargo.arg("--release");
+    }
+    if let Some(pkg) = package {
+        cargo.args(["-p", pkg]);
+    }
+
+    let status = cargo.status().expect("failed to run cargo wasm build");
+    if !status.success() {
+        eprintln!("\u{2717} WASM compilation failed");
+        std::process::exit(1);
+    }
+
+    let manifest_dir = std::path::PathBuf::from("target/autumn/wasm");
+    let _ = std::fs::create_dir_all(&manifest_dir);
+    let manifest_path = manifest_dir.join("manifest.json");
+    let payload = serde_json::json!({
+        "entry_js": "/static/autumn/client.js",
+        "entry_wasm": "/static/autumn/client_bg.wasm",
+        "islands": {}
+    });
+    let _ = std::fs::write(
+        manifest_path,
+        serde_json::to_vec_pretty(&payload).expect("serialize manifest"),
+    );
 }
 
 /// Locate the compiled binary using `cargo metadata`.

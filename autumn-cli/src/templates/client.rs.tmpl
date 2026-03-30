@@ -1,0 +1,8 @@
+use autumn_web::island;
+
+use crate::CounterProps;
+
+pub struct IslandCx<T>(std::marker::PhantomData<T>);
+
+#[island]
+pub fn counter(_cx: IslandCx<CounterProps>) {}

@@ -136,6 +136,9 @@ fn cargo_build(package: Option<&str>) -> bool {
     eprintln!("  Compiling...");
     match cmd.status() {
         Ok(status) if status.success() => {
+            if has_wasm_client() && !cargo_build_wasm(package) {
+                return false;
+            }
             eprintln!("  \u{2713} Build succeeded");
             true
         }
@@ -144,6 +147,23 @@ fn cargo_build(package: Option<&str>) -> bool {
             eprintln!("  \u{2717} Failed to run cargo build: {e}");
             false
         }
+    }
+}
+
+fn has_wasm_client() -> bool {
+    Path::new("src/client.rs").exists()
+}
+
+fn cargo_build_wasm(package: Option<&str>) -> bool {
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--target", "wasm32-unknown-unknown", "--lib"]);
+    if let Some(pkg) = package {
+        cmd.args(["-p", pkg]);
+    }
+    eprintln!("  Compiling WASM...");
+    match cmd.status() {
+        Ok(status) => status.success(),
+        Err(_) => false,
     }
 }
 

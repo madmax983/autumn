@@ -65,6 +65,8 @@ pub fn app() -> AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
         static_metas: Vec::new(),
+        islands: Vec::new(),
+        actions: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
@@ -107,6 +109,8 @@ pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
+    pub(crate) islands: Vec<crate::wasm::IslandMeta>,
+    pub(crate) actions: Vec<crate::wasm::ActionMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
@@ -175,6 +179,20 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register WASM island metadata with the application.
+    #[must_use]
+    pub fn islands(mut self, islands: Vec<crate::wasm::IslandMeta>) -> Self {
+        self.islands.extend(islands);
+        self
+    }
+
+    /// Register typed server action metadata with the application.
+    #[must_use]
+    pub fn actions(mut self, actions: Vec<crate::wasm::ActionMeta>) -> Self {
+        self.actions.extend(actions);
         self
     }
 

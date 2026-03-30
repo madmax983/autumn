@@ -54,15 +54,19 @@ pub enum SetupError {
 ///
 /// Downloads Tailwind CSS to `target/autumn/tailwindcss` (or `.exe` on Windows).
 /// If the binary already exists and `force` is false, exits early.
-pub fn run(force: bool) {
-    if let Err(e) = execute(force) {
+pub fn run(force: bool, wasm: bool) {
+    if let Err(e) = execute(force, wasm) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
 /// Inner implementation so tests can call this without `process::exit`.
-fn execute(force: bool) -> Result<(), SetupError> {
+fn execute(force: bool, wasm: bool) -> Result<(), SetupError> {
+    if wasm {
+        validate_wasm_target()?;
+    }
+
     let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)?;
     let install_dir = PathBuf::from("target/autumn");
     let dest = install_path(&install_dir);
@@ -99,6 +103,25 @@ fn execute(force: bool) -> Result<(), SetupError> {
 
     println!("Tailwind CLI installed to {}", dest.display());
     Ok(())
+}
+
+fn validate_wasm_target() -> Result<(), SetupError> {
+    let output = std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()?;
+    let installed = String::from_utf8_lossy(&output.stdout);
+    if installed
+        .lines()
+        .any(|line| line.trim() == "wasm32-unknown-unknown")
+    {
+        println!("WASM target installed: wasm32-unknown-unknown");
+        return Ok(());
+    }
+
+    Err(SetupError::ChecksumParse(
+        "missing wasm32-unknown-unknown target. Run: rustup target add wasm32-unknown-unknown"
+            .to_owned(),
+    ))
 }
 
 // ── Platform detection ──────────────────────────────────────────────────
