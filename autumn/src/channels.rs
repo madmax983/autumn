@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn channels_is_clone() {
         let channels = Channels::new(16);
-        let _cloned = channels.clone();
+        let _cloned = channels;
     }
 
     #[test]
