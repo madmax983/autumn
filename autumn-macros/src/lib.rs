@@ -378,7 +378,7 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Cache the return value of a function based on its arguments.
 ///
 /// Wraps a function with an in-memory cache backed by a per-function
-/// static [`CacheStore`](autumn_web::cache::CacheStore). Arguments
+/// static `Cache` (from `autumn_web::cache::Cache`). Arguments
 /// must implement `Hash + Eq + Clone`; the return type must be `Clone`.
 ///
 /// # Attributes
@@ -415,7 +415,7 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The function follows the **two-function pattern**: it runs at HTTP
 /// upgrade time (with access to Axum extractors) and returns a closure
-/// implementing [`WsHandler`] that handles the live WebSocket connection.
+/// implementing `WsHandler` (from `autumn_web::ws::WsHandler`) that handles the live WebSocket connection.
 ///
 /// The macro generates a GET route that performs the WebSocket upgrade,
 /// so it integrates seamlessly with `routes![]`.

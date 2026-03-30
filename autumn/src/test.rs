@@ -36,11 +36,11 @@
 //! | [`TestApp`] | `@SpringBootTest` | Boot a fully-configured app for testing |
 //! | [`TestClient`] | `MockMvc` / `WebTestClient` | Fluent HTTP request builder |
 //! | [`TestResponse`] | `MvcResult` | Response with assertion helpers |
-//! | [`TestDb`] | `@DataJpaTest` | Shared Postgres testcontainer with pool |
+//! | `TestDb` | `@DataJpaTest` | Shared Postgres testcontainer with pool |
 //!
 //! # Database testing
 //!
-//! For tests that need a real database, use [`TestDb`] to share a single
+//! For tests that need a real database, use `TestDb` to share a single
 //! Postgres container across your test suite (rather than one per test):
 //!
 //! ```rust,ignore

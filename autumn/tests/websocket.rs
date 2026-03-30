@@ -37,6 +37,7 @@ fn test_state() -> AppState {
 
 #[ws("/echo")]
 async fn echo() -> impl WsHandler {
+    std::future::ready(()).await;
     |mut socket: WebSocket| async move {
         while let Some(Ok(msg)) = socket.recv().await {
             if let Message::Text(text) = msg {
@@ -48,6 +49,7 @@ async fn echo() -> impl WsHandler {
 
 #[ws("/with-state")]
 async fn with_state(state: AppState) -> impl WsHandler {
+    std::future::ready(()).await;
     let _channels = state.channels().clone();
     |mut socket: WebSocket| async move {
         socket.send(Message::Text("hello".into())).await.ok();
@@ -56,6 +58,7 @@ async fn with_state(state: AppState) -> impl WsHandler {
 
 #[ws("/with-shutdown")]
 async fn with_shutdown() -> impl WsHandler {
+    std::future::ready(()).await;
     autumn_web::ws::WithShutdown(
         |mut socket: WebSocket, shutdown: CancellationToken| async move {
             loop {
@@ -68,7 +71,7 @@ async fn with_shutdown() -> impl WsHandler {
                             _ => break,
                         }
                     }
-                    _ = shutdown.cancelled() => {
+                    () = shutdown.cancelled() => {
                         socket.send(Message::Close(None)).await.ok();
                         break;
                     }
