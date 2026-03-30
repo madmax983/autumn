@@ -69,6 +69,8 @@ pub mod actuator;
 pub mod app;
 pub mod auth;
 pub mod cache;
+#[cfg(feature = "ws")]
+pub mod channels;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
@@ -95,6 +97,8 @@ pub mod session;
 pub mod static_gen;
 pub mod task;
 pub mod validation;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -364,6 +368,35 @@ pub use autumn_macros::routes;
 /// ```
 pub use autumn_macros::cached;
 
+/// Annotate an async function as a WebSocket route handler.
+///
+/// The function follows the **two-function pattern**: it runs at HTTP
+/// upgrade time and returns a closure implementing [`ws::WsHandler`]
+/// that handles the live WebSocket connection.
+///
+/// Generates a GET route for the WebSocket upgrade, compatible with
+/// [`routes!`]. Requires the `ws` feature.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::ws::{WebSocket, Message, WsHandler};
+///
+/// #[ws("/echo")]
+/// async fn echo() -> impl WsHandler {
+///     |mut socket: WebSocket| async move {
+///         while let Some(Ok(msg)) = socket.recv().await {
+///             if let Message::Text(text) = msg {
+///                 socket.send(Message::Text(text)).await.ok();
+///             }
+///         }
+///     }
+/// }
+/// ```
+#[cfg(feature = "ws")]
+pub use autumn_macros::ws;
+
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
 
@@ -552,6 +585,7 @@ pub mod reexports {
     pub use diesel_async;
     pub use http;
     pub use tokio;
+    pub use tokio_util;
     pub use tracing;
     pub use validator;
 }

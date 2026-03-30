@@ -705,6 +705,10 @@ mod tests {
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
             config_props: ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
