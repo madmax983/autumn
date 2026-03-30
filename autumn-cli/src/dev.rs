@@ -136,7 +136,7 @@ fn cargo_build(package: Option<&str>) -> bool {
     eprintln!("  Compiling...");
     match cmd.status() {
         Ok(status) if status.success() => {
-            if has_wasm_client() && !cargo_build_wasm(package) {
+            if has_wasm_client(package) && !cargo_build_wasm(package) {
                 return false;
             }
             eprintln!("  \u{2713} Build succeeded");
@@ -150,8 +150,20 @@ fn cargo_build(package: Option<&str>) -> bool {
     }
 }
 
-fn has_wasm_client() -> bool {
-    Path::new("src/client.rs").exists()
+fn has_wasm_client(package: Option<&str>) -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return Path::new("src/client.rs").exists(),
+    };
+
+    let metadata = match cargo_metadata() {
+        Some(metadata) => metadata,
+        None => return Path::new("src/client.rs").exists(),
+    };
+
+    resolve_package_root_from_metadata(&metadata, package, &cwd)
+        .map(|root| root.join("src/client.rs").exists())
+        .unwrap_or_else(|_| Path::new("src/client.rs").exists())
 }
 
 fn cargo_build_wasm(package: Option<&str>) -> bool {
@@ -330,6 +342,50 @@ fn resolve_binary_from_metadata(
     }
 
     Ok(path)
+}
+
+fn resolve_package_root_from_metadata(
+    metadata: &serde_json::Value,
+    package: Option<&str>,
+    cwd: &Path,
+) -> Result<PathBuf, String> {
+    let packages = metadata["packages"]
+        .as_array()
+        .ok_or("missing packages array in metadata")?;
+
+    let manifest = if let Some(pkg_name) = package {
+        packages
+            .iter()
+            .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
+            .and_then(|pkg| pkg["manifest_path"].as_str())
+            .ok_or_else(|| format!("package '{pkg_name}' not found"))?
+    } else {
+        packages
+            .iter()
+            .filter_map(|pkg| pkg["manifest_path"].as_str())
+            .find(|manifest| {
+                Path::new(manifest)
+                    .parent()
+                    .is_some_and(|dir| dir.starts_with(cwd))
+            })
+            .ok_or("current package not found in metadata")?
+    };
+
+    Path::new(manifest)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("invalid manifest_path in metadata".to_owned())
+}
+
+fn cargo_metadata() -> Option<serde_json::Value> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Locate the compiled binary using `cargo metadata`.
@@ -691,6 +747,44 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("mylib"), Path::new("/projects/mylib"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_package_root_explicit_package() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "alpha",
+                    "manifest_path": "/repo/alpha/Cargo.toml"
+                },
+                {
+                    "name": "beta",
+                    "manifest_path": "/repo/beta/Cargo.toml"
+                }
+            ]
+        });
+        let cwd = Path::new("/repo");
+        let root = resolve_package_root_from_metadata(&metadata, Some("beta"), cwd).unwrap();
+        assert_eq!(root, PathBuf::from("/repo/beta"));
+    }
+
+    #[test]
+    fn resolve_package_root_from_cwd() {
+        let metadata = serde_json::json!({
+            "packages": [
+                {
+                    "name": "outside",
+                    "manifest_path": "/other/outside/Cargo.toml"
+                },
+                {
+                    "name": "inside",
+                    "manifest_path": "/repo/app/Cargo.toml"
+                }
+            ]
+        });
+        let cwd = Path::new("/repo/app");
+        let root = resolve_package_root_from_metadata(&metadata, None, cwd).unwrap();
+        assert_eq!(root, PathBuf::from("/repo/app"));
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub fn run(debug: bool, package: Option<&str>) {
         std::process::exit(1);
     }
 
-    if has_wasm_client() {
+    if has_wasm_client(package) {
         build_wasm_bundle(debug, package);
     }
 
@@ -55,8 +55,48 @@ pub fn run(debug: bool, package: Option<&str>) {
     eprintln!("\n\u{1F342} Build complete!");
 }
 
-fn has_wasm_client() -> bool {
-    std::path::Path::new("src/client.rs").exists()
+fn has_wasm_client(package: Option<&str>) -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return std::path::Path::new("src/client.rs").exists(),
+    };
+
+    let output = match Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return std::path::Path::new("src/client.rs").exists(),
+    };
+
+    let metadata: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(metadata) => metadata,
+        Err(_) => return std::path::Path::new("src/client.rs").exists(),
+    };
+
+    let Some(packages) = metadata["packages"].as_array() else {
+        return std::path::Path::new("src/client.rs").exists();
+    };
+
+    let manifest_path = if let Some(pkg_name) = package {
+        packages
+            .iter()
+            .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
+            .and_then(|pkg| pkg["manifest_path"].as_str())
+    } else {
+        packages
+            .iter()
+            .filter_map(|pkg| pkg["manifest_path"].as_str())
+            .find(|manifest| {
+                std::path::Path::new(manifest)
+                    .parent()
+                    .is_some_and(|dir| dir.starts_with(&cwd))
+            })
+    };
+
+    manifest_path
+        .and_then(|manifest| std::path::Path::new(manifest).parent())
+        .is_some_and(|root| root.join("src/client.rs").exists())
 }
 
 fn build_wasm_bundle(debug: bool, package: Option<&str>) {
