@@ -193,3 +193,220 @@ fn live_reload_script() -> String {
 </script>"#
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::http::header::ACCEPT;
+    use std::sync::{Mutex, OnceLock};
+    use tower::ServiceExt;
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env mutex poisoned");
+            let mut previous = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                previous.push((*key, std::env::var(key).ok()));
+                match value {
+                    Some(value) => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                    None => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::remove_var(key) };
+                    }
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                if let Some(previous) = previous {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::set_var(key, previous) };
+                } else {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_enabled_requires_both_env_vars() {
+        {
+            let _env = EnvGuard::set_many(&[(DEV_RELOAD_ENV, None), (DEV_RELOAD_STATE_ENV, None)]);
+            assert!(!is_enabled());
+        }
+
+        {
+            let _env =
+                EnvGuard::set_many(&[(DEV_RELOAD_ENV, Some("1")), (DEV_RELOAD_STATE_ENV, None)]);
+            assert!(!is_enabled());
+        }
+
+        {
+            let _env = EnvGuard::set_many(&[
+                (DEV_RELOAD_ENV, Some("1")),
+                (DEV_RELOAD_STATE_ENV, Some("state.json")),
+            ]);
+            assert!(is_enabled());
+        }
+    }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_defaults_when_state_missing() {
+        let _env = EnvGuard::set_many(&[(DEV_RELOAD_ENV, Some("1")), (DEV_RELOAD_STATE_ENV, None)]);
+
+        let response = live_reload_state_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(&body[..], br#"{"version":0,"kind":"full"}"#);
+    }
+
+    #[tokio::test]
+    async fn disable_static_cache_only_marks_static_paths() {
+        let app = axum::Router::new()
+            .route("/static/demo.txt", axum::routing::get(|| async { "demo" }))
+            .route("/page", axum::routing::get(|| async { "page" }))
+            .layer(axum::middleware::from_fn(disable_static_cache));
+
+        let static_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/static/demo.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("static response");
+        assert_eq!(
+            static_response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+
+        let page_response = app
+            .oneshot(Request::builder().uri("/page").body(Body::empty()).unwrap())
+            .await
+            .expect("page response");
+        assert!(page_response.headers().get(CACHE_CONTROL).is_none());
+    }
+
+    #[tokio::test]
+    async fn inject_live_reload_into_response_updates_html_and_length() {
+        let mut response = Response::new(Body::from("<html><body><main>ok</main></body></html>"));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+
+        let response = inject_live_reload_into_response(response).await;
+        let content_length = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .expect("content-length header")
+            .to_owned();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let html = std::str::from_utf8(&body).expect("utf-8 html");
+
+        assert!(html.contains(LIVE_RELOAD_PATH));
+        assert_eq!(content_length, body.len().to_string());
+    }
+
+    #[tokio::test]
+    async fn inject_live_reload_into_response_skips_encoded_html() {
+        let mut response = Response::new(Body::from("<html><body>ok</body></html>"));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        response
+            .headers_mut()
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+
+        let response = inject_live_reload_into_response(response).await;
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(&body[..], b"<html><body>ok</body></html>");
+    }
+
+    #[tokio::test]
+    async fn inject_live_reload_middleware_leaves_non_html_responses_alone() {
+        let app = axum::Router::new()
+            .route(
+                "/data",
+                axum::routing::get(|| async {
+                    ([(CONTENT_TYPE, "application/json")], r#"{"status":"ok"}"#)
+                }),
+            )
+            .layer(axum::middleware::from_fn(inject_live_reload));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/data")
+                    .header(ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("json response");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(&body[..], br#"{"status":"ok"}"#);
+    }
+
+    #[test]
+    fn inject_snippet_inserts_before_body_or_appends_to_html_shell() {
+        let with_body = inject_snippet(b"<html><body><main>ok</main></body></html>");
+        let with_body = std::str::from_utf8(&with_body).expect("utf-8 html");
+        assert!(with_body.contains(LIVE_RELOAD_PATH));
+        assert!(with_body.contains("</script></body>"));
+
+        let html_shell = inject_snippet(b"<html><main>ok</main></html>");
+        let html_shell = std::str::from_utf8(&html_shell).expect("utf-8 html");
+        assert!(html_shell.ends_with("</script>"));
+
+        let plain = inject_snippet(b"not html");
+        assert_eq!(&plain[..], b"not html");
+    }
+
+    #[test]
+    fn is_static_path_matches_root_and_nested_assets() {
+        assert!(is_static_path("/static"));
+        assert!(is_static_path("/static/css/autumn.css"));
+        assert!(!is_static_path("/assets/autumn.css"));
+    }
+}

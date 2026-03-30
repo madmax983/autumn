@@ -541,6 +541,10 @@ fn tailwind_build() -> bool {
 
 fn build_tailwind_command() -> Option<Command> {
     let tailwind = find_tailwind_cli()?;
+    Some(build_tailwind_command_for(&tailwind))
+}
+
+fn build_tailwind_command_for(tailwind: &Path) -> Command {
     let mut cmd = Command::new(tailwind);
     cmd.args([
         "-i",
@@ -551,7 +555,7 @@ fn build_tailwind_command() -> Option<Command> {
         "src/**/*.rs",
         "--minify",
     ]);
-    Some(cmd)
+    cmd
 }
 
 fn find_tailwind_cli() -> Option<PathBuf> {
@@ -706,6 +710,54 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set_many(entries: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env mutex poisoned");
+            let mut previous = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                previous.push((*key, std::env::var(key).ok()));
+                match value {
+                    Some(value) => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                    None => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::remove_var(key) };
+                    }
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                if let Some(previous) = previous {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::set_var(key, previous) };
+                } else {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -820,6 +872,30 @@ mod tests {
                 build: false,
                 restart: true,
                 tailwind: true,
+                reload: ReloadKind::Full,
+            }
+        );
+    }
+
+    #[test]
+    fn build_restart_overrides_tailwind_only_changes() {
+        let events = [
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("src/main.rs"),
+                kind: DebouncedEventKind::Any,
+            },
+            notify_debouncer_mini::DebouncedEvent {
+                path: PathBuf::from("static/css/input.css"),
+                kind: DebouncedEventKind::Any,
+            },
+        ];
+        let plan = plan_changes(&events);
+        assert_eq!(
+            plan,
+            ChangePlan {
+                build: true,
+                restart: true,
+                tailwind: false,
                 reload: ReloadKind::Full,
             }
         );
@@ -1002,6 +1078,25 @@ mod tests {
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build", "-p", "my-app"]);
+    }
+
+    #[test]
+    fn build_tailwind_command_for_sets_expected_args() {
+        let cmd = build_tailwind_command_for(Path::new("tailwindcss"));
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(cmd.get_program(), "tailwindcss");
+        assert_eq!(
+            args,
+            &[
+                "-i",
+                "static/css/input.css",
+                "-o",
+                "static/css/autumn.css",
+                "--content",
+                "src/**/*.rs",
+                "--minify",
+            ]
+        );
     }
 
     // ── start_server tests ─────────────────────────────────────────
@@ -1257,5 +1352,178 @@ mod tests {
         for f in WATCH_FILES {
             assert!(!f.is_empty());
         }
+    }
+
+    #[test]
+    fn dev_reload_state_signal_writes_css_and_full_versions() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState { path, version: 0 };
+
+        state.signal(ReloadKind::Css).expect("css signal");
+        let body = std::fs::read_to_string(state.path()).expect("read css");
+        assert_eq!(body, r#"{"kind":"css","version":1}"#);
+
+        state.signal(ReloadKind::Full).expect("full signal");
+        let body = std::fs::read_to_string(state.path()).expect("read full");
+        assert_eq!(body, r#"{"kind":"full","version":2}"#);
+    }
+
+    #[test]
+    fn dev_reload_state_signal_none_is_noop() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState { path, version: 41 };
+
+        state.signal(ReloadKind::None).expect("noop signal");
+        assert_eq!(state.version, 41);
+        assert!(
+            std::fs::read_to_string(state.path())
+                .unwrap_or_default()
+                .is_empty(),
+            "noop signal should not write a new state file"
+        );
+    }
+
+    #[test]
+    fn dev_reload_state_signal_rejects_overflow() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload file");
+        let path = reload_file.path().to_path_buf();
+        let mut state = DevReloadState {
+            path,
+            version: u64::MAX,
+        };
+
+        let error = state
+            .signal(ReloadKind::Full)
+            .expect_err("overflow should fail");
+        assert!(error.contains("overflowed"));
+    }
+
+    #[test]
+    fn profile_config_file_requires_named_toml_suffix() {
+        assert!(is_profile_config_file("autumn-dev.toml"));
+        assert!(is_profile_config_file("autumn-local.TOML"));
+        assert!(!is_profile_config_file("autumn-.toml"));
+        assert!(!is_profile_config_file("autumn-dev.txt"));
+        assert!(!is_profile_config_file("config.toml"));
+    }
+
+    #[test]
+    fn has_component_matches_exact_path_components() {
+        assert!(has_component(Path::new("src/routes/main.rs"), "src"));
+        assert!(has_component(
+            Path::new("templates/pages/index.html"),
+            "templates"
+        ));
+        assert!(!has_component(Path::new("srcs/routes/main.rs"), "src"));
+        assert!(!has_component(
+            Path::new("template/index.html"),
+            "templates"
+        ));
+    }
+
+    #[test]
+    fn describe_plan_covers_each_user_visible_action() {
+        assert_eq!(
+            describe_plan(ChangePlan {
+                build: true,
+                restart: true,
+                tailwind: false,
+                reload: ReloadKind::Full,
+            }),
+            "cargo build + restart + full reload"
+        );
+        assert_eq!(
+            describe_plan(ChangePlan {
+                build: false,
+                restart: true,
+                tailwind: true,
+                reload: ReloadKind::Full,
+            }),
+            "Tailwind rebuild + restart + full reload"
+        );
+        assert_eq!(
+            describe_plan(ChangePlan {
+                build: false,
+                restart: true,
+                tailwind: false,
+                reload: ReloadKind::Full,
+            }),
+            "restart + full reload"
+        );
+        assert_eq!(
+            describe_plan(ChangePlan {
+                build: false,
+                restart: false,
+                tailwind: true,
+                reload: ReloadKind::Css,
+            }),
+            "Tailwind rebuild + CSS reload"
+        );
+        assert_eq!(
+            describe_plan(ChangePlan {
+                build: false,
+                restart: false,
+                tailwind: false,
+                reload: ReloadKind::Full,
+            }),
+            "browser full reload"
+        );
+        assert_eq!(describe_plan(ChangePlan::default()), "no-op");
+    }
+
+    #[test]
+    fn resolve_target_directory_returns_workspace_target() {
+        let target_dir = resolve_target_directory().expect("target directory");
+        assert_eq!(
+            target_dir.file_name().and_then(|name| name.to_str()),
+            Some("target")
+        );
+    }
+
+    #[test]
+    fn resolve_dev_reload_state_path_uses_target_autumn_file() {
+        let path = resolve_dev_reload_state_path().expect("reload state path");
+        assert!(
+            path.ends_with(
+                Path::new("target")
+                    .join("autumn")
+                    .join(DEV_RELOAD_STATE_FILE)
+            )
+        );
+    }
+
+    #[test]
+    fn cargo_metadata_includes_target_directory_and_packages() {
+        let metadata = cargo_metadata();
+        assert!(metadata["target_directory"].is_string());
+        assert!(metadata["packages"].is_array());
+    }
+
+    #[test]
+    fn which_finds_binary_on_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary_name = if cfg!(windows) {
+            "mocktailwind.exe"
+        } else {
+            "mocktailwind"
+        };
+        let binary = dir.path().join(binary_name);
+        std::fs::write(&binary, "echo tailwind").expect("write binary");
+        let path = std::env::join_paths([dir.path()]).expect("join path");
+        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
+
+        let found = which("mocktailwind").expect("binary on PATH");
+        assert_eq!(found, binary);
+    }
+
+    #[test]
+    fn which_returns_none_when_binary_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = std::env::join_paths([dir.path()]).expect("join path");
+        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
+
+        assert!(which("definitely-missing-binary").is_none());
     }
 }

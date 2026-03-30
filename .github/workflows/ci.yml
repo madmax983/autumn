@@ -57,12 +57,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Generate coverage
+      - name: Generate framework coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Generate harvest coverage
+        run: cargo llvm-cov --manifest-path autumn-harvest/Cargo.toml --workspace --lcov --output-path autumn-harvest-lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
-          files: lcov.info
+          files: lcov.info,autumn-harvest-lcov.info
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
