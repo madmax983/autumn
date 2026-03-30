@@ -25,6 +25,7 @@ fn main() {
     // Tell Cargo when to re-run this script.
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");
+    println!("cargo:rerun-if-changed=tailwind.config.js");
 
     // Ensure the output directory exists.
     let output_dir = Path::new("static/css");

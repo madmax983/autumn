@@ -302,6 +302,15 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_reruns_on_css_input_changes() {
+        let tmp = TempDir::new().unwrap();
+        generate("css-watch-check", tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
+        assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path()).unwrap();

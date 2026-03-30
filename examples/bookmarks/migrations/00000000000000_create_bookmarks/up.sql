@@ -1,5 +1,5 @@
 CREATE TABLE bookmarks (
-    id SERIAL PRIMARY KEY,
+    id BIGSERIAL PRIMARY KEY,
     url TEXT NOT NULL,
     title TEXT NOT NULL,
     tag TEXT NOT NULL DEFAULT 'general',
