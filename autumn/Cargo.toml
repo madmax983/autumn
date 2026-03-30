@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["maud", "htmx", "tailwind", "db"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
+cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
 tailwind = []
@@ -17,6 +18,8 @@ test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 [dependencies]
 autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
 axum.workspace = true
+bytes = "1"
+http-body-util = "0.1"
 bcrypt.workspace = true
 diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
@@ -27,6 +30,7 @@ http.workspace = true
 indexmap.workspace = true
 libsqlite3-sys = { workspace = true, optional = true }
 maud = { workspace = true, optional = true }
+moka = { workspace = true, optional = true }
 pin-project-lite = "0.2"
 serde.workspace = true
 serde_json = "1"
@@ -55,6 +59,7 @@ tower.workspace = true
 trybuild = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+proptest = "1.4"
 
 [lints]
 workspace = true

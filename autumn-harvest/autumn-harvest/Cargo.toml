@@ -5,11 +5,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["db"]
+db = [
+    "dep:deadpool",
+    "dep:diesel",
+    "dep:diesel-async",
+    "dep:tokio-postgres",
+    "autumn-web/db",
+]
+testing = []
 
 [dependencies]
-autumn-web = { workspace = true }
+autumn-web = { workspace = true, features = ["maud", "htmx", "tailwind"] }
 autumn-harvest-macros = { path = "../autumn-harvest-macros" }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -17,11 +30,16 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-diesel = { workspace = true }
-diesel-async = { workspace = true }
-
-[features]
-testing = []
+lru = "0.12"
+deadpool = { workspace = true, optional = true }
+diesel = { workspace = true, optional = true }
+diesel-async = { workspace = true, optional = true }
+tokio-postgres = { version = "0.7", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+[lints]
+workspace = true

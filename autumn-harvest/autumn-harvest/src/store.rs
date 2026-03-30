@@ -1,122 +1,138 @@
-//! Event store — append and load workflow event histories.
+//! Event store -- append-only persistence for workflow event histories.
 //!
-//! The event store is the persistence backbone of durable execution.
-//! Every side effect in a workflow is recorded as an event; on replay the
-//! engine loads the full history and feeds recorded results back instead
-//! of re-executing activities.
+//! All writes go through [`append_events()`] which inserts atomically.
+//! The `UNIQUE(workflow_exec_id, event_id)` constraint guarantees
+//! that two workers can't append conflicting events to the same workflow.
 
-use diesel::prelude::*;
+use diesel::ExpressionMethods;
+use diesel::QueryDsl;
+use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 
-use crate::error::{HarvestError, HarvestResult};
+use crate::error::HarvestResult;
 use crate::event::WorkflowEvent;
 use crate::models::NewHarvestEvent;
 use crate::schema::harvest_events;
 use crate::types::ExecutionId;
 
-// ── Writer helpers ───────────────────────────────────────────────────
+/// Loaded event history for a single workflow execution.
+///
+/// Contains the deserialized events and the next `event_id` to use when
+/// appending new events (i.e. one past the last existing event).
+#[derive(Debug)]
+pub struct EventHistory {
+    pub exec_id: ExecutionId,
+    pub events: Vec<WorkflowEvent>,
+    pub next_event_id: i32,
+}
 
-/// Convert a slice of `WorkflowEvent`s into insertable rows, starting
-/// event IDs at 0.
+/// Convert in-memory events to insertable rows with sequential event IDs
+/// starting from 0.
+///
+/// This is a convenience wrapper around [`events_to_insert_rows_from`] for
+/// fresh workflow executions where the history starts empty.
+#[must_use]
 pub fn events_to_insert_rows(
     exec_id: ExecutionId,
     events: &[WorkflowEvent],
 ) -> Vec<NewHarvestEvent<'_>> {
-    events_to_insert_rows_from(exec_id, 0, events)
+    events_to_insert_rows_from(exec_id, events, 0)
 }
 
-/// Convert a slice of `WorkflowEvent`s into insertable rows, starting
-/// event IDs at `start_event_id`.
+/// Convert in-memory events to insertable rows with sequential event IDs
+/// starting from `start_id`.
+///
+/// Use `start_id = 0` for new workflows. For appending to in-progress workflows,
+/// pass the current event count so IDs continue sequentially.
+///
+/// # Panics
+///
+/// Panics if a `WorkflowEvent` variant fails to serialize to JSON. This should
+/// never happen in practice since all variants derive `Serialize`.
+#[must_use]
 pub fn events_to_insert_rows_from(
     exec_id: ExecutionId,
-    start_event_id: i32,
     events: &[WorkflowEvent],
+    start_id: i32,
 ) -> Vec<NewHarvestEvent<'_>> {
-    let uuid = exec_id.as_uuid();
     events
         .iter()
         .enumerate()
-        .map(|(i, evt)| {
-            let event_id = start_event_id + i32::try_from(i).expect("event index fits i32");
+        .map(|(i, event)| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let event_id = start_id + i as i32;
             NewHarvestEvent {
-                workflow_exec_id: uuid,
+                workflow_exec_id: exec_id.as_uuid(),
                 event_id,
-                event_type: evt.type_name(),
-                event_data: serde_json::to_value(evt)
-                    .expect("WorkflowEvent is always serializable"),
+                event_type: event.type_name(),
+                event_data: serde_json::to_value(event).expect("WorkflowEvent must serialize"),
             }
         })
         .collect()
 }
 
-/// Append events to the event store for a workflow execution.
+/// Append events to a workflow's history in a single INSERT.
 ///
-/// Uses `events_to_insert_rows_from` starting at `next_event_id` so the
-/// caller controls the continuation point (typically from `EventHistory`).
+/// Returns the number of events inserted. Fails with a unique constraint
+/// violation (wrapped as [`HarvestError::Database`]) if `start_id` conflicts --
+/// this indicates a concurrency conflict where two workers tried to advance
+/// the same workflow simultaneously.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the INSERT fails (e.g. unique
+/// constraint violation on `(workflow_exec_id, event_id)` or connection error).
 pub async fn append_events(
-    conn: &mut diesel_async::AsyncPgConnection,
+    conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    next_event_id: i32,
     events: &[WorkflowEvent],
-) -> HarvestResult<()> {
+    start_id: i32,
+) -> HarvestResult<usize> {
     if events.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
-    let rows = events_to_insert_rows_from(exec_id, next_event_id, events);
+    let rows = events_to_insert_rows_from(exec_id, events, start_id);
 
     diesel::insert_into(harvest_events::table)
         .values(&rows)
         .execute(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
-
-    Ok(())
+        .map_err(crate::error::database_error)
 }
 
-// ── Reader ───────────────────────────────────────────────────────────
-
-/// Loaded event history for a single workflow execution.
+/// Load the full event history for a workflow execution, ordered by `event_id`.
 ///
-/// Contains the deserialized events and a continuation counter so the
-/// caller knows which `event_id` to use when appending new events.
-#[derive(Debug)]
-pub struct EventHistory {
-    /// The workflow execution this history belongs to.
-    pub exec_id: ExecutionId,
-    /// Deserialized events in order of `event_id ASC`.
-    pub events: Vec<WorkflowEvent>,
-    /// The next `event_id` to use when appending (last + 1, or 0 if empty).
-    pub next_event_id: i32,
-}
-
-/// Load the full event history for a workflow execution.
+/// Deserializes each row's `event_data` JSON back into [`WorkflowEvent`].
+/// The returned [`EventHistory::next_event_id`] is set to one past the last
+/// loaded event (or 0 if the history is empty), ready for use with
+/// [`append_events()`].
 ///
-/// Reads all rows from `harvest_events` where `workflow_exec_id` matches,
-/// ordered by `event_id ASC`, and deserializes each `event_data` JSON blob
-/// back into a [`WorkflowEvent`].
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on connection or query errors, or
+/// [`HarvestError::Serialization`] if a stored JSON value can't be deserialized
+/// into `WorkflowEvent`.
 pub async fn load_history(
-    conn: &mut diesel_async::AsyncPgConnection,
+    conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<EventHistory> {
-    let rows: Vec<crate::models::HarvestEvent> = harvest_events::table
+    use crate::models::HarvestEvent;
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .order(harvest_events::event_id.asc())
         .load(conn)
         .await
-        .map_err(|e| HarvestError::Database(e.to_string()))?;
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
 
     let mut events = Vec::with_capacity(rows.len());
-    let mut last_event_id: Option<i32> = None;
-
-    for row in &rows {
-        let evt: WorkflowEvent =
-            serde_json::from_value(row.event_data.clone()).map_err(HarvestError::Serialization)?;
-        last_event_id = Some(row.event_id);
-        events.push(evt);
+    for row in rows {
+        let event: WorkflowEvent = serde_json::from_value(row.event_data)?;
+        events.push(event);
     }
-
-    let next_event_id = last_event_id.map_or(0, |id| id + 1);
 
     Ok(EventHistory {
         exec_id,
@@ -128,59 +144,150 @@ pub async fn load_history(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ActivityExecId;
+    use crate::event::WorkflowEvent;
+    use crate::types::{ActivityExecId, ExecutionId};
     use chrono::Utc;
 
-    /// Round-trip test: serialize events through `events_to_insert_rows`,
-    /// then deserialize the `event_data` JSON values back and verify they
-    /// match the original event variants.
     #[test]
-    fn history_from_rows_deserializes_events() {
+    fn stored_event_has_sequential_event_id() {
         let exec_id = ExecutionId::new();
-        let now = Utc::now();
-
-        let original_events = vec![
+        let events = vec![
             WorkflowEvent::WorkflowStarted {
-                input: serde_json::json!({"order_id": 99}),
-                timestamp: now,
+                input: serde_json::json!({}),
+                timestamp: Utc::now(),
             },
             WorkflowEvent::ActivityScheduled {
                 activity_id: ActivityExecId::new(),
-                name: "charge_card".into(),
-                input: serde_json::json!({"amount": 42.50}),
-                queue: "payments".into(),
-            },
-            WorkflowEvent::ActivityCompleted {
-                activity_id: ActivityExecId::new(),
-                output: serde_json::json!({"txn_id": "abc-123"}),
-            },
-            WorkflowEvent::WorkflowCompleted {
-                output: serde_json::json!({"status": "done"}),
+                name: "send_email".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
             },
         ];
 
-        // Serialize through the insert-row helper (this is what the writer does).
-        let rows = events_to_insert_rows(exec_id, &original_events);
-        assert_eq!(rows.len(), 4);
-
-        // Verify event_ids are sequential starting at 0.
-        for (i, row) in rows.iter().enumerate() {
-            assert_eq!(row.event_id, i32::try_from(i).unwrap());
-            assert_eq!(row.workflow_exec_id, exec_id.as_uuid());
-        }
-
-        // Verify event_type strings match.
+        let rows = events_to_insert_rows(exec_id, &events);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].event_id, 0);
+        assert_eq!(rows[1].event_id, 1);
         assert_eq!(rows[0].event_type, "WorkflowStarted");
         assert_eq!(rows[1].event_type, "ActivityScheduled");
-        assert_eq!(rows[2].event_type, "ActivityCompleted");
-        assert_eq!(rows[3].event_type, "WorkflowCompleted");
+    }
 
-        // Deserialize each event_data back into WorkflowEvent — the reader path.
+    #[test]
+    fn events_to_rows_serializes_json() {
+        let exec_id = ExecutionId::new();
+        let events = vec![WorkflowEvent::WorkflowCompleted {
+            output: serde_json::json!({"result": 42}),
+        }];
+
+        let rows = events_to_insert_rows(exec_id, &events);
+        let data = &rows[0].event_data;
+        // serde tagged enum with (tag = "type", content = "data") wraps in "data"
+        assert!(
+            data.get("data").is_some(),
+            "serde adjacently-tagged enum should wrap payload in 'data' key, got: {data}"
+        );
+    }
+
+    #[test]
+    fn events_to_rows_preserves_event_type_name() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowFailed {
+                error: "boom".into(),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: crate::types::TimerId::new("t1"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approve".into(),
+                payload: serde_json::json!(true),
+            },
+        ];
+
+        let rows = events_to_insert_rows(exec_id, &events);
+        for (row, event) in rows.iter().zip(events.iter()) {
+            assert_eq!(
+                row.event_type,
+                event.type_name(),
+                "event_type column must match WorkflowEvent::type_name()"
+            );
+        }
+    }
+
+    #[test]
+    fn events_to_rows_from_applies_start_offset() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::json!("ok"),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!(null),
+            },
+        ];
+
+        let rows = events_to_insert_rows_from(exec_id, &events, 5);
+        assert_eq!(rows[0].event_id, 5);
+        assert_eq!(rows[1].event_id, 6);
+    }
+
+    #[test]
+    fn events_to_rows_sets_exec_id_on_every_row() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+        ];
+
+        let rows = events_to_insert_rows(exec_id, &events);
+        for row in &rows {
+            assert_eq!(row.workflow_exec_id, exec_id.as_uuid());
+        }
+    }
+
+    #[test]
+    fn empty_events_produce_empty_rows() {
+        let exec_id = ExecutionId::new();
+        let rows = events_to_insert_rows(exec_id, &[]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn history_from_rows_deserializes_events() {
+        let exec_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::json!({"user": "alice"}),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "send_email".into(),
+                input: serde_json::json!({"to": "bob@example.com"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::json!({"status": "ok"}),
+            },
+        ];
+
+        // Serialize via the writer path
+        let rows = events_to_insert_rows(exec_id, &events);
+        assert_eq!(rows.len(), 3);
+
+        // Deserialize each row's event_data back into WorkflowEvent
         let deserialized: Vec<WorkflowEvent> = rows
             .iter()
-            .map(|r| serde_json::from_value(r.event_data.clone()).unwrap())
+            .map(|row| serde_json::from_value(row.event_data.clone()).unwrap())
             .collect();
 
+        assert_eq!(deserialized.len(), 3);
         assert!(matches!(
             deserialized[0],
             WorkflowEvent::WorkflowStarted { .. }
@@ -191,51 +298,52 @@ mod tests {
         ));
         assert!(matches!(
             deserialized[2],
-            WorkflowEvent::ActivityCompleted { .. }
-        ));
-        assert!(matches!(
-            deserialized[3],
             WorkflowEvent::WorkflowCompleted { .. }
         ));
 
-        // Verify data fidelity on the first event.
-        if let WorkflowEvent::WorkflowStarted { input, .. } = &deserialized[0] {
-            assert_eq!(input["order_id"], 99);
+        // Verify data fidelity on WorkflowStarted
+        if let WorkflowEvent::WorkflowStarted { ref input, .. } = deserialized[0] {
+            assert_eq!(input, &serde_json::json!({"user": "alice"}));
         } else {
             panic!("expected WorkflowStarted");
         }
 
-        // Verify data fidelity on the activity event.
-        if let WorkflowEvent::ActivityScheduled { name, queue, .. } = &deserialized[1] {
-            assert_eq!(name, "charge_card");
-            assert_eq!(queue, "payments");
+        // Verify data fidelity on ActivityScheduled
+        if let WorkflowEvent::ActivityScheduled {
+            ref name,
+            ref queue,
+            ..
+        } = deserialized[1]
+        {
+            assert_eq!(name, "send_email");
+            assert_eq!(queue, "default");
         } else {
             panic!("expected ActivityScheduled");
         }
 
-        // Verify next_event_id computation matches what load_history would produce.
-        let last_event_id = rows.last().map(|r| r.event_id);
-        let next_event_id = last_event_id.map_or(0, |id| id + 1);
-        assert_eq!(next_event_id, 4);
+        // Verify data fidelity on WorkflowCompleted
+        if let WorkflowEvent::WorkflowCompleted { ref output } = deserialized[2] {
+            assert_eq!(output, &serde_json::json!({"status": "ok"}));
+        } else {
+            panic!("expected WorkflowCompleted");
+        }
     }
 
     #[test]
-    fn events_to_insert_rows_from_offsets_correctly() {
+    fn json_contains_type_tag() {
         let exec_id = ExecutionId::new();
-        let events = vec![WorkflowEvent::WorkflowCompleted {
-            output: serde_json::json!("ok"),
+        let events = vec![WorkflowEvent::MarkerRecorded {
+            name: "checkpoint".into(),
+            details: serde_json::json!({"step": 3}),
         }];
 
-        let rows = events_to_insert_rows_from(exec_id, 7, &events);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].event_id, 7);
-    }
-
-    #[test]
-    fn empty_history_next_event_id_is_zero() {
-        // Simulate what load_history computes for an empty result set.
-        let last_event_id: Option<i32> = None;
-        let next = last_event_id.map_or(0, |id| id + 1);
-        assert_eq!(next, 0);
+        let rows = events_to_insert_rows(exec_id, &events);
+        let data = &rows[0].event_data;
+        // The "type" key comes from serde(tag = "type", content = "data")
+        assert_eq!(
+            data.get("type").and_then(serde_json::Value::as_str),
+            Some("MarkerRecorded"),
+            "serialized JSON must include the serde 'type' tag"
+        );
     }
 }

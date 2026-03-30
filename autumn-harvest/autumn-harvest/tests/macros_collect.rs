@@ -1,21 +1,19 @@
+#![allow(clippy::unused_async, clippy::used_underscore_binding)]
+
 use autumn_harvest::prelude::*;
-use autumn_harvest_macros::{activities, workflows};
 
 #[workflow]
-async fn wf_a(ctx: &WorkflowContext, _x: String) -> Result<(), String> {
-    let _ = ctx;
+async fn wf_a(_ctx: &WorkflowContext, _x: String) -> Result<(), String> {
     Ok(())
 }
 
 #[workflow]
-async fn wf_b(ctx: &WorkflowContext, _x: String) -> Result<(), String> {
-    let _ = ctx;
+async fn wf_b(_ctx: &WorkflowContext, _x: String) -> Result<(), String> {
     Ok(())
 }
 
 #[activity]
-async fn act_a(ctx: &ActivityContext, _x: String) -> Result<(), String> {
-    let _ = ctx;
+async fn act_a(_ctx: &ActivityContext, _x: String) -> Result<(), String> {
     Ok(())
 }
 
