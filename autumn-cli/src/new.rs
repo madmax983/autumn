@@ -72,19 +72,18 @@ pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewErro
             String::new()
         };
 
+        let wasm_targets = if wasm {
+            "\n[[bin]]\nname = \"client\"\npath = \"src/client.rs\"\n".to_owned()
+        } else {
+            String::new()
+        };
+
         template
             .replace("{{project_name}}", name)
             .replace("{{crate_name}}", &crate_name)
             .replace("{{autumn_version}}", autumn_version)
             .replace("{{wasm_deps}}", &wasm_deps)
-            .replace(
-                "{{cdylib}}",
-                if wasm {
-                    "crate-type = [\"rlib\", \"cdylib\"]"
-                } else {
-                    ""
-                },
-            )
+            .replace("{{wasm_targets}}", &wasm_targets)
     };
 
     fs::write(
@@ -335,6 +334,27 @@ mod tests {
     }
 
     #[test]
+    fn non_wasm_scaffold_omits_lib_target() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-app", tmp.path(), false).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("plain-app/Cargo.toml")).unwrap();
+        assert!(
+            !content.contains("[lib]"),
+            "non-WASM scaffolds should not declare a library target",
+        );
+    }
+
+    #[test]
+    fn generated_build_rs_reruns_on_css_input_changes() {
+        let tmp = TempDir::new().unwrap();
+        generate("css-watch-check", tmp.path(), false).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
+        assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
+    }
+
+    #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
         generate("placeholder-check", tmp.path(), false).unwrap();
@@ -377,6 +397,50 @@ mod tests {
         assert!(p.join("src/client.rs").is_file());
         let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
         assert!(cargo.contains("autumn-wasm"));
+    }
+
+    #[test]
+    fn wasm_scaffold_registers_client_bin_target() {
+        let tmp = TempDir::new().unwrap();
+        generate("wasm-app", tmp.path(), true).unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("wasm-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("[[bin]]"),
+            "WASM scaffolds should declare a client binary target",
+        );
+        assert!(
+            cargo.contains("name = \"client\""),
+            "WASM client target should use the conventional `client` name",
+        );
+        assert!(
+            cargo.contains("path = \"src/client.rs\""),
+            "WASM client target should point at src/client.rs",
+        );
+    }
+
+    #[test]
+    fn wasm_scaffold_client_imports_shared_lib_by_crate_name() {
+        let tmp = TempDir::new().unwrap();
+        generate("wasm-app", tmp.path(), true).unwrap();
+
+        let client = fs::read_to_string(tmp.path().join("wasm-app/src/client.rs")).unwrap();
+        assert!(
+            client.contains("use wasm_app::CounterProps;"),
+            "WASM client entry should import shared types from the package library",
+        );
+    }
+
+    #[test]
+    fn wasm_scaffold_client_defines_main_entrypoint() {
+        let tmp = TempDir::new().unwrap();
+        generate("wasm-app", tmp.path(), true).unwrap();
+
+        let client = fs::read_to_string(tmp.path().join("wasm-app/src/client.rs")).unwrap();
+        assert!(
+            client.contains("fn main()"),
+            "WASM client entry should define a main function so Cargo can build it as a bin target",
+        );
     }
 
     // ── Helpers ──────────────────────────────────────────────────

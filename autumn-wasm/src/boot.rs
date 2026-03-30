@@ -2,7 +2,8 @@ use crate::IslandRegistration;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
-pub fn boot(registry: Vec<IslandRegistration>) {
+#[allow(clippy::missing_const_for_fn)]
+pub fn boot(registry: &[IslandRegistration]) {
     #[cfg(target_arch = "wasm32")]
     {
         let Some(window) = web_sys::window() else {
@@ -12,7 +13,7 @@ pub fn boot(registry: Vec<IslandRegistration>) {
             return;
         };
 
-        for island in registry {
+        for island in registry.iter().copied() {
             let selector = format!(
                 "[data-autumn-island=\"{}\"][data-autumn-mount=\"{}\"]",
                 island.name, island.mount_id

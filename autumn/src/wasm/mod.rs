@@ -9,6 +9,12 @@ pub use types::{ActionMeta, IslandMeta};
 
 const DEFAULT_MANIFEST_PATH: &str = "target/autumn/wasm/manifest.json";
 
+/// Load the optional WASM asset manifest from disk.
+///
+/// # Errors
+///
+/// Returns an error if the configured manifest path cannot be read or if
+/// the JSON payload is invalid.
 pub fn load_manifest() -> crate::AutumnResult<WasmManifest> {
     let path =
         std::env::var("AUTUMN_WASM_MANIFEST").unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.into());
@@ -34,6 +40,7 @@ pub fn assets() -> Markup {
 
 #[cfg(feature = "maud")]
 #[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn island<P: serde::Serialize>(meta: IslandMeta, props: P, fallback: Markup) -> Markup {
     let encoded = serde_json::to_string(&props).unwrap_or_else(|_| "null".to_owned());
     html! {

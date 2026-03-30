@@ -19,6 +19,12 @@ pub struct WasmManifest {
 }
 
 impl WasmManifest {
+    /// Load a WASM manifest from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or if the JSON payload
+    /// cannot be deserialized into [`WasmManifest`].
     pub fn load(path: &Path) -> AutumnResult<Self> {
         let bytes = std::fs::read(path)?;
         Ok(serde_json::from_slice(&bytes)?)

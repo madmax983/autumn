@@ -281,4 +281,17 @@ mod tests {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY
         );
     }
+
+    #[test]
+    fn validation_errors_to_map_fallback_message() {
+        let mut errors = validator::ValidationErrors::new();
+        // Create an error with no custom message
+        let error = validator::ValidationError::new("custom_code");
+        errors.add("my_field", error);
+
+        let map = validation_errors_to_map(&errors);
+
+        assert!(map.contains_key("my_field"));
+        assert_eq!(map["my_field"][0], "validation failed: custom_code");
+    }
 }

@@ -31,6 +31,7 @@ use crate::config::AutumnConfig;
 use crate::db;
 use crate::error_pages::{self, ErrorPageRenderer, SharedRenderer};
 use crate::middleware::RequestIdLayer;
+use crate::middleware::dev;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 #[cfg(feature = "db")]
 use crate::migrate;
@@ -525,6 +526,10 @@ impl AppBuilder {
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::from_config(&config),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -563,9 +568,17 @@ impl AppBuilder {
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
 
+        // Capture the shutdown token so WebSocket handlers are notified.
+        #[cfg(feature = "ws")]
+        let shutdown_token = state.shutdown.clone();
+
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+
+                // Signal WebSocket handlers to close connections.
+                #[cfg(feature = "ws")]
+                shutdown_token.cancel();
 
                 // Warn if draining takes too long
                 if shutdown_timeout > 5 {
@@ -629,6 +642,10 @@ impl AppBuilder {
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::from_config(&config),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         // Build the full router (same as production)
@@ -951,6 +968,8 @@ fn build_router_inner(
         router = router.route(path, method_router);
     }
 
+    let dev_reload_enabled = dev::is_enabled();
+
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
@@ -960,6 +979,17 @@ fn build_router_inner(
             path = "/static/js/htmx.min.js",
             name = format!("htmx {}", crate::htmx::HTMX_VERSION),
             "Mounted route"
+        );
+    }
+
+    if dev_reload_enabled {
+        router = router.route(
+            dev::LIVE_RELOAD_PATH,
+            axum::routing::get(dev::live_reload_state_handler),
+        );
+        tracing::debug!(
+            path = dev::LIVE_RELOAD_PATH,
+            "Mounted dev live reload endpoint"
         );
     }
 
@@ -1077,10 +1107,16 @@ fn build_router_inner(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
-    let router = router
+    let mut router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+
+    if dev_reload_enabled {
+        router = router
+            .layer(axum::middleware::from_fn(dev::disable_static_cache))
+            .layer(axum::middleware::from_fn(dev::inject_live_reload));
+    }
 
     router.with_state(state)
 }
@@ -1296,7 +1332,55 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
+            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let lock = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env mutex poisoned");
+            let mut previous = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                previous.push((*key, std::env::var(key).ok()));
+                match value {
+                    Some(value) => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::set_var(key, value) };
+                    }
+                    None => {
+                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                        unsafe { std::env::remove_var(key) };
+                    }
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.iter().rev() {
+                if let Some(previous) = previous {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::set_var(key, previous) };
+                } else {
+                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
+                    unsafe { std::env::remove_var(key) };
+                }
+            }
+        }
+    }
 
     /// Helper to build a test router with default config and no database.
     fn test_router(routes: Vec<Route>) -> axum::Router {
@@ -1311,6 +1395,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         build_router(routes, &config, state)
     }
@@ -1377,6 +1465,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
@@ -1454,6 +1546,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(post_routes, &config, state);
 
@@ -1498,6 +1594,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(route_list, &config, state);
 
@@ -1652,6 +1752,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -1677,6 +1781,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    #[tokio::test]
+    async fn build_router_injects_live_reload_script_when_enabled() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
+        std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
+        let _env = EnvGuard::set_many(&[
+            ("AUTUMN_DEV_RELOAD", Some("1")),
+            (
+                "AUTUMN_DEV_RELOAD_STATE",
+                Some(reload_file.path().to_str().expect("utf-8 path")),
+            ),
+        ]);
+        let router = test_router(vec![Route {
+            method: http::Method::GET,
+            path: "/page",
+            handler: axum::routing::get(|| async {
+                axum::response::Html("<html><body><main>ok</main></body></html>")
+            }),
+            name: "page",
+        }]);
+
+        let response = router
+            .oneshot(Request::builder().uri("/page").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).expect("utf-8");
+        assert!(html.contains("/__autumn/live-reload"));
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_dev_reload_endpoint_when_enabled() {
+        let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
+        std::fs::write(reload_file.path(), r#"{"version":7,"kind":"css"}"#).expect("write");
+        let _env = EnvGuard::set_many(&[
+            ("AUTUMN_DEV_RELOAD", Some("1")),
+            (
+                "AUTUMN_DEV_RELOAD_STATE",
+                Some(reload_file.path().to_str().expect("utf-8 path")),
+            ),
+        ]);
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__autumn/live-reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store, no-cache, must-revalidate"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"version":7,"kind":"css"}"#);
+    }
+
+    #[tokio::test]
+    async fn build_router_disables_cache_for_static_assets_in_dev_reload_mode() {
+        let project = tempfile::tempdir().expect("project dir");
+        let static_dir = project.path().join("static");
+        std::fs::create_dir_all(&static_dir).expect("mkdir");
+        std::fs::write(static_dir.join("demo.txt"), "hello").expect("write static file");
+        let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
+        std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
+        let _env = EnvGuard::set_many(&[
+            (
+                "AUTUMN_MANIFEST_DIR",
+                Some(project.path().to_str().expect("utf-8 path")),
+            ),
+            ("AUTUMN_DEV_RELOAD", Some("1")),
+            (
+                "AUTUMN_DEV_RELOAD_STATE",
+                Some(reload_file.path().to_str().expect("utf-8 path")),
+            ),
+        ]);
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/static/demo.txt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store, no-cache, must-revalidate"
+        );
     }
 
     #[test]
@@ -1713,6 +1921,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         build_router(routes, config, state)
     }
@@ -1844,6 +2056,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -1873,6 +2089,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router =
             build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);

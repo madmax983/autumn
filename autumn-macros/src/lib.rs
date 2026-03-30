@@ -27,6 +27,7 @@ mod service;
 mod static_route;
 mod static_routes_macro;
 mod tasks_macro;
+mod ws;
 
 use proc_macro::TokenStream;
 
@@ -408,4 +409,45 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
     cached::cached_macro(attr.into(), item.into()).into()
+}
+
+/// Annotate an async function as a WebSocket route handler.
+///
+/// The function follows the **two-function pattern**: it runs at HTTP
+/// upgrade time (with access to Axum extractors) and returns a closure
+/// implementing [`WsHandler`] that handles the live WebSocket connection.
+///
+/// The macro generates a GET route that performs the WebSocket upgrade,
+/// so it integrates seamlessly with `routes![]`.
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::ws::{WebSocket, Message, WsHandler};
+///
+/// // Minimal echo handler
+/// #[ws("/echo")]
+/// async fn echo() -> impl WsHandler {
+///     |mut socket: WebSocket| async move {
+///         while let Some(Ok(msg)) = socket.recv().await {
+///             if let Message::Text(text) = msg {
+///                 socket.send(Message::Text(text)).await.ok();
+///             }
+///         }
+///     }
+/// }
+///
+/// // With extractors (runs before upgrade)
+/// #[ws("/chat")]
+/// async fn chat(state: AppState) -> impl WsHandler {
+///     let channels = state.channels().clone();
+///     |mut socket: WebSocket| async move {
+///         // use channels + socket
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
+    ws::ws_macro(attr.into(), item.into()).into()
 }
