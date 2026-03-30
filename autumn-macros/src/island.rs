@@ -10,7 +10,7 @@ pub fn island_macro(item: TokenStream) -> TokenStream {
 
     if input.sig.asyncness.is_some() {
         return syn::Error::new_spanned(
-            &input.sig.fn_token,
+            input.sig.fn_token,
             "#[island] does not support async fn; use a synchronous function",
         )
         .to_compile_error();
