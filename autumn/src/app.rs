@@ -66,6 +66,8 @@ pub fn app() -> AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
         static_metas: Vec::new(),
+        islands: Vec::new(),
+        actions: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
@@ -108,6 +110,8 @@ pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
+    pub(crate) islands: Vec<crate::wasm::IslandMeta>,
+    pub(crate) actions: Vec<crate::wasm::ActionMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
@@ -176,6 +180,20 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register WASM island metadata with the application.
+    #[must_use]
+    pub fn islands(mut self, islands: Vec<crate::wasm::IslandMeta>) -> Self {
+        self.islands.extend(islands);
+        self
+    }
+
+    /// Register typed server action metadata with the application.
+    #[must_use]
+    pub fn actions(mut self, actions: Vec<crate::wasm::ActionMeta>) -> Self {
+        self.actions.extend(actions);
         self
     }
 
@@ -1409,6 +1427,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[test]
+    fn app_builder_tracks_wasm_metadata() {
+        let app = app()
+            .islands(vec![crate::wasm::IslandMeta {
+                name: "counter",
+                mount_id: "counter-root",
+                props_type: "CounterProps",
+            }])
+            .actions(vec![crate::wasm::ActionMeta {
+                name: "increment",
+                path: "/actions/increment",
+            }]);
+
+        assert_eq!(app.islands.len(), 1);
+        assert_eq!(app.actions.len(), 1);
+        assert_eq!(app.islands[0].mount_id, "counter-root");
+        assert_eq!(app.actions[0].path, "/actions/increment");
     }
 
     #[tokio::test]

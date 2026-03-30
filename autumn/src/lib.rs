@@ -97,6 +97,7 @@ pub mod session;
 pub mod static_gen;
 pub mod task;
 pub mod validation;
+pub mod wasm;
 #[cfg(feature = "ws")]
 pub mod ws;
 
@@ -172,6 +173,7 @@ pub use validation::ValidateExt;
 /// }
 /// ```
 pub use autumn_macros::delete;
+pub use autumn_macros::island;
 
 /// Annotate an async function as a `GET` route handler.
 ///
@@ -192,6 +194,7 @@ pub use autumn_macros::delete;
 /// ```
 pub use autumn_macros::get;
 
+pub use autumn_macros::islands;
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup
