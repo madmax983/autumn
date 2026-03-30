@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 /// `Arc` or are already cheaply cloneable (`deadpool::Pool` is `Arc`-wrapped
 /// internally).
 ///
-/// This struct is normally constructed by [`app::AppBuilder::run`] and
+/// This struct is normally constructed by [`crate::app::AppBuilder::run`] and
 /// should not need to be created manually. It is public so that custom
 /// Axum extractors can access framework resources via
 /// `State<AppState>`.
