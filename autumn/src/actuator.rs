@@ -553,6 +553,146 @@ pub(crate) async fn env_endpoint(State(state): State<AppState>) -> Json<Actuator
 
 /// `GET /actuator/metrics` -- request metrics, latency, status codes, DB pool stats.
 #[allow(unused_variables, unused_mut)]
+/// `GET /actuator/metrics/ui` -- HTML dashboard for metrics.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn metrics_ui_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    #[cfg(feature = "maud")]
+    {
+        use maud::{DOCTYPE, Markup, html};
+
+        let snapshot = state.metrics.snapshot();
+        let m = snapshot.http;
+
+        #[cfg(feature = "db")]
+        let db_html: Option<Markup> = state.pool.as_ref().map(|pool| {
+            let status = pool.status();
+            let active = (status.max_size as u64).saturating_sub(status.available as u64);
+            html! {
+                div class="card" {
+                    h2 { "Database Pool" }
+                    ul {
+                        li { strong { "Pool Size: " } (status.max_size) }
+                        li { strong { "Active: " } (active) }
+                        li { strong { "Idle: " } (status.available) }
+                    }
+                }
+            }
+        });
+        #[cfg(not(feature = "db"))]
+        let db_html: Option<Markup> = None;
+
+        // Sort routes by count descending
+        let mut routes: Vec<_> = m.by_route.iter().collect();
+        routes.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+
+        let page = html! {
+            (DOCTYPE)
+            html lang="en" {
+                head {
+                    meta charset="utf-8";
+                    meta name="viewport" content="width=device-width, initial-scale=1";
+                    title { "Metrics Dashboard" }
+                    style {
+                        "body { font-family: system-ui, -apple-system, sans-serif; line-height: 1.5; color: #333; max-width: 1200px; margin: 0 auto; padding: 2rem; background: #f9fafb; }"
+                        "h1 { color: #111; border-bottom: 2px solid #e5e7eb; padding-bottom: 0.5rem; }"
+                        ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }"
+                        ".card { background: white; padding: 1.5rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+                        ".card h2 { margin-top: 0; color: #4b5563; font-size: 1.25rem; margin-bottom: 1rem; }"
+                        ".stat { font-size: 2.5rem; font-weight: 700; color: #2563eb; }"
+                        "table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-radius: 0.5rem; overflow: hidden; }"
+                        "th, td { padding: 1rem; text-align: left; border-bottom: 1px solid #e5e7eb; }"
+                        "th { background: #f3f4f6; font-weight: 600; color: #4b5563; }"
+                        "tr:last-child td { border-bottom: none; }"
+                        "ul { list-style: none; padding: 0; margin: 0; }"
+                        "li { padding: 0.5rem 0; border-bottom: 1px solid #f3f4f6; }"
+                        "li:last-child { border-bottom: none; }"
+                    }
+                }
+                body {
+                    h1 { "Metrics Dashboard" }
+
+                    div class="grid" {
+                        div class="card" {
+                            h2 { "HTTP Requests" }
+                            div class="stat" { (m.requests_total) }
+                            div { "Total processed" }
+                            div style="margin-top: 1rem;" {
+                                strong { (m.requests_active) } " currently active"
+                            }
+                        }
+
+                        div class="card" {
+                            h2 { "Global Latency" }
+                            ul {
+                                li { strong { "p50: " } (m.latency_ms.p50) " ms" }
+                                li { strong { "p95: " } (m.latency_ms.p95) " ms" }
+                                li { strong { "p99: " } (m.latency_ms.p99) " ms" }
+                            }
+                        }
+
+                        div class="card" {
+                            h2 { "Status Codes" }
+                            ul {
+                                li { strong { "2xx: " } (m.by_status.s2xx) }
+                                li { strong { "3xx: " } (m.by_status.s3xx) }
+                                li { strong { "4xx: " } (m.by_status.s4xx) }
+                                li { strong { "5xx: " } (m.by_status.s5xx) }
+                            }
+                        }
+
+                        @if let Some(db) = db_html {
+                            (db)
+                        }
+                    }
+
+                    h2 { "Route Breakdown" }
+                    table {
+                        thead {
+                            tr {
+                                th { "Route" }
+                                th { "Requests" }
+                                th { "p50 (ms)" }
+                                th { "p95 (ms)" }
+                                th { "p99 (ms)" }
+                            }
+                        }
+                        tbody {
+                            @for (path, snap) in routes {
+                                tr {
+                                    td { code { (path) } }
+                                    td { (snap.count) }
+                                    td { (snap.p50_ms) }
+                                    td { (snap.p95_ms) }
+                                    td { (snap.p99_ms) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            page.into_string(),
+        )
+            .into_response()
+    }
+    #[cfg(not(feature = "maud"))]
+    {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "Maud feature must be enabled for HTML metrics UI.",
+        )
+            .into_response()
+    }
+}
+
 pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let snapshot = state.metrics.snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
@@ -674,6 +814,10 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
 
     if sensitive {
         router = router
+            .route(
+                "/actuator/metrics/ui",
+                axum::routing::get(metrics_ui_endpoint),
+            )
             .route("/actuator/env", axum::routing::get(env_endpoint))
             .route(
                 "/actuator/configprops",
@@ -797,6 +941,43 @@ mod tests {
     }
 
     // ── Metrics endpoint tests ─────────────────────────────────
+
+    #[tokio::test]
+    #[cfg(feature = "maud")]
+    async fn actuator_metrics_ui_returns_html() {
+        let state = test_state();
+        state.metrics.record("GET", "/test", 200, 10);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics/ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/html"),
+            "Metrics UI should return HTML, got: {ct}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Metrics"));
+        assert!(html.contains("GET /test"));
+    }
 
     #[tokio::test]
     async fn actuator_metrics_returns_http_stats() {

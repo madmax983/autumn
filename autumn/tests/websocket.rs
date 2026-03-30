@@ -36,6 +36,7 @@ fn test_state() -> AppState {
 // ── Test handlers ────────────────────────────────────────────────
 
 #[ws("/echo")]
+#[allow(clippy::unused_async)]
 async fn echo() -> impl WsHandler {
     |mut socket: WebSocket| async move {
         while let Some(Ok(msg)) = socket.recv().await {
@@ -47,6 +48,7 @@ async fn echo() -> impl WsHandler {
 }
 
 #[ws("/with-state")]
+#[allow(clippy::unused_async)]
 async fn with_state(state: AppState) -> impl WsHandler {
     let _channels = state.channels().clone();
     |mut socket: WebSocket| async move {
@@ -55,6 +57,7 @@ async fn with_state(state: AppState) -> impl WsHandler {
 }
 
 #[ws("/with-shutdown")]
+#[allow(clippy::unused_async)]
 async fn with_shutdown() -> impl WsHandler {
     autumn_web::ws::WithShutdown(
         |mut socket: WebSocket, shutdown: CancellationToken| async move {
@@ -68,7 +71,7 @@ async fn with_shutdown() -> impl WsHandler {
                             _ => break,
                         }
                     }
-                    _ = shutdown.cancelled() => {
+                    () = shutdown.cancelled() => {
                         socket.send(Message::Close(None)).await.ok();
                         break;
                     }
