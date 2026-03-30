@@ -15,7 +15,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 hex = "0.4"
 indicatif = "0.17"
-notify = "7"
+notify = "8"
 notify-debouncer-mini = "0.5"
 ratatui = "0.29"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
