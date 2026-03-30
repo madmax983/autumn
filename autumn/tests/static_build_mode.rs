@@ -35,6 +35,10 @@ fn test_state() -> autumn_web::AppState {
         log_levels: autumn_web::actuator::LogLevels::new("info"),
         task_registry: autumn_web::actuator::TaskRegistry::new(),
         config_props: autumn_web::actuator::ConfigProperties::default(),
+        #[cfg(feature = "ws")]
+        channels: autumn_web::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
     }
 }
 

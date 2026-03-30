@@ -22,6 +22,9 @@
 //! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
+/// WebSocket route macro.
+#[cfg(feature = "ws")]
+pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
     cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
@@ -87,6 +90,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -97,6 +104,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

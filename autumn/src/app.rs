@@ -508,6 +508,10 @@ impl AppBuilder {
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::from_config(&config),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -546,9 +550,17 @@ impl AppBuilder {
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
 
+        // Capture the shutdown token so WebSocket handlers are notified.
+        #[cfg(feature = "ws")]
+        let shutdown_token = state.shutdown.clone();
+
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 shutdown_signal().await;
+
+                // Signal WebSocket handlers to close connections.
+                #[cfg(feature = "ws")]
+                shutdown_token.cancel();
 
                 // Warn if draining takes too long
                 if shutdown_timeout > 5 {
@@ -612,6 +624,10 @@ impl AppBuilder {
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::from_config(&config),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         // Build the full router (same as production)
@@ -1361,6 +1377,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         build_router(routes, &config, state)
     }
@@ -1427,6 +1447,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
@@ -1504,6 +1528,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(post_routes, &config, state);
 
@@ -1548,6 +1576,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router(route_list, &config, state);
 
@@ -1702,6 +1734,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -1867,6 +1903,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         build_router(routes, config, state)
     }
@@ -1998,6 +2038,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router = build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -2027,6 +2071,10 @@ mod tests {
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
         let router =
             build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);

@@ -1,5 +1,9 @@
 use crate::actuator;
+#[cfg(feature = "ws")]
+use crate::channels::Channels;
 use crate::middleware;
+#[cfg(feature = "ws")]
+use tokio_util::sync::CancellationToken;
 
 /// Shared application state passed to all route handlers.
 ///
@@ -28,6 +32,10 @@ use crate::middleware;
 ///     log_levels: autumn_web::actuator::LogLevels::new("info"),
 ///     task_registry: autumn_web::actuator::TaskRegistry::new(),
 ///     config_props: Default::default(),
+///     #[cfg(feature = "ws")]
+///     channels: autumn_web::channels::Channels::new(32),
+///     #[cfg(feature = "ws")]
+///     shutdown: tokio_util::sync::CancellationToken::new(),
 /// };
 /// ```
 #[derive(Clone)]
@@ -65,6 +73,20 @@ pub struct AppState {
     /// Shared application state passed to all route handlers.
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub config_props: actuator::ConfigProperties,
+
+    /// Named broadcast channel registry for real-time messaging.
+    ///
+    /// Available when the `ws` feature is enabled. Use
+    /// [`channels()`](Self::channels) for convenient access.
+    #[cfg(feature = "ws")]
+    pub channels: Channels,
+
+    /// Cancellation token signalled during graceful shutdown.
+    ///
+    /// WebSocket handlers receive a child token so they can clean up
+    /// when the server is stopping.
+    #[cfg(feature = "ws")]
+    pub shutdown: CancellationToken,
 }
 
 impl AppState {
@@ -98,9 +120,26 @@ impl AppState {
         }
     }
 
-    /// Shared application state passed to all route handlers.
+    /// Returns a reference to the broadcast channel registry.
+    ///
+    /// Shorthand for accessing `self.channels` directly.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub const fn channels(&self) -> &Channels {
+        &self.channels
+    }
+
+    /// Returns a child cancellation token for the server shutdown signal.
+    ///
+    /// WebSocket handlers should select on this to clean up when the
+    /// server is shutting down.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.child_token()
+    }
+
     /// Create an `AppState` suitable for testing, with sensible defaults
-    /// Shared application state passed to all route handlers.
     /// for all fields. Database pool is `None`.
     #[cfg(test)]
     #[allow(dead_code)]
@@ -115,6 +154,10 @@ impl AppState {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         }
     }
 }
@@ -160,6 +203,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         let debug = format!("{state:?}");
         assert!(debug.contains("AppState"));
@@ -184,6 +231,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
@@ -205,6 +256,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         let _cloned = require_clone(&state);
     }
@@ -221,6 +276,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         assert_eq!(state.profile(), "staging");
     }
@@ -237,6 +296,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         assert_eq!(state.profile(), "default");
     }
@@ -253,6 +316,10 @@ mod tests {
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: CancellationToken::new(),
         };
         let display = state.uptime_display();
         assert!(
