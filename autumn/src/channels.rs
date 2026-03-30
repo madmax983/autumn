@@ -166,7 +166,10 @@ impl Channels {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(ChannelsInner {
-                capacity,
+                // tokio::sync::broadcast::channel panics if capacity is 0 or > usize::MAX >> 1
+                // We clamp it safely, but also must avoid memory exhaustion attacks where an
+                // attacker sends a giant number. So we clamp to a reasonable max, like 1,000,000.
+                capacity: capacity.clamp(1, 1_000_000),
                 registry: Mutex::new(HashMap::new()),
             }),
         }
@@ -333,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn channels_is_clone() {
         let channels = Channels::new(16);
         let _cloned = channels.clone();
@@ -351,5 +355,20 @@ mod tests {
         // Both channels have 0 receivers, but gc only checks receiver_count
         // "alive" has no receivers either, so both get cleaned
         assert_eq!(channels.channel_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod havoc_proptest {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
+        fn havoc_channels_capacity_panic(capacity in proptest::num::usize::ANY) {
+            let channels = Channels::new(capacity);
+            let _tx = channels.sender("havoc");
+        }
     }
 }
