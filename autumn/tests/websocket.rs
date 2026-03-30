@@ -126,10 +126,7 @@ async fn non_upgrade_get_returns_error() {
     let router = autumn_web::app::build_router(routes![echo], &config, state);
 
     // A plain GET (without upgrade headers) should NOT get 200
-    let req = Request::builder()
-        .uri("/echo")
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri("/echo").body(Body::empty()).unwrap();
 
     let resp = router.oneshot(req).await.unwrap();
     // Axum returns 421 (upgrade required) for non-upgrade WS requests

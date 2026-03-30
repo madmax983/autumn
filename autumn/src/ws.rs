@@ -61,8 +61,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-pub use axum::extract::ws::{CloseCode, CloseFrame, Message, Utf8Bytes, WebSocket};
 pub use axum::extract::WebSocketUpgrade;
+pub use axum::extract::ws::{CloseCode, CloseFrame, Message, Utf8Bytes, WebSocket};
 pub use tokio_util::sync::CancellationToken;
 
 /// Trait for WebSocket connection handlers.

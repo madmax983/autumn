@@ -22,14 +22,14 @@
 //! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
+/// WebSocket route macro.
+#[cfg(feature = "ws")]
+pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
     cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
     static_routes, tasks,
 };
-/// WebSocket route macro.
-#[cfg(feature = "ws")]
-pub use autumn_macros::ws;
 
 // ── Rendering ────────────────────────────────────────────────────
 /// Maud HTML templating types.
