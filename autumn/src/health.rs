@@ -75,22 +75,33 @@ struct PoolStatus {
     clippy::useless_let_if_seq
 )]
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
-    let mut healthy = true;
-    let mut pool_status = None;
+    let healthy;
+    let pool_status;
 
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool.as_ref() {
-        let status = pool.status();
-        let available = status.available as u64;
-        let size = status.max_size as u64;
-        let waiting = status.waiting as u64;
+    {
+        if let Some(pool) = state.pool.as_ref() {
+            let status = pool.status();
+            let available = status.available as u64;
+            let size = status.max_size as u64;
+            let waiting = status.waiting as u64;
 
-        healthy = available > 0 || waiting == 0;
-        pool_status = Some(PoolStatus {
-            size,
-            available,
-            waiting,
-        });
+            healthy = available > 0 || waiting == 0;
+            pool_status = Some(PoolStatus {
+                size,
+                available,
+                waiting,
+            });
+        } else {
+            healthy = true;
+            pool_status = None;
+        }
+    }
+
+    #[cfg(not(feature = "db"))]
+    {
+        healthy = true;
+        pool_status = None;
     }
 
     let detailed = state.health_detailed;

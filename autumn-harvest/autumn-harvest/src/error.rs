@@ -84,6 +84,13 @@ pub fn database_error(e: impl std::fmt::Display) -> HarvestError {
     HarvestError::Database(e.to_string())
 }
 
+#[cfg(feature = "db")]
+impl From<diesel::result::Error> for HarvestError {
+    fn from(value: diesel::result::Error) -> Self {
+        database_error(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
