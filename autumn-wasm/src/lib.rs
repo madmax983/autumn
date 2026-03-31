@@ -1,3 +1,4 @@
+pub mod action;
 mod boot;
 mod island;
 
@@ -11,7 +12,7 @@ pub type Element = web_sys::Element;
 pub type Element = ();
 
 pub mod prelude {
-    pub use crate::{IslandRegistration, boot};
+    pub use crate::{IslandRegistration, action, boot};
 }
 
 #[cfg(test)]
