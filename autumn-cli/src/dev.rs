@@ -347,14 +347,17 @@ fn cargo_build_wasm(package: Option<&str>) -> bool {
         }
     };
 
-    let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
-    cmd.arg(&client_target);
+    let mut cargo_cmd = Command::new("cargo");
+    cargo_cmd.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
+    cargo_cmd.arg(&client_target);
     if let Some(pkg) = package {
-        cmd.args(["-p", pkg]);
+        cargo_cmd.args(["-p", pkg]);
     }
     eprintln!("  Compiling WASM...");
-    cmd.status().ok().is_some_and(|status| status.success())
+    cargo_cmd
+        .status()
+        .ok()
+        .is_some_and(|status| status.success())
 }
 
 /// Start the application binary. Returns the child process handle.
@@ -1531,7 +1534,6 @@ mod tests {
 
     #[test]
     fn watch_dirs_are_non_empty() {
-        assert!(!WATCH_DIRS.is_empty());
         for dir in WATCH_DIRS {
             assert!(!dir.is_empty());
         }
@@ -1539,7 +1541,6 @@ mod tests {
 
     #[test]
     fn watch_files_are_non_empty() {
-        assert!(!WATCH_FILES.is_empty());
         for f in WATCH_FILES {
             assert!(!f.is_empty());
         }

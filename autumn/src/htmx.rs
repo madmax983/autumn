@@ -30,6 +30,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn htmx_js_is_not_empty() {
         assert!(!HTMX_JS.is_empty(), "htmx.min.js should not be empty");
     }

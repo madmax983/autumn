@@ -116,6 +116,7 @@ pub fn pending_migrations(
 ///
 /// Called internally by [`AppBuilder::run`](crate::app::AppBuilder::run)
 /// when migrations are registered via `.migrations()`.
+#[allow(clippy::cognitive_complexity)]
 pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,

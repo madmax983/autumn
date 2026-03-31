@@ -21,6 +21,7 @@ struct RenameOutput {
 }
 
 #[server]
+#[allow(clippy::unused_async)]
 async fn rename_todo(input: RenameInput) -> AutumnResult<RenameOutput> {
     Ok(RenameOutput { id: input.id })
 }

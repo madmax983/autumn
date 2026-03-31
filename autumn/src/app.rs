@@ -451,6 +451,7 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
@@ -712,6 +713,7 @@ impl AppBuilder {
 /// Each task runs in its own spawned task with error logging.
 /// Uses simple `tokio::time` for fixed-delay scheduling.
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cognitive_complexity)]
 fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
@@ -780,6 +782,7 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
 /// Prints all registered routes, scheduled tasks, active middleware, and
 /// resolved configuration to the `INFO` log so developers can see exactly
 /// what the macros and conventions configured.
+#[allow(clippy::cognitive_complexity)]
 fn log_startup_transparency(
     routes: &[Route],
     tasks: &[crate::task::TaskInfo],
@@ -966,6 +969,7 @@ pub fn build_router_merged(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
 fn build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
