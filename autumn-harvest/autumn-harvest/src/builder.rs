@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use crate::info::{ActivityInfo, WorkflowInfo};
+use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
 
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
@@ -12,6 +12,7 @@ use crate::info::{ActivityInfo, WorkflowInfo};
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,
     activities: Vec<ActivityInfo>,
+    dags: Vec<DagInfo>,
     worker_config: WorkerConfig,
 }
 
@@ -36,6 +37,13 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register DAG definitions (output of `dags![]` macro).
+    #[must_use]
+    pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
+        self.dags.extend(dags);
+        self
+    }
+
     /// Configure the worker (concurrency, queues, timeouts).
     #[must_use]
     pub fn worker(mut self, config: WorkerConfig) -> Self {
@@ -53,6 +61,12 @@ impl HarvestBuilder {
     #[must_use]
     pub fn activity_count(&self) -> usize {
         self.activities.len()
+    }
+
+    /// Number of registered DAG definitions.
+    #[must_use]
+    pub fn dag_count(&self) -> usize {
+        self.dags.len()
     }
 }
 
@@ -98,13 +112,29 @@ impl WorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::info::WorkflowInfo;
+    use crate::dag::DagBuilder;
+    use crate::info::{DagInfo, WorkflowInfo};
+    use crate::policy::Schedule;
 
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
             name: "test",
             module: "test",
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+        }
+    }
+
+    fn fake_dag_info() -> DagInfo {
+        fn build(_dag: &mut DagBuilder) {}
+
+        DagInfo {
+            name: "daily_etl",
+            module: "test",
+            schedule: Some(Schedule::Manual),
+            catchup: false,
+            max_active_runs: 1,
+            default_queue: Some("default"),
+            builder: build,
         }
     }
 
@@ -124,5 +154,11 @@ mod tests {
     fn worker_config_builder_adds_queues() {
         let config = WorkerConfig::default().with_queues(["email-workers", "etl"]);
         assert!(config.queues.contains(&"email-workers".to_string()));
+    }
+
+    #[test]
+    fn harvest_builder_collects_dags() {
+        let builder = HarvestBuilder::new().dags(vec![fake_dag_info()]);
+        assert_eq!(builder.dag_count(), 1);
     }
 }

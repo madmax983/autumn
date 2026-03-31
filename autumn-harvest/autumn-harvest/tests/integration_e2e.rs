@@ -1,3 +1,5 @@
+#![cfg(feature = "db")]
+
 //! End-to-end integration tests using testcontainers for a real Postgres instance.
 //!
 //! These tests spin up a throwaway Postgres container per test, run the harvest
@@ -6,17 +8,23 @@
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::info::WorkflowInfo;
+use autumn_harvest::models::{NewWorkflowExecution, TaskQueueItem, WorkflowExecution};
 use autumn_harvest::queue::{EnqueueParams, TaskType};
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
-use autumn_harvest::{HarvestError, queue};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+use autumn_harvest::{HarvestError, WorkflowContext, queue};
 
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -54,6 +62,69 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
     (conn, container)
 }
 
+/// Start a Postgres container with the harvest schema applied and return
+/// the database URL plus the live container handle.
+async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
+        .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    (database_url, container)
+}
+
+fn build_test_pool(database_url: &str) -> DbPool {
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(database_url);
+    deadpool::managed::Pool::builder(manager)
+        .max_size(4)
+        .build()
+        .expect("failed to build test pool")
+}
+
+async fn load_execution_from_url(database_url: &str, exec_id: ExecutionId) -> WorkflowExecution {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for execution query");
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("failed to reload workflow execution")
+}
+
+async fn load_task_from_url(database_url: &str, task_id: Uuid) -> TaskQueueItem {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for task query");
+    harvest_task_queue::table
+        .find(task_id)
+        .select(TaskQueueItem::as_select())
+        .first(&mut conn)
+        .await
+        .expect("failed to reload task queue row")
+}
+
+async fn load_history_from_url(database_url: &str, exec_id: ExecutionId) -> store::EventHistory {
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for history query");
+    store::load_history(&mut conn, exec_id)
+        .await
+        .expect("load_history failed")
+}
+
 /// Insert a minimal `harvest_workflow_executions` row and return its UUID.
 async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
@@ -77,6 +148,20 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         .expect("failed to insert workflow execution");
 
     exec_id
+}
+
+fn echo_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Ok(input) })
+}
+
+fn failing_workflow<'a>(
+    _ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move { Err("workflow exploded on purpose".to_string()) })
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +294,281 @@ async fn claim_task_returns_none_on_empty_queue() {
         claimed.is_none(),
         "expected None from empty queue, got {claimed:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_completes_workflow_task_and_persists_result() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"status": "ok"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: echo_workflow,
+        }],
+        vec![],
+    ));
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-e2e-complete".to_string(),
+                queues: vec!["default".to_string()],
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+            },
+            registry,
+        )
+        .expect("worker should build"),
+    );
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let completed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = load_execution_from_url(&database_url, exec_id).await;
+
+            if execution.state == "COMPLETED" {
+                break execution;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let execution =
+        completed_execution.expect("worker should complete workflow task within timeout");
+    assert_eq!(execution.output, Some(workflow_input.clone()));
+    assert!(execution.completed_at.is_some());
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(matches!(
+        history.events.last(),
+        Some(WorkflowEvent::WorkflowCompleted { output }) if *output == workflow_input
+    ));
+
+    let task = load_task_from_url(&database_url, task_id).await;
+    assert_eq!(task.state, "COMPLETED");
+    assert_eq!(task.output, Some(workflow_input));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_marks_workflow_failed_when_handler_errors() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"status": "boom"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: workflow_input.clone(),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: failing_workflow,
+        }],
+        vec![],
+    ));
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-e2e-fail".to_string(),
+                queues: vec!["default".to_string()],
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+            },
+            registry,
+        )
+        .expect("worker should build"),
+    );
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let failed_execution = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let execution = load_execution_from_url(&database_url, exec_id).await;
+
+            if execution.state == "FAILED" {
+                break execution;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let execution = failed_execution.expect("worker should fail workflow task within timeout");
+    assert_eq!(execution.state, "FAILED");
+    assert!(
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("workflow exploded"))
+    );
+    assert!(execution.completed_at.is_some());
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(matches!(
+        history.events.last(),
+        Some(WorkflowEvent::WorkflowFailed { error }) if error.contains("workflow exploded")
+    ));
+
+    let task = load_task_from_url(&database_url, task_id).await;
+    assert_eq!(task.state, "FAILED");
+    assert!(
+        task.error
+            .as_deref()
+            .is_some_and(|e| e.contains("workflow exploded"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_fails_activity_task_with_unimplemented_dispatch_error() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let activity_input = serde_json::json!({"step": "send_email"});
+
+    let started_events = vec![WorkflowEvent::WorkflowStarted {
+        input: serde_json::json!({"workflow": "activity-only"}),
+        timestamp: Utc::now(),
+    }];
+    store::append_events(&mut conn, exec_id, &started_events, 0)
+        .await
+        .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Activity, activity_input);
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("send_email".to_string());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue activity task failed");
+
+    let worker = Arc::new(
+        Worker::new(
+            WorkerRuntimeConfig {
+                worker_id: "worker-e2e-activity-unsupported".to_string(),
+                queues: vec!["default".to_string()],
+                max_concurrent_workflows: 1,
+                max_concurrent_activities: 1,
+                poll_interval: Duration::from_millis(25),
+                shutdown_timeout: Duration::from_secs(1),
+            },
+            Arc::new(HandlerRegistry::new(vec![], vec![])),
+        )
+        .expect("worker should build"),
+    );
+    let pool = build_test_pool(&database_url);
+    let runner = Arc::clone(&worker);
+    let pool_for_run = pool.clone();
+
+    let handle = tokio::spawn(async move {
+        runner.run(&pool_for_run).await;
+    });
+
+    let failed_task = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let task = load_task_from_url(&database_url, task_id).await;
+
+            if task.state == "FAILED" {
+                break task;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let task = failed_task.expect("worker should fail unsupported activity task within timeout");
+    assert_eq!(task.state, "FAILED");
+    assert!(
+        task.error
+            .as_deref()
+            .is_some_and(|e| e.contains("activity task dispatch is not implemented"))
+    );
+
+    let execution = load_execution_from_url(&database_url, exec_id).await;
+    assert_eq!(execution.state, "FAILED");
+    assert!(
+        execution
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("activity task dispatch is not implemented"))
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(matches!(
+        history.events.last(),
+        Some(WorkflowEvent::WorkflowFailed { error })
+            if error.contains("activity task dispatch is not implemented")
+    ));
 }
 
 #[tokio::test]

@@ -408,29 +408,36 @@ struct DatabaseCheck {
 /// `GET /actuator/health`
 #[allow(unused_variables, clippy::useless_let_if_seq)]
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let mut db_check = None;
-    let mut overall_healthy = true;
+    let db_check;
+    let overall_healthy;
 
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool.as_ref() {
-        let status = pool.status();
-        let available = status.available as u64;
-        let size = status.max_size as u64;
-        let waiting = status.waiting as u64;
-        let idle = available;
-        let active = size.saturating_sub(available);
+    {
+        if let Some(pool) = state.pool.as_ref() {
+            let status = pool.status();
+            let available = status.available as u64;
+            let size = status.max_size as u64;
+            let waiting = status.waiting as u64;
+            let idle = available;
+            let active = size.saturating_sub(available);
 
-        let healthy = available > 0 || waiting == 0;
-        if !healthy {
-            overall_healthy = false;
+            overall_healthy = available > 0 || waiting == 0;
+            db_check = Some(DatabaseCheck {
+                status: if overall_healthy { "ok" } else { "down" },
+                pool_size: size,
+                active_connections: active,
+                idle_connections: idle,
+            });
+        } else {
+            overall_healthy = true;
+            db_check = None;
         }
+    }
 
-        db_check = Some(DatabaseCheck {
-            status: if healthy { "ok" } else { "down" },
-            pool_size: size,
-            active_connections: active,
-            idle_connections: idle,
-        });
+    #[cfg(not(feature = "db"))]
+    {
+        overall_healthy = true;
+        db_check = None;
     }
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });

@@ -14,14 +14,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use scoped_futures::ScopedFutureExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
+use crate::context::WorkflowCommand;
 use crate::error::{HarvestError, HarvestResult};
+use crate::event::WorkflowEvent;
+use crate::executor::{WorkflowOutcome, run_workflow};
 use crate::info::{ActivityInfo, WorkflowInfo};
-use crate::models::TaskQueueItem;
-use crate::queue;
+use crate::models::{TaskQueueItem, WorkflowExecution};
+use crate::queue::{self, TaskType};
+use crate::schema::harvest_workflow_executions;
+use crate::store;
+use crate::types::ExecutionId;
 
 /// Type alias for the deadpool-managed async Diesel connection pool.
 pub type DbPool = deadpool::managed::Pool<
@@ -124,6 +133,317 @@ impl std::fmt::Debug for HandlerRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimedTaskKind {
+    Workflow,
+    Activity,
+}
+
+impl ClaimedTaskKind {
+    fn from_db(task_type: &str) -> HarvestResult<Self> {
+        match task_type {
+            task_type if task_type == TaskType::Workflow.as_str() => Ok(Self::Workflow),
+            task_type if task_type == TaskType::Activity.as_str() => Ok(Self::Activity),
+            other => Err(HarvestError::Config(format!(
+                "unsupported task type in queue row: {other}"
+            ))),
+        }
+    }
+}
+
+fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
+    id.to_string()
+        .parse()
+        .expect("database UUIDs must round-trip into ExecutionId")
+}
+
+fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
+    match command {
+        WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
+        WorkflowCommand::StartTimer { .. } => "StartTimer",
+        WorkflowCommand::RecordMarker { .. } => "RecordMarker",
+        WorkflowCommand::Complete { .. } => "Complete",
+        WorkflowCommand::Fail { .. } => "Fail",
+    }
+}
+
+fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
+    if commands.is_empty() {
+        return "workflow suspended without emitted commands; resumption is not implemented yet"
+            .to_string();
+    }
+
+    let command_names = commands
+        .iter()
+        .map(workflow_command_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "workflow task suspended with unsupported commands ({command_names}); activity/timer dispatch is not implemented yet"
+    )
+}
+
+async fn load_workflow_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<WorkflowExecution> {
+    harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", exec_id)))
+}
+
+async fn update_workflow_execution_completed(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    worker_id: &str,
+    output: &serde_json::Value,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set((
+            dsl::state.eq("COMPLETED"),
+            dsl::output.eq(Some(output.clone())),
+            dsl::error.eq(None::<String>),
+            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+            dsl::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(HarvestError::NotFound(format!(
+            "workflow execution {}",
+            exec_id
+        )));
+    }
+
+    Ok(())
+}
+
+async fn update_workflow_execution_failed(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_workflow_executions::dsl;
+
+    let updated = diesel::update(dsl::harvest_workflow_executions.find(exec_id.as_uuid()))
+        .set((
+            dsl::state.eq("FAILED"),
+            dsl::output.eq(None::<serde_json::Value>),
+            dsl::error.eq(Some(error.to_string())),
+            dsl::sticky_worker_id.eq(Some(worker_id.to_string())),
+            dsl::completed_at.eq(Some(chrono::Utc::now())),
+        ))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(HarvestError::NotFound(format!(
+            "workflow execution {}",
+            exec_id
+        )));
+    }
+
+    Ok(())
+}
+
+async fn persist_workflow_completion(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    output: serde_json::Value,
+) -> HarvestResult<()> {
+    let event = WorkflowEvent::WorkflowCompleted {
+        output: output.clone(),
+    };
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            store::append_events(conn, exec_id, &[event], next_event_id).await?;
+            update_workflow_execution_completed(conn, exec_id, worker_id, &output).await?;
+            queue::complete_task(conn, task_id, output).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+async fn persist_workflow_failure(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    exec_id: ExecutionId,
+    next_event_id: i32,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    let error = error.to_string();
+    conn.transaction::<(), HarvestError, _>(|conn| {
+        async move {
+            store::append_events(
+                conn,
+                exec_id,
+                &[WorkflowEvent::WorkflowFailed {
+                    error: error.clone(),
+                }],
+                next_event_id,
+            )
+            .await?;
+            update_workflow_execution_failed(conn, exec_id, worker_id, &error).await?;
+            queue::fail_task(conn, task_id, &error).await
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+async fn fail_task_only(
+    conn: &mut AsyncPgConnection,
+    task_id: uuid::Uuid,
+    error: &str,
+) -> HarvestResult<()> {
+    queue::fail_task(conn, task_id, error).await
+}
+
+async fn fail_task_and_execution(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+    error: &str,
+) -> HarvestResult<()> {
+    let Some(exec_uuid) = task.workflow_exec_id else {
+        return fail_task_only(conn, task.id, error).await;
+    };
+
+    let exec_id = execution_id_from_uuid(exec_uuid);
+    match store::load_history(conn, exec_id).await {
+        Ok(history) => {
+            persist_workflow_failure(
+                conn,
+                task.id,
+                exec_id,
+                history.next_event_id,
+                worker_id,
+                error,
+            )
+            .await
+        }
+        Err(history_error) => {
+            tracing::warn!(
+                task_id = %task.id,
+                workflow_exec_id = %exec_id,
+                error = %history_error,
+                "failed to load workflow history while persisting task failure; updating rows without event append"
+            );
+            update_workflow_execution_failed(conn, exec_id, worker_id, error).await?;
+            queue::fail_task(conn, task.id, error).await
+        }
+    }
+}
+
+async fn process_workflow_task(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    task: &TaskQueueItem,
+    worker_id: &str,
+) -> HarvestResult<()> {
+    let Some(exec_uuid) = task.workflow_exec_id else {
+        return fail_task_only(conn, task.id, "workflow task missing workflow_exec_id").await;
+    };
+    let exec_id = execution_id_from_uuid(exec_uuid);
+
+    let execution = match load_workflow_execution(conn, exec_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            fail_task_only(conn, task.id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
+
+    let history = match store::load_history(conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
+
+    let workflow = match registry.workflows.get(&execution.workflow_name) {
+        Some(workflow) => workflow,
+        None => {
+            let error = format!(
+                "no workflow handler registered for '{}'",
+                execution.workflow_name
+            );
+            fail_task_and_execution(conn, task, worker_id, &error).await?;
+            return Err(HarvestError::Config(error));
+        }
+    };
+
+    let next_event_id = history.next_event_id;
+    let history_events = history.events;
+
+    match run_workflow(
+        exec_id,
+        history_events,
+        workflow.handler,
+        task.input.clone(),
+    )
+    .await
+    {
+        WorkflowOutcome::Completed { output } => {
+            persist_workflow_completion(conn, task.id, exec_id, next_event_id, worker_id, output)
+                .await
+        }
+        WorkflowOutcome::Failed { error } => {
+            persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
+        }
+        WorkflowOutcome::Suspended { commands } => {
+            let error = suspended_workflow_error(&commands);
+            persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
+        }
+    }
+}
+
+async fn process_task(
+    pool: &DbPool,
+    registry: Arc<HandlerRegistry>,
+    task: TaskQueueItem,
+    worker_id: &str,
+) -> HarvestResult<()> {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return Err(crate::error::database_error(error));
+        }
+    };
+
+    match ClaimedTaskKind::from_db(&task.task_type)? {
+        ClaimedTaskKind::Workflow => {
+            process_workflow_task(&mut conn, registry.as_ref(), &task, worker_id).await
+        }
+        ClaimedTaskKind::Activity => {
+            fail_task_and_execution(
+                &mut conn,
+                &task,
+                worker_id,
+                "activity task dispatch is not implemented yet",
+            )
+            .await
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Worker
 // ---------------------------------------------------------------------------
@@ -166,8 +486,8 @@ impl Worker {
 
     /// Run the main poll loop until shutdown is requested.
     ///
-    /// This is the worker's entry point. It alternates between polling the
-    /// queue and checking the shutdown token via `tokio::select!`.
+    /// This is the worker's entry point. It keeps polling until shutdown is
+    /// requested, checking the cancellation token between poll iterations.
     pub async fn run(&self, pool: &DbPool) {
         tracing::info!(
             worker_id = %self.config.worker_id,
@@ -175,15 +495,11 @@ impl Worker {
             "worker starting"
         );
 
-        loop {
-            tokio::select! {
-                () = self.shutdown.cancelled() => {
-                    tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
-                    break;
-                }
-                () = self.poll_once(pool) => {}
-            }
+        while !self.shutdown.is_cancelled() {
+            self.poll_once(pool).await;
         }
+
+        tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received");
 
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         self.drain_in_flight().await;
@@ -225,20 +541,28 @@ impl Worker {
     }
 
     /// Spawn a bounded Tokio task for the claimed work item.
-    ///
-    /// For now this is a stub that logs and marks the task completed. The full
-    /// wiring to the executor (replay engine, activity context) comes in
-    /// integration tests.
     fn dispatch_task(&self, task: TaskQueueItem, pool: &DbPool) {
-        let semaphore = if task.task_type == "WORKFLOW" {
-            Arc::clone(&self.workflow_semaphore)
-        } else {
-            Arc::clone(&self.activity_semaphore)
+        let kind = match ClaimedTaskKind::from_db(&task.task_type) {
+            Ok(kind) => kind,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task.id,
+                    task_type = %task.task_type,
+                    error = %error,
+                    "claimed task has invalid task_type"
+                );
+                return;
+            }
+        };
+        let semaphore = match kind {
+            ClaimedTaskKind::Workflow => Arc::clone(&self.workflow_semaphore),
+            ClaimedTaskKind::Activity => Arc::clone(&self.activity_semaphore),
         };
 
         let pool = pool.clone();
+        let registry = Arc::clone(&self.registry);
         let task_id = task.id;
-        let task_type = task.task_type;
+        let task_type = task.task_type.clone();
         let worker_id = self.config.worker_id.clone();
 
         tokio::spawn(async move {
@@ -252,18 +576,17 @@ impl Worker {
                 task_id = %task_id,
                 task_type = %task_type,
                 worker_id = %worker_id,
-                "executing task (stub — full wiring in integration)"
+                "executing task"
             );
 
-            // Stub: mark completed with empty output.
-            let Ok(mut conn) = pool.get().await else {
-                tracing::error!(task_id = %task_id, "failed to get connection for completion");
-                return;
-            };
-
-            if let Err(e) = queue::complete_task(&mut conn, task_id, serde_json::json!(null)).await
-            {
-                tracing::error!(task_id = %task_id, error = %e, "failed to complete task");
+            if let Err(error) = process_task(&pool, registry, task, &worker_id).await {
+                tracing::error!(
+                    task_id = %task_id,
+                    task_type = %task_type,
+                    worker_id = %worker_id,
+                    error = %error,
+                    "task execution failed"
+                );
             }
         });
     }
@@ -417,5 +740,18 @@ mod tests {
         assert!(!worker.shutdown.is_cancelled());
         worker.shutdown();
         assert!(worker.shutdown.is_cancelled());
+    }
+
+    #[test]
+    fn claimed_task_kind_uses_lowercase_db_values() {
+        assert_eq!(
+            ClaimedTaskKind::from_db("workflow").unwrap(),
+            ClaimedTaskKind::Workflow
+        );
+        assert_eq!(
+            ClaimedTaskKind::from_db("activity").unwrap(),
+            ClaimedTaskKind::Activity
+        );
+        assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
     }
 }
