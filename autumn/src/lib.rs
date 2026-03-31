@@ -155,6 +155,7 @@ pub use validation::ValidateExt;
 
 // ── Proc-macro re-exports ──────────────────────────────────────────
 
+pub use autumn_macros::actions;
 /// Annotate an async function as a `DELETE` route handler.
 ///
 /// Generates a companion function that returns a [`route::Route`]
@@ -217,6 +218,7 @@ pub use autumn_macros::islands;
 /// }
 /// ```
 pub use autumn_macros::main;
+pub use autumn_macros::server;
 
 /// Derive Diesel and Serde traits for a database model struct.
 ///

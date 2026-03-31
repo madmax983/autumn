@@ -9,6 +9,26 @@ pub use types::{ActionMeta, IslandMeta};
 
 const DEFAULT_MANIFEST_PATH: &str = "target/autumn/wasm/manifest.json";
 
+#[doc(hidden)]
+pub fn noop_action_route() -> crate::route::Route {
+    crate::route::Route {
+        method: http::Method::POST,
+        path: "/_autumn/actions/__noop",
+        handler: axum::routing::post(|| async {
+            crate::AutumnError::not_found_msg("server action route is unavailable on wasm32")
+        }),
+        name: "__autumn_noop_action_route",
+    }
+}
+
+pub async fn post_json<I, O>(path: &str, input: &I) -> Result<O, String>
+where
+    I: serde::Serialize,
+    O: serde::de::DeserializeOwned,
+{
+    autumn_wasm::action::post_json(path, input).await
+}
+
 /// Load the optional WASM asset manifest from disk.
 ///
 /// # Errors
