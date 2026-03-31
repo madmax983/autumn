@@ -41,6 +41,10 @@ fn build_distributed_state() -> Arc<state::DistributedState> {
 async fn main() {
     let distributed_state = build_distributed_state();
     tracing::info!(
+        primary_url_configured = distributed_state.config.database.primary_url.is_some(),
+        replica_url_configured = distributed_state.config.database.replica_url.is_some(),
+        configured_primary_pool_size = distributed_state.config.database.primary_pool_size,
+        configured_replica_pool_size = distributed_state.config.database.replica_pool_size,
         primary_pool_size = distributed_state.pools.primary_pool_size(),
         replica_pool_size = distributed_state.pools.replica_pool_size(),
         "installed distributed bookmarks state"

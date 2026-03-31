@@ -14,7 +14,6 @@ impl DistributedState {
         Self { config, pools }
     }
 
-    #[must_use]
     pub fn install_global(self: Arc<Self>) -> Result<Arc<Self>, DistributedStateInstallError> {
         Self::global_slot()
             .set(self.clone())

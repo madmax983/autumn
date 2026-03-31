@@ -80,11 +80,6 @@ impl BookmarkRepository {
     }
 
     #[must_use]
-    pub(crate) fn bookmark_shard_id(bookmark_id: i64) -> u32 {
-        bookmark_id.rem_euclid(i64::from(LINK_CHECKER_SHARD_COUNT)) as u32
-    }
-
-    #[must_use]
     pub(crate) fn shard_ids() -> std::ops::Range<u32> {
         0..LINK_CHECKER_SHARD_COUNT
     }
@@ -103,10 +98,7 @@ impl BookmarkRepository {
         })
     }
 
-    fn pool<'state>(
-        state: &'state DistributedState,
-        role: PoolRole,
-    ) -> &'state Pool<AsyncPgConnection> {
+    fn pool(state: &DistributedState, role: PoolRole) -> &Pool<AsyncPgConnection> {
         match role {
             PoolRole::Primary => state.pools.primary(),
             PoolRole::Replica => state.pools.replica(),
@@ -376,10 +368,12 @@ mod tests {
     #[test]
     fn bookmark_shards_wrap_across_fixed_partition_count() {
         assert_eq!(LINK_CHECKER_SHARD_COUNT, 16);
-        assert_eq!(BookmarkRepository::bookmark_shard_id(0), 0);
-        assert_eq!(BookmarkRepository::bookmark_shard_id(15), 15);
-        assert_eq!(BookmarkRepository::bookmark_shard_id(16), 0);
-        assert_eq!(BookmarkRepository::bookmark_shard_id(31), 15);
+        let shard_count = i64::from(LINK_CHECKER_SHARD_COUNT);
+
+        assert_eq!(0_i64.rem_euclid(shard_count), 0);
+        assert_eq!(15_i64.rem_euclid(shard_count), 15);
+        assert_eq!(16_i64.rem_euclid(shard_count), 0);
+        assert_eq!(31_i64.rem_euclid(shard_count), 15);
     }
 
     #[test]

@@ -82,7 +82,6 @@ impl Default for DistributedDatabaseConfig {
 }
 
 impl DistributedConfig {
-    #[must_use]
     pub fn load() -> Result<Self, DistributedConfigLoadError> {
         let manifest_dir =
             resolve_manifest_dir(std::env::var("AUTUMN_MANIFEST_DIR").ok().as_deref());
@@ -115,14 +114,13 @@ impl DistributedConfig {
         }
 
         let toml_str = toml::to_string(&merged).expect("distributed config merge should serialize");
-        Ok(
-            toml::from_str(&toml_str).map_err(|source| DistributedConfigLoadError::Parse {
-                path: base_path,
-                source,
-            })?,
-        )
+        toml::from_str(&toml_str).map_err(|source| DistributedConfigLoadError::Parse {
+            path: base_path,
+            source: Box::new(source),
+        })
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn from_urls(primary_url: &str, replica_url: &str) -> Self {
         Self {
@@ -134,6 +132,7 @@ impl DistributedConfig {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn with_pool_sizes(mut self, primary_pool_size: usize, replica_pool_size: usize) -> Self {
         self.database.primary_pool_size = primary_pool_size;
@@ -201,7 +200,7 @@ pub enum DistributedConfigLoadError {
     },
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 }
 
@@ -234,7 +233,7 @@ impl Error for DistributedConfigLoadError {
         match self {
             Self::MissingSection { .. } => None,
             Self::Io { source, .. } => Some(source),
-            Self::Parse { source, .. } => Some(source),
+            Self::Parse { source, .. } => Some(source.as_ref()),
         }
     }
 }
@@ -249,7 +248,7 @@ fn load_distributed_section(
                     .parse()
                     .map_err(|source| DistributedConfigLoadError::Parse {
                         path: path.to_path_buf(),
-                        source,
+                        source: Box::new(source),
                     })?;
             Ok(file_config.get("distributed").cloned())
         }
