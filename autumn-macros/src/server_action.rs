@@ -2,6 +2,7 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{FnArg, ItemFn, ReturnType, Type};
 
+#[allow(clippy::too_many_lines)]
 pub fn server_macro(item: TokenStream) -> TokenStream {
     let input: ItemFn = match syn::parse2(item) {
         Ok(input) => input,
