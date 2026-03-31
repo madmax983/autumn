@@ -11,6 +11,7 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod actions_macro;
 mod cached;
 mod collect;
 mod island;
@@ -23,6 +24,7 @@ mod route;
 mod routes_macro;
 mod scheduled;
 mod secured;
+mod server_action;
 mod service;
 mod static_route;
 mod static_routes_macro;
@@ -155,6 +157,16 @@ pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn islands(input: TokenStream) -> TokenStream {
     islands_macro::islands_macro(input.into()).into()
+}
+
+#[proc_macro_attribute]
+pub fn server(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    server_action::server_macro(item.into()).into()
+}
+
+#[proc_macro]
+pub fn actions(input: TokenStream) -> TokenStream {
+    actions_macro::actions_macro(input.into()).into()
 }
 
 /// Set up the async runtime for an Autumn application.

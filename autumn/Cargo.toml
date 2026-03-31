@@ -19,6 +19,7 @@ test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
 autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
+autumn-wasm = { version = "0.1.0", path = "../autumn-wasm" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"

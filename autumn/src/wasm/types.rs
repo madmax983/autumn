@@ -9,10 +9,11 @@ pub struct IslandMeta {
 }
 
 /// Metadata for a generated server action endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 pub struct ActionMeta {
     pub name: &'static str,
     pub path: &'static str,
+    pub route: fn() -> crate::route::Route,
 }
 
 #[cfg(test)]
@@ -35,17 +36,24 @@ mod tests {
     }
 
     #[test]
-    fn action_meta_deserializes_from_json() {
-        let meta: ActionMeta =
-            serde_json::from_str(r#"{"name":"increment","path":"/actions/increment"}"#)
-                .expect("deserialize action meta");
-
-        assert_eq!(
-            meta,
-            ActionMeta {
+    fn action_meta_keeps_route_companion() {
+        fn fake_route() -> crate::route::Route {
+            crate::route::Route {
+                method: http::Method::POST,
+                path: "/_autumn/actions/increment",
+                handler: axum::routing::post(|| async { "ok" }),
                 name: "increment",
-                path: "/actions/increment",
             }
-        );
+        }
+
+        let meta = ActionMeta {
+            name: "increment",
+            path: "/_autumn/actions/increment",
+            route: fake_route,
+        };
+
+        let route = (meta.route)();
+        assert_eq!(route.path, "/_autumn/actions/increment");
+        assert_eq!(route.name, "increment");
     }
 }
