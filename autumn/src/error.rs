@@ -87,7 +87,7 @@ struct ErrorInner {
 ///
 /// #[get("/")]
 /// async fn handler() -> AutumnResult<&'static str> {
-///     std::fs::read_to_string("missing.txt")?; // becomes 500 on error
+///     autumn_web::reexports::tokio::fs::read_to_string("missing.txt").await?; // becomes 500 on error
 ///     Ok("ok")
 /// }
 /// ```
