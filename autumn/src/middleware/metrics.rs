@@ -419,4 +419,79 @@ mod tests {
         collector.decrement_active();
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 1);
     }
+
+    #[tokio::test]
+    async fn metrics_layer_records_requests() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let collector = MetricsCollector::new();
+        let app = Router::new()
+            .route("/test", get(|| async { "ok" }))
+            .layer(MetricsLayer::new(collector.clone()));
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+        assert_eq!(snap.http.requests_active, 0);
+        assert_eq!(snap.http.by_status.s2xx, 1);
+
+        let route_key = "GET /test";
+        assert!(snap.http.by_route.contains_key(route_key));
+        assert_eq!(snap.http.by_route[route_key].count, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_layer_handles_errors() {
+        use axum::body::Body;
+        use std::task::{Context, Poll};
+        use tower::{Service, ServiceExt};
+
+        // A custom service that fails instead of returning a response
+        #[derive(Clone)]
+        struct FailingService;
+
+        impl Service<Request<Body>> for FailingService {
+            type Response = Response<Body>;
+            type Error = std::io::Error;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                std::future::ready(Err(std::io::Error::other("boom")))
+            }
+        }
+
+        let collector = MetricsCollector::new();
+        let mut svc = MetricsLayer::new(collector.clone()).layer(FailingService);
+
+        // Active should be 0 initially
+        assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/fail")
+            .body(Body::empty())
+            .unwrap();
+
+        // We know it will error
+        let result = svc.ready().await.unwrap().call(request).await;
+        assert!(result.is_err());
+
+        // Ensure that even though it errored, the active connection count was decremented
+        assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
+    }
 }
