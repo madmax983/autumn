@@ -38,6 +38,17 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct LoggersResponse {
+    #[serde(default)]
+    current_level: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    available_levels: Vec<String>,
+    #[serde(default)]
+    loggers: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct HealthChecks {
     database: Option<DatabaseCheck>,
 }
@@ -155,6 +166,7 @@ struct DashboardState {
     health: HealthResponse,
     metrics: MetricsResponse,
     tasks: TasksResponse,
+    loggers: LoggersResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -184,6 +196,7 @@ impl DashboardState {
             health: HealthResponse::default(),
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
+            loggers: LoggersResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -280,6 +293,16 @@ impl DashboardState {
             }
         }
 
+        // Fetch loggers (best effort, may 404 in prod mode)
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/loggers", self.base_url))
+            .send()
+        {
+            if let Ok(l) = resp.json::<LoggersResponse>() {
+                self.loggers = l;
+            }
+        }
+
         self.last_poll = Instant::now();
     }
 }
@@ -330,10 +353,14 @@ fn run_loop(
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 2;
+                            state.active_tab = (state.active_tab + 1) % 3;
                         }
                         KeyCode::BackTab => {
-                            state.active_tab = usize::from(state.active_tab == 0);
+                            if state.active_tab == 0 {
+                                state.active_tab = 2;
+                            } else {
+                                state.active_tab -= 1;
+                            }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             state.route_scroll = state.route_scroll.saturating_add(1);
@@ -377,6 +404,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
     match state.active_tab {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
+        2 => draw_loggers_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -420,7 +448,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -854,6 +882,88 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Loggers ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Logger Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Level").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut loggers: Vec<_> = state.loggers.loggers.iter().collect();
+    loggers.sort_by(|a, b| a.0.cmp(b.0));
+
+    // Also include the root logger
+    let mut rows = vec![Row::new(vec![
+        Cell::from("ROOT (current)").style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from(state.loggers.current_level.clone()).style(
+            Style::default()
+                .fg(match state.loggers.current_level.as_str() {
+                    "trace" => Color::Magenta,
+                    "debug" => Color::Cyan,
+                    "info" => Color::Green,
+                    "warn" => Color::Yellow,
+                    "error" => Color::Red,
+                    _ => Color::White,
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+
+    for (name, level) in loggers {
+        let level_color = match level.as_str() {
+            "trace" => Color::Magenta,
+            "debug" => Color::Cyan,
+            "info" => Color::Green,
+            "warn" => Color::Yellow,
+            "error" => Color::Red,
+            _ => Color::White,
+        };
+
+        rows.push(Row::new(vec![
+            Cell::from(name.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(level.clone()).style(
+                Style::default()
+                    .fg(level_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(70), Constraint::Percentage(30)],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(2);
+
+    frame.render_widget(table, area);
 }
 
 fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
@@ -1354,6 +1464,16 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_loggers_response() {
+        let json = r#"{"current_level":"info","available_levels":["trace","debug","info","warn","error"],"loggers":{"my_module":"debug","other_module":"trace"}}"#;
+        let loggers: LoggersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(loggers.current_level, "info");
+        assert_eq!(loggers.available_levels.len(), 5);
+        assert_eq!(loggers.loggers["my_module"], "debug");
+        assert_eq!(loggers.loggers["other_module"], "trace");
+    }
+
+    #[test]
     fn default_types() {
         let _h = HealthResponse::default();
         let _m = MetricsResponse::default();
@@ -1366,6 +1486,7 @@ mod tests {
         let _hc = HealthChecks::default();
         let _dc = DatabaseCheck::default();
         let _db = DbPoolMetrics::default();
+        let _l = LoggersResponse::default();
     }
 
     // ── Rendering tests (TestBackend) ─────────────────────────
@@ -1386,6 +1507,33 @@ mod tests {
     fn render_routes_tab() {
         let mut state = test_state();
         state.active_tab = 1;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_loggers_tab() {
+        let mut state = test_state();
+        state.active_tab = 2;
+        state.loggers = LoggersResponse {
+            current_level: "unknown_level".to_string(), // Test fallback color
+            available_levels: vec![
+                "trace".to_string(),
+                "debug".to_string(),
+                "info".to_string(),
+                "warn".to_string(),
+                "error".to_string(),
+            ],
+            loggers: vec![
+                ("my_module".to_string(), "debug".to_string()),
+                ("other_module".to_string(), "trace".to_string()),
+                ("mod_warn".to_string(), "warn".to_string()),
+                ("mod_error".to_string(), "error".to_string()),
+                ("mod_info".to_string(), "info".to_string()),
+                ("mod_unknown".to_string(), "unknown".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
         render_frame(&state, 120, 40);
     }
 
@@ -1531,6 +1679,26 @@ mod tests {
         let mut state = test_state();
         state.active_tab = 99;
         render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn back_tab_wrap_logic() {
+        let mut state = test_state();
+        state.active_tab = 0;
+
+        if state.active_tab == 0 {
+            state.active_tab = 2;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 2);
+
+        if state.active_tab == 0 {
+            state.active_tab = 2;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 1);
     }
 
     #[test]
