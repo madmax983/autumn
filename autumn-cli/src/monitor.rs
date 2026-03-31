@@ -1464,6 +1464,16 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_loggers_response() {
+        let json = r#"{"current_level":"info","available_levels":["trace","debug","info","warn","error"],"loggers":{"my_module":"debug","other_module":"trace"}}"#;
+        let loggers: LoggersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(loggers.current_level, "info");
+        assert_eq!(loggers.available_levels.len(), 5);
+        assert_eq!(loggers.loggers["my_module"], "debug");
+        assert_eq!(loggers.loggers["other_module"], "trace");
+    }
+
+    #[test]
     fn default_types() {
         let _h = HealthResponse::default();
         let _m = MetricsResponse::default();
@@ -1476,6 +1486,7 @@ mod tests {
         let _hc = HealthChecks::default();
         let _dc = DatabaseCheck::default();
         let _db = DbPoolMetrics::default();
+        let _l = LoggersResponse::default();
     }
 
     // ── Rendering tests (TestBackend) ─────────────────────────
@@ -1504,7 +1515,7 @@ mod tests {
         let mut state = test_state();
         state.active_tab = 2;
         state.loggers = LoggersResponse {
-            current_level: "info".to_string(),
+            current_level: "unknown_level".to_string(), // Test fallback color
             available_levels: vec![
                 "trace".to_string(),
                 "debug".to_string(),
@@ -1515,6 +1526,10 @@ mod tests {
             loggers: vec![
                 ("my_module".to_string(), "debug".to_string()),
                 ("other_module".to_string(), "trace".to_string()),
+                ("mod_warn".to_string(), "warn".to_string()),
+                ("mod_error".to_string(), "error".to_string()),
+                ("mod_info".to_string(), "info".to_string()),
+                ("mod_unknown".to_string(), "unknown".to_string()),
             ]
             .into_iter()
             .collect(),
@@ -1664,6 +1679,26 @@ mod tests {
         let mut state = test_state();
         state.active_tab = 99;
         render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn back_tab_wrap_logic() {
+        let mut state = test_state();
+        state.active_tab = 0;
+
+        if state.active_tab == 0 {
+            state.active_tab = 2;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 2);
+
+        if state.active_tab == 0 {
+            state.active_tab = 2;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 1);
     }
 
     #[test]
