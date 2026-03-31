@@ -658,19 +658,19 @@ fn draw_status_codes(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
     let bar_group = BarGroup::default().bars(&[
         Bar::default()
             .value(s.s2xx)
-            .label("2xx".into())
+            .label("2xx")
             .style(Style::default().fg(Color::Green)),
         Bar::default()
             .value(s.s3xx)
-            .label("3xx".into())
+            .label("3xx")
             .style(Style::default().fg(Color::Cyan)),
         Bar::default()
             .value(s.s4xx)
-            .label("4xx".into())
+            .label("4xx")
             .style(Style::default().fg(Color::Yellow)),
         Bar::default()
             .value(s.s5xx)
-            .label("5xx".into())
+            .label("5xx")
             .style(Style::default().fg(Color::Red)),
     ]);
 
