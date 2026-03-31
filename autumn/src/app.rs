@@ -460,6 +460,24 @@ impl AppBuilder {
             return;
         }
 
+        let Self {
+            routes,
+            tasks,
+            static_metas: _,
+            islands: _,
+            actions,
+            exception_filters,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            error_page_renderer,
+            #[cfg(feature = "db")]
+            migrations,
+        } = self;
+
+        let mut all_routes = routes;
+        all_routes.extend(actions.iter().map(|action| (action.route)()));
+
         // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
@@ -471,7 +489,7 @@ impl AppBuilder {
 
         // 3. Validate routes
         assert!(
-            !self.routes.is_empty(),
+            !all_routes.is_empty(),
             "No routes registered. Did you forget to call .routes()?"
         );
 
@@ -486,7 +504,7 @@ impl AppBuilder {
         // 4b. Startup transparency log (AUTUMN_SHOW_CONFIG=1 or log level <= DEBUG)
         let show_config = std::env::var("AUTUMN_SHOW_CONFIG").as_deref() == Ok("1");
         if show_config {
-            log_startup_transparency(&self.routes, &self.tasks, &self.scoped_groups, &config);
+            log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
         // 5. Create database pool (if configured)
@@ -511,7 +529,7 @@ impl AppBuilder {
 
         // 5b. Run migrations if registered
         #[cfg(feature = "db")]
-        if let (Some(migrations), Some(url)) = (self.migrations, &config.database.url) {
+        if let (Some(migrations), Some(url)) = (migrations, &config.database.url) {
             migrate::auto_migrate(url, config.profile.as_deref(), migrations);
         }
 
@@ -539,20 +557,20 @@ impl AppBuilder {
             None
         };
         let router = build_router_with_static_inner(
-            self.routes,
+            all_routes,
             &config,
             state.clone(),
             dist_ref,
-            self.exception_filters,
-            self.scoped_groups,
-            self.merge_routers,
-            self.nest_routers,
-            self.error_page_renderer,
+            exception_filters,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            error_page_renderer,
         );
 
         // 7. Start scheduled tasks (if any)
-        if !self.tasks.is_empty() {
-            start_task_scheduler(self.tasks, &state);
+        if !tasks.is_empty() {
+            start_task_scheduler(tasks, &state);
         }
 
         // 8. Bind and serve with graceful shutdown
@@ -609,6 +627,24 @@ impl AppBuilder {
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
     async fn run_build_mode(self) {
+        let Self {
+            routes,
+            tasks: _,
+            static_metas,
+            islands: _,
+            actions,
+            exception_filters: _,
+            scoped_groups: _,
+            merge_routers: _,
+            nest_routers: _,
+            error_page_renderer: _,
+            #[cfg(feature = "db")]
+                migrations: _,
+        } = self;
+
+        let mut all_routes = routes;
+        all_routes.extend(actions.iter().map(|action| (action.route)()));
+
         // Load config (same as normal startup)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
             eprintln!("Failed to load configuration: {e}");
@@ -616,7 +652,7 @@ impl AppBuilder {
         });
         crate::logging::init(&config.log);
 
-        if self.static_metas.is_empty() {
+        if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
             eprintln!("Hint: use .static_routes(static_routes![...]) on your AppBuilder.");
             std::process::exit(1);
@@ -649,14 +685,14 @@ impl AppBuilder {
         };
 
         // Build the full router (same as production)
-        let router = build_router(self.routes, &config, state);
+        let router = build_router(all_routes, &config, state);
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
 
-        eprintln!("Building {} static route(s)...", self.static_metas.len());
+        eprintln!("Building {} static route(s)...", static_metas.len());
 
-        match crate::static_gen::render_static_routes(router, &self.static_metas, &dist_dir).await {
+        match crate::static_gen::render_static_routes(router, &static_metas, &dist_dir).await {
             Ok(()) => {
                 eprintln!(
                     "\n  \u{2713} Static build complete \u{2192} {}",
@@ -1431,6 +1467,15 @@ mod tests {
 
     #[test]
     fn app_builder_tracks_wasm_metadata() {
+        fn action_route() -> Route {
+            Route {
+                method: http::Method::POST,
+                path: "/actions/increment",
+                handler: axum::routing::post(|| async { "ok" }),
+                name: "increment",
+            }
+        }
+
         let app = app()
             .islands(vec![crate::wasm::IslandMeta {
                 name: "counter",
@@ -1440,6 +1485,7 @@ mod tests {
             .actions(vec![crate::wasm::ActionMeta {
                 name: "increment",
                 path: "/actions/increment",
+                route: action_route,
             }]);
 
         assert_eq!(app.islands.len(), 1);
