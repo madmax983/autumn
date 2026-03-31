@@ -4,7 +4,7 @@
 //! real-time metrics, health status, and task information in a rich
 //! terminal UI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -156,11 +156,11 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
     /// Rolling throughput samples (requests in last interval).
-    throughput_history: Vec<u64>,
+    throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
-    latency_p50_history: Vec<u64>,
+    latency_p50_history: VecDeque<u64>,
     /// Rolling p99 latency samples.
-    latency_p99_history: Vec<u64>,
+    latency_p99_history: VecDeque<u64>,
     /// Previous total requests for computing delta.
     prev_requests_total: u64,
     /// Whether the app is reachable.
@@ -184,9 +184,9 @@ impl DashboardState {
             health: HealthResponse::default(),
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
-            throughput_history: Vec::with_capacity(SPARKLINE_DEPTH),
-            latency_p50_history: Vec::with_capacity(SPARKLINE_DEPTH),
-            latency_p99_history: Vec::with_capacity(SPARKLINE_DEPTH),
+            throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
+            latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
+            latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             prev_requests_total: 0,
             connected: false,
             last_error: None,
@@ -246,22 +246,25 @@ impl DashboardState {
                     .requests_total
                     .saturating_sub(self.prev_requests_total);
                 if self.prev_requests_total > 0 || !self.throughput_history.is_empty() {
-                    self.throughput_history.push(delta);
+                    self.throughput_history.push_back(delta);
                     if self.throughput_history.len() > SPARKLINE_DEPTH {
-                        self.throughput_history.remove(0);
+                        self.throughput_history.pop_front();
                     }
+                    self.throughput_history.make_contiguous();
                 }
                 self.prev_requests_total = m.http.requests_total;
 
                 // Track latency history
-                self.latency_p50_history.push(m.http.latency_ms.p50);
+                self.latency_p50_history.push_back(m.http.latency_ms.p50);
                 if self.latency_p50_history.len() > SPARKLINE_DEPTH {
-                    self.latency_p50_history.remove(0);
+                    self.latency_p50_history.pop_front();
                 }
-                self.latency_p99_history.push(m.http.latency_ms.p99);
+                self.latency_p50_history.make_contiguous();
+                self.latency_p99_history.push_back(m.http.latency_ms.p99);
                 if self.latency_p99_history.len() > SPARKLINE_DEPTH {
-                    self.latency_p99_history.remove(0);
+                    self.latency_p99_history.pop_front();
                 }
+                self.latency_p99_history.make_contiguous();
 
                 self.metrics = m;
             }
@@ -517,7 +520,7 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     frame.render_widget(total, chunks[0]);
 
     // Card 2: Throughput (req/s)
-    let rps = state.throughput_history.last().copied().unwrap_or(0);
+    let rps = state.throughput_history.back().copied().unwrap_or(0);
     let rps_block = make_card_block("Throughput");
     let rps_widget = Paragraph::new(Text::from(vec![
         Line::raw(""),
@@ -615,7 +618,7 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
 
     let throughput_sparkline = Sparkline::default()
         .block(throughput_block)
-        .data(&state.throughput_history)
+        .data(state.throughput_history.as_slices().0)
         .style(Style::default().fg(Color::Green));
     frame.render_widget(throughput_sparkline, chunks[0]);
 
@@ -632,7 +635,7 @@ fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
 
     let latency_sparkline = Sparkline::default()
         .block(latency_block)
-        .data(&state.latency_p99_history)
+        .data(state.latency_p99_history.as_slices().0)
         .style(Style::default().fg(Color::Rgb(255, 150, 50)));
     frame.render_widget(latency_sparkline, chunks[1]);
 }
@@ -1114,9 +1117,9 @@ mod tests {
                 idle_connections: 7,
             }),
         };
-        state.throughput_history = vec![10, 20, 30, 25, 15, 42];
-        state.latency_p50_history = vec![3, 4, 5, 3, 4];
-        state.latency_p99_history = vec![50, 80, 100, 90, 70];
+        state.throughput_history = VecDeque::from(vec![10, 20, 30, 25, 15, 42]);
+        state.latency_p50_history = VecDeque::from(vec![3, 4, 5, 3, 4]);
+        state.latency_p99_history = VecDeque::from(vec![50, 80, 100, 90, 70]);
         state
     }
 
@@ -1481,7 +1484,7 @@ mod tests {
     #[test]
     fn render_zero_throughput() {
         let mut state = test_state();
-        state.throughput_history = vec![0, 0, 0];
+        state.throughput_history = VecDeque::from(vec![0, 0, 0]);
         render_frame(&state, 120, 40);
     }
 
