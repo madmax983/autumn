@@ -22,7 +22,7 @@ pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 /// htmx version string for diagnostics and cache busting.
 ///
 /// Corresponds to the version of the embedded htmx JS file.
-/// Re-exported at the crate root as [`HTMX_VERSION`](crate::HTMX_VERSION).
+/// Re-exported at the crate root as [`HTMX_VERSION`].
 pub const HTMX_VERSION: &str = "2.0.4";
 
 #[cfg(test)]

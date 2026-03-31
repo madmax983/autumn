@@ -1244,7 +1244,7 @@ fn build_router_with_static_inner(
         .fallback_service(serve_dir)
 }
 
-/// Build a `tower_http::cors::CorsLayer` from the framework's [`CorsConfig`].
+/// Build a `tower_http::cors::CorsLayer` from the framework's [`crate::config::CorsConfig`].
 ///
 /// Called only when `config.cors.allowed_origins` is non-empty.
 fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::CorsLayer {
