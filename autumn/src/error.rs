@@ -300,31 +300,92 @@ impl AutumnError {
     // ── String-message convenience constructors ────────────────
 
     /// Create a `404 Not Found` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::not_found_msg("No such user");
+    /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    /// assert_eq!(err.to_string(), "No such user");
+    /// ```
     pub fn not_found_msg(msg: impl Into<String>) -> Self {
         Self::not_found(StringError(msg.into()))
     }
 
     /// Create a `400 Bad Request` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::bad_request_msg("Invalid input parameter");
+    /// assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    /// ```
     pub fn bad_request_msg(msg: impl Into<String>) -> Self {
         Self::bad_request(StringError(msg.into()))
     }
 
     /// Create a `422 Unprocessable Entity` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unprocessable_msg("Title is required");
+    /// assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    /// ```
     pub fn unprocessable_msg(msg: impl Into<String>) -> Self {
         Self::unprocessable(StringError(msg.into()))
     }
 
     /// Create a `401 Unauthorized` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unauthorized_msg("Please log in to continue");
+    /// assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    /// ```
     pub fn unauthorized_msg(msg: impl Into<String>) -> Self {
         Self::unauthorized(StringError(msg.into()))
     }
 
     /// Create a `403 Forbidden` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::forbidden_msg("You lack admin privileges");
+    /// assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    /// ```
     pub fn forbidden_msg(msg: impl Into<String>) -> Self {
         Self::forbidden(StringError(msg.into()))
     }
 
     /// Create a `503 Service Unavailable` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::service_unavailable_msg("Database connection pool exhausted");
+    /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    /// ```
     pub fn service_unavailable_msg(msg: impl Into<String>) -> Self {
         Self::service_unavailable(StringError(msg.into()))
     }
