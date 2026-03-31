@@ -18,5 +18,6 @@ async fn rename_todo(input: RenameTodo) -> AutumnResult<TodoView> {
 fn main() {
     let actions = actions![rename_todo];
     assert_eq!(actions.len(), 1);
-    assert_eq!(actions[0].path, "/_autumn/actions/rename_todo");
+    assert!(actions[0].path.starts_with("/_autumn/actions/"));
+    assert!(actions[0].path.ends_with("::rename_todo"));
 }

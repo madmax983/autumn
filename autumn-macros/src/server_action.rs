@@ -65,7 +65,14 @@ pub fn server_macro(item: TokenStream) -> TokenStream {
     let block = &input.block;
     let name = &input.sig.ident;
 
-    let route_path = format!("/_autumn/actions/{name}");
+    let route_path = quote! {
+        ::core::concat!(
+            "/_autumn/actions/",
+            ::core::module_path!(),
+            "::",
+            ::core::stringify!(#name),
+        )
+    };
     let action_handler = format_ident!("__autumn_action_handler_{name}");
     let action_route = format_ident!("__autumn_action_route_{name}");
     let action_meta = format_ident!("__autumn_action_meta_{name}");
@@ -233,7 +240,8 @@ mod tests {
 
         assert!(out.contains("__autumn_action_meta_rename_todo"));
         assert!(out.contains("__autumn_action_route_rename_todo"));
-        assert!(out.contains("/_autumn/actions/rename_todo"));
+        assert!(out.contains("/_autumn/actions/"));
+        assert!(out.contains("rename_todo"));
     }
 
     #[test]

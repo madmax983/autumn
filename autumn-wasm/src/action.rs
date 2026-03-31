@@ -6,7 +6,11 @@ pub fn parse_cookie_value(cookie_header: &str, cookie_name: &str) -> Option<Stri
         let mut pieces = part.trim().splitn(2, '=');
         let key = pieces.next()?.trim();
         let value = pieces.next()?.trim();
-        (key == cookie_name).then(|| value.to_owned())
+        if key == cookie_name && !value.is_empty() {
+            Some(value.to_owned())
+        } else {
+            None
+        }
     })
 }
 
@@ -82,11 +86,11 @@ fn apply_csrf_headers(window: &web_sys::Window, request: &web_sys::Request) {
         }
 
         if let Ok(Some(meta)) = document.query_selector("meta[name='csrf-token']") {
-            token = meta.get_attribute("content");
+            token = non_empty(meta.get_attribute("content"));
         }
         if token.is_none() {
             if let Ok(Some(meta)) = document.query_selector("meta[name='autumn-csrf-token']") {
-                token = meta.get_attribute("content");
+                token = non_empty(meta.get_attribute("content"));
             }
         }
 
@@ -107,6 +111,11 @@ fn apply_csrf_headers(window: &web_sys::Window, request: &web_sys::Request) {
     if let Some(token) = token {
         let _ = request.headers().set(&header_name, &token);
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.and_then(|value| (!value.trim().is_empty()).then_some(value))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -141,6 +150,14 @@ mod tests {
     #[test]
     fn parse_cookie_value_handles_missing_cookie() {
         assert_eq!(parse_cookie_value("session=abc", "autumn-csrf"), None);
+    }
+
+    #[test]
+    fn parse_cookie_value_rejects_empty_values() {
+        assert_eq!(
+            parse_cookie_value("autumn-csrf=; session=abc", "autumn-csrf"),
+            None
+        );
     }
 
     #[tokio::test]

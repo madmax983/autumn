@@ -10,6 +10,7 @@ pub use types::{ActionMeta, IslandMeta};
 const DEFAULT_MANIFEST_PATH: &str = "target/autumn/wasm/manifest.json";
 
 #[doc(hidden)]
+#[must_use]
 pub fn noop_action_route() -> crate::route::Route {
     crate::route::Route {
         method: http::Method::POST,
@@ -21,6 +22,13 @@ pub fn noop_action_route() -> crate::route::Route {
     }
 }
 
+/// Proxy to the browser transport for generated server actions.
+///
+/// # Errors
+///
+/// Returns an error when request setup, network IO, or JSON decoding fails in
+/// the underlying `autumn-wasm` transport.
+#[allow(clippy::future_not_send)]
 pub async fn post_json<I, O>(path: &str, input: &I) -> Result<O, String>
 where
     I: serde::Serialize,
