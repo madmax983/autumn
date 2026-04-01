@@ -473,6 +473,12 @@ mod tests {
     }
 
     #[test]
+    fn test_not_found_error() {
+        let err = AutumnError::not_found(std::io::Error::other("no such user"));
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn not_found_is_404() {
         let err = AutumnError::not_found(TestError("missing".into()));
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -487,6 +493,26 @@ mod tests {
     #[test]
     fn unprocessable_is_422() {
         let err = AutumnError::unprocessable(TestError("bad entity".into()));
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn unauthorized_is_401() {
+        let err = AutumnError::unauthorized(TestError("unauthorized".into()));
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn forbidden_is_403() {
+        let err = AutumnError::forbidden(TestError("forbidden".into()));
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn validation_is_422() {
+        let mut details = std::collections::HashMap::new();
+        details.insert("field".to_string(), vec!["error".to_string()]);
+        let err = AutumnError::validation(details);
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
@@ -513,6 +539,18 @@ mod tests {
     fn unprocessable_msg_is_422() {
         let err = AutumnError::unprocessable_msg("title required");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn unauthorized_msg_is_401() {
+        let err = AutumnError::unauthorized_msg("login required");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn forbidden_msg_is_403() {
+        let err = AutumnError::forbidden_msg("no access");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
