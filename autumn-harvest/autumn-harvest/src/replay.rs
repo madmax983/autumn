@@ -921,7 +921,8 @@ mod tests {
                 output: serde_json::json!({"sent": true}),
             }
         );
-        assert_eq!(matcher.position(), 3);
+        // Cursor stays at interleaved child start so child replay remains deterministic.
+        assert_eq!(matcher.position(), 1);
     }
 
     #[test]
