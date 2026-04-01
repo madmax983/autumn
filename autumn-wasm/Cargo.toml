@@ -14,10 +14,13 @@ serde_json.workspace = true
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
-web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlElement", "Node", "NodeList", "EventTarget", "Request", "RequestInit", "RequestCredentials", "RequestMode", "Response", "Headers"] }
+web-sys = { version = "0.3", features = ["Document", "Window", "Element", "HtmlElement", "HtmlDocument", "Node", "NodeList", "EventTarget", "Request", "RequestInit", "RequestCredentials", "RequestMode", "Response", "Headers"] }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true

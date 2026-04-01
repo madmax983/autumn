@@ -30,7 +30,7 @@ where
     use wasm_bindgen_futures::JsFuture;
 
     let payload = serde_json::to_string(input).map_err(|error| error.to_string())?;
-    let mut opts = web_sys::RequestInit::new();
+    let opts = web_sys::RequestInit::new();
     opts.set_method("POST");
     opts.set_mode(web_sys::RequestMode::SameOrigin);
     opts.set_credentials(web_sys::RequestCredentials::SameOrigin);
@@ -73,6 +73,8 @@ where
 
 #[cfg(target_arch = "wasm32")]
 fn apply_csrf_headers(window: &web_sys::Window, request: &web_sys::Request) {
+    use wasm_bindgen::JsCast;
+
     let mut header_name = "x-csrf-token".to_owned();
     let mut token = None;
 
@@ -102,8 +104,10 @@ fn apply_csrf_headers(window: &web_sys::Window, request: &web_sys::Request) {
                 .and_then(|meta| meta.get_attribute("content"))
                 .unwrap_or_else(|| "autumn-csrf".to_owned());
 
-            if let Ok(cookie_header) = document.cookie() {
-                token = parse_cookie_value(&cookie_header, &cookie_name);
+            if let Ok(html_document) = document.dyn_into::<web_sys::HtmlDocument>() {
+                if let Ok(cookie_header) = html_document.cookie() {
+                    token = parse_cookie_value(&cookie_header, &cookie_name);
+                }
             }
         }
     }
@@ -160,6 +164,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn post_json_returns_error_on_non_wasm_target() {
         let result = super::post_json::<serde_json::Value, serde_json::Value>(
