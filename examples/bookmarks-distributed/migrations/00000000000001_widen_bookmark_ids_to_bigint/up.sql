@@ -1,0 +1,2 @@
+ALTER TABLE bookmarks ALTER COLUMN id TYPE BIGINT;
+ALTER SEQUENCE bookmarks_id_seq AS BIGINT;
