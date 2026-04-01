@@ -129,24 +129,32 @@ impl HistoryMatcher {
 
         // Advance past the Scheduled event
         self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
 
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
-        while self.cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&self.cursor) {
-                self.cursor += 1;
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+                scan_cursor += 1;
                 continue;
             }
 
-            match &self.events[self.cursor] {
+            match &self.events[scan_cursor] {
                 WorkflowEvent::ActivityCompleted {
                     activity_id: id,
                     output,
                 } if *id == activity_id => {
-                    let result = HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
-                    self.cursor += 1;
+                    let output = output.clone();
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Matched { output };
+                    }
+
+                    let result = HistoryMatch::Matched { output };
+                    self.cursor = scan_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return result;
                 }
@@ -155,11 +163,17 @@ impl HistoryMatcher {
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    let result = HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: *attempt,
-                    };
-                    self.cursor += 1;
+                    let error = error.clone();
+                    let attempt = *attempt;
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Failed { error, attempt };
+                    }
+
+                    let result = HistoryMatch::Failed { error, attempt };
+                    self.cursor = scan_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return result;
                 }
@@ -168,17 +182,18 @@ impl HistoryMatcher {
                 WorkflowEvent::ActivityHeartbeat {
                     activity_id: id, ..
                 } if *id == activity_id => {
-                    self.cursor += 1;
+                    scan_cursor += 1;
                 }
                 WorkflowEvent::ActivityStarted {
                     activity_id: id, ..
                 } if *id == activity_id => {
-                    self.cursor += 1;
+                    scan_cursor += 1;
                 }
                 // Child workflows can run concurrently with activities.
                 // Preserve replay by scanning past interleaved child starts.
                 WorkflowEvent::ChildWorkflowStarted { .. } => {
-                    self.cursor += 1;
+                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
                 _ => break,
@@ -220,22 +235,42 @@ impl HistoryMatcher {
 
         // Advance past TimerStarted
         self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
 
         // Scan forward for TimerFired, skipping consumed child terminals.
-        while self.cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&self.cursor) {
-                self.cursor += 1;
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+                scan_cursor += 1;
                 continue;
             }
 
-            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[self.cursor] {
+            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
                 if id.as_str() == timer_id {
-                    self.cursor += 1;
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Matched {
+                            output: Value::Null,
+                        };
+                    }
+
+                    self.cursor = scan_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched {
                         output: Value::Null,
                     };
                 }
+            }
+
+            if matches!(
+                self.events[scan_cursor],
+                WorkflowEvent::ChildWorkflowStarted { .. }
+            ) {
+                first_interleaved_child_start.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
             }
 
             break;
@@ -890,6 +925,43 @@ mod tests {
     }
 
     #[test]
+    fn matcher_activity_replay_preserves_interleaved_child_start_for_later_child_match() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let activity = matcher.match_activity("send_email");
+        assert!(matches!(activity, HistoryMatch::Matched { .. }));
+        // Cursor should stay on ChildWorkflowStarted for later child replay.
+        assert_eq!(matcher.position(), 1);
+
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
     fn matcher_timer_scan_skips_consumed_interleaved_child_terminal() {
         let child_id = crate::types::ExecutionId::new();
         let timer_id = TimerId::new("cooldown");
@@ -924,6 +996,40 @@ mod tests {
                 output: Value::Null
             }
         );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_timer_replay_preserves_interleaved_child_start_for_later_child_match() {
+        let child_id = crate::types::ExecutionId::new();
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let timer = matcher.match_timer("cooldown");
+        assert!(matches!(timer, HistoryMatch::Matched { .. }));
+        // Cursor should stay on ChildWorkflowStarted for later child replay.
+        assert_eq!(matcher.position(), 1);
+
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
         assert_eq!(matcher.position(), 4);
     }
 
