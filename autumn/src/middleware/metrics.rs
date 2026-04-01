@@ -249,17 +249,31 @@ struct Percentiles {
 }
 
 fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
-    if latencies.is_empty() {
+    let len = latencies.len();
+    if len == 0 {
         return Percentiles::default();
     }
-    let mut sorted: Vec<u64> = latencies.iter().copied().collect();
-    sorted.sort_unstable();
-    let len = sorted.len();
-    Percentiles {
-        p50: sorted[len * 50 / 100],
-        p95: sorted[len.saturating_sub(1).min(len * 95 / 100)],
-        p99: sorted[len.saturating_sub(1).min(len * 99 / 100)],
-    }
+
+    // Pre-allocate to exact capacity and use fast slice copying instead of iterating
+    let mut data = Vec::with_capacity(len);
+    let (slice1, slice2) = latencies.as_slices();
+    data.extend_from_slice(slice1);
+    data.extend_from_slice(slice2);
+
+    let p50_idx = len * 50 / 100;
+    let p95_idx = len.saturating_sub(1).min(len * 95 / 100);
+    let p99_idx = len.saturating_sub(1).min(len * 99 / 100);
+
+    // Use select_nth_unstable to find percentiles in O(N) time instead of O(N log N) sort
+    let (_, &mut p99, _) = data.select_nth_unstable(p99_idx);
+
+    // We only need to search the left partition for p95 since p95_idx <= p99_idx
+    let (_, &mut p95, _) = data[..=p99_idx].select_nth_unstable(p95_idx);
+
+    // We only need to search the left partition for p50 since p50_idx <= p95_idx
+    let (_, &mut p50, _) = data[..=p95_idx].select_nth_unstable(p50_idx);
+
+    Percentiles { p50, p95, p99 }
 }
 
 // ── Tower Layer / Service ───────────────────────────────────────
