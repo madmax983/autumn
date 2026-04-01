@@ -405,7 +405,7 @@ impl WorkflowContext {
             .matcher
             .lock()
             .expect("matcher lock poisoned")
-            .match_child_workflow(workflow_name);
+            .match_child_workflow(workflow_name, &input);
 
         match history_match {
             HistoryMatch::Matched { output } => Ok(output),
@@ -1124,6 +1124,37 @@ mod tests {
         assert!(
             ctx.drain_commands().is_empty(),
             "replay must not emit new child start command"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_child_input_mismatch_is_nondeterministic_and_no_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"order_id":"A-1001"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"magazine"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command on input mismatch"
         );
     }
 

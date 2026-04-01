@@ -238,7 +238,7 @@ impl HistoryMatcher {
     /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
     /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
     /// `child_id`.
-    pub fn match_child_workflow(&mut self, workflow_name: &str) -> HistoryMatch {
+    pub fn match_child_workflow(&mut self, workflow_name: &str, input: &Value) -> HistoryMatch {
         self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
@@ -246,12 +246,12 @@ impl HistoryMatcher {
 
         let start_cursor = self.cursor;
         let started_event = &self.events[self.cursor];
-        let (child_id, recorded_name) = match started_event {
+        let (child_id, recorded_name, recorded_input) = match started_event {
             WorkflowEvent::ChildWorkflowStarted {
                 child_id,
                 workflow_name,
-                ..
-            } => (*child_id, workflow_name.as_str()),
+                input,
+            } => (*child_id, workflow_name.as_str(), input),
             other => {
                 return HistoryMatch::Diverged {
                     expected: format!("ChildWorkflowStarted({workflow_name})"),
@@ -264,6 +264,12 @@ impl HistoryMatcher {
             return HistoryMatch::Diverged {
                 expected: format!("ChildWorkflowStarted({workflow_name})"),
                 actual: format!("ChildWorkflowStarted({recorded_name})"),
+            };
+        }
+        if recorded_input != input {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowInput({input})"),
+                actual: format!("ChildWorkflowInput({recorded_input})"),
             };
         }
 
@@ -604,7 +610,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_child_workflow("process_order");
+        let result = matcher.match_child_workflow("process_order", &serde_json::json!({"id": 42}));
         assert_eq!(result, HistoryMatch::Matched { output });
         assert_eq!(matcher.position(), 2);
     }
@@ -625,7 +631,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_child_workflow("process_order");
+        let result = matcher.match_child_workflow("process_order", &Value::Null);
         assert_eq!(
             result,
             HistoryMatch::Failed {
@@ -645,7 +651,7 @@ mod tests {
         }];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_child_workflow("process_order");
+        let result = matcher.match_child_workflow("process_order", &Value::Null);
         assert!(matches!(result, HistoryMatch::Diverged { .. }));
         assert_eq!(
             matcher.position(),
@@ -676,7 +682,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let result = matcher.match_child_workflow("process_order");
+        let result = matcher.match_child_workflow("process_order", &serde_json::json!({"id": 1}));
         assert_eq!(
             result,
             HistoryMatch::Matched {
@@ -684,6 +690,28 @@ mod tests {
             }
         );
         assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_child_workflow_input_mismatch_diverges() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku":"book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result =
+            matcher.match_child_workflow("process_order", &serde_json::json!({"sku":"magazine"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
     }
 
     #[test]
@@ -712,7 +740,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let a = matcher.match_child_workflow("process_order");
+        let a = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
         assert_eq!(
             a,
             HistoryMatch::Matched {
@@ -722,7 +750,7 @@ mod tests {
         // Cursor should stay at Started(B), not advance past it.
         assert_eq!(matcher.position(), 1);
 
-        let b = matcher.match_child_workflow("process_order");
+        let b = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"B"}));
         assert_eq!(
             b,
             HistoryMatch::Matched {
@@ -759,7 +787,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let child = matcher.match_child_workflow("process_order");
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
         assert!(matches!(child, HistoryMatch::Matched { .. }));
         // Cursor should remain at the interleaved activity schedule.
         assert_eq!(matcher.position(), 1);
@@ -802,7 +830,7 @@ mod tests {
         ];
 
         let mut matcher = HistoryMatcher::new(events);
-        let child = matcher.match_child_workflow("process_order");
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
         assert!(matches!(child, HistoryMatch::Matched { .. }));
         assert_eq!(matcher.position(), 1);
 
