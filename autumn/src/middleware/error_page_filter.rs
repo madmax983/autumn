@@ -129,6 +129,9 @@ impl<S> tower::Layer<S> for ErrorPageContextLayer {
 }
 
 #[derive(Clone)]
+/// Tower `Service` wrapper that injects request context into response extensions.
+///
+/// Used by [`ErrorPageContextLayer`] to stash the path and ID for the error page renderer.
 pub struct ErrorPageContextService<S> {
     inner: S,
 }
@@ -166,6 +169,9 @@ where
 }
 
 pin_project_lite::pin_project! {
+    /// Future type that returns the response after context injection.
+    ///
+    /// Used by [`ErrorPageContextService`].
     pub struct ErrorPageContextFuture<F> {
         #[pin]
         inner: F,

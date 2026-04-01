@@ -74,6 +74,9 @@ struct PoolStatus {
     clippy::needless_pass_by_value,
     clippy::useless_let_if_seq
 )]
+/// Standard health check handler.
+///
+/// Automatically registered at the configured path (default `/health`).
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
     let healthy;
     let pool_status;

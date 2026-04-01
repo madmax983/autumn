@@ -206,6 +206,9 @@ pub struct MetricsSnapshot {
 }
 
 #[derive(Serialize)]
+/// Top-level HTTP metrics containing global and route-specific data.
+///
+/// Accessible via `/actuator/metrics`.
 pub struct HttpMetrics {
     pub requests_total: u64,
     pub requests_active: u64,
@@ -215,6 +218,9 @@ pub struct HttpMetrics {
 }
 
 #[derive(Serialize, Default)]
+/// Percentile latency summary (in milliseconds).
+///
+/// Shows median (p50), 95th percentile, and 99th percentile latencies.
 pub struct LatencySnapshot {
     pub p50: u64,
     pub p95: u64,
@@ -222,6 +228,7 @@ pub struct LatencySnapshot {
 }
 
 #[derive(Serialize)]
+/// Request metrics and latency aggregated by HTTP method and route.
 pub struct RouteSnapshot {
     pub count: u64,
     pub p50_ms: u64,
@@ -230,6 +237,7 @@ pub struct RouteSnapshot {
 }
 
 #[derive(Serialize)]
+/// Breakdown of total HTTP response statuses by generic class (2xx, 4xx, etc).
 pub struct StatusSnapshot {
     #[serde(rename = "2xx")]
     pub s2xx: u64,

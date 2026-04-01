@@ -11,10 +11,16 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+/// Checks if the development live-reload server is active.
+///
+/// Returns `true` if `AUTUMN_DEV_LIVE_RELOAD_PORT` is set.
 pub fn is_enabled() -> bool {
     std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
 }
 
+/// Endpoint to query the live-reload server state.
+///
+/// This allows the injected client script to determine the active WebSocket port.
 pub async fn live_reload_state_handler() -> impl IntoResponse {
     let body =
         read_reload_state_body().unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
@@ -29,6 +35,9 @@ pub async fn live_reload_state_handler() -> impl IntoResponse {
     response
 }
 
+/// Middleware that strips cache headers from static file responses.
+///
+/// Ensures browsers always fetch fresh assets during development.
 pub async fn disable_static_cache(request: Request<Body>, next: Next) -> Response<Body> {
     let is_static = is_static_path(request.uri().path());
     let mut response = next.run(request).await;
@@ -38,6 +47,9 @@ pub async fn disable_static_cache(request: Request<Body>, next: Next) -> Respons
     response
 }
 
+/// Middleware that injects the live-reload client script into HTML responses.
+///
+/// The script connects to the `autumn dev` WebSocket and reloads the page on changes.
 pub async fn inject_live_reload(request: Request<Body>, next: Next) -> Response<Body> {
     let response = next.run(request).await;
     inject_live_reload_into_response(response).await
