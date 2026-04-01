@@ -133,6 +133,11 @@ impl HistoryMatcher {
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
         while self.cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&self.cursor) {
+                self.cursor += 1;
+                continue;
+            }
+
             match &self.events[self.cursor] {
                 WorkflowEvent::ActivityCompleted {
                     activity_id: id,
@@ -767,6 +772,47 @@ mod tests {
             }
         );
         // The consumed child terminal event is skipped automatically.
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_activity_scan_skips_consumed_interleaved_child_terminal() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id": "A", "ok": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order");
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 1);
+
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
         assert_eq!(matcher.position(), 4);
     }
 
