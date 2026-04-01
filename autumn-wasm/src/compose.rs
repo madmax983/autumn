@@ -32,7 +32,7 @@ impl Composition {
             .shared
             .borrow()
             .get(&key)
-            .and_then(|boxed| boxed.downcast_ref::<Signal<T>>())
+            .and_then(|boxed| (**boxed).downcast_ref::<Signal<T>>())
         {
             return existing.clone();
         }
@@ -50,7 +50,7 @@ impl Composition {
         self.shared
             .borrow()
             .get(key)
-            .and_then(|boxed| boxed.downcast_ref::<Signal<T>>())
+            .and_then(|boxed| (**boxed).downcast_ref::<Signal<T>>())
             .cloned()
     }
 }

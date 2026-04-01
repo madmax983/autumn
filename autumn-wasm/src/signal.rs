@@ -2,6 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
+type SubscriberId = usize;
+type SubscriberCallback<T> = Box<dyn Fn(&T)>;
+type Subscribers<T> = HashMap<SubscriberId, SubscriberCallback<T>>;
+
 /// Reactive local state container for browser islands.
 ///
 /// `Signal` is intentionally tiny and framework-agnostic. It allows
@@ -15,7 +19,7 @@ pub struct Signal<T> {
 struct SignalInner<T> {
     value: RefCell<T>,
     next_id: Cell<usize>,
-    subscribers: RefCell<HashMap<usize, Box<dyn Fn(&T)>>>,
+    subscribers: RefCell<Subscribers<T>>,
 }
 
 impl<T> Signal<T> {
@@ -86,7 +90,7 @@ impl<T: Clone> Signal<T> {
 /// Dropping this value unsubscribes from future updates.
 pub struct Subscription<T> {
     inner: Weak<SignalInner<T>>,
-    id: usize,
+    id: SubscriberId,
 }
 
 impl<T> Drop for Subscription<T> {
