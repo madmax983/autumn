@@ -216,8 +216,13 @@ impl HistoryMatcher {
         // Advance past TimerStarted
         self.cursor += 1;
 
-        // Look for TimerFired
-        if self.cursor < self.events.len() {
+        // Scan forward for TimerFired, skipping consumed child terminals.
+        while self.cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&self.cursor) {
+                self.cursor += 1;
+                continue;
+            }
+
             if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[self.cursor] {
                 if id.as_str() == timer_id {
                     self.cursor += 1;
@@ -227,6 +232,8 @@ impl HistoryMatcher {
                     };
                 }
             }
+
+            break;
         }
 
         // Timer was started but never fired — incomplete history
@@ -839,6 +846,44 @@ mod tests {
             activity,
             HistoryMatch::Matched {
                 output: serde_json::json!({"sent": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_timer_scan_skips_consumed_interleaved_child_terminal() {
+        let child_id = crate::types::ExecutionId::new();
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 1);
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
             }
         );
         assert_eq!(matcher.position(), 4);
