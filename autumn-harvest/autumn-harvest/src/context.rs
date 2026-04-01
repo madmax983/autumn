@@ -1126,4 +1126,48 @@ mod tests {
             "replay must not emit new child start command"
         );
     }
+
+    #[tokio::test]
+    async fn context_replays_interleaved_child_starts_without_live_commands() {
+        let child_a = ExecutionId::new();
+        let child_b = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"B"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_b,
+                output: serde_json::json!({"id":"B","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let a = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("A should replay");
+        let b = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"B"}))
+            .await
+            .expect("B should replay");
+
+        assert_eq!(a, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(b, serde_json::json!({"id":"B","ok":true}));
+        assert!(ctx.drain_commands().is_empty());
+    }
 }
