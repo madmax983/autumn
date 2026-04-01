@@ -175,6 +175,11 @@ impl HistoryMatcher {
                 } if *id == activity_id => {
                     self.cursor += 1;
                 }
+                // Child workflows can run concurrently with activities.
+                // Preserve replay by scanning past interleaved child starts.
+                WorkflowEvent::ChildWorkflowStarted { .. } => {
+                    self.cursor += 1;
+                }
                 // Any other event type is unexpected mid-activity
                 _ => break,
             }
@@ -849,6 +854,39 @@ mod tests {
             }
         );
         assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_activity_scan_skips_interleaved_child_start() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 3);
     }
 
     #[test]
