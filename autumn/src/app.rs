@@ -1453,6 +1453,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn app_builder_routes_adds_routes() {
+        let builder = app();
+        assert_eq!(builder.routes.len(), 0);
+
+        let builder = builder.routes(vec![test_get_route("/1", "route1")]);
+        assert_eq!(builder.routes.len(), 1);
+
+        let builder = builder.routes(vec![
+            test_get_route("/2", "route2"),
+            test_get_route("/3", "route3"),
+        ]);
+        assert_eq!(builder.routes.len(), 3);
+
+        assert_eq!(builder.routes[0].path, "/1");
+        assert_eq!(builder.routes[1].path, "/2");
+        assert_eq!(builder.routes[2].path, "/3");
+    }
+
     #[tokio::test]
     async fn build_router_mounts_user_routes() {
         let router = test_router(vec![test_get_route("/test", "test_handler")]);
