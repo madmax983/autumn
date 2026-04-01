@@ -18,7 +18,21 @@ async fn test_session_fixation() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::state::AppState {
+        #[cfg(feature = "db")]
+        pool: None,
+        profile: None,
+        started_at: std::time::Instant::now(),
+        health_detailed: false,
+        metrics: autumn_web::middleware::MetricsCollector::new(),
+        log_levels: autumn_web::actuator::LogLevels::new("info"),
+        task_registry: autumn_web::actuator::TaskRegistry::new(),
+        config_props: autumn_web::actuator::ConfigProperties::default(),
+        #[cfg(feature = "ws")]
+        channels: autumn_web::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
 
     let app = Router::new()
         .route("/login", get(login_handler))
@@ -93,7 +107,21 @@ async fn test_rotate_id() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::state::AppState {
+        #[cfg(feature = "db")]
+        pool: None,
+        profile: None,
+        started_at: std::time::Instant::now(),
+        health_detailed: false,
+        metrics: autumn_web::middleware::MetricsCollector::new(),
+        log_levels: autumn_web::actuator::LogLevels::new("info"),
+        task_registry: autumn_web::actuator::TaskRegistry::new(),
+        config_props: autumn_web::actuator::ConfigProperties::default(),
+        #[cfg(feature = "ws")]
+        channels: autumn_web::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    };
 
     let app = Router::new()
         .route("/rotate", get(rotate_handler))

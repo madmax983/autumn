@@ -17,7 +17,8 @@ use crate::schema::bookmarks;
 #[scheduled(every = "1h", name = "link-checker")]
 pub async fn check_links(state: AppState) -> AutumnResult<()> {
     let pool = state
-        .pool()
+        .pool
+        .as_ref()
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
 
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
