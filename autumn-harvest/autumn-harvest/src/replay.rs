@@ -10,6 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::event::WorkflowEvent;
 
@@ -38,19 +39,28 @@ pub enum HistoryMatch {
 pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
+    consumed_child_terminal_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
     /// Create a new matcher from a list of recorded events.
     #[must_use]
-    pub const fn new(events: Vec<WorkflowEvent>) -> Self {
-        Self { events, cursor: 0 }
+    pub fn new(events: Vec<WorkflowEvent>) -> Self {
+        Self {
+            events,
+            cursor: 0,
+            consumed_child_terminal_events: HashSet::new(),
+        }
     }
 
     /// Returns `true` if the cursor is still within the recorded history.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
-        self.cursor < self.events.len()
+        let mut cursor = self.cursor;
+        while self.consumed_child_terminal_events.contains(&cursor) {
+            cursor += 1;
+        }
+        cursor < self.events.len()
     }
 
     /// Current cursor position in the event list.
@@ -65,6 +75,15 @@ impl HistoryMatcher {
     /// don't correspond to a workflow command.
     pub fn advance(&mut self) {
         if self.cursor < self.events.len() {
+            self.cursor += 1;
+            self.advance_to_next_unconsumed_event();
+        }
+    }
+
+    fn advance_to_next_unconsumed_event(&mut self) {
+        while self.consumed_child_terminal_events.contains(&self.cursor)
+            && self.cursor < self.events.len()
+        {
             self.cursor += 1;
         }
     }
@@ -81,6 +100,7 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -109,19 +129,33 @@ impl HistoryMatcher {
 
         // Advance past the Scheduled event
         self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
 
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
-        while self.cursor < self.events.len() {
-            match &self.events[self.cursor] {
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
                 WorkflowEvent::ActivityCompleted {
                     activity_id: id,
                     output,
                 } if *id == activity_id => {
-                    let result = HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
-                    self.cursor += 1;
+                    let output = output.clone();
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Matched { output };
+                    }
+
+                    let result = HistoryMatch::Matched { output };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
                     return result;
                 }
                 WorkflowEvent::ActivityFailed {
@@ -129,11 +163,18 @@ impl HistoryMatcher {
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    let result = HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: *attempt,
-                    };
-                    self.cursor += 1;
+                    let error = error.clone();
+                    let attempt = *attempt;
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Failed { error, attempt };
+                    }
+
+                    let result = HistoryMatch::Failed { error, attempt };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
                     return result;
                 }
                 // Skip heartbeats, started events, and other intermediate events
@@ -141,12 +182,18 @@ impl HistoryMatcher {
                 WorkflowEvent::ActivityHeartbeat {
                     activity_id: id, ..
                 } if *id == activity_id => {
-                    self.cursor += 1;
+                    scan_cursor += 1;
                 }
                 WorkflowEvent::ActivityStarted {
                     activity_id: id, ..
                 } if *id == activity_id => {
-                    self.cursor += 1;
+                    scan_cursor += 1;
+                }
+                // Child workflows can run concurrently with activities.
+                // Preserve replay by scanning past interleaved child starts.
+                WorkflowEvent::ChildWorkflowStarted { .. } => {
+                    first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
                 _ => break,
@@ -163,6 +210,7 @@ impl HistoryMatcher {
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -187,21 +235,124 @@ impl HistoryMatcher {
 
         // Advance past TimerStarted
         self.cursor += 1;
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_child_start = None;
 
-        // Look for TimerFired
-        if self.cursor < self.events.len() {
-            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[self.cursor] {
+        // Scan forward for TimerFired, skipping consumed child terminals.
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+
+            if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
                 if id.as_str() == timer_id {
-                    self.cursor += 1;
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::Matched {
+                            output: Value::Null,
+                        };
+                    }
+
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched {
                         output: Value::Null,
                     };
                 }
             }
+
+            if matches!(
+                self.events[scan_cursor],
+                WorkflowEvent::ChildWorkflowStarted { .. }
+            ) {
+                first_interleaved_child_start.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
+            }
+
+            break;
         }
 
         // Timer was started but never fired — incomplete history
         HistoryMatch::NoMatch
+    }
+
+    /// Match a child workflow command against history.
+    ///
+    /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
+    /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
+    /// `child_id`.
+    pub fn match_child_workflow(&mut self, workflow_name: &str, input: &Value) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let start_cursor = self.cursor;
+        let started_event = &self.events[self.cursor];
+        let (child_id, recorded_name, recorded_input) = match started_event {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name,
+                input,
+            } => (*child_id, workflow_name.as_str(), input),
+            other => {
+                return HistoryMatch::Diverged {
+                    expected: format!("ChildWorkflowStarted({workflow_name})"),
+                    actual: other.type_name().to_string(),
+                };
+            }
+        };
+
+        if recorded_name != workflow_name {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: format!("ChildWorkflowStarted({recorded_name})"),
+            };
+        }
+        if recorded_input != input {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowInput({input})"),
+                actual: format!("ChildWorkflowInput({recorded_input})"),
+            };
+        }
+
+        let mut scan_cursor = self.cursor + 1;
+
+        while scan_cursor < self.events.len() {
+            match &self.events[scan_cursor] {
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: id,
+                    output,
+                } if *id == child_id => {
+                    let output = output.clone();
+                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.cursor = start_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: id,
+                    error,
+                } if *id == child_id => {
+                    let error = error.clone();
+                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.cursor = start_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Failed { error, attempt: 1 };
+                }
+                _ => scan_cursor += 1,
+            }
+        }
+
+        self.cursor = start_cursor;
+        HistoryMatch::Diverged {
+            expected: format!("ChildWorkflowTerminal({workflow_name})"),
+            actual: "EndOfHistory".to_string(),
+        }
     }
 
     /// Match a version gate against history.
@@ -215,6 +366,7 @@ impl HistoryMatcher {
     /// - `max_version` if past end of history (new code path)
     #[must_use]
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
+        self.advance_to_next_unconsumed_event();
         let marker_name = format!("version:{change_id}");
 
         if !self.is_replaying() {
@@ -228,6 +380,7 @@ impl HistoryMatcher {
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(min_version);
                 self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
                 version
             }
             // No marker at current position — old workflow that didn't have
@@ -485,6 +638,400 @@ mod tests {
         let mut matcher = HistoryMatcher::new(vec![]);
         let version = matcher.match_version("billing_v2", 1, 3);
         assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn matcher_replays_child_workflow_completion() {
+        let child_id = crate::types::ExecutionId::new();
+        let output = serde_json::json!({"result": "ok"});
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: output.clone(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order", &serde_json::json!({"id": 42}));
+        assert_eq!(result, HistoryMatch::Matched { output });
+        assert_eq!(matcher.position(), 2);
+    }
+
+    #[test]
+    fn matcher_replays_child_workflow_failure() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "child failed".into(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order", &Value::Null);
+        assert_eq!(
+            result,
+            HistoryMatch::Failed {
+                error: "child failed".into(),
+                attempt: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_child_workflow_without_terminal_diverges_and_preserves_cursor() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".into(),
+            input: Value::Null,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order", &Value::Null);
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(
+            matcher.position(),
+            0,
+            "cursor must not consume started event"
+        );
+    }
+
+    #[test]
+    fn matcher_child_workflow_scans_past_interleaved_events() {
+        let child_a = crate::types::ExecutionId::new();
+        let child_b = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 1}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 2}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order", &serde_json::json!({"id": 1}));
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_child_workflow_input_mismatch_diverges() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku":"book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result =
+            matcher.match_child_workflow("process_order", &serde_json::json!({"sku":"magazine"}));
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(matcher.position(), 0);
+    }
+
+    #[test]
+    fn matcher_child_workflow_keeps_interleaved_starts_replayable() {
+        let child_a = crate::types::ExecutionId::new();
+        let child_b = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "A"}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "B"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id": "A", "ok": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_b,
+                output: serde_json::json!({"id": "B", "ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let a = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert_eq!(
+            a,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"id": "A", "ok": true}),
+            }
+        );
+        // Cursor should stay at Started(B), not advance past it.
+        assert_eq!(matcher.position(), 1);
+
+        let b = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"B"}));
+        assert_eq!(
+            b,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"id": "B", "ok": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_child_workflow_keeps_interleaved_activity_replayable() {
+        let child_a = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id": "A", "ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        // Cursor should remain at the interleaved activity schedule.
+        assert_eq!(matcher.position(), 1);
+
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
+        // The consumed child terminal event is skipped automatically.
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_activity_scan_skips_consumed_interleaved_child_terminal() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id": "A", "ok": true}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 1);
+
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_activity_scan_skips_interleaved_child_start() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
+        // Cursor stays at interleaved child start so child replay remains deterministic.
+        assert_eq!(matcher.position(), 1);
+    }
+
+    #[test]
+    fn matcher_activity_replay_preserves_interleaved_child_start_for_later_child_match() {
+        let child_id = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let activity = matcher.match_activity("send_email");
+        assert!(matches!(activity, HistoryMatch::Matched { .. }));
+        // Cursor should stay on ChildWorkflowStarted for later child replay.
+        assert_eq!(matcher.position(), 1);
+
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_timer_scan_skips_consumed_interleaved_child_terminal() {
+        let child_id = crate::types::ExecutionId::new();
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 1);
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_timer_replay_preserves_interleaved_child_start_for_later_child_match() {
+        let child_id = crate::types::ExecutionId::new();
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: timer_id.clone(),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let timer = matcher.match_timer("cooldown");
+        assert!(matches!(timer, HistoryMatch::Matched { .. }));
+        // Cursor should stay on ChildWorkflowStarted for later child replay.
+        assert_eq!(matcher.position(), 1);
+
+        let child = matcher.match_child_workflow("process_order", &serde_json::json!({"id":"A"}));
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        assert_eq!(matcher.position(), 4);
     }
 
     #[test]

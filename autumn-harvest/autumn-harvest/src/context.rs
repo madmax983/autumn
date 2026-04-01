@@ -44,6 +44,14 @@ pub enum WorkflowCommand {
         /// Fires when the timer completes.
         result_tx: oneshot::Sender<()>,
     },
+    /// Start a child workflow execution.
+    StartChildWorkflow {
+        child_id: ExecutionId,
+        workflow_name: String,
+        input: Value,
+        /// The worker sends the terminal child result back through this channel.
+        result_tx: oneshot::Sender<Result<Value, String>>,
+    },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
     RecordMarker { name: String, details: Value },
     /// The workflow function returned `Ok(output)`.
@@ -75,6 +83,15 @@ impl std::fmt::Debug for WorkflowCommand {
                 .debug_struct("StartTimer")
                 .field("timer_id", timer_id)
                 .field("duration_secs", duration_secs)
+                .finish_non_exhaustive(),
+            Self::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                ..
+            } => f
+                .debug_struct("StartChildWorkflow")
+                .field("child_id", child_id)
+                .field("workflow_name", workflow_name)
                 .finish_non_exhaustive(),
             Self::RecordMarker { name, details } => f
                 .debug_struct("RecordMarker")
@@ -371,6 +388,55 @@ impl WorkflowContext {
                         "timer '{timer_id}' cancelled: result channel dropped"
                     ))
                 })
+            }
+        }
+    }
+
+    /// Spawn a child workflow and await its terminal result.
+    ///
+    /// During replay, returns the recorded child output or failure.
+    /// During live execution, emits a `StartChildWorkflow` command and suspends.
+    pub async fn spawn_child_workflow_raw(
+        &self,
+        workflow_name: &str,
+        input: Value,
+    ) -> HarvestResult<Value> {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_child_workflow(workflow_name, &input);
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Failed { error, attempt } => Err(HarvestError::ActivityFailed {
+                name: format!("child-workflow:{workflow_name}"),
+                attempt,
+                source: error.into(),
+            }),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("child workflow mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::NoMatch => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::StartChildWorkflow {
+                    child_id: ExecutionId::new(),
+                    workflow_name: workflow_name.to_string(),
+                    input,
+                    result_tx: tx,
+                });
+
+                match rx.await {
+                    Ok(Ok(output)) => Ok(output),
+                    Ok(Err(error)) => Err(HarvestError::ActivityFailed {
+                        name: format!("child-workflow:{workflow_name}"),
+                        attempt: 1,
+                        source: error.into(),
+                    }),
+                    Err(_) => Err(HarvestError::Cancelled(format!(
+                        "child workflow '{workflow_name}' cancelled: result channel dropped"
+                    ))),
+                }
             }
         }
     }
@@ -967,5 +1033,217 @@ mod tests {
             result.unwrap_err(),
             HarvestError::NonDeterministic(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn context_replays_child_workflow_completion() {
+        let child_id = ExecutionId::new();
+        let output = serde_json::json!({"order_id": "A-1001"});
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: output.clone(),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku": "book"}))
+            .await
+            .expect("child should replay from history");
+
+        assert_eq!(result, output);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_live_child_command_round_trip() {
+        let ctx = Arc::new(WorkflowContext::new_test());
+        let ctx_for_task = Arc::clone(&ctx);
+        let workflow_name = "process_order";
+
+        let join = tokio::spawn(async move {
+            ctx_for_task
+                .spawn_child_workflow_raw(workflow_name, serde_json::json!({"sku":"book"}))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let mut commands = ctx.drain_commands();
+        assert_eq!(commands.len(), 1);
+        let WorkflowCommand::StartChildWorkflow {
+            workflow_name: emitted_name,
+            result_tx,
+            ..
+        } = commands.remove(0)
+        else {
+            panic!("expected StartChildWorkflow command");
+        };
+        assert_eq!(emitted_name, workflow_name);
+        result_tx
+            .send(Ok(serde_json::json!({"ok": true})))
+            .expect("receiver should exist");
+
+        let result = join.await.expect("join should succeed");
+        assert_eq!(
+            result.expect("child call should succeed"),
+            serde_json::json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn context_child_without_terminal_does_not_emit_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"book"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_child_input_mismatch_is_nondeterministic_and_no_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"order_id":"A-1001"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"magazine"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command on input mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_replays_interleaved_child_starts_without_live_commands() {
+        let child_a = ExecutionId::new();
+        let child_b = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"B"}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_b,
+                output: serde_json::json!({"id":"B","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let a = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("A should replay");
+        let b = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"B"}))
+            .await
+            .expect("B should replay");
+
+        assert_eq!(a, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(b, serde_json::json!({"id":"B","ok":true}));
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_replays_child_with_interleaved_activity_without_live_commands() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let child = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("child should replay");
+        let activity = ctx
+            .execute_activity_raw("send_email", serde_json::json!({"id":"A"}), "default")
+            .await
+            .expect("activity should replay");
+
+        assert_eq!(child, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(activity, serde_json::json!({"sent":true}));
+        assert!(ctx.drain_commands().is_empty());
     }
 }
