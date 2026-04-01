@@ -15,16 +15,17 @@ const DEFAULT_MANIFEST_PATH: &str = "target/autumn/wasm/manifest.json";
 ///
 /// Returns an error if the configured manifest path cannot be read or if
 /// the JSON payload is invalid.
-pub fn load_manifest() -> crate::AutumnResult<WasmManifest> {
-    let path =
-        std::env::var("AUTUMN_WASM_MANIFEST").unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.into());
+pub fn load_manifest(env: &dyn crate::config::Env) -> crate::AutumnResult<WasmManifest> {
+    let path = env
+        .var("AUTUMN_WASM_MANIFEST")
+        .unwrap_or_else(|_| DEFAULT_MANIFEST_PATH.into());
     WasmManifest::load(std::path::Path::new(&path))
 }
 
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn assets() -> Markup {
-    let Ok(manifest) = load_manifest() else {
+pub fn assets(env: &dyn crate::config::Env) -> Markup {
+    let Ok(manifest) = load_manifest(env) else {
         return html! {};
     };
 
@@ -56,42 +57,8 @@ pub fn island<P: serde::Serialize>(meta: IslandMeta, props: P, fallback: Markup)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let guard = ENV_LOCK.lock().expect("env lock poisoned");
-            let previous = std::env::var_os(key);
-            // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key,
-                previous,
-                _guard: guard,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                unsafe { std::env::set_var(self.key, previous) };
-            } else {
-                // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
+    use crate::config::MockEnv;
 
     #[test]
     fn manifest_round_trip() {
@@ -119,9 +86,9 @@ mod tests {
             r#"{"entry_js":"/static/client.js","entry_wasm":null,"islands":{}}"#,
         )
         .expect("write manifest");
-        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", temp.path());
+        let env = MockEnv::new().with("AUTUMN_WASM_MANIFEST", temp.path().to_str().unwrap());
 
-        let manifest = load_manifest().expect("load manifest");
+        let manifest = load_manifest(&env).expect("load manifest");
 
         assert_eq!(manifest.entry_js.as_deref(), Some("/static/client.js"));
         assert_eq!(manifest.entry_wasm, None);
@@ -174,9 +141,9 @@ mod tests {
             r#"{"entry_js":"/static/client.js","entry_wasm":"/static/client_bg.wasm","islands":{}}"#,
         )
         .expect("write manifest");
-        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", temp.path());
+        let env = MockEnv::new().with("AUTUMN_WASM_MANIFEST", temp.path().to_str().unwrap());
 
-        let markup = assets().into_string();
+        let markup = assets(&env).into_string();
 
         assert!(markup.contains("src=\"/static/client.js\""));
         assert!(markup.contains("href=\"/static/client_bg.wasm\""));
@@ -189,8 +156,8 @@ mod tests {
             .expect("temp dir")
             .path()
             .join("missing-manifest.json");
-        let _env = EnvGuard::set("AUTUMN_WASM_MANIFEST", &missing);
+        let env = MockEnv::new().with("AUTUMN_WASM_MANIFEST", missing.to_str().unwrap());
 
-        assert_eq!(assets().into_string(), "");
+        assert_eq!(assets(&env).into_string(), "");
     }
 }
