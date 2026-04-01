@@ -1,0 +1,145 @@
+# Autumn Bookmarks Distributed Example
+
+A bookmark manager copied from `bookmarks` as a clean baseline for the future
+distributed retrofit. It keeps the same bookmark domain and user-facing surface
+today, but it is intentionally separated so we can add distributed plumbing
+without contaminating the happy-path example.
+
+This version is the "went viral" sibling: same bookmark domain, but with the
+runtime seams pulled into the open instead of hidden behind happy-path defaults.
+
+## What it demonstrates
+
+| Feature | Where | What it does |
+|---------|-------|--------------|
+| **Profiles** | `autumn.toml` + `autumn-dev.toml` + `autumn-docker.toml` | Local dev and Docker deployment use different runtime wiring without touching framework internals |
+| **`#[model]`** | `models.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
+| **Explicit repository** | `repositories.rs` | Routes reads to replica, writes to primary, and defines `/api/bookmarks` handlers by hand |
+| **Partitioned scheduled task** | `tasks.rs` | `#[scheduled(every = "1h")]` link checker partitions work into fixed shards and uses Postgres advisory locks for ownership |
+| **Explicit migrator** | `src/bin/migrate.rs` | Runs embedded migrations once against the primary before web replicas start |
+| **Compose deployment** | `docker-compose.yml` + `docker/` | Primary + streaming replica + one-shot migrator + 3 web replicas + nginx |
+| **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
+
+## Prerequisites
+
+- Rust (edition 2024) if you want to run the app locally
+- Docker & Docker Compose for the full distributed stack
+
+## Quick start
+
+### Full distributed stack
+
+From the **workspace root** (`autumn/`):
+
+```bash
+# Build and start the full stack
+docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --build
+```
+
+That stack brings up:
+
+- `postgres-primary` on `localhost:5432`
+- `postgres-replica` on `localhost:5433`
+- `bookmarks-migrate` as a one-shot embedded-migration runner
+- `bookmarks-1`, `bookmarks-2`, `bookmarks-3`
+- `load-balancer` on <http://localhost:3000>
+
+The checked-in `static/css/autumn.css` is enough for the container image. You do
+not need to run `autumn setup` just to boot the Docker stack.
+The web replicas wait until the standby has replayed the latest Diesel migration
+version before they start serving traffic.
+
+Useful follow-ups:
+
+```bash
+# Watch the stack settle
+docker compose -f examples/bookmarks-distributed/docker-compose.yml logs -f
+
+# Tear it back down, including Postgres volumes
+docker compose -f examples/bookmarks-distributed/docker-compose.yml down -v
+```
+
+### Local app against the same primary/replica pair
+
+If you want to run the app directly on your machine but still use the same
+database topology:
+
+```bash
+# 1. Start only the databases
+docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d postgres-primary postgres-replica
+
+# 2. Apply migrations to the primary using the explicit migrator
+AUTUMN_PROFILE=dev cargo run -p bookmarks-distributed --bin migrate
+
+# 3. Run the app locally (dev profile auto-detected)
+cargo run -p bookmarks-distributed
+```
+
+The local app uses `autumn.toml` plus `autumn-dev.toml`, so reads go to
+`localhost:5433` and writes go to `localhost:5432`.
+
+If you want to recompile Tailwind locally instead of using the checked-in CSS,
+run `cargo run -p autumn-cli -- setup` first.
+
+## Available routes
+
+### HTML (browser)
+
+| Method | Path         | Description                  |
+|--------|--------------|------------------------------|
+| GET    | `/`          | List all bookmarks           |
+| GET    | `/tag/{tag}` | Filter bookmarks by tag      |
+| GET    | `/new`       | Add bookmark form            |
+
+### JSON API
+
+These routes are explicit handlers in `repositories.rs` and use the distributed
+state seam directly instead of generated CRUD endpoints.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/bookmarks` | List all bookmarks |
+| GET | `/api/bookmarks/{id}` | Fetch one bookmark |
+| POST | `/api/bookmarks` | Create a bookmark |
+| PUT | `/api/bookmarks/{id}` | Update a bookmark |
+| DELETE | `/api/bookmarks/{id}` | Delete a bookmark |
+
+### Framework
+
+| Method | Path                     | Description            |
+|--------|--------------------------|------------------------|
+| GET    | `/actuator/health`       | Health + profile info  |
+| GET    | `/actuator/info`         | Build & runtime info   |
+| GET    | `/actuator/metrics`      | Request and pool stats |
+| GET    | `/health`                | Health check           |
+| GET    | `/static/js/htmx.min.js` | Bundled htmx          |
+| GET    | `/static/css/autumn.css` | Compiled Tailwind CSS  |
+
+## Try the explicit CRUD API
+
+```bash
+# Create
+curl -X POST http://localhost:3000/api/bookmarks \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://rust-lang.org","title":"Rust","tag":"lang"}'
+
+# List
+curl http://localhost:3000/api/bookmarks
+
+# Update
+curl -X PUT http://localhost:3000/api/bookmarks/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Rust Lang","tag":"rust","alive":true}'
+```
+
+## Pain points surfaced on purpose
+
+- The generated repository macro is great for the happy path, but read/write
+  split wanted an explicit repository seam almost immediately.
+- Scheduled tasks are process-local by default, so distributed safety required
+  explicit shard ownership and advisory-lock coordination in application code.
+- Non-dev deployment needed an explicit migration runner because
+  `AUTUMN_PROFILE=docker` correctly does not auto-apply migrations.
+- The distributed state lives beside Autumn's normal app state instead of inside
+  it. That is an escape hatch, but it also shows where a future framework helper
+  might reduce ceremony without hiding the runtime truth.

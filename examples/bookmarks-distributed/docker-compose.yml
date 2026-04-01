@@ -1,0 +1,125 @@
+x-bookmarks-base: &bookmarks-base
+  build:
+    context: ../..
+    dockerfile: examples/bookmarks-distributed/Dockerfile
+  environment:
+    AUTUMN_PROFILE: docker
+    AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-distributed
+  restart: unless-stopped
+
+services:
+  bookmarks-migrate:
+    <<: *bookmarks-base
+    command: ["/app/bookmarks-distributed-migrate"]
+    restart: "no"
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+
+  postgres-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: bookmarks_distributed
+      POSTGRES_USER: autumn
+      POSTGRES_PASSWORD: autumn
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=8
+      - -c
+      - max_replication_slots=8
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./docker/primary/00-configure-replication.sh:/docker-entrypoint-initdb.d/00-configure-replication.sh:ro
+      - pgdata-primary:/var/lib/postgresql/data
+      - ./docker/primary/01-init-replication.sql:/docker-entrypoint-initdb.d/01-init-replication.sql:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U autumn -d bookmarks_distributed && psql -U autumn -d bookmarks_distributed -tAc \"SELECT 1 FROM pg_roles WHERE rolname = 'replicator'\" | grep -q 1",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  postgres-replica:
+    image: postgres:16
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: postgres-primary
+      PRIMARY_PORT: 5432
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator
+      PGPASSWORD: autumn
+    entrypoint:
+      - /bin/bash
+      - /docker/bootstrap-replica.sh
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata-replica:/var/lib/postgresql/data
+      - ./docker/replica/bootstrap-replica.sh:/docker/bootstrap-replica.sh:ro
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U autumn -d bookmarks_distributed && [ \"$(psql -h postgres-primary -U autumn -d bookmarks_distributed -tAc \"SELECT COALESCE(MAX(version), '') FROM __diesel_schema_migrations\")\" = \"$(psql -U autumn -d bookmarks_distributed -tAc \"SELECT COALESCE(MAX(version), '') FROM __diesel_schema_migrations\")\" ] && psql -U autumn -d bookmarks_distributed -tAc \"SELECT pg_is_in_recovery()\" | grep -q t",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  bookmarks-1:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+      postgres-primary:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+
+  bookmarks-2:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+      postgres-primary:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+
+  bookmarks-3:
+    <<: *bookmarks-base
+    depends_on:
+      bookmarks-migrate:
+        condition: service_completed_successfully
+      postgres-primary:
+        condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
+
+  load-balancer:
+    image: nginx:1.27-alpine
+    depends_on:
+      - bookmarks-1
+      - bookmarks-2
+      - bookmarks-3
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata-primary:
+  pgdata-replica:

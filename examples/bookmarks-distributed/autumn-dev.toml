@@ -1,0 +1,13 @@
+# Dev profile overrides — merged on top of autumn.toml when
+# running in debug mode (cargo run) or AUTUMN_PROFILE=dev.
+#
+# Smart defaults already set: log.level=debug, log.format=Pretty,
+# health.detailed=true, actuator.sensitive=true.
+# We only need the database URL here.
+
+[database]
+url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed"
+
+[distributed.database]
+primary_pool_size = 7
+replica_pool_size = 3
