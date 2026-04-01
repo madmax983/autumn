@@ -21,6 +21,11 @@ impl Composition {
     ///
     /// This is useful when two islands need to coordinate state without a
     /// parent/child relationship.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `key` already exists in the registry with a different
+    /// signal type than `T`.
     #[must_use]
     pub fn signal<T: Clone + 'static>(
         &self,
@@ -28,19 +33,23 @@ impl Composition {
         init: impl FnOnce() -> T,
     ) -> Signal<T> {
         let key = key.into();
-        if let Some(existing) = self
-            .shared
-            .borrow()
-            .get(&key)
-            .and_then(|boxed| (**boxed).downcast_ref::<Signal<T>>())
-        {
-            return existing.clone();
+        if let Some(existing) = self.shared.borrow().get(&key) {
+            if let Some(typed) = (**existing).downcast_ref::<Signal<T>>() {
+                return typed.clone();
+            }
+            panic!("composition signal type mismatch for key `{key}`");
         }
 
         let signal = Signal::new(init());
-        self.shared
-            .borrow_mut()
-            .insert(key, Box::new(signal.clone()) as Box<dyn Any>);
+        let mut shared = self.shared.borrow_mut();
+        if let Some(existing) = shared.get(&key) {
+            if let Some(typed) = (**existing).downcast_ref::<Signal<T>>() {
+                return typed.clone();
+            }
+            panic!("composition signal type mismatch for key `{key}`");
+        }
+
+        shared.insert(key, Box::new(signal.clone()) as Box<dyn Any>);
         signal
     }
 
@@ -58,6 +67,9 @@ impl Composition {
 #[cfg(test)]
 mod tests {
     use super::Composition;
+    use crate::Signal;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn named_signal_returns_same_instance_for_same_type() {
@@ -77,5 +89,32 @@ mod tests {
         let _count = composition.signal("shared", || 1_i32);
 
         assert!(composition.get::<String>("shared").is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "composition signal type mismatch")]
+    fn signal_panics_when_existing_key_has_different_type() {
+        let composition = Composition::new();
+        let _count = composition.signal("shared", || 1_i32);
+        let _name = composition.signal("shared", || String::from("name"));
+    }
+
+    #[test]
+    fn reentrant_init_reuses_existing_signal_for_key() {
+        let composition = Composition::new();
+        let inner_seen: Rc<RefCell<Option<Signal<i32>>>> = Rc::new(RefCell::new(None));
+        let inner_seen_clone = Rc::clone(&inner_seen);
+        let composition_clone = composition.clone();
+
+        let outer = composition.signal("shared", || {
+            let inner = composition_clone.signal("shared", || 1_i32);
+            *inner_seen_clone.borrow_mut() = Some(inner);
+            999_i32
+        });
+
+        let inner = inner_seen.borrow().as_ref().expect("inner signal").clone();
+        assert_eq!(outer.get(), 1);
+        inner.set(7);
+        assert_eq!(outer.get(), 7);
     }
 }

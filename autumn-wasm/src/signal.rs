@@ -1,10 +1,9 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 type SubscriberId = usize;
-type SubscriberCallback<T> = Box<dyn Fn(&T)>;
-type Subscribers<T> = HashMap<SubscriberId, SubscriberCallback<T>>;
+type SubscriberCallback<T> = Rc<dyn Fn(&T)>;
+type Subscribers<T> = Vec<(SubscriberId, SubscriberCallback<T>)>;
 
 /// Reactive local state container for browser islands.
 ///
@@ -20,6 +19,19 @@ struct SignalInner<T> {
     value: RefCell<T>,
     next_id: Cell<usize>,
     subscribers: RefCell<Subscribers<T>>,
+    version: Cell<u64>,
+    notifying: Cell<bool>,
+    needs_flush: Cell<bool>,
+}
+
+struct NotifyingGuard<'a> {
+    notifying: &'a Cell<bool>,
+}
+
+impl Drop for NotifyingGuard<'_> {
+    fn drop(&mut self) {
+        self.notifying.set(false);
+    }
 }
 
 impl<T> Signal<T> {
@@ -30,7 +42,10 @@ impl<T> Signal<T> {
             inner: Rc::new(SignalInner {
                 value: RefCell::new(initial),
                 next_id: Cell::new(0),
-                subscribers: RefCell::new(HashMap::new()),
+                subscribers: RefCell::new(Vec::new()),
+                version: Cell::new(0),
+                notifying: Cell::new(false),
+                needs_flush: Cell::new(false),
             }),
         }
     }
@@ -45,24 +60,57 @@ impl<T> Signal<T> {
         self.inner
             .subscribers
             .borrow_mut()
-            .insert(id, Box::new(callback));
+            .push((id, Rc::new(callback)));
 
         Subscription {
             inner: Rc::downgrade(&self.inner),
             id,
         }
     }
-
-    fn notify_subscribers(&self) {
-        let value = self.inner.value.borrow();
-        let subscribers = self.inner.subscribers.borrow();
-        for callback in subscribers.values() {
-            callback(&value);
-        }
-    }
 }
 
 impl<T: Clone> Signal<T> {
+    fn mark_updated(&self) {
+        let next = self.inner.version.get().wrapping_add(1);
+        self.inner.version.set(next);
+    }
+
+    fn notify_subscribers(&self) {
+        if self.inner.notifying.get() {
+            self.inner.needs_flush.set(true);
+            return;
+        }
+
+        self.inner.notifying.set(true);
+        let _guard = NotifyingGuard {
+            notifying: &self.inner.notifying,
+        };
+        loop {
+            self.inner.needs_flush.set(false);
+            let cycle_version = self.inner.version.get();
+            let callbacks = self
+                .inner
+                .subscribers
+                .borrow()
+                .iter()
+                .map(|(_, callback)| Rc::clone(callback))
+                .collect::<Vec<_>>();
+            let value = self.get();
+
+            for callback in callbacks {
+                if self.inner.version.get() != cycle_version {
+                    break;
+                }
+                callback(&value);
+            }
+
+            let has_newer_value = self.inner.version.get() != cycle_version;
+            if !has_newer_value && !self.inner.needs_flush.get() {
+                break;
+            }
+        }
+    }
+
     /// Read the current value.
     #[must_use]
     pub fn get(&self) -> T {
@@ -72,6 +120,7 @@ impl<T: Clone> Signal<T> {
     /// Set a new value and notify subscribers.
     pub fn set(&self, next: T) {
         *self.inner.value.borrow_mut() = next;
+        self.mark_updated();
         self.notify_subscribers();
     }
 
@@ -81,6 +130,7 @@ impl<T: Clone> Signal<T> {
             let mut value = self.inner.value.borrow_mut();
             updater(&mut value);
         }
+        self.mark_updated();
         self.notify_subscribers();
     }
 }
@@ -96,7 +146,14 @@ pub struct Subscription<T> {
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
-            inner.subscribers.borrow_mut().remove(&self.id);
+            let removed = {
+                let mut subscribers = inner.subscribers.borrow_mut();
+                subscribers
+                    .iter()
+                    .position(|(id, _)| *id == self.id)
+                    .map(|index| subscribers.remove(index))
+            };
+            drop(removed);
         }
     }
 }
@@ -105,6 +162,7 @@ impl<T> Drop for Subscription<T> {
 mod tests {
     use super::Signal;
     use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
     #[test]
@@ -136,5 +194,86 @@ mod tests {
         signal.set(12);
 
         assert_eq!(*observed.borrow(), vec![11]);
+    }
+
+    #[test]
+    fn callback_can_drop_another_subscription_without_panicking() {
+        let signal = Signal::new(0_i32);
+        let dropped = Rc::new(RefCell::new(false));
+        let drop_slot = Rc::new(RefCell::new(None));
+
+        let dropped_clone = Rc::clone(&dropped);
+        let tracked = signal.subscribe(move |_| {
+            *dropped_clone.borrow_mut() = true;
+        });
+        *drop_slot.borrow_mut() = Some(tracked);
+
+        let drop_slot_clone = Rc::clone(&drop_slot);
+        let _dropper = signal.subscribe(move |_| {
+            drop_slot_clone.borrow_mut().take();
+        });
+
+        signal.set(1);
+        assert!(*dropped.borrow());
+
+        *dropped.borrow_mut() = false;
+        signal.set(2);
+        assert!(!*dropped.borrow());
+    }
+
+    #[test]
+    fn reentrant_update_does_not_deliver_stale_value_to_later_subscribers() {
+        let signal = Signal::new(0_i32);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let signal_for_reentrant = signal.clone();
+        let _first = signal.subscribe(move |value| {
+            if *value == 1 {
+                signal_for_reentrant.set(2);
+            }
+        });
+
+        let seen_clone = Rc::clone(&seen);
+        let _second = signal.subscribe(move |value| {
+            seen_clone.borrow_mut().push(*value);
+        });
+
+        signal.set(1);
+
+        assert_eq!(*seen.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn panic_in_callback_does_not_brick_future_notifications() {
+        let signal = Signal::new(0_i32);
+        let panicker = signal.subscribe(|_| panic!("boom"));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            signal.set(1);
+        }));
+        assert!(result.is_err());
+        drop(panicker);
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_clone = Rc::clone(&seen);
+        let _healthy = signal.subscribe(move |value| seen_clone.borrow_mut().push(*value));
+
+        signal.set(2);
+        assert_eq!(*seen.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn dropping_subscription_does_not_panic_when_callback_owns_other_subscription() {
+        let signal = Signal::new(0_i32);
+        let nested = signal.subscribe(|_| {});
+        let outer = signal.subscribe(move |_| {
+            let _keep_nested_alive = &nested;
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            drop(outer);
+        }));
+
+        assert!(result.is_ok());
     }
 }
