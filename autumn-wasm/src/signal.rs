@@ -146,10 +146,14 @@ pub struct Subscription<T> {
 impl<T> Drop for Subscription<T> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.upgrade() {
-            inner
-                .subscribers
-                .borrow_mut()
-                .retain(|(id, _)| *id != self.id);
+            let removed = {
+                let mut subscribers = inner.subscribers.borrow_mut();
+                subscribers
+                    .iter()
+                    .position(|(id, _)| *id == self.id)
+                    .map(|index| subscribers.remove(index))
+            };
+            drop(removed);
         }
     }
 }
@@ -256,5 +260,20 @@ mod tests {
 
         signal.set(2);
         assert_eq!(*seen.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn dropping_subscription_does_not_panic_when_callback_owns_other_subscription() {
+        let signal = Signal::new(0_i32);
+        let nested = signal.subscribe(|_| {});
+        let outer = signal.subscribe(move |_| {
+            let _keep_nested_alive = &nested;
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            drop(outer);
+        }));
+
+        assert!(result.is_ok());
     }
 }
