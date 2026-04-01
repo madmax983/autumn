@@ -53,7 +53,7 @@ pub struct Channels {
 
 struct ChannelsInner {
     capacity: usize,
-    registry: Mutex<HashMap<String, broadcast::Sender<ChannelMessage>>>,
+    registry: Mutex<HashMap<String, Arc<broadcast::Sender<ChannelMessage>>>>,
 }
 
 /// A message sent through a broadcast channel.
@@ -101,7 +101,7 @@ impl std::fmt::Display for ChannelMessage {
 /// Sending to a channel with no active subscribers silently succeeds.
 #[derive(Clone)]
 pub struct Sender {
-    inner: broadcast::Sender<ChannelMessage>,
+    inner: Arc<broadcast::Sender<ChannelMessage>>,
 }
 
 impl Sender {
@@ -196,8 +196,10 @@ impl Channels {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         let tx = registry
             .entry(name.to_owned())
-            .or_insert_with(|| broadcast::channel(self.inner.capacity).0);
-        let sender = Sender { inner: tx.clone() };
+            .or_insert_with(|| Arc::new(broadcast::channel(self.inner.capacity).0));
+        let sender = Sender {
+            inner: Arc::clone(tx),
+        };
         drop(registry);
         sender
     }
@@ -226,7 +228,7 @@ impl Channels {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         let tx = registry
             .entry(name.to_owned())
-            .or_insert_with(|| broadcast::channel(self.inner.capacity).0);
+            .or_insert_with(|| Arc::new(broadcast::channel(self.inner.capacity).0));
         let subscriber = Subscriber {
             inner: tx.subscribe(),
         };
@@ -255,7 +257,7 @@ impl Channels {
     /// Panics if the internal mutex is poisoned.
     pub fn gc(&self) {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        registry.retain(|_, tx| tx.receiver_count() > 0);
+        registry.retain(|_, tx| tx.receiver_count() > 0 || Arc::strong_count(tx) > 1);
     }
 }
 
@@ -349,8 +351,8 @@ mod tests {
         }
         assert_eq!(channels.channel_count(), 2);
         channels.gc();
-        // Both channels have 0 receivers, but gc only checks receiver_count
-        // "alive" has no receivers either, so both get cleaned
-        assert_eq!(channels.channel_count(), 0);
+        // "alive" has an active sender (_tx), so it is kept (count = 1).
+        // "dead" has 0 receivers and 0 active senders (dropped), so it gets cleaned.
+        assert_eq!(channels.channel_count(), 1);
     }
 }
