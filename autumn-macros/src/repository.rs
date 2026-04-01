@@ -702,8 +702,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 _parts: &mut ::autumn_web::reexports::http::request::Parts,
                 state: &::autumn_web::AppState,
             ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool
-                    .as_ref()
+                let pool = state.pool()
                     .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
                     .clone();
                 #extractor_init

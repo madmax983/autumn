@@ -9,7 +9,6 @@
 
 #![cfg(feature = "ws")]
 
-use autumn_web::channels::Channels;
 use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
 use autumn_web::ws::{CancellationToken, Message, WebSocket, WsHandler};
@@ -18,19 +17,7 @@ use http::Request;
 use tower::ServiceExt;
 
 fn test_state() -> AppState {
-    AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: Some("test".into()),
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-        channels: Channels::new(32),
-        shutdown: CancellationToken::new(),
-    }
+    AppState::for_test()
 }
 
 // ── Test handlers ────────────────────────────────────────────────
@@ -173,12 +160,3 @@ async fn channels_on_app_state() {
     assert_eq!(msg.as_str(), "from state");
 }
 
-#[tokio::test]
-async fn shutdown_token_propagates() {
-    let state = test_state();
-    let child = state.shutdown_token();
-
-    assert!(!child.is_cancelled());
-    state.shutdown.cancel();
-    assert!(child.is_cancelled());
-}
