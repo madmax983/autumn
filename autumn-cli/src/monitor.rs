@@ -725,58 +725,57 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
 
     // DB pool info
     if let Some(db) = &state.metrics.database {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Database Pool",
-            Style::default()
-                .fg(Color::Rgb(204, 120, 50))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )));
-        lines.push(info_line(
-            "Pool Size",
-            &db.pool_size.to_string(),
-            Color::White,
-        ));
-        lines.push(info_line(
-            "Active",
-            &db.active_connections.to_string(),
-            Color::Yellow,
-        ));
-        lines.push(info_line(
-            "Idle",
-            &db.idle_connections.to_string(),
-            Color::Green,
-        ));
+        push_db_pool_lines(
+            &mut lines,
+            None,
+            db.pool_size,
+            db.active_connections,
+            db.idle_connections,
+        );
     } else if let Some(checks) = &state.health.checks {
         if let Some(db) = &checks.database {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "Database Pool",
-                Style::default()
-                    .fg(Color::Rgb(204, 120, 50))
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )));
-            lines.push(info_line("DB Status", &db.status, status_color(&db.status)));
-            lines.push(info_line(
-                "Pool Size",
-                &db.pool_size.to_string(),
-                Color::White,
-            ));
-            lines.push(info_line(
-                "Active",
-                &db.active_connections.to_string(),
-                Color::Yellow,
-            ));
-            lines.push(info_line(
-                "Idle",
-                &db.idle_connections.to_string(),
-                Color::Green,
-            ));
+            push_db_pool_lines(
+                &mut lines,
+                Some(&db.status),
+                db.pool_size,
+                db.active_connections,
+                db.idle_connections,
+            );
         }
     }
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn push_db_pool_lines(
+    lines: &mut Vec<Line<'static>>,
+    status: Option<&str>,
+    pool_size: u64,
+    active_connections: u64,
+    idle_connections: u64,
+) {
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Database Pool",
+        Style::default()
+            .fg(Color::Rgb(204, 120, 50))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    if let Some(status) = status {
+        lines.push(info_line("DB Status", status, status_color(status)));
+    }
+    lines.push(info_line("Pool Size", &pool_size.to_string(), Color::White));
+    lines.push(info_line(
+        "Active",
+        &active_connections.to_string(),
+        Color::Yellow,
+    ));
+    lines.push(info_line(
+        "Idle",
+        &idle_connections.to_string(),
+        Color::Green,
+    ));
 }
 
 fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
