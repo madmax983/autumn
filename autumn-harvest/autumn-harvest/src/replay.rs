@@ -237,7 +237,7 @@ impl HistoryMatcher {
             };
         }
 
-        let scan_cursor = self.cursor + 1;
+        let mut scan_cursor = self.cursor + 1;
 
         while scan_cursor < self.events.len() {
             match &self.events[scan_cursor] {
@@ -260,13 +260,7 @@ impl HistoryMatcher {
                         attempt: 1,
                     };
                 }
-                _ => {
-                    self.cursor = start_cursor;
-                    return HistoryMatch::Diverged {
-                        expected: format!("ChildWorkflowTerminal({workflow_name})"),
-                        actual: self.events[scan_cursor].type_name().to_string(),
-                    };
-                }
+                _ => scan_cursor += 1,
             }
         }
 
@@ -625,6 +619,38 @@ mod tests {
             0,
             "cursor must not consume started event"
         );
+    }
+
+    #[test]
+    fn matcher_child_workflow_scans_past_interleaved_events() {
+        let child_a = crate::types::ExecutionId::new();
+        let child_b = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 1}),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_b,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 2}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 3);
     }
 
     #[test]
