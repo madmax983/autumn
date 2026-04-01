@@ -10,6 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::event::WorkflowEvent;
 
@@ -38,19 +39,28 @@ pub enum HistoryMatch {
 pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
+    consumed_child_terminal_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
     /// Create a new matcher from a list of recorded events.
     #[must_use]
-    pub const fn new(events: Vec<WorkflowEvent>) -> Self {
-        Self { events, cursor: 0 }
+    pub fn new(events: Vec<WorkflowEvent>) -> Self {
+        Self {
+            events,
+            cursor: 0,
+            consumed_child_terminal_events: HashSet::new(),
+        }
     }
 
     /// Returns `true` if the cursor is still within the recorded history.
     #[must_use]
     pub fn is_replaying(&self) -> bool {
-        self.cursor < self.events.len()
+        let mut cursor = self.cursor;
+        while self.consumed_child_terminal_events.contains(&cursor) {
+            cursor += 1;
+        }
+        cursor < self.events.len()
     }
 
     /// Current cursor position in the event list.
@@ -65,6 +75,15 @@ impl HistoryMatcher {
     /// don't correspond to a workflow command.
     pub fn advance(&mut self) {
         if self.cursor < self.events.len() {
+            self.cursor += 1;
+            self.advance_to_next_unconsumed_event();
+        }
+    }
+
+    fn advance_to_next_unconsumed_event(&mut self) {
+        while self.consumed_child_terminal_events.contains(&self.cursor)
+            && self.cursor < self.events.len()
+        {
             self.cursor += 1;
         }
     }
@@ -81,6 +100,7 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -122,6 +142,7 @@ impl HistoryMatcher {
                         output: output.clone(),
                     };
                     self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
                     return result;
                 }
                 WorkflowEvent::ActivityFailed {
@@ -134,6 +155,7 @@ impl HistoryMatcher {
                         attempt: *attempt,
                     };
                     self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
                     return result;
                 }
                 // Skip heartbeats, started events, and other intermediate events
@@ -163,6 +185,7 @@ impl HistoryMatcher {
     /// Expects `TimerStarted { timer_id }` at cursor, then scans for
     /// `TimerFired` with the same `timer_id`.
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -193,6 +216,7 @@ impl HistoryMatcher {
             if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[self.cursor] {
                 if id.as_str() == timer_id {
                     self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
                     return HistoryMatch::Matched {
                         output: Value::Null,
                     };
@@ -210,6 +234,7 @@ impl HistoryMatcher {
     /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
     /// `child_id`.
     pub fn match_child_workflow(&mut self, workflow_name: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -245,32 +270,21 @@ impl HistoryMatcher {
                     child_id: id,
                     output,
                 } if *id == child_id => {
-                    let next_child_start = self.events[(start_cursor + 1)..scan_cursor]
-                        .iter()
-                        .position(|event| {
-                            matches!(event, WorkflowEvent::ChildWorkflowStarted { .. })
-                        })
-                        .map(|offset| start_cursor + 1 + offset);
-                    self.cursor = next_child_start.unwrap_or(scan_cursor + 1);
-                    return HistoryMatch::Matched {
-                        output: output.clone(),
-                    };
+                    let output = output.clone();
+                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.cursor = start_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
                 }
                 WorkflowEvent::ChildWorkflowFailed {
                     child_id: id,
                     error,
                 } if *id == child_id => {
-                    let next_child_start = self.events[(start_cursor + 1)..scan_cursor]
-                        .iter()
-                        .position(|event| {
-                            matches!(event, WorkflowEvent::ChildWorkflowStarted { .. })
-                        })
-                        .map(|offset| start_cursor + 1 + offset);
-                    self.cursor = next_child_start.unwrap_or(scan_cursor + 1);
-                    return HistoryMatch::Failed {
-                        error: error.clone(),
-                        attempt: 1,
-                    };
+                    let error = error.clone();
+                    self.consumed_child_terminal_events.insert(scan_cursor);
+                    self.cursor = start_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Failed { error, attempt: 1 };
                 }
                 _ => scan_cursor += 1,
             }
@@ -294,6 +308,7 @@ impl HistoryMatcher {
     /// - `max_version` if past end of history (new code path)
     #[must_use]
     pub fn match_version(&mut self, change_id: &str, min_version: u32, max_version: u32) -> u32 {
+        self.advance_to_next_unconsumed_event();
         let marker_name = format!("version:{change_id}");
 
         if !self.is_replaying() {
@@ -307,6 +322,7 @@ impl HistoryMatcher {
                     .and_then(|v| u32::try_from(v).ok())
                     .unwrap_or(min_version);
                 self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
                 version
             }
             // No marker at current position — old workflow that didn't have
@@ -662,7 +678,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
             }
         );
-        assert_eq!(matcher.position(), 3);
+        assert_eq!(matcher.position(), 1);
     }
 
     #[test]
@@ -708,6 +724,49 @@ mod tests {
                 output: serde_json::json!({"id": "B", "ok": true}),
             }
         );
+        assert_eq!(matcher.position(), 4);
+    }
+
+    #[test]
+    fn matcher_child_workflow_keeps_interleaved_activity_replayable() {
+        let child_a = crate::types::ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: child_a,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": "A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent": true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: child_a,
+                output: serde_json::json!({"id": "A", "ok": true}),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let child = matcher.match_child_workflow("process_order");
+        assert!(matches!(child, HistoryMatch::Matched { .. }));
+        // Cursor should remain at the interleaved activity schedule.
+        assert_eq!(matcher.position(), 1);
+
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"sent": true}),
+            }
+        );
+        // The consumed child terminal event is skipped automatically.
         assert_eq!(matcher.position(), 4);
     }
 

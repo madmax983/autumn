@@ -1170,4 +1170,49 @@ mod tests {
         assert_eq!(b, serde_json::json!({"id":"B","ok":true}));
         assert!(ctx.drain_commands().is_empty());
     }
+
+    #[tokio::test]
+    async fn context_replays_child_with_interleaved_activity_without_live_commands() {
+        let child_id = ExecutionId::new();
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id":"A"}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: serde_json::json!({"id":"A"}),
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: serde_json::json!({"sent":true}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!({"id":"A","ok":true}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let child = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"id":"A"}))
+            .await
+            .expect("child should replay");
+        let activity = ctx
+            .execute_activity_raw("send_email", serde_json::json!({"id":"A"}), "default")
+            .await
+            .expect("activity should replay");
+
+        assert_eq!(child, serde_json::json!({"id":"A","ok":true}));
+        assert_eq!(activity, serde_json::json!({"sent":true}));
+        assert!(ctx.drain_commands().is_empty());
+    }
 }
