@@ -1413,7 +1413,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn app_builder_routes_adds_routes() {
         let builder = app();
@@ -1422,7 +1421,10 @@ mod tests {
         let builder = builder.routes(vec![test_get_route("/1", "route1")]);
         assert_eq!(builder.routes.len(), 1);
 
-        let builder = builder.routes(vec![test_get_route("/2", "route2"), test_get_route("/3", "route3")]);
+        let builder = builder.routes(vec![
+            test_get_route("/2", "route2"),
+            test_get_route("/3", "route3"),
+        ]);
         assert_eq!(builder.routes.len(), 3);
 
         assert_eq!(builder.routes[0].path, "/1");
