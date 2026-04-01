@@ -24,6 +24,16 @@ struct SignalInner<T> {
     needs_flush: Cell<bool>,
 }
 
+struct NotifyingGuard<'a> {
+    notifying: &'a Cell<bool>,
+}
+
+impl Drop for NotifyingGuard<'_> {
+    fn drop(&mut self) {
+        self.notifying.set(false);
+    }
+}
+
 impl<T> Signal<T> {
     /// Create a new signal with the initial value.
     #[must_use]
@@ -72,6 +82,9 @@ impl<T: Clone> Signal<T> {
         }
 
         self.inner.notifying.set(true);
+        let _guard = NotifyingGuard {
+            notifying: &self.inner.notifying,
+        };
         loop {
             self.inner.needs_flush.set(false);
             let cycle_version = self.inner.version.get();
@@ -96,7 +109,6 @@ impl<T: Clone> Signal<T> {
                 break;
             }
         }
-        self.inner.notifying.set(false);
     }
 
     /// Read the current value.
@@ -146,6 +158,7 @@ impl<T> Drop for Subscription<T> {
 mod tests {
     use super::Signal;
     use std::cell::RefCell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
     #[test]
@@ -223,6 +236,25 @@ mod tests {
 
         signal.set(1);
 
+        assert_eq!(*seen.borrow(), vec![2]);
+    }
+
+    #[test]
+    fn panic_in_callback_does_not_brick_future_notifications() {
+        let signal = Signal::new(0_i32);
+        let panicker = signal.subscribe(|_| panic!("boom"));
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            signal.set(1);
+        }));
+        assert!(result.is_err());
+        drop(panicker);
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_clone = Rc::clone(&seen);
+        let _healthy = signal.subscribe(move |value| seen_clone.borrow_mut().push(*value));
+
+        signal.set(2);
         assert_eq!(*seen.borrow(), vec![2]);
     }
 }
