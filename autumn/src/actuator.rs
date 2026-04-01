@@ -1095,6 +1095,99 @@ mod tests {
         let registry = TaskRegistry::new();
         assert!(registry.snapshot().is_empty());
     }
+    #[test]
+    fn log_levels_rejects_new_key_at_capacity() {
+        let levels = LogLevels::new("info");
+        // Fill to capacity
+        for i in 0..1000 {
+            let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
+        }
+
+        // Try to add a new key, should be rejected
+        let result = levels.set_logger_level("logger_1000", "warn");
+        assert_eq!(result, None);
+        assert_eq!(levels.logger_overrides().len(), 1000);
+        assert_eq!(levels.logger_overrides().get("logger_1000"), None);
+    }
+
+    #[test]
+    fn log_levels_accepts_existing_key_at_capacity() {
+        let levels = LogLevels::new("info");
+        // Fill to capacity
+        for i in 0..1000 {
+            let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
+        }
+
+        // Try to update an existing key, should succeed
+        let prev = levels.set_logger_level("logger_999", "warn");
+        assert_eq!(prev.as_deref(), Some("debug"));
+        assert_eq!(levels.logger_overrides().len(), 1000);
+        assert_eq!(
+            levels
+                .logger_overrides()
+                .get("logger_999")
+                .map(String::as_str),
+            Some("warn")
+        );
+    }
+
+    #[test]
+    fn task_registry_records_multiple_successes_and_failures() {
+        let registry = TaskRegistry::new();
+        registry.register("my_task", "cron * * * * *");
+
+        // 1st success
+        registry.record_start("my_task");
+        registry.record_success("my_task", 100);
+
+        // 2nd success
+        registry.record_start("my_task");
+        registry.record_success("my_task", 110);
+
+        let snapshot = registry.snapshot();
+        let task = &snapshot["my_task"];
+        assert_eq!(task.total_runs, 2);
+        assert_eq!(task.total_failures, 0);
+
+        // 1st failure
+        registry.record_start("my_task");
+        registry.record_failure("my_task", 50, "failed");
+
+        let snapshot2 = registry.snapshot();
+        let task2 = &snapshot2["my_task"];
+        assert_eq!(task2.total_runs, 3);
+        assert_eq!(task2.total_failures, 1);
+    }
+
+    #[test]
+    fn configprops_tracks_custom_profile() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(
+            &mut props,
+            "log.level",
+            "debug",
+            "info",
+            "custom_profile",
+        );
+        assert_eq!(props["log.level"].source, "autumn.toml");
+    }
+
+    #[test]
+    fn configprops_tracks_dev_prod_profiles() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "log.level", "debug", "info", "dev");
+        assert_eq!(props["log.level"].source, "profile_default:dev");
+
+        ConfigProperties::track_property(&mut props, "log.format", "json", "text", "prod");
+        assert_eq!(props["log.format"].source, "profile_default:prod");
+    }
+
+    #[test]
+    fn configprops_returns_default_when_values_match() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "log.level", "info", "info", "dev");
+        assert_eq!(props["log.level"].source, "default");
+    }
 }
 
 #[cfg(test)]
