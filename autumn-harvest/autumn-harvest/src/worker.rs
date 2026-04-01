@@ -161,6 +161,7 @@ fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
+        WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",

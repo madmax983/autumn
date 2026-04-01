@@ -204,6 +204,68 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Match a child workflow command against history.
+    ///
+    /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
+    /// a terminal `ChildWorkflowCompleted` or `ChildWorkflowFailed` with the same
+    /// `child_id`.
+    pub fn match_child_workflow(&mut self, workflow_name: &str) -> HistoryMatch {
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let started_event = &self.events[self.cursor];
+        let (child_id, recorded_name) = match started_event {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name,
+                ..
+            } => (*child_id, workflow_name.as_str()),
+            other => {
+                return HistoryMatch::Diverged {
+                    expected: format!("ChildWorkflowStarted({workflow_name})"),
+                    actual: other.type_name().to_string(),
+                };
+            }
+        };
+
+        if recorded_name != workflow_name {
+            return HistoryMatch::Diverged {
+                expected: format!("ChildWorkflowStarted({workflow_name})"),
+                actual: format!("ChildWorkflowStarted({recorded_name})"),
+            };
+        }
+
+        self.cursor += 1;
+
+        while self.cursor < self.events.len() {
+            match &self.events[self.cursor] {
+                WorkflowEvent::ChildWorkflowCompleted {
+                    child_id: id,
+                    output,
+                } if *id == child_id => {
+                    self.cursor += 1;
+                    return HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                }
+                WorkflowEvent::ChildWorkflowFailed {
+                    child_id: id,
+                    error,
+                } if *id == child_id => {
+                    self.cursor += 1;
+                    return HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: 1,
+                    };
+                }
+                _ => break,
+            }
+        }
+
+        HistoryMatch::NoMatch
+    }
+
     /// Match a version gate against history.
     ///
     /// Looks for a `MarkerRecorded { name: "version:{change_id}" }` at
@@ -485,6 +547,54 @@ mod tests {
         let mut matcher = HistoryMatcher::new(vec![]);
         let version = matcher.match_version("billing_v2", 1, 3);
         assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn matcher_replays_child_workflow_completion() {
+        let child_id = crate::types::ExecutionId::new();
+        let output = serde_json::json!({"result": "ok"});
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"id": 42}),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: output.clone(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order");
+        assert_eq!(result, HistoryMatch::Matched { output });
+        assert_eq!(matcher.position(), 2);
+    }
+
+    #[test]
+    fn matcher_replays_child_workflow_failure() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id,
+                error: "child failed".into(),
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order");
+        assert_eq!(
+            result,
+            HistoryMatch::Failed {
+                error: "child failed".into(),
+                attempt: 1,
+            }
+        );
     }
 
     #[test]
