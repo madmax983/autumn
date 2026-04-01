@@ -28,6 +28,7 @@ use crate::executor::{WorkflowOutcome, run_workflow};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{TaskQueueItem, WorkflowExecution};
 use crate::queue::{self, TaskType};
+use crate::signal;
 use crate::schema::harvest_workflow_executions;
 use crate::store;
 use crate::types::ExecutionId;
@@ -163,6 +164,7 @@ fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
+        WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
     }
@@ -379,6 +381,22 @@ async fn process_workflow_task(
         }
     };
 
+    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+    if !pending_signals.is_empty() {
+        let signal_events = pending_signals
+            .iter()
+            .map(|s| WorkflowEvent::SignalReceived {
+                signal_name: s.signal_name.clone(),
+                payload: s.payload.clone(),
+            })
+            .collect::<Vec<_>>();
+        let signal_ids = pending_signals.iter().map(|s| s.id).collect::<Vec<_>>();
+        store::append_events(conn, exec_id, &signal_events, history.next_event_id).await?;
+        signal::mark_signals_consumed(conn, &signal_ids).await?;
+    }
+
+    let history = store::load_history(conn, exec_id).await?;
+
     let workflow = match registry.workflows.get(&execution.workflow_name) {
         Some(workflow) => workflow,
         None => {
@@ -410,8 +428,16 @@ async fn process_workflow_task(
             persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
         }
         WorkflowOutcome::Suspended { commands } => {
-            let error = suspended_workflow_error(&commands);
-            persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
+            if commands
+                .iter()
+                .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
+            {
+                queue::requeue_for_retry(conn, task.id, chrono::Duration::seconds(1)).await
+            } else {
+                let error = suspended_workflow_error(&commands);
+                persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error)
+                    .await
+            }
         }
     }
 }

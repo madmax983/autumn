@@ -280,6 +280,39 @@ impl HistoryMatcher {
         HistoryMatch::NoMatch
     }
 
+    /// Match a signal wait command against history.
+    ///
+    /// Expects `SignalReceived { signal_name }` at the current cursor.
+    pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        self.advance_to_next_unconsumed_event();
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        match &self.events[self.cursor] {
+            WorkflowEvent::SignalReceived {
+                signal_name: recorded_name,
+                payload,
+            } if recorded_name == signal_name => {
+                let output = payload.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                HistoryMatch::Matched { output }
+            }
+            WorkflowEvent::SignalReceived {
+                signal_name: recorded_name,
+                ..
+            } => HistoryMatch::Diverged {
+                expected: format!("SignalReceived({signal_name})"),
+                actual: format!("SignalReceived({recorded_name})"),
+            },
+            other => HistoryMatch::Diverged {
+                expected: format!("SignalReceived({signal_name})"),
+                actual: other.type_name().to_string(),
+            },
+        }
+    }
+
     /// Match a child workflow command against history.
     ///
     /// Expects `ChildWorkflowStarted { workflow_name }` at cursor, then scans for
@@ -1100,5 +1133,21 @@ mod tests {
         assert_eq!(r2, HistoryMatch::Matched { output: output2 });
 
         assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_replays_signal_payload() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal("approved");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
     }
 }

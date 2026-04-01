@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
+use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
@@ -54,6 +55,11 @@ pub enum WorkflowCommand {
     },
     /// Record an opaque marker (used by version gates, side-effect-free notes).
     RecordMarker { name: String, details: Value },
+    /// Suspend until a named signal is delivered.
+    WaitForSignal {
+        signal_name: String,
+        result_tx: oneshot::Sender<Value>,
+    },
     /// The workflow function returned `Ok(output)`.
     Complete { output: Value },
     /// The workflow function returned `Err(error)`.
@@ -98,6 +104,10 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("name", name)
                 .field("details", details)
                 .finish(),
+            Self::WaitForSignal { signal_name, .. } => f
+                .debug_struct("WaitForSignal")
+                .field("signal_name", signal_name)
+                .finish_non_exhaustive(),
             Self::Complete { output } => {
                 f.debug_struct("Complete").field("output", output).finish()
             }
@@ -134,6 +144,8 @@ pub struct WorkflowContext {
     activity_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    /// In-memory query handlers (not persisted to history).
+    query_registry: Mutex<QueryRegistry>,
 }
 
 impl WorkflowContext {
@@ -177,6 +189,7 @@ impl WorkflowContext {
             start_time,
             activity_seq: Mutex::new(0),
             state,
+            query_registry: Mutex::new(QueryRegistry::new()),
         }
     }
 
@@ -194,6 +207,7 @@ impl WorkflowContext {
             start_time,
             activity_seq: Mutex::new(0),
             state: Arc::new(HashMap::new()),
+            query_registry: Mutex::new(QueryRegistry::new()),
         }
     }
 
@@ -441,6 +455,54 @@ impl WorkflowContext {
         }
     }
 
+    /// Wait for the next delivered signal with the given name.
+    pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
+        let history_match = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .match_signal(signal_name);
+
+        match history_match {
+            HistoryMatch::Matched { output } => Ok(output),
+            HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
+                format!("signal mismatch: expected {expected}, got {actual}"),
+            )),
+            HistoryMatch::Failed { .. } => Err(HarvestError::NonDeterministic(
+                "signal history contains unexpected failure".into(),
+            )),
+            HistoryMatch::NoMatch => {
+                let (tx, rx) = oneshot::channel();
+                self.push_command(WorkflowCommand::WaitForSignal {
+                    signal_name: signal_name.to_string(),
+                    result_tx: tx,
+                });
+                rx.await.map_err(|_| {
+                    HarvestError::Cancelled(format!(
+                        "signal '{signal_name}' cancelled: result channel dropped"
+                    ))
+                })
+            }
+        }
+    }
+
+    pub fn register_query<F>(&self, name: &str, handler: F)
+    where
+        F: Fn() -> Value + Send + Sync + 'static,
+    {
+        self.query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .register(name, Arc::new(handler));
+    }
+
+    pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
+        self.query_registry
+            .lock()
+            .expect("query_registry lock poisoned")
+            .execute(name)
+    }
+
     // ── Command drain ─────────────────────────────────────────────────
 
     /// Drain all accumulated commands. Called by the worker after the
@@ -578,6 +640,7 @@ impl ActivityContext {
 mod tests {
     use super::*;
     use crate::types::ActivityExecId;
+    use chrono::Utc;
 
     #[test]
     fn activity_context_state_returns_none_when_not_registered() {
@@ -1245,5 +1308,37 @@ mod tests {
         assert_eq!(child, serde_json::json!({"id":"A","ok":true}));
         assert_eq!(activity, serde_json::json!({"sent":true}));
         assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_signal_replays_recorded_signal() {
+        let exec_id = ExecutionId::new();
+        let history = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".to_string(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let ctx = WorkflowContext::for_replay(exec_id, history);
+
+        let payload = ctx
+            .wait_for_signal("approved")
+            .await
+            .expect("signal should replay");
+        assert_eq!(payload, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn query_registry_does_not_emit_commands() {
+        let ctx = WorkflowContext::new_test();
+        ctx.register_query("status", || serde_json::json!({"state": "running"}));
+
+        let value = ctx.execute_query("status").expect("query should execute");
+        assert_eq!(value, serde_json::json!({"state": "running"}));
+        assert!(ctx.drain_commands().is_empty(), "queries must not emit events");
     }
 }
