@@ -1099,4 +1099,31 @@ mod tests {
             serde_json::json!({"ok": true})
         );
     }
+
+    #[tokio::test]
+    async fn context_child_without_terminal_does_not_emit_live_start() {
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "process_order".into(),
+                input: serde_json::json!({"sku": "book"}),
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let result = ctx
+            .spawn_child_workflow_raw("process_order", serde_json::json!({"sku":"book"}))
+            .await;
+
+        assert!(matches!(result, Err(HarvestError::NonDeterministic(_))));
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "replay must not emit new child start command"
+        );
+    }
 }

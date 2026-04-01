@@ -214,6 +214,7 @@ impl HistoryMatcher {
             return HistoryMatch::NoMatch;
         }
 
+        let start_cursor = self.cursor;
         let started_event = &self.events[self.cursor];
         let (child_id, recorded_name) = match started_event {
             WorkflowEvent::ChildWorkflowStarted {
@@ -236,15 +237,15 @@ impl HistoryMatcher {
             };
         }
 
-        self.cursor += 1;
+        let scan_cursor = self.cursor + 1;
 
-        while self.cursor < self.events.len() {
-            match &self.events[self.cursor] {
+        while scan_cursor < self.events.len() {
+            match &self.events[scan_cursor] {
                 WorkflowEvent::ChildWorkflowCompleted {
                     child_id: id,
                     output,
                 } if *id == child_id => {
-                    self.cursor += 1;
+                    self.cursor = scan_cursor + 1;
                     return HistoryMatch::Matched {
                         output: output.clone(),
                     };
@@ -253,17 +254,27 @@ impl HistoryMatcher {
                     child_id: id,
                     error,
                 } if *id == child_id => {
-                    self.cursor += 1;
+                    self.cursor = scan_cursor + 1;
                     return HistoryMatch::Failed {
                         error: error.clone(),
                         attempt: 1,
                     };
                 }
-                _ => break,
+                _ => {
+                    self.cursor = start_cursor;
+                    return HistoryMatch::Diverged {
+                        expected: format!("ChildWorkflowTerminal({workflow_name})"),
+                        actual: self.events[scan_cursor].type_name().to_string(),
+                    };
+                }
             }
         }
 
-        HistoryMatch::NoMatch
+        self.cursor = start_cursor;
+        HistoryMatch::Diverged {
+            expected: format!("ChildWorkflowTerminal({workflow_name})"),
+            actual: "EndOfHistory".to_string(),
+        }
     }
 
     /// Match a version gate against history.
@@ -594,6 +605,25 @@ mod tests {
                 error: "child failed".into(),
                 attempt: 1,
             }
+        );
+    }
+
+    #[test]
+    fn matcher_child_workflow_without_terminal_diverges_and_preserves_cursor() {
+        let child_id = crate::types::ExecutionId::new();
+        let events = vec![WorkflowEvent::ChildWorkflowStarted {
+            child_id,
+            workflow_name: "process_order".into(),
+            input: Value::Null,
+        }];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_child_workflow("process_order");
+        assert!(matches!(result, HistoryMatch::Diverged { .. }));
+        assert_eq!(
+            matcher.position(),
+            0,
+            "cursor must not consume started event"
         );
     }
 
