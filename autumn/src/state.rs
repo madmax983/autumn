@@ -81,7 +81,10 @@ impl AppState {
     /// Returns the database connection pool.
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> {
+    pub const fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
         self.pool.as_ref()
     }
 
