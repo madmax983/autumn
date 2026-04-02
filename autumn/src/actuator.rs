@@ -681,10 +681,16 @@ pub(crate) async fn tasks_stream_endpoint(
 
         loop {
             tokio::select! {
-                Ok(msg) = rx.recv() => {
-                    let ws_msg = axum::extract::ws::Message::Text(msg.into_string().into());
-                    if socket.send(ws_msg).await.is_err() {
-                        break;
+                res = rx.recv() => {
+                    match res {
+                        Ok(msg) => {
+                            let ws_msg = axum::extract::ws::Message::Text(msg.into_string().into());
+                            if socket.send(ws_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
                 () = shutdown.cancelled() => {
