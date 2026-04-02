@@ -150,10 +150,6 @@ impl DevReloadState {
 
 /// Run the dev server with file watching.
 pub fn run(package: Option<&str>, show_config: bool) {
-    if show_config {
-        // SAFETY: called before spawning any threads; single-threaded at this point.
-        unsafe { std::env::set_var("AUTUMN_SHOW_CONFIG", "1") };
-    }
     eprintln!("\u{1F342} autumn dev\n");
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -170,7 +166,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     }
 
     let binary = find_binary(package);
-    let mut child = start_server(&binary, reload_state.as_ref().map(DevReloadState::path));
+    let mut child = start_server(&binary, reload_state.as_ref().map(DevReloadState::path), show_config);
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -223,6 +219,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
                             package,
                             &mut child,
                             reload_state.as_ref().map(DevReloadState::path),
+                            show_config,
                         ) {
                             applied_reload = ReloadKind::Full;
                         }
@@ -241,6 +238,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
                             package,
                             &mut child,
                             reload_state.as_ref().map(DevReloadState::path),
+                            show_config,
                         ) {
                             applied_reload = ReloadKind::Full;
                         }
@@ -361,7 +359,7 @@ fn cargo_build_wasm(package: Option<&str>) -> bool {
 }
 
 /// Start the application binary. Returns the child process handle.
-fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child> {
+fn start_server(binary: &Path, reload_state_path: Option<&Path>, show_config: bool) -> Option<Child> {
     eprintln!("  Starting server...\n");
     let mut command = Command::new(binary);
     // Inherit stdio so tracing output (including --show-config) is visible.
@@ -370,6 +368,9 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
     if let Some(path) = reload_state_path {
         command.env(DEV_RELOAD_ENV, "1");
         command.env(DEV_RELOAD_STATE_ENV, path);
+    }
+    if show_config {
+        command.env("AUTUMN_SHOW_CONFIG", "1");
     }
 
     match command.spawn() {
@@ -384,50 +385,12 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
     if let Some(proc) = child {
-        // Send SIGTERM on Unix for graceful shutdown
-        #[cfg(unix)]
-        {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = proc.id() as libc::pid_t;
-            // SAFETY: `pid` is retrieved directly from `proc.id()`, representing a valid child
-            // process we own. `libc::SIGTERM` is a standard, valid signal. Sending it to our
-            // own child process is safe.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            // Wait briefly for graceful shutdown before forcing
-            if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
-                let _ = proc.kill();
-                let _ = proc.wait();
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = proc.kill();
-            let _ = proc.wait();
-        }
+        let _ = proc.kill();
+        let _ = proc.wait();
     }
     *child = None;
 }
 
-/// Wait for a child process with a timeout. Returns Err if timed out.
-#[cfg(unix)]
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return Err(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return Err(()),
-        }
-    }
-}
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
 fn is_relevant_change(path: &Path, kind: DebouncedEventKind) -> bool {
@@ -556,9 +519,10 @@ fn restart_server(
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state_path: Option<&Path>,
+    show_config: bool,
 ) -> bool {
     let binary = find_binary(package);
-    *child = start_server(&binary, reload_state_path);
+    *child = start_server(&binary, reload_state_path, show_config);
     child.is_some()
 }
 
@@ -623,7 +587,11 @@ fn find_tailwind_cli() -> Option<PathBuf> {
 }
 
 fn which(binary: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
+    which_with_env(binary, std::env::var_os("PATH"))
+}
+
+fn which_with_env(binary: &str, path_var: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path_var = path_var?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(binary);
         if candidate.exists() {
@@ -866,54 +834,6 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -1259,14 +1179,14 @@ mod tests {
 
     #[test]
     fn start_server_returns_none_for_missing_binary() {
-        let result = start_server(Path::new("/nonexistent/binary/path"), None);
+        let result = start_server(Path::new("/nonexistent/binary/path"), None, false);
         assert!(result.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn start_server_returns_child_for_valid_binary() {
-        let child = start_server(Path::new("/bin/sleep"), None);
+        let child = start_server(Path::new("/bin/sleep"), None, false);
         assert!(child.is_some());
         // Clean up
         let mut child = child.unwrap();
@@ -1486,34 +1406,6 @@ mod tests {
         assert!(child.is_none());
     }
 
-    // ── wait_with_timeout tests ────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_succeeds_for_fast_process() {
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        // Give it a moment to exit
-        std::thread::sleep(Duration::from_millis(50));
-        let result = wait_with_timeout(&mut child, Duration::from_secs(2));
-        assert!(result.is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_times_out_for_long_process() {
-        let mut child = Command::new("sleep")
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-        let result = wait_with_timeout(&mut child, Duration::from_millis(100));
-        assert!(result.is_err());
-        // Clean up
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
     // ── find_binary tests ──────────────────────────────────────────
 
     #[test]
@@ -1704,9 +1596,9 @@ mod tests {
         let binary = dir.path().join(binary_name);
         std::fs::write(&binary, "echo tailwind").expect("write binary");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
+        let path_os_string = Some(path.to_os_string());
 
-        let found = which("mocktailwind").expect("binary on PATH");
+        let found = which_with_env("mocktailwind", path_os_string).expect("binary on PATH");
         assert_eq!(found, binary);
     }
 
@@ -1714,8 +1606,8 @@ mod tests {
     fn which_returns_none_when_binary_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
+        let path_os_string = Some(path.to_os_string());
 
-        assert!(which("definitely-missing-binary").is_none());
+        assert!(which_with_env("definitely-missing-binary", path_os_string).is_none());
     }
 }

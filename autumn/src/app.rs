@@ -932,7 +932,7 @@ pub fn build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
-    build_router_inner(
+    build_router_inner_with_env(
         route_list,
         config,
         state,
@@ -941,6 +941,26 @@ pub fn build_router(
         Vec::new(),
         Vec::new(),
         None,
+        &crate::config::OsEnv,
+    )
+}
+
+pub fn build_router_with_env(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    env: &dyn crate::config::Env,
+) -> axum::Router {
+    build_router_inner_with_env(
+        route_list,
+        config,
+        state,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        env,
     )
 }
 
@@ -956,7 +976,7 @@ pub fn build_router_merged(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
 ) -> axum::Router {
-    build_router_inner(
+    build_router_inner_with_env(
         route_list,
         config,
         state,
@@ -965,6 +985,7 @@ pub fn build_router_merged(
         merge_routers,
         nest_routers,
         None,
+        &crate::config::OsEnv,
     )
 }
 
@@ -979,6 +1000,32 @@ fn build_router_inner(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     error_page_renderer: Option<SharedRenderer>,
+) -> axum::Router {
+    build_router_inner_with_env(
+        route_list,
+        config,
+        state,
+        exception_filters,
+        scoped_groups,
+        merge_routers,
+        nest_routers,
+        error_page_renderer,
+        &crate::config::OsEnv,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::cognitive_complexity)]
+fn build_router_inner_with_env(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    scoped_groups: Vec<ScopedGroup>,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    error_page_renderer: Option<SharedRenderer>,
+    env: &dyn crate::config::Env,
 ) -> axum::Router {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
@@ -1008,7 +1055,7 @@ fn build_router_inner(
         router = router.route(path, method_router);
     }
 
-    let dev_reload_enabled = dev::is_enabled();
+    let dev_reload_enabled = dev::is_enabled_with_env(env);
 
     // Framework-provided routes
     #[cfg(feature = "htmx")]
@@ -1023,9 +1070,22 @@ fn build_router_inner(
     }
 
     if dev_reload_enabled {
+        // Create an Arc'd copy of the env trait object so it can be passed via Axum State
+        // to the dev live reload endpoint. This requires cloning if it's MockEnv.
+        // Wait, env is `&dyn Env`. To put it in state we need an owned version.
+        // Since we only need it to support live_reload_state_handler, we can just use OsEnv directly
+        // in production, and for testing we need MockEnv.
+        // I will use an Arc<dyn Env + Send + Sync> wrapper for the state.
+
+        let env_state: std::sync::Arc<dyn crate::config::Env + Send + Sync> = if let Some(mock) = env.as_any().downcast_ref::<crate::config::MockEnv>() {
+            std::sync::Arc::new(mock.clone())
+        } else {
+            std::sync::Arc::new(crate::config::OsEnv)
+        };
+
         router = router.route(
             dev::LIVE_RELOAD_PATH,
-            axum::routing::get(dev::live_reload_state_handler),
+            axum::routing::get(dev::live_reload_state_handler).with_state(env_state),
         );
         tracing::debug!(
             path = dev::LIVE_RELOAD_PATH,
@@ -1049,8 +1109,7 @@ fn build_router_inner(
     );
 
     // Static file serving from project's static/ directory.
-    let env = crate::config::OsEnv;
-    let static_dir = project_dir("static", &env);
+    let static_dir = project_dir("static", env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
 
     // Mount scoped route groups (each with its own middleware layer).
@@ -1372,55 +1431,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
+    use crate::config::MockEnv;
 
     /// Helper to build a test router with default config and no database.
     fn test_router(routes: Vec<Route>) -> axum::Router {
@@ -1875,21 +1887,35 @@ mod tests {
     async fn build_router_injects_live_reload_script_when_enabled() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
         std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
-        let _env = EnvGuard::set_many(&[
-            ("AUTUMN_DEV_RELOAD", Some("1")),
-            (
-                "AUTUMN_DEV_RELOAD_STATE",
-                Some(reload_file.path().to_str().expect("utf-8 path")),
-            ),
-        ]);
-        let router = test_router(vec![Route {
+        let env = MockEnv::new()
+            .with("AUTUMN_DEV_RELOAD", "1")
+            .with("AUTUMN_DEV_RELOAD_STATE", reload_file.path().to_str().expect("utf-8 path"));
+
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let router = build_router_with_env(vec![Route {
             method: http::Method::GET,
             path: "/page",
             handler: axum::routing::get(|| async {
                 axum::response::Html("<html><body><main>ok</main></body></html>")
             }),
             name: "page",
-        }]);
+        }], &config, state, &env);
 
         let response = router
             .oneshot(Request::builder().uri("/page").body(Body::empty()).unwrap())
@@ -1907,14 +1933,28 @@ mod tests {
     async fn build_router_mounts_dev_reload_endpoint_when_enabled() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
         std::fs::write(reload_file.path(), r#"{"version":7,"kind":"css"}"#).expect("write");
-        let _env = EnvGuard::set_many(&[
-            ("AUTUMN_DEV_RELOAD", Some("1")),
-            (
-                "AUTUMN_DEV_RELOAD_STATE",
-                Some(reload_file.path().to_str().expect("utf-8 path")),
-            ),
-        ]);
-        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+        let env = MockEnv::new()
+            .with("AUTUMN_DEV_RELOAD", "1")
+            .with("AUTUMN_DEV_RELOAD_STATE", reload_file.path().to_str().expect("utf-8 path"));
+
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let router = build_router_with_env(vec![test_get_route("/dummy", "dummy")], &config, state, &env);
 
         let response = router
             .oneshot(
@@ -1945,18 +1985,30 @@ mod tests {
         std::fs::write(static_dir.join("demo.txt"), "hello").expect("write static file");
         let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
         std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
-        let _env = EnvGuard::set_many(&[
-            (
-                "AUTUMN_MANIFEST_DIR",
-                Some(project.path().to_str().expect("utf-8 path")),
-            ),
-            ("AUTUMN_DEV_RELOAD", Some("1")),
-            (
-                "AUTUMN_DEV_RELOAD_STATE",
-                Some(reload_file.path().to_str().expect("utf-8 path")),
-            ),
-        ]);
-        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let env = MockEnv::new()
+            .with("AUTUMN_MANIFEST_DIR", project.path().to_str().expect("utf-8 path"))
+            .with("AUTUMN_DEV_RELOAD", "1")
+            .with("AUTUMN_DEV_RELOAD_STATE", reload_file.path().to_str().expect("utf-8 path"));
+
+        let config = AutumnConfig::default();
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let router = build_router_with_env(vec![test_get_route("/dummy", "dummy")], &config, state, &env);
 
         let response = router
             .oneshot(
