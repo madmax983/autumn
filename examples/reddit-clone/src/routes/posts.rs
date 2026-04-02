@@ -610,6 +610,11 @@ pub async fn update(
     }
 
     let base_slug = slugify(&form.0.title);
+    if base_slug.is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "Title must contain at least one letter or number",
+        ));
+    }
     // Ensure unique slug within subreddit, excluding the current post
     let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
 

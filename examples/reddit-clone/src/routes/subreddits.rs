@@ -138,6 +138,11 @@ pub async fn create(
 
     let name = form.0.name.trim().to_string();
     let slug = slugify(&name);
+    if slug.is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "Community name must contain at least one letter or number",
+        ));
+    }
 
     let new_sub = NewSubreddit {
         name: name.clone(),

@@ -5,28 +5,34 @@
 //   Database            -> Diesel async Postgres, Db extractor, embedded migrations
 //   Model macro         -> #[autumn_web::model] with #[id], #[indexed], #[validate], #[default]
 //   Repository macro    -> #[autumn_web::repository] with derived queries & REST API generation
-//   Mutation hooks      -> before_create / after_create / before_update lifecycle hooks
+//   Mutation hooks      -> before_create / before_update lifecycle hooks
 //   Authentication      -> Session cookies, bcrypt hashing, session.rotate_id()
 //   Authorization       -> #[secured] macro for route protection
 //   CSRF protection     -> CsrfToken extractor in forms
 //   Validation          -> #[validate(length(min, max))] on model fields
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
+//   WebSockets          -> #[ws] live feed with Channels pub/sub
+//   WASM Islands        -> island() renderer with htmx fallback (see islands.rs)
+//   Durable Workflows   -> autumn-harvest patterns (see workflows.rs)
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
 //
 // Run with:   cargo run -p reddit-clone
 // Front page: http://localhost:3000
+// WebSocket:  ws://localhost:3000/ws/feed
 // API test:   curl http://localhost:3000/api/posts
 //             curl http://localhost:3000/api/subreddits
 
 mod hooks;
+mod islands;
 mod models;
 mod repositories;
 mod routes;
 mod schema;
 mod slugify;
 mod tasks;
+mod workflows;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
@@ -68,9 +74,10 @@ async fn main() {
             // ── Votes (htmx) ──────────────────────────
             routes::votes::upvote,
             routes::votes::downvote,
+            // ── WebSocket live feeds ───────────────────
+            routes::live::live_feed,
+            routes::live::subreddit_feed,
             // ── Generated REST API (read-only) ────────
-            // Only expose list/get endpoints publicly.
-            // Mutations go through the authenticated HTML routes above.
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
             repositories::post_api_list,

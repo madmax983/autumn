@@ -84,20 +84,25 @@ async fn cast_vote(
                 .await?;
         }
         None => {
-            // New vote
-            diesel::insert_into(votes::table)
+            // New vote — use ON CONFLICT to handle race conditions
+            // (e.g. double-click sending two requests before the first completes)
+            let inserted = diesel::insert_into(votes::table)
                 .values((
                     votes::user_id.eq(user_id),
                     votes::post_id.eq(post_id),
                     votes::value.eq(value),
                 ))
+                .on_conflict((votes::user_id, votes::post_id))
+                .do_nothing()
                 .execute(&mut **db)
                 .await?;
 
-            diesel::update(posts::table.find(post_id))
-                .set(posts::score.eq(posts::score + i64::from(value)))
-                .execute(&mut **db)
-                .await?;
+            if inserted > 0 {
+                diesel::update(posts::table.find(post_id))
+                    .set(posts::score.eq(posts::score + i64::from(value)))
+                    .execute(&mut **db)
+                    .await?;
+            }
         }
     }
 
