@@ -28,6 +28,7 @@ use crate::executor::{WorkflowOutcome, run_workflow};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{TaskQueueItem, WorkflowExecution};
 use crate::queue::{self, TaskType};
+use crate::signal;
 use crate::schema::harvest_workflow_executions;
 use crate::store;
 use crate::types::ExecutionId;
@@ -163,6 +164,7 @@ fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
         WorkflowCommand::StartTimer { .. } => "StartTimer",
         WorkflowCommand::StartChildWorkflow { .. } => "StartChildWorkflow",
         WorkflowCommand::RecordMarker { .. } => "RecordMarker",
+        WorkflowCommand::WaitForSignal { .. } => "WaitForSignal",
         WorkflowCommand::Complete { .. } => "Complete",
         WorkflowCommand::Fail { .. } => "Fail",
     }
@@ -182,6 +184,31 @@ fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
     format!(
         "workflow task suspended with unsupported commands ({command_names}); activity/timer dispatch is not implemented yet"
     )
+}
+
+fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
+    !commands.is_empty()
+        && commands
+            .iter()
+            .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
+}
+
+fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
+    if commands.is_empty() {
+        return false;
+    }
+
+    let has_wait = commands
+        .iter()
+        .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
+    let only_wait_or_marker = commands.iter().all(|cmd| {
+        matches!(
+            cmd,
+            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::RecordMarker { .. }
+        )
+    });
+
+    has_wait && only_wait_or_marker
 }
 
 async fn load_workflow_execution(
@@ -379,6 +406,46 @@ async fn process_workflow_task(
         }
     };
 
+    let signal_ingest_result: HarvestResult<()> = async {
+        let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+        if pending_signals.is_empty() {
+            return Ok(());
+        }
+
+        let signal_events = pending_signals
+            .iter()
+            .map(|s| WorkflowEvent::SignalReceived {
+                signal_name: s.signal_name.clone(),
+                payload: s.payload.clone(),
+            })
+            .collect::<Vec<_>>();
+        let signal_ids = pending_signals.iter().map(|s| s.id).collect::<Vec<_>>();
+        conn.transaction::<(), HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &signal_events, history.next_event_id).await?;
+                signal::mark_signals_consumed(conn, &signal_ids).await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = signal_ingest_result {
+        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+        return Err(error);
+    }
+
+    let history = match store::load_history(conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
+
     let workflow = match registry.workflows.get(&execution.workflow_name) {
         Some(workflow) => workflow,
         None => {
@@ -410,8 +477,13 @@ async fn process_workflow_task(
             persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
         }
         WorkflowOutcome::Suspended { commands } => {
-            let error = suspended_workflow_error(&commands);
-            persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
+            if should_requeue_signal_wait(&commands) {
+                queue::requeue_for_retry(conn, task.id, chrono::Duration::seconds(1)).await
+            } else {
+                let error = suspended_workflow_error(&commands);
+                persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error)
+                    .await
+            }
         }
     }
 }
@@ -638,6 +710,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
@@ -754,5 +827,60 @@ mod tests {
             ClaimedTaskKind::Activity
         );
         assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
+    }
+
+    #[test]
+    fn all_commands_wait_for_signal_requires_non_empty() {
+        let commands: Vec<WorkflowCommand> = vec![];
+        assert!(!all_commands_wait_for_signal(&commands));
+    }
+
+    #[test]
+    fn all_commands_wait_for_signal_only_accepts_wait_commands() {
+        let (signal_tx, _signal_rx) = oneshot::channel::<serde_json::Value>();
+        let (timer_tx, _timer_rx) = oneshot::channel::<()>();
+
+        let only_wait = vec![WorkflowCommand::WaitForSignal {
+            signal_name: "approved".to_string(),
+            result_tx: signal_tx,
+        }];
+        assert!(all_commands_wait_for_signal(&only_wait));
+
+        let mixed = vec![
+            WorkflowCommand::WaitForSignal {
+                signal_name: "approved".to_string(),
+                result_tx: oneshot::channel::<serde_json::Value>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 1,
+                result_tx: timer_tx,
+            },
+        ];
+        assert!(!all_commands_wait_for_signal(&mixed));
+    }
+
+    #[test]
+    fn should_requeue_signal_wait_allows_marker_plus_wait() {
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "version:gate".to_string(),
+                details: serde_json::json!(2),
+            },
+            WorkflowCommand::WaitForSignal {
+                signal_name: "approved".to_string(),
+                result_tx: oneshot::channel::<serde_json::Value>().0,
+            },
+        ];
+        assert!(should_requeue_signal_wait(&commands));
+    }
+
+    #[test]
+    fn should_requeue_signal_wait_rejects_marker_only() {
+        let commands = vec![WorkflowCommand::RecordMarker {
+            name: "version:gate".to_string(),
+            details: serde_json::json!(2),
+        }];
+        assert!(!should_requeue_signal_wait(&commands));
     }
 }

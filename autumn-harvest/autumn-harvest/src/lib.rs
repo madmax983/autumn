@@ -11,6 +11,7 @@ pub mod info;
 pub mod policy;
 pub mod pool;
 pub mod prelude;
+pub mod query;
 pub mod replay;
 pub mod types;
 
@@ -28,6 +29,8 @@ pub mod queue;
 #[allow(clippy::wildcard_imports)]
 pub mod schema;
 #[cfg(feature = "db")]
+pub mod signal;
+#[cfg(feature = "db")]
 pub mod store;
 #[cfg(feature = "db")]
 pub mod timeout;
@@ -44,6 +47,7 @@ pub use executor::{WorkflowOutcome, run_workflow};
 pub use info::{ActivityHandlerFn, ActivityInfo, DagInfo, WorkflowHandlerFn, WorkflowInfo};
 pub use policy::{RetryPolicy, Schedule, TaskStatus, TriggerRule};
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
+pub use query::QueryRegistry;
 pub use replay::{HistoryMatch, HistoryMatcher};
 pub use types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 

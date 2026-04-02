@@ -10,7 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::event::WorkflowEvent;
 
@@ -40,6 +40,8 @@ pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
     consumed_child_terminal_events: HashSet<usize>,
+    consumed_signal_events: HashSet<usize>,
+    pending_signals: VecDeque<(String, Value)>,
 }
 
 impl HistoryMatcher {
@@ -50,6 +52,8 @@ impl HistoryMatcher {
             events,
             cursor: 0,
             consumed_child_terminal_events: HashSet::new(),
+            consumed_signal_events: HashSet::new(),
+            pending_signals: VecDeque::new(),
         }
     }
 
@@ -57,7 +61,9 @@ impl HistoryMatcher {
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         let mut cursor = self.cursor;
-        while self.consumed_child_terminal_events.contains(&cursor) {
+        while self.consumed_child_terminal_events.contains(&cursor)
+            || self.consumed_signal_events.contains(&cursor)
+        {
             cursor += 1;
         }
         cursor < self.events.len()
@@ -81,7 +87,8 @@ impl HistoryMatcher {
     }
 
     fn advance_to_next_unconsumed_event(&mut self) {
-        while self.consumed_child_terminal_events.contains(&self.cursor)
+        while (self.consumed_child_terminal_events.contains(&self.cursor)
+            || self.consumed_signal_events.contains(&self.cursor))
             && self.cursor < self.events.len()
         {
             self.cursor += 1;
@@ -277,6 +284,69 @@ impl HistoryMatcher {
         }
 
         // Timer was started but never fired — incomplete history
+        HistoryMatch::NoMatch
+    }
+
+    /// Match a signal wait command against history.
+    ///
+    /// Expects `SignalReceived { signal_name }` at the current cursor.
+    pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        if let Some(index) = self
+            .pending_signals
+            .iter()
+            .position(|(name, _)| name == signal_name)
+        {
+            let (_name, payload) = self
+                .pending_signals
+                .remove(index)
+                .expect("index from position must be valid");
+            return HistoryMatch::Matched { output: payload };
+        }
+
+        self.advance_to_next_unconsumed_event();
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let mut scan_cursor = self.cursor;
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor)
+                || self.consumed_signal_events.contains(&scan_cursor)
+            {
+                scan_cursor += 1;
+                continue;
+            }
+
+            match &self.events[scan_cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name => {
+                    let output = payload.clone();
+                    self.consumed_signal_events.insert(scan_cursor);
+                    self.cursor = scan_cursor.saturating_add(1);
+                    self.advance_to_next_unconsumed_event();
+
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } => {
+                    self.consumed_signal_events.insert(scan_cursor);
+                    self.pending_signals
+                        .push_back((recorded_name.clone(), payload.clone()));
+                    scan_cursor += 1;
+                }
+                other => {
+                    return HistoryMatch::Diverged {
+                        expected: format!("SignalReceived({signal_name})"),
+                        actual: other.type_name().to_string(),
+                    };
+                }
+            }
+        }
+
         HistoryMatch::NoMatch
     }
 
@@ -1100,5 +1170,111 @@ mod tests {
         assert_eq!(r2, HistoryMatch::Matched { output: output2 });
 
         assert!(!matcher.is_replaying());
+    }
+
+    #[test]
+    fn matcher_replays_signal_payload() {
+        let events = vec![WorkflowEvent::SignalReceived {
+            signal_name: "approved".into(),
+            payload: serde_json::json!({"ok": true}),
+        }];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal("approved");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_skips_unrelated_signals_while_waiting() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal("approved");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+        assert_eq!(
+            matcher.position(),
+            2,
+            "cursor should advance beyond matched signal to avoid stale divergences"
+        );
+    }
+
+    #[test]
+    fn matcher_preserves_unrelated_signal_for_later_wait() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let approved = matcher.match_signal("approved");
+        assert_eq!(
+            approved,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+
+        let cancel = matcher.match_signal("cancel");
+        assert_eq!(
+            cancel,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"reason": "manual"}),
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_allows_non_signal_command_after_out_of_order_signal_match() {
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 5,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let approved = matcher.match_signal("approved");
+        assert!(matches!(approved, HistoryMatch::Matched { .. }));
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
+            }
+        );
     }
 }

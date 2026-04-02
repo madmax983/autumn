@@ -11,6 +11,7 @@ pub use crate::error::{HarvestError, HarvestResult, TimeoutType};
 pub use crate::event::WorkflowEvent;
 pub use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
 pub use crate::policy::{RetryPolicy, Schedule, TriggerRule};
+pub use crate::query::QueryRegistry;
 pub use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId, WorkflowId};
 
 // Re-export macros from autumn-harvest-macros.
