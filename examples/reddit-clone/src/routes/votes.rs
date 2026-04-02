@@ -35,8 +35,9 @@ pub async fn downvote(
 
 /// Cast a vote on a post. Handles insert-or-update and score recalculation.
 ///
-/// Score is always recomputed from the votes table (not incremented),
-/// so concurrent requests cannot cause drift.
+/// Uses `ON CONFLICT DO UPDATE` so that concurrent/rapid requests always
+/// persist the latest intended value. Score is recomputed in a single
+/// `UPDATE ... SET score = (subquery)` so no read-then-write race exists.
 async fn cast_vote(
     post_id: i64,
     value: i16,
@@ -74,7 +75,8 @@ async fn cast_vote(
                 .await?;
         }
         None => {
-            // New vote — use ON CONFLICT to handle race conditions
+            // New vote — ON CONFLICT DO UPDATE so rapid clicks always
+            // persist the latest intended value instead of dropping one.
             diesel::insert_into(votes::table)
                 .values((
                     votes::user_id.eq(user_id),
@@ -82,24 +84,26 @@ async fn cast_vote(
                     votes::value.eq(value),
                 ))
                 .on_conflict((votes::user_id, votes::post_id))
-                .do_nothing()
+                .do_update()
+                .set(votes::value.eq(value))
                 .execute(&mut **db)
                 .await?;
         }
     }
 
-    // Recompute score from actual votes — avoids drift from concurrent requests.
-    // Load all vote values and sum in Rust to sidestep Diesel's Numeric type.
-    let all_votes: Vec<i16> = votes::table
-        .filter(votes::post_id.eq(post_id))
-        .select(votes::value)
-        .load(&mut **db)
-        .await?;
-    let score: i64 = all_votes.iter().map(|&v| i64::from(v)).sum();
+    // Recompute score atomically in a single statement — no read-then-write race.
+    // Uses raw SQL because Diesel doesn't support SET col = (subquery) directly.
+    diesel::sql_query(
+        "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes WHERE post_id = $1), 0) WHERE id = $1"
+    )
+    .bind::<diesel::sql_types::BigInt, _>(post_id)
+    .execute(&mut **db)
+    .await?;
 
-    diesel::update(posts::table.find(post_id))
-        .set(posts::score.eq(score))
-        .execute(&mut **db)
+    let score: i64 = posts::table
+        .find(post_id)
+        .select(posts::score)
+        .first(&mut **db)
         .await?;
 
     Ok(vote_controls(post_id, score))

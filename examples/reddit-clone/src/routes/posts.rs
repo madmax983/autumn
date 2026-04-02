@@ -314,8 +314,9 @@ pub async fn submit(
     // Ensure unique slug within this subreddit by appending a suffix
     let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut db).await?;
 
-    // Insert the post with an initial upvote (score = 1)
-    diesel::insert_into(posts::table)
+    // Insert the post, then create an explicit author upvote so
+    // score always matches the sum of actual vote rows.
+    let post_id: i64 = diesel::insert_into(posts::table)
         .values((
             posts::title.eq(&title),
             posts::slug.eq(&slug),
@@ -324,6 +325,16 @@ pub async fn submit(
             posts::author_id.eq(user_id),
             posts::subreddit_id.eq(form.0.subreddit_id),
             posts::score.eq(1_i64),
+        ))
+        .returning(posts::id)
+        .get_result(&mut *db)
+        .await?;
+
+    diesel::insert_into(crate::schema::votes::table)
+        .values((
+            crate::schema::votes::user_id.eq(user_id),
+            crate::schema::votes::post_id.eq(post_id),
+            crate::schema::votes::value.eq(1_i16),
         ))
         .execute(&mut *db)
         .await?;
