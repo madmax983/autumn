@@ -8,3 +8,6 @@ format = "Pretty"
 
 [health]
 path = "/health"
+
+[security.csrf]
+enabled = true

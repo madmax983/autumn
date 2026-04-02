@@ -1,5 +1,0 @@
-error: #[server] requires async fn
-  --> tests/compile-fail/server_action_non_async.rs:10:1
-   |
-10 | fn bad_action(_input: Input) -> AutumnResult<Output> {
-   | ^^

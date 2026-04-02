@@ -163,7 +163,6 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-
     // Initial build
     if !cargo_build(package) {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
@@ -304,9 +303,6 @@ fn cargo_build(package: Option<&str>) -> bool {
     eprintln!("  Compiling...");
     match cmd.status() {
         Ok(status) if status.success() => {
-            if has_wasm_client(package) && !cargo_build_wasm(package) {
-                return false;
-            }
             eprintln!("  \u{2713} Build succeeded");
             true
         }
@@ -316,48 +312,6 @@ fn cargo_build(package: Option<&str>) -> bool {
             false
         }
     }
-}
-
-fn has_wasm_client(package: Option<&str>) -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        return Path::new("src/client.rs").exists();
-    };
-
-    let Some(metadata) = try_cargo_metadata() else {
-        return Path::new("src/client.rs").exists();
-    };
-
-    resolve_wasm_client_target_from_metadata(&metadata, package, &cwd).is_ok()
-}
-
-fn cargo_build_wasm(package: Option<&str>) -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        eprintln!("  \u{2717} Failed to determine current directory for WASM build");
-        return false;
-    };
-    let Some(metadata) = try_cargo_metadata() else {
-        eprintln!("  \u{2717} Failed to read cargo metadata for WASM build");
-        return false;
-    };
-    let client_target = match resolve_wasm_client_target_from_metadata(&metadata, package, &cwd) {
-        Ok(target) => target,
-        Err(error) => {
-            eprintln!("  \u{2717} {error}");
-            return false;
-        }
-    };
-
-    let mut cargo_cmd = Command::new("cargo");
-    cargo_cmd.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
-    cargo_cmd.arg(&client_target);
-    if let Some(pkg) = package {
-        cargo_cmd.args(["-p", pkg]);
-    }
-    eprintln!("  Compiling WASM...");
-    cargo_cmd
-        .status()
-        .ok()
-        .is_some_and(|status| status.success())
 }
 
 /// Start the application binary. Returns the child process handle.
@@ -736,114 +690,6 @@ fn resolve_binary_from_metadata(
     }
 
     Ok(path)
-}
-
-#[cfg(test)]
-fn resolve_package_root_from_metadata(
-    metadata: &serde_json::Value,
-    package: Option<&str>,
-    cwd: &Path,
-) -> Result<PathBuf, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("missing packages array in metadata")?;
-
-    let manifest = if let Some(pkg_name) = package {
-        packages
-            .iter()
-            .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
-            .and_then(|pkg| pkg["manifest_path"].as_str())
-            .ok_or_else(|| format!("package '{pkg_name}' not found"))?
-    } else {
-        packages
-            .iter()
-            .filter_map(|pkg| pkg["manifest_path"].as_str())
-            .find(|manifest| {
-                Path::new(manifest)
-                    .parent()
-                    .is_some_and(|dir| dir.starts_with(cwd))
-            })
-            .ok_or("current package not found in metadata")?
-    };
-
-    Path::new(manifest)
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "invalid manifest_path in metadata".to_owned())
-}
-
-fn resolve_wasm_client_target_from_metadata(
-    metadata: &serde_json::Value,
-    package: Option<&str>,
-    cwd: &Path,
-) -> Result<String, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("missing packages array in metadata")?;
-
-    let package_entry = package.map_or_else(
-        || {
-            packages.iter().find(|pkg| {
-                let manifest = pkg["manifest_path"].as_str().unwrap_or("");
-                Path::new(manifest)
-                    .parent()
-                    .is_some_and(|dir| dir.starts_with(cwd))
-            })
-        },
-        |pkg_name| {
-            packages
-                .iter()
-                .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
-        },
-    );
-
-    let package_entry = package_entry.ok_or_else(|| {
-        package.map_or_else(
-            || "current package not found in cargo metadata".to_owned(),
-            |pkg_name| format!("package '{pkg_name}' not found in cargo metadata"),
-        )
-    })?;
-
-    package_entry["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|target| {
-            target["kind"]
-                .as_array()
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-                && target["src_path"].as_str().is_some_and(|src| {
-                    Path::new(src)
-                        .file_name()
-                        .is_some_and(|file| file == "client.rs")
-                })
-        })
-        .and_then(|target| target["name"].as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            package.map_or_else(
-                || {
-                    "current package has no `src/client.rs` binary target; add [[bin]] name = \"client\" path = \"src/client.rs\""
-                        .to_owned()
-                },
-                |pkg_name| {
-                    format!(
-                        "package '{pkg_name}' has no `src/client.rs` binary target; add [[bin]] name = \"client\" path = \"src/client.rs\""
-                    )
-                },
-            )
-        })
-}
-
-fn try_cargo_metadata() -> Option<serde_json::Value> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Locate the compiled binary using `cargo metadata`.
@@ -1380,44 +1226,6 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("mylib"), Path::new("/projects/mylib"));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn resolve_package_root_explicit_package() {
-        let metadata = serde_json::json!({
-            "packages": [
-                {
-                    "name": "alpha",
-                    "manifest_path": "/repo/alpha/Cargo.toml"
-                },
-                {
-                    "name": "beta",
-                    "manifest_path": "/repo/beta/Cargo.toml"
-                }
-            ]
-        });
-        let cwd = Path::new("/repo");
-        let root = resolve_package_root_from_metadata(&metadata, Some("beta"), cwd).unwrap();
-        assert_eq!(root, PathBuf::from("/repo/beta"));
-    }
-
-    #[test]
-    fn resolve_package_root_from_cwd() {
-        let metadata = serde_json::json!({
-            "packages": [
-                {
-                    "name": "outside",
-                    "manifest_path": "/other/outside/Cargo.toml"
-                },
-                {
-                    "name": "inside",
-                    "manifest_path": "/repo/app/Cargo.toml"
-                }
-            ]
-        });
-        let cwd = Path::new("/repo/app");
-        let root = resolve_package_root_from_metadata(&metadata, None, cwd).unwrap();
-        assert_eq!(root, PathBuf::from("/repo/app"));
     }
 
     #[test]
