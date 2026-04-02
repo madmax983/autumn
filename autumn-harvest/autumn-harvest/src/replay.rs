@@ -40,6 +40,7 @@ pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
     consumed_child_terminal_events: HashSet<usize>,
+    consumed_signal_events: HashSet<usize>,
 }
 
 impl HistoryMatcher {
@@ -50,6 +51,7 @@ impl HistoryMatcher {
             events,
             cursor: 0,
             consumed_child_terminal_events: HashSet::new(),
+            consumed_signal_events: HashSet::new(),
         }
     }
 
@@ -57,7 +59,9 @@ impl HistoryMatcher {
     #[must_use]
     pub fn is_replaying(&self) -> bool {
         let mut cursor = self.cursor;
-        while self.consumed_child_terminal_events.contains(&cursor) {
+        while self.consumed_child_terminal_events.contains(&cursor)
+            || self.consumed_signal_events.contains(&cursor)
+        {
             cursor += 1;
         }
         cursor < self.events.len()
@@ -81,7 +85,8 @@ impl HistoryMatcher {
     }
 
     fn advance_to_next_unconsumed_event(&mut self) {
-        while self.consumed_child_terminal_events.contains(&self.cursor)
+        while (self.consumed_child_terminal_events.contains(&self.cursor)
+            || self.consumed_signal_events.contains(&self.cursor))
             && self.cursor < self.events.len()
         {
             self.cursor += 1;
@@ -284,25 +289,39 @@ impl HistoryMatcher {
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
-        loop {
-            self.advance_to_next_unconsumed_event();
-            if !self.is_replaying() {
-                return HistoryMatch::NoMatch;
+        self.advance_to_next_unconsumed_event();
+        if !self.is_replaying() {
+            return HistoryMatch::NoMatch;
+        }
+
+        let mut scan_cursor = self.cursor;
+        while scan_cursor < self.events.len() {
+            if self.consumed_child_terminal_events.contains(&scan_cursor)
+                || self.consumed_signal_events.contains(&scan_cursor)
+            {
+                scan_cursor += 1;
+                continue;
             }
 
-            match &self.events[self.cursor] {
+            match &self.events[scan_cursor] {
                 WorkflowEvent::SignalReceived {
                     signal_name: recorded_name,
                     payload,
                 } if recorded_name == signal_name => {
                     let output = payload.clone();
-                    self.cursor += 1;
-                    self.advance_to_next_unconsumed_event();
+
+                    if scan_cursor == self.cursor {
+                        self.cursor += 1;
+                        self.advance_to_next_unconsumed_event();
+                    } else {
+                        self.consumed_signal_events.insert(scan_cursor);
+                    }
+
                     return HistoryMatch::Matched { output };
                 }
                 WorkflowEvent::SignalReceived { .. } => {
-                    // Different signal names are validly interleaved; skip and keep waiting.
-                    self.cursor += 1;
+                    // Different signal names remain available for future waits.
+                    scan_cursor += 1;
                 }
                 other => {
                     return HistoryMatch::Diverged {
@@ -312,6 +331,8 @@ impl HistoryMatcher {
                 }
             }
         }
+
+        HistoryMatch::NoMatch
     }
 
     /// Match a child workflow command against history.
@@ -1172,6 +1193,41 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
             }
         );
-        assert_eq!(matcher.position(), 2);
+        assert_eq!(
+            matcher.position(),
+            0,
+            "cursor should remain on unrelated signal so later waits can consume it"
+        );
+    }
+
+    #[test]
+    fn matcher_preserves_unrelated_signal_for_later_wait() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let approved = matcher.match_signal("approved");
+        assert_eq!(
+            approved,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+
+        let cancel = matcher.match_signal("cancel");
+        assert_eq!(
+            cancel,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"reason": "manual"}),
+            }
+        );
     }
 }

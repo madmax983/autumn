@@ -420,7 +420,13 @@ async fn process_workflow_task(
         return Err(error);
     }
 
-    let history = store::load_history(conn, exec_id).await?;
+    let history = match store::load_history(conn, exec_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+            return Err(error);
+        }
+    };
 
     let workflow = match registry.workflows.get(&execution.workflow_name) {
         Some(workflow) => workflow,
