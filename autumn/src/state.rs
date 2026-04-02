@@ -291,4 +291,20 @@ mod tests {
             "uptime should contain 's': {display}"
         );
     }
+
+    #[test]
+    fn app_state_accessors() {
+        let state = AppState::for_test();
+
+        // Exercise the new getters to ensure they compile and return the expected types
+        let _metrics = state.metrics();
+        let _log_levels = state.log_levels();
+        let _task_registry = state.task_registry();
+        let _config_props = state.config_props();
+
+        #[cfg(feature = "db")]
+        {
+            let _pool = state.pool();
+        }
+    }
 }
