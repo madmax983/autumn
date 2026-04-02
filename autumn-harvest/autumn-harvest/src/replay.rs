@@ -284,32 +284,33 @@ impl HistoryMatcher {
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
-        self.advance_to_next_unconsumed_event();
-        if !self.is_replaying() {
-            return HistoryMatch::NoMatch;
-        }
-
-        match &self.events[self.cursor] {
-            WorkflowEvent::SignalReceived {
-                signal_name: recorded_name,
-                payload,
-            } if recorded_name == signal_name => {
-                let output = payload.clone();
-                self.cursor += 1;
-                self.advance_to_next_unconsumed_event();
-                HistoryMatch::Matched { output }
+        loop {
+            self.advance_to_next_unconsumed_event();
+            if !self.is_replaying() {
+                return HistoryMatch::NoMatch;
             }
-            WorkflowEvent::SignalReceived {
-                signal_name: recorded_name,
-                ..
-            } => HistoryMatch::Diverged {
-                expected: format!("SignalReceived({signal_name})"),
-                actual: format!("SignalReceived({recorded_name})"),
-            },
-            other => HistoryMatch::Diverged {
-                expected: format!("SignalReceived({signal_name})"),
-                actual: other.type_name().to_string(),
-            },
+
+            match &self.events[self.cursor] {
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } if recorded_name == signal_name => {
+                    let output = payload.clone();
+                    self.cursor += 1;
+                    self.advance_to_next_unconsumed_event();
+                    return HistoryMatch::Matched { output };
+                }
+                WorkflowEvent::SignalReceived { .. } => {
+                    // Different signal names are validly interleaved; skip and keep waiting.
+                    self.cursor += 1;
+                }
+                other => {
+                    return HistoryMatch::Diverged {
+                        expected: format!("SignalReceived({signal_name})"),
+                        actual: other.type_name().to_string(),
+                    };
+                }
+            }
         }
     }
 
@@ -1149,5 +1150,28 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
             }
         );
+    }
+
+    #[test]
+    fn matcher_skips_unrelated_signals_while_waiting() {
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_signal("approved");
+        assert_eq!(
+            result,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true}),
+            }
+        );
+        assert_eq!(matcher.position(), 2);
     }
 }

@@ -388,8 +388,12 @@ async fn process_workflow_task(
         }
     };
 
-    let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
-    if !pending_signals.is_empty() {
+    let signal_ingest_result: HarvestResult<()> = async {
+        let pending_signals = signal::load_pending_signals(conn, exec_id).await?;
+        if pending_signals.is_empty() {
+            return Ok(());
+        }
+
         let signal_events = pending_signals
             .iter()
             .map(|s| WorkflowEvent::SignalReceived {
@@ -407,6 +411,13 @@ async fn process_workflow_task(
             .scope_boxed()
         })
         .await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = signal_ingest_result {
+        fail_task_and_execution(conn, task, worker_id, &error.to_string()).await?;
+        return Err(error);
     }
 
     let history = store::load_history(conn, exec_id).await?;
