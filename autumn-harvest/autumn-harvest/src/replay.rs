@@ -10,7 +10,7 @@
 //! it directly, avoiding duplicate side effects.
 
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use crate::event::WorkflowEvent;
 
@@ -41,6 +41,7 @@ pub struct HistoryMatcher {
     cursor: usize,
     consumed_child_terminal_events: HashSet<usize>,
     consumed_signal_events: HashSet<usize>,
+    pending_signals: VecDeque<(String, Value)>,
 }
 
 impl HistoryMatcher {
@@ -52,6 +53,7 @@ impl HistoryMatcher {
             cursor: 0,
             consumed_child_terminal_events: HashSet::new(),
             consumed_signal_events: HashSet::new(),
+            pending_signals: VecDeque::new(),
         }
     }
 
@@ -289,6 +291,18 @@ impl HistoryMatcher {
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
+        if let Some(index) = self
+            .pending_signals
+            .iter()
+            .position(|(name, _)| name == signal_name)
+        {
+            let (_name, payload) = self
+                .pending_signals
+                .remove(index)
+                .expect("index from position must be valid");
+            return HistoryMatch::Matched { output: payload };
+        }
+
         self.advance_to_next_unconsumed_event();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
@@ -309,18 +323,19 @@ impl HistoryMatcher {
                     payload,
                 } if recorded_name == signal_name => {
                     let output = payload.clone();
-
-                    if scan_cursor == self.cursor {
-                        self.cursor += 1;
-                        self.advance_to_next_unconsumed_event();
-                    } else {
-                        self.consumed_signal_events.insert(scan_cursor);
-                    }
+                    self.consumed_signal_events.insert(scan_cursor);
+                    self.cursor = scan_cursor.saturating_add(1);
+                    self.advance_to_next_unconsumed_event();
 
                     return HistoryMatch::Matched { output };
                 }
-                WorkflowEvent::SignalReceived { .. } => {
-                    // Different signal names remain available for future waits.
+                WorkflowEvent::SignalReceived {
+                    signal_name: recorded_name,
+                    payload,
+                } => {
+                    self.consumed_signal_events.insert(scan_cursor);
+                    self.pending_signals
+                        .push_back((recorded_name.clone(), payload.clone()));
                     scan_cursor += 1;
                 }
                 other => {
@@ -1195,8 +1210,8 @@ mod tests {
         );
         assert_eq!(
             matcher.position(),
-            0,
-            "cursor should remain on unrelated signal so later waits can consume it"
+            2,
+            "cursor should advance beyond matched signal to avoid stale divergences"
         );
     }
 
@@ -1227,6 +1242,38 @@ mod tests {
             cancel,
             HistoryMatch::Matched {
                 output: serde_json::json!({"reason": "manual"}),
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_allows_non_signal_command_after_out_of_order_signal_match() {
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 5,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let approved = matcher.match_signal("approved");
+        assert!(matches!(approved, HistoryMatch::Matched { .. }));
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
             }
         );
     }
