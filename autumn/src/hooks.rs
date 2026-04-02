@@ -179,7 +179,6 @@ pub trait MutationHooks: Send + Sync + 'static {
     ) -> impl Future<Output = AutumnResult<()>> + Send {
         async { Ok(()) }
     }
-
 }
 
 // ── Default no-op hooks ──────────────────────────────────────────────
