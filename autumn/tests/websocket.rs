@@ -166,10 +166,6 @@ async fn shutdown_token_propagates() {
     let child = state.shutdown_token();
 
     assert!(!child.is_cancelled());
-    // Since shutdown is internal, we can't easily cancel it directly in tests,
-    // but the actual framework cancellation logic is part of app.rs run().
-    // Since AppState test setup creates a new token, the test itself ensures
-    // child token derivation works.
-    // For coverage, we'd simulate what the server does:
-    // state.shutdown.cancel() is internal, so we only test derivation here.
+    state.trigger_shutdown_for_test();
+    assert!(child.is_cancelled());
 }

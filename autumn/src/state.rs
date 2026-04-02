@@ -179,6 +179,13 @@ impl AppState {
         self.shutdown.child_token()
     }
 
+    /// Helper for integration tests to simulate a server shutdown.
+    #[cfg(feature = "ws")]
+    #[doc(hidden)]
+    pub fn trigger_shutdown_for_test(&self) {
+        self.shutdown.cancel();
+    }
+
     /// Create an `AppState` suitable for testing, with sensible defaults
     /// for all fields. Database pool is `None`.
     #[allow(dead_code)]
