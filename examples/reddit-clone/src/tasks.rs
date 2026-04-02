@@ -20,8 +20,7 @@ use crate::schema::posts;
 #[scheduled(every = "15m", name = "hot-rank-calculator")]
 pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
     let pool = state
-        .pool
-        .as_ref()
+        .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
 
     let mut conn = pool.get().await.map_err(AutumnError::from)?;

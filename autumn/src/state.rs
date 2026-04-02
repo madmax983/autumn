@@ -23,73 +23,110 @@ use tokio_util::sync::CancellationToken;
 /// use autumn_web::AppState;
 ///
 /// // State without a database (e.g., for testing)
-/// let state = AppState {
-///     pool: None,
-///     profile: Some("dev".into()),
-///     started_at: std::time::Instant::now(),
-///     health_detailed: true,
-///     metrics: autumn_web::middleware::MetricsCollector::new(),
-///     log_levels: autumn_web::actuator::LogLevels::new("info"),
-///     task_registry: autumn_web::actuator::TaskRegistry::new(),
-///     config_props: Default::default(),
-///     #[cfg(feature = "ws")]
-///     channels: autumn_web::channels::Channels::new(32),
-///     #[cfg(feature = "ws")]
-///     shutdown: tokio_util::sync::CancellationToken::new(),
-/// };
+/// let state = AppState::for_test().with_profile("dev");
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AppState {
     /// Shared application state passed to all route handlers.
     /// Database connection pool, or `None` when no `database.url` is configured.
     #[cfg(feature = "db")]
-    pub pool:
+    pub(crate) pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Shared application state passed to all route handlers.
     /// Active profile name (e.g., "dev", "prod", "staging").
-    pub profile: Option<String>,
+    pub(crate) profile: Option<String>,
 
     /// Shared application state passed to all route handlers.
     /// When the application started. Used for uptime calculation.
-    pub started_at: std::time::Instant,
+    pub(crate) started_at: std::time::Instant,
 
     /// Shared application state passed to all route handlers.
     /// Whether the health endpoint should include detailed info.
-    pub health_detailed: bool,
+    pub(crate) health_detailed: bool,
 
     /// Shared application state passed to all route handlers.
     /// In-memory metrics collector for the `/actuator/metrics` endpoint.
-    pub metrics: middleware::MetricsCollector,
+    pub(crate) metrics: middleware::MetricsCollector,
 
     /// Shared application state passed to all route handlers.
     /// Runtime log level state for the `/actuator/loggers` endpoint.
-    pub log_levels: actuator::LogLevels,
+    pub(crate) log_levels: actuator::LogLevels,
 
     /// Shared application state passed to all route handlers.
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
-    pub task_registry: actuator::TaskRegistry,
+    pub(crate) task_registry: actuator::TaskRegistry,
 
     /// Shared application state passed to all route handlers.
     /// Resolved config properties with source tracking for `/actuator/configprops`.
-    pub config_props: actuator::ConfigProperties,
+    pub(crate) config_props: actuator::ConfigProperties,
 
     /// Named broadcast channel registry for real-time messaging.
     ///
     /// Available when the `ws` feature is enabled. Use
     /// [`channels()`](Self::channels) for convenient access.
     #[cfg(feature = "ws")]
-    pub channels: Channels,
+    pub(crate) channels: Channels,
 
     /// Cancellation token signalled during graceful shutdown.
     ///
     /// WebSocket handlers receive a child token so they can clean up
     /// when the server is stopping.
     #[cfg(feature = "ws")]
-    pub shutdown: CancellationToken,
+    pub(crate) shutdown: CancellationToken,
 }
 
 impl AppState {
+    /// Returns the database connection pool.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> {
+        self.pool.as_ref()
+    }
+
+    /// Returns the metrics collector.
+    #[must_use]
+    pub const fn metrics(&self) -> &middleware::MetricsCollector {
+        &self.metrics
+    }
+
+    /// Returns the log levels configuration.
+    #[must_use]
+    pub const fn log_levels(&self) -> &actuator::LogLevels {
+        &self.log_levels
+    }
+
+    /// Returns the task registry.
+    #[must_use]
+    pub const fn task_registry(&self) -> &actuator::TaskRegistry {
+        &self.task_registry
+    }
+
+    /// Returns the config properties.
+    #[must_use]
+    pub const fn config_props(&self) -> &actuator::ConfigProperties {
+        &self.config_props
+    }
+
+    /// Sets the database pool.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_pool(
+        mut self,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    ) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Sets the active profile.
+    #[must_use]
+    pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
+        self.profile = Some(profile.into());
+        self
+    }
+
     /// Shared application state passed to all route handlers.
     /// Returns the active profile name, or `"default"` if none is set.
     #[must_use]
@@ -141,9 +178,9 @@ impl AppState {
 
     /// Create an `AppState` suitable for testing, with sensible defaults
     /// for all fields. Database pool is `None`.
-    #[cfg(test)]
     #[allow(dead_code)]
-    pub(crate) fn for_test() -> Self {
+    #[must_use]
+    pub fn for_test() -> Self {
         Self {
             #[cfg(feature = "db")]
             pool: None,
@@ -193,21 +230,7 @@ mod tests {
 
     #[test]
     fn app_state_debug_without_pool() {
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: Some("dev".into()),
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test().with_profile("dev");
         let debug = format!("{state:?}");
         assert!(debug.contains("AppState"));
         assert!(debug.contains("dev"));
@@ -222,20 +245,7 @@ mod tests {
             ..Default::default()
         };
         let pool = db::create_pool(&config).unwrap().unwrap();
-        let state = AppState {
-            pool: Some(pool),
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test().with_pool(pool);
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
     }
@@ -246,81 +256,25 @@ mod tests {
 
     #[test]
     fn app_state_is_clone() {
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test();
         let _cloned = require_clone(&state);
     }
 
     #[test]
     fn app_state_profile_accessor() {
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: Some("staging".into()),
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test().with_profile("staging");
         assert_eq!(state.profile(), "staging");
     }
 
     #[test]
     fn app_state_profile_default() {
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test();
         assert_eq!(state.profile(), "default");
     }
 
     #[test]
     fn app_state_uptime_display() {
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
-        };
+        let state = AppState::for_test();
         let display = state.uptime_display();
         assert!(
             display.contains('s'),

@@ -25,21 +25,7 @@ const fn about_meta() -> StaticRouteMeta {
 }
 
 fn test_state() -> autumn_web::AppState {
-    autumn_web::AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-        #[cfg(feature = "ws")]
-        channels: autumn_web::channels::Channels::new(32),
-        #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    }
+    autumn_web::AppState::for_test()
 }
 
 #[tokio::test]
