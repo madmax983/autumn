@@ -739,6 +739,16 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                         tokio::time::sleep(delay).await;
                         tracing::debug!(task = %name, "Running scheduled task");
                         state.task_registry.record_start(&name);
+                        #[cfg(feature = "ws")]
+                        {
+                            let msg = serde_json::json!({
+                                "event": "started",
+                                "task": name,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+                        }
+
                         let start = std::time::Instant::now();
                         match (handler)(state.clone()).await {
                             Ok(()) => {
@@ -746,16 +756,40 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 state.task_registry.record_success(&name, duration_ms);
                                 tracing::debug!(task = %name, "Task completed");
+
+                                #[cfg(feature = "ws")]
+                                {
+                                    let msg = serde_json::json!({
+                                        "event": "success",
+                                        "task": name,
+                                        "duration_ms": duration_ms,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    let _ =
+                                        state.channels().sender("sys:tasks").send(msg.to_string());
+                                }
                             }
                             Err(e) => {
                                 let duration_ms =
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                state.task_registry.record_failure(
-                                    &name,
-                                    duration_ms,
-                                    &e.to_string(),
-                                );
+                                let error_str = e.to_string();
+                                state
+                                    .task_registry
+                                    .record_failure(&name, duration_ms, &error_str);
                                 tracing::warn!(task = %name, error = %e, "Task failed");
+
+                                #[cfg(feature = "ws")]
+                                {
+                                    let msg = serde_json::json!({
+                                        "event": "failure",
+                                        "task": name,
+                                        "duration_ms": duration_ms,
+                                        "error": error_str,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    let _ =
+                                        state.channels().sender("sys:tasks").send(msg.to_string());
+                                }
                             }
                         }
                     }
