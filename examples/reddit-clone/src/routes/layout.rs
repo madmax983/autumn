@@ -58,11 +58,10 @@ pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
                                   class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
                                     "New Post"
                                 }
-                                form action="/logout" method="post" class="inline" {
-                                    button type="submit"
-                                           class="text-gray-500 hover:text-orange-600 cursor-pointer" {
-                                        "Log out"
-                                    }
+                                button
+                                    hx-post="/logout"
+                                    class="text-gray-500 hover:text-orange-600 cursor-pointer" {
+                                    "Log out"
                                 }
                             } @else {
                                 a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }

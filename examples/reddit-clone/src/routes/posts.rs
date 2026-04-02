@@ -292,6 +292,11 @@ pub async fn submit(
     }
 
     let base_slug = slugify(&title);
+    if base_slug.is_empty() {
+        return Err(AutumnError::unprocessable_msg(
+            "Title must contain at least one letter or number",
+        ));
+    }
     let url = if form.0.url.trim().is_empty() {
         None
     } else {

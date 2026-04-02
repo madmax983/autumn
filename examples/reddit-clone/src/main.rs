@@ -68,17 +68,13 @@ async fn main() {
             // ── Votes (htmx) ──────────────────────────
             routes::votes::upvote,
             routes::votes::downvote,
-            // ── Generated REST API ─────────────────────
+            // ── Generated REST API (read-only) ────────
+            // Only expose list/get endpoints publicly.
+            // Mutations go through the authenticated HTML routes above.
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
-            repositories::subreddit_api_create,
-            repositories::subreddit_api_update,
-            repositories::subreddit_api_delete,
             repositories::post_api_list,
             repositories::post_api_get,
-            repositories::post_api_create,
-            repositories::post_api_update,
-            repositories::post_api_delete,
         ])
         .static_routes(static_routes![routes::about::about])
         .tasks(tasks![tasks::recalculate_hot_ranks])
