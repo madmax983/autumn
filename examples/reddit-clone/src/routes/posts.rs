@@ -31,7 +31,7 @@ type PostSummary = (
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
-pub async fn front_page(session: Session, mut db: Db) -> AutumnResult<Markup> {
+pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
     let hot_posts: Vec<PostSummary> = posts::table
@@ -56,6 +56,7 @@ pub async fn front_page(session: Session, mut db: Db) -> AutumnResult<Markup> {
     Ok(layout(
         "Front Page",
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             // Sort tabs
             div class="flex items-center gap-4 mb-4 text-sm" {
@@ -132,6 +133,7 @@ pub async fn submit_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
     Ok(layout(
         "Submit Post",
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create a Post" }
@@ -211,6 +213,7 @@ pub async fn submit_to_sub_form(
     Ok(layout(
         &format!("Submit to r/{}", sub.name),
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" {
@@ -394,6 +397,7 @@ pub async fn show(
     Ok(layout(
         &post.title,
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             // Breadcrumbs
             div class="text-sm text-gray-500 mb-4" {
@@ -543,6 +547,7 @@ pub async fn edit_form(
     Ok(layout(
         &format!("Edit: {}", post.title),
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Edit Post" }

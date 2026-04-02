@@ -21,6 +21,7 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
     layout(
         "Sign Up",
         None,
+        Some(csrf.token()),
         html! {
             div class="max-w-md mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create an Account" }
@@ -81,6 +82,14 @@ pub async fn register(
             "Username must be 2-32 characters",
         ));
     }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(AutumnError::unprocessable_msg(
+            "Username may only contain letters, numbers, and underscores",
+        ));
+    }
     if password.len() < 6 {
         return Err(AutumnError::unprocessable_msg(
             "Password must be at least 6 characters",
@@ -127,6 +136,7 @@ pub async fn login_form(csrf: CsrfToken) -> Markup {
     layout(
         "Log In",
         None,
+        Some(csrf.token()),
         html! {
             div class="max-w-md mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Log In" }
@@ -209,6 +219,7 @@ pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::
 pub async fn profile(
     Path(name): Path<String>,
     session: Session,
+    csrf: CsrfToken,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -223,6 +234,7 @@ pub async fn profile(
     Ok(layout(
         &format!("u/{}", user.username),
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             div class="bg-white rounded-lg shadow p-6" {
                 div class="flex items-center gap-4 mb-4" {

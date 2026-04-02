@@ -14,6 +14,7 @@ pub async fn about() -> Markup {
     layout(
         "About",
         None,
+        None,
         html! {
             div class="max-w-3xl mx-auto" {
                 h1 class="text-3xl font-bold mb-6" { "About Autumn Reddit" }

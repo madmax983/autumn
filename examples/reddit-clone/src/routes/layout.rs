@@ -34,7 +34,12 @@ pub fn hx_redirect_to(url: &str) -> Response {
 ///
 /// Accepts an optional `username` to show login/logout state in the nav.
 #[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
-pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
+pub fn layout(
+    title: &str,
+    username: Option<&str>,
+    csrf_token: Option<&str>,
+    content: Markup,
+) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -42,16 +47,21 @@ pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn Reddit" }
+                // Embed CSRF token in a meta tag so htmx JS can read it
+                // (the autumn-csrf cookie is HttpOnly and inaccessible to JS)
+                @if let Some(token) = csrf_token {
+                    meta name="csrf-token" content=(token);
+                }
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
-                // Configure htmx to send CSRF token from cookie on every request
+                // Configure htmx to send CSRF token from meta tag on every request
                 script {
-                    (PreEscaped(r"
+                    (PreEscaped(r#"
                     document.addEventListener('htmx:configRequest', function(evt) {
-                        var match = document.cookie.match(/autumn-csrf=([^;]+)/);
-                        if (match) evt.detail.headers['X-CSRF-Token'] = match[1];
+                        var meta = document.querySelector('meta[name="csrf-token"]');
+                        if (meta) evt.detail.headers['X-CSRF-Token'] = meta.content;
                     });
-                    "))
+                    "#))
                 }
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {

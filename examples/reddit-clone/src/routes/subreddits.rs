@@ -25,6 +25,7 @@ pub async fn list(session: Session, repo: PgSubredditRepository) -> AutumnResult
     Ok(layout(
         "Communities",
         current_user.as_deref(),
+        None,
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "Communities" }
@@ -73,6 +74,7 @@ pub async fn create_form(session: Session, csrf: CsrfToken) -> AutumnResult<Mark
     Ok(layout(
         "Create Community",
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             div class="max-w-lg mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create a Community" }
@@ -171,6 +173,7 @@ pub async fn create(
 pub async fn show(
     Path(slug): Path<String>,
     session: Session,
+    csrf: CsrfToken,
     repo: PgSubredditRepository,
     mut db: Db,
 ) -> AutumnResult<Markup> {
@@ -203,6 +206,7 @@ pub async fn show(
     Ok(layout(
         &format!("r/{}", sub.name),
         current_user.as_deref(),
+        Some(csrf.token()),
         html! {
             // Subreddit header
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
