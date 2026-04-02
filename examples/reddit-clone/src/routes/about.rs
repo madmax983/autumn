@@ -8,6 +8,7 @@ use autumn_web::{Markup, html, static_get};
 
 use super::layout::layout;
 
+#[allow(clippy::too_many_lines)] // Template-heavy function
 #[static_get("/about")]
 pub async fn about() -> Markup {
     layout(

@@ -13,7 +13,7 @@ use crate::schema::posts;
 
 /// Recalculate `hot_rank` for all posts using a time-decay formula.
 ///
-/// hot_rank = score / (age_in_hours + 2) ^ 1.5
+/// `hot_rank` = score / (`age_in_hours` + 2) ^ 1.5
 ///
 /// This ensures fresh posts with engagement bubble up, while older
 /// posts naturally decay off the front page.
@@ -41,7 +41,9 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
     let mut updated = 0u64;
 
     for (id, score, created_at) in &all_posts {
+        #[allow(clippy::cast_precision_loss)] // Acceptable for ranking math
         let age_hours = (now - *created_at).num_seconds() as f64 / 3600.0;
+        #[allow(clippy::cast_precision_loss)]
         let hot_rank = *score as f64 / (age_hours + 2.0_f64).powf(1.5);
 
         diesel::update(posts::table.find(*id))

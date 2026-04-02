@@ -91,6 +91,7 @@ pub struct Comment {
 // ── Vote ───────────────────────────────────────────────────────
 // Manual model — complex constraints.
 
+#[allow(dead_code)] // Used by generated API routes; not directly referenced in app code
 #[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
 #[diesel(table_name = votes)]
 pub struct Vote {

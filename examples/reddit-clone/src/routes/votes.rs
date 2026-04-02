@@ -65,7 +65,7 @@ async fn cast_vote(
 
             // Subtract old vote from score
             diesel::update(posts::table.find(post_id))
-                .set(posts::score.eq(posts::score - old_value as i64))
+                .set(posts::score.eq(posts::score - i64::from(old_value)))
                 .execute(&mut **db)
                 .await?;
         }
@@ -77,7 +77,7 @@ async fn cast_vote(
                 .await?;
 
             // Adjust score: remove old vote, add new vote
-            let diff = value as i64 - old_value as i64;
+            let diff = i64::from(value) - i64::from(old_value);
             diesel::update(posts::table.find(post_id))
                 .set(posts::score.eq(posts::score + diff))
                 .execute(&mut **db)
@@ -95,7 +95,7 @@ async fn cast_vote(
                 .await?;
 
             diesel::update(posts::table.find(post_id))
-                .set(posts::score.eq(posts::score + value as i64))
+                .set(posts::score.eq(posts::score + i64::from(value)))
                 .execute(&mut **db)
                 .await?;
         }

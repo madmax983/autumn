@@ -1,7 +1,7 @@
 //! Authentication routes — register, login, logout.
 //!
 //! Demonstrates: Session extractor, password hashing (bcrypt),
-//! session.insert / session.destroy, CsrfToken, form handling.
+//! session.insert / session.destroy, `CsrfToken`, form handling.
 
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;

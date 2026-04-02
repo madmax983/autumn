@@ -16,6 +16,7 @@ pub fn redirect_to(url: &str) -> Markup {
 /// Base HTML layout wrapping page content.
 ///
 /// Accepts an optional `username` to show login/logout state in the nav.
+#[allow(clippy::needless_pass_by_value)] // Maud Markup is idiomatically passed by value
 pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
@@ -28,12 +29,12 @@ pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
                 script src="/static/js/htmx.min.js" {}
                 // Configure htmx to send CSRF token from cookie on every request
                 script {
-                    (PreEscaped(r#"
+                    (PreEscaped(r"
                     document.addEventListener('htmx:configRequest', function(evt) {
                         var match = document.cookie.match(/autumn-csrf=([^;]+)/);
                         if (match) evt.detail.headers['X-CSRF-Token'] = match[1];
                     });
-                    "#))
+                    "))
                 }
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {

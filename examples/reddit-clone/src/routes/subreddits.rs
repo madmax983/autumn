@@ -1,14 +1,14 @@
 //! Subreddit routes — list communities, create, and show.
 //!
 //! Demonstrates: #[secured] macro for requiring authentication,
-//! repository-generated CRUD, CsrfToken for forms, Maud templates.
+//! repository-generated CRUD, `CsrfToken` for forms, Maud templates.
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{NewSubreddit, Subreddit, User};
+use crate::models::NewSubreddit;
 use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::{subreddits, users};
 use crate::slugify::slugify;

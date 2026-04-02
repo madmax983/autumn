@@ -1,6 +1,6 @@
 //! Post routes — front page, submit, view, edit, delete.
 //!
-//! Demonstrates: CRUD with the Db extractor, CsrfToken in forms,
+//! Demonstrates: CRUD with the Db extractor, `CsrfToken` in forms,
 //! #[secured] for write operations, htmx for voting and deletion,
 //! Maud templates with Tailwind CSS.
 
@@ -15,13 +15,16 @@ use crate::slugify::slugify;
 
 use super::layout::{layout, redirect_to, time_ago, vote_controls};
 
+/// (`post_id`, title, `post_slug`, score, `comment_count`, author, `sub_name`, `sub_slug`, `created_at`)
+type PostSummary = (i64, String, String, i64, i64, String, String, String, chrono::NaiveDateTime);
+
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
 pub async fn front_page(session: Session, mut db: Db) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
-    let hot_posts: Vec<(i64, String, String, i64, i64, String, String, String, chrono::NaiveDateTime)> =
+    let hot_posts: Vec<PostSummary> =
         posts::table
             .inner_join(users::table.on(posts::author_id.eq(users::id)))
             .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
@@ -299,7 +302,7 @@ pub async fn submit(
         .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
 
     // Ensure unique slug within this subreddit by appending a suffix
-    let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut *db).await?;
+    let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut db).await?;
 
     // Insert the post with an initial upvote (score = 1)
     diesel::insert_into(posts::table)
@@ -320,6 +323,7 @@ pub async fn submit(
 
 // ── View single post with comments ─────────────────────────────
 
+#[allow(clippy::too_many_lines)] // Template-heavy function
 #[get("/r/{sub_slug}/posts/{post_slug}")]
 pub async fn show(
     Path((sub_slug, post_slug)): Path<(String, String)>,
@@ -593,7 +597,7 @@ pub async fn update(
 
     let base_slug = slugify(&form.0.title);
     // Ensure unique slug within subreddit, excluding the current post
-    let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut *db).await?;
+    let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
 
     diesel::update(posts::table.find(post.id))
         .set((

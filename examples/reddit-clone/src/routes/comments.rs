@@ -1,7 +1,7 @@
 //! Comment routes — create and display comments on posts.
 //!
 //! Demonstrates: #[secured] for write routes, Db extractor for
-//! raw queries, CsrfToken, htmx integration for inline comment
+//! raw queries, `CsrfToken`, htmx integration for inline comment
 //! loading.
 
 use autumn_web::extract::Path;
