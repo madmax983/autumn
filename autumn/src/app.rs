@@ -1284,10 +1284,7 @@ fn build_router_with_static_inner(
                         if let Ok(contents) = std::fs::read(&file_path) {
                             return http::Response::builder()
                                 .status(http::StatusCode::OK)
-                                .header(
-                                    http::header::CONTENT_TYPE,
-                                    "text/html; charset=utf-8",
-                                )
+                                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
                                 .body(axum::body::Body::from(contents))
                                 .unwrap();
                         }
