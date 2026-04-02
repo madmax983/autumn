@@ -51,6 +51,14 @@ async fn cast_vote(
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
+    // Verify the post exists before touching votes
+    let post_exists: bool = diesel::dsl::select(diesel::dsl::exists(posts::table.find(post_id)))
+        .get_result(&mut **db)
+        .await?;
+    if !post_exists {
+        return Err(AutumnError::not_found_msg("Post not found"));
+    }
+
     // Check if user already voted on this post
     // All mutations filter by (user_id, post_id) — never by vote_id —
     // so concurrent toggle/flip requests cannot target a deleted row.

@@ -620,7 +620,14 @@ pub async fn update(
         ));
     }
 
-    let base_slug = slugify(&form.0.title);
+    let title = form.0.title.trim().to_string();
+    if title.is_empty() || title.len() > 300 {
+        return Err(AutumnError::unprocessable_msg(
+            "Title must be 1-300 characters",
+        ));
+    }
+
+    let base_slug = slugify(&title);
     if base_slug.is_empty() {
         return Err(AutumnError::unprocessable_msg(
             "Title must contain at least one letter or number",
@@ -631,7 +638,7 @@ pub async fn update(
 
     diesel::update(posts::table.find(post.id))
         .set((
-            posts::title.eq(form.0.title.trim()),
+            posts::title.eq(&title),
             posts::slug.eq(&new_slug),
             posts::body.eq(form.0.body.trim()),
             posts::updated_at.eq(chrono::Utc::now().naive_utc()),

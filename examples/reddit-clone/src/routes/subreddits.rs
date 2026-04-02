@@ -137,6 +137,11 @@ pub async fn create(
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
     let name = form.0.name.trim().to_string();
+    if name.len() < 2 || name.len() > 32 {
+        return Err(AutumnError::unprocessable_msg(
+            "Community name must be 2-32 characters",
+        ));
+    }
     let slug = slugify(&name);
     if slug.is_empty() {
         return Err(AutumnError::unprocessable_msg(
