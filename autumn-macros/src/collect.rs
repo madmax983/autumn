@@ -38,3 +38,61 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
         vec![#(#calls),*]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn tokens_to_string(tokens: &TokenStream) -> String {
+        tokens.to_string()
+    }
+
+    #[test]
+    fn test_collect_companions_empty() {
+        let input = quote! {};
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(&quote! { ::std::vec::Vec::new() })
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_single() {
+        let input = quote! { handler };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(&quote! { vec![__prefix_handler()] })
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_multiple() {
+        let input = quote! { a, b, c };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(&quote! { vec![__prefix_a(), __prefix_b(), __prefix_c()] })
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_module_path() {
+        let input = quote! { users::list, auth::login };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(&quote! { vec![users::__prefix_list(), auth::__prefix_login()] })
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_invalid_input() {
+        let input = quote! { struct };
+        let result = collect_companions(input, "__prefix_");
+        let result_str = tokens_to_string(&result);
+        assert!(result_str.contains("compile_error"));
+    }
+}
