@@ -1,4 +1,4 @@
-# Autumn ??
+# Autumn üçÇ
 
 [![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
@@ -19,16 +19,16 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ## Features
 
-- **Route and app macros** ó `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
-- **Hybrid rendering** ó `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
-- **Application builder** ó `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
-- **Configuration and profiles** ó defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
-- **Database ergonomics** ó async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
-- **HTML stack** ó Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
-- **Operations** ó `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
-- **Background work** ó `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
-- **Security primitives** ó session cookies, auth extractor, security headers, CSRF, and `#[secured]`
-- **CLI workflow** ó `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
+- **Route and app macros** - `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
+- **Hybrid rendering** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
+- **Application builder** - `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
+- **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
+- **Database ergonomics** - async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
+- **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
+- **Background work** - `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
 
 ## Quickstart
 
@@ -84,13 +84,13 @@ async fn main() {
 
 ## Built On
 
-- [Axum](https://github.com/tokio-rs/axum) ó async HTTP routing and middleware
-- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) ó database access
-- [Maud](https://maud.lambda.xyz/) ó compiled HTML templates
-- [htmx](https://htmx.org/) ó HTML-first interactivity
-- [Tailwind CSS](https://tailwindcss.com/) ó utility-first styling
-- [Tokio](https://tokio.rs/) ó async runtime
-- [Tracing](https://github.com/tokio-rs/tracing) ó structured logging
+- [Axum](https://github.com/tokio-rs/axum) - async HTTP routing and middleware
+- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) - database access
+- [Maud](https://maud.lambda.xyz/) - compiled HTML templates
+- [htmx](https://htmx.org/) - HTML-first interactivity
+- [Tailwind CSS](https://tailwindcss.com/) - utility-first styling
+- [Tokio](https://tokio.rs/) - async runtime
+- [Tracing](https://github.com/tokio-rs/tracing) - structured logging
 
 ## Examples
 
