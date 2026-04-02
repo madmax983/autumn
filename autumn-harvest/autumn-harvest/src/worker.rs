@@ -193,6 +193,24 @@ fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
             .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
 }
 
+fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
+    if commands.is_empty() {
+        return false;
+    }
+
+    let has_wait = commands
+        .iter()
+        .any(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }));
+    let only_wait_or_marker = commands.iter().all(|cmd| {
+        matches!(
+            cmd,
+            WorkflowCommand::WaitForSignal { .. } | WorkflowCommand::RecordMarker { .. }
+        )
+    });
+
+    has_wait && only_wait_or_marker
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -459,7 +477,7 @@ async fn process_workflow_task(
             persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
         }
         WorkflowOutcome::Suspended { commands } => {
-            if all_commands_wait_for_signal(&commands) {
+            if should_requeue_signal_wait(&commands) {
                 queue::requeue_for_retry(conn, task.id, chrono::Duration::seconds(1)).await
             } else {
                 let error = suspended_workflow_error(&commands);
@@ -840,5 +858,29 @@ mod tests {
             },
         ];
         assert!(!all_commands_wait_for_signal(&mixed));
+    }
+
+    #[test]
+    fn should_requeue_signal_wait_allows_marker_plus_wait() {
+        let commands = vec![
+            WorkflowCommand::RecordMarker {
+                name: "version:gate".to_string(),
+                details: serde_json::json!(2),
+            },
+            WorkflowCommand::WaitForSignal {
+                signal_name: "approved".to_string(),
+                result_tx: oneshot::channel::<serde_json::Value>().0,
+            },
+        ];
+        assert!(should_requeue_signal_wait(&commands));
+    }
+
+    #[test]
+    fn should_requeue_signal_wait_rejects_marker_only() {
+        let commands = vec![WorkflowCommand::RecordMarker {
+            name: "version:gate".to_string(),
+            details: serde_json::json!(2),
+        }];
+        assert!(!should_requeue_signal_wait(&commands));
     }
 }
