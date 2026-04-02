@@ -26,6 +26,15 @@ pub fn layout(title: &str, username: Option<&str>, content: Markup) -> Markup {
                 title { (title) " — Autumn Reddit" }
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src="/static/js/htmx.min.js" {}
+                // Configure htmx to send CSRF token from cookie on every request
+                script {
+                    (PreEscaped(r#"
+                    document.addEventListener('htmx:configRequest', function(evt) {
+                        var match = document.cookie.match(/autumn-csrf=([^;]+)/);
+                        if (match) evt.detail.headers['X-CSRF-Token'] = match[1];
+                    });
+                    "#))
+                }
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {
                 // Navigation bar

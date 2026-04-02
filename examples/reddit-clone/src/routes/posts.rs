@@ -283,7 +283,7 @@ pub async fn submit(
         ));
     }
 
-    let slug = slugify(&title);
+    let base_slug = slugify(&title);
     let url = if form.0.url.trim().is_empty() {
         None
     } else {
@@ -297,6 +297,9 @@ pub async fn submit(
         .first(&mut *db)
         .await
         .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
+
+    // Ensure unique slug within this subreddit by appending a suffix
+    let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut *db).await?;
 
     // Insert the post with an initial upvote (score = 1)
     diesel::insert_into(posts::table)
@@ -588,7 +591,9 @@ pub async fn update(
         return Err(AutumnError::forbidden_msg("You can only edit your own posts"));
     }
 
-    let new_slug = slugify(&form.0.title);
+    let base_slug = slugify(&form.0.title);
+    // Ensure unique slug within subreddit, excluding the current post
+    let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut *db).await?;
 
     diesel::update(posts::table.find(post.id))
         .set((
@@ -639,4 +644,54 @@ pub async fn delete_post(
         .await?;
 
     Ok(redirect_to(&format!("/r/{sub_slug}")))
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+/// Generate a unique slug within a subreddit by appending `-2`, `-3`, etc.
+async fn unique_slug(
+    base: &str,
+    subreddit_id: i64,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<String> {
+    let mut slug = base.to_string();
+    let mut suffix = 2u64;
+    loop {
+        let count: i64 = posts::table
+            .filter(posts::subreddit_id.eq(subreddit_id))
+            .filter(posts::slug.eq(&slug))
+            .count()
+            .get_result(conn)
+            .await?;
+        if count == 0 {
+            return Ok(slug);
+        }
+        slug = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+}
+
+/// Like `unique_slug`, but excludes a specific post ID (for updates).
+async fn unique_slug_excluding(
+    base: &str,
+    subreddit_id: i64,
+    exclude_id: i64,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<String> {
+    let mut slug = base.to_string();
+    let mut suffix = 2u64;
+    loop {
+        let count: i64 = posts::table
+            .filter(posts::subreddit_id.eq(subreddit_id))
+            .filter(posts::slug.eq(&slug))
+            .filter(posts::id.ne(exclude_id))
+            .count()
+            .get_result(conn)
+            .await?;
+        if count == 0 {
+            return Ok(slug);
+        }
+        slug = format!("{base}-{suffix}");
+        suffix += 1;
+    }
 }

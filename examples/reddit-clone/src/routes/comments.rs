@@ -75,10 +75,12 @@ pub async fn create(
 /// htmx endpoint: load comments for a post (for lazy loading).
 #[get("/r/{sub_slug}/posts/{post_slug}/comments")]
 pub async fn list_comments(
-    Path((_sub_slug, post_slug)): Path<(String, String)>,
+    Path((sub_slug, post_slug)): Path<(String, String)>,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let post_id: i64 = posts::table
+        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+        .filter(subreddits::slug.eq(&sub_slug))
         .filter(posts::slug.eq(&post_slug))
         .select(posts::id)
         .first(&mut *db)
