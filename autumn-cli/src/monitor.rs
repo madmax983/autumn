@@ -224,7 +224,18 @@ impl DashboardState {
             }
         };
 
-        // Fetch health
+        if !self.fetch_health(&client) {
+            return;
+        }
+
+        self.fetch_metrics(&client);
+        self.fetch_tasks(&client);
+        self.fetch_loggers(&client);
+
+        self.last_poll = Instant::now();
+    }
+
+    fn fetch_health(&mut self, client: &reqwest::blocking::Client) -> bool {
         match client
             .get(format!("{}/actuator/health", self.base_url))
             .send()
@@ -235,19 +246,22 @@ impl DashboardState {
                 if let Ok(h) = resp.json::<HealthResponse>() {
                     self.health = h;
                 }
+                true
             }
             Ok(resp) => {
                 self.connected = true;
                 self.last_error = Some(format!("Health returned {}", resp.status()));
+                true
             }
             Err(e) => {
                 self.connected = false;
                 self.last_error = Some(format!("Connection failed: {e}"));
-                return;
+                false
             }
         }
+    }
 
-        // Fetch metrics
+    fn fetch_metrics(&mut self, client: &reqwest::blocking::Client) {
         if let Ok(resp) = client
             .get(format!("{}/actuator/metrics", self.base_url))
             .send()
@@ -282,8 +296,9 @@ impl DashboardState {
                 self.metrics = m;
             }
         }
+    }
 
-        // Fetch tasks (best effort, may 404 in prod mode)
+    fn fetch_tasks(&mut self, client: &reqwest::blocking::Client) {
         if let Ok(resp) = client
             .get(format!("{}/actuator/tasks", self.base_url))
             .send()
@@ -292,8 +307,9 @@ impl DashboardState {
                 self.tasks = t;
             }
         }
+    }
 
-        // Fetch loggers (best effort, may 404 in prod mode)
+    fn fetch_loggers(&mut self, client: &reqwest::blocking::Client) {
         if let Ok(resp) = client
             .get(format!("{}/actuator/loggers", self.base_url))
             .send()
@@ -302,8 +318,6 @@ impl DashboardState {
                 self.loggers = l;
             }
         }
-
-        self.last_poll = Instant::now();
     }
 }
 
