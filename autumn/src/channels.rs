@@ -355,4 +355,16 @@ mod tests {
         // "dead" has 0 receivers and 0 active senders (dropped), so it gets cleaned.
         assert_eq!(channels.channel_count(), 1);
     }
+
+    #[test]
+    fn send_without_receivers_returns_err() {
+        let channels = Channels::new(16);
+        let tx = channels.sender("chat");
+
+        let result = tx.send("hello");
+        assert!(result.is_err(), "should return error when no subscribers are active");
+
+        let err = result.unwrap_err();
+        assert_eq!(err.0.as_str(), "hello");
+    }
 }

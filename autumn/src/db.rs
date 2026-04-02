@@ -55,7 +55,12 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
     };
 
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    let pool = Pool::builder(manager).max_size(config.pool_size).build()?;
+
+    // Attempting to build a deadpool Pool with max_size(0) causes a panic.
+    // We enforce a minimum pool size of 1.
+    let safe_pool_size = config.pool_size.max(1);
+
+    let pool = Pool::builder(manager).max_size(safe_pool_size).build()?;
 
     Ok(Some(pool))
 }
@@ -162,6 +167,17 @@ mod tests {
             .expect("should build pool")
             .expect("should be Some");
         assert_eq!(pool.status().max_size, 5);
+    }
+
+    #[test]
+    fn create_pool_with_zero_pool_size_defaults_to_one() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            pool_size: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap().unwrap();
+        assert_eq!(pool.status().max_size, 1, "should clamp 0 pool_size to 1");
     }
 
     // ── Db extractor tests ───────────────────────────────────────
