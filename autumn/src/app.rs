@@ -1164,9 +1164,13 @@ fn build_router_inner(
 /// Build the router with optional static-file-first serving.
 ///
 /// If `dist_dir` is `Some` and contains a valid `manifest.json`, the
-/// returned router uses `ServeDir` to serve pre-built HTML files first
-/// and falls back to the dynamic Axum router for any path not found on
-/// disk.  This is the "static-first, SSR-fallback" pattern.
+/// returned router intercepts GET requests whose path appears in the
+/// manifest and serves pre-built HTML directly — before the dynamic
+/// router runs.  This matches Next.js SSG/ISR semantics where static
+/// pages always win over dynamic handlers.
+///
+/// Requests not in the manifest (including all non-GET methods) fall
+/// through to the dynamic router unchanged.
 ///
 /// When `dist_dir` is `None` or the manifest is missing, the returned
 /// router is identical to [`build_router`].
@@ -1249,39 +1253,50 @@ fn build_router_with_static_inner(
         );
     }
 
-    // Store the layer in an Arc so the ISR check middleware can use it.
+    // Store the layer in an Arc so the static-first middleware can use it.
     let layer = Arc::new(layer);
 
-    // Mount static files as a fallback on the app router rather than
-    // wrapping the app behind ServeDir. The previous approach
-    // (ServeDir.fallback(app)) caused 405 errors for POST/PUT/DELETE
-    // because ServeDir only handles GET/HEAD — non-GET requests never
-    // reached the app router's fallback.
+    // Static-first serving: intercept GET requests whose path appears in
+    // the manifest and serve pre-built HTML directly, BEFORE the dynamic
+    // router runs.  This matches Next.js SSG/ISR semantics where static
+    // pages always win over dynamic handlers.
     //
-    // With this approach: explicit routes (GET, POST, etc.) always win.
-    // Only requests that match NO dynamic route fall through to ServeDir,
-    // which then serves static files (e.g. /about/ → dist/about/index.html).
+    // Requests not in the manifest (including all non-GET methods) fall
+    // through to the dynamic router unchanged.
     //
-    // ISR staleness checking: before ServeDir handles the request, we
-    // trigger resolve() on the StaticFileLayer to check for stale pages
-    // and spawn background regeneration tasks if needed.
-    let isr_layer = layer;
-    let serve_dir = tower_http::services::ServeDir::new(dist);
-    app_router
-        .layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let isr_layer = isr_layer.clone();
-                async move {
-                    // Trigger ISR check for GET requests (resolves the path
-                    // and spawns background regeneration if stale)
-                    if req.method() == http::Method::GET {
-                        let _ = isr_layer.resolve(req.uri().path());
+    // ISR staleness checking happens inside `resolve()`: stale pages are
+    // still served immediately while background regeneration runs
+    // (stale-while-revalidate).
+    let static_layer = layer;
+    app_router.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let static_layer = static_layer.clone();
+            async move {
+                if req.method() == http::Method::GET {
+                    let path = req.uri().path();
+                    // Normalize trailing slash: /about/ → /about (but keep / as /)
+                    let normalized = if path.len() > 1 && path.ends_with('/') {
+                        &path[..path.len() - 1]
+                    } else {
+                        path
+                    };
+                    if let Some(file_path) = static_layer.resolve(normalized) {
+                        if let Ok(contents) = std::fs::read(&file_path) {
+                            return http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .header(
+                                    http::header::CONTENT_TYPE,
+                                    "text/html; charset=utf-8",
+                                )
+                                .body(axum::body::Body::from(contents))
+                                .unwrap();
+                        }
                     }
-                    next.run(req).await
                 }
-            },
-        ))
-        .fallback_service(serve_dir)
+                next.run(req).await
+            }
+        },
+    ))
 }
 
 /// Build a `tower_http::cors::CorsLayer` from the framework's [`crate::config::CorsConfig`].
@@ -1852,8 +1867,8 @@ mod tests {
             Some(dist.as_path()),
         );
 
-        // GET /docs/ should serve the static file via ServeDir fallback
-        // (no dynamic route competes for this path).
+        // GET /docs/ should serve the pre-built HTML via static-first
+        // middleware (manifest lookup with trailing-slash normalization).
         let response = router
             .oneshot(
                 Request::builder()

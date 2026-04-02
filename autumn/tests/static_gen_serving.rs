@@ -1,8 +1,9 @@
 //! Integration tests for static-file-first serving through the full router.
 //!
-//! Exercises `build_router_with_static` end-to-end: static files shadow
-//! dynamic routes when a `dist/` directory with a valid manifest is present,
-//! and dynamic routes still work when no static build exists.
+//! Exercises `build_router_with_static` end-to-end: pre-built static files
+//! take priority over dynamic routes when a `dist/` directory with a valid
+//! manifest is present (Next.js SSG/ISR semantics).  Dynamic routes still
+//! work for paths not in the manifest or when no static build exists.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -42,11 +43,11 @@ fn dynamic_get_route(
     }
 }
 
-/// Dynamic routes take priority over static files. When both exist,
-/// the dynamic handler runs (SSR). Static files in dist/ are served
-/// only for paths with NO matching dynamic route.
+/// Static files take priority over dynamic routes (Next.js SSG/ISR
+/// semantics).  When both exist, the pre-built HTML is served directly.
+/// The dynamic handler only runs for paths NOT in the manifest.
 #[tokio::test]
-async fn dynamic_routes_take_priority_over_static_files() {
+async fn static_files_take_priority_over_dynamic_routes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dist = tmp.path().join("dist");
     std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
@@ -82,7 +83,8 @@ async fn dynamic_routes_take_priority_over_static_files() {
         Some(dist.as_path()),
     );
 
-    // Dynamic handler wins — GET /about returns the SSR response, not the static file.
+    // Static file wins — GET /about returns the pre-built HTML, not the
+    // dynamic handler.  This matches Next.js SSG semantics.
     let resp = router
         .oneshot(
             Request::builder()
@@ -99,8 +101,8 @@ async fn dynamic_routes_take_priority_over_static_files() {
         .unwrap();
     let text = std::str::from_utf8(&body).expect("valid utf-8");
     assert!(
-        text.contains("Dynamic About"),
-        "Dynamic handler should take priority, got: {text}"
+        text.contains("Static About"),
+        "Static file should take priority, got: {text}"
     );
 }
 
