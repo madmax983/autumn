@@ -194,12 +194,19 @@ impl Channels {
     #[must_use]
     pub fn sender(&self, name: &str) -> Sender {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        let tx = registry
-            .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(broadcast::channel(self.inner.capacity).0));
-        let sender = Sender {
-            inner: Arc::clone(tx),
+
+        // ⚡ Bolt Optimization: Use get() first to avoid allocating a String key
+        // on every lookup for channels that already exist.
+        #[allow(clippy::option_if_let_else)]
+        let tx = if let Some(tx) = registry.get(name) {
+            Arc::clone(tx)
+        } else {
+            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
+            registry.insert(name.to_owned(), Arc::clone(&tx));
+            tx
         };
+
+        let sender = Sender { inner: tx };
         drop(registry);
         sender
     }
@@ -226,9 +233,18 @@ impl Channels {
     #[must_use]
     pub fn subscribe(&self, name: &str) -> Subscriber {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        let tx = registry
-            .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(broadcast::channel(self.inner.capacity).0));
+
+        // ⚡ Bolt Optimization: Use get() first to avoid allocating a String key
+        // on every lookup for channels that already exist.
+        #[allow(clippy::option_if_let_else)]
+        let tx = if let Some(tx) = registry.get(name) {
+            Arc::clone(tx)
+        } else {
+            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
+            registry.insert(name.to_owned(), Arc::clone(&tx));
+            tx
+        };
+
         let subscriber = Subscriber {
             inner: tx.subscribe(),
         };
