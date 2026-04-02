@@ -1372,13 +1372,13 @@ mod tests {
                     }
                 }
 
-                let (body, status) = if req_line.contains("GET /actuator/health") {
+                let (body, status) = if req_line.contains("/actuator/health") {
                     ("{\"status\":\"up\"}", "200 OK")
-                } else if req_line.contains("GET /actuator/metrics") {
+                } else if req_line.contains("/actuator/metrics") {
                     ("{\"http\":{\"requests_total\":42}}", "200 OK")
-                } else if req_line.contains("GET /actuator/tasks") {
+                } else if req_line.contains("/actuator/tasks") {
                     ("{\"scheduled_tasks\":{}}", "200 OK")
-                } else if req_line.contains("GET /actuator/loggers") {
+                } else if req_line.contains("/actuator/loggers") {
                     ("{\"current_level\":\"info\"}", "200 OK")
                 } else {
                     ("", "404 NOT FOUND")
@@ -1411,7 +1411,11 @@ mod tests {
     #[test]
     fn test_poll_handles_connection_error() {
         // Use an invalid port to force connection error
-        let mut state = DashboardState::new("http://127.0.0.1:1".to_string());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Ensure the port is immediately closed and unreachable
+
+        let mut state = DashboardState::new(format!("http://127.0.0.1:{port}"));
         state.connected = true; // Assume it was previously connected
 
         state.poll();
