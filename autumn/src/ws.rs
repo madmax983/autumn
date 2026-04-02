@@ -1,6 +1,6 @@
 //! WebSocket support for Autumn applications.
 //!
-//! This module provides ergonomic WebSocket handling through the [`#[ws]`](crate::ws)
+//! This module provides ergonomic WebSocket handling through the [`#[ws]`](macro@crate::ws)
 //! macro and re-exports of Axum's WebSocket types.
 //!
 //! # Two-function pattern
