@@ -12,7 +12,7 @@
 //! |----------|-------|
 //! | Route macros | [`get`], [`post`], [`put`], [`delete`], [`routes`], [`main`] |
 //! | HTML rendering | [`Markup`], [`PreEscaped`], [`html!`](maud::html) |
-//! | Extractors | [`Db`], [`Json`], [`Form`] |
+//! | Extractors | [`Db`], [`Json`], [`Form`], [`Path`] |
 //! | Error handling | [`AutumnError`], [`AutumnResult`] |
 //! | State | [`AppState`] |
 //!
@@ -44,6 +44,8 @@ pub use crate::db::Db;
 pub use crate::extract::Form;
 /// JSON request/response type.
 pub use crate::extract::Json;
+/// Path extractor.
+pub use crate::extract::Path;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.
