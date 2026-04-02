@@ -650,7 +650,7 @@ pub async fn delete_post(
     Path((sub_slug, post_slug)): Path<(String, String)>,
     session: Session,
     mut db: Db,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -677,7 +677,7 @@ pub async fn delete_post(
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to(&format!("/r/{sub_slug}")))
+    Ok(super::layout::hx_redirect_to(&format!("/r/{sub_slug}")))
 }
 
 // ── Helpers ────────────────────────────────────────────────────

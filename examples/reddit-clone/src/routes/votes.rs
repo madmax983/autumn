@@ -52,27 +52,37 @@ async fn cast_vote(
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
 
     // Check if user already voted on this post
-    let existing: Option<(i64, i16)> = votes::table
+    // All mutations filter by (user_id, post_id) — never by vote_id —
+    // so concurrent toggle/flip requests cannot target a deleted row.
+    let existing_value: Option<i16> = votes::table
         .filter(votes::user_id.eq(user_id))
         .filter(votes::post_id.eq(post_id))
-        .select((votes::id, votes::value))
+        .select(votes::value)
         .first(&mut **db)
         .await
         .optional()?;
 
-    match existing {
-        Some((vote_id, old_value)) if old_value == value => {
+    match existing_value {
+        Some(old_value) if old_value == value => {
             // Same vote again — toggle off (remove vote)
-            diesel::delete(votes::table.find(vote_id))
-                .execute(&mut **db)
-                .await?;
+            diesel::delete(
+                votes::table
+                    .filter(votes::user_id.eq(user_id))
+                    .filter(votes::post_id.eq(post_id)),
+            )
+            .execute(&mut **db)
+            .await?;
         }
-        Some((vote_id, _)) => {
+        Some(_) => {
             // Different vote — flip direction
-            diesel::update(votes::table.find(vote_id))
-                .set(votes::value.eq(value))
-                .execute(&mut **db)
-                .await?;
+            diesel::update(
+                votes::table
+                    .filter(votes::user_id.eq(user_id))
+                    .filter(votes::post_id.eq(post_id)),
+            )
+            .set(votes::value.eq(value))
+            .execute(&mut **db)
+            .await?;
         }
         None => {
             // New vote — ON CONFLICT DO UPDATE so rapid clicks always

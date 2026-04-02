@@ -1,8 +1,10 @@
 //! Shared layout and UI components used across all routes.
 
+use autumn_web::reexports::axum::response::{IntoResponse, Response};
+use autumn_web::reexports::http;
 use autumn_web::{Markup, PreEscaped, html};
 
-/// Render a meta-refresh redirect page.
+/// Render a meta-refresh redirect page (for regular form submissions).
 pub fn redirect_to(url: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
@@ -11,6 +13,21 @@ pub fn redirect_to(url: &str) -> Markup {
             body { p { "Redirecting to " a href=(url) { (url) } "..." } }
         }
     }
+}
+
+/// Redirect that works for htmx requests.
+///
+/// Returns an `HX-Redirect` header so htmx performs a full-page navigation
+/// instead of swapping the response into the triggering element. Also
+/// includes a meta-refresh fallback for non-htmx clients.
+pub fn hx_redirect_to(url: &str) -> Response {
+    let mut response = redirect_to(url).into_response();
+    response.headers_mut().insert(
+        http::header::HeaderName::from_static("hx-redirect"),
+        http::header::HeaderValue::from_str(url)
+            .unwrap_or_else(|_| http::header::HeaderValue::from_static("/")),
+    );
+    response
 }
 
 /// Base HTML layout wrapping page content.

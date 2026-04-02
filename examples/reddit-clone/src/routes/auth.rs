@@ -198,9 +198,9 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
 // ── Logout ─────────────────────────────────────────────────────
 
 #[post("/logout")]
-pub async fn logout(session: Session) -> Markup {
+pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::Response {
     session.destroy().await;
-    redirect_to("/")
+    super::layout::hx_redirect_to("/")
 }
 
 // ── Profile ────────────────────────────────────────────────────
