@@ -88,8 +88,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    const MIGRATION_SQL: &str =
-        include_str!("../migrations/00000000000000_create_reddit/up.sql");
+    const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
 
     #[test]
     fn migration_uses_bigserial_ids() {

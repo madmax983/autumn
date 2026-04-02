@@ -67,10 +67,4 @@ diesel::joinable!(comments -> users (author_id));
 diesel::joinable!(comments -> posts (post_id));
 diesel::joinable!(subreddits -> users (creator_id));
 
-diesel::allow_tables_to_appear_in_same_query!(
-    users,
-    subreddits,
-    posts,
-    comments,
-    votes,
-);
+diesel::allow_tables_to_appear_in_same_query!(users, subreddits, posts, comments, votes,);

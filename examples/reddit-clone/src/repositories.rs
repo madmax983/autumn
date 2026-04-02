@@ -9,8 +9,7 @@
 
 use crate::hooks::PostHooks;
 use crate::models::{
-    NewPost, NewSubreddit, Post, PostDraftExt, Subreddit, UpdatePost,
-    UpdateSubreddit,
+    NewPost, NewSubreddit, Post, PostDraftExt, Subreddit, UpdatePost, UpdateSubreddit,
 };
 use crate::schema::{posts, subreddits};
 

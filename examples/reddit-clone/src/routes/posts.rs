@@ -16,7 +16,17 @@ use crate::slugify::slugify;
 use super::layout::{layout, redirect_to, time_ago, vote_controls};
 
 /// (`post_id`, title, `post_slug`, score, `comment_count`, author, `sub_name`, `sub_slug`, `created_at`)
-type PostSummary = (i64, String, String, i64, i64, String, String, String, chrono::NaiveDateTime);
+type PostSummary = (
+    i64,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    chrono::NaiveDateTime,
+);
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -24,25 +34,24 @@ type PostSummary = (i64, String, String, i64, i64, String, String, String, chron
 pub async fn front_page(session: Session, mut db: Db) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
-    let hot_posts: Vec<PostSummary> =
-        posts::table
-            .inner_join(users::table.on(posts::author_id.eq(users::id)))
-            .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-            .order(posts::hot_rank.desc())
-            .limit(50)
-            .select((
-                posts::id,
-                posts::title,
-                posts::slug,
-                posts::score,
-                posts::comment_count,
-                users::username,
-                subreddits::name,
-                subreddits::slug,
-                posts::created_at,
-            ))
-            .load(&mut *db)
-            .await?;
+    let hot_posts: Vec<PostSummary> = posts::table
+        .inner_join(users::table.on(posts::author_id.eq(users::id)))
+        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+        .order(posts::hot_rank.desc())
+        .limit(50)
+        .select((
+            posts::id,
+            posts::title,
+            posts::slug,
+            posts::score,
+            posts::comment_count,
+            users::username,
+            subreddits::name,
+            subreddits::slug,
+            posts::created_at,
+        ))
+        .load(&mut *db)
+        .await?;
 
     Ok(layout(
         "Front Page",
@@ -111,11 +120,7 @@ pub async fn front_page(session: Session, mut db: Db) -> AutumnResult<Markup> {
 
 #[secured]
 #[get("/submit")]
-pub async fn submit_form(
-    session: Session,
-    csrf: CsrfToken,
-    mut db: Db,
-) -> AutumnResult<Markup> {
+pub async fn submit_form(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
     let subs: Vec<Subreddit> = subreddits::table
@@ -514,7 +519,9 @@ pub async fn edit_form(
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
     if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg("You can only edit your own posts"));
+        return Err(AutumnError::forbidden_msg(
+            "You can only edit your own posts",
+        ));
     }
 
     Ok(layout(
@@ -592,7 +599,9 @@ pub async fn update(
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
     if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg("You can only edit your own posts"));
+        return Err(AutumnError::forbidden_msg(
+            "You can only edit your own posts",
+        ));
     }
 
     let base_slug = slugify(&form.0.title);

@@ -171,11 +171,7 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(
-    mut db: Db,
-    session: Session,
-    form: Form<LoginForm>,
-) -> AutumnResult<Markup> {
+pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Markup> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table

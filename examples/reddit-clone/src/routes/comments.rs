@@ -67,9 +67,7 @@ pub async fn create(
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to(&format!(
-        "/r/{sub_slug}/posts/{post_slug}"
-    )))
+    Ok(redirect_to(&format!("/r/{sub_slug}/posts/{post_slug}")))
 }
 
 /// htmx endpoint: load comments for a post (for lazy loading).
