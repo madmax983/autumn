@@ -19,16 +19,16 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ## Features
 
-- **Route and app macros** — `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
-- **Hybrid rendering** — `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
-- **Application builder** — `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
-- **Configuration and profiles** — defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
-- **Database ergonomics** — async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
-- **HTML stack** — Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
-- **Operations** — `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
-- **Background work** — `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
-- **Security primitives** — session cookies, auth extractor, security headers, CSRF, and `#[secured]`
-- **CLI workflow** — `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
+- **Route and app macros** ï¿½ `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
+- **Hybrid rendering** ï¿½ `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
+- **Application builder** ï¿½ `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
+- **Configuration and profiles** ï¿½ defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
+- **Database ergonomics** ï¿½ async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
+- **HTML stack** ï¿½ Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Operations** ï¿½ `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
+- **Background work** ï¿½ `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Security primitives** ï¿½ session cookies, auth extractor, security headers, CSRF, and `#[secured]`
+- **CLI workflow** ï¿½ `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
 
 ## Quickstart
 
@@ -84,13 +84,13 @@ async fn main() {
 
 ## Built On
 
-- [Axum](https://github.com/tokio-rs/axum) — async HTTP routing and middleware
-- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) — database access
-- [Maud](https://maud.lambda.xyz/) — compiled HTML templates
-- [htmx](https://htmx.org/) — HTML-first interactivity
-- [Tailwind CSS](https://tailwindcss.com/) — utility-first styling
-- [Tokio](https://tokio.rs/) — async runtime
-- [Tracing](https://github.com/tokio-rs/tracing) — structured logging
+- [Axum](https://github.com/tokio-rs/axum) ï¿½ async HTTP routing and middleware
+- [Diesel](https://diesel.rs/) + [diesel-async](https://github.com/weiznich/diesel_async) ï¿½ database access
+- [Maud](https://maud.lambda.xyz/) ï¿½ compiled HTML templates
+- [htmx](https://htmx.org/) ï¿½ HTML-first interactivity
+- [Tailwind CSS](https://tailwindcss.com/) ï¿½ utility-first styling
+- [Tokio](https://tokio.rs/) ï¿½ async runtime
+- [Tracing](https://github.com/tokio-rs/tracing) ï¿½ structured logging
 
 ## Examples
 
@@ -101,6 +101,7 @@ async fn main() {
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and hybrid rendering via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using **every** framework feature: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, htmx voting, and profiles |
 
 ## Documentation
 
