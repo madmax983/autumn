@@ -1,5 +1,4 @@
-#!/usr/bin/env bash
-set -euo pipefail
+$ErrorActionPreference = "Stop"
 
 rustup target add wasm32-unknown-unknown
 cargo test -p autumn-web

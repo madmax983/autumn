@@ -2,6 +2,7 @@ pub mod action;
 mod boot;
 pub mod compose;
 mod island;
+pub mod prelude;
 pub mod signal;
 
 pub use boot::boot;
@@ -14,10 +15,6 @@ pub type Element = web_sys::Element;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub type Element = ();
-
-pub mod prelude {
-    pub use crate::{Composition, IslandRegistration, Signal, Subscription, action, boot};
-}
 
 #[cfg(test)]
 mod tests {
