@@ -36,7 +36,6 @@ Open <http://localhost:3000>.
 
 - `before_create` slugifies the title and fills in a default `"draft"` status
 - `before_update` re-slugifies when the title changes
-- `after_create` and `after_update` append a revision row in the same transaction
 
 That means the UI routes and the generated REST API both get the same lifecycle
 behavior automatically.

@@ -32,24 +32,14 @@
 //!
 //! Every mutating CRUD operation follows the same lifecycle:
 //!
-//! 1. **`before_*`** -- called outside the transaction with a mutable
+//! 1. **`before_*`** -- called before the mutation with a mutable
 //!    reference to the [`MutationContext`] and the input/model. The hook
 //!    may validate, enrich, or reject (by returning `Err`).
-//! 2. **persist** -- the actual `INSERT`, `UPDATE`, or `DELETE` runs
-//!    inside a database transaction.
-//! 3. **`after_*`** -- called inside the same transaction with the
-//!    persisted record. Returning `Err` rolls back the transaction.
-//! 4. **commit** -- the transaction is committed.
-//! 5. **`after_commit`** -- called after a successful commit. Errors
-//!    are logged as warnings but do **not** roll back (the data is
-//!    already persisted). Use this for side-effects like sending
-//!    notifications or publishing events.
+//! 2. **persist** -- the actual `INSERT`, `UPDATE`, or `DELETE` runs.
 //!
 //! # Error semantics
 //!
 //! - `before_*` errors prevent the mutation entirely.
-//! - `after_*` errors (inside the transaction) cause a rollback.
-//! - `after_commit` errors are best-effort: logged, never propagated.
 //!
 //! # Helper types
 //!
@@ -160,16 +150,6 @@ pub trait MutationHooks: Send + Sync + 'static {
         async { Ok(()) }
     }
 
-    /// Called after a new record has been inserted (inside the transaction).
-    fn after_create(
-        &self,
-        _ctx: &MutationContext,
-        _record: &Self::Model,
-        _conn: &mut diesel_async::AsyncPgConnection,
-    ) -> impl Future<Output = AutumnResult<()>> + Send {
-        async { Ok(()) }
-    }
-
     /// Called before an existing record is updated.
     ///
     /// The `draft` holds the merged before/after state. Use per-field
@@ -191,40 +171,11 @@ pub trait MutationHooks: Send + Sync + 'static {
         async { Ok(()) }
     }
 
-    /// Called after an existing record has been updated (inside the transaction).
-    fn after_update(
-        &self,
-        _ctx: &MutationContext,
-        _record: &Self::Model,
-        _conn: &mut diesel_async::AsyncPgConnection,
-    ) -> impl Future<Output = AutumnResult<()>> + Send {
-        async { Ok(()) }
-    }
-
     /// Called before an existing record is deleted.
     fn before_delete(
         &self,
         _ctx: &mut MutationContext,
         _record: &Self::Model,
-    ) -> impl Future<Output = AutumnResult<()>> + Send {
-        async { Ok(()) }
-    }
-
-    /// Called after a record has been deleted (inside the transaction).
-    fn after_delete(
-        &self,
-        _ctx: &MutationContext,
-        _id: i64,
-        _conn: &mut diesel_async::AsyncPgConnection,
-    ) -> impl Future<Output = AutumnResult<()>> + Send {
-        async { Ok(()) }
-    }
-
-    /// Called after the transaction has been committed for any operation.
-    fn after_commit(
-        &self,
-        _ctx: &MutationContext,
-        _op: MutationOp,
     ) -> impl Future<Output = AutumnResult<()>> + Send {
         async { Ok(()) }
     }
@@ -717,11 +668,8 @@ mod tests {
         let mut draft = UpdateDraft::new(());
 
         assert!(hooks.before_create(&mut ctx, &mut new_model).await.is_ok());
-        // after_create, after_update, after_delete require &mut AsyncPgConnection
-        // and are covered by compile-pass and db_hooks_lifecycle tests.
         assert!(hooks.before_update(&mut ctx, &mut draft).await.is_ok());
         assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
-        assert!(hooks.after_commit(&ctx, MutationOp::Create).await.is_ok());
     }
 
     // ── Patch serde tests ──────────────────────────────────────────
