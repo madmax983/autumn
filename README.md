@@ -101,7 +101,7 @@ async fn main() {
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and hybrid rendering via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using **every** framework feature: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, WASM islands, autumn-harvest workflows, htmx voting, and profiles |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, autumn-harvest workflows, htmx voting, and profiles |
 
 ## Documentation
 
@@ -120,3 +120,4 @@ Autumn can still run without a database if you omit the `[database]` section.
 ## License
 
 MIT OR Apache-2.0
+

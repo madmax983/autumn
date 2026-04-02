@@ -1,5 +1,0 @@
-error: #[server] does not support generic functions yet
-  --> tests/compile-fail/server_action_generic.rs:12:24
-   |
-12 | async fn generic_action<T>(input: Input<T>) -> AutumnResult<Output> {
-   |                        ^^^

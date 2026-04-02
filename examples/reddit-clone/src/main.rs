@@ -12,7 +12,6 @@
 //   Validation          -> #[validate(length(min, max))] on model fields
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
 //   WebSockets          -> #[ws] live feed with Channels pub/sub
-//   WASM Islands        -> island() renderer with htmx fallback (see islands.rs)
 //   Durable Workflows   -> autumn-harvest patterns (see workflows.rs)
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
@@ -25,7 +24,6 @@
 //             curl http://localhost:3000/api/subreddits
 
 mod hooks;
-mod islands;
 mod models;
 mod repositories;
 mod routes;
@@ -91,6 +89,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use autumn_web::config::{AutumnConfig, MockEnv};
+
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
 
     #[test]
@@ -109,5 +109,20 @@ mod tests {
                 "Migration must create the '{table}' table",
             );
         }
+    }
+
+    #[test]
+    fn dev_profile_enables_csrf_for_forms() {
+        let env = MockEnv::new()
+            .with("AUTUMN_PROFILE", "dev")
+            .with("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"));
+
+        let config =
+            AutumnConfig::load_with_env(&env).expect("reddit-clone dev config should load");
+
+        assert!(
+            config.security.csrf.enabled,
+            "reddit-clone extracts `CsrfToken`, so its dev profile must enable CSRF",
+        );
     }
 }

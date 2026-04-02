@@ -25,8 +25,6 @@ fn compile_fail_tests() {
 
     // Cached macro failures
     t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
-    t.compile_fail("tests/compile-fail/server_action_non_async.rs");
-    t.compile_fail("tests/compile-fail/server_action_generic.rs");
 }
 
 #[test]
@@ -72,5 +70,4 @@ fn compile_pass_tests() {
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
     t.pass("tests/compile-pass/cached_result.rs");
-    t.pass("tests/compile-pass/server_action_basic.rs");
 }

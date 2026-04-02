@@ -23,7 +23,6 @@ showcasing **every major framework feature** in a single cohesive application.
 | Field validation (`#[validate(length(min, max))]`) | `models.rs` |
 | Scheduled background tasks (`#[scheduled(every = "15m")]`) | `tasks.rs` |
 | **WebSockets** (`#[ws]`, `Channels` pub/sub, `CancellationToken`) | `routes/live.rs` |
-| **WASM Islands** (`island()` renderer with htmx fallback) | `islands.rs` |
 | **Durable Workflows** (autumn-harvest `#[workflow]` + `#[activity]` + `#[dag]`) | `workflows.rs` |
 | Actuator endpoints (`/health`, `/actuator/*`) | Auto-mounted |
 | Maud HTML templates | All route files |
@@ -79,7 +78,6 @@ src/
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)
   tasks.rs          # #[scheduled] hot-rank recalculator
-  islands.rs        # WASM island: vote counter with htmx fallback
   workflows.rs      # autumn-harvest: onboarding, moderation, DAG pipelines
   slugify.rs        # URL slug generation utility
   routes/

@@ -1,5 +1,11 @@
 # Autumn WASM Roadmap Design
 
+Status: Won't do
+
+This plan is retained as historical context only.
+
+Autumn is returning to a server-first scope: assembled crates, SSR/SSG, htmx, static JS, and raw Axum escape hatches. First-class WASM islands/server-actions were dropped before release because they pulled the framework away from that goal and created maintenance cost without a compelling core use case.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Define a phased WASM roadmap for Autumn that starts with Rust islands and typed server actions, preserves Autumn's server-first identity, and keeps full client-side app mode as a conditional later extension instead of a premature product bet.

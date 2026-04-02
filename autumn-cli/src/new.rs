@@ -8,8 +8,6 @@ use std::path::Path;
 mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
-    pub const LIB_RS: &str = include_str!("templates/lib.rs.tmpl");
-    pub const CLIENT_RS: &str = include_str!("templates/client.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
     pub const BUILD_RS: &str = include_str!("templates/build.rs.tmpl");
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
@@ -33,20 +31,20 @@ pub enum NewError {
     Io(#[from] std::io::Error),
 }
 
-/// Entry point called from `main.rs` — resolves CWD and delegates.
-pub fn run(name: &str, wasm: bool) {
+/// Entry point called from `main.rs` and delegates to [`generate`].
+pub fn run(name: &str) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("Error: cannot determine current directory: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = generate(name, &cwd, wasm) {
+    if let Err(e) = generate(name, &cwd) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
 /// Generate a new Autumn project under `parent_dir/name`.
-pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewError> {
+pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     validate_name(name)?;
 
     let project_dir = parent_dir.join(name);
@@ -57,33 +55,15 @@ pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewErro
     let crate_name = name.replace('-', "_");
     let autumn_version = env!("CARGO_PKG_VERSION");
 
-    // Create directory structure
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
 
-    // Render templates with substitution
     let render = |template: &str| -> String {
-        let wasm_deps = if wasm {
-            format!(
-                "autumn-wasm = \"{autumn_version}\"\nserde = {{ version = \"1\", features = [\"derive\"] }}"
-            )
-        } else {
-            String::new()
-        };
-
-        let wasm_targets = if wasm {
-            "\n[[bin]]\nname = \"client\"\npath = \"src/client.rs\"\n".to_owned()
-        } else {
-            String::new()
-        };
-
         template
             .replace("{{project_name}}", name)
             .replace("{{crate_name}}", &crate_name)
             .replace("{{autumn_version}}", autumn_version)
-            .replace("{{wasm_deps}}", &wasm_deps)
-            .replace("{{wasm_targets}}", &wasm_targets)
     };
 
     fs::write(
@@ -91,13 +71,6 @@ pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewErro
         render(templates::CARGO_TOML),
     )?;
     fs::write(project_dir.join("src/main.rs"), render(templates::MAIN_RS))?;
-    if wasm {
-        fs::write(project_dir.join("src/lib.rs"), render(templates::LIB_RS))?;
-        fs::write(
-            project_dir.join("src/client.rs"),
-            render(templates::CLIENT_RS),
-        )?;
-    }
     fs::write(
         project_dir.join("autumn.toml"),
         render(templates::AUTUMN_TOML),
@@ -119,10 +92,6 @@ pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewErro
     println!("  Created {name}/autumn.toml");
     println!("  Created {name}/build.rs");
     println!("  Created {name}/src/main.rs");
-    if wasm {
-        println!("  Created {name}/src/lib.rs");
-        println!("  Created {name}/src/client.rs");
-    }
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
@@ -131,9 +100,6 @@ pub fn generate(name: &str, parent_dir: &Path, wasm: bool) -> Result<(), NewErro
     println!("Get started:");
     println!("  cd {name}");
     println!("  cargo run");
-    if wasm {
-        println!("  rustup target add wasm32-unknown-unknown");
-    }
     println!();
     println!("Your app will be available at http://localhost:3000");
 
@@ -192,8 +158,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // ── Name validation ──────────────────────────────────────────
-
     #[test]
     fn valid_name_simple() {
         assert!(validate_name("myapp").is_ok());
@@ -250,12 +214,10 @@ mod tests {
         assert!(err.to_string().contains("keyword"));
     }
 
-    // ── Project generation ───────────────────────────────────────
-
     #[test]
     fn generates_all_expected_files() {
         let tmp = TempDir::new().unwrap();
-        generate("test-app", tmp.path(), false).unwrap();
+        generate("test-app", tmp.path()).unwrap();
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
@@ -266,12 +228,14 @@ mod tests {
         assert!(p.join("static/css/input.css").is_file());
         assert!(p.join("tailwind.config.js").is_file());
         assert!(p.join("migrations/.gitkeep").is_file());
+        assert!(!p.join("src/lib.rs").exists());
+        assert!(!p.join("src/client.rs").exists());
     }
 
     #[test]
     fn cargo_toml_has_project_name() {
         let tmp = TempDir::new().unwrap();
-        generate("my-cool-app", tmp.path(), false).unwrap();
+        generate("my-cool-app", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml")).unwrap();
         assert!(content.contains(r#"name = "my-cool-app""#));
@@ -281,7 +245,7 @@ mod tests {
     #[test]
     fn cargo_toml_has_autumn_version() {
         let tmp = TempDir::new().unwrap();
-        generate("ver-check", tmp.path(), false).unwrap();
+        generate("ver-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml")).unwrap();
         let expected = format!(r#"autumn-web = "{}""#, env!("CARGO_PKG_VERSION"));
@@ -291,7 +255,7 @@ mod tests {
     #[test]
     fn main_rs_has_sample_routes() {
         let tmp = TempDir::new().unwrap();
-        generate("route-check", tmp.path(), false).unwrap();
+        generate("route-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("route-check/src/main.rs")).unwrap();
         assert!(content.contains(r#"#[get("/")]"#));
@@ -304,7 +268,7 @@ mod tests {
     #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();
-        generate("cfg-check", tmp.path(), false).unwrap();
+        generate("cfg-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("cfg-check/autumn.toml")).unwrap();
         assert!(content.contains("port = 3000"));
@@ -316,39 +280,27 @@ mod tests {
     #[test]
     fn autumn_toml_has_crate_name_in_db_url() {
         let tmp = TempDir::new().unwrap();
-        generate("my-db-app", tmp.path(), false).unwrap();
+        generate("my-db-app", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml")).unwrap();
-        // Hyphens should become underscores in the database URL
         assert!(content.contains("my_db_app"));
     }
 
     #[test]
     fn gitignore_excludes_target_and_css() {
         let tmp = TempDir::new().unwrap();
-        generate("gi-check", tmp.path(), false).unwrap();
+        generate("gi-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore")).unwrap();
         assert!(content.contains("/target"));
         assert!(content.contains("static/css/autumn.css"));
-    }
-
-    #[test]
-    fn non_wasm_scaffold_omits_lib_target() {
-        let tmp = TempDir::new().unwrap();
-        generate("plain-app", tmp.path(), false).unwrap();
-
-        let content = fs::read_to_string(tmp.path().join("plain-app/Cargo.toml")).unwrap();
-        assert!(
-            !content.contains("[lib]"),
-            "non-WASM scaffolds should not declare a library target",
-        );
+        assert!(!content.contains("static/autumn/"));
     }
 
     #[test]
     fn generated_build_rs_reruns_on_css_input_changes() {
         let tmp = TempDir::new().unwrap();
-        generate("css-watch-check", tmp.path(), false).unwrap();
+        generate("css-watch-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
@@ -357,7 +309,7 @@ mod tests {
     #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
-        generate("placeholder-check", tmp.path(), false).unwrap();
+        generate("placeholder-check", tmp.path()).unwrap();
 
         let p = tmp.path().join("placeholder-check");
         for entry in walkdir(&p) {
@@ -370,13 +322,11 @@ mod tests {
         }
     }
 
-    // ── Error cases ──────────────────────────────────────────────
-
     #[test]
     fn already_exists_error() {
         let tmp = TempDir::new().unwrap();
-        generate("dupe-check", tmp.path(), false).unwrap();
-        let err = generate("dupe-check", tmp.path(), false).unwrap_err();
+        generate("dupe-check", tmp.path()).unwrap();
+        let err = generate("dupe-check", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
         assert!(err.to_string().contains("already exists"));
     }
@@ -384,68 +334,10 @@ mod tests {
     #[test]
     fn invalid_name_error() {
         let tmp = TempDir::new().unwrap();
-        let err = generate("123bad", tmp.path(), false).unwrap_err();
+        let err = generate("123bad", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::InvalidName(_, _)));
     }
 
-    #[test]
-    fn wasm_scaffold_adds_client_files() {
-        let tmp = TempDir::new().unwrap();
-        generate("wasm-app", tmp.path(), true).unwrap();
-        let p = tmp.path().join("wasm-app");
-        assert!(p.join("src/lib.rs").is_file());
-        assert!(p.join("src/client.rs").is_file());
-        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
-        assert!(cargo.contains("autumn-wasm"));
-    }
-
-    #[test]
-    fn wasm_scaffold_registers_client_bin_target() {
-        let tmp = TempDir::new().unwrap();
-        generate("wasm-app", tmp.path(), true).unwrap();
-
-        let cargo = fs::read_to_string(tmp.path().join("wasm-app/Cargo.toml")).unwrap();
-        assert!(
-            cargo.contains("[[bin]]"),
-            "WASM scaffolds should declare a client binary target",
-        );
-        assert!(
-            cargo.contains("name = \"client\""),
-            "WASM client target should use the conventional `client` name",
-        );
-        assert!(
-            cargo.contains("path = \"src/client.rs\""),
-            "WASM client target should point at src/client.rs",
-        );
-    }
-
-    #[test]
-    fn wasm_scaffold_client_imports_shared_lib_by_crate_name() {
-        let tmp = TempDir::new().unwrap();
-        generate("wasm-app", tmp.path(), true).unwrap();
-
-        let client = fs::read_to_string(tmp.path().join("wasm-app/src/client.rs")).unwrap();
-        assert!(
-            client.contains("use wasm_app::CounterProps;"),
-            "WASM client entry should import shared types from the package library",
-        );
-    }
-
-    #[test]
-    fn wasm_scaffold_client_defines_main_entrypoint() {
-        let tmp = TempDir::new().unwrap();
-        generate("wasm-app", tmp.path(), true).unwrap();
-
-        let client = fs::read_to_string(tmp.path().join("wasm-app/src/client.rs")).unwrap();
-        assert!(
-            client.contains("fn main()"),
-            "WASM client entry should define a main function so Cargo can build it as a bin target",
-        );
-    }
-
-    // ── Helpers ──────────────────────────────────────────────────
-
-    /// Recursively collect all files (not directories) under a path.
     fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
         let mut files = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {

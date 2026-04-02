@@ -66,8 +66,6 @@ pub fn app() -> AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
         static_metas: Vec::new(),
-        islands: Vec::new(),
-        actions: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
@@ -110,8 +108,6 @@ pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
-    pub(crate) islands: Vec<crate::wasm::IslandMeta>,
-    pub(crate) actions: Vec<crate::wasm::ActionMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
@@ -180,20 +176,6 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
-        self
-    }
-
-    /// Register WASM island metadata with the application.
-    #[must_use]
-    pub fn islands(mut self, islands: Vec<crate::wasm::IslandMeta>) -> Self {
-        self.islands.extend(islands);
-        self
-    }
-
-    /// Register typed server action metadata with the application.
-    #[must_use]
-    pub fn actions(mut self, actions: Vec<crate::wasm::ActionMeta>) -> Self {
-        self.actions.extend(actions);
         self
     }
 
@@ -465,8 +447,6 @@ impl AppBuilder {
             routes,
             tasks,
             static_metas: _,
-            islands: _,
-            actions,
             exception_filters,
             scoped_groups,
             merge_routers,
@@ -476,8 +456,7 @@ impl AppBuilder {
             migrations,
         } = self;
 
-        let mut all_routes = routes;
-        all_routes.extend(actions.iter().map(|action| (action.route)()));
+        let all_routes = routes;
 
         // 1. Load configuration (profile-aware)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
@@ -632,8 +611,6 @@ impl AppBuilder {
             routes,
             tasks: _,
             static_metas,
-            islands: _,
-            actions,
             exception_filters: _,
             scoped_groups: _,
             merge_routers: _,
@@ -643,8 +620,7 @@ impl AppBuilder {
                 migrations: _,
         } = self;
 
-        let mut all_routes = routes;
-        all_routes.extend(actions.iter().map(|action| (action.route)()));
+        let all_routes = routes;
 
         // Load config (same as normal startup)
         let config = AutumnConfig::load().unwrap_or_else(|e| {
@@ -1486,35 +1462,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
-    }
-
-    #[test]
-    fn app_builder_tracks_wasm_metadata() {
-        fn action_route() -> Route {
-            Route {
-                method: http::Method::POST,
-                path: "/actions/increment",
-                handler: axum::routing::post(|| async { "ok" }),
-                name: "increment",
-            }
-        }
-
-        let app = app()
-            .islands(vec![crate::wasm::IslandMeta {
-                name: "counter",
-                mount_id: "counter-root",
-                props_type: "CounterProps",
-            }])
-            .actions(vec![crate::wasm::ActionMeta {
-                name: "increment",
-                path: "/actions/increment",
-                route: action_route,
-            }]);
-
-        assert_eq!(app.islands.len(), 1);
-        assert_eq!(app.actions.len(), 1);
-        assert_eq!(app.islands[0].mount_id, "counter-root");
-        assert_eq!(app.actions[0].path, "/actions/increment");
     }
 
     #[tokio::test]
