@@ -42,7 +42,7 @@
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`](axum::extract::Form),
-//!   [`Json`], [`Path`](axum::extract::Path), [`Query`](axum::extract::Query)).
+//!   [`Json`], [`Path`], [`Query`](axum::extract::Query)).
 //! - [`health`] -- Auto-mounted health check endpoint.
 //! - [`logging`] -- Structured logging via `tracing-subscriber`.
 //! - [`middleware`] -- Built-in middleware (request IDs).
@@ -561,6 +561,25 @@ pub use maud::html;
 /// }
 /// ```
 pub use crate::extract::Json;
+
+/// Path extractor.
+///
+/// Extract typed path parameters from the URL.
+///
+/// Re-exported from [Axum](https://docs.rs/axum). See
+/// [`axum::extract::Path`] for full documentation.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+/// ```
+pub use crate::extract::Path;
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///
