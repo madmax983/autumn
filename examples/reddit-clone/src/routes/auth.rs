@@ -108,7 +108,8 @@ pub async fn register(
         .values(&new_user)
         .returning(User::as_returning())
         .get_result(&mut *db)
-        .await?;
+        .await
+        .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
     // Log in immediately after registration
     session.rotate_id().await;

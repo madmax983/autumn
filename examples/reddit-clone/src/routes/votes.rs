@@ -34,6 +34,9 @@ pub async fn downvote(
 }
 
 /// Cast a vote on a post. Handles insert-or-update and score recalculation.
+///
+/// Score is always recomputed from the votes table (not incremented),
+/// so concurrent requests cannot cause drift.
 async fn cast_vote(
     post_id: i64,
     value: i16,
@@ -62,31 +65,17 @@ async fn cast_vote(
             diesel::delete(votes::table.find(vote_id))
                 .execute(&mut **db)
                 .await?;
-
-            // Subtract old vote from score
-            diesel::update(posts::table.find(post_id))
-                .set(posts::score.eq(posts::score - i64::from(old_value)))
-                .execute(&mut **db)
-                .await?;
         }
-        Some((vote_id, old_value)) => {
-            // Different vote — update
+        Some((vote_id, _)) => {
+            // Different vote — flip direction
             diesel::update(votes::table.find(vote_id))
                 .set(votes::value.eq(value))
-                .execute(&mut **db)
-                .await?;
-
-            // Adjust score: remove old vote, add new vote
-            let diff = i64::from(value) - i64::from(old_value);
-            diesel::update(posts::table.find(post_id))
-                .set(posts::score.eq(posts::score + diff))
                 .execute(&mut **db)
                 .await?;
         }
         None => {
             // New vote — use ON CONFLICT to handle race conditions
-            // (e.g. double-click sending two requests before the first completes)
-            let inserted = diesel::insert_into(votes::table)
+            diesel::insert_into(votes::table)
                 .values((
                     votes::user_id.eq(user_id),
                     votes::post_id.eq(post_id),
@@ -96,21 +85,21 @@ async fn cast_vote(
                 .do_nothing()
                 .execute(&mut **db)
                 .await?;
-
-            if inserted > 0 {
-                diesel::update(posts::table.find(post_id))
-                    .set(posts::score.eq(posts::score + i64::from(value)))
-                    .execute(&mut **db)
-                    .await?;
-            }
         }
     }
 
-    // Fetch updated score and return new vote controls
-    let score: i64 = posts::table
-        .find(post_id)
-        .select(posts::score)
-        .first(&mut **db)
+    // Recompute score from actual votes — avoids drift from concurrent requests.
+    // Load all vote values and sum in Rust to sidestep Diesel's Numeric type.
+    let all_votes: Vec<i16> = votes::table
+        .filter(votes::post_id.eq(post_id))
+        .select(votes::value)
+        .load(&mut **db)
+        .await?;
+    let score: i64 = all_votes.iter().map(|&v| i64::from(v)).sum();
+
+    diesel::update(posts::table.find(post_id))
+        .set(posts::score.eq(score))
+        .execute(&mut **db)
         .await?;
 
     Ok(vote_controls(post_id, score))
