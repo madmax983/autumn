@@ -53,9 +53,22 @@
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use thiserror::Error;
+
+static AUTUMN_MANIFEST_DIR_LOCK: OnceLock<&'static str> = OnceLock::new();
+static AUTUMN_IS_DEBUG_LOCK: OnceLock<bool> = OnceLock::new();
+
+/// Initialize global framework environment variables safely without mutating the process environment.
+///
+/// This replaces the unsafe `std::env::set_var` approach in earlier framework versions.
+/// It is called automatically by `#[autumn_web::main]` and `autumn dev`.
+pub fn init_env(manifest_dir: &'static str, is_debug: bool) {
+    let _ = AUTUMN_MANIFEST_DIR_LOCK.set(manifest_dir);
+    let _ = AUTUMN_IS_DEBUG_LOCK.set(is_debug);
+}
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
 pub trait Env {
@@ -64,6 +77,9 @@ pub trait Env {
     /// # Errors
     /// Returns [`std::env::VarError`] if the variable is not present or is not valid Unicode.
     fn var(&self, key: &str) -> Result<String, std::env::VarError>;
+
+    /// Used for downcasting.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Production implementation of `Env` that reads from the OS environment.
@@ -71,7 +87,25 @@ pub trait Env {
 pub struct OsEnv;
 
 impl Env for OsEnv {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            if let Some(&dir) = AUTUMN_MANIFEST_DIR_LOCK.get() {
+                return Ok(dir.to_string());
+            }
+        }
+        if key == "AUTUMN_IS_DEBUG" {
+            if let Some(&debug) = AUTUMN_IS_DEBUG_LOCK.get() {
+                return Ok(if debug {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                });
+            }
+        }
         std::env::var(key)
     }
 }
@@ -107,6 +141,10 @@ impl MockEnv {
 }
 
 impl Env for MockEnv {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
         self.vars
             .get(key)
