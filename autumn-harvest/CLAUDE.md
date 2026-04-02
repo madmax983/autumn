@@ -231,7 +231,7 @@ The `testing` feature in `autumn-harvest/Cargo.toml` gates `WorkflowContext::new
 2. The function must take `ctx: &WorkflowContext` or `ctx: &ActivityContext` as its first argument.
 3. Return type must be `Result<T, E>` where both `T` and `E` implement `serde::Serialize` / `serde::Deserialize` and `E: ToString`.
 4. Add the function name to `workflows![...]` or `activities![...]` in the builder call.
-5. If the activity uses shared state (DB pool, HTTP client), register it on the builder with `.state(value)` (Phase 2) and access via `ctx.state::<T>()`.
+5. If the activity uses shared state (DB pool, HTTP client), inject state through your own runtime wiring for now and access via `ctx.state::<T>()`; fluent `.state(value)` support is planned, not yet implemented.
 
 ---
 
@@ -309,4 +309,4 @@ Worker pool and web pool are independently sized but share a total connection ce
 - **DAG scheduler**: `DagBuilder`, topological sort, `#[dag]` macro
 - **Trigger rules**: timetable, signals/queries, saga pattern
 - **Management HTTP API**: start/cancel/query workflow executions
-- **`HarvestExt` trait**: embeds the worker into Autumn's `AppBuilder` lifecycle (start/stop with the server)
+- **`HarvestExt` trait**: planned integration to embed worker lifecycle into Autumn's `AppBuilder` (start/stop with the server)

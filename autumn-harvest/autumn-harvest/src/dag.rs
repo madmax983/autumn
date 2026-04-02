@@ -97,6 +97,12 @@ impl DagTaskRef {
     }
 
     #[must_use]
+    /// Attach `upstream` as a dependency of this task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` and `upstream` were created by different
+    /// [`DagBuilder`] instances.
     pub fn upstream(self, upstream: &Self) -> Self {
         assert!(
             Rc::ptr_eq(&self.tasks, &upstream.tasks),

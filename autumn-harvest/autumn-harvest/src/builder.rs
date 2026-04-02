@@ -7,7 +7,8 @@ use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
 /// In a full Autumn app, this is consumed by the `HarvestExt` trait on
-/// `AppBuilder`. In tests or standalone use, call `.build()` directly.
+/// `AppBuilder`. In tests or standalone use today, use this type as a
+/// registration container and pass values to worker/runtime construction APIs.
 #[derive(Default, Debug)]
 pub struct HarvestBuilder {
     workflows: Vec<WorkflowInfo>,

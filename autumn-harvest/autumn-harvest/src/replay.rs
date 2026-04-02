@@ -290,6 +290,10 @@ impl HistoryMatcher {
     /// Match a signal wait command against history.
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if internal queue bookkeeping is corrupted unexpectedly.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals

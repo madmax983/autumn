@@ -245,7 +245,10 @@ impl WorkflowContext {
     /// Returns `None` if the state type was not registered with the builder.
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+        self.state
+            .get(&TypeId::of::<T>())?
+            .as_ref()
+            .downcast_ref::<T>()
     }
 
     // ── Version gate ──────────────────────────────────────────────────
@@ -410,6 +413,16 @@ impl WorkflowContext {
     ///
     /// During replay, returns the recorded child output or failure.
     /// During live execution, emits a `StartChildWorkflow` command and suspends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`], [`HarvestError::ActivityFailed`],
+    /// or [`HarvestError::Cancelled`] when replay, child execution, or
+    /// cancellation fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matcher or commands mutex is poisoned.
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
@@ -456,6 +469,15 @@ impl WorkflowContext {
     }
 
     /// Wait for the next delivered signal with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] if replay history diverges or
+    /// [`HarvestError::Cancelled`] if the signal wait channel is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the matcher or commands mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
         let history_match = self
             .matcher
@@ -486,6 +508,11 @@ impl WorkflowContext {
         }
     }
 
+    /// Register a query handler callable by name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the query registry mutex is poisoned.
     pub fn register_query<F>(&self, name: &str, handler: F)
     where
         F: Fn() -> Value + Send + Sync + 'static,
@@ -496,6 +523,15 @@ impl WorkflowContext {
             .register(name, Arc::new(handler));
     }
 
+    /// Execute a registered query by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when no handler exists with `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the query registry mutex is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
         self.query_registry
             .lock()
@@ -577,7 +613,10 @@ impl ActivityContext {
     /// Access typed shared state.
     #[must_use]
     pub fn state<T: Any + Send + Sync>(&self) -> Option<&T> {
-        self.state.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+        self.state
+            .get(&TypeId::of::<T>())?
+            .as_ref()
+            .downcast_ref::<T>()
     }
 
     /// Send a heartbeat to signal the activity is still running.
@@ -1339,6 +1378,9 @@ mod tests {
 
         let value = ctx.execute_query("status").expect("query should execute");
         assert_eq!(value, serde_json::json!({"state": "running"}));
-        assert!(ctx.drain_commands().is_empty(), "queries must not emit events");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "queries must not emit events"
+        );
     }
 }

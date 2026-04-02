@@ -22,6 +22,11 @@ impl QueryRegistry {
         self.handlers.insert(name.to_string(), handler);
     }
 
+    /// Execute a registered query handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] when `name` is not registered.
     pub fn execute(&self, name: &str) -> HarvestResult<Value> {
         self.handlers
             .get(name)
