@@ -1341,6 +1341,97 @@ mod tests {
 
     // ── Dashboard state tests ─────────────────────────────────
 
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn test_poll_updates_state() {
+        // Start a mock server
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+
+                // Consume all remaining headers until an empty line is reached
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+
+                let (body, status) = if req_line.contains("GET /actuator/health") {
+                    ("{\"status\":\"up\"}", "200 OK")
+                } else if req_line.contains("GET /actuator/metrics") {
+                    ("{\"http\":{\"requests_total\":42}}", "200 OK")
+                } else if req_line.contains("GET /actuator/tasks") {
+                    ("{\"scheduled_tasks\":{}}", "200 OK")
+                } else if req_line.contains("GET /actuator/loggers") {
+                    ("{\"current_level\":\"info\"}", "200 OK")
+                } else {
+                    ("", "404 NOT FOUND")
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        // Initially disconnected and metrics at 0
+        assert!(!state.connected);
+        assert_eq!(state.metrics.http.requests_total, 0);
+
+        // Run poll
+        state.poll();
+
+        // Check if state was updated correctly
+        assert!(state.connected);
+        assert_eq!(state.health.status, "up");
+        assert_eq!(state.metrics.http.requests_total, 42);
+        assert_eq!(state.loggers.current_level, "info");
+    }
+
+    #[test]
+    fn test_poll_handles_connection_error() {
+        // Use an invalid port to force connection error
+        let mut state = DashboardState::new("http://127.0.0.1:1".to_string());
+        state.connected = true; // Assume it was previously connected
+
+        state.poll();
+
+        assert!(!state.connected);
+        assert!(state.last_error.is_some());
+        assert!(
+            state
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("Connection failed")
+                || state
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("HTTP client error")
+        );
+    }
+
     #[test]
     fn dashboard_state_initial() {
         let state = DashboardState::new("http://localhost:3000".to_string());
