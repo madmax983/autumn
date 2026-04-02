@@ -1226,7 +1226,6 @@ mod tests {
         ConfigProperties::track_property(&mut props, "log.level", "info", "info", "dev");
         assert_eq!(props["log.level"].source, "default");
     }
-
 }
 
 #[cfg(test)]
