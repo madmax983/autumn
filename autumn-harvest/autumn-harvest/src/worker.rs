@@ -186,6 +186,13 @@ fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
     )
 }
 
+fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
+    !commands.is_empty()
+        && commands
+            .iter()
+            .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
+}
+
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
@@ -391,8 +398,15 @@ async fn process_workflow_task(
             })
             .collect::<Vec<_>>();
         let signal_ids = pending_signals.iter().map(|s| s.id).collect::<Vec<_>>();
-        store::append_events(conn, exec_id, &signal_events, history.next_event_id).await?;
-        signal::mark_signals_consumed(conn, &signal_ids).await?;
+        conn.transaction::<(), HarvestError, _>(|conn| {
+            async move {
+                store::append_events(conn, exec_id, &signal_events, history.next_event_id).await?;
+                signal::mark_signals_consumed(conn, &signal_ids).await?;
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await?;
     }
 
     let history = store::load_history(conn, exec_id).await?;
@@ -428,10 +442,7 @@ async fn process_workflow_task(
             persist_workflow_failure(conn, task.id, exec_id, next_event_id, worker_id, &error).await
         }
         WorkflowOutcome::Suspended { commands } => {
-            if commands
-                .iter()
-                .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
-            {
+            if all_commands_wait_for_signal(&commands) {
                 queue::requeue_for_retry(conn, task.id, chrono::Duration::seconds(1)).await
             } else {
                 let error = suspended_workflow_error(&commands);
@@ -664,6 +675,7 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::oneshot;
 
     fn default_runtime_config() -> WorkerRuntimeConfig {
         WorkerRuntimeConfig {
@@ -780,5 +792,36 @@ mod tests {
             ClaimedTaskKind::Activity
         );
         assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
+    }
+
+    #[test]
+    fn all_commands_wait_for_signal_requires_non_empty() {
+        let commands: Vec<WorkflowCommand> = vec![];
+        assert!(!all_commands_wait_for_signal(&commands));
+    }
+
+    #[test]
+    fn all_commands_wait_for_signal_only_accepts_wait_commands() {
+        let (signal_tx, _signal_rx) = oneshot::channel::<serde_json::Value>();
+        let (timer_tx, _timer_rx) = oneshot::channel::<()>();
+
+        let only_wait = vec![WorkflowCommand::WaitForSignal {
+            signal_name: "approved".to_string(),
+            result_tx: signal_tx,
+        }];
+        assert!(all_commands_wait_for_signal(&only_wait));
+
+        let mixed = vec![
+            WorkflowCommand::WaitForSignal {
+                signal_name: "approved".to_string(),
+                result_tx: oneshot::channel::<serde_json::Value>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 1,
+                result_tx: timer_tx,
+            },
+        ];
+        assert!(!all_commands_wait_for_signal(&mixed));
     }
 }
