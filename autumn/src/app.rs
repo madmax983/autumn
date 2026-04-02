@@ -2389,4 +2389,102 @@ mod tests {
         let config = AutumnConfig::default();
         log_startup_transparency(&routes, &[], &[], &config);
     }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn start_task_scheduler_broadcasts_events() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            channels: crate::channels::Channels::new(32),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let mut rx = state.channels().subscribe("sys:tasks");
+
+        let task = crate::task::TaskInfo {
+            name: "test_broadcaster".into(),
+            // 1ms delay so it fires immediately
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            handler: |_| Box::pin(async { Ok(()) }),
+        };
+
+        // Start scheduler in background so we don't block
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            super::start_task_scheduler(vec![task], &state_clone);
+        });
+
+        // First message should be "started"
+        let msg1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for start event")
+            .expect("channel closed");
+        let json1: serde_json::Value = serde_json::from_str(msg1.as_str()).unwrap();
+        assert_eq!(json1["event"], "started");
+        assert_eq!(json1["task"], "test_broadcaster");
+
+        // Second message should be "success"
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for success event")
+            .expect("channel closed");
+        let json2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
+        assert_eq!(json2["event"], "success");
+        assert_eq!(json2["task"], "test_broadcaster");
+        assert!(json2.get("duration_ms").is_some());
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn start_task_scheduler_broadcasts_failure_events() {
+        let state = AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            channels: crate::channels::Channels::new(32),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let mut rx = state.channels().subscribe("sys:tasks");
+
+        let task = crate::task::TaskInfo {
+            name: "test_failing_task".into(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            handler: |_| {
+                Box::pin(async { Err(crate::AutumnError::bad_request_msg("forced error")) })
+            },
+        };
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            super::start_task_scheduler(vec![task], &state_clone);
+        });
+
+        // First message: started
+        let _ = rx.recv().await.unwrap();
+
+        // Second message: failure
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for failure event")
+            .expect("channel closed");
+        let json2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
+        assert_eq!(json2["event"], "failure");
+        assert_eq!(json2["task"], "test_failing_task");
+        assert_eq!(json2["error"], "forced error");
+    }
 }
