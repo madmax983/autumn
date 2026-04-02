@@ -1164,12 +1164,12 @@ fn build_router_inner(
 /// Build the router with optional static-file-first serving.
 ///
 /// If `dist_dir` is `Some` and contains a valid `manifest.json`, the
-/// returned router intercepts GET requests whose path appears in the
-/// manifest and serves pre-built HTML directly — before the dynamic
+/// returned router intercepts GET/HEAD requests whose path appears in
+/// the manifest and serves pre-built HTML directly — before the dynamic
 /// router runs.  This matches Next.js SSG/ISR semantics where static
 /// pages always win over dynamic handlers.
 ///
-/// Requests not in the manifest (including all non-GET methods) fall
+/// Requests not in the manifest (including non-GET/HEAD methods) fall
 /// through to the dynamic router unchanged.
 ///
 /// When `dist_dir` is `None` or the manifest is missing, the returned
@@ -1256,12 +1256,12 @@ fn build_router_with_static_inner(
     // Store the layer in an Arc so the static-first middleware can use it.
     let layer = Arc::new(layer);
 
-    // Static-first serving: intercept GET requests whose path appears in
-    // the manifest and serve pre-built HTML directly, BEFORE the dynamic
+    // Static-first serving: intercept GET/HEAD requests whose path appears
+    // in the manifest and serve pre-built HTML directly, BEFORE the dynamic
     // router runs.  This matches Next.js SSG/ISR semantics where static
     // pages always win over dynamic handlers.
     //
-    // Requests not in the manifest (including all non-GET methods) fall
+    // Requests not in the manifest (including non-GET/HEAD methods) fall
     // through to the dynamic router unchanged.
     //
     // ISR staleness checking happens inside `resolve()`: stale pages are
@@ -1272,7 +1272,9 @@ fn build_router_with_static_inner(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let static_layer = static_layer.clone();
             async move {
-                if req.method() == http::Method::GET {
+                let is_get = req.method() == http::Method::GET;
+                let is_head = req.method() == http::Method::HEAD;
+                if is_get || is_head {
                     let path = req.uri().path();
                     // Normalize trailing slash: /about/ → /about (but keep / as /)
                     let normalized = if path.len() > 1 && path.ends_with('/') {
@@ -1281,11 +1283,16 @@ fn build_router_with_static_inner(
                         path
                     };
                     if let Some(file_path) = static_layer.resolve(normalized) {
-                        if let Ok(contents) = std::fs::read(&file_path) {
+                        if let Ok(contents) = tokio::fs::read(&file_path).await {
+                            let body = if is_head {
+                                axum::body::Body::empty()
+                            } else {
+                                axum::body::Body::from(contents)
+                            };
                             return http::Response::builder()
                                 .status(http::StatusCode::OK)
                                 .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                                .body(axum::body::Body::from(contents))
+                                .body(body)
                                 .unwrap();
                         }
                     }

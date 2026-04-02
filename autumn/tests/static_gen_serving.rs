@@ -200,8 +200,60 @@ async fn unknown_routes_fall_through_to_dynamic() {
     );
 }
 
-/// POST requests must pass through `ServeDir` to the dynamic router,
-/// even when a dist/ directory is active.
+/// HEAD requests for manifest-backed static routes return 200 with an
+/// empty body (standard HTTP HEAD semantics).
+#[tokio::test]
+async fn head_requests_served_for_static_routes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dist = tmp.path().join("dist");
+    std::fs::create_dir_all(dist.join("about")).expect("mkdir about");
+    std::fs::write(dist.join("about/index.html"), "<h1>Static About</h1>").expect("write html");
+
+    let manifest = autumn_web::static_gen::StaticManifest {
+        generated_at: "2026-03-27T00:00:00Z".to_owned(),
+        autumn_version: "0.1.0".to_owned(),
+        routes: HashMap::from([(
+            "/about".to_owned(),
+            autumn_web::static_gen::ManifestEntry {
+                file: "about/index.html".to_owned(),
+                revalidate: None,
+            },
+        )]),
+    };
+    std::fs::write(
+        dist.join("manifest.json"),
+        serde_json::to_string(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+
+    let config = autumn_web::config::AutumnConfig::default();
+    let router = autumn_web::app::build_router_with_static(
+        vec![],
+        &config,
+        test_state(),
+        Some(dist.as_path()),
+    );
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/about")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.is_empty(), "HEAD response body should be empty");
+}
+
+/// POST requests pass through to the dynamic router, even when a
+/// dist/ directory is active.
 #[tokio::test]
 async fn post_requests_pass_through_static_layer() {
     let tmp = tempfile::tempdir().expect("tempdir");
