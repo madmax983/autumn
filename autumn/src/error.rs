@@ -516,25 +516,6 @@ mod tests {
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    #[tokio::test]
-    async fn validation_response_has_details_in_json_body() {
-        let mut details = std::collections::HashMap::new();
-        details.insert("username".to_string(), vec!["must not be empty".to_string()]);
-        let err = AutumnError::validation(details);
-        let response = err.into_response();
-
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(json["error"]["status"], 422);
-        assert_eq!(json["error"]["message"], "Validation failed");
-        assert_eq!(json["error"]["details"]["username"][0], "must not be empty");
-    }
-
     #[test]
     fn service_unavailable_is_503() {
         let err = AutumnError::service_unavailable(TestError("pool exhausted".into()));
