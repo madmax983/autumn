@@ -16,7 +16,7 @@
 //!
 //! #[post("/register")]
 //! async fn register() -> AutumnResult<&'static str> {
-//!     let hashed = hash_password("secret123")?;
+//!     let hashed = hash_password("secret123").await?;
 //!     // Save hashed password to database...
 //!     Ok("registered")
 //! }
@@ -25,7 +25,7 @@
 //! async fn login(session: Session) -> AutumnResult<&'static str> {
 //!     // Verify credentials...
 //!     let stored_hash = "$2b$12$..."; // from database
-//!     if verify_password("secret123", stored_hash)? {
+//!     if verify_password("secret123", stored_hash).await? {
 //!         session.insert("user_id", "42").await;
 //!         Ok("logged in")
 //!     } else {
@@ -83,12 +83,19 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// ```rust
 /// use autumn_web::auth::hash_password;
 ///
-/// let hashed = hash_password("my_secret").unwrap();
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let hashed = hash_password("my_secret").await.unwrap();
 /// assert!(hashed.starts_with("$2b$"));
+/// # });
 /// ```
-pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
-    bcrypt::hash(password, DEFAULT_BCRYPT_COST)
-        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        bcrypt::hash(password, DEFAULT_BCRYPT_COST)
+            .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+    })
+    .await
+    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
 }
 
 /// Verify a plaintext password against a bcrypt hash.
@@ -104,13 +111,21 @@ pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
 /// ```rust
 /// use autumn_web::auth::{hash_password, verify_password};
 ///
-/// let hashed = hash_password("my_secret").unwrap();
-/// assert!(verify_password("my_secret", &hashed).unwrap());
-/// assert!(!verify_password("wrong_password", &hashed).unwrap());
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let hashed = hash_password("my_secret").await.unwrap();
+/// assert!(verify_password("my_secret", &hashed).await.unwrap());
+/// assert!(!verify_password("wrong_password", &hashed).await.unwrap());
+/// # });
 /// ```
-pub fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
-    bcrypt::verify(password, hash)
-        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
+    let password = password.to_string();
+    let hash = hash.to_string();
+    tokio::task::spawn_blocking(move || {
+        bcrypt::verify(password, &hash)
+            .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+    })
+    .await
+    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
 }
 
 // ── Runtime check for #[secured] macro ──────────────────────────
@@ -370,17 +385,17 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hash_and_verify_password() {
-        let hash = hash_password("test_password").unwrap();
+    #[tokio::test]
+    async fn hash_and_verify_password() {
+        let hash = hash_password("test_password").await.unwrap();
         assert!(hash.starts_with("$2b$"));
-        assert!(verify_password("test_password", &hash).unwrap());
-        assert!(!verify_password("wrong_password", &hash).unwrap());
+        assert!(verify_password("test_password", &hash).await.unwrap());
+        assert!(!verify_password("wrong_password", &hash).await.unwrap());
     }
 
-    #[test]
-    fn verify_invalid_hash_returns_error() {
-        let result = verify_password("test", "not-a-valid-hash");
+    #[tokio::test]
+    async fn verify_invalid_hash_returns_error() {
+        let result = verify_password("test", "not-a-valid-hash").await;
         assert!(result.is_err());
     }
 
