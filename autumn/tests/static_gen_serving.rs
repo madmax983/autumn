@@ -12,21 +12,7 @@ use tower::ServiceExt;
 
 /// Helper: build an `AppState` suitable for testing (no database, no profile).
 fn test_state() -> autumn_web::AppState {
-    autumn_web::AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: true,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-        #[cfg(feature = "ws")]
-        channels: autumn_web::channels::Channels::new(32),
-        #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    }
+    autumn_web::AppState::for_test()
 }
 
 /// Helper: create a `Route` for a GET handler that returns the given body.
