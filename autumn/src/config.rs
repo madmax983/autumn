@@ -2033,10 +2033,12 @@ path = "/healthz"
 
     #[test]
     fn mock_env_os_string_operations() {
-        let env = MockEnv::new()
-            .with_os("OS_KEY", std::ffi::OsString::from("os_value"));
+        let env = MockEnv::new().with_os("OS_KEY", std::ffi::OsString::from("os_value"));
 
-        assert_eq!(env.var_os("OS_KEY"), Some(std::ffi::OsString::from("os_value")));
+        assert_eq!(
+            env.var_os("OS_KEY"),
+            Some(std::ffi::OsString::from("os_value"))
+        );
         assert_eq!(env.var("OS_KEY").unwrap(), "os_value");
 
         let env_removed = env.without("OS_KEY");
@@ -2073,13 +2075,22 @@ path = "/healthz"
         assert_eq!(env.var("AUTUMN_IS_DEBUG").unwrap(), "1");
 
         // Check `var_os`
-        assert_eq!(env.var_os("AUTUMN_MANIFEST_DIR").unwrap(), std::ffi::OsString::from("test_manifest_dir"));
-        assert_eq!(env.var_os("AUTUMN_IS_DEBUG").unwrap(), std::ffi::OsString::from("1"));
+        assert_eq!(
+            env.var_os("AUTUMN_MANIFEST_DIR").unwrap(),
+            std::ffi::OsString::from("test_manifest_dir")
+        );
+        assert_eq!(
+            env.var_os("AUTUMN_IS_DEBUG").unwrap(),
+            std::ffi::OsString::from("1")
+        );
 
         // Check fallback to std::env (read an existing var rather than setting one to avoid unsafe)
         // CARGO_MANIFEST_DIR is set by Cargo when testing
         let cargo_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         assert_eq!(env.var("CARGO_MANIFEST_DIR").unwrap(), cargo_dir);
-        assert_eq!(env.var_os("CARGO_MANIFEST_DIR").unwrap(), std::ffi::OsString::from(cargo_dir));
+        assert_eq!(
+            env.var_os("CARGO_MANIFEST_DIR").unwrap(),
+            std::ffi::OsString::from(cargo_dir)
+        );
     }
 }
