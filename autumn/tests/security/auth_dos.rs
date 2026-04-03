@@ -1,11 +1,7 @@
 use std::time::{Duration, Instant};
 
 use autumn_web::auth::hash_password;
-use axum::{
-    Router,
-    routing::post,
-    routing::get,
-};
+use axum::{Router, routing::get, routing::post};
 
 #[tokio::test]
 async fn eris_auth_dos_poc() {
@@ -38,7 +34,7 @@ async fn eris_auth_dos_poc() {
     // We use a simple tcp connection and manually send the HTTP request
     // This avoids dependency issues in the tests module.
 
-    use tokio::io::{AsyncWriteExt, AsyncReadExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // We spawn a lot of concurrent hashing tasks to ensure we block the pool.
     let mut login_tasks = vec![];
