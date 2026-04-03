@@ -65,13 +65,11 @@ pub async fn notify_task_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
-    // Postgres NOTIFY requires the channel as an identifier (not a parameter),
-    // so we must format it into the SQL string. The channel name is derived from
-    // our own queue_channel() function which only produces [a-z0-9_] characters,
-    // so this is safe from injection.
-    let sql = format!("NOTIFY {channel}, '{payload}'");
-
-    diesel::sql_query(sql)
+    // Use pg_notify to allow parameter binding for both the channel and the payload,
+    // preventing SQL injection via the channel name.
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<diesel::sql_types::Text, _>(channel)
+        .bind::<diesel::sql_types::Text, _>(payload)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -149,8 +147,12 @@ impl QueueListener {
         // Subscribe to all queue channels.
         for queue in queues {
             let channel = queue_channel(queue);
+            // LISTEN does not support parameterized identifiers in standard queries.
+            // Safely quote the channel name as an identifier by wrapping it in double quotes
+            // and escaping any internal double quotes.
+            let safe_channel = channel.replace('"', "\"\"");
             client
-                .batch_execute(&format!("LISTEN {channel}"))
+                .batch_execute(&format!("LISTEN \"{safe_channel}\""))
                 .await
                 .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
         }
