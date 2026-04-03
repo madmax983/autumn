@@ -305,15 +305,18 @@ fn warn_profile_typo(profile: &str) {
 }
 
 /// Levenshtein edit distance between two strings.
+///
+/// ⚡ Bolt Optimization:
+/// Avoids allocating two `Vec<char>` buffers by iterating directly over `Chars`.
+/// While this re-evaluates UTF-8 boundaries in the inner loop, avoiding the heap
+/// allocations is typically faster for the short strings compared here (e.g., config profile typos).
 fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let n = b.len();
+    let n = b.chars().count();
     let mut prev = (0..=n).collect::<Vec<_>>();
     let mut curr = vec![0; n + 1];
-    for (i, a_ch) in a.iter().enumerate() {
+    for (i, a_ch) in a.chars().enumerate() {
         curr[0] = i + 1;
-        for (j, b_ch) in b.iter().enumerate() {
+        for (j, b_ch) in b.chars().enumerate() {
             let cost = usize::from(a_ch != b_ch);
             curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
