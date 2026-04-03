@@ -480,6 +480,125 @@ mod tests {
         let headers = http::HeaderMap::new();
         assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
     }
+
+    #[tokio::test]
+    async fn post_with_empty_cookie_but_valid_header() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("X-CSRF-Token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_valid_cookie_but_empty_header() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("X-CSRF-Token", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_empty_cookie_but_valid_form_field() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_valid_cookie_but_empty_form_field() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_csrf="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_large_body_fails_csrf() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        // Create a body just slightly over 2MB. The CSRF extractor limits to 2MB.
+        let large_padding = "a".repeat(2 * 1024 * 1024 + 10);
+        let body_content = format!("_csrf={token}&pad={large_padding}");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body_content))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::test]
