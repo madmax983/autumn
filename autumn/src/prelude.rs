@@ -46,6 +46,9 @@ pub use crate::extract::Form;
 pub use crate::extract::Json;
 /// Path extractor.
 pub use crate::extract::Path;
+/// Flash message extractor.
+#[cfg(feature = "flash")]
+pub use crate::flash::{Flash, FlashLevel, FlashMessage};
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.

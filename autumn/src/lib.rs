@@ -86,6 +86,8 @@ pub mod migrate;
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
+#[cfg(feature = "flash")]
+pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub mod logging;

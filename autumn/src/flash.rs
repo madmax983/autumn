@@ -1,0 +1,194 @@
+//! Flash messages for Autumn applications.
+//!
+//! Provides a [`Flash`] extractor that allows storing and retrieving
+//! temporary messages across HTTP redirects, backed by the user's
+//! [`Session`](crate::session::Session).
+//!
+//! # Examples
+//!
+//! ```rust,no_run
+//! use autumn_web::prelude::*;
+//!
+//! #[post("/items")]
+//! async fn create_item(flash: Flash) -> impl IntoResponse {
+//!     // ... create item ...
+//!     flash.success("Item created successfully!").await;
+//!     Redirect::to("/items")
+//! }
+//!
+//! #[get("/items")]
+//! async fn list_items(flash: Flash) -> Markup {
+//!     let messages = flash.consume().await;
+//!     html! {
+//!         // ... render messages ...
+//!         @for msg in messages {
+//!             div class=(msg.level.as_str()) { (msg.message) }
+//!         }
+//!     }
+//! }
+//! ```
+
+use axum::extract::FromRequestParts;
+use http::request::Parts;
+use serde::{Deserialize, Serialize};
+
+use crate::session::Session;
+
+const FLASH_SESSION_KEY: &str = "__autumn_flash";
+
+/// The severity level of a flash message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlashLevel {
+    /// Success messages (e.g., "Item created").
+    Success,
+    /// Informational messages (e.g., "Welcome back").
+    Info,
+    /// Warning messages (e.g., "Your trial ends soon").
+    Warning,
+    /// Error messages (e.g., "Invalid password").
+    Error,
+}
+
+impl FlashLevel {
+    /// Returns the level as a lowercase string (useful for CSS classes).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A single flash message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlashMessage {
+    /// The severity level.
+    pub level: FlashLevel,
+    /// The text message.
+    pub message: String,
+}
+
+/// Extractor for adding and consuming flash messages.
+///
+/// Backed by the session. Messages are stored as a JSON array
+/// under the key `__autumn_flash`.
+#[derive(Debug, Clone)]
+pub struct Flash {
+    session: Session,
+}
+
+impl Flash {
+    /// Create a new `Flash` instance wrapping the given `Session`.
+    #[must_use]
+    pub const fn new(session: Session) -> Self {
+        Self { session }
+    }
+
+    /// Add a new message to the flash queue.
+    pub async fn push(&self, level: FlashLevel, message: impl Into<String>) {
+        let mut messages = self.peek().await;
+        messages.push(FlashMessage {
+            level,
+            message: message.into(),
+        });
+
+        if let Ok(json) = serde_json::to_string(&messages) {
+            self.session.insert(FLASH_SESSION_KEY, json).await;
+        }
+    }
+
+    /// Add a success message.
+    pub async fn success(&self, message: impl Into<String>) {
+        self.push(FlashLevel::Success, message).await;
+    }
+
+    /// Add an informational message.
+    pub async fn info(&self, message: impl Into<String>) {
+        self.push(FlashLevel::Info, message).await;
+    }
+
+    /// Add a warning message.
+    pub async fn warning(&self, message: impl Into<String>) {
+        self.push(FlashLevel::Warning, message).await;
+    }
+
+    /// Add an error message.
+    pub async fn error(&self, message: impl Into<String>) {
+        self.push(FlashLevel::Error, message).await;
+    }
+
+    /// Read all pending flash messages without removing them.
+    pub async fn peek(&self) -> Vec<FlashMessage> {
+        self.session
+            .get(FLASH_SESSION_KEY)
+            .await
+            .map_or_else(Vec::new, |json| {
+                serde_json::from_str(&json).unwrap_or_default()
+            })
+    }
+
+    /// Read all pending flash messages and remove them from the session.
+    pub async fn consume(&self) -> Vec<FlashMessage> {
+        let messages = self.peek().await;
+        if !messages.is_empty() {
+            self.session.remove(FLASH_SESSION_KEY).await;
+        }
+        messages
+    }
+}
+
+use crate::state::AppState;
+
+impl FromRequestParts<AppState> for Flash {
+    type Rejection = <Session as FromRequestParts<AppState>>::Rejection;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let session = Session::from_request_parts(parts, state).await?;
+        Ok(Self::new(session))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn flash_push_and_consume() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session.clone());
+
+        flash.success("Saved!").await;
+        flash.error("Failed!").await;
+
+        let messages = flash.peek().await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].level, FlashLevel::Success);
+        assert_eq!(messages[0].message, "Saved!");
+        assert_eq!(messages[1].level, FlashLevel::Error);
+        assert_eq!(messages[1].message, "Failed!");
+
+        // Still there after peek
+        assert_eq!(flash.peek().await.len(), 2);
+
+        // Consume removes them
+        let consumed = flash.consume().await;
+        assert_eq!(consumed.len(), 2);
+        assert_eq!(flash.peek().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn flash_level_as_str() {
+        assert_eq!(FlashLevel::Success.as_str(), "success");
+        assert_eq!(FlashLevel::Info.as_str(), "info");
+        assert_eq!(FlashLevel::Warning.as_str(), "warning");
+        assert_eq!(FlashLevel::Error.as_str(), "error");
+    }
+}
