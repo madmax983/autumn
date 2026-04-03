@@ -16,25 +16,35 @@ pub mod replay;
 pub mod types;
 
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod dlq;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod heartbeat;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod models;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod notify;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod queue;
 #[cfg(feature = "db")]
 #[allow(clippy::wildcard_imports)]
+#[doc(hidden)]
 pub mod schema;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod signal;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod store;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod timeout;
 #[cfg(feature = "db")]
+#[doc(hidden)]
 pub mod worker;
 
 pub use builder::{HarvestBuilder, WorkerConfig};
