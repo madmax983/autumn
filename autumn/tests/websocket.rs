@@ -13,7 +13,7 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::prelude::*;
 use autumn_web::ws::{CancellationToken, Message, WebSocket, WsHandler};
 use axum::body::Body;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use http::Request;
 use tower::ServiceExt;
 
@@ -146,6 +146,102 @@ async fn upgrade_request_without_real_tcp_returns_426() {
 
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), http::StatusCode::from_u16(426).unwrap());
+}
+
+// ── Real connection execution tests ──────────────────────────────
+
+#[tokio::test]
+async fn real_websocket_echo_works() {
+    let config = AutumnConfig::default();
+    let state = test_state();
+    let app = autumn_web::app::build_router(routes![echo], &config, state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{addr}/echo");
+
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut client, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect");
+
+    client
+        .send(tokio_tungstenite::tungstenite::Message::Text("ping".into()))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), client.next())
+        .await
+        .expect("Timeout waiting for echo")
+        .expect("Client closed")
+        .expect("Protocol error");
+
+    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        assert_eq!(text, "ping");
+    } else {
+        panic!("Expected text message");
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn real_websocket_with_shutdown_works() {
+    let config = AutumnConfig::default();
+    let state = test_state();
+    let app = autumn_web::app::build_router(routes![with_shutdown], &config, state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{addr}/with-shutdown");
+
+    let server_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut client, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect");
+
+    // Test that the handler is running normally
+    client
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            "hello".into(),
+        ))
+        .await
+        .unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), client.next())
+        .await
+        .expect("Timeout waiting for response")
+        .expect("Client closed")
+        .expect("Protocol error");
+
+    if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+        assert_eq!(text, "hello");
+    } else {
+        panic!("Expected text message");
+    }
+
+    // Trigger shutdown
+    state.trigger_shutdown_for_test();
+
+    // Verify the socket closes properly due to the shutdown token
+    let close_msg = tokio::time::timeout(std::time::Duration::from_millis(500), client.next())
+        .await
+        .expect("Timeout waiting for close frame")
+        .expect("Client closed unexpectedly")
+        .expect("Protocol error");
+
+    assert!(matches!(
+        close_msg,
+        tokio_tungstenite::tungstenite::Message::Close(_)
+    ));
+
+    server_task.abort();
 }
 
 // ── Channels unit tests (beyond channels.rs) ─────────────────────
