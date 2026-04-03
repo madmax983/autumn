@@ -2030,4 +2030,56 @@ path = "/healthz"
             panic!("Expected a table");
         }
     }
+
+    #[test]
+    fn mock_env_os_string_operations() {
+        let env = MockEnv::new()
+            .with_os("OS_KEY", std::ffi::OsString::from("os_value"));
+
+        assert_eq!(env.var_os("OS_KEY"), Some(std::ffi::OsString::from("os_value")));
+        assert_eq!(env.var("OS_KEY").unwrap(), "os_value");
+
+        let env_removed = env.without("OS_KEY");
+        assert_eq!(env_removed.var_os("OS_KEY"), None);
+        assert!(env_removed.var("OS_KEY").is_err());
+    }
+
+    #[test]
+    fn mock_env_invalid_unicode() {
+        // Create OsString with invalid unicode on Unix-like systems (or handle platform specifically)
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid = std::ffi::OsString::from_vec(vec![0xFF, 0xFF]);
+            let env = MockEnv::new().with_os("INVALID", invalid);
+
+            assert!(matches!(
+                env.var("INVALID"),
+                Err(std::env::VarError::NotUnicode(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn macro_env_initialization_and_os_env_retrieval() {
+        // Test that init_macro_env successfully sets the statics and OsEnv reads them.
+        // We set unique values to ensure they aren't masked by real environment variables.
+        init_macro_env("test_manifest_dir".to_string(), "1".to_string());
+
+        let env = OsEnv;
+
+        // Check `var`
+        assert_eq!(env.var("AUTUMN_MANIFEST_DIR").unwrap(), "test_manifest_dir");
+        assert_eq!(env.var("AUTUMN_IS_DEBUG").unwrap(), "1");
+
+        // Check `var_os`
+        assert_eq!(env.var_os("AUTUMN_MANIFEST_DIR").unwrap(), std::ffi::OsString::from("test_manifest_dir"));
+        assert_eq!(env.var_os("AUTUMN_IS_DEBUG").unwrap(), std::ffi::OsString::from("1"));
+
+        // Check fallback to std::env (read an existing var rather than setting one to avoid unsafe)
+        // CARGO_MANIFEST_DIR is set by Cargo when testing
+        let cargo_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        assert_eq!(env.var("CARGO_MANIFEST_DIR").unwrap(), cargo_dir);
+        assert_eq!(env.var_os("CARGO_MANIFEST_DIR").unwrap(), std::ffi::OsString::from(cargo_dir));
+    }
 }
