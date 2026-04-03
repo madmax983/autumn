@@ -58,12 +58,26 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
-pub trait Env {
+pub trait Env: Send + Sync {
     /// Read an environment variable.
     ///
     /// # Errors
     /// Returns [`std::env::VarError`] if the variable is not present or is not valid Unicode.
     fn var(&self, key: &str) -> Result<String, std::env::VarError>;
+
+    /// Read an environment variable as an `OsString`.
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString>;
+}
+
+static MACRO_MANIFEST_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static MACRO_IS_DEBUG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Initialize environment variables injected by the `#[autumn_web::main]` macro.
+/// This prevents unsafe global environment mutation while maintaining correct behavior.
+#[doc(hidden)]
+pub fn init_macro_env(manifest_dir: String, is_debug: String) {
+    let _ = MACRO_MANIFEST_DIR.set(manifest_dir);
+    let _ = MACRO_IS_DEBUG.set(is_debug);
 }
 
 /// Production implementation of `Env` that reads from the OS environment.
@@ -72,14 +86,35 @@ pub struct OsEnv;
 
 impl Env for OsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            if let Some(val) = MACRO_MANIFEST_DIR.get() {
+                return Ok(val.clone());
+            }
+        } else if key == "AUTUMN_IS_DEBUG" {
+            if let Some(val) = MACRO_IS_DEBUG.get() {
+                return Ok(val.clone());
+            }
+        }
         std::env::var(key)
+    }
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            if let Some(val) = MACRO_MANIFEST_DIR.get() {
+                return Some(val.into());
+            }
+        } else if key == "AUTUMN_IS_DEBUG" {
+            if let Some(val) = MACRO_IS_DEBUG.get() {
+                return Some(val.into());
+            }
+        }
+        std::env::var_os(key)
     }
 }
 
 /// Mock implementation of `Env` for testing.
 #[derive(Clone, Default)]
 pub struct MockEnv {
-    vars: std::collections::HashMap<String, String>,
+    vars: std::collections::HashMap<String, std::ffi::OsString>,
 }
 
 impl MockEnv {
@@ -94,7 +129,14 @@ impl MockEnv {
     /// Set an environment variable in the mock.
     #[must_use]
     pub fn with(mut self, key: &str, value: &str) -> Self {
-        self.vars.insert(key.to_owned(), value.to_owned());
+        self.vars.insert(key.to_owned(), value.into());
+        self
+    }
+
+    /// Set an environment variable as `OsString` in the mock.
+    #[must_use]
+    pub fn with_os(mut self, key: &str, value: std::ffi::OsString) -> Self {
+        self.vars.insert(key.to_owned(), value);
         self
     }
 
@@ -112,6 +154,10 @@ impl Env for MockEnv {
             .get(key)
             .cloned()
             .ok_or(std::env::VarError::NotPresent)
+            .and_then(|v| v.into_string().map_err(std::env::VarError::NotUnicode))
+    }
+    fn var_os(&self, key: &str) -> Option<std::ffi::OsString> {
+        self.vars.get(key).cloned()
     }
 }
 
