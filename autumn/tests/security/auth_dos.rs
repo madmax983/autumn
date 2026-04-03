@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use autumn_web::auth::hash_password;
 use axum::{Router, routing::get, routing::post};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn eris_auth_dos_poc() {
@@ -25,7 +26,6 @@ async fn eris_auth_dos_poc() {
     // Start server in background
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let server_url = format!("http://{}", addr);
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -34,12 +34,9 @@ async fn eris_auth_dos_poc() {
     // We use a simple tcp connection and manually send the HTTP request
     // This avoids dependency issues in the tests module.
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     // We spawn a lot of concurrent hashing tasks to ensure we block the pool.
     let mut login_tasks = vec![];
     for _ in 0..64 {
-        let addr = addr.clone();
         login_tasks.push(tokio::spawn(async move {
             if let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await {
                 let req = b"POST /login HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
@@ -78,8 +75,7 @@ async fn eris_auth_dos_poc() {
     // And there are enough idle worker threads to accept the connection for `/ping` immediately.
     assert!(
         ping_duration < Duration::from_millis(150),
-        "Ping took too long ({:?}), indicating a Denial of Service via blocked worker threads!",
-        ping_duration
+        "Ping took too long ({ping_duration:?}), indicating a Denial of Service via blocked worker threads!"
     );
 
     // cleanup
