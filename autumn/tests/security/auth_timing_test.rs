@@ -15,8 +15,8 @@ async fn eris_auth_timing_test() {
     let elapsed_invalid = start_invalid.elapsed();
 
     // 3. Compare the times. If invalid is significantly faster, we have a timing vulnerability.
-    println!("Elapsed valid: {:?}", elapsed_valid);
-    println!("Elapsed invalid: {:?}", elapsed_invalid);
+    println!("Elapsed valid: {elapsed_valid:?}");
+    println!("Elapsed invalid: {elapsed_invalid:?}");
 
     // To make this a regression test that fails now and passes later, we assert:
     assert!(
