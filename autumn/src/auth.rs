@@ -120,9 +120,19 @@ pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
 pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
     let password = password.to_string();
     let hash = hash.to_string();
+
     tokio::task::spawn_blocking(move || {
-        bcrypt::verify(password, &hash)
-            .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+        // First try to verify.
+        match bcrypt::verify(&password, &hash) {
+            Ok(valid) => Ok(valid),
+            Err(_) => {
+                // To prevent timing attacks where an invalid hash format returns instantly,
+                // we perform a dummy hash calculation so the timing remains roughly the same.
+                // We use the same DEFAULT_BCRYPT_COST.
+                let _ = bcrypt::hash(&password, DEFAULT_BCRYPT_COST);
+                Ok(false)
+            }
+        }
     })
     .await
     .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
@@ -394,9 +404,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_invalid_hash_returns_error() {
+    async fn verify_invalid_hash_returns_false() {
         let result = verify_password("test", "not-a-valid-hash").await;
-        assert!(result.is_err());
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 
     #[test]
