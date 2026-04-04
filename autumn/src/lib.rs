@@ -77,6 +77,8 @@ pub mod db;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
+#[cfg(feature = "flash")]
+pub mod flash;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;

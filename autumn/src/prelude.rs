@@ -65,6 +65,9 @@ pub use crate::hooks::{
 // ── Session & Auth ──────────────────────────────────────────────
 /// Auth extractor for retrieving the authenticated user.
 pub use crate::auth::Auth;
+#[cfg(feature = "flash")]
+/// Flash extractor for temporary session-based messages.
+pub use crate::flash::Flash;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 
