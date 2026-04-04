@@ -4,10 +4,10 @@
 //! Allows pushing a message for the next request, and retrieving
 //! it exactly once on the following request.
 
-use axum::extract::FromRequestParts;
 use crate::error::AutumnError;
 use crate::session::Session;
 use crate::state::AppState;
+use axum::extract::FromRequestParts;
 
 /// The key used to store flash messages in the session.
 const FLASH_KEY: &str = "_flash";
@@ -38,8 +38,7 @@ impl Flash {
     }
 }
 
-impl FromRequestParts<AppState> for Flash
-{
+impl FromRequestParts<AppState> for Flash {
     type Rejection = AutumnError;
 
     async fn from_request_parts(
@@ -105,6 +104,9 @@ mod tests {
         flash.push("new message").await;
 
         // Verify it was added to the session
-        assert_eq!(session.get(FLASH_KEY).await, Some("new message".to_string()));
+        assert_eq!(
+            session.get(FLASH_KEY).await,
+            Some("new message".to_string())
+        );
     }
 }
