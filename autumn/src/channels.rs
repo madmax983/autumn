@@ -164,9 +164,12 @@ impl Channels {
     /// ```
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        // tokio::sync::broadcast channel capacity must be > 0 and <= usize::MAX / 2
+        // Furthermore, allocating huge capacities will OOM the process.
+        // Cap it at a reasonable maximum for an application, like 16384, and min 1.
         Self {
             inner: Arc::new(ChannelsInner {
-                capacity,
+                capacity: capacity.max(1).min(16384),
                 registry: Mutex::new(HashMap::new()),
             }),
         }
