@@ -215,13 +215,10 @@ impl DashboardState {
             .timeout(Duration::from_secs(2))
             .build();
 
-        let client = match client {
-            Ok(c) => c,
-            Err(e) => {
-                self.connected = false;
-                self.last_error = Some(format!("HTTP client error: {e}"));
-                return;
-            }
+        let Ok(client) = client else {
+            self.connected = false;
+            self.last_error = Some(format!("HTTP client error: {}", client.unwrap_err()));
+            return;
         };
 
         if !self.fetch_health(&client) {
