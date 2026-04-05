@@ -65,9 +65,9 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
-use crate::app::build_router;
 use crate::config::AutumnConfig;
 use crate::route::Route;
+use crate::router::build_router;
 use crate::state::AppState;
 
 #[cfg(feature = "db")]

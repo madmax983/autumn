@@ -58,7 +58,7 @@ async fn static_files_take_priority_over_dynamic_routes() {
 
     // Dynamic handler registered at the same path as the static file.
     let config = autumn_web::config::AutumnConfig::default();
-    let router = autumn_web::app::build_router_with_static(
+    let router = autumn_web::router::build_router_with_static(
         vec![dynamic_get_route(
             "/about",
             "about_dynamic",
@@ -96,7 +96,7 @@ async fn static_files_take_priority_over_dynamic_routes() {
 #[tokio::test]
 async fn dynamic_routes_still_work_without_dist() {
     let config = autumn_web::config::AutumnConfig::default();
-    let router = autumn_web::app::build_router_with_static(
+    let router = autumn_web::router::build_router_with_static(
         vec![dynamic_get_route(
             "/about",
             "about_dynamic",
@@ -157,7 +157,7 @@ async fn unknown_routes_fall_through_to_dynamic() {
 
     // 2. Build router with a dynamic /admin route (not in the manifest).
     let config = autumn_web::config::AutumnConfig::default();
-    let router = autumn_web::app::build_router_with_static(
+    let router = autumn_web::router::build_router_with_static(
         vec![dynamic_get_route("/admin", "admin", "Admin Panel")],
         &config,
         test_state(),
@@ -213,7 +213,7 @@ async fn head_requests_served_for_static_routes() {
     .expect("write manifest");
 
     let config = autumn_web::config::AutumnConfig::default();
-    let router = autumn_web::app::build_router_with_static(
+    let router = autumn_web::router::build_router_with_static(
         vec![],
         &config,
         test_state(),
@@ -266,7 +266,7 @@ async fn post_requests_pass_through_static_layer() {
 
     // Register both GET and POST on /admin
     let config = autumn_web::config::AutumnConfig::default();
-    let router = autumn_web::app::build_router_with_static(
+    let router = autumn_web::router::build_router_with_static(
         vec![
             dynamic_get_route("/admin", "admin_list", "Admin Panel"),
             autumn_web::route::Route {
