@@ -503,10 +503,7 @@ mod tests {
     fn extract_cookie_ignores_malformed_cookies() {
         let mut headers = http::HeaderMap::new();
         // Missing '='
-        headers.insert(
-            http::header::COOKIE,
-            "autumn-csrf abc123".parse().unwrap(),
-        );
+        headers.insert(http::header::COOKIE, "autumn-csrf abc123".parse().unwrap());
         assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
 
         // Multiple spaces
@@ -514,7 +511,10 @@ mod tests {
             http::header::COOKIE,
             "   autumn-csrf  =  abc123  ; other=xyz".parse().unwrap(),
         );
-        assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), Some("abc123".to_owned()));
+        assert_eq!(
+            extract_cookie_token(&headers, "autumn-csrf"),
+            Some("abc123".to_owned())
+        );
     }
 
     #[test]
