@@ -1,5 +1,6 @@
 [workspace]
 members = ["autumn", "autumn-macros", "autumn-cli", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone"]
+exclude = ["autumn-harvest"]
 resolver = "3"
 
 [workspace.package]

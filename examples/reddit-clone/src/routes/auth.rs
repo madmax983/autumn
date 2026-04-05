@@ -8,6 +8,7 @@ use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use tracing::warn;
 
 use crate::models::{NewUser, User};
 use crate::schema::users;
@@ -119,6 +120,15 @@ pub async fn register(
         .get_result(&mut *db)
         .await
         .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
+
+    if let Err(error) = crate::workflows::start_user_onboarding(&mut db, &user).await {
+        warn!(
+            user_id = user.id,
+            username = %user.username,
+            error = %error,
+            "failed to enqueue onboarding workflow"
+        );
+    }
 
     // Log in immediately after registration
     session.rotate_id().await;

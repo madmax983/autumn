@@ -20,6 +20,18 @@ use crate::query::QueryRegistry;
 use crate::replay::{HistoryMatch, HistoryMatcher};
 use crate::types::{ActivityExecId, ExecutionId, TimerId};
 
+/// Runtime map of typed shared state registered on the harvest builder.
+pub type SharedStateMap = HashMap<TypeId, Box<dyn Any + Send + Sync>>;
+
+/// Shared reference to the registered typed state map.
+pub type SharedState = Arc<SharedStateMap>;
+
+/// Create an empty shared-state map.
+#[must_use]
+pub fn empty_shared_state() -> SharedState {
+    Arc::new(HashMap::new())
+}
+
 // ---------------------------------------------------------------------------
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
@@ -143,7 +155,7 @@ pub struct WorkflowContext {
     /// Monotonically increasing counter for generating activity sequence IDs.
     activity_seq: Mutex<u32>,
     /// Shared typed state map (same `AppState` extras as the web server).
-    state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: SharedState,
     /// In-memory query handlers (not persisted to history).
     query_registry: Mutex<QueryRegistry>,
 }
@@ -158,7 +170,7 @@ impl WorkflowContext {
     /// with the cursor past the `WorkflowStarted` event.
     #[must_use]
     pub fn for_replay(exec_id: ExecutionId, events: Vec<WorkflowEvent>) -> Self {
-        Self::for_replay_with_state(exec_id, events, Arc::new(HashMap::new()))
+        Self::for_replay_with_state(exec_id, events, empty_shared_state())
     }
 
     /// Create a replay context with shared application state.
@@ -166,7 +178,7 @@ impl WorkflowContext {
     pub fn for_replay_with_state(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
-        state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+        state: SharedState,
     ) -> Self {
         // Extract the start_time from WorkflowStarted (first event).
         let start_time = events
@@ -206,7 +218,7 @@ impl WorkflowContext {
             commands: Mutex::new(Vec::new()),
             start_time,
             activity_seq: Mutex::new(0),
-            state: Arc::new(HashMap::new()),
+            state: empty_shared_state(),
             query_registry: Mutex::new(QueryRegistry::new()),
         }
     }
@@ -320,6 +332,11 @@ impl WorkflowContext {
                 source: error.into(),
             }),
 
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: name.to_string(),
+            }),
+
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("activity mismatch: expected {expected}, got {actual}"),
             )),
@@ -384,7 +401,7 @@ impl WorkflowContext {
                 format!("timer mismatch: expected {expected}, got {actual}"),
             )),
 
-            HistoryMatch::Failed { .. } => {
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => {
                 // Timers don't fail in the traditional sense, but handle gracefully.
                 Ok(())
             }
@@ -410,6 +427,18 @@ impl WorkflowContext {
     ///
     /// During replay, returns the recorded child output or failure.
     /// During live execution, emits a `StartChildWorkflow` command and suspends.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::ActivityFailed`] or [`HarvestError::Timeout`] when
+    /// replay finds a terminal child-workflow event, [`HarvestError::NonDeterministic`]
+    /// if the recorded history does not match the requested child workflow, or
+    /// [`HarvestError::Cancelled`] if the workflow task is dropped before a live
+    /// child result arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
@@ -427,6 +456,10 @@ impl WorkflowContext {
                 name: format!("child-workflow:{workflow_name}"),
                 attempt,
                 source: error.into(),
+            }),
+            HistoryMatch::TimedOut { timeout_type } => Err(HarvestError::Timeout {
+                timeout_type,
+                task_name: format!("child-workflow:{workflow_name}"),
             }),
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("child workflow mismatch: expected {expected}, got {actual}"),
@@ -456,6 +489,16 @@ impl WorkflowContext {
     }
 
     /// Wait for the next delivered signal with the given name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NonDeterministic`] if replay history diverges from
+    /// the requested signal wait, or [`HarvestError::Cancelled`] if the workflow
+    /// task is dropped before a live signal arrives.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal replay matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
         let history_match = self
             .matcher
@@ -468,9 +511,9 @@ impl WorkflowContext {
             HistoryMatch::Diverged { expected, actual } => Err(HarvestError::NonDeterministic(
                 format!("signal mismatch: expected {expected}, got {actual}"),
             )),
-            HistoryMatch::Failed { .. } => Err(HarvestError::NonDeterministic(
-                "signal history contains unexpected failure".into(),
-            )),
+            HistoryMatch::Failed { .. } | HistoryMatch::TimedOut { .. } => Err(
+                HarvestError::NonDeterministic("signal history contains unexpected failure".into()),
+            ),
             HistoryMatch::NoMatch => {
                 let (tx, rx) = oneshot::channel();
                 self.push_command(WorkflowCommand::WaitForSignal {
@@ -486,6 +529,13 @@ impl WorkflowContext {
         }
     }
 
+    /// Register a named query handler for this workflow execution.
+    ///
+    /// Query handlers are in-memory only and do not emit workflow commands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
     pub fn register_query<F>(&self, name: &str, handler: F)
     where
         F: Fn() -> Value + Send + Sync + 'static,
@@ -496,6 +546,16 @@ impl WorkflowContext {
             .register(name, Arc::new(handler));
     }
 
+    /// Execute a previously registered query by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::NotFound`] if no query handler is registered under
+    /// `name`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal query registry mutex is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
         self.query_registry
             .lock()
@@ -551,7 +611,7 @@ impl WorkflowContext {
 /// detection, and state access for shared resources.
 pub struct ActivityContext {
     /// Shared state map.
-    state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+    state: SharedState,
     /// Heartbeat channel -- `None` in test contexts.
     heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
     /// Cancellation token -- allows the worker to signal graceful shutdown.
@@ -563,7 +623,7 @@ impl ActivityContext {
     /// cancellation token.
     #[allow(dead_code)] // Used by worker dispatch (not yet wired in Phase 2)
     pub(crate) fn new(
-        state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+        state: SharedState,
         heartbeat_tx: Option<tokio::sync::mpsc::Sender<serde_json::Value>>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Self {
@@ -625,7 +685,7 @@ impl ActivityContext {
     #[must_use]
     pub fn new_test() -> Self {
         Self::new(
-            Arc::new(HashMap::new()),
+            empty_shared_state(),
             None,
             tokio_util::sync::CancellationToken::new(),
         )
@@ -639,6 +699,7 @@ impl ActivityContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TimeoutType;
     use crate::types::ActivityExecId;
     use chrono::Utc;
 
@@ -804,6 +865,42 @@ mod tests {
         let err = result.unwrap_err();
         assert!(matches!(err, HarvestError::ActivityFailed { .. }));
         assert!(err.to_string().contains("send_email"));
+    }
+
+    #[tokio::test]
+    async fn context_replays_timed_out_activity() {
+        let activity_id = ActivityExecId::new();
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: TimeoutType::StartToClose,
+            },
+        ];
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+
+        let result = ctx
+            .execute_activity_raw("send_email", Value::Null, "default")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(HarvestError::Timeout {
+                timeout_type: TimeoutType::StartToClose,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1339,6 +1436,9 @@ mod tests {
 
         let value = ctx.execute_query("status").expect("query should execute");
         assert_eq!(value, serde_json::json!({"state": "running"}));
-        assert!(ctx.drain_commands().is_empty(), "queries must not emit events");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "queries must not emit events"
+        );
     }
 }

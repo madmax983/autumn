@@ -20,10 +20,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
+      - name: Check framework formatting
         run: cargo fmt --all -- --check
-      - name: Clippy
+      - name: Check harvest formatting
+        working-directory: autumn-harvest
+        run: cargo fmt --all -- --check
+      - name: Framework clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Harvest clippy
+        working-directory: autumn-harvest
+        run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
+      - name: Harvest Autumn adapter clippy
+        working-directory: autumn-harvest
+        run: cargo clippy -p autumn-harvest-autumn --all-targets -- -D warnings
+      - name: Harvest macros clippy
+        working-directory: autumn-harvest
+        run: cargo clippy -p autumn-harvest-macros -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
@@ -37,15 +49,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests
+      - name: Run framework tests
         run: cargo test --workspace
-      - name: Run Docker-dependent tests
+      - name: Run harvest no-db tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest --no-default-features
+      - name: Compile harvest db-backed tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest --all-features --tests --no-run
+      - name: Run harvest all-features lib tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest --all-features --lib
+      - name: Run harvest Autumn adapter lib tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest-autumn --lib
+      - name: Run harvest macros tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest-macros
+      - name: Compile harvest Autumn adapter integration tests
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest-autumn --test api_scheduler_integration --no-run
+      - name: Run framework Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
+      - name: Run harvest Docker-backed integration tests
+        if: runner.os == 'Linux'
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest --test integration_e2e -- --test-threads=1
+      - name: Run harvest Autumn adapter API and scheduler integration tests
+        if: runner.os == 'Linux'
+        working-directory: autumn-harvest
+        run: cargo test -p autumn-harvest-autumn --test api_scheduler_integration -- --test-threads=1
 
   coverage:
     name: Coverage
-    needs: lint
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,5 +110,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.86.0
       - uses: Swatinem/rust-cache@v2
-      - name: Check MSRV compiles
+      - name: Check framework MSRV compiles
+        run: cargo check --workspace
+      - name: Check harvest MSRV compiles
+        working-directory: autumn-harvest
         run: cargo check --workspace

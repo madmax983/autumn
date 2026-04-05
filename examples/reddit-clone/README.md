@@ -1,7 +1,7 @@
 # Reddit Clone
 
 A Reddit clone built with [Autumn](https://github.com/madmax983/autumn),
-showcasing **every major framework feature** in a single cohesive application.
+showcasing the framework's major features in a single cohesive application.
 
 ## Features Demonstrated
 
@@ -23,7 +23,7 @@ showcasing **every major framework feature** in a single cohesive application.
 | Field validation (`#[validate(length(min, max))]`) | `models.rs` |
 | Scheduled background tasks (`#[scheduled(every = "15m")]`) | `tasks.rs` |
 | **WebSockets** (`#[ws]`, `Channels` pub/sub, `CancellationToken`) | `routes/live.rs` |
-| **Durable Workflows** (autumn-harvest `#[workflow]` + `#[activity]` + `#[dag]`) | `workflows.rs` |
+| **Durable Workflows** (real autumn-harvest onboarding + post-publication flows + management API) | `workflows.rs`, `/api/harvest/*` |
 | Actuator endpoints (`/health`, `/actuator/*`) | Auto-mounted |
 | Maud HTML templates | All route files |
 | htmx interactivity (voting, deletion, logout) | `routes/votes.rs`, `routes/layout.rs` |
@@ -78,7 +78,7 @@ src/
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)
   tasks.rs          # #[scheduled] hot-rank recalculator
-  workflows.rs      # autumn-harvest: onboarding, moderation, DAG pipelines
+  workflows.rs      # real autumn-harvest onboarding + post-publication workflows and activities
   slugify.rs        # URL slug generation utility
   routes/
     mod.rs          # Module exports

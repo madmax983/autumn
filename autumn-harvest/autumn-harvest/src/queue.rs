@@ -6,6 +6,7 @@
 
 use chrono::{Duration, Utc};
 use diesel::ExpressionMethods;
+use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -13,6 +14,7 @@ use uuid::Uuid;
 
 use crate::error::HarvestResult;
 use crate::models::{NewTaskQueueItem, TaskQueueItem};
+use crate::types::ExecutionId;
 
 // ---------------------------------------------------------------------------
 // TaskType
@@ -26,6 +28,8 @@ pub enum TaskType {
     /// A single activity invocation within a workflow.
     Activity,
 }
+
+const IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE: Duration = Duration::seconds(5);
 
 impl TaskType {
     /// Returns the string representation stored in the `task_type` column.
@@ -83,7 +87,9 @@ impl EnqueueParams {
             input,
             priority: 0,
             max_attempts: 3,
-            scheduled_at: Utc::now(),
+            // Default immediate tasks slightly into the past to tolerate small
+            // host/Postgres clock skew when workers claim with `scheduled_at <= NOW()`.
+            scheduled_at: Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE,
             heartbeat_timeout: None,
             start_to_close: None,
             schedule_to_start: None,
@@ -127,6 +133,8 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+    crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
 
     Ok(task_id)
 }
@@ -175,15 +183,25 @@ pub async fn complete_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set((
-            dsl::state.eq("COMPLETED"),
-            dsl::output.eq(Some(output)),
-            dsl::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("COMPLETED"),
+        dsl::output.eq(Some(output)),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
 
     Ok(())
 }
@@ -200,15 +218,25 @@ pub async fn fail_task(
 ) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set((
-            dsl::state.eq("FAILED"),
-            dsl::error.eq(Some(error)),
-            dsl::completed_at.eq(Some(Utc::now())),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    )
+    .set((
+        dsl::state.eq("FAILED"),
+        dsl::error.eq(Some(error)),
+        dsl::completed_at.eq(Some(Utc::now())),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not pending or running"
+        )));
+    }
 
     Ok(())
 }
@@ -221,11 +249,21 @@ pub async fn fail_task(
 pub async fn record_heartbeat(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set(dsl::last_heartbeat_at.eq(Some(Utc::now())))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "task queue item {task_id} is not running"
+        )));
+    }
 
     Ok(())
 }
@@ -240,20 +278,87 @@ pub async fn requeue_for_retry(
     task_id: Uuid,
     delay: Duration,
 ) -> HarvestResult<()> {
+    let next_run = Utc::now() + delay;
+    reschedule_task(conn, task_id, next_run).await
+}
+
+/// Reset a task to `PENDING` at an explicit timestamp.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on update failure.
+pub async fn reschedule_task(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    scheduled_at: chrono::DateTime<Utc>,
+) -> HarvestResult<()> {
     use crate::schema::harvest_task_queue::dsl;
 
-    let next_run = Utc::now() + delay;
+    let queue_name = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::scheduled_at.eq(scheduled_at),
+    ))
+    .returning(dsl::queue_name)
+    .get_result::<String>(conn)
+    .await
+    .optional()
+    .map_err(crate::error::database_error)?
+    .ok_or_else(|| {
+        crate::error::HarvestError::NotFound(format!("task queue item {task_id} is not running"))
+    })?;
 
-    diesel::update(dsl::harvest_task_queue.find(task_id))
-        .set((
-            dsl::state.eq("PENDING"),
-            dsl::worker_id.eq(None::<String>),
-            dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
-            dsl::scheduled_at.eq(next_run),
-        ))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    crate::notify::notify_task_enqueued(conn, &queue_name, task_id).await?;
+
+    Ok(())
+}
+
+/// Wake a parked workflow task for the given execution so replay can continue.
+///
+/// This resets any parked workflow task row for `exec_id` back to `PENDING`
+/// and schedules it immediately. Both `RUNNING` and already-parked `PENDING`
+/// tasks are eligible so signals can wake a workflow without waiting for the
+/// next retry backoff window. If no workflow task exists, this is a no-op.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on update failure.
+pub async fn wake_workflow_task(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let queue_names = diesel::update(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+            .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
+            .filter(dsl::state.eq_any(["RUNNING", "PENDING"])),
+    )
+    .set((
+        dsl::state.eq("PENDING"),
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::scheduled_at.eq(Utc::now() - IMMEDIATE_SCHEDULE_SKEW_ALLOWANCE),
+    ))
+    .returning(dsl::queue_name)
+    .get_results::<String>(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    let mut queue_names = queue_names;
+    queue_names.sort();
+    queue_names.dedup();
+
+    for queue_name in queue_names {
+        crate::notify::notify_task_enqueued(conn, &queue_name, Uuid::nil()).await?;
+    }
 
     Ok(())
 }

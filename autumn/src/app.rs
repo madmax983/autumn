@@ -24,6 +24,10 @@
 //! }
 //! ```
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::AutumnConfig;
@@ -70,11 +74,19 @@ pub fn app() -> AppBuilder {
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
+        startup_hooks: Vec::new(),
+        shutdown_hooks: Vec::new(),
+        extensions: HashMap::new(),
         error_page_renderer: None,
         #[cfg(feature = "db")]
-        migrations: None,
+        migrations: Vec::new(),
     }
 }
+
+type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>;
+type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
+type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
 
 /// Builder for configuring and launching an Autumn application.
 ///
@@ -112,11 +124,14 @@ pub struct AppBuilder {
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    startup_hooks: Vec<StartupHook>,
+    shutdown_hooks: Vec<ShutdownHook>,
+    extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
     #[cfg(feature = "db")]
-    migrations: Option<migrate::EmbeddedMigrations>,
+    migrations: Vec<migrate::EmbeddedMigrations>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -383,6 +398,84 @@ impl AppBuilder {
         self
     }
 
+    /// Register an async startup hook that runs after [`AppState`] exists and
+    /// before the server begins accepting requests.
+    ///
+    /// This is intended for background runtimes that need the fully built app
+    /// state, such as workers or pollers that share the database pool.
+    #[must_use]
+    pub fn on_startup<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(AppState) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.startup_hooks
+            .push(Box::new(move |state| Box::pin(hook(state))));
+        self
+    }
+
+    /// Register an async shutdown hook that runs during graceful shutdown.
+    ///
+    /// Hooks execute in reverse registration order so later-added runtimes
+    /// shut down before earlier infrastructure they might depend on.
+    #[must_use]
+    pub fn on_shutdown<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
+        self
+    }
+
+    /// Store or replace a typed builder extension.
+    ///
+    /// External crates use this to accumulate configuration across fluent
+    /// extension-trait calls without Autumn needing to know the concrete type.
+    #[must_use]
+    pub fn with_extension<T>(mut self, value: T) -> Self
+    where
+        T: Any + Send + 'static,
+    {
+        self.extensions.insert(TypeId::of::<T>(), Box::new(value));
+        self
+    }
+
+    /// Mutate a typed builder extension, inserting a default value first when
+    /// the extension has not been registered yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension type map is corrupted and the value
+    /// stored under `T`'s [`TypeId`] cannot be downcast back to `T`.
+    #[must_use]
+    pub fn update_extension<T, Init, Update>(mut self, init: Init, update: Update) -> Self
+    where
+        T: Any + Send + 'static,
+        Init: FnOnce() -> T,
+        Update: FnOnce(&mut T),
+    {
+        let type_id = TypeId::of::<T>();
+        let entry = self
+            .extensions
+            .entry(type_id)
+            .or_insert_with(|| Box::new(init()));
+        let typed = entry
+            .downcast_mut::<T>()
+            .expect("extension type map corrupted");
+        update(typed);
+        self
+    }
+
+    /// Borrow a typed builder extension if it has been registered.
+    #[must_use]
+    pub fn extension<T>(&self) -> Option<&T>
+    where
+        T: Any + Send + 'static,
+    {
+        self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -408,8 +501,8 @@ impl AppBuilder {
     /// ```
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
-        self.migrations = Some(migrations);
+    pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
+        self.migrations.push(migrations);
         self
     }
 
@@ -451,6 +544,9 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            startup_hooks,
+            shutdown_hooks,
+            extensions: _,
             error_page_renderer,
             #[cfg(feature = "db")]
             migrations,
@@ -509,8 +605,10 @@ impl AppBuilder {
 
         // 5b. Run migrations if registered
         #[cfg(feature = "db")]
-        if let (Some(migrations), Some(url)) = (migrations, &config.database.url) {
-            migrate::auto_migrate(url, config.profile.as_deref(), migrations);
+        if let Some(url) = &config.database.url {
+            for migrations in migrations {
+                migrate::auto_migrate(url, config.profile.as_deref(), migrations);
+            }
         }
 
         // 6. Build the router (with optional static-file layer)
@@ -547,6 +645,11 @@ impl AppBuilder {
             nest_routers,
             error_page_renderer,
         );
+
+        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+            tracing::error!(error = %error, "startup hook failed");
+            std::process::exit(1);
+        }
 
         // 7. Start scheduled tasks (if any)
         if !tasks.is_empty() {
@@ -591,6 +694,8 @@ impl AppBuilder {
                         );
                     });
                 }
+
+                run_shutdown_hooks(&shutdown_hooks).await;
             })
             .await
             .unwrap_or_else(|e| {
@@ -615,6 +720,9 @@ impl AppBuilder {
             scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
+            startup_hooks: _,
+            shutdown_hooks: _,
+            extensions: _,
             error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,
@@ -749,6 +857,19 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                 );
             }
         }
+    }
+}
+
+async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::AutumnResult<()> {
+    for hook in hooks {
+        hook(state.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
+    for hook in hooks.iter().rev() {
+        hook().await;
     }
 }
 
@@ -1465,6 +1586,77 @@ mod tests {
         assert_eq!(builder.routes[0].path, "/1");
         assert_eq!(builder.routes[1].path, "/2");
         assert_eq!(builder.routes[2].path, "/3");
+    }
+
+    #[test]
+    fn app_builder_extensions_store_and_update_typed_values() {
+        let builder = app()
+            .with_extension::<String>("haunted".into())
+            .update_extension::<String, _, _>(String::new, |value| value.push_str(" harvest"));
+
+        let value = builder
+            .extension::<String>()
+            .expect("string extension should be present");
+        assert_eq!(value, "haunted harvest");
+    }
+
+    #[tokio::test]
+    async fn startup_and_shutdown_hooks_run_in_expected_order() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let startup_events = Arc::clone(&events);
+        let shutdown_a = Arc::clone(&events);
+        let shutdown_b = Arc::clone(&events);
+        let builder = app()
+            .on_startup(move |_state| {
+                let startup_events = Arc::clone(&startup_events);
+                async move {
+                    startup_events
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("start");
+                    Ok(())
+                }
+            })
+            .on_shutdown(move || {
+                let shutdown_a = Arc::clone(&shutdown_a);
+                async move {
+                    shutdown_a
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("stop-a");
+                }
+            })
+            .on_shutdown(move || {
+                let shutdown_b = Arc::clone(&shutdown_b);
+                async move {
+                    shutdown_b
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("stop-b");
+                }
+            });
+
+        run_startup_hooks(&builder.startup_hooks, AppState::for_test())
+            .await
+            .expect("startup hooks should succeed");
+        run_shutdown_hooks(&builder.shutdown_hooks).await;
+
+        let events = events.lock().expect("events lock poisoned");
+        assert_eq!(*events, vec!["start", "stop-b", "stop-a"]);
+    }
+
+    #[tokio::test]
+    async fn startup_hook_errors_propagate() {
+        let builder = app().on_startup(|_state| async {
+            Err(crate::AutumnError::service_unavailable_msg(
+                "startup ritual failed",
+            ))
+        });
+
+        let error = run_startup_hooks(&builder.startup_hooks, AppState::for_test())
+            .await
+            .expect_err("startup hook should fail");
+        assert!(error.to_string().contains("startup ritual failed"));
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use tracing::warn;
 
 use crate::models::{Post, Subreddit, User};
 use crate::schema::{comments, posts, subreddits, users};
@@ -286,6 +287,10 @@ pub async fn submit(
         .ok_or_else(|| AutumnError::unauthorized_msg("Login required"))?
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
+    let author_username = session
+        .get("username")
+        .await
+        .unwrap_or_else(|| format!("user-{user_id}"));
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -341,6 +346,27 @@ pub async fn submit(
         ))
         .execute(&mut *db)
         .await?;
+
+    if let Err(error) = crate::workflows::start_post_publication(
+        &mut db,
+        post_id,
+        &title,
+        &slug,
+        &sub.slug,
+        &author_username,
+    )
+    .await
+    {
+        warn!(
+            post_id,
+            title = %title,
+            post_slug = %slug,
+            subreddit_slug = %sub.slug,
+            author_username = %author_username,
+            error = %error,
+            "failed to enqueue post publication workflow"
+        );
+    }
 
     Ok(redirect_to(&format!("/r/{}", sub.slug)))
 }

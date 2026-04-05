@@ -9,6 +9,11 @@ use crate::models::{HarvestSignal, NewHarvestSignal};
 use crate::types::ExecutionId;
 
 /// Queue a workflow signal for durable delivery.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the insert fails.
 #[cfg(feature = "db")]
 pub async fn send_signal(
     conn: &mut AsyncPgConnection,
@@ -34,6 +39,11 @@ pub async fn send_signal(
 }
 
 /// Load all unconsumed queued signals for an execution, ordered by receive time.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the query fails.
 #[cfg(feature = "db")]
 pub async fn load_pending_signals(
     conn: &mut AsyncPgConnection,
@@ -52,6 +62,11 @@ pub async fn load_pending_signals(
 }
 
 /// Mark the provided signal IDs consumed.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the update fails.
 #[cfg(feature = "db")]
 pub async fn mark_signals_consumed(
     conn: &mut AsyncPgConnection,

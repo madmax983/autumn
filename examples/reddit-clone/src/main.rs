@@ -12,7 +12,7 @@
 //   Validation          -> #[validate(length(min, max))] on model fields
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
 //   WebSockets          -> #[ws] live feed with Channels pub/sub
-//   Durable Workflows   -> autumn-harvest patterns (see workflows.rs)
+//   Durable Workflows   -> autumn-harvest onboarding + post-publication workflows + management API
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
@@ -32,6 +32,8 @@ mod slugify;
 mod tasks;
 mod workflows;
 
+use autumn_harvest::prelude::WorkerConfig;
+use autumn_harvest_autumn::prelude::HarvestExt;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 
@@ -83,6 +85,14 @@ async fn main() {
         ])
         .static_routes(static_routes![routes::about::about])
         .tasks(tasks![tasks::recalculate_hot_ranks])
+        .workflows(workflows::registered_workflows())
+        .activities(workflows::registered_activities())
+        .worker(WorkerConfig {
+            max_concurrent_workflows: 4,
+            max_concurrent_activities: 8,
+            ..WorkerConfig::default()
+        })
+        .harvest_api("/api/harvest")
         .run()
         .await;
 }
