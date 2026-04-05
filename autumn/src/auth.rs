@@ -121,8 +121,18 @@ pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<
     let password = password.to_string();
     let hash = hash.to_string();
     tokio::task::spawn_blocking(move || {
-        bcrypt::verify(password, &hash)
-            .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+        match bcrypt::verify(&password, &hash) {
+            Ok(valid) => Ok(valid),
+            Err(e) => {
+                // Compute a dummy hash to prevent timing attacks.
+                // If the provided hash is invalid, `bcrypt::verify` returns almost instantly.
+                // By doing a dummy hash, we ensure the function takes the same amount of time.
+                let _ = bcrypt::hash(&password, DEFAULT_BCRYPT_COST);
+                Err(crate::AutumnError::from(std::io::Error::other(
+                    e.to_string(),
+                )))
+            }
+        }
     })
     .await
     .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
