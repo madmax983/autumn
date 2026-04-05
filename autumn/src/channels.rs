@@ -169,7 +169,7 @@ impl Channels {
         // Cap it at a reasonable maximum for an application, like 16384, and min 1.
         Self {
             inner: Arc::new(ChannelsInner {
-                capacity: capacity.max(1).min(16384),
+                capacity: capacity.clamp(1, 16384),
                 registry: Mutex::new(HashMap::new()),
             }),
         }
