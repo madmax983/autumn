@@ -262,8 +262,12 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
         return;
     }
 
-    let toml::Value::Table(overlay_table) = overlay else { return; };
-    let Some(base_table) = base.as_table_mut() else { return; };
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+    let Some(base_table) = base.as_table_mut() else {
+        return;
+    };
 
     for (key, overlay_val) in overlay_table {
         let is_recursive_merge =
