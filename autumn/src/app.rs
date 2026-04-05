@@ -1567,10 +1567,7 @@ mod tests {
     }
 
     /// Helper to build a test router with custom config.
-    pub fn test_router_with_config(
-        routes: Vec<Route>,
-        config: &AutumnConfig,
-    ) -> axum::Router {
+    pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
             #[cfg(feature = "db")]
             pool: None,
