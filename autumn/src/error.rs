@@ -288,6 +288,25 @@ impl AutumnError {
 
     /// Create a `422 Unprocessable Entity` error with field-level
     /// validation details.
+    ///
+    /// Use this when a request fails multiple field-specific validation rules
+    /// (e.g., in a form submission). It attaches the `details` parameter, a mapping
+    /// of field names to their respective error messages, so the client can display
+    /// errors next to the relevant inputs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut errors = HashMap::new();
+    /// errors.insert("username".to_string(), vec!["Username is taken".to_string()]);
+    ///
+    /// let err = AutumnError::validation(errors);
+    /// assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    /// ```
     #[must_use]
     pub fn validation(details: std::collections::HashMap<String, Vec<String>>) -> Self {
         Self {
