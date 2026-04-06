@@ -28,8 +28,8 @@ use crate::executor::{WorkflowOutcome, run_workflow};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{TaskQueueItem, WorkflowExecution};
 use crate::queue::{self, TaskType};
-use crate::signal;
 use crate::schema::harvest_workflow_executions;
+use crate::signal;
 use crate::store;
 use crate::types::ExecutionId;
 

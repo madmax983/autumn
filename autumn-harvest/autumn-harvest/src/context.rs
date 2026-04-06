@@ -1339,6 +1339,9 @@ mod tests {
 
         let value = ctx.execute_query("status").expect("query should execute");
         assert_eq!(value, serde_json::json!({"state": "running"}));
-        assert!(ctx.drain_commands().is_empty(), "queries must not emit events");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "queries must not emit events"
+        );
     }
 }
