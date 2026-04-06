@@ -205,6 +205,14 @@ fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     has_wait && only_wait_or_marker
 }
 
+#[allow(dead_code)]
+fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
+    !commands.is_empty()
+        && commands
+            .iter()
+            .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
+}
+
 
 async fn load_workflow_execution(
     conn: &mut AsyncPgConnection,
@@ -820,6 +828,37 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn all_commands_wait_for_signal_requires_non_empty() {
+        let commands: Vec<WorkflowCommand> = vec![];
+        assert!(!all_commands_wait_for_signal(&commands));
+    }
+
+    #[test]
+    fn all_commands_wait_for_signal_only_accepts_wait_commands() {
+        let (signal_tx, _signal_rx) = oneshot::channel::<serde_json::Value>();
+        let (timer_tx, _timer_rx) = oneshot::channel::<()>();
+
+        let only_wait = vec![WorkflowCommand::WaitForSignal {
+            signal_name: "approved".to_string(),
+            result_tx: signal_tx,
+        }];
+        assert!(all_commands_wait_for_signal(&only_wait));
+
+        let mixed = vec![
+            WorkflowCommand::WaitForSignal {
+                signal_name: "approved".to_string(),
+                result_tx: oneshot::channel::<serde_json::Value>().0,
+            },
+            WorkflowCommand::StartTimer {
+                timer_id: crate::types::TimerId::new("t1"),
+                duration_secs: 1,
+                result_tx: timer_tx,
+            },
+        ];
+        assert!(!all_commands_wait_for_signal(&mixed));
+    }
 
     #[test]
     fn should_requeue_signal_wait_allows_marker_plus_wait() {
