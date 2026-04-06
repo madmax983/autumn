@@ -166,7 +166,7 @@ impl Channels {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(ChannelsInner {
-                capacity,
+                capacity: capacity.max(1),
                 registry: Mutex::new(HashMap::new()),
             }),
         }
