@@ -187,10 +187,10 @@ pub async fn render_static_routes(
 
     // Render concurrently
     let results: Vec<Result<(String, ManifestEntry), BuildError>> =
-        futures::stream::iter(jobs.iter().map(|job| {
+        futures::stream::iter(jobs.into_iter().map(|job| {
             let router = router.clone();
             let staging = staging.clone();
-            let url = job.url.clone();
+            let url = job.url;
             let revalidate = job.revalidate;
             async move {
                 eprintln!("  Rendering {url} ...");

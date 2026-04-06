@@ -1005,12 +1005,15 @@ fn build_router_inner(
         );
     }
     for route in route_list {
-        grouped
-            .entry(route.path)
-            .and_modify(|existing| {
-                *existing = existing.clone().merge(route.handler.clone());
-            })
-            .or_insert(route.handler);
+        match grouped.entry(route.path) {
+            indexmap::map::Entry::Occupied(mut entry) => {
+                let taken = std::mem::take(entry.get_mut());
+                *entry.get_mut() = taken.merge(route.handler);
+            }
+            indexmap::map::Entry::Vacant(entry) => {
+                entry.insert(route.handler);
+            }
+        }
     }
 
     let mut router = axum::Router::new();
