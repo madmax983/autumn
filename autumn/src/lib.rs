@@ -86,6 +86,8 @@ pub mod migrate;
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
+#[cfg(feature = "flash")]
+pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub mod logging;
@@ -94,6 +96,7 @@ pub mod prelude;
 pub mod route;
 pub mod security;
 pub mod session;
+/// Static site generation support.
 pub mod static_gen;
 pub mod task;
 pub mod validation;
@@ -608,6 +611,7 @@ pub mod reexports {
     pub use validator;
 }
 
+/// Shared application state passed to route handlers.
 pub mod state;
 #[allow(
     clippy::missing_panics_doc,

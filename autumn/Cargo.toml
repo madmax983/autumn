@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
 ws = []
+flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
@@ -69,6 +70,7 @@ trybuild = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 proptest = "1.4"
+tokio-tungstenite = "0.29.0"
 
 [lints]
 workspace = true

@@ -108,7 +108,7 @@ pub async fn register(
         return Err(AutumnError::unprocessable_msg("Username already taken"));
     }
 
-    let hashed = hash_password(&password)?;
+    let hashed = hash_password(&password).await?;
     let new_user = NewUser {
         username: username.clone(),
         password_hash: hashed,
@@ -202,7 +202,7 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
         .await
         .map_err(|_| AutumnError::bad_request_msg("Invalid username or password"))?;
 
-    if !verify_password(&form.0.password, &user.password_hash)? {
+    if !verify_password(&form.0.password, &user.password_hash).await? {
         return Err(AutumnError::bad_request_msg("Invalid username or password"));
     }
 

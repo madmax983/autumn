@@ -667,6 +667,42 @@ pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_
     }))
 }
 
+// ── Tasks Stream (WebSocket) ───────────────────────────────────
+
+/// `GET /actuator/tasks/stream` -- stream scheduled task events.
+#[cfg(feature = "ws")]
+pub(crate) async fn tasks_stream_endpoint(
+    State(state): State<AppState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = state.channels().subscribe("sys:tasks");
+        let shutdown = state.shutdown_token();
+
+        loop {
+            tokio::select! {
+                res = rx.recv() => {
+                    match res {
+                        Ok(msg) => {
+                            let ws_msg = axum::extract::ws::Message::Text(msg.into_string().into());
+                            if socket.send(ws_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                () = shutdown.cancelled() => {
+                    let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+                    break;
+                }
+                else => break,
+            }
+        }
+    })
+}
+
 // ── Router builder ──────────────────────────────────────────────
 
 /// Build the actuator router with profile-aware endpoint exposure.
@@ -689,6 +725,14 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
             .route("/actuator/loggers", axum::routing::get(loggers_get))
             .route("/actuator/loggers/{name}", axum::routing::put(loggers_put))
             .route("/actuator/tasks", axum::routing::get(tasks_endpoint));
+
+        #[cfg(feature = "ws")]
+        {
+            router = router.route(
+                "/actuator/tasks/stream",
+                axum::routing::get(tasks_stream_endpoint),
+            );
+        }
     }
 
     router

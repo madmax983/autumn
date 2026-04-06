@@ -32,7 +32,9 @@ pub enum Schedule {
     FixedDelay(Duration),
     /// Run on a cron schedule (6-field: sec min hour day month weekday).
     Cron {
+        /// The 6-field cron expression (e.g., `"0 * * * * *"` for every minute).
         expression: String,
+        /// The timezone for the cron expression (e.g., `"America/New_York"`).
         timezone: Option<String>,
     },
 }

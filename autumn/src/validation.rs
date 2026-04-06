@@ -138,7 +138,9 @@ where
 /// Helper trait for extracting the validatable inner type from extractors
 /// like `Json<T>`, `Form<T>`, `Query<T>`.
 pub trait AsValidatable {
+    /// The inner type to validate.
     type Inner;
+    /// Returns a reference to the inner type to validate.
     fn as_validatable(&self) -> &Self::Inner;
 }
 

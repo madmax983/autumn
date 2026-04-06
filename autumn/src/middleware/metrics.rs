@@ -202,41 +202,62 @@ impl Default for MetricsCollector {
 /// Serializable metrics snapshot returned by `/actuator/metrics`.
 #[derive(Serialize)]
 pub struct MetricsSnapshot {
+    /// HTTP-specific metrics including latency and status codes.
     pub http: HttpMetrics,
 }
 
+/// A snapshot of HTTP metrics across the entire application.
 #[derive(Serialize)]
 pub struct HttpMetrics {
+    /// Total number of requests processed.
     pub requests_total: u64,
+    /// Number of currently active (in-flight) requests.
     pub requests_active: u64,
+    /// Global latency percentiles (in milliseconds).
     pub latency_ms: LatencySnapshot,
+    /// Metrics broken down by route ("METHOD /path").
     pub by_route: HashMap<String, RouteSnapshot>,
+    /// Global distribution of HTTP status codes.
     pub by_status: StatusSnapshot,
 }
 
+/// Percentiles for latency measurements.
 #[derive(Serialize, Default)]
 pub struct LatencySnapshot {
+    /// 50th percentile (median) latency in milliseconds.
     pub p50: u64,
+    /// 95th percentile latency in milliseconds.
     pub p95: u64,
+    /// 99th percentile latency in milliseconds.
     pub p99: u64,
 }
 
+/// Metrics for a specific route.
 #[derive(Serialize)]
 pub struct RouteSnapshot {
+    /// Total number of requests to this route.
     pub count: u64,
+    /// 50th percentile (median) latency for this route in milliseconds.
     pub p50_ms: u64,
+    /// 95th percentile latency for this route in milliseconds.
     pub p95_ms: u64,
+    /// 99th percentile latency for this route in milliseconds.
     pub p99_ms: u64,
 }
 
+/// Global distribution of HTTP status codes.
 #[derive(Serialize)]
 pub struct StatusSnapshot {
+    /// Number of 2xx success responses.
     #[serde(rename = "2xx")]
     pub s2xx: u64,
+    /// Number of 3xx redirection responses.
     #[serde(rename = "3xx")]
     pub s3xx: u64,
+    /// Number of 4xx client error responses.
     #[serde(rename = "4xx")]
     pub s4xx: u64,
+    /// Number of 5xx server error responses.
     #[serde(rename = "5xx")]
     pub s5xx: u64,
 }

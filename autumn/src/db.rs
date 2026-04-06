@@ -55,7 +55,9 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
     };
 
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    let pool = Pool::builder(manager).max_size(config.pool_size).build()?;
+    let pool = Pool::builder(manager)
+        .max_size(config.pool_size.max(1))
+        .build()?;
 
     Ok(Some(pool))
 }
@@ -162,6 +164,23 @@ mod tests {
             .expect("should build pool")
             .expect("should be Some");
         assert_eq!(pool.status().max_size, 5);
+    }
+
+    #[test]
+    fn pool_clamps_size_to_one_if_zero() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            pool_size: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("should build pool")
+            .expect("should be Some");
+        assert_eq!(
+            pool.status().max_size,
+            1,
+            "Pool size should be clamped to 1"
+        );
     }
 
     // ── Db extractor tests ───────────────────────────────────────
