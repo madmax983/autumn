@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
 ws = []
+flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
