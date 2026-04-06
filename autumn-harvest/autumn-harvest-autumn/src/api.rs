@@ -429,7 +429,7 @@ async fn trigger_dag_run(
         .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("database is not configured"))?;
     let run = trigger_dag(
-        pool,
+        pool.clone(),
         Arc::clone(&runtime.registry),
         Arc::clone(&runtime.dags),
         &dag_name,

@@ -197,9 +197,12 @@ fn start_harvest_runtime(
     shared: &Arc<Mutex<HarvestIntegrationShared>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
-    let pool = state.pool().ok_or_else(|| {
-        AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
-    })?;
+    let pool = {
+        let state_ref = &state;
+        state_ref.pool().ok_or_else(|| {
+            AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
+        })?
+    };
 
     let (registration, runtime_already_started) = {
         let mut guard = shared.lock().expect("harvest lock poisoned");
