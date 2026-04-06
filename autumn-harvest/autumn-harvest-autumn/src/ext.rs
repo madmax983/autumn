@@ -175,7 +175,7 @@ where
         .on_startup(move |state| {
             let shared = Arc::clone(&startup_shared);
             let api_state = startup_api_state.clone();
-            async move { start_harvest_runtime(state, &shared, &api_state) }
+            async move { start_harvest_runtime(&state, &shared, &api_state) }
         })
         .on_shutdown(move || {
             let shared = Arc::clone(&shutdown_shared);
@@ -193,7 +193,7 @@ where
 }
 
 fn start_harvest_runtime(
-    state: AppState,
+    state: &AppState,
     shared: &Arc<Mutex<HarvestIntegrationShared>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
@@ -305,9 +305,6 @@ mod tests {
     use super::*;
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
-    use autumn_web::actuator;
-    use autumn_web::middleware;
-
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
             name: "echo",
@@ -344,16 +341,7 @@ mod tests {
     }
 
     fn test_app_state() -> AppState {
-        AppState {
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: middleware::MetricsCollector::new(),
-            log_levels: actuator::LogLevels::new("info"),
-            task_registry: actuator::TaskRegistry::new(),
-            config_props: actuator::ConfigProperties::default(),
-        }
+        AppState::for_test()
     }
 
     #[test]

@@ -16,8 +16,6 @@ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfi
 use autumn_harvest::{ActivityContext, WorkflowContext};
 use autumn_harvest_autumn::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use autumn_web::AppState;
-use autumn_web::actuator::{ConfigProperties, LogLevels, TaskRegistry};
-use autumn_web::middleware::MetricsCollector;
 use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -68,16 +66,7 @@ fn build_test_pool(database_url: &str) -> DbPool {
 }
 
 fn test_app_state(pool: DbPool) -> AppState {
-    AppState {
-        pool: Some(pool),
-        profile: Some("test".to_string()),
-        started_at: std::time::Instant::now(),
-        health_detailed: true,
-        metrics: MetricsCollector::new(),
-        log_levels: LogLevels::new("info"),
-        task_registry: TaskRegistry::new(),
-        config_props: ConfigProperties::default(),
-    }
+    AppState::for_test().with_pool(pool).with_profile("test")
 }
 
 fn build_test_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
