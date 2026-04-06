@@ -18,6 +18,7 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_proxy()
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
@@ -25,6 +26,22 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
     let metrics = fetch_endpoint(&client, base_url, "/actuator/metrics");
     let tasks = fetch_endpoint(&client, base_url, "/actuator/tasks");
     let loggers = fetch_endpoint(&client, base_url, "/actuator/loggers");
+
+    // If any endpoint returns an error, fail the export
+    for (name, val) in [
+        ("health", &health),
+        ("metrics", &metrics),
+        ("tasks", &tasks),
+        ("loggers", &loggers),
+    ] {
+        if let Some(err) = val.get("error") {
+            return Err(format!(
+                "Failed to fetch {} from {base_url}: {}",
+                name,
+                err.as_str().unwrap_or("Unknown error")
+            ));
+        }
+    }
 
     // Use std::time for a simple timestamp as chrono is not available
     let timestamp = std::time::SystemTime::now()
