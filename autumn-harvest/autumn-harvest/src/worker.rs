@@ -845,11 +845,15 @@ async fn ingest_fired_timers(
     next_event_id: i32,
 ) -> HarvestResult<()> {
     use crate::schema::harvest_timers::dsl;
+    use diesel::dsl::sql;
+    use diesel::sql_types::Timestamptz;
 
     let due_timers = dsl::harvest_timers
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .filter(dsl::fired.eq(false))
-        .filter(dsl::fires_at.le(chrono::Utc::now()))
+        // Use the database clock here so timer replay stays consistent with the
+        // queue claim path, which also uses Postgres NOW().
+        .filter(dsl::fires_at.le(sql::<Timestamptz>("NOW()")))
         .order((dsl::fires_at.asc(), dsl::timer_id.asc()))
         .select(HarvestTimer::as_select())
         .load(conn)
