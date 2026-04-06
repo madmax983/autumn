@@ -1,6 +1,5 @@
 use autumn_harvest::notify::notify_task_enqueued;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
-use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
@@ -23,7 +22,12 @@ async fn test_notify_sql_injection_poc() {
 
     let mut conn = AsyncPgConnection::establish(&db_url).await.unwrap();
 
-    diesel::sql_query("CREATE TABLE IF EXISTS dummy_test_table (id INT)")
+    // Use a simpler table creation syntax that is definitively supported.
+    let _ = diesel::sql_query("DROP TABLE IF EXISTS dummy_test_table")
+        .execute(&mut conn)
+        .await;
+
+    diesel::sql_query("CREATE TABLE dummy_test_table (id INT)")
         .execute(&mut conn)
         .await
         .unwrap();
@@ -44,8 +48,7 @@ async fn test_notify_sql_injection_poc() {
     );
 
     // Clean up
-    diesel::sql_query("DROP TABLE IF EXISTS dummy_test_table")
+    let _ = diesel::sql_query("DROP TABLE dummy_test_table")
         .execute(&mut conn)
-        .await
-        .unwrap();
+        .await;
 }
