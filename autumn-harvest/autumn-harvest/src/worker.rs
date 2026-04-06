@@ -158,7 +158,7 @@ fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
         .expect("database UUIDs must round-trip into ExecutionId")
 }
 
-const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
+fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
@@ -223,7 +223,7 @@ async fn load_workflow_execution(
         .await
         .optional()
         .map_err(crate::error::database_error)?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", exec_id)))
 }
 
 async fn update_workflow_execution_completed(
@@ -248,7 +248,8 @@ async fn update_workflow_execution_completed(
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
+            "workflow execution {}",
+            exec_id
         )));
     }
 
@@ -277,7 +278,8 @@ async fn update_workflow_execution_failed(
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {exec_id}"
+            "workflow execution {}",
+            exec_id
         )));
     }
 
@@ -445,13 +447,16 @@ async fn process_workflow_task(
         }
     };
 
-    let workflow = if let Some(workflow) = registry.workflows.get(&execution.workflow_name) { workflow } else {
-        let error = format!(
-            "no workflow handler registered for '{}'",
-            execution.workflow_name
-        );
-        fail_task_and_execution(conn, task, worker_id, &error).await?;
-        return Err(HarvestError::Config(error));
+    let workflow = match registry.workflows.get(&execution.workflow_name) {
+        Some(workflow) => workflow,
+        None => {
+            let error = format!(
+                "no workflow handler registered for '{}'",
+                execution.workflow_name
+            );
+            fail_task_and_execution(conn, task, worker_id, &error).await?;
+            return Err(HarvestError::Config(error));
+        }
     };
 
     let next_event_id = history.next_event_id;
