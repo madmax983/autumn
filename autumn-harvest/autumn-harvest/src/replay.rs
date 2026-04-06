@@ -290,9 +290,6 @@ impl HistoryMatcher {
     /// Match a signal wait command against history.
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
-    ///
-    /// # Panics
-    /// Panics if a signal index returned by `position()` cannot be removed.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
@@ -1054,7 +1051,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
             },
             WorkflowEvent::TimerFired {
-                timer_id,
+                timer_id: timer_id.clone(),
             },
         ];
 
@@ -1088,7 +1085,7 @@ mod tests {
                 input: serde_json::json!({"id":"A"}),
             },
             WorkflowEvent::TimerFired {
-                timer_id,
+                timer_id: timer_id.clone(),
             },
             WorkflowEvent::ChildWorkflowCompleted {
                 child_id,

@@ -86,9 +86,10 @@ impl DagInfo {
     ///
     /// Returns [`DagBuildError`] if the builder creates an invalid graph.
     pub fn build_definition(&self) -> Result<DagDefinition, DagBuildError> {
-        let mut dag = self
-            .default_queue
-            .map_or_else(DagBuilder::new, DagBuilder::with_default_queue);
+        let mut dag = match self.default_queue {
+            Some(queue) => DagBuilder::with_default_queue(queue),
+            None => DagBuilder::new(),
+        };
         (self.builder)(&mut dag);
         dag.build()
     }

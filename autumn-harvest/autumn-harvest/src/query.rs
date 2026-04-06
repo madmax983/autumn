@@ -22,10 +22,6 @@ impl QueryRegistry {
         self.handlers.insert(name.to_string(), handler);
     }
 
-    /// Executes a registered query handler by name.
-    ///
-    /// # Errors
-    /// Returns an error if the query handler does not exist.
     pub fn execute(&self, name: &str) -> HarvestResult<Value> {
         self.handlers
             .get(name)

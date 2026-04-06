@@ -8,7 +8,6 @@
 //!
 //! ```rust,no_run
 //! use autumn_web::prelude::*;
-//! use axum::response::{IntoResponse, Redirect};
 //!
 //! #[post("/items")]
 //! async fn create_item(flash: Flash) -> impl IntoResponse {

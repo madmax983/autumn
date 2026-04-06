@@ -410,12 +410,6 @@ impl WorkflowContext {
     ///
     /// During replay, returns the recorded child output or failure.
     /// During live execution, emits a `StartChildWorkflow` command and suspends.
-    ///
-    /// # Errors
-    /// Returns an error if the child workflow fails or diverges from history.
-    ///
-    /// # Panics
-    /// Panics if the internal mutexes are poisoned.
     pub async fn spawn_child_workflow_raw(
         &self,
         workflow_name: &str,
@@ -462,12 +456,6 @@ impl WorkflowContext {
     }
 
     /// Wait for the next delivered signal with the given name.
-    ///
-    /// # Errors
-    /// Returns an error if the workflow diverges from history or channel closes.
-    ///
-    /// # Panics
-    /// Panics if the internal matcher mutex is poisoned.
     pub async fn wait_for_signal(&self, signal_name: &str) -> HarvestResult<Value> {
         let history_match = self
             .matcher
@@ -498,13 +486,6 @@ impl WorkflowContext {
         }
     }
 
-    /// Register a query handler for this workflow.
-    ///
-    /// The handler receives no arguments (it must close over the workflow state)
-    /// and returns an arbitrary JSON value.
-    ///
-    /// # Panics
-    /// Panics if the internal query registry lock is poisoned.
     pub fn register_query<F>(&self, name: &str, handler: F)
     where
         F: Fn() -> Value + Send + Sync + 'static,
@@ -515,13 +496,6 @@ impl WorkflowContext {
             .register(name, Arc::new(handler));
     }
 
-    /// Execute a registered query handler.
-    ///
-    /// # Errors
-    /// Returns an error if the query is not registered.
-    ///
-    /// # Panics
-    /// Panics if the internal query registry lock is poisoned.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
         self.query_registry
             .lock()
