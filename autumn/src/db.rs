@@ -32,7 +32,6 @@ use diesel_async::pooled_connection::deadpool::Pool;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
-use crate::state::AppState;
 
 /// Error type for pool creation failures.
 ///
@@ -108,22 +107,34 @@ impl std::ops::DerefMut for Db {
     }
 }
 
-impl FromRequestParts<AppState> for Db {
+/// Trait for application state that provides a database connection pool.
+pub trait DbState {
+    /// Return a reference to the connection pool, if configured.
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
+
+impl<S> FromRequestParts<S> for Db
+where
+    S: DbState + Send + Sync,
+{
     type Rejection = AutumnError;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
-        state: &AppState,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
         let pool = state
-            .pool
-            .as_ref()
+            .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
-        let conn = pool.get().await.map_err(|e| {
-            tracing::error!("Failed to acquire database connection: {e}");
-            AutumnError::service_unavailable_msg(e.to_string())
-        })?;
+        let conn = pool.get().await.map_err(
+            |e: diesel_async::pooled_connection::deadpool::PoolError| {
+                tracing::error!("Failed to acquire database connection: {e}");
+                AutumnError::service_unavailable_msg(e.to_string())
+            },
+        )?;
 
         Ok(Self(conn))
     }
@@ -191,26 +202,29 @@ mod tests {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use axum::routing::get;
+
         use tower::ServiceExt;
 
         async fn handler(_db: Db) -> &'static str {
             "ok"
         }
 
-        let app = Router::new().route("/", get(handler)).with_state(AppState {
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let app = Router::new()
+            .route("/", get(handler))
+            .with_state(crate::state::AppState {
+                pool: None,
+                profile: None,
+                started_at: std::time::Instant::now(),
+                health_detailed: true,
+                metrics: crate::middleware::MetricsCollector::new(),
+                log_levels: crate::diagnostics::LogLevels::new("info"),
+                task_registry: crate::diagnostics::TaskRegistry::new(),
+                config_props: crate::diagnostics::ConfigProperties::default(),
+                #[cfg(feature = "ws")]
+                channels: crate::channels::Channels::new(32),
+                #[cfg(feature = "ws")]
+                shutdown: tokio_util::sync::CancellationToken::new(),
+            });
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
