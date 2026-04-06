@@ -197,12 +197,10 @@ fn start_harvest_runtime(
     shared: &Arc<Mutex<HarvestIntegrationShared>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
-    let pool = {
-        let state_ref = &state;
-        state_ref.pool().ok_or_else(|| {
-            AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
-        })?
-    };
+    let runtime_state = state.clone();
+    let pool = state.pool().ok_or_else(|| {
+        AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
+    })?;
 
     let (registration, runtime_already_started) = {
         let mut guard = shared.lock().expect("harvest lock poisoned");
@@ -218,8 +216,9 @@ fn start_harvest_runtime(
     }
 
     let built = registration.builder.build();
-    let (registry, dags, worker_config) =
-        built.into_worker_parts_with_extra_state(injected_runtime_state(state, Some(pool.clone())));
+    let (registry, dags, worker_config) = built.into_worker_parts_with_extra_state(
+        injected_runtime_state(runtime_state, Some(pool.clone())),
+    );
     let dag_catalog = Arc::new(
         compile_dag_catalog(dags)
             .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
