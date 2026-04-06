@@ -1641,10 +1641,8 @@ mod tests {
             .expect("startup hooks should succeed");
         run_shutdown_hooks(&builder.shutdown_hooks).await;
 
-        {
-            let events = events.lock().expect("events lock poisoned");
-            assert_eq!(*events, vec!["start", "stop-b", "stop-a"]);
-        }
+        let recorded_events = events.lock().expect("events lock poisoned").clone();
+        assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
     }
 
     #[tokio::test]

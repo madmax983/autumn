@@ -90,6 +90,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Returns a clone of the configured database pool, if one exists.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool(
+        &self,
+    ) -> Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.clone()
+    }
+
     /// Shared application state passed to all route handlers.
     /// Returns the active profile name, or `"default"` if none is set.
     #[must_use]

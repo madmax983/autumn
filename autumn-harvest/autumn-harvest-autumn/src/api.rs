@@ -426,8 +426,7 @@ async fn trigger_dag_run(
 ) -> Result<(axum::http::StatusCode, Json<DagRun>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = state
-        .pool
-        .clone()
+        .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("database is not configured"))?;
     let run = trigger_dag(
         pool,
@@ -520,12 +519,13 @@ async fn db_conn(
     AutumnError,
 > {
     let pool = state
-        .pool
-        .clone()
+        .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("database is not configured"))?;
-    pool.get()
+    let conn = pool
+        .get()
         .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    Ok(conn)
 }
 
 fn parse_execution_id(raw: &str) -> Result<ExecutionId, AutumnError> {

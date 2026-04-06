@@ -197,7 +197,7 @@ fn start_harvest_runtime(
     shared: &Arc<Mutex<HarvestIntegrationShared>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
-    let pool = state.pool.clone().ok_or_else(|| {
+    let pool = state.pool().ok_or_else(|| {
         AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
     })?;
 
