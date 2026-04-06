@@ -486,6 +486,9 @@ impl WorkflowContext {
         }
     }
 
+    /// Registers a local query handler by name.
+    ///
+    /// This allows external clients to interrogate the current state of a running workflow.
     pub fn register_query<F>(&self, name: &str, handler: F)
     where
         F: Fn() -> Value + Send + Sync + 'static,
@@ -496,6 +499,7 @@ impl WorkflowContext {
             .register(name, Arc::new(handler));
     }
 
+    /// Executes a registered query handler by name.
     pub fn execute_query(&self, name: &str) -> HarvestResult<Value> {
         self.query_registry
             .lock()
@@ -1339,6 +1343,9 @@ mod tests {
 
         let value = ctx.execute_query("status").expect("query should execute");
         assert_eq!(value, serde_json::json!({"state": "running"}));
-        assert!(ctx.drain_commands().is_empty(), "queries must not emit events");
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "queries must not emit events"
+        );
     }
 }

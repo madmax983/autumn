@@ -113,6 +113,7 @@ pub enum TriggerRule {
 }
 
 impl TriggerRule {
+    /// Determines whether the task should run given the statuses of its upstream dependencies.
     #[must_use]
     pub fn should_run(&self, upstream_statuses: &[TaskStatus]) -> bool {
         match self {

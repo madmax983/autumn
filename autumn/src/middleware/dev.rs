@@ -11,10 +11,20 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+/// Checks whether live reload is enabled in the current environment.
+///
+/// Returns true only if both `AUTUMN_DEV_RELOAD` and `AUTUMN_DEV_RELOAD_STATE`
+/// environment variables are present. Used internally to decide whether to mount
+/// live reload endpoints and inject live reload scripts.
 pub fn is_enabled() -> bool {
     std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
 }
 
+/// Handler serving the current live reload state JSON file.
+///
+/// The state file contains the latest compilation version and kind (CSS or Full),
+/// which the injected client script polls to determine if it should reload styles
+/// or refresh the whole page.
 pub async fn live_reload_state_handler() -> impl IntoResponse {
     let body =
         read_reload_state_body().unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
@@ -29,6 +39,10 @@ pub async fn live_reload_state_handler() -> impl IntoResponse {
     response
 }
 
+/// Middleware to disable caching for static paths in development.
+///
+/// Injects `Cache-Control: no-store` for any path starting with `/static`.
+/// This ensures developers always see the latest assets instead of browser-cached versions.
 pub async fn disable_static_cache(request: Request<Body>, next: Next) -> Response<Body> {
     let is_static = is_static_path(request.uri().path());
     let mut response = next.run(request).await;
@@ -38,6 +52,11 @@ pub async fn disable_static_cache(request: Request<Body>, next: Next) -> Respons
     response
 }
 
+/// Middleware that injects the live reload script into HTML responses.
+///
+/// Only affects responses with a `text/html` Content-Type that are not already
+/// encoded (e.g., gzip). The script is injected just before the `</body>` tag or
+/// appended at the end.
 pub async fn inject_live_reload(request: Request<Body>, next: Next) -> Response<Body> {
     let response = next.run(request).await;
     inject_live_reload_into_response(response).await

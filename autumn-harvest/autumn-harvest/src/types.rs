@@ -18,11 +18,13 @@ use uuid::Uuid;
 pub struct WorkflowId(String);
 
 impl WorkflowId {
+    /// Creates a new `WorkflowId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string of the workflow ID.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -42,6 +44,7 @@ impl fmt::Display for WorkflowId {
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
+    /// Generates a new, random `ExecutionId` using UUID v4.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -77,6 +80,7 @@ impl FromStr for ExecutionId {
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
+    /// Generates a new, random `ActivityExecId` using UUID v4.
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -112,11 +116,13 @@ impl FromStr for ActivityExecId {
 pub struct TimerId(String);
 
 impl TimerId {
+    /// Creates a new `TimerId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string of the timer ID.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -134,11 +140,13 @@ impl fmt::Display for TimerId {
 pub struct WorkerId(String);
 
 impl WorkerId {
+    /// Creates a new `WorkerId` from a string-like value.
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    /// Returns the underlying string of the worker ID.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0

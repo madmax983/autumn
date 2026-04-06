@@ -13,15 +13,20 @@ pub struct QueryRegistry {
 }
 
 impl QueryRegistry {
+    /// Creates a new, empty `QueryRegistry`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a query handler under the given name.
     pub fn register(&mut self, name: &str, handler: QueryHandler) {
         self.handlers.insert(name.to_string(), handler);
     }
 
+    /// Executes a registered query handler and returns its JSON result.
+    ///
+    /// Returns an error if the query handler name does not exist.
     pub fn execute(&self, name: &str) -> HarvestResult<Value> {
         self.handlers
             .get(name)

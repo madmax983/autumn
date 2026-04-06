@@ -54,11 +54,14 @@ pub struct DagDefinition {
 }
 
 impl DagDefinition {
+    /// Returns the list of tasks registered in this DAG task.
     #[must_use]
     pub fn tasks(&self) -> &[DagTask] {
         &self.tasks
     }
 
+    /// Returns the execution levels containing indices of the tasks
+    /// scheduled for execution in topological order.
     #[must_use]
     pub fn execution_levels(&self) -> &[Vec<usize>] {
         &self.execution_levels
@@ -91,11 +94,16 @@ pub struct DagTaskRef {
 }
 
 impl DagTaskRef {
+    /// Returns the underlying index.
     #[must_use]
     pub const fn index(&self) -> usize {
         self.index
     }
 
+    /// Adds an upstream dependency to this DAG task.
+    ///
+    /// This task will not execute until the `upstream` task has completed
+    /// (or satisfied the specific `TriggerRule`).
     #[must_use]
     pub fn upstream(self, upstream: &Self) -> Self {
         assert!(
@@ -109,21 +117,28 @@ impl DagTaskRef {
         })
     }
 
+    /// Sets the `TriggerRule` for this DAG task.
+    ///
+    /// By default, tasks use `TriggerRule::AllSuccess`, meaning they wait
+    /// for all upstream tasks to complete successfully.
     #[must_use]
     pub fn trigger_rule(self, trigger_rule: TriggerRule) -> Self {
         self.mutate(|task| task.trigger_rule = trigger_rule)
     }
 
+    /// Sets the `RetryPolicy` for this DAG task.
     #[must_use]
     pub fn retry(self, retry_policy: RetryPolicy) -> Self {
         self.mutate(|task| task.retry_policy = Some(retry_policy))
     }
 
+    /// Sets the start-to-close timeout for this DAG task.
     #[must_use]
     pub fn start_to_close(self, timeout: Duration) -> Self {
         self.mutate(|task| task.start_to_close = Some(timeout))
     }
 
+    /// Assigns this DAG task to a specific task queue.
     #[must_use]
     pub fn queue(self, queue: impl Into<String>) -> Self {
         self.mutate(|task| task.queue = Some(queue.into()))
@@ -155,11 +170,14 @@ impl Default for DagBuilder {
 }
 
 impl DagBuilder {
+    /// Constructs a new, empty `DagBuilder`.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Constructs a new `DagBuilder` with a specific default queue.
+    /// All activities registered will use this queue unless overridden.
     #[must_use]
     pub fn with_default_queue(queue: impl Into<String>) -> Self {
         Self {
@@ -168,6 +186,9 @@ impl DagBuilder {
         }
     }
 
+    /// Registers a new activity task in the DAG.
+    ///
+    /// The activity must be a valid, copyable handler function.
     #[must_use]
     pub fn activity<F>(&mut self, activity: F) -> DagTaskRef
     where

@@ -68,6 +68,19 @@ struct PoolStatus {
 /// - `200 OK` -- application is healthy.
 /// - `503 Service Unavailable` -- database pool is exhausted (all
 ///   connections in use and requests are queuing).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::health::handler;
+/// use autumn_web::AppState;
+/// use axum::extract::State;
+///
+/// async fn check_health(state: AppState) {
+///     let response = handler(State(state)).await;
+///     // Evaluates health based on pool exhaustions and uptime metrics
+/// }
+/// ```
 #[allow(
     unused_variables,
     clippy::if_not_else,
