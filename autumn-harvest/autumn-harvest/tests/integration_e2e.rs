@@ -1012,6 +1012,9 @@ async fn timeout_enforcement_fails_pending_activity_and_wakes_workflow() {
         .expect("workflow task should be claimable");
     assert_eq!(claimed_workflow.id, workflow_task_id);
     assert_eq!(claimed_workflow.state, "RUNNING");
+    queue::park_workflow_task(&mut conn, workflow_task_id)
+        .await
+        .expect("park workflow task failed");
 
     let mut activity_params = EnqueueParams::new(
         "stuck-queue",
@@ -1492,6 +1495,9 @@ async fn wake_workflow_task_emits_notification() {
         .expect("claim should succeed")
         .expect("workflow task should be claimable");
     assert_eq!(claimed.id, task_id);
+    queue::park_workflow_task(&mut conn, task_id)
+        .await
+        .expect("park workflow task should succeed");
 
     let mut listener = autumn_harvest::notify::QueueListener::connect(&database_url, &queues)
         .await
@@ -1508,6 +1514,45 @@ async fn wake_workflow_task_emits_notification() {
         .expect("listener should receive a wake notification");
 
     assert_eq!(notification.task_id, Uuid::nil());
+}
+
+#[tokio::test]
+async fn wake_workflow_task_does_not_requeue_active_running_task() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(
+        "default",
+        TaskType::Workflow,
+        serde_json::json!({"wake": false}),
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "active-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("workflow task should be claimable");
+    assert_eq!(claimed.id, task_id);
+    assert_eq!(claimed.state, "RUNNING");
+    assert!(claimed.worker_id.is_some());
+    assert!(claimed.started_at.is_some());
+
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task should succeed");
+
+    let task = load_task_from_url(&database_url, task_id).await;
+    assert_eq!(task.state, "RUNNING");
+    assert_eq!(task.worker_id.as_deref(), Some("active-worker"));
+    assert!(task.started_at.is_some());
 }
 
 #[tokio::test]

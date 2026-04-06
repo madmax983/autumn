@@ -5,6 +5,7 @@
 //! no two workers will ever claim the same task.
 
 use chrono::{Duration, Utc};
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -319,12 +320,48 @@ pub async fn reschedule_task(
     Ok(())
 }
 
+/// Mark a running workflow task as parked while it waits on an external event.
+///
+/// Parked tasks stay in `RUNNING` state so they remain attached to the same
+/// workflow execution, but their worker ownership and start timestamp are cleared
+/// so wake-up paths can distinguish them from actively executing workflow tasks.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] on update failure.
+pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> HarvestResult<()> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    let updated = diesel::update(
+        dsl::harvest_task_queue
+            .find(task_id)
+            .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
+            .filter(dsl::state.eq("RUNNING")),
+    )
+    .set((
+        dsl::worker_id.eq(None::<String>),
+        dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+    ))
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+
+    if updated == 0 {
+        return Err(crate::error::HarvestError::NotFound(format!(
+            "workflow task queue item {task_id} is not running"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Wake a parked workflow task for the given execution so replay can continue.
 ///
 /// This resets any parked workflow task row for `exec_id` back to `PENDING`
-/// and schedules it immediately. Both `RUNNING` and already-parked `PENDING`
-/// tasks are eligible so signals can wake a workflow without waiting for the
-/// next retry backoff window. If no workflow task exists, this is a no-op.
+/// and schedules it immediately. Already-parked `PENDING` rows and parked
+/// `RUNNING` rows with no worker ownership are eligible. Actively executing
+/// `RUNNING` rows are intentionally excluded. If no parked workflow task exists,
+/// this is a no-op.
 ///
 /// # Errors
 ///
@@ -339,7 +376,12 @@ pub async fn wake_workflow_task(
         dsl::harvest_task_queue
             .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
-            .filter(dsl::state.eq_any(["RUNNING", "PENDING"])),
+            .filter(
+                dsl::state.eq("PENDING").or(dsl::state
+                    .eq("RUNNING")
+                    .and(dsl::worker_id.is_null())
+                    .and(dsl::started_at.is_null())),
+            ),
     )
     .set((
         dsl::state.eq("PENDING"),

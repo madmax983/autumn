@@ -392,24 +392,12 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
         let Some(dag) = dags.get(&schedule.dag_name) else {
             continue;
         };
-        let Some(mut logical_date) = schedule.next_run_at else {
+        let Some(logical_date) = schedule.next_run_at else {
             continue;
         };
         let now = Utc::now();
-        let mut created = Vec::new();
-
-        if dag.catchup {
-            while logical_date <= now {
-                created.push(logical_date);
-                let Some(next_logical) = next_run_after(dag.schedule.as_ref(), logical_date) else {
-                    break;
-                };
-                logical_date = next_logical;
-            }
-        } else {
-            created.push(logical_date);
-            logical_date = next_run_after(dag.schedule.as_ref(), now).unwrap_or(logical_date);
-        }
+        let (created, next_run_at) =
+            due_run_plan(dag.schedule.as_ref(), logical_date, now, dag.catchup);
 
         for run_at in &created {
             let _ = insert_dag_run(conn, &schedule.dag_name, *run_at, None).await?;
@@ -418,7 +406,7 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
         diesel::update(dsl::harvest_schedules.find(schedule.id))
             .set((
                 dsl::last_run_at.eq(created.last().copied()),
-                dsl::next_run_at.eq(next_run_after(dag.schedule.as_ref(), logical_date)),
+                dsl::next_run_at.eq(next_run_at),
                 dsl::updated_at.eq(Utc::now()),
             ))
             .execute(conn)
@@ -670,5 +658,72 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
             .ok()
             .map(|duration| reference + duration),
         Some(Schedule::Manual) | None => None,
+    }
+}
+
+fn due_run_plan(
+    schedule: Option<&Schedule>,
+    first_due: DateTime<Utc>,
+    now: DateTime<Utc>,
+    catchup: bool,
+) -> (Vec<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    if !catchup {
+        return (vec![first_due], next_run_after(schedule, now));
+    }
+
+    let mut created = Vec::new();
+    let mut cursor = first_due;
+
+    loop {
+        if cursor > now {
+            return (created, Some(cursor));
+        }
+        created.push(cursor);
+        let Some(next) = next_run_after(schedule, cursor) else {
+            return (created, None);
+        };
+        cursor = next;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("timestamp should parse")
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn due_run_plan_without_catchup_keeps_next_live_slot() {
+        let schedule = Schedule::Interval(Duration::from_secs(60));
+        let first_due = parse_utc("2026-04-06T12:00:00Z");
+        let now = parse_utc("2026-04-06T12:05:00Z");
+
+        let (created, next_run_at) = due_run_plan(Some(&schedule), first_due, now, false);
+
+        assert_eq!(created, vec![first_due]);
+        assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:06:00Z")));
+    }
+
+    #[test]
+    fn due_run_plan_with_catchup_stops_at_first_future_slot() {
+        let schedule = Schedule::Interval(Duration::from_secs(60));
+        let first_due = parse_utc("2026-04-06T12:00:00Z");
+        let now = parse_utc("2026-04-06T12:02:30Z");
+
+        let (created, next_run_at) = due_run_plan(Some(&schedule), first_due, now, true);
+
+        assert_eq!(
+            created,
+            vec![
+                parse_utc("2026-04-06T12:00:00Z"),
+                parse_utc("2026-04-06T12:01:00Z"),
+                parse_utc("2026-04-06T12:02:00Z")
+            ]
+        );
+        assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:03:00Z")));
     }
 }

@@ -628,6 +628,7 @@ async fn persist_signal_wait_requeue(
 async fn persist_scheduled_activity(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
+    task_id: uuid::Uuid,
     exec_id: ExecutionId,
     next_event_id: i32,
     commands: &[WorkflowCommand],
@@ -691,6 +692,7 @@ async fn persist_scheduled_activity(
         async move {
             store::append_events(conn, exec_id, &events, next_event_id).await?;
             queue::enqueue(conn, &params).await?;
+            queue::park_workflow_task(conn, task_id).await?;
             Ok(())
         }
         .scope_boxed()
@@ -740,8 +742,8 @@ async fn persist_started_timer(
 async fn persist_started_child_workflow(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
+    task_id: uuid::Uuid,
     parent_execution: &WorkflowExecution,
-    parent_exec_id: ExecutionId,
     next_event_id: i32,
     commands: &[WorkflowCommand],
     child: &StartedChildWorkflowCommand,
@@ -754,6 +756,7 @@ async fn persist_started_child_workflow(
     }
 
     let marker_events = marker_events_from_commands(commands);
+    let parent_exec_id = execution_id_from_uuid(parent_execution.id);
     let child_started_in_parent = WorkflowEvent::ChildWorkflowStarted {
         child_id: child.child_id,
         workflow_name: child.workflow_name.clone(),
@@ -795,6 +798,7 @@ async fn persist_started_child_workflow(
                 .map_err(crate::error::database_error)?;
             store::append_events(conn, child.child_id, &[child_started_event], 0).await?;
             queue::enqueue(conn, &params).await?;
+            queue::park_workflow_task(conn, task_id).await?;
             Ok(())
         }
         .scope_boxed()
@@ -1188,6 +1192,7 @@ async fn handle_suspended_workflow(
         let result = persist_scheduled_activity(
             conn,
             registry,
+            context.persistence.task.id,
             context.persistence.exec_id,
             context.persistence.next_event_id,
             commands,
@@ -1226,8 +1231,8 @@ async fn handle_suspended_workflow(
         let result = persist_started_child_workflow(
             conn,
             registry,
+            context.persistence.task.id,
             context.execution,
-            context.persistence.exec_id,
             context.persistence.next_event_id,
             commands,
             &child,
