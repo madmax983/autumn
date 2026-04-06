@@ -581,6 +581,82 @@ pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serd
     Json(result)
 }
 
+// ── Prometheus ─────────────────────────────────────────────────
+
+/// `GET /actuator/prometheus` -- Export metrics in Prometheus format.
+pub(crate) async fn prometheus_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    use std::fmt::Write;
+
+    let snapshot = state.metrics.snapshot();
+    let mut out = String::with_capacity(1024);
+
+    // requests_total
+    out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
+    out.push_str("# TYPE autumn_http_requests_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_requests_total {}",
+        snapshot.http.requests_total
+    );
+
+    // requests_active
+    out.push_str("# HELP autumn_http_requests_active Currently active HTTP requests\n");
+    out.push_str("# TYPE autumn_http_requests_active gauge\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_requests_active {}",
+        snapshot.http.requests_active
+    );
+
+    // by_status
+    out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
+    out.push_str("# TYPE autumn_http_responses_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"2xx\"}} {}",
+        snapshot.http.by_status.s2xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"3xx\"}} {}",
+        snapshot.http.by_status.s3xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"4xx\"}} {}",
+        snapshot.http.by_status.s4xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"5xx\"}} {}",
+        snapshot.http.by_status.s5xx
+    );
+
+    // by_route
+    if !snapshot.http.by_route.is_empty() {
+        out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
+        out.push_str("# TYPE autumn_http_route_requests_total counter\n");
+        for (route_key, metrics) in &snapshot.http.by_route {
+            // route_key is formatted as "METHOD /path"
+            if let Some((method, path)) = route_key.split_once(' ') {
+                let _ = writeln!(
+                    out,
+                    "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
+                    method, path, metrics.count
+                );
+            }
+        }
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+}
+
 // ── Config Properties (sensitive) ──────────────────────────────
 
 /// `GET /actuator/configprops` -- all config properties with source tracking.
@@ -724,7 +800,11 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
             )
             .route("/actuator/loggers", axum::routing::get(loggers_get))
             .route("/actuator/loggers/{name}", axum::routing::put(loggers_put))
-            .route("/actuator/tasks", axum::routing::get(tasks_endpoint));
+            .route("/actuator/tasks", axum::routing::get(tasks_endpoint))
+            .route(
+                "/actuator/prometheus",
+                axum::routing::get(prometheus_endpoint),
+            );
 
         #[cfg(feature = "ws")]
         {
@@ -1067,6 +1147,67 @@ mod tests {
         let prev = levels.set_logger_level("root", "trace");
         assert_eq!(prev, Some("info".to_string()));
         assert_eq!(levels.current_level(), "trace");
+    }
+
+    // ── Prometheus endpoint tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn actuator_prometheus_returns_metrics() {
+        let state = test_state();
+        state.metrics.record("GET", "/test", 200, 10);
+        state.metrics.record("POST", "/test", 500, 50);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("# HELP autumn_http_requests_total Total number of HTTP requests"));
+        assert!(text.contains("# TYPE autumn_http_requests_total counter"));
+        assert!(text.contains("autumn_http_requests_total 2"));
+
+        assert!(text.contains("autumn_http_requests_active "));
+        assert!(text.contains("autumn_http_responses_total{status=\"2xx\"} 1"));
+        assert!(text.contains("autumn_http_responses_total{status=\"5xx\"} 1"));
+
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
+        );
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // ── Tasks endpoint tests ───────────────────────────────────
