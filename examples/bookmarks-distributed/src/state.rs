@@ -64,7 +64,7 @@ mod tests {
         .with_pool_sizes(5, 5);
         let pools = create_dual_pools(&config).expect("dual pools should build");
 
-        let state = DistributedState::new(config.clone(), pools);
+        let state = DistributedState::new(config, pools);
 
         assert_eq!(
             state.config.database.primary_url.as_deref(),

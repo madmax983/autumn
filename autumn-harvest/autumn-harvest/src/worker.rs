@@ -158,7 +158,7 @@ fn execution_id_from_uuid(id: uuid::Uuid) -> ExecutionId {
         .expect("database UUIDs must round-trip into ExecutionId")
 }
 
-fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
+const fn workflow_command_name(command: &WorkflowCommand) -> &'static str {
     match command {
         WorkflowCommand::ScheduleActivity { .. } => "ScheduleActivity",
         WorkflowCommand::StartTimer { .. } => "StartTimer",
@@ -186,12 +186,6 @@ fn suspended_workflow_error(commands: &[WorkflowCommand]) -> String {
     )
 }
 
-fn all_commands_wait_for_signal(commands: &[WorkflowCommand]) -> bool {
-    !commands.is_empty()
-        && commands
-            .iter()
-            .all(|cmd| matches!(cmd, WorkflowCommand::WaitForSignal { .. }))
-}
 
 fn should_requeue_signal_wait(commands: &[WorkflowCommand]) -> bool {
     if commands.is_empty() {
@@ -222,7 +216,7 @@ async fn load_workflow_execution(
         .await
         .optional()
         .map_err(crate::error::database_error)?
-        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {}", exec_id)))
+        .ok_or_else(|| HarvestError::NotFound(format!("workflow execution {exec_id}")))
 }
 
 async fn update_workflow_execution_completed(
@@ -247,8 +241,7 @@ async fn update_workflow_execution_completed(
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {}",
-            exec_id
+            "workflow execution {exec_id}",
         )));
     }
 
@@ -277,8 +270,7 @@ async fn update_workflow_execution_failed(
 
     if updated == 0 {
         return Err(HarvestError::NotFound(format!(
-            "workflow execution {}",
-            exec_id
+            "workflow execution {exec_id}",
         )));
     }
 
@@ -446,16 +438,13 @@ async fn process_workflow_task(
         }
     };
 
-    let workflow = match registry.workflows.get(&execution.workflow_name) {
-        Some(workflow) => workflow,
-        None => {
-            let error = format!(
-                "no workflow handler registered for '{}'",
-                execution.workflow_name
-            );
-            fail_task_and_execution(conn, task, worker_id, &error).await?;
-            return Err(HarvestError::Config(error));
-        }
+    let Some(workflow) = registry.workflows.get(&execution.workflow_name) else {
+        let error = format!(
+            "no workflow handler registered for '{}'",
+            execution.workflow_name
+        );
+        fail_task_and_execution(conn, task, worker_id, &error).await?;
+        return Err(HarvestError::Config(error));
     };
 
     let next_event_id = history.next_event_id;
@@ -829,36 +818,6 @@ mod tests {
         assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
     }
 
-    #[test]
-    fn all_commands_wait_for_signal_requires_non_empty() {
-        let commands: Vec<WorkflowCommand> = vec![];
-        assert!(!all_commands_wait_for_signal(&commands));
-    }
-
-    #[test]
-    fn all_commands_wait_for_signal_only_accepts_wait_commands() {
-        let (signal_tx, _signal_rx) = oneshot::channel::<serde_json::Value>();
-        let (timer_tx, _timer_rx) = oneshot::channel::<()>();
-
-        let only_wait = vec![WorkflowCommand::WaitForSignal {
-            signal_name: "approved".to_string(),
-            result_tx: signal_tx,
-        }];
-        assert!(all_commands_wait_for_signal(&only_wait));
-
-        let mixed = vec![
-            WorkflowCommand::WaitForSignal {
-                signal_name: "approved".to_string(),
-                result_tx: oneshot::channel::<serde_json::Value>().0,
-            },
-            WorkflowCommand::StartTimer {
-                timer_id: crate::types::TimerId::new("t1"),
-                duration_secs: 1,
-                result_tx: timer_tx,
-            },
-        ];
-        assert!(!all_commands_wait_for_signal(&mixed));
-    }
 
     #[test]
     fn should_requeue_signal_wait_allows_marker_plus_wait() {

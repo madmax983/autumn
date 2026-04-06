@@ -1051,7 +1051,7 @@ mod tests {
                 output: serde_json::json!({"ok": true}),
             },
             WorkflowEvent::TimerFired {
-                timer_id: timer_id.clone(),
+                timer_id,
             },
         ];
 
@@ -1085,7 +1085,7 @@ mod tests {
                 input: serde_json::json!({"id":"A"}),
             },
             WorkflowEvent::TimerFired {
-                timer_id: timer_id.clone(),
+                timer_id,
             },
             WorkflowEvent::ChildWorkflowCompleted {
                 child_id,
