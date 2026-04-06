@@ -290,6 +290,9 @@ impl HistoryMatcher {
     /// Match a signal wait command against history.
     ///
     /// Expects `SignalReceived { signal_name }` at the current cursor.
+    ///
+    /// # Panics
+    /// Panics if a signal index returned by `position()` cannot be removed.
     pub fn match_signal(&mut self, signal_name: &str) -> HistoryMatch {
         if let Some(index) = self
             .pending_signals
