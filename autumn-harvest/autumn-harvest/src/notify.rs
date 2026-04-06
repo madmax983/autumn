@@ -65,13 +65,11 @@ pub async fn notify_task_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
-    // Postgres NOTIFY requires the channel as an identifier (not a parameter),
-    // so we must format it into the SQL string. The channel name is derived from
-    // our own queue_channel() function which only produces [a-z0-9_] characters,
-    // so this is safe from injection.
-    let sql = format!("NOTIFY {channel}, '{payload}'");
-
-    diesel::sql_query(sql)
+    // To prevent SQL injection vulnerabilities from unescaped channel names,
+    // we use `pg_notify` via `SELECT` with parameter binding rather than string interpolation.
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<diesel::sql_types::Text, _>(channel)
+        .bind::<diesel::sql_types::Text, _>(payload)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
