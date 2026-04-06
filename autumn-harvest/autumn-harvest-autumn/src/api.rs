@@ -320,9 +320,6 @@ async fn signal_workflow(
     signal::send_signal(&mut conn, exec_id, &signal_name, payload)
         .await
         .map_err(map_error)?;
-    queue::wake_workflow_task(&mut conn, exec_id)
-        .await
-        .map_err(map_error)?;
 
     Ok((
         axum::http::StatusCode::ACCEPTED,

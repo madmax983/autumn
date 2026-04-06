@@ -70,10 +70,11 @@ fn test_app_state(pool: DbPool) -> AppState {
 }
 
 fn build_test_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
-    Arc::new(
-        Worker::new(WorkerRuntimeConfig::from(WorkerConfig::default()), registry)
-            .expect("worker config should be valid"),
-    )
+    let mut runtime_config = WorkerRuntimeConfig::from(WorkerConfig::default());
+    runtime_config.worker_id = "test-worker".to_string();
+    runtime_config.poll_interval = Duration::from_millis(25);
+
+    Arc::new(Worker::new(runtime_config, registry).expect("worker config should be valid"))
 }
 
 fn spawn_test_worker(worker: Arc<Worker>, pool: DbPool) -> tokio::task::JoinHandle<()> {
@@ -138,6 +139,24 @@ fn approval_registry() -> Arc<HandlerRegistry> {
             module: "tests",
             handler: approval_workflow,
         }],
+        vec![],
+    ))
+}
+
+fn approval_and_timer_signal_registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![
+            WorkflowInfo {
+                name: "approval_workflow",
+                module: "tests",
+                handler: approval_workflow,
+            },
+            WorkflowInfo {
+                name: "timer_then_signal_workflow",
+                module: "tests",
+                handler: timer_then_signal_workflow,
+            },
+        ],
         vec![],
     ))
 }
@@ -233,7 +252,7 @@ async fn wait_for_workflow_state(
     exec_id: &str,
     expected_state: &str,
 ) -> WorkflowExecution {
-    for _ in 0..100 {
+    for _ in 0..200 {
         let execution = load_execution_from_url(database_url, exec_id).await;
         if execution.state == expected_state {
             return execution;
@@ -284,6 +303,26 @@ fn approval_workflow<'a>(
 
         Ok(json!({
             "phase": "approved",
+            "approval": approval,
+        }))
+    })
+}
+
+fn timer_then_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        ctx.timer("cooldown", 2)
+            .await
+            .map_err(|error| error.to_string())?;
+        let approval = ctx
+            .wait_for_signal("approved")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(json!({
+            "timer": "fired",
             "approval": approval,
         }))
     })
@@ -429,6 +468,107 @@ async fn harvest_api_starts_queries_and_signals_workflows() {
             .iter()
             .any(|event| event["type"] == "WorkflowCompleted"),
         "history should include workflow completion"
+    );
+
+    shutdown_test_worker(&worker, worker_task).await;
+}
+
+#[tokio::test]
+async fn harvest_api_signal_does_not_wake_timer_waits_early() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_and_timer_signal_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        "test-worker".to_string(),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+    ));
+
+    let worker = build_test_worker(Arc::clone(&registry));
+    let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool.clone()));
+
+    let (start_status, start_json) = post_json(
+        &app,
+        "/workflows/timer_then_signal_workflow/start",
+        json!({
+            "workflow_id": "timer-signal-1",
+            "input": { "request_id": "timer-signal-1" },
+        }),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::CREATED);
+    let exec_id = start_json["execution_id"]
+        .as_str()
+        .expect("start response should include execution_id")
+        .to_string();
+
+    let mut timer_wait_established = false;
+    for _ in 0..100 {
+        let (details_status, details_json) = get_json(&app, format!("/workflows/{exec_id}")).await;
+        assert_eq!(details_status, StatusCode::OK);
+        let history = details_json["history"]
+            .as_array()
+            .expect("workflow history must be an array");
+        let timer_started = history.iter().any(|event| event["type"] == "TimerStarted");
+        let timer_fired = history.iter().any(|event| event["type"] == "TimerFired");
+        if timer_started && !timer_fired {
+            timer_wait_established = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        timer_wait_established,
+        "workflow should be parked on a pending timer before the signal is sent"
+    );
+
+    let (signal_status, _signal_json) = post_json(
+        &app,
+        format!("/workflows/{exec_id}/signal/approved"),
+        json!({ "approved": true }),
+    )
+    .await;
+    assert_eq!(signal_status, StatusCode::ACCEPTED);
+
+    let execution = wait_for_workflow_state(&database_url, &exec_id, "COMPLETED").await;
+    assert_eq!(
+        execution.output,
+        Some(json!({
+            "timer": "fired",
+            "approval": { "approved": true },
+        }))
+    );
+
+    let (details_status, details_json) = get_json(&app, format!("/workflows/{exec_id}")).await;
+    assert_eq!(details_status, StatusCode::OK);
+    let history = details_json["history"]
+        .as_array()
+        .expect("workflow history must be an array");
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| event["type"] == "TimerStarted")
+            .count(),
+        1,
+        "signal enqueue should not duplicate timer scheduling"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| event["type"] == "TimerFired")
+            .count(),
+        1,
+        "timer should fire exactly once"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|event| event["type"] == "SignalReceived"),
+        "history should include the delivered signal"
     );
 
     shutdown_test_worker(&worker, worker_task).await;
