@@ -169,6 +169,25 @@ impl AutumnError {
         self
     }
 
+    /// Create a `500 Internal Server Error`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::internal_server_error(std::io::Error::other("boom"));
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    pub fn internal_server_error(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            details: None,
+        }
+    }
+
     /// Create a `404 Not Found` error.
     ///
     /// # Examples
@@ -317,6 +336,21 @@ impl AutumnError {
     }
 
     // ── String-message convenience constructors ────────────────
+
+    /// Create a `500 Internal Server Error` from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::internal_server_error_msg("Database explosion");
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    pub fn internal_server_error_msg(msg: impl Into<String>) -> Self {
+        Self::internal_server_error(StringError(msg.into()))
+    }
 
     /// Create a `404 Not Found` error from a plain string message.
     ///
@@ -492,6 +526,12 @@ mod tests {
     }
 
     #[test]
+    fn internal_server_error_is_500() {
+        let err = AutumnError::internal_server_error(TestError("boom".into()));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
     fn test_not_found_error() {
         let err = AutumnError::not_found(std::io::Error::other("no such user"));
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -539,6 +579,13 @@ mod tests {
     fn service_unavailable_is_503() {
         let err = AutumnError::service_unavailable(TestError("pool exhausted".into()));
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn internal_server_error_msg_is_500() {
+        let err = AutumnError::internal_server_error_msg("db failure");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.to_string(), "db failure");
     }
 
     #[test]
