@@ -14,14 +14,12 @@ async fn eris_timing_attack() {
     let _ = verify_password(password, "not_a_valid_hash_at_all_which_is_bad").await;
     let time_invalid = start_invalid.elapsed();
 
-    println!("Time with valid hash: {:?}", time_valid);
-    println!("Time with invalid hash: {:?}", time_invalid);
+    println!("Time with valid hash: {time_valid:?}");
+    println!("Time with invalid hash: {time_invalid:?}");
 
     // If time_invalid is less than a small threshold (e.g. 5ms), it returned instantly
     assert!(
         time_invalid > Duration::from_millis(10),
-        "[ERIS-VULN] verify_password returns instantly on invalid hash, exposing a timing attack! Invalid: {:?}, Valid: {:?}",
-        time_invalid,
-        time_valid
+        "[ERIS-VULN] verify_password returns instantly on invalid hash, exposing a timing attack! Invalid: {time_invalid:?}, Valid: {time_valid:?}",
     );
 }
