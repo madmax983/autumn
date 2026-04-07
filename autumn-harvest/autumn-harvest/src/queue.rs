@@ -304,6 +304,7 @@ pub async fn reschedule_task(
         dsl::state.eq("PENDING"),
         dsl::worker_id.eq(None::<String>),
         dsl::started_at.eq(None::<chrono::DateTime<Utc>>),
+        dsl::last_heartbeat_at.eq(None::<chrono::DateTime<Utc>>),
         dsl::scheduled_at.eq(scheduled_at),
     ))
     .returning(dsl::queue_name)

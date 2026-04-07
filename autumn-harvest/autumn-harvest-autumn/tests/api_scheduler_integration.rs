@@ -313,7 +313,7 @@ fn timer_then_signal_workflow<'a>(
     _input: Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        ctx.timer("cooldown", 2)
+        ctx.timer("cooldown", 3)
             .await
             .map_err(|error| error.to_string())?;
         let approval = ctx
@@ -383,6 +383,18 @@ fn interval_pipeline_info() -> DagInfo {
         name: "interval_pipeline",
         module: "tests",
         schedule: Some(Schedule::Interval(Duration::from_secs(1))),
+        catchup: false,
+        max_active_runs: 1,
+        default_queue: Some("default"),
+        builder: build_interval_pipeline_dag,
+    }
+}
+
+fn manual_interval_pipeline_info() -> DagInfo {
+    DagInfo {
+        name: "interval_pipeline",
+        module: "tests",
+        schedule: Some(Schedule::Manual),
         catchup: false,
         max_active_runs: 1,
         default_queue: Some("default"),
@@ -507,7 +519,7 @@ async fn harvest_api_signal_does_not_wake_timer_waits_early() {
         .to_string();
 
     let mut timer_wait_established = false;
-    for _ in 0..100 {
+    for _ in 0..200 {
         let (details_status, details_json) = get_json(&app, format!("/workflows/{exec_id}")).await;
         assert_eq!(details_status, StatusCode::OK);
         let history = details_json["history"]
@@ -696,5 +708,41 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
         vec!["interval_step"]
+    );
+}
+
+#[tokio::test]
+async fn register_schedules_recomputes_next_run_when_schedule_changes() {
+    let (database_url, _container) = setup_test_database_url().await;
+
+    let interval_catalog = compile_dag_catalog(vec![interval_pipeline_info()])
+        .expect("interval pipeline dag should compile");
+    register_test_schedules(
+        &database_url,
+        &interval_catalog,
+        "failed to connect for interval schedule registration",
+    )
+    .await;
+
+    let schedule = load_schedule_from_url(&database_url, "interval_pipeline").await;
+    assert!(
+        schedule.next_run_at.is_some(),
+        "interval schedule should begin with a queued next_run_at"
+    );
+
+    let manual_catalog = compile_dag_catalog(vec![manual_interval_pipeline_info()])
+        .expect("manual interval pipeline dag should compile");
+    register_test_schedules(
+        &database_url,
+        &manual_catalog,
+        "failed to connect for manual schedule registration",
+    )
+    .await;
+
+    let updated = load_schedule_from_url(&database_url, "interval_pipeline").await;
+    assert_eq!(updated.schedule_expr.as_deref(), Some("manual"));
+    assert!(
+        updated.next_run_at.is_none(),
+        "changing an automatic schedule to manual should clear stale next_run_at"
     );
 }

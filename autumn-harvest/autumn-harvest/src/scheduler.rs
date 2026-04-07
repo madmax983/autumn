@@ -316,9 +316,14 @@ async fn upsert_schedule(
     let expr = schedule_expr(dag.schedule.as_ref());
 
     if let Some(existing) = existing {
-        let next_run_at = existing
-            .next_run_at
-            .or_else(|| next_run_after(dag.schedule.as_ref(), now));
+        let schedule_changed = existing.schedule_expr != expr;
+        let next_run_at = if schedule_changed {
+            next_run_after(dag.schedule.as_ref(), now)
+        } else {
+            existing
+                .next_run_at
+                .or_else(|| next_run_after(dag.schedule.as_ref(), now))
+        };
         diesel::update(dsl::harvest_schedules.find(existing.id))
             .set((
                 dsl::schedule_expr.eq(expr.clone()),

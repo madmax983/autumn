@@ -1556,6 +1556,60 @@ async fn wake_workflow_task_does_not_requeue_active_running_task() {
 }
 
 #[tokio::test]
+async fn reschedule_task_clears_stale_heartbeat_timestamp() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(
+        "default",
+        TaskType::Activity,
+        serde_json::json!({"retry": true}),
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.activity_name = Some("flaky_step".to_string());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed");
+    let queues = vec!["default".to_string()];
+    let claimed = queue::claim_task(&mut conn, &queues, "retry-worker")
+        .await
+        .expect("claim should succeed")
+        .expect("activity task should be claimable");
+    assert_eq!(claimed.id, task_id);
+
+    queue::record_heartbeat(&mut conn, task_id)
+        .await
+        .expect("record heartbeat should succeed");
+    let heartbeating = load_task_from_url(&database_url, task_id).await;
+    assert!(
+        heartbeating.last_heartbeat_at.is_some(),
+        "heartbeat should be recorded before reschedule"
+    );
+
+    queue::reschedule_task(
+        &mut conn,
+        task_id,
+        Utc::now() + chrono::Duration::seconds(30),
+    )
+    .await
+    .expect("reschedule_task should succeed");
+
+    let task = load_task_from_url(&database_url, task_id).await;
+    assert_eq!(task.state, "PENDING");
+    assert!(task.worker_id.is_none());
+    assert!(task.started_at.is_none());
+    assert!(
+        task.last_heartbeat_at.is_none(),
+        "rescheduling should clear stale heartbeat timestamps"
+    );
+}
+
+#[tokio::test]
 async fn enqueue_inside_transaction_emits_notification_on_commit() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
