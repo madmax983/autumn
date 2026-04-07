@@ -693,6 +693,19 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
         schedule.next_run_at.is_some(),
         "interval schedule should have next_run_at"
     );
+    {
+        let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect for forcing due interval schedule");
+        diesel::update(harvest_schedules::table.find(schedule.id))
+            .set(
+                harvest_schedules::next_run_at
+                    .eq(Some(chrono::Utc::now() - chrono::Duration::seconds(1))),
+            )
+            .execute(&mut conn)
+            .await
+            .expect("failed to force interval schedule due");
+    }
 
     tick_once(
         pool.clone(),
