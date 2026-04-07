@@ -1470,6 +1470,40 @@ async fn queue_listener_receives_enqueue_notification() {
 }
 
 #[tokio::test]
+async fn queue_listener_handles_quoted_queue_names() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let queue_name = "priority\"queue";
+    let queues = vec![queue_name.to_string()];
+    let mut listener = autumn_harvest::notify::QueueListener::connect(&database_url, &queues)
+        .await
+        .expect("listener should connect for quoted queue names");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let mut params = EnqueueParams::new(
+        queue_name,
+        TaskType::Workflow,
+        serde_json::json!({"notify": "quoted"}),
+    );
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+
+    let task_id = queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue should succeed for quoted queue names");
+
+    let notification = listener
+        .wait_for_notification(Duration::from_secs(2))
+        .await
+        .expect("listener wait should succeed")
+        .expect("listener should receive a notification");
+
+    assert_eq!(notification.task_id, task_id);
+}
+
+#[tokio::test]
 async fn wake_workflow_task_emits_notification() {
     let (database_url, _container) = setup_test_database_url().await;
     let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)

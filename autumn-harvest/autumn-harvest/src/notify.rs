@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use diesel::sql_types::Text;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use uuid::Uuid;
@@ -31,6 +32,11 @@ use crate::error::{HarvestError, HarvestResult};
 #[must_use]
 pub fn queue_channel(queue_name: &str) -> String {
     format!("harvest_queue_{}", queue_name.replace('-', "_"))
+}
+
+#[must_use]
+fn quote_pg_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 // ---------------------------------------------------------------------------
@@ -65,13 +71,9 @@ pub async fn notify_task_enqueued(
     let payload = serde_json::to_string(&NotifyPayload { task_id })
         .map_err(|e| HarvestError::Database(format!("failed to serialize notify payload: {e}")))?;
 
-    // Postgres NOTIFY requires the channel as an identifier (not a parameter),
-    // so we must format it into the SQL string. The channel name is derived from
-    // our own queue_channel() function which only produces [a-z0-9_] characters,
-    // so this is safe from injection.
-    let sql = format!("NOTIFY {channel}, '{payload}'");
-
-    diesel::sql_query(sql)
+    diesel::sql_query("SELECT pg_notify($1, $2)")
+        .bind::<Text, _>(&channel)
+        .bind::<Text, _>(&payload)
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -151,10 +153,13 @@ impl QueueListener {
         // Subscribe to all queue channels.
         for queue in queues {
             let channel = queue_channel(queue);
+            let quoted_channel = quote_pg_identifier(&channel);
             client
-                .batch_execute(&format!("LISTEN {channel}"))
+                .batch_execute(&format!("LISTEN {quoted_channel}"))
                 .await
-                .map_err(|e| HarvestError::Database(format!("LISTEN {channel} failed: {e}")))?;
+                .map_err(|e| {
+                    HarvestError::Database(format!("LISTEN {quoted_channel} failed: {e}"))
+                })?;
         }
 
         Ok(Self {
@@ -236,6 +241,14 @@ mod tests {
         assert!(
             !channel.contains('-'),
             "channel name must not contain hyphens: {channel}"
+        );
+    }
+
+    #[test]
+    fn quoted_identifier_escapes_embedded_quotes() {
+        assert_eq!(
+            quote_pg_identifier("harvest_queue_priority\"queue"),
+            "\"harvest_queue_priority\"\"queue\""
         );
     }
 }
