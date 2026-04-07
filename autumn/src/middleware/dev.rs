@@ -288,6 +288,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_reload_state_handler_reads_file_when_present() {
+        let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = r#"{"version":42,"kind":"css"}"#;
+        std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
+        let _env = EnvGuard::set_many(&[
+            (DEV_RELOAD_ENV, Some("1")),
+            (DEV_RELOAD_STATE_ENV, tmp_file.path().to_str()),
+        ]);
+
+        let response = live_reload_state_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(&body[..], content.as_bytes());
+    }
+
+    #[tokio::test]
     async fn disable_static_cache_only_marks_static_paths() {
         let app = axum::Router::new()
             .route("/static/demo.txt", axum::routing::get(|| async { "demo" }))
