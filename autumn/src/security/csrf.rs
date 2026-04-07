@@ -645,68 +645,54 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
-}
 
-#[tokio::test]
-async fn post_with_empty_tokens_returns_403() {
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::http::StatusCode;
-    use axum::routing::post;
-    use tower::ServiceExt;
+    #[tokio::test]
+    async fn post_with_empty_tokens_returns_403() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&CsrfConfig {
+                enabled: true,
+                ..Default::default()
+            }));
 
-    let app = Router::new()
-        .route("/submit", post(|| async { "created" }))
-        .layer(CsrfLayer::from_config(&CsrfConfig {
-            enabled: true,
-            ..Default::default()
-        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("X-CSRF-Token", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/submit")
-                .header("Cookie", "autumn-csrf=")
-                .header("X-CSRF-Token", "")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-}
+    #[tokio::test]
+    async fn post_with_empty_form_tokens_returns_403() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&CsrfConfig {
+                enabled: true,
+                ..Default::default()
+            }));
 
-#[tokio::test]
-async fn post_with_empty_form_tokens_returns_403() {
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::http::StatusCode;
-    use axum::routing::post;
-    use tower::ServiceExt;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_csrf="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    let app = Router::new()
-        .route("/submit", post(|| async { "created" }))
-        .layer(CsrfLayer::from_config(&CsrfConfig {
-            enabled: true,
-            ..Default::default()
-        }));
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/submit")
-                .header("Cookie", "autumn-csrf=")
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .body(Body::from("_csrf="))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
