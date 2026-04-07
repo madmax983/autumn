@@ -103,6 +103,9 @@ pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
 /// This is the primary entry point for every Autumn application.
