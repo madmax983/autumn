@@ -164,6 +164,8 @@ impl Channels {
     /// ```
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        // Clamp capacity between 1 and 16384 to prevent panics and OOM
+        let capacity = capacity.clamp(1, 16384);
         Self {
             inner: Arc::new(ChannelsInner {
                 capacity,
