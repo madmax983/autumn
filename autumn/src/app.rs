@@ -1008,7 +1008,11 @@ fn build_router_inner(
         grouped
             .entry(route.path)
             .and_modify(|existing| {
-                *existing = existing.clone().merge(route.handler.clone());
+                // ⚡ Bolt Optimization: Use `std::mem::take` to extract the existing MethodRouter
+                // temporarily, taking ownership so we can call `.merge()` on it directly.
+                // This completely removes the heap allocation and deep cloning of the Axum router
+                // tree that previously occurred during route assembly.
+                *existing = std::mem::take(existing).merge(route.handler.clone());
             })
             .or_insert(route.handler);
     }
