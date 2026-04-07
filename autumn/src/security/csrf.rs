@@ -499,6 +499,34 @@ mod tests {
         assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
     }
 
+    #[test]
+    fn extract_cookie_ignores_malformed_cookies() {
+        let mut headers = http::HeaderMap::new();
+        // Missing '='
+        headers.insert(http::header::COOKIE, "autumn-csrf abc123".parse().unwrap());
+        assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
+
+        // Multiple spaces
+        headers.insert(
+            http::header::COOKIE,
+            "   autumn-csrf  =  abc123  ; other=xyz".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_cookie_token(&headers, "autumn-csrf"),
+            Some("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(super::constant_time_eq("abc", "abc"));
+        assert!(!super::constant_time_eq("abc", "ab"));
+        assert!(!super::constant_time_eq("abc", "abd"));
+        assert!(super::constant_time_eq("", ""));
+        assert!(!super::constant_time_eq("a", "b"));
+        assert!(!super::constant_time_eq("a", "A"));
+    }
+
     #[tokio::test]
     async fn post_with_empty_cookie_but_valid_header() {
         let token = Uuid::new_v4().to_string();
