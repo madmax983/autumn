@@ -1,3 +1,14 @@
+//! Shared application state.
+//!
+//! This module defines [`AppState`], the core state object passed to all
+//! Axum route handlers. It contains framework-managed resources like the
+//! database connection pool, metrics collector, and WebSocket channels.
+//!
+//! Handlers typically don't extract `AppState` directly. Instead, they use
+//! specialized extractors like [`Db`](crate::Db) which pull what they need
+//! from the state. However, custom extractors can access the state via
+//! `axum::extract::State<AppState>`.
+
 use crate::actuator;
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
@@ -28,37 +39,29 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AppState {
-    /// Shared application state passed to all route handlers.
     /// Database connection pool, or `None` when no `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
-    /// Shared application state passed to all route handlers.
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
 
-    /// Shared application state passed to all route handlers.
     /// When the application started. Used for uptime calculation.
     pub(crate) started_at: std::time::Instant,
 
-    /// Shared application state passed to all route handlers.
     /// Whether the health endpoint should include detailed info.
     pub(crate) health_detailed: bool,
 
-    /// Shared application state passed to all route handlers.
     /// In-memory metrics collector for the `/actuator/metrics` endpoint.
     pub(crate) metrics: middleware::MetricsCollector,
 
-    /// Shared application state passed to all route handlers.
     /// Runtime log level state for the `/actuator/loggers` endpoint.
     pub(crate) log_levels: actuator::LogLevels,
 
-    /// Shared application state passed to all route handlers.
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
     pub(crate) task_registry: actuator::TaskRegistry,
 
-    /// Shared application state passed to all route handlers.
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
 
@@ -130,21 +133,18 @@ impl AppState {
         self
     }
 
-    /// Shared application state passed to all route handlers.
     /// Returns the active profile name, or `"default"` if none is set.
     #[must_use]
     pub fn profile(&self) -> &str {
         self.profile.as_deref().unwrap_or("default")
     }
 
-    /// Shared application state passed to all route handlers.
     /// Returns how long the application has been running.
     #[must_use]
     pub fn uptime(&self) -> std::time::Duration {
         self.started_at.elapsed()
     }
 
-    /// Shared application state passed to all route handlers.
     /// Format uptime as a human-readable string (e.g., "2h 15m").
     #[must_use]
     pub fn uptime_display(&self) -> String {
