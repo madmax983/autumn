@@ -90,6 +90,8 @@ pub async fn notify_task_enqueued(
 /// notifications. The connection is driven by a background task that forwards
 /// notifications through an `mpsc` channel.
 pub struct QueueListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
     /// Receiver for notifications forwarded by the connection driver task.
     rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
     /// Background connection driver handle -- kept alive for the connection's lifetime.
@@ -156,6 +158,7 @@ impl QueueListener {
         }
 
         Ok(Self {
+            _client: client,
             rx,
             _connection_handle: handle,
             queues: queues.to_vec(),

@@ -1,0 +1,31 @@
+[package]
+name = "autumn-harvest-autumn"
+description = "Autumn web-framework adapter for autumn-harvest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-harvest = { path = "../autumn-harvest" }
+autumn-web = { path = "../../autumn" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_migrations = { workspace = true }
+deadpool = { workspace = true }
+scoped-futures = "0.1"
+
+[dev-dependencies]
+tower = "0.5"
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+[lints]
+workspace = true

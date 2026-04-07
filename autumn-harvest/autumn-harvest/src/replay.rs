@@ -12,6 +12,7 @@
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 
+use crate::error::TimeoutType;
 use crate::event::WorkflowEvent;
 
 /// Result of matching a workflow command against the event history.
@@ -21,6 +22,8 @@ pub enum HistoryMatch {
     Matched { output: Value },
     /// History contains a failure for this command.
     Failed { error: String, attempt: u32 },
+    /// History contains a timeout for this command.
+    TimedOut { timeout_type: TimeoutType },
     /// Cursor is past the end of history — this is a new command.
     NoMatch,
     /// The command does not match what was recorded at this position,
@@ -104,6 +107,7 @@ impl HistoryMatcher {
     /// Returns:
     /// - [`HistoryMatch::Matched`] if a completed result is found
     /// - [`HistoryMatch::Failed`] if a failure is found
+    /// - [`HistoryMatch::TimedOut`] if a timeout is found
     /// - [`HistoryMatch::NoMatch`] if past end of history
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
@@ -180,6 +184,23 @@ impl HistoryMatcher {
                     }
 
                     let result = HistoryMatch::Failed { error, attempt };
+                    self.cursor = scan_cursor + 1;
+                    self.advance_to_next_unconsumed_event();
+                    return result;
+                }
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let timeout_type = timeout_type.clone();
+                    if let Some(child_start_cursor) = first_interleaved_child_start {
+                        self.consumed_child_terminal_events.insert(scan_cursor);
+                        self.cursor = child_start_cursor;
+                        self.advance_to_next_unconsumed_event();
+                        return HistoryMatch::TimedOut { timeout_type };
+                    }
+
+                    let result = HistoryMatch::TimedOut { timeout_type };
                     self.cursor = scan_cursor + 1;
                     self.advance_to_next_unconsumed_event();
                     return result;
@@ -296,11 +317,9 @@ impl HistoryMatcher {
             .iter()
             .position(|(name, _)| name == signal_name)
         {
-            let (_name, payload) = self
-                .pending_signals
-                .remove(index)
-                .expect("index from position must be valid");
-            return HistoryMatch::Matched { output: payload };
+            if let Some((_name, payload)) = self.pending_signals.remove(index) {
+                return HistoryMatch::Matched { output: payload };
+            }
         }
 
         self.advance_to_next_unconsumed_event();
@@ -463,6 +482,7 @@ impl HistoryMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::TimeoutType;
     use crate::types::{ActivityExecId, TimerId, WorkerId};
     use chrono::Utc;
 
@@ -536,6 +556,32 @@ mod tests {
             HistoryMatch::Failed {
                 error: "SMTP connection refused".into(),
                 attempt: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn matcher_replays_timed_out_activity() {
+        let activity_id = ActivityExecId::new();
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: TimeoutType::Heartbeat,
+            },
+        ];
+
+        let mut matcher = HistoryMatcher::new(events);
+        let result = matcher.match_activity("send_email");
+        assert_eq!(
+            result,
+            HistoryMatch::TimedOut {
+                timeout_type: TimeoutType::Heartbeat,
             }
         );
     }
@@ -1050,9 +1096,7 @@ mod tests {
                 child_id,
                 output: serde_json::json!({"ok": true}),
             },
-            WorkflowEvent::TimerFired {
-                timer_id: timer_id.clone(),
-            },
+            WorkflowEvent::TimerFired { timer_id },
         ];
 
         let mut matcher = HistoryMatcher::new(events);
@@ -1084,9 +1128,7 @@ mod tests {
                 workflow_name: "process_order".into(),
                 input: serde_json::json!({"id":"A"}),
             },
-            WorkflowEvent::TimerFired {
-                timer_id: timer_id.clone(),
-            },
+            WorkflowEvent::TimerFired { timer_id },
             WorkflowEvent::ChildWorkflowCompleted {
                 child_id,
                 output: serde_json::json!({"id":"A","ok": true}),

@@ -11,6 +11,21 @@ use autumn_web::prelude::*;
 
 use crate::schema::posts;
 
+/// Compute Reddit-style hot rank from score and age.
+#[must_use]
+pub(crate) fn calculate_hot_rank(
+    score: i64,
+    created_at: chrono::NaiveDateTime,
+    now: chrono::NaiveDateTime,
+) -> f64 {
+    #[allow(clippy::cast_precision_loss)] // Ranking math intentionally uses floats.
+    let age_hours = (now - created_at).num_seconds() as f64 / 3600.0;
+    #[allow(clippy::cast_precision_loss)]
+    {
+        score as f64 / (age_hours + 2.0_f64).powf(1.5)
+    }
+}
+
 /// Recalculate `hot_rank` for all posts using a time-decay formula.
 ///
 /// `hot_rank` = score / (`age_in_hours` + 2) ^ 1.5
@@ -40,10 +55,7 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
     let mut updated = 0u64;
 
     for (id, score, created_at) in &all_posts {
-        #[allow(clippy::cast_precision_loss)] // Acceptable for ranking math
-        let age_hours = (now - *created_at).num_seconds() as f64 / 3600.0;
-        #[allow(clippy::cast_precision_loss)]
-        let hot_rank = *score as f64 / (age_hours + 2.0_f64).powf(1.5);
+        let hot_rank = calculate_hot_rank(*score, *created_at, now);
 
         diesel::update(posts::table.find(*id))
             .set(posts::hot_rank.eq(hot_rank))
