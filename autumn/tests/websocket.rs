@@ -114,7 +114,7 @@ async fn non_upgrade_get_returns_error() {
     let config = AutumnConfig::default();
     let state = test_state();
 
-    let router = autumn_web::app::build_router(routes![echo], &config, state);
+    let router = autumn_web::router::build_router(routes![echo], &config, state);
 
     // A plain GET (without upgrade headers) should NOT get 200
     let req = Request::builder().uri("/echo").body(Body::empty()).unwrap();
@@ -129,7 +129,7 @@ async fn upgrade_request_without_real_tcp_returns_426() {
     let config = AutumnConfig::default();
     let state = test_state();
 
-    let router = autumn_web::app::build_router(routes![echo], &config, state);
+    let router = autumn_web::router::build_router(routes![echo], &config, state);
 
     // With tower::oneshot there's no real TCP connection, so the upgrade
     // cannot complete. Axum correctly returns 426 Upgrade Required.
@@ -154,7 +154,7 @@ async fn upgrade_request_without_real_tcp_returns_426() {
 async fn real_websocket_echo_works() {
     let config = AutumnConfig::default();
     let state = test_state();
-    let app = autumn_web::app::build_router(routes![echo], &config, state);
+    let app = autumn_web::router::build_router(routes![echo], &config, state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -192,7 +192,7 @@ async fn real_websocket_echo_works() {
 async fn real_websocket_with_shutdown_works() {
     let config = AutumnConfig::default();
     let state = test_state();
-    let app = autumn_web::app::build_router(routes![with_shutdown], &config, state.clone());
+    let app = autumn_web::router::build_router(routes![with_shutdown], &config, state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

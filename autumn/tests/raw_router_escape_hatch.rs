@@ -20,8 +20,13 @@ async fn merged_route_is_accessible() {
         .route("/raw", axum::routing::get(|| async { "from raw router" }));
 
     let config = AutumnConfig::default();
-    let router =
-        autumn_web::app::build_router_merged(routes![], &config, test_state(), vec![raw], vec![]);
+    let router = autumn_web::router::build_router_merged(
+        routes![],
+        &config,
+        test_state(),
+        vec![raw],
+        vec![],
+    );
 
     let resp = router
         .oneshot(Request::builder().uri("/raw").body(Body::empty()).unwrap())
@@ -44,8 +49,13 @@ async fn merged_route_receives_app_state() {
     );
 
     let config = AutumnConfig::default();
-    let router =
-        autumn_web::app::build_router_merged(routes![], &config, test_state(), vec![raw], vec![]);
+    let router = autumn_web::router::build_router_merged(
+        routes![],
+        &config,
+        test_state(),
+        vec![raw],
+        vec![],
+    );
 
     let resp = router
         .oneshot(
@@ -69,8 +79,13 @@ async fn autumn_middleware_applies_to_merged_routes() {
         axum::Router::<AppState>::new().route("/raw-mid", axum::routing::get(|| async { "ok" }));
 
     let config = AutumnConfig::default();
-    let router =
-        autumn_web::app::build_router_merged(routes![], &config, test_state(), vec![raw], vec![]);
+    let router = autumn_web::router::build_router_merged(
+        routes![],
+        &config,
+        test_state(),
+        vec![raw],
+        vec![],
+    );
 
     let resp = router
         .oneshot(
@@ -104,7 +119,7 @@ async fn multiple_merged_routers_accumulate() {
         axum::Router::<AppState>::new().route("/raw2", axum::routing::get(|| async { "second" }));
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![],
         &config,
         test_state(),
@@ -142,7 +157,7 @@ async fn nested_route_works_under_prefix() {
         .route("/users", axum::routing::get(|| async { "v2 users" }));
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![],
         &config,
         test_state(),
@@ -189,7 +204,7 @@ async fn nested_route_receives_app_state() {
     );
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![],
         &config,
         test_state(),
@@ -219,7 +234,7 @@ async fn nested_route_gets_autumn_middleware() {
         axum::Router::<AppState>::new().route("/check", axum::routing::get(|| async { "ok" }));
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![],
         &config,
         test_state(),
@@ -257,7 +272,7 @@ async fn annotated_and_merged_routes_coexist() {
         .route("/raw-only", axum::routing::get(|| async { "from raw" }));
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![annotated_handler],
         &config,
         test_state(),
@@ -306,7 +321,7 @@ async fn merged_route_adds_different_method_to_same_path() {
         .route("/annotated", axum::routing::post(|| async { "posted" }));
 
     let config = AutumnConfig::default();
-    let router = autumn_web::app::build_router_merged(
+    let router = autumn_web::router::build_router_merged(
         routes![annotated_handler],
         &config,
         test_state(),
