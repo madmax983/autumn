@@ -262,21 +262,26 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
         return;
     }
 
-    if base.is_table() && overlay.is_table() {
-        if let toml::Value::Table(overlay_table) = overlay {
-            let base_table = base.as_table_mut().expect("checked is_table above");
-            for (key, overlay_val) in overlay_table {
-                if overlay_val.is_table() {
-                    if let Some(base_val) = base_table.get_mut(&key) {
-                        if base_val.is_table() {
-                            deep_merge_with_depth(base_val, overlay_val, depth + 1);
-                            continue;
-                        }
-                    }
+    if !base.is_table() {
+        return;
+    }
+
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+
+    let base_table = base.as_table_mut().expect("checked is_table above");
+
+    for (key, overlay_val) in overlay_table {
+        if overlay_val.is_table() {
+            if let Some(base_val) = base_table.get_mut(&key) {
+                if base_val.is_table() {
+                    deep_merge_with_depth(base_val, overlay_val, depth + 1);
+                    continue;
                 }
-                base_table.insert(key, overlay_val);
             }
         }
+        base_table.insert(key, overlay_val);
     }
 }
 
