@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod dev;
+mod export;
 mod migrate;
 mod monitor;
 mod new;
@@ -61,6 +62,15 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         interval: u64,
     },
+    /// Export an offline diagnostic snapshot of the application
+    Export {
+        /// URL of the running Autumn application
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
+        /// Output file for diagnostics
+        #[arg(short, long, default_value = "autumn-diag.json")]
+        output: String,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -86,6 +96,7 @@ fn main() {
             migrate::run(action);
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
+        Commands::Export { url, output } => export::run(&url, &output),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -275,6 +286,38 @@ mod tests {
                 assert_eq!(interval, 5);
             }
             _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "export"]).unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://localhost:3000");
+                assert_eq!(output, "autumn-diag.json");
+            }
+            _ => panic!("expected Export command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_custom() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "export",
+            "-u",
+            "http://prod:8080",
+            "-o",
+            "snapshot.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://prod:8080");
+                assert_eq!(output, "snapshot.json");
+            }
+            _ => panic!("expected Export command"),
         }
     }
 
