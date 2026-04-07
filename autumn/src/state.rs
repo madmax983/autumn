@@ -1,6 +1,6 @@
+use crate::actuator;
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
-use crate::diagnostics;
 use crate::middleware;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
@@ -52,15 +52,15 @@ pub struct AppState {
 
     /// Shared application state passed to all route handlers.
     /// Runtime log level state for the `/actuator/loggers` endpoint.
-    pub(crate) log_levels: diagnostics::LogLevels,
+    pub(crate) log_levels: actuator::LogLevels,
 
     /// Shared application state passed to all route handlers.
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
-    pub(crate) task_registry: diagnostics::TaskRegistry,
+    pub(crate) task_registry: actuator::TaskRegistry,
 
     /// Shared application state passed to all route handlers.
     /// Resolved config properties with source tracking for `/actuator/configprops`.
-    pub(crate) config_props: diagnostics::ConfigProperties,
+    pub(crate) config_props: actuator::ConfigProperties,
 
     /// Named broadcast channel registry for real-time messaging.
     ///
@@ -96,19 +96,19 @@ impl AppState {
 
     /// Returns the log levels configuration.
     #[must_use]
-    pub const fn log_levels(&self) -> &diagnostics::LogLevels {
+    pub const fn log_levels(&self) -> &actuator::LogLevels {
         &self.log_levels
     }
 
     /// Returns the task registry.
     #[must_use]
-    pub const fn task_registry(&self) -> &diagnostics::TaskRegistry {
+    pub const fn task_registry(&self) -> &actuator::TaskRegistry {
         &self.task_registry
     }
 
     /// Returns the config properties.
     #[must_use]
-    pub const fn config_props(&self) -> &diagnostics::ConfigProperties {
+    pub const fn config_props(&self) -> &actuator::ConfigProperties {
         &self.config_props
     }
 
@@ -198,9 +198,9 @@ impl AppState {
             started_at: std::time::Instant::now(),
             health_detailed: true,
             metrics: middleware::MetricsCollector::new(),
-            log_levels: diagnostics::LogLevels::new("info"),
-            task_registry: diagnostics::TaskRegistry::new(),
-            config_props: diagnostics::ConfigProperties::default(),
+            log_levels: actuator::LogLevels::new("info"),
+            task_registry: actuator::TaskRegistry::new(),
+            config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: Channels::new(32),
             #[cfg(feature = "ws")]
@@ -227,16 +227,6 @@ impl std::fmt::Debug for AppState {
             .field("log_levels", &"LogLevels")
             .field("task_registry", &"TaskRegistry")
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(feature = "db")]
-impl crate::db::DbState for AppState {
-    fn pool(
-        &self,
-    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
-    {
-        self.pool.as_ref()
     }
 }
 

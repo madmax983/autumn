@@ -170,9 +170,9 @@ impl TestApp {
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
             metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::diagnostics::LogLevels::new(&self.config.log.level),
-            task_registry: crate::diagnostics::TaskRegistry::new(),
-            config_props: crate::diagnostics::ConfigProperties::default(),
+            log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]

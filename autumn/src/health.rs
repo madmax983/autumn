@@ -149,9 +149,9 @@ mod tests {
             started_at: std::time::Instant::now(),
             health_detailed: true,
             metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::diagnostics::LogLevels::new("info"),
-            task_registry: crate::diagnostics::TaskRegistry::new(),
-            config_props: crate::diagnostics::ConfigProperties::default(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -235,9 +235,9 @@ mod tests {
                 started_at: std::time::Instant::now(),
                 health_detailed: true,
                 metrics: crate::middleware::MetricsCollector::new(),
-                log_levels: crate::diagnostics::LogLevels::new("info"),
-                task_registry: crate::diagnostics::TaskRegistry::new(),
-                config_props: crate::diagnostics::ConfigProperties::default(),
+                log_levels: crate::actuator::LogLevels::new("info"),
+                task_registry: crate::actuator::TaskRegistry::new(),
+                config_props: crate::actuator::ConfigProperties::default(),
                 #[cfg(feature = "ws")]
                 channels: crate::channels::Channels::new(32),
                 #[cfg(feature = "ws")]
