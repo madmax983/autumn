@@ -1,5 +1,5 @@
-use std::time::{Instant, Duration};
 use autumn_web::auth::{hash_password, verify_password};
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn eris_timing_attack() {
@@ -18,6 +18,10 @@ async fn eris_timing_attack() {
     println!("Time with invalid hash: {:?}", time_invalid);
 
     // If time_invalid is less than a small threshold (e.g. 5ms), it returned instantly
-    assert!(time_invalid > Duration::from_millis(10),
-        "[ERIS-VULN] verify_password returns instantly on invalid hash, exposing a timing attack! Invalid: {:?}, Valid: {:?}", time_invalid, time_valid);
+    assert!(
+        time_invalid > Duration::from_millis(10),
+        "[ERIS-VULN] verify_password returns instantly on invalid hash, exposing a timing attack! Invalid: {:?}, Valid: {:?}",
+        time_invalid,
+        time_valid
+    );
 }

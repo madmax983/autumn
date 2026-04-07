@@ -126,7 +126,9 @@ pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<
             Err(_) => {
                 // Fallback to prevent timing attacks. Compute a dummy hash.
                 let _ = bcrypt::hash(&password, DEFAULT_BCRYPT_COST);
-                Err(crate::AutumnError::from(std::io::Error::other("invalid hash format")))
+                Err(crate::AutumnError::from(std::io::Error::other(
+                    "invalid hash format",
+                )))
             }
         }
     })
