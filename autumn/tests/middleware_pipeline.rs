@@ -46,7 +46,7 @@ async fn exception_filter_on_error_response() {
     let config = AutumnConfig::default();
 
     let router =
-        autumn_web::app::build_router(routes![ok_handler, fail_handler], &config, test_state());
+        autumn_web::router::build_router(routes![ok_handler, fail_handler], &config, test_state());
     // Manually layer the exception filter (build_router doesn't take filters)
     let router = router.layer(ExceptionFilterLayer::new(vec![Arc::new(
         MarkCalledFilter {

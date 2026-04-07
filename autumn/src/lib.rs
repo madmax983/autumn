@@ -82,6 +82,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub mod router;
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
