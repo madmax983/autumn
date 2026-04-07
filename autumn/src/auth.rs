@@ -936,4 +936,50 @@ mod tests {
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
     }
+
+    #[tokio::test]
+    async fn require_auth_poll_ready_propagates() {
+        use std::task::{Context, Poll};
+        use tower::{Layer, Service};
+
+        #[derive(Clone)]
+        struct MockService {
+            ready: bool,
+        }
+
+        impl Service<axum::extract::Request> for MockService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                if self.ready {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+
+            fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
+                std::future::ready(Ok(axum::response::Response::new(axum::body::Body::empty())))
+            }
+        }
+
+        let layer = RequireAuth::new("user_id");
+        let mock_service = MockService { ready: false };
+        let mut service = layer.layer(mock_service);
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // When inner is not ready, RequireAuthService should not be ready
+        let poll = service.poll_ready(&mut cx);
+        assert!(poll.is_pending());
+
+        // When inner is ready, RequireAuthService should be ready
+        let mock_service_ready = MockService { ready: true };
+        let mut service_ready = layer.layer(mock_service_ready);
+        let poll_ready = service_ready.poll_ready(&mut cx);
+        assert!(poll_ready.is_ready());
+    }
 }
