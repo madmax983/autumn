@@ -511,7 +511,7 @@ async fn execute_dag_run(
     let final_state = if statuses.contains(&TaskStatus::Failed) {
         "FAILED"
     } else {
-        "COMPLETED"
+        "SUCCESS"
     };
     let mut db = pool
         .get()

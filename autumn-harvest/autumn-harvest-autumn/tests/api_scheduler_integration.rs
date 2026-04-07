@@ -620,7 +620,7 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     .await;
     assert_eq!(trigger_status, StatusCode::CREATED);
 
-    let run = wait_for_dag_run_state(&database_url, "manual_pipeline", "COMPLETED").await;
+    let run = wait_for_dag_run_state(&database_url, "manual_pipeline", "SUCCESS").await;
     assert_eq!(run.dag_name, "manual_pipeline");
 
     let (runs_status, runs_json) = get_json(&app, "/dags/manual_pipeline/runs").await;
@@ -691,7 +691,7 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
     .await
     .expect("scheduler tick should succeed");
 
-    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "COMPLETED").await;
+    let run = wait_for_dag_run_state(&database_url, "interval_pipeline", "SUCCESS").await;
     assert_eq!(run.dag_name, "interval_pipeline");
     assert_eq!(
         log.lock().expect("log mutex poisoned").clone(),
