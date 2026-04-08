@@ -63,8 +63,6 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
 
-use crate::state::AppState;
-
 // ── Password hashing ────────────────────────────────────────────
 
 /// Default bcrypt cost factor.
@@ -206,15 +204,16 @@ pub async fn __check_secured(
 /// ```
 pub struct Auth<T>(pub T);
 
-impl<T> FromRequestParts<AppState> for Auth<T>
+impl<T, S> FromRequestParts<S> for Auth<T>
 where
     T: Clone + Send + Sync + 'static,
+    S: Send + Sync,
 {
     type Rejection = AuthRejection;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let user = parts.extensions.get::<T>().cloned();
         async move { user.map_or_else(|| Err(AuthRejection), |user| Ok(Self(user))) }
@@ -431,6 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -478,6 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -546,6 +547,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
+        use crate::state::AppState;
 
         let state = AppState {
             #[cfg(feature = "db")]
@@ -650,6 +652,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
+        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -702,6 +705,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -764,6 +768,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured("admin")]
         async fn admin_only() -> crate::AutumnResult<&'static str> {
@@ -825,6 +830,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured("admin", "editor")]
         async fn content_handler() -> crate::AutumnResult<&'static str> {
@@ -890,6 +896,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         let store = MemoryStore::new();
         // Pre-populate a session with user_id

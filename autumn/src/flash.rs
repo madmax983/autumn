@@ -141,15 +141,13 @@ impl Flash {
     }
 }
 
-use crate::state::AppState;
+impl<S> FromRequestParts<S> for Flash
+where
+    S: Send + Sync,
+{
+    type Rejection = <Session as FromRequestParts<S>>::Rejection;
 
-impl FromRequestParts<AppState> for Flash {
-    type Rejection = <Session as FromRequestParts<AppState>>::Rejection;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let session = Session::from_request_parts(parts, state).await?;
         Ok(Self::new(session))
     }
