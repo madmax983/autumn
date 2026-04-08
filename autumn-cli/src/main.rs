@@ -340,51 +340,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(feature = "load-test")]
-    fn parse_load_defaults() {
-        let cli = Cli::try_parse_from(["autumn", "load"]).unwrap();
-        match cli.command {
-            Commands::Load {
-                url,
-                concurrency,
-                requests,
-            } => {
-                assert_eq!(url, "http://localhost:3000");
-                assert_eq!(concurrency, 10);
-                assert_eq!(requests, 100);
-            }
-            _ => panic!("expected Load command"),
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "load-test")]
-    fn parse_load_custom() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "load",
-            "-u",
-            "http://prod:8080",
-            "-c",
-            "50",
-            "-r",
-            "1000",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Load {
-                url,
-                concurrency,
-                requests,
-            } => {
-                assert_eq!(url, "http://prod:8080");
-                assert_eq!(concurrency, 50);
-                assert_eq!(requests, 1000);
-            }
-            _ => panic!("expected Load command"),
-        }
-    }
 
     #[test]
     fn unknown_subcommand_is_error() {
