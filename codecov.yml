@@ -17,6 +17,7 @@ comment:
 ignore:
   - "examples/**"
   - "autumn-cli/src/build.rs"  # CLI subprocess orchestration — untestable in unit tests
+  - "autumn-cli/src/dev.rs"    # CLI subprocess orchestration — untestable in unit tests
   - "autumn-cli/src/templates/**"
   - "**/*_test.rs"
   - "**/tests/**"
