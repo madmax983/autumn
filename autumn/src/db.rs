@@ -32,7 +32,14 @@ use diesel_async::pooled_connection::deadpool::Pool;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
-use crate::state::AppState;
+
+/// Trait to abstract the state requirement for the `Db` extractor.
+/// This breaks the circular dependency between the database extractor
+/// and the central `AppState`.
+pub trait DbState {
+    /// Returns the database connection pool, if configured.
+    fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
+}
 
 /// Error type for pool creation failures.
 ///
@@ -108,16 +115,18 @@ impl std::ops::DerefMut for Db {
     }
 }
 
-impl FromRequestParts<AppState> for Db {
+impl<S> FromRequestParts<S> for Db
+where
+    S: DbState + Send + Sync,
+{
     type Rejection = AutumnError;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
-        state: &AppState,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
         let pool = state
-            .pool
-            .as_ref()
+            .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
         let conn = pool.get().await.map_err(|e| {
@@ -192,6 +201,7 @@ mod tests {
         use axum::http::{Request, StatusCode};
         use axum::routing::get;
         use tower::ServiceExt;
+        use crate::state::AppState;
 
         async fn handler(_db: Db) -> &'static str {
             "ok"
