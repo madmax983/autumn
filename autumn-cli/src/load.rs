@@ -52,7 +52,11 @@ pub fn calculate_stats(mut latencies: Vec<u64>) -> Stats {
     let min_ms = latencies[0];
     let max_ms = latencies[latencies.len() - 1];
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     let p50_index = (total_requests as f64 * 0.50).round() as usize;
     let p50_ms = if p50_index > 0 && p50_index <= latencies.len() {
         latencies[p50_index - 1]
@@ -60,7 +64,11 @@ pub fn calculate_stats(mut latencies: Vec<u64>) -> Stats {
         0
     };
 
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
     let p95_index = (total_requests as f64 * 0.95).round() as usize;
     let p95_ms = if p95_index > 0 && p95_index <= latencies.len() {
         latencies[p95_index - 1]
@@ -196,7 +204,11 @@ impl TuiState {
         // Prevent division by zero and excessive spam
         if elapsed >= 0.5 {
             let newly_completed = self.completed.saturating_sub(self.last_tick_completed);
-            #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
             let rps = (newly_completed as f64 / elapsed).round() as u64;
 
             self.rps_history.pop_front();
@@ -271,7 +283,10 @@ fn ui_loop(
                     // Channels disconnected means all workers have finished or panicked.
                     // If we haven't hit the target, it means a worker panicked. We should exit.
                     if state.completed < state.total_requested {
-                        return Err("Worker threads died unexpectedly before completing all requests".to_string());
+                        return Err(
+                            "Worker threads died unexpectedly before completing all requests"
+                                .to_string(),
+                        );
                     }
                     break;
                 }
