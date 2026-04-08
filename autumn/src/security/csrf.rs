@@ -190,20 +190,28 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Extract the CSRF cookie value from the Cookie header.
 fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Option<String> {
-    req_headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|cookie_str| cookie_str.split(';'))
-        .map(str::trim)
-        .find_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            if name.trim() == cookie_name {
-                Some(value.trim().to_owned())
-            } else {
-                None
+    let mut found_token = None;
+
+    for cookie_header in &req_headers.get_all(http::header::COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for pair in cookie_str.split(';') {
+                let pair = pair.trim();
+                if let Some((name, value)) = pair.split_once('=') {
+                    if name.trim() == cookie_name {
+                        if found_token.is_some() {
+                            // Multiple cookies with the same name found.
+                            // This indicates a potential Cookie Tossing attack!
+                            // Reject by returning None.
+                            return None;
+                        }
+                        found_token = Some(value.trim().to_owned());
+                    }
+                }
             }
-        })
+        }
+    }
+
+    found_token
 }
 
 impl<S, ResBody> Service<Request<axum::body::Body>> for CsrfService<S>
