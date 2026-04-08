@@ -109,19 +109,16 @@ fn resolve_binary_from_metadata(
 
     let bin_name = matching_packages
         .iter()
-        .flat_map(|pkg| {
-            pkg["targets"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|target| {
-                    target["kind"]
-                        .as_array()
-                        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-                })
-                .filter_map(|target| target["name"].as_str().map(str::to_owned))
+        .find_map(|pkg| {
+            pkg["targets"].as_array()?.iter().find_map(|t| {
+                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+                if is_bin {
+                    t["name"].as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
         })
-        .next()
         .ok_or_else(|| {
             package.map_or_else(
                 || "no binary target found in current package".to_owned(),
