@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod build;
 mod dev;
 mod export;
+mod load;
 mod migrate;
 mod monitor;
 mod new;
@@ -71,6 +72,18 @@ enum Commands {
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
     },
+    /// Load test a URL
+    Load {
+        /// URL to load test
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
+        /// Number of concurrent workers
+        #[arg(short, long, default_value = "10")]
+        concurrency: u64,
+        /// Total number of requests to send
+        #[arg(short, long, default_value = "100")]
+        requests: u64,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -97,6 +110,12 @@ fn main() {
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
+        #[cfg(feature = "load-test")]
+        Commands::Load {
+            url,
+            concurrency,
+            requests,
+        } => load::run(&url, concurrency, requests),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -318,6 +337,52 @@ mod tests {
                 assert_eq!(output, "snapshot.json");
             }
             _ => panic!("expected Export command"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "load-test")]
+    fn parse_load_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "load"]).unwrap();
+        match cli.command {
+            Commands::Load {
+                url,
+                concurrency,
+                requests,
+            } => {
+                assert_eq!(url, "http://localhost:3000");
+                assert_eq!(concurrency, 10);
+                assert_eq!(requests, 100);
+            }
+            _ => panic!("expected Load command"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "load-test")]
+    fn parse_load_custom() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "load",
+            "-u",
+            "http://prod:8080",
+            "-c",
+            "50",
+            "-r",
+            "1000",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Load {
+                url,
+                concurrency,
+                requests,
+            } => {
+                assert_eq!(url, "http://prod:8080");
+                assert_eq!(concurrency, 50);
+                assert_eq!(requests, 1000);
+            }
+            _ => panic!("expected Load command"),
         }
     }
 

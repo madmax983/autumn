@@ -10,6 +10,10 @@ repository.workspace = true
 name = "autumn"
 path = "src/main.rs"
 
+[features]
+default = ["load-test"]
+load-test = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
