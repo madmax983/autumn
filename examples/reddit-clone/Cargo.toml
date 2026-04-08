@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 autumn-harvest = { path = "../../autumn-harvest/autumn-harvest" }
-autumn-harvest-autumn = { path = "../../autumn-harvest/autumn-harvest-autumn" }
+autumn-web-harvest = { path = "../../autumn-harvest/autumn-web-harvest" }
 autumn-web = { path = "../../autumn", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }

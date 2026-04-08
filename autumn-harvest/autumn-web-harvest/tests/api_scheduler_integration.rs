@@ -14,7 +14,7 @@ use autumn_harvest::scheduler::{
 use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
-use autumn_harvest_autumn::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
+use autumn_web_harvest::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use autumn_web::AppState;
 use autumn_web::reexports::axum;
 use axum::body::Body;
