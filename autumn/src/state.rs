@@ -213,7 +213,10 @@ impl AppState {
 
 #[cfg(feature = "db")]
 impl DbState for AppState {
-    fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> {
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
         self.pool.as_ref()
     }
 }

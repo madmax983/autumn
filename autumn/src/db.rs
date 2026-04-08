@@ -196,12 +196,12 @@ mod tests {
 
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use axum::routing::get;
         use tower::ServiceExt;
-        use crate::state::AppState;
 
         async fn handler(_db: Db) -> &'static str {
             "ok"

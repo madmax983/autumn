@@ -430,11 +430,11 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
         use tower::ServiceExt;
-        use crate::state::AppState;
 
         #[derive(Clone)]
         struct TestUser {
@@ -478,11 +478,11 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
         use tower::ServiceExt;
-        use crate::state::AppState;
 
         #[derive(Clone)]
         struct TestUser {

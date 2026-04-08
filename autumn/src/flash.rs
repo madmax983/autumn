@@ -147,10 +147,7 @@ where
 {
     type Rejection = <Session as FromRequestParts<S>>::Rejection;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let session = Session::from_request_parts(parts, state).await?;
         Ok(Self::new(session))
     }
