@@ -340,7 +340,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn unknown_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "bogus"]).is_err());
