@@ -34,7 +34,7 @@ pub fn build_router(
 ///
 /// Like [`build_router`], but also merges and nests additional raw
 /// Axum routers. This is primarily useful for integration testing;
-/// in production, use [`AppBuilder::merge`] and [`AppBuilder::nest`].
+/// in production, use [`AppBuilder::merge`](crate::app::AppBuilder::merge) and [`AppBuilder::nest`](crate::app::AppBuilder::nest).
 pub fn build_router_merged(
     route_list: Vec<Route>,
     config: &AutumnConfig,
