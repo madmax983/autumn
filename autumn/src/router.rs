@@ -84,7 +84,7 @@ pub(crate) fn build_router_inner(
         grouped
             .entry(route.path)
             .and_modify(|existing| {
-                *existing = existing.clone().merge(route.handler.clone());
+                *existing = std::mem::take(existing).merge(route.handler.clone());
             })
             .or_insert(route.handler);
     }

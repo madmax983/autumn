@@ -12,6 +12,8 @@
 use crate::actuator;
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
+#[cfg(feature = "db")]
+use crate::db::DbState;
 use crate::middleware;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
@@ -206,6 +208,16 @@ impl AppState {
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
         }
+    }
+}
+
+#[cfg(feature = "db")]
+impl DbState for AppState {
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.as_ref()
     }
 }
 

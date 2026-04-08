@@ -70,8 +70,6 @@ use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
 
-use crate::state::AppState;
-
 // ── Session data ────────────────────────────────────────────────
 
 /// A handle to the current request's session data.
@@ -178,12 +176,15 @@ impl Session {
     }
 }
 
-impl FromRequestParts<AppState> for Session {
+impl<S> FromRequestParts<S> for Session
+where
+    S: Send + Sync,
+{
     type Rejection = std::convert::Infallible;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let session = parts
             .extensions
@@ -609,6 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
+        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
             "ok".to_owned()
@@ -654,6 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_persists_data_across_requests() {
+        use crate::state::AppState;
         async fn write_handler(session: Session) -> String {
             session.insert("user", "alice").await;
             "saved".to_owned()
@@ -729,6 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_destroy_expires_cookie() {
+        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.destroy().await;
             "destroyed".to_owned()
