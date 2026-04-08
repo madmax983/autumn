@@ -2,16 +2,32 @@
 ///
 /// "Hello World!" -> "hello-world"
 /// "Ask Rust: What's new?" -> "ask-rust-what-s-new"
+///
+/// ⚡ Bolt Optimization:
+/// This avoids multiple heap allocations (an intermediate `String` and `Vec`)
+/// by iterating through characters in a single pass and pushing to a pre-allocated String.
 pub fn slugify(title: &str) -> String {
-    title
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+    let mut slug = String::with_capacity(title.len());
+    let mut last_was_dash = true; // Start true to prevent leading dashes
+
+    for c in title.chars() {
+        if c.is_alphanumeric() {
+            // Using flat_map to handle potential multiple chars from lowercase conversion
+            for lc in c.to_lowercase() {
+                slug.push(lc);
+            }
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    if slug.ends_with('-') {
+        slug.pop();
+    }
+
+    slug
 }
 
 #[cfg(test)]

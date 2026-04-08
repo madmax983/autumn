@@ -119,13 +119,30 @@ pub struct UpdatePost {
 }
 
 /// Convert a string into a URL-safe slug.
+///
+/// ⚡ Bolt Optimization:
+/// This avoids multiple heap allocations (an intermediate `String` and `Vec`)
+/// by iterating through characters in a single pass and pushing to a pre-allocated String.
 pub fn slugify(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
+    let mut slug = String::with_capacity(s.len());
+    let mut last_was_dash = true; // Start true to prevent leading dashes
+
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            // Using flat_map to handle potential multiple chars from lowercase conversion
+            for lc in c.to_lowercase() {
+                slug.push(lc);
+            }
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    if slug.ends_with('-') {
+        slug.pop();
+    }
+
+    slug
 }
