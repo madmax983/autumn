@@ -191,4 +191,59 @@ mod tests {
         assert_eq!(FlashLevel::Warning.as_str(), "warning");
         assert_eq!(FlashLevel::Error.as_str(), "error");
     }
+
+    #[tokio::test]
+    async fn should_not_remove_key_when_consuming_empty_flash() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        // Insert a dummy key to verify the session remains untouched and "dirty" flag logic
+        session.insert("dummy", "val").await;
+
+        let flash = Flash::new(session.clone());
+        let messages = flash.consume().await;
+
+        // No messages were present
+        assert_eq!(messages.len(), 0);
+
+        // "dummy" key is still there
+        assert_eq!(session.get("dummy").await.unwrap(), "val");
+        // Flash key shouldn't be added or touched
+        assert!(!session.contains_key(FLASH_SESSION_KEY).await);
+    }
+
+    #[tokio::test]
+    async fn should_handle_invalid_json_gracefully() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        // Insert broken JSON manually
+        session
+            .insert(FLASH_SESSION_KEY, "{ invalid_json: true")
+            .await;
+
+        let flash = Flash::new(session);
+        let messages = flash.peek().await;
+
+        // It should gracefully fall back to an empty vector rather than panicking
+        assert_eq!(messages.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn should_support_all_convenience_methods() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session);
+
+        flash.success("Success msg").await;
+        flash.info("Info msg").await;
+        flash.warning("Warning msg").await;
+        flash.error("Error msg").await;
+
+        let messages = flash.peek().await;
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].level, FlashLevel::Success);
+        assert_eq!(messages[0].message, "Success msg");
+        assert_eq!(messages[1].level, FlashLevel::Info);
+        assert_eq!(messages[1].message, "Info msg");
+        assert_eq!(messages[2].level, FlashLevel::Warning);
+        assert_eq!(messages[2].message, "Warning msg");
+        assert_eq!(messages[3].level, FlashLevel::Error);
+        assert_eq!(messages[3].message, "Error msg");
+    }
 }
