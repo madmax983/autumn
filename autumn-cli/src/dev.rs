@@ -197,74 +197,91 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     // Main event loop
     loop {
-        match rx.recv() {
-            Ok(Ok(events)) => {
-                let plan = plan_changes(&events);
-                if plan.is_empty() {
-                    continue;
-                }
-
-                let changed = collect_relevant_changes(&events);
-                if changed.is_empty() {
-                    continue;
-                }
-
-                eprintln!("\n  Changed: {}", changed.join(", "));
-                eprintln!("  Action: {}", describe_plan(plan));
-
-                let mut applied_reload = ReloadKind::None;
-
-                if plan.build {
-                    stop_server(&mut child);
-
-                    if cargo_build(package) {
-                        if restart_server(
-                            package,
-                            &mut child,
-                            reload_state.as_ref().map(DevReloadState::path),
-                        ) {
-                            applied_reload = ReloadKind::Full;
-                        }
-                    } else {
-                        eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-                        child = None;
-                    }
-                } else {
-                    if plan.tailwind && tailwind_build() {
-                        applied_reload = applied_reload.max(ReloadKind::Css);
-                    }
-
-                    if plan.restart {
-                        stop_server(&mut child);
-                        if restart_server(
-                            package,
-                            &mut child,
-                            reload_state.as_ref().map(DevReloadState::path),
-                        ) {
-                            applied_reload = ReloadKind::Full;
-                        }
-                    } else if plan.reload == ReloadKind::Full {
-                        applied_reload = ReloadKind::Full;
-                    }
-                }
-
-                if let Some(reload_state) = reload_state.as_mut() {
-                    if let Err(error) = reload_state.signal(applied_reload) {
-                        eprintln!("  Warning: live reload signal failed: {error}");
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                eprintln!("  Watch error: {error}");
-            }
-            Err(e) => {
-                eprintln!("  Watch channel error: {e}");
-                break;
-            }
+        if !process_events(&rx, package, &mut child, reload_state.as_mut()) {
+            break;
         }
     }
 
     stop_server(&mut child);
+}
+
+/// Process a single batch of events from the debouncer channel.
+/// Returns false if the channel was closed and the loop should exit.
+fn process_events(
+    rx: &mpsc::Receiver<Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>>,
+    package: Option<&str>,
+    child: &mut Option<Child>,
+    reload_state: Option<&mut DevReloadState>,
+) -> bool {
+    match rx.recv() {
+        Ok(Ok(events)) => {
+            let plan = plan_changes(&events);
+            if plan.is_empty() {
+                return true;
+            }
+
+            let changed = collect_relevant_changes(&events);
+            if changed.is_empty() {
+                return true;
+            }
+
+            eprintln!("\n  Changed: {}", changed.join(", "));
+            eprintln!("  Action: {}", describe_plan(plan));
+
+            execute_plan(plan, package, child, reload_state);
+            true
+        }
+        Ok(Err(error)) => {
+            eprintln!("  Watch error: {error:?}");
+            true
+        }
+        Err(e) => {
+            eprintln!("  Watch channel error: {e}");
+            false
+        }
+    }
+}
+
+/// Execute a computed change plan.
+fn execute_plan(
+    plan: ChangePlan,
+    package: Option<&str>,
+    child: &mut Option<Child>,
+    mut reload_state: Option<&mut DevReloadState>,
+) {
+    let mut applied_reload = ReloadKind::None;
+
+    if plan.build {
+        stop_server(child);
+
+        if cargo_build(package) {
+            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+                applied_reload = ReloadKind::Full;
+            }
+        } else {
+            eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
+            *child = None;
+        }
+    } else {
+        if plan.tailwind && tailwind_build() {
+            applied_reload = applied_reload.max(ReloadKind::Css);
+        }
+
+        if plan.restart {
+            stop_server(child);
+            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+                applied_reload = ReloadKind::Full;
+            }
+        } else if plan.reload == ReloadKind::Full {
+            applied_reload = ReloadKind::Full;
+        }
+    }
+
+    if let Some(reload_state) = reload_state.as_mut() {
+        if let Err(error) = reload_state.signal(applied_reload) {
+            eprintln!("  Warning: live reload signal failed: {error}");
+        }
+    }
 }
 
 /// Collect display paths for all relevant file changes from a debounced batch.
@@ -661,19 +678,16 @@ fn resolve_binary_from_metadata(
 
     let bin_name = matching_packages
         .iter()
-        .flat_map(|pkg| {
-            pkg["targets"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|t| {
-                    t["kind"]
-                        .as_array()
-                        .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
-                })
-                .filter_map(|t| t["name"].as_str().map(String::from))
+        .find_map(|pkg| {
+            pkg["targets"].as_array()?.iter().find_map(|t| {
+                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+                if is_bin {
+                    t["name"].as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
         })
-        .next()
         .ok_or_else(|| {
             package.map_or_else(
                 || "no binary target found in current package".to_owned(),
