@@ -30,7 +30,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
-lru = "0.12"
+lru = "0.16.3"
 croner = "2.2"
 deadpool = { workspace = true, optional = true }
 diesel = { workspace = true, optional = true }
