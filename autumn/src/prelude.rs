@@ -49,6 +49,9 @@ pub use crate::extract::Path;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// htmx request extractor.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::HxRequest;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.
