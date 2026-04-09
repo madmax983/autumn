@@ -176,13 +176,25 @@ pub struct CsrfService<S> {
 use subtle::ConstantTimeEq;
 
 /// Constant-time string comparison to prevent timing attacks when verifying CSRF tokens.
+///
+/// Length mismatch is folded into the constant-time accumulator rather than
+/// returning early, so an attacker cannot distinguish a wrong-length token from
+/// a same-length wrong-character token by observing response latency.
 #[inline(never)]
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
+    let a = a.as_bytes();
+    let b = b.as_bytes();
 
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    // Constant-time length check — no early exit.
+    let len_eq = a.len().ct_eq(&b.len());
+
+    // Compare up to the minimum length so we never go out-of-bounds.
+    // Both this comparison and `len_eq` are always evaluated; they are
+    // combined with `&` (not `&&`) so neither short-circuits.
+    let min_len = a.len().min(b.len());
+    let bytes_eq = a[..min_len].ct_eq(&b[..min_len]);
+
+    (len_eq & bytes_eq).into()
 }
 
 /// Extract the CSRF cookie value from the Cookie header.
