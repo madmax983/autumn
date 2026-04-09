@@ -508,6 +508,23 @@ mod tests {
     }
 
     #[test]
+    fn extract_cookie_rejects_multiple_cookies() {
+        // Multiple cookies with the same name in a single header
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "autumn-csrf=abc123; autumn-csrf=xyz456".parse().unwrap(),
+        );
+        assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
+
+        // Multiple headers with the same cookie
+        let mut headers2 = http::HeaderMap::new();
+        headers2.append(http::header::COOKIE, "autumn-csrf=abc123".parse().unwrap());
+        headers2.append(http::header::COOKIE, "autumn-csrf=xyz456".parse().unwrap());
+        assert_eq!(extract_cookie_token(&headers2, "autumn-csrf"), None);
+    }
+
+    #[test]
     fn extract_cookie_ignores_malformed_cookies() {
         let mut headers = http::HeaderMap::new();
         // Missing '='
