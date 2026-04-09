@@ -4,7 +4,7 @@
 
 **Goal:** Split Autumn-specific integration out of Harvest so the workflow engine can live as a framework-agnostic core crate.
 
-**Architecture:** Keep `autumn-harvest` as the engine core crate and add a thin `autumn-harvest-autumn` adapter crate for `HarvestExt`, the HTTP management API, and app lifecycle wiring. Preserve existing runtime behavior by moving the Autumn glue rather than rewriting the engine.
+**Architecture:** Keep `autumn-harvest` as the engine core crate and add a thin `autumn-web-harvest` adapter crate for `HarvestExt`, the HTTP management API, and app lifecycle wiring. Preserve existing runtime behavior by moving the Autumn glue rather than rewriting the engine.
 
 **Tech Stack:** Rust 2024, Cargo workspaces, Diesel, Tokio, Axum, Autumn `AppBuilder`, autumn-harvest macros.
 
@@ -15,7 +15,7 @@
 **Files:**
 - Modify: `autumn-harvest/Cargo.toml`
 - Modify: `autumn-harvest/autumn-harvest/Cargo.toml`
-- Create: `autumn-harvest/autumn-harvest-autumn/Cargo.toml`
+- Create: `autumn-harvest/autumn-web-harvest/Cargo.toml`
 
 **Step 1: Write the failing test**
 
@@ -28,7 +28,7 @@ Expected: FAIL until the new adapter crate exists and imports are corrected.
 
 **Step 3: Write minimal implementation**
 
-- Add `autumn-harvest-autumn` to the nested Harvest workspace.
+- Add `autumn-web-harvest` to the nested Harvest workspace.
 - Remove `autumn-web` from the core crate.
 - Add the adapter crate depending on `autumn-harvest` and `autumn-web`.
 
@@ -40,10 +40,10 @@ Expected: adapter and core both compile.
 ### Task 2: Move Autumn glue into the adapter crate
 
 **Files:**
-- Create: `autumn-harvest/autumn-harvest-autumn/src/lib.rs`
-- Create: `autumn-harvest/autumn-harvest-autumn/src/prelude.rs`
-- Create: `autumn-harvest/autumn-harvest-autumn/src/api.rs`
-- Create: `autumn-harvest/autumn-harvest-autumn/src/ext.rs`
+- Create: `autumn-harvest/autumn-web-harvest/src/lib.rs`
+- Create: `autumn-harvest/autumn-web-harvest/src/prelude.rs`
+- Create: `autumn-harvest/autumn-web-harvest/src/api.rs`
+- Create: `autumn-harvest/autumn-web-harvest/src/ext.rs`
 - Delete: `autumn-harvest/autumn-harvest/src/api.rs`
 - Delete: `autumn-harvest/autumn-harvest/src/ext.rs`
 - Modify: `autumn-harvest/autumn-harvest/src/lib.rs`
@@ -55,7 +55,7 @@ Use the moved `api_scheduler_integration.rs` plus existing `ext.rs` unit tests a
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p autumn-harvest-autumn --test api_scheduler_integration --no-run`
+Run: `cargo test -p autumn-web-harvest --test api_scheduler_integration --no-run`
 Expected: FAIL until imports and exports are corrected.
 
 **Step 3: Write minimal implementation**
@@ -66,7 +66,7 @@ Expected: FAIL until imports and exports are corrected.
 
 **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p autumn-harvest-autumn --test api_scheduler_integration --no-run`
+Run: `cargo test -p autumn-web-harvest --test api_scheduler_integration --no-run`
 Expected: PASS.
 
 ### Task 3: Remove Autumn helper usage from core
@@ -134,9 +134,9 @@ Run:
 - `cargo clippy -p autumn-harvest --all-features --tests -- -D warnings`
 - `cargo test -p autumn-harvest --no-default-features`
 - `cargo test -p autumn-harvest --all-features --lib`
-- `cargo clippy -p autumn-harvest-autumn --all-targets -- -D warnings`
-- `cargo test -p autumn-harvest-autumn --lib`
-- `cargo test -p autumn-harvest-autumn --test api_scheduler_integration --no-run`
+- `cargo clippy -p autumn-web-harvest --all-targets -- -D warnings`
+- `cargo test -p autumn-web-harvest --lib`
+- `cargo test -p autumn-web-harvest --test api_scheduler_integration --no-run`
 - `cargo test -p reddit-clone`
 - `cargo check --workspace`
 

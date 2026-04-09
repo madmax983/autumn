@@ -1,5 +1,5 @@
 [package]
-name = "autumn-harvest-autumn"
+name = "autumn-web-harvest"
 description = "Autumn web-framework adapter for autumn-harvest"
 version.workspace = true
 edition.workspace = true

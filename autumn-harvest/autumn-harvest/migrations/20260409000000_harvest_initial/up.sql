@@ -1,4 +1,4 @@
--- autumn-harvest/migrations/00000000000000_harvest_initial/up.sql
+-- autumn-harvest/migrations/20260409000000_harvest_initial/up.sql
 -- Workflow execution tracking and event history for autumn-harvest.
 -- All tables prefixed with harvest_ to avoid collisions with application tables.
 
