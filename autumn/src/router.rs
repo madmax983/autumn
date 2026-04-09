@@ -12,6 +12,13 @@ use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use http::StatusCode;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RouterBuildError {
+    #[error("invalid session backend configuration: {0}")]
+    InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+}
 
 /// Build the fully-configured Axum router from routes, config, and state.
 ///
@@ -22,8 +29,24 @@ pub fn build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
+    try_build_router(route_list, config, state)
+        .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
+}
+
+/// Checked variant of [`build_router`] that returns configuration errors
+/// instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
+pub fn try_build_router(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let router = build_router_inner(
+    let router = try_build_router_inner(
         route_list,
         config,
         state,
@@ -32,8 +55,12 @@ pub fn build_router(
         Vec::new(),
         Vec::new(),
         None,
-    );
-    apply_startup_barrier(router, config, &startup_barrier_state)
+    )?;
+    Ok(apply_startup_barrier(
+        router,
+        config,
+        &startup_barrier_state,
+    ))
 }
 
 /// Build a router that includes user-supplied raw Axum routers.
@@ -48,8 +75,26 @@ pub fn build_router_merged(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
 ) -> axum::Router {
+    try_build_router_merged(route_list, config, state, merge_routers, nest_routers)
+        .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
+}
+
+/// Checked variant of [`build_router_merged`] that returns configuration
+/// errors instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
+pub fn try_build_router_merged(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let router = build_router_inner(
+    let router = try_build_router_inner(
         route_list,
         config,
         state,
@@ -58,13 +103,17 @@ pub fn build_router_merged(
         merge_routers,
         nest_routers,
         None,
-    );
-    apply_startup_barrier(router, config, &startup_barrier_state)
+    )?;
+    Ok(apply_startup_barrier(
+        router,
+        config,
+        &startup_barrier_state,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
-pub(crate) fn build_router_inner(
+pub(crate) fn try_build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
@@ -73,7 +122,7 @@ pub(crate) fn build_router_inner(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     error_page_renderer: Option<SharedRenderer>,
-) -> axum::Router {
+) -> Result<axum::Router, RouterBuildError> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
     // MethodRouter. Axum 0.7+ panics if .route() is called twice
@@ -239,8 +288,7 @@ pub(crate) fn build_router_inner(
     // see all error responses regardless of scoping or interceptors.
     let router = router.layer(RequestIdLayer).layer(security_headers);
     let router =
-        crate::session::apply_session_layer(router, &config.session, config.profile.as_deref())
-            .unwrap_or_else(|error| panic!("invalid session backend configuration: {error}"));
+        crate::session::apply_session_layer(router, &config.session, config.profile.as_deref())?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Error page filter: renders HTML error pages for browser requests.
@@ -278,7 +326,7 @@ pub(crate) fn build_router_inner(
             .layer(axum::middleware::from_fn(dev::inject_live_reload));
     }
 
-    router.with_state(state)
+    Ok(router.with_state(state))
 }
 
 /// Build the router with optional static-file-first serving.
@@ -302,7 +350,24 @@ pub fn build_router_with_static(
     state: AppState,
     dist_dir: Option<&std::path::Path>,
 ) -> axum::Router {
-    build_router_with_static_inner(
+    try_build_router_with_static(route_list, config, state, dist_dir)
+        .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
+}
+
+/// Checked variant of [`build_router_with_static`] that returns configuration
+/// errors instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
+pub fn try_build_router_with_static(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
+) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_static_inner(
         route_list,
         config,
         state,
@@ -316,7 +381,7 @@ pub fn build_router_with_static(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_router_with_static_inner(
+pub(crate) fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
@@ -326,9 +391,9 @@ pub(crate) fn build_router_with_static_inner(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     error_page_renderer: Option<SharedRenderer>,
-) -> axum::Router {
+) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let app_router = build_router_inner(
+    let app_router = try_build_router_inner(
         route_list,
         config,
         state,
@@ -337,10 +402,14 @@ pub(crate) fn build_router_with_static_inner(
         merge_routers,
         nest_routers,
         error_page_renderer,
-    );
+    )?;
 
     let Some(dist) = dist_dir else {
-        return apply_startup_barrier(app_router, config, &startup_barrier_state);
+        return Ok(apply_startup_barrier(
+            app_router,
+            config,
+            &startup_barrier_state,
+        ));
     };
 
     let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
@@ -348,7 +417,11 @@ pub(crate) fn build_router_with_static_inner(
             dist = %dist.display(),
             "No valid manifest.json in dist dir; skipping static file layer"
         );
-        return apply_startup_barrier(app_router, config, &startup_barrier_state);
+        return Ok(apply_startup_barrier(
+            app_router,
+            config,
+            &startup_barrier_state,
+        ));
     };
 
     // Enable ISR regeneration by attaching the app router to the static layer.
@@ -423,7 +496,11 @@ pub(crate) fn build_router_with_static_inner(
         },
     ));
 
-    apply_startup_barrier(router, config, &startup_barrier_state)
+    Ok(apply_startup_barrier(
+        router,
+        config,
+        &startup_barrier_state,
+    ))
 }
 
 #[derive(Clone)]
@@ -619,5 +696,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn try_build_router_rejects_invalid_session_backend_config() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+
+        let error = try_build_router(Vec::new(), &config, test_state())
+            .expect_err("missing redis config should fail checked router build");
+
+        assert!(matches!(
+            error,
+            RouterBuildError::InvalidSessionBackend(
+                crate::session::SessionBackendConfigError::MissingRedisUrl
+            )
+        ));
+    }
+
+    #[test]
+    fn try_build_router_with_static_rejects_invalid_session_backend_config() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+
+        let error = try_build_router_with_static(Vec::new(), &config, test_state(), None)
+            .expect_err("missing redis config should fail checked static router build");
+
+        assert!(matches!(
+            error,
+            RouterBuildError::InvalidSessionBackend(
+                crate::session::SessionBackendConfigError::MissingRedisUrl
+            )
+        ));
     }
 }

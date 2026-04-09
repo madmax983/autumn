@@ -642,7 +642,7 @@ impl AppBuilder {
         } else {
             None
         };
-        let router = crate::router::build_router_with_static_inner(
+        let router = crate::router::try_build_router_with_static_inner(
             all_routes,
             &config,
             state.clone(),
@@ -652,7 +652,11 @@ impl AppBuilder {
             merge_routers,
             nest_routers,
             error_page_renderer,
-        );
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to build router");
+            std::process::exit(1);
+        });
 
         // 7. Bind and serve. We start listening before startup hooks finish so
         // `/startup` can honestly report startup progress.
@@ -805,7 +809,11 @@ impl AppBuilder {
         };
 
         // Build the full router (same as production)
-        let router = crate::router::build_router(all_routes, &config, state);
+        let router =
+            crate::router::try_build_router(all_routes, &config, state).unwrap_or_else(|error| {
+                eprintln!("Failed to build router: {error}");
+                std::process::exit(1);
+            });
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
