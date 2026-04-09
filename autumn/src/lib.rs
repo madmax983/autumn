@@ -621,6 +621,8 @@ pub mod state;
 )]
 pub mod test;
 pub use state::AppState;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_utils;
 
 #[cfg(test)]
 mod tests {

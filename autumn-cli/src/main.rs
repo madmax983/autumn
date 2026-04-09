@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub mod test_utils;
+
 use clap::{Parser, Subcommand};
 
 mod build;
