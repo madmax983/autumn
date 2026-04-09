@@ -14,9 +14,9 @@ use autumn_harvest::scheduler::{
 use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
-use autumn_web_harvest::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use autumn_web::AppState;
 use autumn_web::reexports::axum;
+use autumn_web_harvest::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use diesel::ExpressionMethods;
@@ -34,7 +34,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 const INIT_SQL: &str =
-    include_str!("../../autumn-harvest/migrations/00000000000000_harvest_initial/up.sql");
+    include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql");
 type HarvestApiApp = axum::Router;
 
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {

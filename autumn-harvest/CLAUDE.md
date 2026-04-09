@@ -31,7 +31,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
     migrations/
-      00000000000000_harvest_initial/
+      20260409000000_harvest_initial/
     tests/
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests

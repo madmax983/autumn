@@ -17,7 +17,7 @@
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
 //
-// Run with:   cargo run -p reddit-clone
+// Run with:   cargo run -p reddit-clone   (first dev boot applies reddit + Harvest migrations)
 // Front page: http://localhost:3000
 // WebSocket:  ws://localhost:3000/ws/feed
 // API test:   curl http://localhost:3000/api/posts
@@ -33,9 +33,9 @@ mod tasks;
 mod workflows;
 
 use autumn_harvest::prelude::WorkerConfig;
-use autumn_web_harvest::prelude::HarvestExt;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+use autumn_web_harvest::prelude::HarvestExt;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -99,6 +99,10 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+
     use autumn_web::config::{AutumnConfig, MockEnv};
 
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
@@ -122,6 +126,25 @@ mod tests {
     }
 
     #[test]
+    fn app_and_harvest_migration_versions_do_not_collide() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let app_migrations = collect_migration_versions(&manifest_dir.join("migrations"));
+        let harvest_migrations = collect_migration_versions(
+            &manifest_dir.join("../../autumn-harvest/autumn-harvest/migrations"),
+        );
+
+        let collisions: Vec<_> = app_migrations
+            .intersection(&harvest_migrations)
+            .cloned()
+            .collect();
+
+        assert!(
+            collisions.is_empty(),
+            "reddit-clone and Harvest migrations must not share Diesel version prefixes: {collisions:?}",
+        );
+    }
+
+    #[test]
     fn dev_profile_enables_csrf_for_forms() {
         let env = MockEnv::new()
             .with("AUTUMN_PROFILE", "dev")
@@ -134,5 +157,30 @@ mod tests {
             config.security.csrf.enabled,
             "reddit-clone extracts `CsrfToken`, so its dev profile must enable CSRF",
         );
+    }
+
+    fn collect_migration_versions(dir: &Path) -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap_or_else(|error| {
+                panic!("failed to read migrations at {}: {error}", dir.display())
+            })
+            .map(|entry| entry.expect("migration directory entry should be readable"))
+            .filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| entry)
+            })
+            .map(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .split('_')
+                    .next()
+                    .expect("migration directory should have a version prefix")
+                    .to_owned()
+            })
+            .collect()
     }
 }
