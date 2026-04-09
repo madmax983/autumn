@@ -188,13 +188,15 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Constant-time length check — no early exit.
     let len_eq = a.len().ct_eq(&b.len());
 
-    // Always iterate b.len() times so the work done is independent of
-    // the submitted token's length.  Out-of-range positions in `a` use the
-    // sentinel 0xFF, which can never match a valid ASCII/UTF-8 token byte
-    // at that position, ensuring correctness without a variable-length loop.
+    // Iterate over `a` (the trusted stored token) so the loop count is fixed
+    // at the server-side token length, regardless of what the caller submits
+    // as `b`.  Callers pass the attacker-controlled value as `b`, so iterating
+    // over `a` ensures every submission — short or long — executes the same
+    // amount of work.  Out-of-range positions in `b` use the sentinel 0xFF,
+    // which can never match a valid ASCII/UTF-8 token byte.
     let mut bytes_eq = Choice::from(1u8);
-    for (i, &b_byte) in b.iter().enumerate() {
-        let a_byte = *a.get(i).unwrap_or(&0xFF);
+    for (i, &a_byte) in a.iter().enumerate() {
+        let b_byte = *b.get(i).unwrap_or(&0xFF);
         bytes_eq &= a_byte.ct_eq(&b_byte);
     }
 
