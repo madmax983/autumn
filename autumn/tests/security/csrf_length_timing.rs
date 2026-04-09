@@ -6,8 +6,8 @@ use axum::{
     http::{Request, StatusCode},
     routing::post,
 };
-use tower::ServiceExt;
 use std::time::Instant;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn test_csrf_constant_time_length() {
@@ -54,11 +54,10 @@ async fn test_csrf_constant_time_length() {
     // Instead of asserting flaky strict timing, we just make sure the
     // endpoint functions as expected and the time difference isn't ridiculous.
     // The main verification is that `constant_time_eq` doesn't have an early return.
-    let diff = if duration1 > duration2 {
-        duration1 - duration2
-    } else {
-        duration2 - duration1
-    };
+    let diff = duration1.abs_diff(duration2);
 
-    assert!(diff.as_millis() < 50, "Timing difference is suspiciously high, but expected to be minimal");
+    assert!(
+        diff.as_millis() < 50,
+        "Timing difference is suspiciously high, but expected to be minimal"
+    );
 }
