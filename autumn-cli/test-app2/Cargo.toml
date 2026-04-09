@@ -1,0 +1,8 @@
+[package]
+name = "test-app2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autumn-web = "0.1.0"
+[workspace]

@@ -46,6 +46,8 @@ pub use crate::extract::Form;
 pub use crate::extract::Json;
 /// Path extractor.
 pub use crate::extract::Path;
+/// Query string extractor.
+pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
