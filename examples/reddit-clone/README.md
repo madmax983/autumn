@@ -36,11 +36,21 @@ showcasing the framework's major features in a single cohesive application.
 # Start PostgreSQL
 docker compose up -d
 
-# Run the app
+# Run the app in dev mode
+# The first boot applies both the reddit-clone schema and the embedded
+# autumn-harvest workflow tables.
 cargo run -p reddit-clone
+
+# Optional: watch mode from the workspace root
+# cargo run -p autumn-cli -- dev -p reddit-clone
 
 # Visit http://localhost:3000
 ```
+
+If Harvest logs errors like `relation "harvest_task_queue" does not exist`, you
+are pointing the app at a database that never received the embedded Harvest
+migrations. Start the example once in dev mode against that database before
+using a release/profile-specific run.
 
 ## WebSocket Live Feed
 

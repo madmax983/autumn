@@ -1,7 +1,7 @@
 //! Convenient glob import for Autumn + Harvest integration.
 //!
 //! ```rust,no_run
-//! use autumn_harvest_autumn::prelude::*;
+//! use autumn_web_harvest::prelude::*;
 //! ```
 
 pub use crate::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};

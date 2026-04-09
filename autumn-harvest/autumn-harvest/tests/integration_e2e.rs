@@ -38,7 +38,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use uuid::Uuid;
 
 /// The migration SQL embedded at compile time.
-const INIT_SQL: &str = include_str!("../migrations/00000000000000_harvest_initial/up.sql");
+const INIT_SQL: &str = include_str!("../migrations/20260409000000_harvest_initial/up.sql");
 
 /// Start a Postgres container with the harvest schema applied and return
 /// an `AsyncPgConnection` ready for use.

@@ -31,7 +31,7 @@ autumn-harvest/          <- workspace root (this file lives here)
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
     migrations/
-      00000000000000_harvest_initial/
+      20260409000000_harvest_initial/
     tests/
       integration_e2e.rs <- testcontainers integration tests
       replay_tests.rs    <- replay engine integration tests
@@ -59,7 +59,7 @@ Two crates in the workspace. `autumn-harvest` is the public library. `autumn-har
 
 ### Crate Relationship
 
-`autumn-harvest` is the core engine crate. It re-exports everything from `autumn-harvest-macros` through `prelude.rs`. Autumn-specific integration lives in the separate `autumn-harvest-autumn` adapter crate, which provides `HarvestExt`, the management API router, and app lifecycle wiring.
+`autumn-harvest` is the core engine crate. It re-exports everything from `autumn-harvest-macros` through `prelude.rs`. Autumn-specific integration lives in the separate `autumn-web-harvest` adapter crate, which provides `HarvestExt`, the management API router, and app lifecycle wiring.
 
 Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes its own local `task_duration()` parser at `::autumn_harvest::task_duration` for exactly this reason.
 
@@ -179,7 +179,7 @@ let app = autumn_web::app()
     .harvest_api("/api/harvest");
 ```
 
-The `workflows`, `activities`, `worker`, and `harvest_api` methods above are provided by `autumn-harvest-autumn::HarvestExt`, not the core crate.
+The `workflows`, `activities`, `worker`, and `harvest_api` methods above are provided by `autumn-web-harvest::HarvestExt`, not the core crate.
 
 Supported `#[activity]` attribute keys:
 - `start_to_close = "30s"` — duration string parsed by `task_duration()`
