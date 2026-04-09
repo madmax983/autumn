@@ -9,6 +9,13 @@ pub struct EnvGuard {
 
 #[cfg(test)]
 impl EnvGuard {
+    /// Safely sets multiple environment variables for testing.
+    ///
+    /// The global nature of environment variables makes testing concurrent
+    /// processes notoriously flaky. This method tames that chaos. It establishes a
+    /// centralized lock per crate to ensure that environment variable mutations
+    /// don't race against each other, returning an `EnvGuard` that gracefully
+    /// cleans up the environment when dropped.
     pub fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let lock = ENV_LOCK

@@ -166,6 +166,13 @@ where
 }
 
 pin_project_lite::pin_project! {
+    /// Future for the error page filter middleware.
+    ///
+    /// When an application panics or bubbles an error, we don't want to expose
+    /// a raw stack trace to the user, nor do we want to drop the connection.
+    /// This future wraps the underlying handler's execution. If an error occurs,
+    /// it replaces the payload with a beautifully crafted HTML or JSON error page
+    /// based on what the client asked for via the `Accept` header.
     pub struct ErrorPageContextFuture<F> {
         #[pin]
         inner: F,

@@ -11,6 +11,15 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+/// Checks if the development live-reload environment is active.
+///
+/// In the developer experience, it's crucial to tighten the feedback loop. This
+/// function answers the core question: "Are we running in a watched development
+/// session?" It exists to safely guard dev-only handlers (like the live-reload script
+/// injector) from ever waking up in production.
+///
+/// Returns `true` if both the `AUTUMN_DEV_RELOAD` and
+/// `AUTUMN_DEV_RELOAD_STATE` environment variables are present.
 pub fn is_enabled() -> bool {
     std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
 }
