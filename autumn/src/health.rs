@@ -290,4 +290,37 @@ mod tests {
 
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
     }
+
+    #[tokio::test]
+    async fn health_detailed_false_omits_details() {
+        let mut state = test_state();
+        state.health_detailed = false;
+
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(handler))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("version").is_none());
+        assert!(json.get("profile").is_none());
+        assert!(json.get("uptime").is_none());
+        assert!(json.get("pool").is_none());
+    }
 }
