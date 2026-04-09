@@ -140,13 +140,10 @@ struct TaskStatus {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    #[allow(dead_code)]
     last_run: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_duration_ms: Option<u64>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_result: Option<String>,
     #[serde(default)]
     last_error: Option<String>,
@@ -878,6 +875,33 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
             } else {
                 Span::raw("")
             },
+            task.last_run.as_ref().map_or_else(
+                || Span::raw(""),
+                |run| {
+                    Span::styled(
+                        format!("  last run: {}", truncate(run, 20)),
+                        Style::default().fg(ratatui::style::Color::DarkGray),
+                    )
+                },
+            ),
+            task.last_duration_ms.map_or_else(
+                || Span::raw(""),
+                |dur| {
+                    Span::styled(
+                        format!("  {dur}ms"),
+                        Style::default().fg(ratatui::style::Color::DarkGray),
+                    )
+                },
+            ),
+            task.last_result.as_ref().map_or_else(
+                || Span::raw(""),
+                |res| {
+                    Span::styled(
+                        format!("  res: {}", truncate(res, 20)),
+                        Style::default().fg(ratatui::style::Color::DarkGray),
+                    )
+                },
+            ),
         ]));
 
         if let Some(err) = &task.last_error {
