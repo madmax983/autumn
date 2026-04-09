@@ -37,7 +37,10 @@ const INIT_SQL: &str =
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql");
 type HarvestApiApp = axum::Router;
 
-async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
+async fn setup_test_database_url() -> (String, Option<ContainerAsync<Postgres>>) {
+    if let Ok(url) = std::env::var("POSTGRES_URL") {
+        return (url, None);
+    }
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
         .start()
@@ -54,7 +57,7 @@ async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
         .expect("failed to get container port");
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    (database_url, container)
+    (database_url, Some(container))
 }
 
 fn build_test_pool(database_url: &str) -> DbPool {
