@@ -173,13 +173,13 @@ pub struct CsrfService<S> {
     settings: Arc<CsrfSettings>,
 }
 
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConstantTimeEq};
 
 /// Constant-time string comparison to prevent timing attacks when verifying CSRF tokens.
 ///
-/// Length mismatch is folded into the constant-time accumulator rather than
-/// returning early, so an attacker cannot distinguish a wrong-length token from
-/// a same-length wrong-character token by observing response latency.
+/// The comparison always processes exactly `b.len()` bytes so that execution
+/// time is independent of the length of the submitted token `a`.  Neither a
+/// length mismatch nor a short input causes an early exit.
 #[inline(never)]
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
@@ -188,11 +188,15 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     // Constant-time length check — no early exit.
     let len_eq = a.len().ct_eq(&b.len());
 
-    // Compare up to the minimum length so we never go out-of-bounds.
-    // Both this comparison and `len_eq` are always evaluated; they are
-    // combined with `&` (not `&&`) so neither short-circuits.
-    let min_len = a.len().min(b.len());
-    let bytes_eq = a[..min_len].ct_eq(&b[..min_len]);
+    // Always iterate b.len() times so the work done is independent of
+    // the submitted token's length.  Out-of-range positions in `a` use the
+    // sentinel 0xFF, which can never match a valid ASCII/UTF-8 token byte
+    // at that position, ensuring correctness without a variable-length loop.
+    let mut bytes_eq = Choice::from(1u8);
+    for (i, &b_byte) in b.iter().enumerate() {
+        let a_byte = *a.get(i).unwrap_or(&0xFF);
+        bytes_eq &= a_byte.ct_eq(&b_byte);
+    }
 
     (len_eq & bytes_eq).into()
 }
