@@ -545,7 +545,17 @@ impl AutumnConfig {
 
     /// Apply environment overrides using the provided env abstraction.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // ── Server ──────────────────────────────────────────────
+        self.apply_server_env_overrides_with_env(env);
+        self.apply_database_env_overrides_with_env(env);
+        self.apply_log_env_overrides_with_env(env);
+        self.apply_health_env_overrides_with_env(env);
+        self.apply_cors_env_overrides_with_env(env);
+        self.apply_session_env_overrides_with_env(env);
+        self.apply_auth_env_overrides_with_env(env);
+        self.apply_security_env_overrides_with_env(env);
+    }
+
+    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
@@ -553,8 +563,9 @@ impl AutumnConfig {
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
         );
+    }
 
-        // ── Database ────────────────────────────────────────────
+    fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
@@ -568,8 +579,9 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
         );
+    }
 
-        // ── Log ─────────────────────────────────────────────────
+    fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
         if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
@@ -582,12 +594,14 @@ impl AutumnConfig {
                 ),
             }
         }
+    }
 
-        // ── Health ──────────────────────────────────────────────
+    fn apply_health_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_HEALTH__PATH", &mut self.health.path);
         parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+    }
 
-        // ── CORS ────────────────────────────────────────────────
+    fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_csv(
             env,
             "AUTUMN_CORS__ALLOWED_ORIGINS",
@@ -613,8 +627,9 @@ impl AutumnConfig {
             "AUTUMN_CORS__MAX_AGE_SECS",
             &mut self.cors.max_age_secs,
         );
+    }
 
-        // ── Session ────────────────────────────────────────────
+    fn apply_session_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(
             env,
             "AUTUMN_SESSION__COOKIE_NAME",
@@ -631,13 +646,11 @@ impl AutumnConfig {
             "AUTUMN_SESSION__SAME_SITE",
             &mut self.session.same_site,
         );
+    }
 
-        // ── Auth ───────────────────────────────────────────────
+    fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
-
-        // ── Security ────────────────────────────────────────
-        self.apply_security_env_overrides_with_env(env);
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
