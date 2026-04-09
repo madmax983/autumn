@@ -183,7 +183,13 @@ fn generate_derived_query(
                 .map_err(::autumn_web::AutumnError::from)
             }
         }
-        _ => quote! { todo!() },
+        _ => {
+            let msg = format!(
+                "Unsupported query prefix: {}. Supported prefixes are find, count, delete, exists.",
+                query.prefix
+            );
+            quote! { ::core::compile_error!(#msg); }
+        }
     }
 }
 
