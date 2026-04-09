@@ -57,6 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+subtle = "2.6.1"
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }

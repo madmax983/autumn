@@ -173,19 +173,16 @@ pub struct CsrfService<S> {
     settings: Arc<CsrfSettings>,
 }
 
+use subtle::ConstantTimeEq;
+
 /// Constant-time string comparison to prevent timing attacks when verifying CSRF tokens.
 #[inline(never)]
 fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut result = 0;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        // Prevent compiler from optimizing out the bitwise operations
-        result |= x ^ y;
-    }
-    // ensure result is evaluated using std::hint::black_box to defeat compiler optimizations
-    std::hint::black_box(result) == 0
+
+    a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
 /// Extract the CSRF cookie value from the Cookie header.
