@@ -1157,6 +1157,49 @@ mod tests {
     }
 
     #[test]
+    fn database_validate_none_url_is_ok() {
+        let config = DatabaseConfig {
+            url: None,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_postgres_url_is_ok() {
+        let config = DatabaseConfig {
+            url: Some("postgres://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_postgresql_url_is_ok() {
+        let config = DatabaseConfig {
+            url: Some("postgresql://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_invalid_url_is_err() {
+        let config = DatabaseConfig {
+            url: Some("mysql://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        if let Err(ConfigError::Validation(msg)) = result {
+            assert!(msg.contains("Invalid database URL"));
+            assert!(msg.contains("must start with postgres:// or postgresql://"));
+        } else {
+            panic!("Expected ConfigError::Validation");
+        }
+    }
+
+    #[test]
     fn log_defaults() {
         let config = LogConfig::default();
         assert_eq!(config.level, "info");
