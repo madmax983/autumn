@@ -33,7 +33,6 @@ mod tasks;
 mod workflows;
 
 use autumn_harvest::prelude::WorkerConfig;
-use autumn_web_harvest::prelude::HarvestExt;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 use autumn_web_harvest::prelude::HarvestExt;
