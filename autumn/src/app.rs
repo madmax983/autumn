@@ -559,8 +559,16 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 2. Initialize logging immediately after config (before any tracing calls)
-        crate::logging::init(&config.log);
+        // 2. Initialize logging/telemetry immediately after config.
+        let _telemetry_guard = crate::logging::init_with_telemetry(
+            &config.log,
+            &config.telemetry,
+            config.profile.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
 
         // 3. Validate routes
         assert!(
@@ -617,6 +625,7 @@ impl AppBuilder {
             profile: config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
+            probes: crate::probe::ProbeState::pending_startup(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -645,62 +654,80 @@ impl AppBuilder {
             error_page_renderer,
         );
 
-        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
-            tracing::error!(error = %error, "startup hook failed");
-            std::process::exit(1);
-        }
-
-        // 7. Start scheduled tasks (if any)
-        if !tasks.is_empty() {
-            start_task_scheduler(tasks, &state);
-        }
-
-        // 8. Bind and serve with graceful shutdown
+        // 7. Bind and serve. We start listening before startup hooks finish so
+        // `/startup` can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
-        tracing::info!(addr = %addr, "Listening");
-
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
+        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown_wait = server_shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    server_shutdown_wait.cancelled().await;
+                })
+                .await
+        });
 
-        // Capture the shutdown token so WebSocket handlers are notified.
+        let shutdown_state = state.clone();
+        let shutdown_signal_token = server_shutdown.clone();
         #[cfg(feature = "ws")]
-        let shutdown_token = state.shutdown.clone();
+        let websocket_shutdown = state.shutdown.clone();
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown_signal().await;
+        let shutdown_task = tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_state.begin_shutdown();
 
-                // Signal WebSocket handlers to close connections.
-                #[cfg(feature = "ws")]
-                shutdown_token.cancel();
+            #[cfg(feature = "ws")]
+            websocket_shutdown.cancel();
 
-                // Warn if draining takes too long
-                if shutdown_timeout > 5 {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            shutdown_timeout.saturating_sub(5),
-                        ))
-                        .await;
-                        tracing::warn!(
-                            timeout_secs = shutdown_timeout,
-                            "Shutdown draining near timeout, force-kill may be imminent"
-                        );
-                    });
-                }
+            if shutdown_timeout > 5 {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        shutdown_timeout.saturating_sub(5),
+                    ))
+                    .await;
+                    tracing::warn!(
+                        timeout_secs = shutdown_timeout,
+                        "Shutdown draining near timeout, force-kill may be imminent"
+                    );
+                });
+            }
 
-                run_shutdown_hooks(&shutdown_hooks).await;
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Server error: {e}");
-                std::process::exit(1);
-            });
+            run_shutdown_hooks(&shutdown_hooks).await;
+            shutdown_signal_token.cancel();
+        });
+
+        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+            tracing::error!(error = %error, "startup hook failed");
+            server_shutdown.cancel();
+            server_task.abort();
+            std::process::exit(1);
+        }
+
+        if !state.probes().is_shutting_down() {
+            if !tasks.is_empty() {
+                start_task_scheduler(tasks, &state);
+            }
+            state.probes().mark_startup_complete();
+        }
+
+        let server_result = server_task.await.unwrap_or_else(|e| {
+            tracing::error!("Server task join error: {e}");
+            std::process::exit(1);
+        });
+        shutdown_task.abort();
+        server_result.unwrap_or_else(|e| {
+            tracing::error!("Server error: {e}");
+            std::process::exit(1);
+        });
 
         tracing::info!("Server shut down cleanly");
     }
@@ -734,7 +761,15 @@ impl AppBuilder {
             eprintln!("Failed to load configuration: {e}");
             std::process::exit(1);
         });
-        crate::logging::init(&config.log);
+        let _telemetry_guard = crate::logging::init_with_telemetry(
+            &config.log,
+            &config.telemetry,
+            config.profile.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -758,6 +793,7 @@ impl AppBuilder {
             profile: config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: config.health.detailed,
+            probes: crate::probe::ProbeState::default(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -958,8 +994,23 @@ fn format_route_lines(
             );
         }
     }
-    let _ = write!(out, "\n    {} {:<8} -> health", config.health.path, "GET");
-    out.push_str("\n    /actuator/* GET      -> actuator");
+    let mut probe_paths = std::collections::HashSet::new();
+    for (path, name) in [
+        (config.health.live_path.as_str(), "live"),
+        (config.health.ready_path.as_str(), "ready"),
+        (config.health.startup_path.as_str(), "startup"),
+        (config.health.path.as_str(), "health"),
+    ] {
+        if probe_paths.insert(path) {
+            let _ = write!(out, "\n    {} {:<8} -> {}", path, "GET", name);
+        }
+    }
+    let _ = write!(
+        out,
+        "\n    {} {:<8} -> actuator",
+        crate::actuator::actuator_route_glob(&config.actuator.prefix),
+        "GET"
+    );
     #[cfg(feature = "htmx")]
     out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
     out
@@ -1023,6 +1074,16 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         || "not configured".to_owned(),
         |url| mask_database_url(url, config.database.pool_size),
     );
+    let telemetry_status = if config.telemetry.enabled {
+        let endpoint = config
+            .telemetry
+            .otlp_endpoint
+            .as_deref()
+            .unwrap_or("<missing endpoint>");
+        format!("{:?} -> {endpoint}", config.telemetry.protocol)
+    } else {
+        "disabled".to_owned()
+    };
     format!(
         "\
         \n    profile:    {profile}\
@@ -1030,6 +1091,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         \n    database:   {db_status}\
         \n    log_level:  {}\
         \n    log_format: {:?}\
+        \n    telemetry:  {telemetry_status}\
         \n    health:     {} (detailed={})\
         \n    actuator:   sensitive={}\
         \n    shutdown:   {}s",
@@ -1100,6 +1162,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1260,6 +1323,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1342,6 +1406,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1390,6 +1455,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1550,6 +1616,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1719,6 +1786,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1854,6 +1922,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1887,6 +1956,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1927,11 +1997,12 @@ mod tests {
     }
 
     #[test]
-    fn format_route_lines_includes_framework_routes() {
-        let config = AutumnConfig::default();
+    fn config_runtime_drift_format_route_lines_uses_actuator_prefix() {
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/ops".to_owned();
         let output = format_route_lines(&[], &[], &config);
         assert!(output.contains("-> health"));
-        assert!(output.contains("/actuator/*"));
+        assert!(output.contains("/ops/*"));
     }
 
     #[test]
@@ -2023,6 +2094,7 @@ mod tests {
         assert!(output.contains("server:     127.0.0.1:3000"));
         assert!(output.contains("database:   not configured"));
         assert!(output.contains("log_level:"));
+        assert!(output.contains("telemetry:  disabled"));
         assert!(output.contains("health:     /health"));
     }
 
@@ -2050,6 +2122,21 @@ mod tests {
         };
         let output = format_config_summary(&config);
         assert!(output.contains("profile:    prod"));
+    }
+
+    #[test]
+    fn format_config_summary_with_telemetry() {
+        let config = AutumnConfig {
+            telemetry: crate::config::TelemetryConfig {
+                enabled: true,
+                service_name: "orders-api".into(),
+                otlp_endpoint: Some("http://otel-collector:4317".into()),
+                ..crate::config::TelemetryConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let output = format_config_summary(&config);
+        assert!(output.contains("telemetry:  Grpc -> http://otel-collector:4317"));
     }
 
     #[test]
@@ -2083,6 +2170,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -2135,6 +2223,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),

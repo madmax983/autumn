@@ -12,9 +12,29 @@ level = "info"
 
 [health]
 path = "/health"
+# live_path = "/live"
+# ready_path = "/ready"
+# startup_path = "/startup"
+
+# Uncomment for OpenTelemetry / OTLP tracing:
+# [telemetry]
+# enabled = true
+# service_name = "{{project_name}}"
+# service_namespace = "apps"
+# environment = "production"
+# otlp_endpoint = "http://otel-collector:4317"
+# protocol = "Grpc"  # Grpc | HttpProtobuf
 
 # Uncomment to configure database:
 # [database]
 # url = "postgres://user:pass@localhost:5432/{{crate_name}}"
 # pool_size = 10
-# connect_timeout_secs = 5
+# connect_timeout_secs = 5  # pool wait/create timeout in seconds
+
+# Uncomment to externalize sessions in production:
+# [session]
+# backend = "redis"
+#
+# [session.redis]
+# url = "redis://redis:6379"
+# key_prefix = "{{crate_name}}:sessions"

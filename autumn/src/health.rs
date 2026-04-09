@@ -1,8 +1,10 @@
-//! Health check endpoint.
+//! Compatibility health endpoint.
 //!
-//! Automatically mounted by [`AppBuilder::run`](crate::app::AppBuilder::run)
-//! at the path configured in [`HealthConfig`](crate::config::HealthConfig)
-//! (default: `/health`).
+//! Automatically mounted by [`AppBuilder::run`](crate::app::AppBuilder::run) at
+//! the path configured in [`HealthConfig`](crate::config::HealthConfig)
+//! (default: `/health`). This endpoint is a compatibility alias for the
+//! readiness probe during the `v0.x` transition to explicit `/live`,
+//! `/ready`, and `/startup` probe contracts.
 //!
 //! # Response format
 //!
@@ -22,43 +24,15 @@
 //! }
 //! ```
 //!
-//! Returns `200 OK` when healthy or `503 Service Unavailable` when the
-//! database pool is exhausted (all connections in use **and** requests
-//! are queuing).
-
-use axum::Json;
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use serde::Serialize;
+//! Returns the same response as the readiness probe.
 
 use crate::state::AppState;
-
-/// Typed health response — avoids dynamic `serde_json::Value` allocation.
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    profile: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    uptime: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pool: Option<PoolStatus>,
-}
-
-#[derive(Serialize)]
-struct PoolStatus {
-    size: u64,
-    available: u64,
-    waiting: u64,
-}
+use axum::extract::State;
+use axum::response::IntoResponse;
 
 /// Health check handler.
 ///
-/// Returns pool status when a database is configured, or a simple
-/// `"ok"` response when running without a database.
+/// Returns the readiness response at the compatibility `/health` path.
 ///
 /// This handler is auto-mounted by the framework and does not need to be
 /// registered manually.
@@ -68,77 +42,15 @@ struct PoolStatus {
 /// - `200 OK` -- application is healthy.
 /// - `503 Service Unavailable` -- database pool is exhausted (all
 ///   connections in use and requests are queuing).
-#[allow(
-    unused_variables,
-    clippy::if_not_else,
-    clippy::needless_pass_by_value,
-    clippy::useless_let_if_seq
-)]
 pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
-    let healthy;
-    let pool_status;
-
-    #[cfg(feature = "db")]
-    {
-        if let Some(pool) = state.pool.as_ref() {
-            let status = pool.status();
-            let available = status.available as u64;
-            let size = status.max_size as u64;
-            let waiting = status.waiting as u64;
-
-            healthy = available > 0 || waiting == 0;
-            pool_status = Some(PoolStatus {
-                size,
-                available,
-                waiting,
-            });
-        } else {
-            healthy = true;
-            pool_status = None;
-        }
-    }
-
-    #[cfg(not(feature = "db"))]
-    {
-        healthy = true;
-        pool_status = None;
-    }
-
-    let detailed = state.health_detailed;
-    let body = HealthResponse {
-        status: if healthy { "ok" } else { "degraded" },
-        version: if detailed {
-            Some(env!("CARGO_PKG_VERSION"))
-        } else {
-            None
-        },
-        profile: if detailed {
-            Some(state.profile().to_owned())
-        } else {
-            None
-        },
-        uptime: if detailed {
-            Some(state.uptime_display())
-        } else {
-            None
-        },
-        pool: if detailed { pool_status } else { None },
-    };
-
-    let status_code = if healthy {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-
-    (status_code, Json(body))
+    crate::probe::readiness_response(&state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -148,6 +60,7 @@ mod tests {
             profile: Some("dev".into()),
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -234,6 +147,7 @@ mod tests {
                 profile: Some("prod".into()),
                 started_at: std::time::Instant::now(),
                 health_detailed: true,
+                probes: crate::probe::ProbeState::ready_for_test(),
                 metrics: crate::middleware::MetricsCollector::new(),
                 log_levels: crate::actuator::LogLevels::new("info"),
                 task_registry: crate::actuator::TaskRegistry::new(),

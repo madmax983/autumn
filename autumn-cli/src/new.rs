@@ -9,6 +9,8 @@ mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
+    pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
+    pub const DOCKERIGNORE: &str = include_str!("templates/.dockerignore.tmpl");
     pub const BUILD_RS: &str = include_str!("templates/build.rs.tmpl");
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
@@ -75,6 +77,14 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
         project_dir.join("autumn.toml"),
         render(templates::AUTUMN_TOML),
     )?;
+    fs::write(
+        project_dir.join("Dockerfile"),
+        render(templates::DOCKERFILE),
+    )?;
+    fs::write(
+        project_dir.join(".dockerignore"),
+        render(templates::DOCKERIGNORE),
+    )?;
     fs::write(project_dir.join("build.rs"), render(templates::BUILD_RS))?;
     fs::write(
         project_dir.join("static/css/input.css"),
@@ -90,6 +100,8 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
+    println!("  Created {name}/Dockerfile");
+    println!("  Created {name}/.dockerignore");
     println!("  Created {name}/build.rs");
     println!("  Created {name}/src/main.rs");
     println!("  Created {name}/static/css/input.css");
@@ -223,6 +235,8 @@ mod tests {
         assert!(p.join("Cargo.toml").is_file());
         assert!(p.join("src/main.rs").is_file());
         assert!(p.join("autumn.toml").is_file());
+        assert!(p.join("Dockerfile").is_file());
+        assert!(p.join(".dockerignore").is_file());
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
         assert!(p.join("static/css/input.css").is_file());

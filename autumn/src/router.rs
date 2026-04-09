@@ -8,6 +8,10 @@ use crate::middleware::dev;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 use crate::state::AppState;
+use axum::extract::State;
+use axum::middleware::Next;
+use axum::response::IntoResponse;
+use http::StatusCode;
 
 /// Build the fully-configured Axum router from routes, config, and state.
 ///
@@ -18,7 +22,8 @@ pub fn build_router(
     config: &AutumnConfig,
     state: AppState,
 ) -> axum::Router {
-    build_router_inner(
+    let startup_barrier_state = state.clone();
+    let router = build_router_inner(
         route_list,
         config,
         state,
@@ -27,7 +32,8 @@ pub fn build_router(
         Vec::new(),
         Vec::new(),
         None,
-    )
+    );
+    apply_startup_barrier(router, config, &startup_barrier_state)
 }
 
 /// Build a router that includes user-supplied raw Axum routers.
@@ -42,7 +48,8 @@ pub fn build_router_merged(
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
 ) -> axum::Router {
-    build_router_inner(
+    let startup_barrier_state = state.clone();
+    let router = build_router_inner(
         route_list,
         config,
         state,
@@ -51,7 +58,8 @@ pub fn build_router_merged(
         merge_routers,
         nest_routers,
         None,
-    )
+    );
+    apply_startup_barrier(router, config, &startup_barrier_state)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -119,19 +127,51 @@ pub(crate) fn build_router_inner(
         );
     }
 
-    // Health check endpoint (auto-mounted)
-    router = router.route(
-        &config.health.path,
-        axum::routing::get(crate::health::handler),
+    // Probe endpoints (auto-mounted)
+    let mut mounted_probe_paths = std::collections::HashSet::new();
+
+    if mounted_probe_paths.insert(config.health.live_path.as_str()) {
+        router = router.route(
+            &config.health.live_path,
+            axum::routing::get(crate::probe::live_handler),
+        );
+    }
+    if mounted_probe_paths.insert(config.health.ready_path.as_str()) {
+        router = router.route(
+            &config.health.ready_path,
+            axum::routing::get(crate::probe::ready_handler),
+        );
+    }
+    if mounted_probe_paths.insert(config.health.startup_path.as_str()) {
+        router = router.route(
+            &config.health.startup_path,
+            axum::routing::get(crate::probe::startup_handler),
+        );
+    }
+    if mounted_probe_paths.insert(config.health.path.as_str()) {
+        router = router.route(
+            &config.health.path,
+            axum::routing::get(crate::health::handler),
+        );
+    }
+    tracing::debug!(
+        health = %config.health.path,
+        live = %config.health.live_path,
+        ready = %config.health.ready_path,
+        startup = %config.health.startup_path,
+        "Mounted probe endpoints"
     );
-    tracing::debug!(path = %config.health.path, "Mounted health check");
 
     // Actuator endpoints
     let actuator_sensitive = config.actuator.sensitive;
-    router = router.merge(crate::actuator::actuator_router(actuator_sensitive));
+    router = router.merge(crate::actuator::actuator_router_with_prefix(
+        &config.actuator.prefix,
+        actuator_sensitive,
+    ));
     tracing::debug!(
         sensitive = actuator_sensitive,
-        "Mounted actuator endpoints at /actuator/*"
+        prefix = %config.actuator.prefix,
+        "Mounted actuator endpoints"
     );
 
     // Static file serving from project's static/ directory.
@@ -187,13 +227,6 @@ pub(crate) fn build_router_inner(
         router = router.layer(csrf_layer);
     }
 
-    // Session management layer (always enabled with default in-memory store)
-    let session_layer = crate::session::SessionLayer::new(
-        crate::session::MemoryStore::new(),
-        config.session.clone(),
-    );
-    tracing::debug!("Session management enabled (in-memory store)");
-
     // Security headers layer (always applied)
     let security_headers =
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
@@ -204,10 +237,11 @@ pub(crate) fn build_router_inner(
 
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
-    let router = router
-        .layer(RequestIdLayer)
-        .layer(security_headers)
-        .layer(session_layer);
+    let router = router.layer(RequestIdLayer).layer(security_headers);
+    let router =
+        crate::session::apply_session_layer(router, &config.session, config.profile.as_deref())
+            .unwrap_or_else(|error| panic!("invalid session backend configuration: {error}"));
+    tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Error page filter: renders HTML error pages for browser requests.
     // Always registered (uses default renderer if no custom one is provided).
@@ -293,6 +327,7 @@ pub(crate) fn build_router_with_static_inner(
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     error_page_renderer: Option<SharedRenderer>,
 ) -> axum::Router {
+    let startup_barrier_state = state.clone();
     let app_router = build_router_inner(
         route_list,
         config,
@@ -305,7 +340,7 @@ pub(crate) fn build_router_with_static_inner(
     );
 
     let Some(dist) = dist_dir else {
-        return app_router;
+        return apply_startup_barrier(app_router, config, &startup_barrier_state);
     };
 
     let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
@@ -313,7 +348,7 @@ pub(crate) fn build_router_with_static_inner(
             dist = %dist.display(),
             "No valid manifest.json in dist dir; skipping static file layer"
         );
-        return app_router;
+        return apply_startup_barrier(app_router, config, &startup_barrier_state);
     };
 
     // Enable ISR regeneration by attaching the app router to the static layer.
@@ -354,7 +389,7 @@ pub(crate) fn build_router_with_static_inner(
     // still served immediately while background regeneration runs
     // (stale-while-revalidate).
     let static_layer = layer;
-    app_router.layer(axum::middleware::from_fn(
+    let router = app_router.layer(axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
             let static_layer = static_layer.clone();
             async move {
@@ -386,7 +421,93 @@ pub(crate) fn build_router_with_static_inner(
                 next.run(req).await
             }
         },
+    ));
+
+    apply_startup_barrier(router, config, &startup_barrier_state)
+}
+
+#[derive(Clone)]
+struct StartupBarrierState {
+    app_state: AppState,
+    live_path: String,
+    ready_path: String,
+    startup_path: String,
+    health_path: String,
+    actuator_paths: Vec<String>,
+    actuator_subtree_paths: Vec<String>,
+}
+
+impl StartupBarrierState {
+    fn from_config(config: &AutumnConfig, app_state: &AppState) -> Self {
+        Self {
+            app_state: app_state.clone(),
+            live_path: config.health.live_path.clone(),
+            ready_path: config.health.ready_path.clone(),
+            startup_path: config.health.startup_path.clone(),
+            health_path: config.health.path.clone(),
+            actuator_paths: crate::actuator::actuator_endpoint_paths(
+                &config.actuator.prefix,
+                config.actuator.sensitive,
+            ),
+            actuator_subtree_paths: config
+                .actuator
+                .sensitive
+                .then(|| {
+                    vec![crate::actuator::actuator_route_path(
+                        &config.actuator.prefix,
+                        "/loggers",
+                    )]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn allows_path(&self, path: &str) -> bool {
+        path == self.live_path
+            || path == self.ready_path
+            || path == self.startup_path
+            || path == self.health_path
+            || self.actuator_paths.iter().any(|allowed| path == allowed)
+            || self
+                .actuator_subtree_paths
+                .iter()
+                .any(|allowed| path_matches_route_prefix(path, allowed))
+    }
+}
+
+fn apply_startup_barrier(
+    router: axum::Router,
+    config: &AutumnConfig,
+    state: &AppState,
+) -> axum::Router {
+    let barrier_state = StartupBarrierState::from_config(config, state);
+    router.layer(axum::middleware::from_fn_with_state(
+        barrier_state,
+        startup_barrier,
     ))
+}
+
+async fn startup_barrier(
+    State(state): State<StartupBarrierState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    if state.app_state.probes().is_startup_complete() || state.allows_path(request.uri().path()) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service is still starting up",
+        )
+            .into_response()
+    }
+}
+
+fn path_matches_route_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 /// Build a `tower_http::cors::CorsLayer` from the framework's [`crate::config::CorsConfig`].
@@ -440,4 +561,63 @@ pub(crate) async fn htmx_handler() -> axum::response::Response {
         crate::htmx::HTMX_JS,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        AppState {
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: Some("test".to_owned()),
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_actuator_at_configured_prefix() {
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/ops".to_owned();
+        config.actuator.sensitive = true;
+
+        let app = build_router(Vec::new(), &config, test_state());
+
+        let prefixed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ops/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefixed.status(), StatusCode::OK);
+
+        let legacy = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
 }
