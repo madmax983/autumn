@@ -94,7 +94,7 @@ pub const fn schedule_to_start_timeout_query() -> &'static str {
 ///
 /// # Errors
 ///
-/// Returns [`HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
 pub async fn find_timed_out_tasks(
     conn: &mut AsyncPgConnection,
 ) -> HarvestResult<Vec<(TaskQueueItem, TimeoutReason)>> {
