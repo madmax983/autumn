@@ -168,7 +168,7 @@ pub(crate) fn try_build_router_inner(
         router = router.route(path, method_router);
     }
 
-    let dev_reload_enabled = dev::is_enabled();
+    let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
     // Framework-provided routes
     #[cfg(feature = "htmx")]
