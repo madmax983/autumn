@@ -67,7 +67,12 @@ async fn get_database_url() -> (String, TestDbResources) {
         .expect("failed to get container port");
     let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-    (database_url, TestDbResources { container: Some(container) })
+    (
+        database_url,
+        TestDbResources {
+            container: Some(container),
+        },
+    )
 }
 
 /// Start a Postgres container with the harvest schema applied and return
@@ -80,9 +85,10 @@ async fn setup_test_db() -> (AsyncPgConnection, TestDbResources) {
 
     // Wait, if using POSTGRES_URL fallback, we should apply INIT_SQL
     if resources.container.is_none() {
-        let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect to fallback Postgres database");
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+                .await
+                .expect("failed to connect to fallback Postgres database");
         diesel::sql_query(INIT_SQL)
             .execute(&mut conn)
             .await
@@ -103,9 +109,10 @@ async fn setup_test_database_url() -> (String, TestDbResources) {
     let (database_url, resources) = get_database_url().await;
 
     if resources.container.is_none() {
-        let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
-            .await
-            .expect("failed to connect to fallback Postgres database");
+        let mut conn =
+            <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+                .await
+                .expect("failed to connect to fallback Postgres database");
         diesel::sql_query(INIT_SQL)
             .execute(&mut conn)
             .await
