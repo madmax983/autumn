@@ -307,6 +307,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn referrer_policy_when_configured() {
+        let config = HeadersConfig {
+            referrer_policy: "strict-origin-when-cross-origin".to_owned(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("referrer-policy").unwrap(),
+            "strict-origin-when-cross-origin"
+        );
+    }
+
+    #[tokio::test]
     async fn permissions_policy_when_configured() {
         let config = HeadersConfig {
             permissions_policy: "camera=(), microphone=()".to_owned(),

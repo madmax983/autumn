@@ -352,19 +352,25 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
     }
 }
 
+#[cfg(unix)]
+fn validate_pid_for_kill(pid: u32) -> Option<libc::pid_t> {
+    let cast_pid = pid.try_into().ok()?;
+    if cast_pid > 0 { Some(cast_pid) } else { None }
+}
+
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
     if let Some(proc) = child {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = proc.id() as libc::pid_t;
-            // SAFETY: `pid` is retrieved directly from `proc.id()`, representing a valid child
-            // process we own. `libc::SIGTERM` is a standard, valid signal. Sending it to our
-            // own child process is safe.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+            if let Some(pid) = validate_pid_for_kill(proc.id()) {
+                // SAFETY: `pid` is retrieved directly from `proc.id()` and validated to be safely
+                // representable as `libc::pid_t` and strictly positive. `libc::SIGTERM` is a standard,
+                // valid signal. Sending it to our own child process is safe.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
             }
             // Wait briefly for graceful shutdown before forcing
             if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
@@ -1238,6 +1244,21 @@ mod tests {
     }
 
     // ── stop_server tests ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    mod havoc_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn safe_pid_cast(pid in proptest::num::u32::ANY) {
+                if let Some(safe_pid) = validate_pid_for_kill(pid) {
+                    assert!(safe_pid > 0, "Safe PID must be strictly positive");
+                }
+            }
+        }
+    }
 
     #[test]
     fn stop_server_with_none_is_noop() {

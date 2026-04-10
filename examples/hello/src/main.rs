@@ -1,4 +1,4 @@
-use autumn_web::{get, routes};
+use autumn_web::prelude::*;
 
 #[get("/")]
 async fn index() -> &'static str {
@@ -11,7 +11,7 @@ async fn hello() -> &'static str {
 }
 
 #[get("/hello/{name}")]
-async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
+async fn hello_name(name: Path<String>) -> String {
     format!("Hello, {}!", *name)
 }
 
