@@ -3,7 +3,7 @@
 //! This module provides async Postgres connectivity via `diesel-async` with
 //! the `deadpool` connection pool. The pool is created at startup by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
-//! [`AppState`].
+//! [`crate::state::AppState`].
 //!
 //! When no `database.url` is configured, [`create_pool`] returns `Ok(None)`
 //! and the application runs without a database -- useful for static-site or
