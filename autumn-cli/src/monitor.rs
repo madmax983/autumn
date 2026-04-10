@@ -49,6 +49,21 @@ struct LoggersResponse {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct ConfigPropsResponse {
+    #[serde(default)]
+    #[allow(dead_code)]
+    active_profile: String,
+    #[serde(default)]
+    properties: HashMap<String, ConfigProperty>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ConfigProperty {
+    value: serde_json::Value,
+    source: String,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct HealthChecks {
     database: Option<DatabaseCheck>,
 }
@@ -167,6 +182,7 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
     loggers: LoggersResponse,
+    configprops: ConfigPropsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -183,6 +199,8 @@ struct DashboardState {
     last_poll: Instant,
     /// Route table scroll offset.
     route_scroll: usize,
+    /// Config table scroll offset.
+    config_scroll: usize,
     /// Currently selected tab.
     active_tab: usize,
     /// Tick counter for animations.
@@ -197,6 +215,7 @@ impl DashboardState {
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
+            configprops: ConfigPropsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -205,6 +224,7 @@ impl DashboardState {
             last_error: None,
             last_poll: Instant::now(),
             route_scroll: 0,
+            config_scroll: 0,
             active_tab: 0,
             tick: 0,
         }
@@ -231,6 +251,7 @@ impl DashboardState {
         self.fetch_metrics(&client);
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
+        self.fetch_configprops(&client);
 
         self.last_poll = Instant::now();
     }
@@ -319,6 +340,17 @@ impl DashboardState {
             }
         }
     }
+
+    fn fetch_configprops(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/configprops", self.base_url))
+            .send()
+        {
+            if let Ok(c) = resp.json::<ConfigPropsResponse>() {
+                self.configprops = c;
+            }
+        }
+    }
 }
 
 // ── TUI rendering ─────────────────────────────────────────────
@@ -367,23 +399,35 @@ fn run_loop(
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 3;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
                             if state.active_tab == 0 {
-                                state.active_tab = 2;
+                                state.active_tab = 3;
                             } else {
                                 state.active_tab -= 1;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            state.route_scroll = state.route_scroll.saturating_add(1);
+                            if state.active_tab == 1 {
+                                state.route_scroll = state.route_scroll.saturating_add(1);
+                            } else if state.active_tab == 3 {
+                                state.config_scroll = state.config_scroll.saturating_add(1);
+                            }
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            state.route_scroll = state.route_scroll.saturating_sub(1);
+                            if state.active_tab == 1 {
+                                state.route_scroll = state.route_scroll.saturating_sub(1);
+                            } else if state.active_tab == 3 {
+                                state.config_scroll = state.config_scroll.saturating_sub(1);
+                            }
                         }
                         KeyCode::Home | KeyCode::Char('g') => {
-                            state.route_scroll = 0;
+                            if state.active_tab == 1 {
+                                state.route_scroll = 0;
+                            } else if state.active_tab == 3 {
+                                state.config_scroll = 0;
+                            }
                         }
                         _ => {}
                     }
@@ -419,6 +463,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_config_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -462,7 +507,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes", "Loggers"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Config"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -1081,6 +1126,76 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
     frame.render_widget(table, area);
 }
 
+fn draw_config_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Configuration Properties ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Property").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Value").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Source").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut props: Vec<_> = state.configprops.properties.iter().collect();
+    props.sort_by(|a, b| a.0.cmp(b.0));
+
+    let rows: Vec<Row> = props
+        .into_iter()
+        .skip(state.config_scroll)
+        .map(|(key, prop)| {
+            let val_str = match &prop.value {
+                serde_json::Value::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+
+            Row::new(vec![
+                Cell::from(key.as_str()).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(val_str).style(Style::default().fg(Color::Cyan)),
+                Cell::from(prop.source.as_str()).style(Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Percentage(30),
+        Constraint::Percentage(50),
+        Constraint::Percentage(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    frame.render_widget(table, area);
+}
+
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let elapsed = state.last_poll.elapsed().as_secs();
 
@@ -1252,6 +1367,17 @@ mod tests {
     fn format_number_plain() {
         assert_eq!(format_number(0), "0");
         assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn deserialize_configprops_response() {
+        let json = r#"{"active_profile":"dev","properties":{"server.port":{"value":"3000","source":"default"}}}"#;
+        let configprops: ConfigPropsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(configprops.active_profile, "dev");
+        assert_eq!(configprops.properties.len(), 1);
+        let prop = configprops.properties.get("server.port").unwrap();
+        assert_eq!(prop.value, serde_json::Value::String("3000".to_string()));
+        assert_eq!(prop.source, "default");
     }
 
     #[test]
@@ -1446,6 +1572,7 @@ mod tests {
         assert!(state.latency_p99_history.is_empty());
         assert_eq!(state.active_tab, 0);
         assert_eq!(state.route_scroll, 0);
+        assert_eq!(state.config_scroll, 0);
         assert_eq!(state.tick, 0);
         assert!(state.last_error.is_none());
     }
@@ -1641,6 +1768,39 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+        };
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_config_tab() {
+        let mut state = test_state();
+        state.active_tab = 3;
+        state.configprops = ConfigPropsResponse {
+            active_profile: "dev".to_string(),
+            properties: HashMap::from([
+                (
+                    "server.port".to_string(),
+                    ConfigProperty {
+                        value: serde_json::Value::String("3000".to_string()),
+                        source: "default".to_string(),
+                    },
+                ),
+                (
+                    "database.url".to_string(),
+                    ConfigProperty {
+                        value: serde_json::Value::String("****".to_string()),
+                        source: "AUTUMN_DATABASE__URL".to_string(),
+                    },
+                ),
+                (
+                    "nested.val".to_string(),
+                    ConfigProperty {
+                        value: serde_json::json!({"enabled": true}),
+                        source: "autumn.toml".to_string(),
+                    },
+                ),
+            ]),
         };
         render_frame(&state, 120, 40);
     }
