@@ -3,26 +3,29 @@ fn main() {
     println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
 
-    if let Some(tailwind) = find_tailwind_cli() {
-        let status = std::process::Command::new(&tailwind)
-            .args([
-                "-i",
-                "static/css/input.css",
-                "-o",
-                "static/css/autumn.css",
-                "--content",
-                "src/**/*.rs",
-                "--minify",
-            ])
-            .status()
-            .expect("Failed to run Tailwind CLI");
-
-        if !status.success() {
-            panic!("Tailwind CSS compilation failed");
+    let tailwind_cli = match find_tailwind_cli() {
+        Some(path) => path,
+        None => {
+            println!("cargo:warning=Tailwind CSS CLI not found. Skipping Tailwind build. Run `autumn setup` to install it.");
+            return;
         }
-    } else {
-        println!("cargo:warning=Tailwind CSS CLI not found, skipping CSS build.");
-        println!("cargo:warning=Run `autumn setup` to download it automatically.");
+    };
+
+    let status = std::process::Command::new(&tailwind_cli)
+        .args([
+            "-i",
+            "static/css/input.css",
+            "-o",
+            "static/css/autumn.css",
+            "--content",
+            "src/**/*.rs",
+            "--minify",
+        ])
+        .status()
+        .expect("Failed to run Tailwind CLI");
+
+    if !status.success() {
+        panic!("Tailwind CSS compilation failed");
     }
 }
 
@@ -38,7 +41,7 @@ fn find_tailwind_cli() -> Option<std::path::PathBuf> {
         return Some(path);
     }
 
-    // 3. Return None to treat this as optional
+    // 3. Not found
     None
 }
 
