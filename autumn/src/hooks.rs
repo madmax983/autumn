@@ -543,12 +543,16 @@ mod tests {
     fn patch_unchanged_is_default() {
         let p: Patch<String> = Patch::default();
         assert!(p.is_unchanged());
+        assert!(!p.is_set());
+        assert!(!p.is_clear());
     }
 
     #[test]
     fn patch_set_holds_value() {
         let p = Patch::Set("hello");
         assert!(p.is_set());
+        assert!(!p.is_unchanged());
+        assert!(!p.is_clear());
         assert_eq!(p.as_set(), Some(&"hello"));
     }
 
@@ -743,7 +747,23 @@ mod tests {
         assert_eq!(draft.after(), &42);
     }
 
+    #[test]
+    fn update_draft_after_mut() {
+        let mut draft = UpdateDraft::new_with_changes(1, 2);
+        *draft.after_mut() = 3;
+        assert_eq!(draft.after(), &3);
+    }
+
     // ── DraftField tests ────────────────────────────────────────────
+
+    #[test]
+    fn draft_field_before_after() {
+        let before = 1;
+        let mut after = 2;
+        let field = DraftField::new(&before, &mut after);
+        assert_eq!(field.before(), &1);
+        assert_eq!(field.after(), &2);
+    }
 
     #[test]
     fn draft_field_changed() {
