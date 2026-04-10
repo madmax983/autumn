@@ -336,7 +336,7 @@ pub async fn submit(
     let title_for_insert = title.clone();
     let slug_for_insert = slug.clone();
     let author_username_for_outbox = author_username.clone();
-    let post_id = (&mut *db)
+    let post_id = (*db)
         .transaction::<i64, AutumnError, _>(|conn| {
             let title = title_for_insert.clone();
             let slug = slug_for_insert.clone();

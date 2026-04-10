@@ -119,7 +119,7 @@ pub async fn register(
         password_hash: hashed,
     };
 
-    let user = (&mut *db)
+    let user = (*db)
         .transaction::<User, AutumnError, _>(|conn| {
             let new_user = new_user.clone();
             async move {

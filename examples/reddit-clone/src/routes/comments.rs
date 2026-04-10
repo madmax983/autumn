@@ -55,7 +55,7 @@ pub async fn create(
     let post_slug_for_event = post_slug.clone();
     let body_for_insert = body.clone();
     let author_username_for_event = author_username.clone();
-    let event_id = (&mut *db)
+    let event_id = (*db)
         .transaction::<i64, AutumnError, _>(|conn| {
             let sub_slug = sub_slug_for_event.clone();
             let post_slug = post_slug_for_event.clone();

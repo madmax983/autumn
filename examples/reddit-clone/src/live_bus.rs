@@ -82,7 +82,7 @@ impl LiveFeedBusConfig {
         )
         .map_err(|source| LiveFeedBusConfigLoadError::Parse {
             path: base_path,
-            source,
+            source: Box::new(source),
         })?;
 
         Ok(distributed.live_feed_bus)
@@ -101,7 +101,7 @@ pub enum LiveFeedBusConfigLoadError {
     Parse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 }
 
@@ -152,7 +152,7 @@ fn load_distributed_section(
                     .parse()
                     .map_err(|source| LiveFeedBusConfigLoadError::Parse {
                         path: path.to_path_buf(),
-                        source,
+                        source: Box::new(source),
                     })?;
             Ok(config.get("distributed").cloned())
         }
