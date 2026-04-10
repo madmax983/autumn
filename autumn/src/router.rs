@@ -18,6 +18,12 @@ use thiserror::Error;
 pub enum RouterBuildError {
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+    #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
+    FrameworkRouteOverlap {
+        path: String,
+        existing: &'static str,
+        incoming: &'static str,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -224,6 +230,18 @@ pub(crate) fn try_build_router_inner(
 
     // Actuator endpoints
     let actuator_sensitive = config.actuator.sensitive;
+    let actuator_paths =
+        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, actuator_sensitive);
+    if let Some(path) = actuator_paths
+        .iter()
+        .find(|path| mounted_probe_paths.contains(path.as_str()))
+    {
+        return Err(RouterBuildError::FrameworkRouteOverlap {
+            path: path.clone(),
+            existing: "probe endpoint",
+            incoming: "actuator endpoint",
+        });
+    }
     router = router.merge(crate::actuator::actuator_router_with_prefix(
         &config.actuator.prefix,
         actuator_sensitive,
@@ -586,7 +604,10 @@ async fn startup_barrier(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    if state.app_state.probes().is_startup_complete() || state.allows_path(request.uri().path()) {
+    if crate::app::is_static_build_mode()
+        || state.app_state.probes().is_startup_complete()
+        || state.allows_path(request.uri().path())
+    {
         next.run(request).await
     } else {
         (
@@ -745,5 +766,21 @@ mod tests {
                 crate::session::SessionBackendConfigError::MissingRedisUrl
             )
         ));
+    }
+
+    #[test]
+    fn try_build_router_returns_error_for_probe_actuator_path_overlap() {
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/".to_owned();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_build_router(Vec::new(), &config, test_state())
+        }));
+
+        assert!(result.is_ok(), "try_build_router panicked on route overlap");
+        assert!(
+            result.unwrap().is_err(),
+            "route overlap should be reported as a checked router build error"
+        );
     }
 }

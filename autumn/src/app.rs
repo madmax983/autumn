@@ -530,7 +530,7 @@ impl AppBuilder {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
         // instead of starting the HTTP server. This is triggered by `autumn build`.
-        if std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1") {
+        if is_static_build_mode() {
             self.run_build_mode().await;
             return;
         }
@@ -833,6 +833,10 @@ impl AppBuilder {
             }
         }
     }
+}
+
+pub(crate) fn is_static_build_mode() -> bool {
+    std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -1658,6 +1662,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    #[tokio::test]
+    async fn build_mode_static_rendering_bypasses_startup_barrier() {
+        let _env = EnvGuard::set_many(&[("AUTUMN_BUILD_STATIC", Some("1"))]);
+        let config = AutumnConfig::default();
+        let state = AppState::for_test().with_startup_complete(false);
+        let router = crate::router::build_router(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/about",
+                handler: axum::routing::get(|| async { "About Page Content" }),
+                name: "about",
+            }],
+            &config,
+            state,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+
+        let result = crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/about",
+                name: "about",
+                revalidate: None,
+                params_fn: None,
+            }],
+            &dist,
+        )
+        .await;
+
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+        let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
+        assert_eq!(html, "About Page Content");
     }
 
     #[tokio::test]
