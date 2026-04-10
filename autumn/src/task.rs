@@ -125,4 +125,26 @@ mod tests {
     fn empty() {
         assert!(parse_duration("").is_none());
     }
+
+    #[test]
+    fn zero_duration() {
+        assert!(parse_duration("0s").is_none());
+        assert!(parse_duration("0m").is_none());
+    }
+
+    #[test]
+    fn invalid_characters() {
+        assert!(parse_duration("1h_30m").is_none());
+        assert!(parse_duration("1h-30m").is_none());
+    }
+
+    #[test]
+    fn multiple_spaces() {
+        assert_eq!(parse_duration("1h   30m"), Some(Duration::from_secs(5400)));
+    }
+
+    #[test]
+    fn compound_trailing_number() {
+        assert!(parse_duration("1h 30").is_none());
+    }
 }
