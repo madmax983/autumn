@@ -709,6 +709,11 @@ pub(crate) async fn tasks_stream_endpoint(
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
+///
+/// # Parameters
+///
+/// - `sensitive`: A boolean indicating if sensitive actuator endpoints
+///   (like env vars, config properties, and loggers) should be exposed.
 pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
     let mut router = axum::Router::new()
         .route("/actuator/health", axum::routing::get(health))

@@ -36,6 +36,11 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 ///
 /// If the configured `level` string is not a valid `EnvFilter` directive,
 /// a warning is printed to stderr and the filter falls back to `"info"`.
+///
+/// # Parameters
+///
+/// - `config`: A reference to the [`LogConfig`] detailing the log level
+///   and format.
 pub fn init(config: &LogConfig) {
     let filter = EnvFilter::try_new(&config.level).unwrap_or_else(|e| {
         eprintln!(

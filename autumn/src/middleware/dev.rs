@@ -11,6 +11,11 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+/// Checks if dev reload functionality is enabled.
+///
+/// It does this by checking if the required environment variables (`AUTUMN_DEV_RELOAD` and
+/// `AUTUMN_DEV_RELOAD_STATE`) are set, which indicate that the framework is running in development mode
+/// and live reloading is active.
 pub fn is_enabled() -> bool {
     std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
 }

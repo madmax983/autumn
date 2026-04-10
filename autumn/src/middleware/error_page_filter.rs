@@ -128,6 +128,11 @@ impl<S> tower::Layer<S> for ErrorPageContextLayer {
     }
 }
 
+/// Tower [`Service`](tower::Service) produced by [`ErrorPageContextLayer`].
+///
+/// Wraps an inner service and extracts information about whether the client
+/// prefers an HTML response (via the `Accept` header), passing it along in the
+/// request extensions for downstream error handling.
 #[derive(Clone)]
 pub struct ErrorPageContextService<S> {
     inner: S,

@@ -126,6 +126,10 @@ impl StaticManifest {
 /// | `/about` | `about/index.html` |
 /// | `/about/` | `about/index.html` |
 /// | `/posts/hello` | `posts/hello/index.html` |
+///
+/// # Parameters
+///
+/// - `url_path`: The URL path string to convert into a relative file path.
 #[must_use]
 pub fn url_to_file_path(url_path: &str) -> String {
     let trimmed = url_path.trim_matches('/');

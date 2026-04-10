@@ -43,6 +43,10 @@ pub enum Schedule {
 ///
 /// Supported units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
 ///
+/// # Parameters
+///
+/// - `s`: The string slice to parse, e.g., `"5s"`, `"1m30s"`, `"1h"`.
+///
 /// # Errors
 ///
 /// Returns `None` if the string contains invalid syntax.

@@ -76,6 +76,11 @@ pub trait Cache: Send + Sync + 'static {
 ///
 /// Returns `None` if the key is absent or the stored type doesn't
 /// match `V`. Works with any `Cache` implementation.
+///
+/// # Parameters
+///
+/// - `cache`: The [`Cache`] instance to retrieve the value from.
+/// - `key`: The string key associated with the cached value.
 pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Option<V> {
     cache
         .get_value(key)
@@ -85,6 +90,12 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
 /// Typed insert: wrap the value in an `Arc` and store it.
 ///
 /// Works with any `Cache` implementation.
+///
+/// # Parameters
+///
+/// - `cache`: The [`Cache`] instance to store the value in.
+/// - `key`: The string key to associate with the cached value.
+/// - `value`: The typed value to be stored in the cache.
 pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, value: V) {
     cache.insert_value(key, Arc::new(value));
 }
@@ -132,6 +143,11 @@ impl<T: Clone, E> CacheableResult for Result<T, E> {
 /// Used by `#[cached]` macro-generated code. The key is
 /// `"{fn_name}:{hash_hex}"` where the hash is a 64-bit `DefaultHasher`
 /// digest of the argument tuple.
+///
+/// # Parameters
+///
+/// - `fn_name`: The name of the cached function to prefix the key.
+/// - `args`: The tuple of arguments to hash for the cache key.
 #[must_use]
 pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
     let mut hasher = DefaultHasher::new();

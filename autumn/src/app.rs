@@ -959,6 +959,18 @@ pub fn build_router(
 /// Like [`build_router`], but also merges and nests additional raw
 /// Axum routers. This is primarily useful for integration testing;
 /// in production, use [`AppBuilder::merge`] and [`AppBuilder::nest`].
+///
+/// # Parameters
+///
+/// - `route_list`: A vector of [`Route`] instances to register.
+/// - `config`: A reference to the [`AutumnConfig`] containing the application's configuration.
+/// - `state`: The initialized [`AppState`] to be injected into handlers.
+/// - `merge_routers`: A vector of [`axum::Router`] instances to merge directly into the root router.
+/// - `nest_routers`: A vector of `(path, router)` pairs to nest under specific path prefixes.
+///
+/// # Returns
+///
+/// An [`axum::Router`] configured with the provided routes, nested routers, merged routers, state, and standard middleware.
 pub fn build_router_merged(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -1186,6 +1198,18 @@ fn build_router_inner(
 /// router is identical to [`build_router`].
 ///
 /// This function is public primarily for integration testing.
+///
+/// # Parameters
+///
+/// - `route_list`: A vector of [`Route`] instances to register.
+/// - `config`: A reference to the [`AutumnConfig`] containing the application's configuration.
+/// - `state`: The initialized [`AppState`] to be injected into handlers.
+/// - `dist_dir`: An optional path to the `dist/` directory containing pre-rendered static files.
+///   If `None`, it falls back to the default `dist/` directory relative to the current working directory.
+///
+/// # Returns
+///
+/// An [`axum::Router`] configured with the provided routes, state, static file serving middleware, and standard middleware.
 pub fn build_router_with_static(
     route_list: Vec<Route>,
     config: &AutumnConfig,
