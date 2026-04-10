@@ -296,4 +296,212 @@ mod tests {
         assert!(map.contains_key("my_field"));
         assert_eq!(map["my_field"][0], "validation failed: custom_code");
     }
+
+    #[tokio::test]
+    async fn valid_extractor_json_ok() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Payload {
+            #[validate(length(min = 3))]
+            name: String,
+        }
+
+        async fn handle(Valid(axum::Json(payload)): Valid<axum::Json<Payload>>) -> String {
+            payload.name
+        }
+
+        let app = Router::new().route("/", post(handle));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"name": "Alice"}"#))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_json_err() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Payload {
+            #[validate(length(min = 3))]
+            name: String,
+        }
+
+        async fn handle(Valid(axum::Json(payload)): Valid<axum::Json<Payload>>) -> String {
+            payload.name
+        }
+
+        let app = Router::new().route("/", post(handle));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"name": "Al"}"#))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_form_ok() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Payload {
+            #[validate(range(min = 18))]
+            age: i32,
+        }
+
+        async fn handle(
+            Valid(axum::extract::Form(payload)): Valid<axum::extract::Form<Payload>>,
+        ) -> String {
+            payload.age.to_string()
+        }
+
+        let app = Router::new().route("/", post(handle));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from("age=25"))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_form_err() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Payload {
+            #[validate(range(min = 18))]
+            age: i32,
+        }
+
+        async fn handle(
+            Valid(axum::extract::Form(payload)): Valid<axum::extract::Form<Payload>>,
+        ) -> String {
+            payload.age.to_string()
+        }
+
+        let app = Router::new().route("/", post(handle));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(axum::body::Body::from("age=17"))
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_query_ok() {
+        use axum::extract::FromRequestParts;
+
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Params {
+            #[validate(length(min = 2))]
+            q: String,
+        }
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/?q=test")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let (mut parts, _) = req.into_parts();
+        let query = axum::extract::Query::<Params>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        let valid = query.0.validate();
+
+        assert!(valid.is_ok());
+        assert_eq!(
+            valid
+                .unwrap_or_else(|_| Validated::new(Params { q: String::new() }))
+                .q,
+            "test"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_query_err() {
+        use axum::extract::FromRequestParts;
+
+        #[derive(serde::Deserialize, validator::Validate, Debug)]
+        struct Params {
+            #[validate(length(min = 2))]
+            q: String,
+        }
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/?q=a")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let (mut parts, _) = req.into_parts();
+        let query = axum::extract::Query::<Params>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        let valid = query.0.validate();
+
+        assert!(valid.is_err());
+        if let Err(e) = valid {
+            assert_eq!(e.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_json_parse_err() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct Payload {
+            #[validate(length(min = 3))]
+            name: String,
+        }
+
+        async fn handle(Valid(axum::Json(payload)): Valid<axum::Json<Payload>>) -> String {
+            payload.name
+        }
+
+        let app = Router::new().route("/", post(handle));
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"name": "#)) // Malformed JSON
+            .unwrap();
+
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+    }
 }
