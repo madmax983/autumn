@@ -424,15 +424,11 @@ fn run_loop(
                             let filename = format!("monitor-snapshot-{}.json", timestamp);
                             let path = std::path::Path::new(&filename);
                             if let Ok(()) = export_state_to_json(state, path) {
-                                state.export_message = Some((
-                                    format!("Snapshot saved to {filename}"),
-                                    Instant::now()
-                                ));
+                                state.export_message =
+                                    Some((format!("Snapshot saved to {filename}"), Instant::now()));
                             } else {
-                                state.export_message = Some((
-                                    format!("Failed to save {filename}"),
-                                    Instant::now()
-                                ));
+                                state.export_message =
+                                    Some((format!("Failed to save {filename}"), Instant::now()));
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
@@ -572,12 +568,12 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     ));
 
     let conn = Paragraph::new(Line::from(status_spans))
-    .alignment(Alignment::Right)
-    .block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
+        .alignment(Alignment::Right)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
     frame.render_widget(conn, chunks[2]);
 }
 
