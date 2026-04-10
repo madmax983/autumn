@@ -120,7 +120,11 @@ impl MetricsCollector {
         }
 
         // Per-route
-        let key = format!("{method} {route}");
+        let mut key = String::with_capacity(method.len() + 1 + route.len());
+        key.push_str(method);
+        key.push(' ');
+        key.push_str(route);
+
         if let Ok(mut routes) = self.inner.by_route.write() {
             let entry = routes.entry(key).or_default();
             entry.count += 1;
