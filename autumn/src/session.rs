@@ -931,21 +931,8 @@ mod tests {
         assert!(cookie_str.contains("autumn.sid="));
     }
 
-    #[tokio::test]
-    async fn session_layer_persists_data_across_requests() {
-        use crate::state::AppState;
-        async fn write_handler(session: Session) -> String {
-            session.insert("user", "alice").await;
-            "saved".to_owned()
-        }
-
-        async fn read_handler(session: Session) -> String {
-            session.get("user").await.unwrap_or_default()
-        }
-
-        let store = MemoryStore::new();
-        let config = SessionConfig::default();
-        let state = AppState {
+    fn test_state() -> crate::state::AppState {
+        crate::state::AppState {
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -960,7 +947,23 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn session_layer_persists_data_across_requests() {
+        async fn write_handler(session: Session) -> String {
+            session.insert("user", "alice").await;
+            "saved".to_owned()
+        }
+
+        async fn read_handler(session: Session) -> String {
+            session.get("user").await.unwrap_or_default()
+        }
+
+        let store = MemoryStore::new();
+        let config = SessionConfig::default();
+        let state = test_state();
 
         let app = Router::new()
             .route("/write", get(write_handler))
@@ -1010,28 +1013,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_destroy_expires_cookie() {
-        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.destroy().await;
             "destroyed".to_owned()
         }
 
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        let state = test_state();
 
         let store = MemoryStore::new();
         store
