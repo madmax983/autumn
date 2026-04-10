@@ -24,7 +24,7 @@ use serde::Deserialize;
 
 // ── Actuator response types ───────────────────────────────────
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct HealthResponse {
     status: String,
     #[serde(default)]
@@ -37,7 +37,7 @@ struct HealthResponse {
     checks: Option<HealthChecks>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct LoggersResponse {
     #[serde(default)]
     current_level: String,
@@ -48,12 +48,12 @@ struct LoggersResponse {
     loggers: HashMap<String, String>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct HealthChecks {
     database: Option<DatabaseCheck>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct DatabaseCheck {
     status: String,
     pool_size: u64,
@@ -61,7 +61,7 @@ struct DatabaseCheck {
     idle_connections: u64,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct MetricsResponse {
     #[serde(default)]
     http: HttpMetrics,
@@ -69,7 +69,7 @@ struct MetricsResponse {
     database: Option<DbPoolMetrics>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct HttpMetrics {
     #[serde(default)]
     requests_total: u64,
@@ -83,7 +83,7 @@ struct HttpMetrics {
     by_status: StatusSnapshot,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct LatencySnapshot {
     #[serde(default)]
     p50: u64,
@@ -93,7 +93,7 @@ struct LatencySnapshot {
     p99: u64,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct RouteSnapshot {
     #[serde(default)]
     count: u64,
@@ -105,7 +105,7 @@ struct RouteSnapshot {
     p99_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct StatusSnapshot {
     #[serde(rename = "2xx", default)]
     s2xx: u64,
@@ -117,7 +117,7 @@ struct StatusSnapshot {
     s5xx: u64,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct DbPoolMetrics {
     #[serde(default)]
     pool_size: u64,
@@ -127,13 +127,13 @@ struct DbPoolMetrics {
     idle_connections: u64,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct TasksResponse {
     #[serde(default)]
     scheduled_tasks: HashMap<String, TaskStatus>,
 }
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
 struct TaskStatus {
     #[serde(default)]
     schedule: String,
@@ -161,12 +161,30 @@ struct TaskStatus {
 /// Maximum sparkline history depth.
 const SPARKLINE_DEPTH: usize = 120;
 
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
+struct ConfigPropsResponse {
+    #[serde(default)]
+    properties: HashMap<String, ConfigProperty>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone, serde::Serialize)]
+struct ConfigProperty {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    value: String,
+}
+
+#[derive(Debug, serde::Serialize)]
 struct DashboardState {
     base_url: String,
     health: HealthResponse,
     metrics: MetricsResponse,
     tasks: TasksResponse,
     loggers: LoggersResponse,
+    config: ConfigPropsResponse,
+    #[serde(skip)]
+    export_message: Option<(String, Instant)>,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -180,13 +198,22 @@ struct DashboardState {
     /// Last error message.
     last_error: Option<String>,
     /// When we last polled.
+    #[serde(skip)]
     last_poll: Instant,
     /// Route table scroll offset.
+    #[serde(skip)]
     route_scroll: usize,
     /// Currently selected tab.
+    #[serde(skip)]
     active_tab: usize,
     /// Tick counter for animations.
+    #[serde(skip)]
     tick: u64,
+}
+
+fn export_state_to_json(state: &DashboardState, filepath: &std::path::Path) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(state)?;
+    std::fs::write(filepath, json)
 }
 
 impl DashboardState {
@@ -197,6 +224,8 @@ impl DashboardState {
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
+            config: ConfigPropsResponse::default(),
+            export_message: None,
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -231,8 +260,22 @@ impl DashboardState {
         self.fetch_metrics(&client);
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
+        self.fetch_config(&client);
 
         self.last_poll = Instant::now();
+    }
+
+    fn fetch_config(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/configprops", self.base_url))
+            .send()
+        {
+            if resp.status().is_success() {
+                if let Ok(config) = resp.json::<ConfigPropsResponse>() {
+                    self.config = config;
+                }
+            }
+        }
     }
 
     fn fetch_health(&mut self, client: &reqwest::blocking::Client) -> bool {
@@ -367,13 +410,29 @@ fn run_loop(
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 3;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
                             if state.active_tab == 0 {
-                                state.active_tab = 2;
+                                state.active_tab = 3;
                             } else {
                                 state.active_tab -= 1;
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                            let filename = format!("monitor-snapshot-{}.json", timestamp);
+                            let path = std::path::Path::new(&filename);
+                            if let Ok(()) = export_state_to_json(state, path) {
+                                state.export_message = Some((
+                                    format!("Snapshot saved to {filename}"),
+                                    Instant::now()
+                                ));
+                            } else {
+                                state.export_message = Some((
+                                    format!("Failed to save {filename}"),
+                                    Instant::now()
+                                ));
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
@@ -419,6 +478,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_config_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -488,20 +548,30 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
         ("●", "degraded")
     };
 
-    let conn = Paragraph::new(Line::from(vec![
-        Span::styled(indicator, Style::default().fg(status_color)),
-        Span::raw(" "),
-        Span::styled(label, Style::default().fg(status_color)),
-        Span::raw("  "),
-        Span::styled(
-            if state.health.profile.is_empty() {
-                String::new()
-            } else {
-                format!("[{}]", state.health.profile)
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]))
+    let mut status_spans = vec![];
+    if let Some((msg, time)) = &state.export_message {
+        if time.elapsed().as_secs() < 3 {
+            status_spans.push(Span::styled(
+                format!("{msg}  |  "),
+                Style::default().fg(Color::Green),
+            ));
+        }
+    }
+
+    status_spans.push(Span::styled(indicator, Style::default().fg(status_color)));
+    status_spans.push(Span::raw(" "));
+    status_spans.push(Span::styled(label, Style::default().fg(status_color)));
+    status_spans.push(Span::raw("  "));
+    status_spans.push(Span::styled(
+        if state.health.profile.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", state.health.profile)
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let conn = Paragraph::new(Line::from(status_spans))
     .alignment(Alignment::Right)
     .block(
         Block::default()
@@ -895,6 +965,74 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_config_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Config Properties ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Property").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Value").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Source").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut props: Vec<_> = state.config.properties.iter().collect();
+    props.sort_by(|a, b| a.0.cmp(b.0));
+
+    let mut rows = Vec::new();
+    for (i, (key, prop)) in props.iter().enumerate() {
+        let bg = if i % 2 == 0 {
+            Color::Reset
+        } else {
+            Color::Rgb(30, 30, 30)
+        };
+
+        rows.push(
+            Row::new(vec![
+                Cell::from((*key).clone()).style(Style::default().fg(Color::White)),
+                Cell::from(prop.value.clone()).style(Style::default().fg(Color::Cyan)),
+                Cell::from(prop.source.clone()).style(Style::default().fg(Color::DarkGray)),
+            ])
+            .style(Style::default().bg(bg)),
+        );
+    }
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+        ],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(2);
+
+    frame.render_widget(table, area);
 }
 
 fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
