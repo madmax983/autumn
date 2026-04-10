@@ -707,7 +707,6 @@ impl AutumnConfig {
             }
         }
         parse_env_bool(env, "AUTUMN_TELEMETRY__STRICT", &mut self.telemetry.strict);
-
     }
 
     fn apply_health_env_overrides_with_env(&mut self, env: &dyn Env) {
