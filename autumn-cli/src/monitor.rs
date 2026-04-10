@@ -421,9 +421,9 @@ fn run_loop(
                         }
                         KeyCode::Char('s') => {
                             let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-                            let filename = format!("monitor-snapshot-{}.json", timestamp);
+                            let filename = format!("monitor-snapshot-{timestamp}.json");
                             let path = std::path::Path::new(&filename);
-                            if let Ok(()) = export_state_to_json(state, path) {
+                            if matches!(export_state_to_json(state, path), Ok(())) {
                                 state.export_message =
                                     Some((format!("Snapshot saved to {filename}"), Instant::now()));
                             } else {
