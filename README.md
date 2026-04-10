@@ -8,7 +8,7 @@
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
 Autumn assembles proven Rust crates into a convention-over-configuration web
-stack with proc-macro ergonomics, framework defaults, and escape hatches when
+stack with proc-macro ergonomics, framework defaults, and customization options when
 you need them. If Spring Boot, Rails, or Laravel feels familiar, Autumn aims
 for that same "ship the app, not the plumbing" shape in Rust.
 
@@ -20,7 +20,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 ## Features
 
 - **Route and app macros** - `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
-- **Hybrid rendering** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
+- **Pre-rendering pages to static HTML** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
 - **Application builder** - `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
 - **Database ergonomics** - async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
@@ -98,7 +98,7 @@ async fn main() {
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
 | [`examples/todo-app`](examples/todo-app) | Classic full-stack CRUD app with Diesel, Maud, htmx, Tailwind, and JSON endpoints |
-| [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and hybrid rendering via `#[static_get]` |
+| [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
 | [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, real autumn-harvest onboarding and post-publication workflows, htmx voting, and profiles |
@@ -108,7 +108,7 @@ async fn main() {
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [API Reference](https://docs.rs/autumn-web)
-- [Hybrid Rendering Design Notes](docs/design/hybrid-rendering.md)
+- [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 
 ## Requirements
 

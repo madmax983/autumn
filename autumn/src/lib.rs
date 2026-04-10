@@ -4,7 +4,7 @@
 //!
 //! Autumn assembles proven Rust crates ([Axum], [Maud], [Diesel], htmx, Tailwind)
 //! into a Spring Boot-style developer experience with proc-macro-driven
-//! conventions and escape hatches at every level.
+//! conventions and customization options at every level.
 //!
 //! ## Quick start
 //!
