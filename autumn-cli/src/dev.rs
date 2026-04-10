@@ -358,13 +358,19 @@ fn stop_server(child: &mut Option<Child>) {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = proc.id() as libc::pid_t;
-            // SAFETY: `pid` is retrieved directly from `proc.id()`, representing a valid child
-            // process we own. `libc::SIGTERM` is a standard, valid signal. Sending it to our
-            // own child process is safe.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+            if let Ok(pid) = proc.id().try_into() {
+                if pid > 0 {
+                    // SAFETY: `pid` is retrieved directly from `proc.id()`, checked for being strictly
+                    // positive to avoid signaling process groups or all processes, and fits into `libc::pid_t`.
+                    // Sending `libc::SIGTERM` to our own child process is safe.
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                } else {
+                    let _ = proc.kill();
+                }
+            } else {
+                let _ = proc.kill();
             }
             // Wait briefly for graceful shutdown before forcing
             if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
