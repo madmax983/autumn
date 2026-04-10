@@ -273,68 +273,10 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            if !is_safe {
-                // 1. Check header
-                let mut token_found = false;
-
-                let header_token = req
-                    .headers()
-                    .get(&settings.token_header)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
-
-                if let (Some(c), Some(h)) = (&cookie_token, &header_token) {
-                    if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
-                        token_found = true;
-                    }
-                }
-
-                // 2. Check form field (if not found in header)
-                if !token_found {
-                    let content_type = req
-                        .headers()
-                        .get(http::header::CONTENT_TYPE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default();
-
-                    if content_type.starts_with("application/x-www-form-urlencoded") {
-                        let (parts, body) = req.into_parts();
-                        // Limit body size to avoid DoS when extracting form field
-                        let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
-                            .await
-                            .unwrap_or_else(|_| axum::body::Bytes::new());
-
-                        if let Ok(body_str) = std::str::from_utf8(&bytes) {
-                            for pair in body_str.split('&') {
-                                if let Some((key, value)) = pair.split_once('=') {
-                                    if key == settings.form_field {
-                                        // Simple URL decoding by replacing + with space and % encoded chars
-                                        // Note: CSRF tokens are UUIDs, so they shouldn't contain special chars anyway
-                                        if let Some(c) = &cookie_token {
-                                            if !c.is_empty()
-                                                && !value.is_empty()
-                                                && constant_time_eq(c, value)
-                                            {
-                                                token_found = true;
-                                            }
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Reconstruct request
-                        req = Request::from_parts(parts, axum::body::Body::from(bytes));
-                    }
-                }
-
-                if !token_found {
-                    // Validation failed, reject immediately
-                    let mut response = Response::new(ResBody::default());
-                    *response.status_mut() = StatusCode::FORBIDDEN;
-                    return Ok(response);
-                }
+            if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                return Ok(response);
             }
 
             // Validation passed (or method is safe)
@@ -349,6 +291,69 @@ where
             Ok(response)
         })
     }
+}
+
+async fn verify_csrf_token(
+    req: &mut Request<axum::body::Body>,
+    settings: &CsrfSettings,
+    cookie_token: Option<&str>,
+) -> bool {
+    let mut token_found = false;
+
+    // 1. Check header
+    let header_token = req
+        .headers()
+        .get(&settings.token_header)
+        .and_then(|v| v.to_str().ok());
+
+    if let (Some(c), Some(h)) = (cookie_token, header_token) {
+        if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
+            token_found = true;
+        }
+    }
+
+    if token_found {
+        return true;
+    }
+
+    // 2. Check form field (if not found in header)
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        return false;
+    }
+
+    // Temporarily take ownership of the body
+    let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
+
+    // Limit body size to avoid DoS when extracting form field
+    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
+        .await
+        .unwrap_or_else(|_| axum::body::Bytes::new());
+
+    if let Ok(body_str) = std::str::from_utf8(&bytes) {
+        for pair in body_str.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                if key == settings.form_field {
+                    if let Some(c) = cookie_token {
+                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
+                            token_found = true;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Restore request body
+    *req.body_mut() = axum::body::Body::from(bytes);
+
+    token_found
 }
 
 #[cfg(test)]
