@@ -318,6 +318,8 @@ mod tests {
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
+        assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
+        assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
     }
 
     #[test]
