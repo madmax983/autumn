@@ -138,8 +138,12 @@ curl -X PUT http://localhost:3000/api/bookmarks/1 \
   split wanted an explicit repository seam almost immediately.
 - Scheduled tasks are process-local by default, so distributed safety required
   explicit shard ownership and advisory-lock coordination in application code.
+  Use `#[scheduled]` for light in-process work like this demo; move durable or
+  coordinated multi-step work to Harvest.
 - Non-dev deployment needed an explicit migration runner because
   `AUTUMN_PROFILE=docker` correctly does not auto-apply migrations.
+  Treat that migrator as the shape to copy into a real deployment job before
+  any web replica starts.
 - The distributed state lives beside Autumn's normal app state instead of inside
   it. That is an escape hatch, but it also shows where a future framework helper
   might reduce ceremony without hiding the runtime truth.

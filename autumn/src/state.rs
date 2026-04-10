@@ -15,6 +15,7 @@ use crate::channels::Channels;
 #[cfg(feature = "db")]
 use crate::db::DbState;
 use crate::middleware;
+use crate::probe;
 #[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +55,9 @@ pub struct AppState {
 
     /// Whether the health endpoint should include detailed info.
     pub(crate) health_detailed: bool,
+
+    /// Probe lifecycle state for liveness, readiness, and startup endpoints.
+    pub(crate) probes: probe::ProbeState,
 
     /// In-memory metrics collector for the `/actuator/metrics` endpoint.
     pub(crate) metrics: middleware::MetricsCollector,
@@ -117,6 +121,22 @@ impl AppState {
         &self.config_props
     }
 
+    /// Returns the shared probe lifecycle state.
+    #[must_use]
+    pub const fn probes(&self) -> &probe::ProbeState {
+        &self.probes
+    }
+
+    /// Mark startup as complete so readiness can become healthy.
+    pub fn mark_startup_complete(&self) {
+        self.probes.mark_startup_complete();
+    }
+
+    /// Mark the application as draining so readiness flips unhealthy.
+    pub fn begin_shutdown(&self) {
+        self.probes.begin_shutdown();
+    }
+
     /// Sets the database pool.
     #[cfg(feature = "db")]
     #[must_use]
@@ -132,6 +152,22 @@ impl AppState {
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = Some(profile.into());
+        self
+    }
+
+    /// Set the startup probe completion flag.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_startup_complete(self, startup_complete: bool) -> Self {
+        self.probes.set_startup_complete(startup_complete);
+        self
+    }
+
+    /// Set the readiness draining flag.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_draining(self, draining: bool) -> Self {
+        self.probes.set_draining(draining);
         self
     }
 
@@ -185,7 +221,26 @@ impl AppState {
     #[cfg(feature = "ws")]
     #[doc(hidden)]
     pub fn trigger_shutdown_for_test(&self) {
+        self.begin_shutdown();
         self.shutdown.cancel();
+    }
+
+    /// Update startup completion in tests after the router is already built.
+    #[doc(hidden)]
+    pub fn set_startup_complete_for_test(&self, startup_complete: bool) {
+        self.probes.set_startup_complete(startup_complete);
+    }
+
+    /// Update draining state in tests after the router is already built.
+    #[doc(hidden)]
+    pub fn set_draining_for_test(&self, draining: bool) {
+        self.probes.set_draining(draining);
+    }
+
+    /// Compatibility helper for tests that model shutdown as readiness drain.
+    #[doc(hidden)]
+    pub fn begin_shutdown_for_test(&self) {
+        self.set_draining_for_test(true);
     }
 
     /// Create an `AppState` suitable for testing, with sensible defaults
@@ -199,6 +254,7 @@ impl AppState {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: probe::ProbeState::ready_for_test(),
             metrics: middleware::MetricsCollector::new(),
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
@@ -235,6 +291,7 @@ impl std::fmt::Debug for AppState {
         s.field("profile", &self.profile)
             .field("started_at", &self.started_at)
             .field("health_detailed", &self.health_detailed)
+            .field("probes", &self.probes)
             .field("metrics", &"MetricsCollector")
             .field("log_levels", &"LogLevels")
             .field("task_registry", &"TaskRegistry")

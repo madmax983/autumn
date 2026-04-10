@@ -15,6 +15,7 @@ maud = ["dep:maud"]
 htmx = []
 tailwind = []
 db = [
+    "dep:deadpool",
     "dep:diesel",
     "dep:diesel-async",
     "dep:diesel_migrations",
@@ -23,6 +24,13 @@ db = [
     "diesel/postgres",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
+telemetry-otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+redis = ["dep:redis"]
 
 [dependencies]
 autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
@@ -30,6 +38,7 @@ axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"
 bcrypt.workspace = true
+deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
@@ -51,6 +60,11 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
 tokio-cron-scheduler.workspace = true
 validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
@@ -70,6 +84,7 @@ tower.workspace = true
 trybuild = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+redis.workspace = true
 proptest = "1.4"
 tokio-tungstenite = "0.29.0"
 loom = "0.7.2"

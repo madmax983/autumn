@@ -29,6 +29,7 @@ use axum::extract::FromRequestParts;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use std::time::Duration;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
@@ -61,9 +62,13 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
         return Ok(None);
     };
 
+    let timeout = Duration::from_secs(config.connect_timeout_secs);
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     let pool = Pool::builder(manager)
         .max_size(config.pool_size.max(1))
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
         .build()?;
 
     Ok(Some(pool))
@@ -142,6 +147,7 @@ where
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
+    use std::time::Duration;
 
     // ── Pool creation tests ──────────────────────────────────────
 
@@ -194,6 +200,22 @@ mod tests {
 
     // ── Db extractor tests ───────────────────────────────────────
 
+    #[test]
+    fn config_runtime_drift_pool_applies_connect_timeout_to_wait_and_create() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            connect_timeout_secs: 7,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("should build pool")
+            .expect("should be Some");
+
+        let timeouts = pool.timeouts();
+        assert_eq!(timeouts.wait, Some(Duration::from_secs(7)));
+        assert_eq!(timeouts.create, Some(Duration::from_secs(7)));
+    }
+
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
         use crate::state::AppState;
@@ -212,6 +234,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),

@@ -67,6 +67,8 @@ This generates:
 my-app/
   Cargo.toml
   autumn.toml          # framework configuration
+  Dockerfile           # production container image
+  .dockerignore
   build.rs             # Tailwind CSS build pipeline
   src/
     main.rs            # your application entry point
@@ -87,7 +89,9 @@ The files that matter right now:
 | File                | Purpose                                    |
 |---------------------|--------------------------------------------|
 | `src/main.rs`       | Routes and application bootstrap           |
-| `autumn.toml`       | Server, database, logging, health config   |
+| `autumn.toml`       | Server, probes, telemetry, database config |
+| `Dockerfile`        | Multi-stage production image scaffold      |
+| `.dockerignore`     | Keeps local junk out of container builds   |
 | `build.rs`          | Compiles Tailwind CSS on `cargo build`     |
 | `static/`           | Auto-served at `/static/` (CSS, JS, images)|
 | `migrations/`       | Diesel SQL migrations                      |
@@ -171,6 +175,7 @@ endpoints are also auto-mounted at
 [http://localhost:3000/actuator/health](http://localhost:3000/actuator/health),
 [http://localhost:3000/actuator/info](http://localhost:3000/actuator/info), and
 [http://localhost:3000/actuator/metrics](http://localhost:3000/actuator/metrics).
+Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 
 The `/health` response looks like:
 
@@ -180,6 +185,28 @@ The `/health` response looks like:
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
 drain timeout).
+
+---
+
+## Production Notes
+
+The generated app starts with local-safe defaults:
+
+- sessions are in-memory unless you switch to Redis
+- `#[scheduled]` tasks run in-process
+- the generated Dockerfile is generic container scaffolding, not a full Kubernetes deployment
+
+Before deploying multiple replicas, you should usually:
+
+1. Set `AUTUMN_PROFILE=prod`
+2. Configure `/live`, `/ready`, and `/startup` in your platform probes
+3. Enable OTLP telemetry and point it at your collector
+4. Move sessions to Redis
+5. Run migrations as a one-shot job before starting web replicas
+
+The scaffolded `Dockerfile` and `autumn.toml` include commented examples for
+probes, telemetry, and Redis sessions. For the full deployment story, read the
+[Cloud-Native Guide](cloud-native.md).
 
 ---
 

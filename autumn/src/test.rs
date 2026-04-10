@@ -169,6 +169,7 @@ impl TestApp {
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),

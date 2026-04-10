@@ -9,10 +9,9 @@
 //! [`init`] automatically. You only need to call it directly in test
 //! harnesses or custom entry points.
 
-use crate::config::{LogConfig, LogFormat};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use crate::config::{LogConfig, TelemetryConfig};
 
-/// Initialize the tracing subscriber based on configuration.
+/// Initialize the tracing subscriber based on logging configuration alone.
 ///
 /// Must be called **once**, early in application startup -- before any
 /// `tracing::info!` / `tracing::debug!` calls. In normal usage,
@@ -24,48 +23,32 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 /// Panics if called a second time. The global tracing subscriber can
 /// only be set once per process.
 ///
-/// # Format selection
-///
-/// | [`LogFormat`] | Behaviour |
-/// |-------------|-----------|
-/// | `Auto` | JSON when `AUTUMN_ENV=production`, pretty otherwise |
-/// | `Pretty` | Always human-readable, colorized |
-/// | `Json` | Always structured JSON |
-///
-/// # Filter fallback
-///
-/// If the configured `level` string is not a valid `EnvFilter` directive,
-/// a warning is printed to stderr and the filter falls back to `"info"`.
 pub fn init(config: &LogConfig) {
-    let filter = EnvFilter::try_new(&config.level).unwrap_or_else(|e| {
-        eprintln!(
-            "Warning: invalid log filter {:?}: {e}, falling back to \"info\"",
-            config.level
-        );
-        EnvFilter::new("info")
-    });
+    let profile = crate::config::resolve_profile(&crate::config::OsEnv);
+    let _ = init_with_telemetry(config, &TelemetryConfig::default(), profile.as_deref())
+        .unwrap_or_else(|error| panic!("failed to initialize logging: {error}"));
+}
 
-    let use_json = match config.format {
-        LogFormat::Auto => is_production(),
-        LogFormat::Pretty => false,
-        LogFormat::Json => true,
-    };
-
-    if use_json {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().json())
-            .init();
-    } else {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt::layer().pretty())
-            .init();
-    }
+/// Initialize logging plus optional framework-managed telemetry.
+///
+/// Returns a guard that must stay alive for as long as OTLP export should stay
+/// active so batched spans can flush cleanly on shutdown.
+///
+/// # Errors
+///
+/// Returns [`crate::telemetry::TelemetryInitError`] when the telemetry plan is
+/// invalid or the tracing subscriber/exporter fails to initialize.
+pub fn init_with_telemetry(
+    config: &LogConfig,
+    telemetry: &TelemetryConfig,
+    profile: Option<&str>,
+) -> Result<crate::telemetry::TelemetryGuard, crate::telemetry::TelemetryInitError> {
+    crate::telemetry::init(config, telemetry, profile)
 }
 
 /// Returns `true` when `AUTUMN_ENV` is set to `"production"`
 /// (case-insensitive).
+#[cfg(test)]
 fn is_production() -> bool {
     std::env::var("AUTUMN_ENV")
         .map(|v| v.eq_ignore_ascii_case("production"))

@@ -1,66 +1,134 @@
-# Chapter 10: Configuration and Production Defaults
+ï»¿# Chapter 10: Configuration and Production Defaults
 
 **Goal:** By the end of this chapter, you will understand Autumn's profile-aware
 configuration system, know how to override settings with environment variables,
-and have a clear mental model for logging, health checks, and actuator
-endpoints in development and production.
+and have a clear mental model for probes, logging, telemetry, sessions, and
+deployment defaults in development and production.
 
 ---
 
-## Sections
+## The Five Layers
 
-### The Five Configuration Layers
+Autumn resolves configuration in this order:
 
 1. Framework defaults
-2. Profile smart defaults for `dev` / `prod`
+2. Smart defaults for `dev` or `prod`
 3. `autumn.toml`
 4. `autumn-{profile}.toml`
 5. `AUTUMN_*` environment variables
 
-How the layers merge, how the active profile is resolved, and why Autumn keeps
-shared config separate from environment-specific overrides.
+That ordering keeps local defaults readable while still letting deployment
+systems override the real runtime knobs at the edge.
 
-### `autumn.toml` Sections
+## Local-Safe vs Production-Safe
 
-Walking through every section: `[server]` (host, port, shutdown timeout),
-`[database]` (URL, pool size, connect timeout), `[log]` (level, format),
-`[health]` (path, detail level), `[actuator]` (sensitive endpoint exposure),
-and the security/session sections that matter once you leave toy apps behind.
+Autumn still has a deliberate split between safe local defaults and safe
+distributed defaults.
 
-### Environment Variable Overrides
+Local-safe defaults:
 
-The `AUTUMN_SECTION__FIELD` naming convention (double underscore separates
-sections). Examples: `AUTUMN_SERVER__PORT=8080`,
-`AUTUMN_DATABASE__URL=postgres://...`, `AUTUMN_LOG__FORMAT=Json`,
-`AUTUMN_PROFILE=prod`. Env vars always win over TOML layers.
+- in-memory sessions
+- pretty logs in `dev`
+- process-local `#[scheduled]` tasks
+- one-process startup with no explicit migration job
 
-### Structured Logging
+Production-safe expectations:
 
-The `LogFormat` enum: `Auto`, `Pretty`, `Json`. How profile smart defaults and
-runtime environment interact, and when to force JSON for deployment logs.
+- `AUTUMN_PROFILE=prod`
+- probe wiring for `/live`, `/ready`, and `/startup`
+- JSON logs or OTLP export
+- Redis-backed sessions for multi-replica deployments
+- explicit migration job before web replicas start
 
-### Health and Actuator
+The framework warns if the `prod` profile still uses in-memory sessions without
+`session.allow_memory_in_production = true`.
 
-Auto-mounted `/health` for simple probes plus `/actuator/health`,
-`/actuator/info`, `/actuator/metrics`, and the sensitive endpoints exposed in
-development. Customizing the health path and reasoning about what should stay
-visible in production.
+## `autumn.toml` Sections That Matter First
 
-### Graceful Shutdown
+The new scaffold keeps `autumn.toml` short, but the first sections worth
+understanding are:
 
-How `Ctrl+C` and `SIGTERM` trigger shutdown. The `shutdown_timeout_secs`
-setting. Draining in-flight requests.
+- `[server]` for `host`, `port`, and `shutdown_timeout_secs`
+- `[log]` for `level` and `format`
+- `[health]` for `/health`, `/live`, `/ready`, and `/startup`
+- `[telemetry]` for OTLP export and service metadata
+- `[session]` and `[session.redis]` when you move beyond a single process
+- `[database]` for connection URL, pool size, and connect timeout
+- `[actuator]` for prefix and sensitive endpoint exposure
 
-### Checkpoint
+## Environment Variable Overrides
 
-Expected project state with profile-aware config, environment overrides, and a
-clear dev-vs-prod operational story.
+Environment variables always win. A few high-signal examples:
+
+```bash
+AUTUMN_PROFILE=prod
+AUTUMN_SERVER__PORT=8080
+AUTUMN_LOG__FORMAT=Json
+AUTUMN_TELEMETRY__ENABLED=true
+AUTUMN_TELEMETRY__OTLP_ENDPOINT=http://otel-collector:4317
+AUTUMN_SESSION__BACKEND=redis
+AUTUMN_SESSION__REDIS__URL=redis://redis:6379
+```
+
+The naming rule is `AUTUMN_SECTION__FIELD`, with nested sections using another
+double underscore.
+
+## Probes and Actuator
+
+Autumn auto-mounts four probe endpoints:
+
+- `/live`
+- `/ready`
+- `/startup`
+- `/health`
+
+Recommended use:
+
+- liveness probe -> `/live`
+- readiness probe -> `/ready`
+- startup probe -> `/startup`
+
+Actuator endpoints live under `/actuator` by default and expose health, info,
+metrics, config properties, loggers, and task visibility based on the
+`actuator.sensitive` setting.
+
+## Telemetry
+
+For production, treat telemetry as a first-class config section instead of a
+future TODO:
+
+```toml
+[telemetry]
+enabled = true
+service_name = "my-app"
+service_namespace = "apps"
+environment = "production"
+otlp_endpoint = "http://otel-collector:4317"
+protocol = "Grpc"
+```
+
+Use `Json` logs or OTLP tracing in production. `Pretty` logs are for humans,
+not aggregators.
+
+## `#[scheduled]` vs Harvest
+
+Use `#[scheduled]` when the task is light, in-process, and you can tolerate one
+copy per replica or your application code can coordinate ownership explicitly.
+
+Use Harvest when the work needs durability, retries, workflow history, or clear
+singleton semantics across multiple replicas. The framework-level scheduler is
+not a distributed job system.
+
+## Deployment Checkpoint
+
+At this point your app should have:
+
+1. profile-aware config with env overrides
+2. probe endpoints wired for your platform
+3. telemetry config ready for an OTLP collector
+4. a decision on whether sessions stay local or move to Redis
+5. a clear plan for migrations and background work before you deploy replicas
 
 ---
 
-*This chapter still needs the full walkthrough, but the outline above reflects
-the current framework rather than the old pre-profile configuration model.*
-
----
-
-Previous: [Chapter 9 — Error Handling](09-errors.md) | Next: [Chapter 11 — What's Next](11-whats-next.md)
+Previous: [Chapter 9 - Error Handling](09-errors.md) | Next: [Chapter 11 - What's Next](11-whats-next.md)

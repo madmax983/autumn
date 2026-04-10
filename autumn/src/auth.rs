@@ -451,6 +451,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -499,6 +500,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -555,6 +557,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -665,6 +668,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -718,7 +722,8 @@ mod tests {
                 "sess1",
                 std::collections::HashMap::from([("user_id".into(), "42".into())]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
             #[cfg(feature = "db")]
@@ -726,6 +731,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -784,7 +790,8 @@ mod tests {
                     ("role".into(), "viewer".into()),
                 ]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
             #[cfg(feature = "db")]
@@ -792,6 +799,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -846,7 +854,8 @@ mod tests {
                     ("role".into(), "editor".into()),
                 ]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
             #[cfg(feature = "db")]
@@ -854,6 +863,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -902,7 +912,7 @@ mod tests {
         // Pre-populate a session with user_id
         let mut session_data = std::collections::HashMap::new();
         session_data.insert("user_id".into(), "42".into());
-        store.save("valid-session", session_data).await;
+        store.save("valid-session", session_data).await.unwrap();
 
         let state = AppState {
             #[cfg(feature = "db")]
@@ -910,6 +920,7 @@ mod tests {
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
