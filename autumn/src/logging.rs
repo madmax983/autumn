@@ -3,7 +3,7 @@
 //! Call [`init`] once, early in application startup (after loading config),
 //! to install the global tracing subscriber. The subscriber respects
 //! [`LogConfig`] to choose between human-readable and JSON output, and
-//! uses [`EnvFilter`] to parse the configured log level directive.
+//! uses [`tracing_subscriber::EnvFilter`] to parse the configured log level directive.
 //!
 //! In normal usage, [`AppBuilder::run`](crate::app::AppBuilder::run) calls
 //! [`init`] automatically. You only need to call it directly in test
