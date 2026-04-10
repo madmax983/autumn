@@ -9,6 +9,22 @@ pub struct EnvGuard {
 
 #[cfg(test)]
 impl EnvGuard {
+    /// Safely updates multiple environment variables using a process-wide mutex.
+    ///
+    /// Since Cargo runs tests in parallel within the same process, modifying
+    /// environment variables via `std::env::set_var` can cause data races and
+    /// Undefined Behavior. `EnvGuard` prevents this by acquiring a static mutex.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn::test_utils::EnvGuard;
+    ///
+    /// let _guard = EnvGuard::set_many(&[
+    ///     ("AUTUMN_ENV", Some("test")),
+    ///     ("SOME_VAR", None),
+    /// ]);
+    /// ```
     pub fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let lock = ENV_LOCK

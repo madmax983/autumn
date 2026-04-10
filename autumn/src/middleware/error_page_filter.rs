@@ -166,6 +166,10 @@ where
 }
 
 pin_project_lite::pin_project! {
+    /// A future wrapper that stores context needed for error page rendering.
+    ///
+    /// This is used internally by the [`ErrorPageFilterLayer`](crate::middleware::ErrorPageFilterLayer) to remember whether
+    /// the original request wanted HTML and what its path and ID were.
     pub struct ErrorPageContextFuture<F> {
         #[pin]
         inner: F,

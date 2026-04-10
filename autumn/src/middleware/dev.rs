@@ -11,6 +11,18 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+/// Returns true if the live reload environment is active.
+///
+/// The development live-reload environment is active only when both the
+/// `AUTUMN_DEV_RELOAD` and `AUTUMN_DEV_RELOAD_STATE` environment variables are present.
+///
+/// # Examples
+///
+/// ```rust
+/// if autumn::middleware::dev::is_enabled() {
+///     // Inject live reload scripts
+/// }
+/// ```
 pub fn is_enabled() -> bool {
     std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
 }
