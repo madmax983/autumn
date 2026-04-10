@@ -224,6 +224,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn is_enabled_accepts_non_utf8_state_env() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStringExt;
+
+        let non_utf8 = std::ffi::OsString::from_vec(vec![0x66, 0x80, 0x6f]);
+        let _env = EnvGuard::set_many_os(&[
+            (DEV_RELOAD_ENV, Some(OsStr::new("1"))),
+            (DEV_RELOAD_STATE_ENV, Some(non_utf8.as_os_str())),
+        ]);
+
+        assert!(is_enabled());
+    }
+
     #[tokio::test]
     async fn live_reload_state_handler_defaults_when_state_missing() {
         let _env = EnvGuard::set_many(&[(DEV_RELOAD_ENV, Some("1")), (DEV_RELOAD_STATE_ENV, None)]);
