@@ -39,7 +39,7 @@ fn cloud_native_scaffold_includes_probe_and_telemetry_examples() {
     assert!(config.contains(r#"# ready_path = "/ready""#));
     assert!(config.contains(r#"# startup_path = "/startup""#));
     assert!(config.contains("# [telemetry]"));
-    assert!(config.contains(r#"# enabled = true"#));
+    assert!(config.contains(r"# enabled = true"));
     assert!(config.contains(r#"# otlp_endpoint = "http://otel-collector:4317""#));
 }
 
