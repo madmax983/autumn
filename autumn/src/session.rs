@@ -893,6 +893,9 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -933,6 +936,7 @@ mod tests {
 
     fn test_state() -> crate::state::AppState {
         crate::state::AppState {
+            extensions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,

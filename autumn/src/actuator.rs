@@ -1057,6 +1057,9 @@ mod tests {
 
     fn test_state_with_config(config: &AutumnConfig) -> AppState {
         AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: config.profile.clone().or_else(|| Some("dev".into())),

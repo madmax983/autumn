@@ -80,3 +80,13 @@ CREATE TABLE votes (
 CREATE INDEX idx_votes_user_id ON votes (user_id);
 CREATE INDEX idx_votes_post_id ON votes (post_id);
 CREATE INDEX idx_votes_comment_id ON votes (comment_id);
+
+-- Durable live-feed events for cross-process WebSocket fan-out
+CREATE TABLE live_feed_events (
+    id BIGSERIAL PRIMARY KEY,
+    subreddit_slug TEXT NOT NULL,
+    event JSONB NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_live_feed_events_created_at ON live_feed_events (created_at);

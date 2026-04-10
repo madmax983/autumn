@@ -8,19 +8,23 @@
 use std::time::Duration;
 
 use autumn_harvest::error::database_error;
-use autumn_harvest::models::NewWorkflowExecution;
 use autumn_harvest::prelude::*;
-use autumn_harvest::queue::{EnqueueParams, TaskType};
-use autumn_harvest::worker::DbPool;
 use autumn_web::AppState;
+use autumn_web_harvest::{AppDbPool, WorkflowStartRequest};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
-use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+#[cfg(test)]
+use diesel_async::AsyncPgConnection;
+
+use crate::live_events::{
+    post_created_event, publish_stored_live_event_best_effort, store_activity_event,
+};
 use crate::models::User;
-use crate::routes::live::publish_activity;
 use crate::schema::posts;
 use crate::schema::users;
 use crate::tasks::calculate_hot_rank;
@@ -102,8 +106,8 @@ async fn award_starter_karma(ctx: &ActivityContext, input: Value) -> HarvestResu
         .get("starter_karma")
         .and_then(Value::as_i64)
         .unwrap_or(STARTER_KARMA);
-    let pool = ctx.state::<DbPool>().ok_or_else(|| {
-        HarvestError::Config("reddit-clone Harvest activity is missing DbPool".into())
+    let pool = ctx.state::<AppDbPool>().ok_or_else(|| {
+        HarvestError::Config("reddit-clone Harvest activity is missing AppDbPool".into())
     })?;
     let mut conn = pool.get().await.map_err(database_error)?;
 
@@ -125,8 +129,8 @@ async fn award_starter_karma(ctx: &ActivityContext, input: Value) -> HarvestResu
 )]
 async fn refresh_post_hot_rank(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
     let post_id = parse_i64_field(&input, "post_id", "post hot-rank input")?;
-    let pool = ctx.state::<DbPool>().ok_or_else(|| {
-        HarvestError::Config("reddit-clone Harvest activity is missing DbPool".into())
+    let pool = ctx.state::<AppDbPool>().ok_or_else(|| {
+        HarvestError::Config("reddit-clone Harvest activity is missing AppDbPool".into())
     })?;
     let mut conn = pool.get().await.map_err(database_error)?;
     let (score, created_at): (i64, chrono::NaiveDateTime) = posts::table
@@ -154,25 +158,33 @@ async fn refresh_post_hot_rank(ctx: &ActivityContext, input: Value) -> HarvestRe
     retry = RetryPolicy::fixed(3, Duration::from_secs(1))
 )]
 async fn broadcast_post_created(ctx: &ActivityContext, input: Value) -> HarvestResult<Value> {
-    let state = ctx.state::<AppState>().ok_or_else(|| {
-        HarvestError::Config("reddit-clone Harvest activity is missing AppState".into())
+    let pool = ctx.state::<AppDbPool>().ok_or_else(|| {
+        HarvestError::Config("reddit-clone Harvest activity is missing AppDbPool".into())
     })?;
+    let mut conn = pool.get().await.map_err(database_error)?;
     let post_id = parse_i64_field(&input, "post_id", "post broadcast input")?;
     let title = parse_string_field(&input, "title", "post broadcast input")?;
     let post_slug = parse_string_field(&input, "post_slug", "post broadcast input")?;
     let subreddit_slug = parse_string_field(&input, "subreddit_slug", "post broadcast input")?;
     let author_username = parse_string_field(&input, "author_username", "post broadcast input")?;
-    let event = json!({
-        "type": "post_created",
-        "post_id": post_id,
-        "title": title,
-        "post_slug": post_slug,
-        "subreddit_slug": subreddit_slug,
-        "author_username": author_username,
-        "path": format!("/r/{subreddit_slug}/posts/{post_slug}"),
-    });
-
-    publish_activity(state, &subreddit_slug, &event.to_string());
+    let event = post_created_event(
+        post_id,
+        &title,
+        &post_slug,
+        &subreddit_slug,
+        &author_username,
+    );
+    let event_id = store_activity_event(&mut conn, &subreddit_slug, &event)
+        .await
+        .map_err(database_error)?;
+    if let Some(state) = ctx.state::<AppState>() {
+        publish_stored_live_event_best_effort(state, event_id).await;
+    } else {
+        tracing::warn!(
+            event_id,
+            "reddit-clone Harvest activity is missing AppState for live-event bus publication"
+        );
+    }
 
     Ok(json!({
         "post_id": post_id,
@@ -192,64 +204,25 @@ pub fn registered_activities() -> Vec<ActivityInfo> {
     ]
 }
 
-pub async fn start_user_onboarding(
-    conn: &mut AsyncPgConnection,
-    user: &User,
-) -> HarvestResult<ExecutionId> {
-    let workflow_id = onboarding_workflow_id(user.id);
-    let input = onboarding_input(user);
-
-    start_workflow_execution(
-        conn,
-        ONBOARDING_WORKFLOW_NAME,
-        &workflow_id,
-        ONBOARDING_QUEUE,
-        input,
-        json!({
-            "kind": "user_onboarding",
-            "user_id": user.id,
-        }),
-        json!({
-            "user_id": user.id,
-            "username": user.username,
-        }),
-    )
-    .await
-}
-
-pub async fn start_post_publication(
-    conn: &mut AsyncPgConnection,
-    post_id: i64,
-    title: &str,
-    post_slug: &str,
-    subreddit_slug: &str,
-    author_username: &str,
-) -> HarvestResult<ExecutionId> {
-    let workflow_id = post_publication_workflow_id(post_id);
-    let input = post_publication_input(post_id, title, post_slug, subreddit_slug, author_username);
-
-    start_workflow_execution(
-        conn,
-        POST_PUBLICATION_WORKFLOW_NAME,
-        &workflow_id,
-        POST_PUBLICATION_QUEUE,
-        input,
-        json!({
-            "kind": "post_publication",
-            "post_id": post_id,
-        }),
-        json!({
-            "post_id": post_id,
-            "post_slug": post_slug,
-            "subreddit_slug": subreddit_slug,
-            "author_username": author_username,
-        }),
-    )
-    .await
-}
-
 fn onboarding_workflow_id(user_id: i64) -> String {
     format!("user-onboarding:{user_id}")
+}
+
+pub(crate) fn user_onboarding_dispatch(user: &User) -> WorkflowStartRequest {
+    WorkflowStartRequest {
+        workflow_name: ONBOARDING_WORKFLOW_NAME.to_string(),
+        workflow_id: onboarding_workflow_id(user.id),
+        queue_name: ONBOARDING_QUEUE.to_string(),
+        input: onboarding_input(user),
+        memo: Some(json!({
+            "kind": "user_onboarding",
+            "user_id": user.id,
+        })),
+        search_attrs: Some(json!({
+            "user_id": user.id,
+            "username": user.username,
+        })),
+    }
 }
 
 fn onboarding_input(user: &User) -> Value {
@@ -261,6 +234,31 @@ fn onboarding_input(user: &User) -> Value {
 
 fn post_publication_workflow_id(post_id: i64) -> String {
     format!("post-publication:{post_id}")
+}
+
+pub(crate) fn post_publication_dispatch(
+    post_id: i64,
+    title: &str,
+    post_slug: &str,
+    subreddit_slug: &str,
+    author_username: &str,
+) -> WorkflowStartRequest {
+    WorkflowStartRequest {
+        workflow_name: POST_PUBLICATION_WORKFLOW_NAME.to_string(),
+        workflow_id: post_publication_workflow_id(post_id),
+        queue_name: POST_PUBLICATION_QUEUE.to_string(),
+        input: post_publication_input(post_id, title, post_slug, subreddit_slug, author_username),
+        memo: Some(json!({
+            "kind": "post_publication",
+            "post_id": post_id,
+        })),
+        search_attrs: Some(json!({
+            "post_id": post_id,
+            "post_slug": post_slug,
+            "subreddit_slug": subreddit_slug,
+            "author_username": author_username,
+        })),
+    }
 }
 
 fn post_publication_input(
@@ -279,45 +277,33 @@ fn post_publication_input(
     })
 }
 
+#[cfg(test)]
 async fn start_workflow_execution(
     conn: &mut AsyncPgConnection,
-    workflow_name: &'static str,
+    workflow_name: &str,
     workflow_id: &str,
-    queue_name: &'static str,
+    queue_name: &str,
     input: Value,
-    memo: Value,
-    search_attrs: Value,
+    memo: Option<Value>,
+    search_attrs: Option<Value>,
 ) -> HarvestResult<ExecutionId> {
-    let exec_id = ExecutionId::new();
-    let row = NewWorkflowExecution {
-        id: exec_id.as_uuid(),
-        workflow_name,
-        workflow_id,
-        run_id: ExecutionId::new().as_uuid(),
-        shard_id: 0,
-        input: input.clone(),
-        parent_id: None,
-        queue_name,
-        execution_timeout: None,
-        memo: Some(memo),
-        search_attrs: Some(search_attrs),
-    };
-    let started_event = WorkflowEvent::WorkflowStarted {
-        input: input.clone(),
-        timestamp: chrono::Utc::now(),
-    };
-    let mut params = EnqueueParams::new(queue_name, TaskType::Workflow, input);
-    params.workflow_exec_id = Some(exec_id.as_uuid());
+    let start = start_or_load_workflow_execution(
+        conn,
+        StartWorkflowParams {
+            workflow_name,
+            workflow_id,
+            shard_id: 0,
+            input,
+            parent_id: None,
+            queue_name,
+            execution_timeout: None,
+            memo,
+            search_attrs,
+        },
+    )
+    .await?;
 
-    diesel::insert_into(autumn_harvest::schema::harvest_workflow_executions::table)
-        .values(&row)
-        .execute(conn)
-        .await
-        .map_err(database_error)?;
-    autumn_harvest::store::append_events(conn, exec_id, &[started_event], 0).await?;
-    autumn_harvest::queue::enqueue(conn, &params).await?;
-
-    Ok(exec_id)
+    Ok(start.exec_id)
 }
 
 fn parse_user_id(input: &Value) -> HarvestResult<i64> {
@@ -346,6 +332,83 @@ fn parse_string_field(input: &Value, field: &str, context: &str) -> HarvestResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::ExpressionMethods;
+    use diesel::QueryDsl;
+    use diesel::SelectableHelper;
+    use diesel_async::AsyncConnection;
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::RunQueryDsl;
+    use testcontainers::ContainerAsync;
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    const HARVEST_INIT_SQL: &str = include_str!(
+        "../../../autumn-harvest/autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"
+    );
+
+    #[tokio::test]
+    async fn duplicate_publication_reuses_existing_execution() {
+        let (mut conn, _container) = setup_test_db().await;
+        let workflow_id = onboarding_workflow_id(42);
+        let input = json!({
+            "user_id": 42,
+            "username": "ferris",
+        });
+
+        let first_exec_id = start_workflow_execution(
+            &mut conn,
+            ONBOARDING_WORKFLOW_NAME,
+            &workflow_id,
+            ONBOARDING_QUEUE,
+            input.clone(),
+            Some(json!({
+                "kind": "user_onboarding",
+                "user_id": 42,
+            })),
+            Some(json!({
+                "user_id": 42,
+                "username": "ferris",
+            })),
+        )
+        .await
+        .expect("first publication should succeed");
+
+        let second_exec_id = start_workflow_execution(
+            &mut conn,
+            ONBOARDING_WORKFLOW_NAME,
+            &workflow_id,
+            ONBOARDING_QUEUE,
+            input,
+            Some(json!({
+                "kind": "user_onboarding",
+                "user_id": 42,
+            })),
+            Some(json!({
+                "user_id": 42,
+                "username": "ferris",
+            })),
+        )
+        .await
+        .expect("duplicate publication should resolve safely");
+
+        assert_eq!(
+            second_exec_id, first_exec_id,
+            "duplicate publication should return the original execution id"
+        );
+
+        let executions =
+            load_workflow_rows(&mut conn, ONBOARDING_WORKFLOW_NAME, &workflow_id).await;
+        assert_eq!(
+            executions.len(),
+            1,
+            "duplicate publication should not create a second workflow row"
+        );
+        let queued_tasks = count_workflow_tasks(&mut conn, first_exec_id).await;
+        assert_eq!(
+            queued_tasks, 1,
+            "duplicate publication should not enqueue duplicate tasks"
+        );
+    }
 
     #[test]
     fn onboarding_metadata_uses_expected_names() {
@@ -415,5 +478,61 @@ mod tests {
                 "author_username": "ferris",
             })
         );
+    }
+
+    async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
+        let container = Postgres::default()
+            .with_init_sql(HARVEST_INIT_SQL.to_string().into_bytes())
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to get container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to get container port");
+        let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        let conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+            .await
+            .expect("failed to connect to Postgres container");
+
+        (conn, container)
+    }
+
+    async fn load_workflow_rows(
+        conn: &mut AsyncPgConnection,
+        workflow_name: &str,
+        workflow_id: &str,
+    ) -> Vec<autumn_harvest::models::WorkflowExecution> {
+        autumn_harvest::schema::harvest_workflow_executions::table
+            .filter(
+                autumn_harvest::schema::harvest_workflow_executions::workflow_name
+                    .eq(workflow_name),
+            )
+            .filter(
+                autumn_harvest::schema::harvest_workflow_executions::workflow_id.eq(workflow_id),
+            )
+            .order(autumn_harvest::schema::harvest_workflow_executions::created_at.asc())
+            .select(autumn_harvest::models::WorkflowExecution::as_select())
+            .load(conn)
+            .await
+            .expect("failed to load workflow rows")
+    }
+
+    async fn count_workflow_tasks(conn: &mut AsyncPgConnection, exec_id: ExecutionId) -> i64 {
+        autumn_harvest::schema::harvest_task_queue::table
+            .filter(
+                autumn_harvest::schema::harvest_task_queue::workflow_exec_id
+                    .eq(Some(exec_id.as_uuid())),
+            )
+            .count()
+            .get_result(conn)
+            .await
+            .expect("failed to count workflow task rows")
     }
 }

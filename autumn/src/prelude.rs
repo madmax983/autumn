@@ -92,6 +92,9 @@ mod tests {
     fn prelude_types_are_accessible() {
         #[cfg(feature = "db")]
         let _state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
@@ -108,6 +111,9 @@ mod tests {
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,

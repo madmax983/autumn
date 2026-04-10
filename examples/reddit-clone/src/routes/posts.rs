@@ -6,8 +6,12 @@
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::State;
+use autumn_web_harvest::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use diesel::prelude::*;
+use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 use tracing::warn;
 
 use crate::models::{Post, Subreddit, User};
@@ -277,6 +281,7 @@ pub struct SubmitPostForm {
 #[secured]
 #[post("/submit")]
 pub async fn submit(
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<SubmitPostForm>,
@@ -324,39 +329,63 @@ pub async fn submit(
 
     // Insert the post, then create an explicit author upvote so
     // score always matches the sum of actual vote rows.
-    let post_id: i64 = diesel::insert_into(posts::table)
-        .values((
-            posts::title.eq(&title),
-            posts::slug.eq(&slug),
-            posts::body.eq(form.0.body.trim()),
-            posts::url.eq(&url),
-            posts::author_id.eq(user_id),
-            posts::subreddit_id.eq(form.0.subreddit_id),
-            posts::score.eq(1_i64),
-        ))
-        .returning(posts::id)
-        .get_result(&mut *db)
+    let body = form.0.body.trim().to_string();
+    let subreddit_id = form.0.subreddit_id;
+    let subreddit_slug = sub.slug.clone();
+    let url_for_insert = url.clone();
+    let title_for_insert = title.clone();
+    let slug_for_insert = slug.clone();
+    let author_username_for_outbox = author_username.clone();
+    let post_id = (&mut *db)
+        .transaction::<i64, AutumnError, _>(|conn| {
+            let title = title_for_insert.clone();
+            let slug = slug_for_insert.clone();
+            let body = body.clone();
+            let url = url_for_insert.clone();
+            let subreddit_slug = subreddit_slug.clone();
+            let author_username = author_username_for_outbox.clone();
+            async move {
+                let post_id: i64 = diesel::insert_into(posts::table)
+                    .values((
+                        posts::title.eq(&title),
+                        posts::slug.eq(&slug),
+                        posts::body.eq(&body),
+                        posts::url.eq(&url),
+                        posts::author_id.eq(user_id),
+                        posts::subreddit_id.eq(subreddit_id),
+                        posts::score.eq(1_i64),
+                    ))
+                    .returning(posts::id)
+                    .get_result(conn)
+                    .await?;
+
+                diesel::insert_into(crate::schema::votes::table)
+                    .values((
+                        crate::schema::votes::user_id.eq(user_id),
+                        crate::schema::votes::post_id.eq(post_id),
+                        crate::schema::votes::value.eq(1_i16),
+                    ))
+                    .execute(conn)
+                    .await?;
+
+                let request = crate::workflows::post_publication_dispatch(
+                    post_id,
+                    &title,
+                    &slug,
+                    &subreddit_slug,
+                    &author_username,
+                );
+                enqueue_workflow_start_outbox(conn, &request)
+                    .await
+                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+                Ok(post_id)
+            }
+            .scope_boxed()
+        })
         .await?;
 
-    diesel::insert_into(crate::schema::votes::table)
-        .values((
-            crate::schema::votes::user_id.eq(user_id),
-            crate::schema::votes::post_id.eq(post_id),
-            crate::schema::votes::value.eq(1_i16),
-        ))
-        .execute(&mut *db)
-        .await?;
-
-    if let Err(error) = crate::workflows::start_post_publication(
-        &mut db,
-        post_id,
-        &title,
-        &slug,
-        &sub.slug,
-        &author_username,
-    )
-    .await
-    {
+    if let Err(error) = flush_workflow_start_outbox(&state).await {
         warn!(
             post_id,
             title = %title,
@@ -364,7 +393,7 @@ pub async fn submit(
             subreddit_slug = %sub.slug,
             author_username = %author_username,
             error = %error,
-            "failed to enqueue post publication workflow"
+            "failed to flush post publication workflow outbox"
         );
     }
 

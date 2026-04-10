@@ -9,6 +9,10 @@
 //! from the state. However, custom extractors can access the state via
 //! `axum::extract::State<AppState>`.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use crate::actuator;
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
@@ -42,6 +46,10 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AppState {
+    /// Runtime-managed typed extensions installed by integrations after the app
+    /// state has been constructed.
+    pub(crate) extensions: Arc<Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+
     /// Database connection pool, or `None` when no `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
@@ -87,6 +95,45 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Install or replace a typed runtime extension.
+    ///
+    /// Integrations use this to publish typed runtime resources, such as
+    /// background-worker handles or dedicated storage pools, after startup.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    pub fn insert_extension<T>(&self, value: T)
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.extensions
+            .lock()
+            .expect("app state extension lock poisoned")
+            .insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// Borrow a typed runtime extension if it has been installed.
+    ///
+    /// The returned [`Arc`] is cloned out of the internal registry so callers
+    /// do not hold the state mutex while using the value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    #[must_use]
+    pub fn extension<T>(&self) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.extensions
+            .lock()
+            .expect("app state extension lock poisoned")
+            .get(&TypeId::of::<T>())
+            .cloned()
+            .and_then(|value| Arc::downcast::<T>(value).ok())
+    }
+
     /// Returns the database connection pool.
     #[cfg(feature = "db")]
     #[must_use]
@@ -145,6 +192,16 @@ impl AppState {
         pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Install a typed runtime extension while building test or ad-hoc state.
+    #[must_use]
+    pub fn with_extension<T>(self, value: T) -> Self
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        self.insert_extension(value);
         self
     }
 
@@ -243,12 +300,15 @@ impl AppState {
         self.set_draining_for_test(true);
     }
 
-    /// Create an `AppState` suitable for testing, with sensible defaults
-    /// for all fields. Database pool is `None`.
-    #[allow(dead_code)]
+    /// Create a minimal detached `AppState` without an HTTP server.
+    ///
+    /// This is useful for background runtimes or helper processes that still
+    /// need framework-managed resources such as typed extensions, metrics, or
+    /// WebSocket channel registries.
     #[must_use]
-    pub fn for_test() -> Self {
+    pub fn detached() -> Self {
         Self {
+            extensions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -264,6 +324,14 @@ impl AppState {
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
         }
+    }
+
+    /// Create an `AppState` suitable for testing, with sensible defaults
+    /// for all fields. Database pool is `None`.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn for_test() -> Self {
+        Self::detached()
     }
 }
 
@@ -287,6 +355,14 @@ impl std::fmt::Debug for AppState {
                 .pool
                 .as_ref()
                 .map(|p| format!("Pool(max={})", p.status().max_size)),
+        );
+        s.field(
+            "extensions",
+            &self
+                .extensions
+                .lock()
+                .map(|extensions| extensions.len())
+                .unwrap_or(0),
         );
         s.field("profile", &self.profile)
             .field("started_at", &self.started_at)
@@ -327,6 +403,13 @@ mod tests {
         let state = AppState::for_test().with_pool(pool);
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
+    }
+
+    #[test]
+    fn detached_state_starts_without_profile() {
+        let state = AppState::detached();
+
+        assert_eq!(state.profile(), "default");
     }
 
     fn require_clone<T: Clone>(t: &T) -> T {
@@ -375,5 +458,18 @@ mod tests {
         {
             let _pool = state.pool();
         }
+        let _missing = state.extension::<String>();
+    }
+
+    #[test]
+    fn app_state_runtime_extensions_round_trip() {
+        let state = AppState::for_test();
+        state.insert_extension(String::from("haunted"));
+
+        let stored = state
+            .extension::<String>()
+            .expect("runtime extension should be installed");
+
+        assert_eq!(stored.as_str(), "haunted");
     }
 }
