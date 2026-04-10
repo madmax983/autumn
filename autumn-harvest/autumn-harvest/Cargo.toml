@@ -45,3 +45,7 @@ testcontainers-modules = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "security"
+path = "tests/security/sql_injection.rs"
