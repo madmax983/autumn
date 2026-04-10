@@ -101,7 +101,7 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    fn disabled() -> Self {
+    const fn disabled() -> Self {
         Self {
             #[cfg(feature = "telemetry-otlp")]
             provider: None,
@@ -109,7 +109,7 @@ impl TelemetryGuard {
     }
 
     #[cfg(feature = "telemetry-otlp")]
-    fn with_provider(provider: SdkTracerProvider) -> Self {
+    const fn with_provider(provider: SdkTracerProvider) -> Self {
         Self {
             provider: Some(provider),
         }
@@ -130,6 +130,11 @@ impl TelemetryRuntime {
     ///
     /// This function is pure and intentionally avoids touching any global
     /// tracing state so tests can exercise the contract safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryInitError`] when strict telemetry is enabled and the
+    /// OTLP configuration is incomplete or invalid.
     pub fn from_config(
         log: &LogConfig,
         telemetry: &TelemetryConfig,
@@ -187,6 +192,11 @@ impl TelemetryRuntime {
 }
 
 /// Initialize the global tracing subscriber based on Autumn telemetry config.
+///
+/// # Errors
+///
+/// Returns [`TelemetryInitError`] when telemetry planning fails or when the
+/// tracing subscriber / OTLP exporter cannot be installed.
 pub fn init(
     log: &LogConfig,
     telemetry: &TelemetryConfig,

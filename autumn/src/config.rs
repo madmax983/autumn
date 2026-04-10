@@ -602,7 +602,7 @@ impl AutumnConfig {
     /// - `AUTUMN_TELEMETRY__SERVICE_VERSION` -> `telemetry.service_version` (String)
     /// - `AUTUMN_TELEMETRY__ENVIRONMENT` -> `telemetry.environment` (String)
     /// - `AUTUMN_TELEMETRY__OTLP_ENDPOINT` -> `telemetry.otlp_endpoint` (String)
-    /// - `AUTUMN_TELEMETRY__PROTOCOL` -> `telemetry.protocol` (Grpc | HttpProtobuf)
+    /// - `AUTUMN_TELEMETRY__PROTOCOL` -> `telemetry.protocol` (`Grpc` | `HttpProtobuf`)
     /// - `AUTUMN_TELEMETRY__STRICT` -> `telemetry.strict` (bool)
     ///
     /// # Health / Probes
@@ -1071,10 +1071,11 @@ pub struct TelemetryConfig {
 }
 
 /// OTLP transport protocol selection.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 pub enum TelemetryProtocol {
     /// OTLP over gRPC.
     #[serde(alias = "grpc", alias = "GRPC")]
+    #[default]
     Grpc,
     /// OTLP over HTTP/protobuf.
     #[serde(
@@ -1093,12 +1094,6 @@ impl TelemetryProtocol {
             | "httpprotobuf" => Some(Self::HttpProtobuf),
             _ => None,
         }
-    }
-}
-
-impl Default for TelemetryProtocol {
-    fn default() -> Self {
-        Self::Grpc
     }
 }
 

@@ -238,6 +238,7 @@ pub struct ConfigProperties {
 impl ConfigProperties {
     /// Build config properties with source tracking from the loaded config.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &crate::config::AutumnConfig) -> Self {
         let profile = config.profile.as_deref().unwrap_or("default");
         let defaults = crate::config::AutumnConfig::default();
@@ -1155,12 +1156,23 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_env_available_in_sensitive_mode() {
-        let mut config = AutumnConfig::default();
-        config.profile = Some("prod".into());
-        config.server.port = 4100;
-        config.telemetry.enabled = true;
-        config.telemetry.service_name = "cloud-app".into();
-        config.health.path = "/healthz".into();
+        let config = AutumnConfig {
+            profile: Some("prod".into()),
+            server: crate::config::ServerConfig {
+                port: 4100,
+                ..crate::config::ServerConfig::default()
+            },
+            telemetry: crate::config::TelemetryConfig {
+                enabled: true,
+                service_name: "cloud-app".into(),
+                ..crate::config::TelemetryConfig::default()
+            },
+            health: crate::config::HealthConfig {
+                path: "/healthz".into(),
+                ..crate::config::HealthConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
 
         let app = actuator_router(true).with_state(test_state_with_config(&config));
         let resp = app

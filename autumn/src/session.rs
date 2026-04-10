@@ -332,9 +332,10 @@ pub struct SessionConfig {
     pub redis: SessionRedisConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionBackend {
+    #[default]
     Memory,
     Redis,
 }
@@ -346,12 +347,6 @@ impl SessionBackend {
             "redis" => Some(Self::Redis),
             _ => None,
         }
-    }
-}
-
-impl Default for SessionBackend {
-    fn default() -> Self {
-        Self::Memory
     }
 }
 
@@ -426,6 +421,12 @@ impl Default for SessionConfig {
 }
 
 impl SessionConfig {
+    /// Resolve the concrete session backend plan from config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionBackendConfigError`] when the configured backend is
+    /// incomplete or invalid, such as Redis without a URL.
     pub fn backend_plan(
         &self,
         profile: Option<&str>,
@@ -860,8 +861,10 @@ mod tests {
 
     #[test]
     fn session_backend_plan_suppresses_prod_warning_when_acknowledged() {
-        let mut config = SessionConfig::default();
-        config.allow_memory_in_production = true;
+        let config = SessionConfig {
+            allow_memory_in_production: true,
+            ..SessionConfig::default()
+        };
         let plan = config.backend_plan(Some("prod")).unwrap();
         assert_eq!(
             plan,
@@ -873,8 +876,10 @@ mod tests {
 
     #[test]
     fn session_backend_plan_requires_redis_url() {
-        let mut config = SessionConfig::default();
-        config.backend = SessionBackend::Redis;
+        let config = SessionConfig {
+            backend: SessionBackend::Redis,
+            ..SessionConfig::default()
+        };
         let error = config.backend_plan(None).unwrap_err();
         assert_eq!(error, SessionBackendConfigError::MissingRedisUrl);
     }

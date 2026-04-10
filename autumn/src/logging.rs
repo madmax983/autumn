@@ -33,6 +33,11 @@ pub fn init(config: &LogConfig) {
 ///
 /// Returns a guard that must stay alive for as long as OTLP export should stay
 /// active so batched spans can flush cleanly on shutdown.
+///
+/// # Errors
+///
+/// Returns [`crate::telemetry::TelemetryInitError`] when the telemetry plan is
+/// invalid or the tracing subscriber/exporter fails to initialize.
 pub fn init_with_telemetry(
     config: &LogConfig,
     telemetry: &TelemetryConfig,

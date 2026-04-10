@@ -24,6 +24,11 @@ pub enum RouterBuildError {
 ///
 /// Extracted from `AppBuilder::run` so the router construction logic is
 /// testable without binding a real TCP listener.
+///
+/// # Panics
+///
+/// Panics when framework router assembly encounters invalid configuration.
+/// Use [`try_build_router`] to handle configuration errors explicitly.
 pub fn build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -68,6 +73,11 @@ pub fn try_build_router(
 /// Like [`build_router`], but also merges and nests additional raw
 /// Axum routers. This is primarily useful for integration testing;
 /// in production, use [`AppBuilder::merge`](crate::app::AppBuilder::merge) and [`AppBuilder::nest`](crate::app::AppBuilder::nest).
+///
+/// # Panics
+///
+/// Panics when framework router assembly encounters invalid configuration.
+/// Use [`try_build_router_merged`] to handle configuration errors explicitly.
 pub fn build_router_merged(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -113,6 +123,7 @@ pub fn try_build_router_merged(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn try_build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -344,6 +355,12 @@ pub(crate) fn try_build_router_inner(
 /// router is identical to [`build_router`].
 ///
 /// This function is public primarily for integration testing.
+///
+/// # Panics
+///
+/// Panics when framework router assembly encounters invalid configuration.
+/// Use [`try_build_router_with_static`] to handle configuration errors
+/// explicitly.
 pub fn build_router_with_static(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -516,6 +533,15 @@ struct StartupBarrierState {
 
 impl StartupBarrierState {
     fn from_config(config: &AutumnConfig, app_state: &AppState) -> Self {
+        let actuator_subtree_paths = if config.actuator.sensitive {
+            vec![crate::actuator::actuator_route_path(
+                &config.actuator.prefix,
+                "/loggers",
+            )]
+        } else {
+            Vec::new()
+        };
+
         Self {
             app_state: app_state.clone(),
             live_path: config.health.live_path.clone(),
@@ -526,16 +552,7 @@ impl StartupBarrierState {
                 &config.actuator.prefix,
                 config.actuator.sensitive,
             ),
-            actuator_subtree_paths: config
-                .actuator
-                .sensitive
-                .then(|| {
-                    vec![crate::actuator::actuator_route_path(
-                        &config.actuator.prefix,
-                        "/loggers",
-                    )]
-                })
-                .unwrap_or_default(),
+            actuator_subtree_paths,
         }
     }
 

@@ -6,7 +6,7 @@ use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use crate::session::{SessionBackendConfigError, SessionConfig, SessionStore, SessionStoreError};
 
 #[derive(Clone, Debug)]
-pub(crate) struct RedisStore {
+pub struct RedisStore {
     connection: ConnectionManager,
     key_prefix: String,
     ttl_secs: u64,

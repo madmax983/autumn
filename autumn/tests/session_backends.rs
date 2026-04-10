@@ -46,8 +46,10 @@ fn session_backends_memory_requires_explicit_prod_acknowledgement() {
         }
     );
 
-    let mut acknowledged = SessionConfig::default();
-    acknowledged.allow_memory_in_production = true;
+    let acknowledged = SessionConfig {
+        allow_memory_in_production: true,
+        ..SessionConfig::default()
+    };
     assert_eq!(
         acknowledged.backend_plan(Some("prod")).unwrap(),
         SessionBackendPlan::Memory {
@@ -101,11 +103,17 @@ use tower::ServiceExt;
 
 #[cfg(feature = "redis")]
 fn redis_test_config(url: String) -> AutumnConfig {
-    let mut config = AutumnConfig::default();
-    config.session.backend = SessionBackend::Redis;
-    config.session.redis.url = Some(url);
-    config.session.redis.key_prefix = format!("autumn:test:{}", uuid::Uuid::new_v4());
-    config
+    AutumnConfig {
+        session: SessionConfig {
+            backend: SessionBackend::Redis,
+            redis: autumn_web::session::SessionRedisConfig {
+                url: Some(url),
+                key_prefix: format!("autumn:test:{}", uuid::Uuid::new_v4()),
+            },
+            ..SessionConfig::default()
+        },
+        ..AutumnConfig::default()
+    }
 }
 
 #[cfg(feature = "redis")]
