@@ -31,7 +31,7 @@ async fn test_session_fixation() {
     // in the server so it's considered valid.
     let mut initial_data = std::collections::HashMap::new();
     initial_data.insert("some_data".to_string(), "attacker_set".to_string());
-    store.save(attacker_session_id, initial_data).await;
+    store.save(attacker_session_id, initial_data).await.unwrap();
 
     let response = app
         .oneshot(
@@ -69,7 +69,7 @@ async fn test_session_fixation() {
 
     // The attacker's ID should have been destroyed in the store
     assert!(
-        store.load(attacker_session_id).await.is_none(),
+        store.load(attacker_session_id).await.unwrap().is_none(),
         "Old session ID was not destroyed"
     );
 
@@ -77,6 +77,7 @@ async fn test_session_fixation() {
     let new_data = store
         .load(new_id)
         .await
+        .unwrap()
         .expect("New session ID should be in store");
     assert_eq!(new_data.get("user_id").unwrap(), "123");
 }
@@ -104,7 +105,7 @@ async fn test_rotate_id() {
     let session_id = "initial-id-123";
     let mut initial_data = std::collections::HashMap::new();
     initial_data.insert("pre_existing".to_string(), "data".to_string());
-    store.save(session_id, initial_data).await;
+    store.save(session_id, initial_data).await.unwrap();
 
     let response = app
         .oneshot(
@@ -143,7 +144,7 @@ async fn test_rotate_id() {
 
     // The old ID should be deleted from the store
     assert!(
-        store.load(session_id).await.is_none(),
+        store.load(session_id).await.unwrap().is_none(),
         "Old session ID was not destroyed"
     );
 
@@ -151,6 +152,7 @@ async fn test_rotate_id() {
     let new_data = store
         .load(new_id)
         .await
+        .unwrap()
         .expect("New session ID should be in store");
     assert_eq!(new_data.get("pre_existing").unwrap(), "data");
     assert_eq!(new_data.get("user").unwrap(), "alice");

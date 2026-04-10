@@ -43,11 +43,12 @@
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`](axum::extract::Form),
 //!   [`Json`], [`Path`], [`Query`](axum::extract::Query)).
-//! - [`health`] -- Auto-mounted health check endpoint.
+//! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 //! - [`logging`] -- Structured logging via `tracing-subscriber`.
 //! - [`middleware`] -- Built-in middleware (request IDs).
 //! - [`prelude`] -- Glob import for the most common types.
 //! - [`route`] -- Route descriptor used by macro-generated code.
+//! - [`telemetry`] -- OTLP runtime planning and subscriber wiring.
 //!
 //! ## Zero-config defaults
 //!
@@ -82,6 +83,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub mod probe;
 pub mod router;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -99,9 +101,12 @@ pub mod prelude;
 pub mod route;
 pub mod security;
 pub mod session;
+#[cfg(feature = "redis")]
+pub(crate) mod session_redis;
 /// Static site generation support.
 pub mod static_gen;
 pub mod task;
+pub mod telemetry;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;
