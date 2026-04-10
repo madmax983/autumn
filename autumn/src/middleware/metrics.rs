@@ -9,8 +9,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -71,13 +71,14 @@ impl Default for RouteMetrics {
 
 /// Maximum number of latency samples to keep per route.
 const MAX_LATENCY_SAMPLES: usize = 10_000;
+const SHARD_COUNT: usize = 16;
 
 impl MetricsCollector {
     /// Create a new empty metrics collector.
     #[must_use]
     pub fn new() -> Self {
-        let mut shards = Vec::with_capacity(16);
-        for _ in 0..16 {
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
             shards.push(RwLock::new(Shard::default()));
         }
         Self {
@@ -133,7 +134,8 @@ impl MetricsCollector {
         // Per-route (sharded)
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(route, &mut hasher);
-        let shard_idx = (std::hash::Hasher::finish(&hasher) % 16) as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let shard_idx = (std::hash::Hasher::finish(&hasher) % (SHARD_COUNT as u64)) as usize;
 
         let key = format!("{method} {route}");
         {
@@ -159,7 +161,12 @@ impl MetricsCollector {
     /// Produce a snapshot of current metrics for the `/actuator/metrics` endpoint.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
-        let global_latency = self.inner.latencies_ms.read().map(|v| compute_percentiles(&v)).unwrap_or_default();
+        let global_latency = self
+            .inner
+            .latencies_ms
+            .read()
+            .map(|v| compute_percentiles(&v))
+            .unwrap_or_default();
 
         let mut by_route = HashMap::new();
         for shard_lock in &self.inner.shards {
