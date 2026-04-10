@@ -160,8 +160,8 @@ impl HandlerRegistry {
 impl std::fmt::Debug for HandlerRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandlerRegistry")
-            .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
-            .field("activities", &self.activities.keys().collect::<Vec<_>>())
+            .field("workflows", &self.workflows.keys())
+            .field("activities", &self.activities.keys())
             .field("state_count", &self.state.len())
             .finish()
     }
@@ -465,22 +465,19 @@ fn find_pending_scheduled_activity(
         })
         .collect::<HashSet<_>>();
 
-    let pending = history
-        .iter()
-        .filter_map(|event| match event {
-            WorkflowEvent::ActivityScheduled {
-                activity_id, name, ..
-            } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let mut pending = history.iter().filter_map(|event| match event {
+        WorkflowEvent::ActivityScheduled {
+            activity_id, name, ..
+        } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
+        _ => None,
+    });
 
-    match pending.as_slice() {
-        [activity_id] => Ok(*activity_id),
-        [] => Err(HarvestError::NotFound(format!(
+    match (pending.next(), pending.next()) {
+        (Some(activity_id), None) => Ok(activity_id),
+        (None, _) => Err(HarvestError::NotFound(format!(
             "no pending scheduled activity '{activity_name}' in workflow history"
         ))),
-        _ => Err(HarvestError::NonDeterministic(format!(
+        (Some(_), Some(_)) => Err(HarvestError::NonDeterministic(format!(
             "multiple pending scheduled activities named '{activity_name}' found in history"
         ))),
     }
