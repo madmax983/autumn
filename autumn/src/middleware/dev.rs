@@ -18,8 +18,8 @@ const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 ///
 /// # Examples
 ///
-/// ```rust
-/// if autumn::middleware::dev::is_enabled() {
+/// ```rust,ignore
+/// if autumn_web::middleware::dev::is_enabled() {
 ///     // Inject live reload scripts
 /// }
 /// ```

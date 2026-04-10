@@ -18,7 +18,7 @@ impl EnvGuard {
     /// # Examples
     ///
     /// ```rust
-    /// use autumn::test_utils::EnvGuard;
+    /// use autumn_web::test_utils::EnvGuard;
     ///
     /// let _guard = EnvGuard::set_many(&[
     ///     ("AUTUMN_ENV", Some("test")),
