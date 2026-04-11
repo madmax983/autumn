@@ -885,6 +885,17 @@ pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_
     }))
 }
 
+// ── Channels (sensitive) ───────────────────────────────────────
+
+/// `GET <actuator-prefix>/channels` -- get current channel snapshots.
+#[cfg(feature = "ws")]
+pub(crate) async fn channels_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let channels = state.channels().snapshot();
+    Json(serde_json::json!({
+        "channels": channels,
+    }))
+}
+
 // ── Tasks Stream (WebSocket) ───────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
@@ -1033,10 +1044,15 @@ pub(crate) fn actuator_router_with_prefix(prefix: &str, sensitive: bool) -> axum
 
         #[cfg(feature = "ws")]
         {
-            router = router.route(
-                &actuator_route_path(prefix, "/tasks/stream"),
-                axum::routing::get(tasks_stream_endpoint),
-            );
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/channels"),
+                    axum::routing::get(channels_endpoint),
+                );
         }
     }
 

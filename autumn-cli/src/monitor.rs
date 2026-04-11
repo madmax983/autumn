@@ -128,6 +128,12 @@ struct DbPoolMetrics {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct ChannelsResponse {
+    #[serde(default)]
+    channels: HashMap<String, usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct TasksResponse {
     #[serde(default)]
     scheduled_tasks: HashMap<String, TaskStatus>,
@@ -167,6 +173,7 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
     loggers: LoggersResponse,
+    channels: ChannelsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -197,6 +204,7 @@ impl DashboardState {
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
+            channels: ChannelsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -231,6 +239,7 @@ impl DashboardState {
         self.fetch_metrics(&client);
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
+        self.fetch_channels(&client);
 
         self.last_poll = Instant::now();
     }
@@ -319,6 +328,17 @@ impl DashboardState {
             }
         }
     }
+
+    fn fetch_channels(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/channels", self.base_url))
+            .send()
+        {
+            if let Ok(c) = resp.json::<ChannelsResponse>() {
+                self.channels = c;
+            }
+        }
+    }
 }
 
 // ── TUI rendering ─────────────────────────────────────────────
@@ -367,11 +387,11 @@ fn run_loop(
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 3;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
                             if state.active_tab == 0 {
-                                state.active_tab = 2;
+                                state.active_tab = 3;
                             } else {
                                 state.active_tab -= 1;
                             }
@@ -419,6 +439,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_channels_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -462,7 +483,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes", "Loggers"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -975,6 +996,68 @@ fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     .header(header)
     .block(block)
     .column_spacing(2);
+
+    frame.render_widget(table, area);
+}
+
+fn draw_channels_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Channels ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Channel Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Subscribers").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut rows = Vec::new();
+
+    if state.channels.channels.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from("No active channels").style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+        ]));
+    } else {
+        let mut sorted_channels: Vec<_> = state.channels.channels.iter().collect();
+        sorted_channels.sort_by_key(|(name, _)| *name);
+
+        for (name, count) in sorted_channels {
+            let count_color = if *count > 0 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+
+            rows.push(Row::new(vec![
+                Cell::from(name.clone()),
+                Cell::from(count.to_string()).style(Style::default().fg(count_color)),
+            ]));
+        }
+    }
+
+    let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
 
     frame.render_widget(table, area);
 }
@@ -1582,6 +1665,15 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_channels_response() {
+        let json = r#"{"channels":{"chat":10,"notifications":0}}"#;
+        let channels: ChannelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(channels.channels.len(), 2);
+        assert_eq!(channels.channels["chat"], 10);
+        assert_eq!(channels.channels["notifications"], 0);
+    }
+
+    #[test]
     fn default_types() {
         let _h = HealthResponse::default();
         let _m = MetricsResponse::default();
@@ -1595,6 +1687,7 @@ mod tests {
         let _dc = DatabaseCheck::default();
         let _db = DbPoolMetrics::default();
         let _l = LoggersResponse::default();
+        let _c = ChannelsResponse::default();
     }
 
     // ── Rendering tests (TestBackend) ─────────────────────────
@@ -1615,6 +1708,15 @@ mod tests {
     fn render_routes_tab() {
         let mut state = test_state();
         state.active_tab = 1;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_channels_tab() {
+        let mut state = test_state();
+        state.active_tab = 3;
+        state.channels.channels.insert("chat".to_string(), 10);
+        state.channels.channels.insert("notifications".to_string(), 0);
         render_frame(&state, 120, 40);
     }
 
@@ -1795,18 +1897,18 @@ mod tests {
         state.active_tab = 0;
 
         if state.active_tab == 0 {
-            state.active_tab = 2;
+            state.active_tab = 3;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 3);
+
+        if state.active_tab == 0 {
+            state.active_tab = 3;
         } else {
             state.active_tab -= 1;
         }
         assert_eq!(state.active_tab, 2);
-
-        if state.active_tab == 0 {
-            state.active_tab = 2;
-        } else {
-            state.active_tab -= 1;
-        }
-        assert_eq!(state.active_tab, 1);
     }
 
     #[test]
