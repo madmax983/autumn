@@ -168,7 +168,7 @@ mod tests {
 
         let client = Client::new();
         let val = fetch_endpoint(&client, &url, "/test");
-        assert!(val["error"].as_str().unwrap().contains("HTTP 404"));
+        assert!(val["error"].as_str().unwrap_or("").contains("HTTP 404"));
     }
 
     #[test]
