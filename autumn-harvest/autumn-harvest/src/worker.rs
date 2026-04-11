@@ -816,17 +816,16 @@ async fn ingest_pending_signals(
         return Ok(());
     }
 
-    let signal_events = pending_signals
-        .iter()
-        .map(|signal| WorkflowEvent::SignalReceived {
-            signal_name: signal.signal_name.clone(),
-            payload: signal.payload.clone(),
-        })
-        .collect::<Vec<_>>();
-    let signal_ids = pending_signals
-        .iter()
-        .map(|signal| signal.id)
-        .collect::<Vec<_>>();
+    let mut signal_events = Vec::with_capacity(pending_signals.len());
+    let mut signal_ids = Vec::with_capacity(pending_signals.len());
+
+    for signal in pending_signals {
+        signal_ids.push(signal.id);
+        signal_events.push(WorkflowEvent::SignalReceived {
+            signal_name: signal.signal_name,
+            payload: signal.payload,
+        });
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -864,13 +863,15 @@ async fn ingest_fired_timers(
         return Ok(());
     }
 
-    let timer_events = due_timers
-        .iter()
-        .map(|timer| WorkflowEvent::TimerFired {
-            timer_id: TimerId::new(timer.timer_id.clone()),
-        })
-        .collect::<Vec<_>>();
-    let timer_row_ids = due_timers.iter().map(|timer| timer.id).collect::<Vec<_>>();
+    let mut timer_events = Vec::with_capacity(due_timers.len());
+    let mut timer_row_ids = Vec::with_capacity(due_timers.len());
+
+    for timer in due_timers {
+        timer_row_ids.push(timer.id);
+        timer_events.push(WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(timer.timer_id),
+        });
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
