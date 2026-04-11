@@ -14,14 +14,23 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
+/// Errors that can occur during the router build process.
+///
+/// These errors are typically fatal and represent configuration or routing
+/// definition issues that must be fixed before the application can start.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RouterBuildError {
+    /// The session backend configuration is invalid (e.g. Redis without a URL).
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+    /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
+        /// The HTTP path where the overlap occurred.
         path: String,
+        /// The name of the existing framework route.
         existing: &'static str,
+        /// The name of the incoming user route.
         incoming: &'static str,
     },
 }
