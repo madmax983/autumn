@@ -14,3 +14,19 @@ use proc_macro2::TokenStream;
 pub fn routes_macro(input: TokenStream) -> TokenStream {
     crate::collect::collect_companions(input, "__autumn_route_info_")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    #[test]
+    fn test_routes_macro() {
+        let input = quote! { handler_a, users::handler_b };
+        let result = routes_macro(input);
+        let result_str = result.to_string();
+
+        assert!(result_str.contains("__autumn_route_info_handler_a"));
+        assert!(result_str.contains("users :: __autumn_route_info_handler_b"));
+    }
+}
