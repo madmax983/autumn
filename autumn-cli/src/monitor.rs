@@ -1716,7 +1716,10 @@ mod tests {
         let mut state = test_state();
         state.active_tab = 3;
         state.channels.channels.insert("chat".to_string(), 10);
-        state.channels.channels.insert("notifications".to_string(), 0);
+        state
+            .channels
+            .channels
+            .insert("notifications".to_string(), 0);
         render_frame(&state, 120, 40);
     }
 
