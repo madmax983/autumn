@@ -149,6 +149,9 @@ impl DevReloadState {
 }
 
 /// Run the dev server with file watching.
+///
+/// Note: The `run` function executes shell commands, polls file events, and interacts
+/// with the terminal/child processes, so it is tested via integration tests in `tests/e2e.rs`.
 pub fn run(package: Option<&str>, show_config: bool) {
     if show_config {
         // SAFETY: called before spawning any threads; single-threaded at this point.

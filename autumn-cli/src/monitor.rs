@@ -249,9 +249,9 @@ impl DashboardState {
                 true
             }
             Ok(resp) => {
-                self.connected = true;
+                self.connected = false;
                 self.last_error = Some(format!("Health returned {}", resp.status()));
-                true
+                false
             }
             Err(e) => {
                 self.connected = false;
@@ -323,6 +323,9 @@ impl DashboardState {
 
 // ── TUI rendering ─────────────────────────────────────────────
 
+/// Note: The `run` function interacts with terminal inputs directly, so
+/// its exact side-effects are tested through e2e tests or mocked interactions
+/// rather than direct unit testing here.
 pub fn run(url: &str, poll_secs: u64) {
     // Normalize URL
     let base_url = url.trim_end_matches('/').to_string();
@@ -1481,6 +1484,180 @@ mod tests {
         assert_eq!(db.pool_size, 10);
         assert_eq!(db.active_connections, 3);
         assert_eq!(db.idle_connections, 7);
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_metrics_throughput_history_init() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/actuator/metrics")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "http": {
+                    "requests_total": 100,
+                    "latency_ms": { "p50": 10, "p99": 50 }
+                }
+            }"#,
+            )
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+
+        // Initial fetch: self.prev_requests_total is 0, history is empty.
+        // Therefore, it should NOT push to throughput_history.
+        state.fetch_metrics(&client);
+        assert_eq!(state.prev_requests_total, 100);
+        assert!(state.throughput_history.is_empty());
+        assert_eq!(state.latency_p50_history.len(), 1);
+        assert_eq!(state.latency_p99_history.len(), 1);
+
+        // Second fetch: prev_requests_total > 0
+        let _m2 = server
+            .mock("GET", "/actuator/metrics")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "http": {
+                    "requests_total": 150,
+                    "latency_ms": { "p50": 15, "p99": 60 }
+                }
+            }"#,
+            )
+            .create();
+
+        state.fetch_metrics(&client);
+        assert_eq!(state.prev_requests_total, 150);
+        assert_eq!(state.throughput_history.len(), 1);
+        assert_eq!(state.throughput_history[0], 50); // delta = 150 - 100 = 50
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_metrics_throughput_history_depth() {
+        let mut server = mockito::Server::new();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+
+        // Set up initial state so that history is pushed to.
+        state.prev_requests_total = 10;
+
+        // Push > SPARKLINE_DEPTH items
+        for i in 1..=(SPARKLINE_DEPTH + 5) as u64 {
+            let req_total = 10 + (i * 5); // delta of 5
+            let body = format!(
+                r#"{{
+                "http": {{
+                    "requests_total": {},
+                    "latency_ms": {{ "p50": {}, "p99": {} }}
+                }}
+            }}"#,
+                req_total,
+                i,
+                i * 2
+            );
+
+            let _m = server
+                .mock("GET", "/actuator/metrics")
+                .with_status(200)
+                .with_body(body)
+                .create();
+
+            state.fetch_metrics(&client);
+        }
+
+        assert_eq!(state.throughput_history.len(), SPARKLINE_DEPTH);
+        assert_eq!(state.latency_p50_history.len(), SPARKLINE_DEPTH);
+        assert_eq!(state.latency_p99_history.len(), SPARKLINE_DEPTH);
+
+        // Verify the values are the most recent ones
+        assert_eq!(state.throughput_history.back(), Some(&5)); // constant delta
+        assert_eq!(
+            state.latency_p50_history.back(),
+            Some(&((SPARKLINE_DEPTH + 5) as u64))
+        );
+        assert_eq!(
+            state.latency_p99_history.back(),
+            Some(&(((SPARKLINE_DEPTH + 5) * 2) as u64))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_health_success() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/actuator/health")
+            .with_status(200)
+            .with_body(r#"{"status": "up"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(state.fetch_health(&client));
+        assert!(state.connected);
+        assert_eq!(state.health.status, "up");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_health_invalid_status() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/actuator/health")
+            .with_status(500)
+            .with_body(r#"{"status": "down"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(!state.fetch_health(&client));
+        assert!(!state.connected);
+        assert!(state.last_error.is_some());
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_health_503() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/actuator/health")
+            .with_status(503)
+            .with_body(r#"{"status": "down"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(state.fetch_health(&client));
+        assert!(state.connected);
+        assert_eq!(state.health.status, "down");
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn test_fetch_tasks() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/actuator/tasks")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "scheduled_tasks": {
+                    "Task 1": { "status": "running" }
+                }
+            }"#,
+            )
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+
+        state.fetch_tasks(&client);
+        assert_eq!(state.tasks.scheduled_tasks.len(), 1);
+        assert_eq!(state.tasks.scheduled_tasks["Task 1"].status, "running");
     }
 
     #[test]

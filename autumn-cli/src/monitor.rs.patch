@@ -1,0 +1,52 @@
+<<<<<<< SEARCH
+    #[test]
+    fn test_fetch_health_success() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/actuator/health")
+            .with_status(200)
+            .with_body(r#"{"status": "up"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(state.fetch_health(&client));
+        assert!(state.connected);
+        assert_eq!(state.health.status, "up");
+    }
+
+    #[test]
+    fn test_fetch_health_503() {
+=======
+    #[test]
+    fn test_fetch_health_success() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/actuator/health")
+            .with_status(200)
+            .with_body(r#"{"status": "up"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(state.fetch_health(&client));
+        assert!(state.connected);
+        assert_eq!(state.health.status, "up");
+    }
+
+    #[test]
+    fn test_fetch_health_invalid_status() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/actuator/health")
+            .with_status(500)
+            .with_body(r#"{"status": "down"}"#)
+            .create();
+
+        let mut state = DashboardState::new(server.url());
+        let client = reqwest::blocking::Client::new();
+        assert!(!state.fetch_health(&client));
+        assert!(!state.connected);
+        assert!(state.last_error.is_some());
+    }
+
+    #[test]
+    fn test_fetch_health_503() {
+>>>>>>> REPLACE

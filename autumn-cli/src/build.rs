@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Run the static build pipeline.
+///
+/// Note: The `run` function executes shell commands and writes to the filesystem,
+/// so it is tested via integration tests in `tests/e2e.rs` rather than unit tests.
 pub fn run(debug: bool, package: Option<&str>) {
     eprintln!("\u{1F342} autumn build\n");
 

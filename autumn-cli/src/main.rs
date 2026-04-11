@@ -82,6 +82,11 @@ enum MigrateCommands {
     Status,
 }
 
+/// The entry point for the `autumn` CLI.
+///
+/// This handles parsing arguments and routing to the appropriate subcommand.
+/// Note: The `main` function executes shell commands, so its exact side-effects
+/// are tested via integration tests in `tests/e2e.rs` and `tests/cloud_native_scaffold.rs`.
 fn main() {
     let cli = Cli::parse();
     match cli.command {
