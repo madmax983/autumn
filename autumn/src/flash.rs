@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn should_not_remove_key_when_consuming_empty_flash() {
+    async fn should_not_remove_key_when_consuming_empty_flash() -> Result<(), String> {
         let session = Session::new_for_test("test_id".to_string(), HashMap::new());
         // Insert a dummy key to verify the session remains untouched and "dirty" flag logic
         session.insert("dummy", "val").await;
@@ -203,9 +203,10 @@ mod tests {
         assert_eq!(messages.len(), 0);
 
         // "dummy" key is still there
-        assert_eq!(session.get("dummy").await.unwrap(), "val");
+        assert_eq!(session.get("dummy").await.ok_or("missing key dummy")?, "val");
         // Flash key shouldn't be added or touched
         assert!(!session.contains_key(FLASH_SESSION_KEY).await);
+        Ok(())
     }
 
     #[tokio::test]

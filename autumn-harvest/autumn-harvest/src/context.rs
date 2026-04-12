@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_replays_completed_activity() {
+    async fn context_replays_completed_activity() -> Result<(), crate::error::HarvestError> {
         let activity_id = ActivityExecId::new();
         let output = serde_json::json!({"email_id": "msg-001"});
 
@@ -824,13 +824,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), output);
+        assert_eq!(result?, output);
 
         // After consuming all events, no longer replaying.
         assert!(!ctx.is_replaying());
 
         // No commands emitted during replay.
         assert!(ctx.drain_commands().is_empty());
+        Ok(())
     }
 
     #[tokio::test]
@@ -968,7 +969,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_live_activity_resolves_via_oneshot() {
+    async fn context_live_activity_resolves_via_oneshot() -> Result<(), String> {
         let ctx = Arc::new(WorkflowContext::new_test());
         let ctx2 = Arc::clone(&ctx);
 
@@ -990,7 +991,7 @@ mod tests {
 
         if let WorkflowCommand::ScheduleActivity {
             result_tx, name, ..
-        } = cmds.into_iter().next().unwrap()
+        } = cmds.into_iter().next().ok_or("no command")?
         {
             assert_eq!(name, "send_email");
             result_tx
@@ -1003,7 +1004,8 @@ mod tests {
         // The coroutine should now resolve with the output.
         let result = handle.await.expect("task should not panic");
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_output);
+        assert_eq!(result.map_err(|e| e.to_string())?, expected_output);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1042,7 +1044,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_replays_multiple_activities_in_sequence() {
+    async fn context_replays_multiple_activities_in_sequence() -> Result<(), crate::error::HarvestError> {
         let id1 = ActivityExecId::new();
         let id2 = ActivityExecId::new();
         let output1 = serde_json::json!({"email_id": "msg-001"});
@@ -1080,15 +1082,16 @@ mod tests {
         let r1 = ctx
             .execute_activity_raw("send_email", Value::Null, "default")
             .await;
-        assert_eq!(r1.unwrap(), output1);
+        assert_eq!(r1?, output1);
 
         let r2 = ctx
             .execute_activity_raw("charge_payment", Value::Null, "billing")
             .await;
-        assert_eq!(r2.unwrap(), output2);
+        assert_eq!(r2?, output2);
 
         assert!(!ctx.is_replaying());
         assert!(ctx.drain_commands().is_empty());
+        Ok(())
     }
 
     #[tokio::test]

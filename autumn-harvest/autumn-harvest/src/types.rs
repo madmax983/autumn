@@ -171,10 +171,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_exec_id_display_roundtrip() {
+    fn activity_exec_id_display_roundtrip() -> Result<(), uuid::Error> {
         let id = ActivityExecId::new();
         let s = id.to_string();
-        let parsed: ActivityExecId = s.parse().unwrap();
+        let parsed: ActivityExecId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 }
