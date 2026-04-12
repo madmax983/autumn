@@ -177,7 +177,10 @@ mod tests {
             max_interval: Duration::from_secs(120),
             non_retryable_errors: vec![],
         };
-        assert_eq!(policy.next_delay(6).ok_or("no delay")?, Duration::from_secs(120));
+        assert_eq!(
+            policy.next_delay(6).ok_or("no delay")?,
+            Duration::from_secs(120)
+        );
         Ok(())
     }
 

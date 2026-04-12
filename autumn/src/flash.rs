@@ -203,7 +203,10 @@ mod tests {
         assert_eq!(messages.len(), 0);
 
         // "dummy" key is still there
-        assert_eq!(session.get("dummy").await.ok_or("missing key dummy")?, "val");
+        assert_eq!(
+            session.get("dummy").await.ok_or("missing key dummy")?,
+            "val"
+        );
         // Flash key shouldn't be added or touched
         assert!(!session.contains_key(FLASH_SESSION_KEY).await);
         Ok(())

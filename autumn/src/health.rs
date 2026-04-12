@@ -79,11 +79,7 @@ mod tests {
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())?,
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -100,17 +96,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_no_database_returns_json_content_type() -> Result<(), Box<dyn std::error::Error>> {
+    async fn health_no_database_returns_json_content_type() -> Result<(), Box<dyn std::error::Error>>
+    {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())?,
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
         let content_type = response
@@ -154,11 +147,7 @@ mod tests {
             });
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())?,
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -180,11 +169,7 @@ mod tests {
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())?,
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
@@ -204,11 +189,7 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())?,
-            )
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
             .await?;
 
         assert_eq!(response.status(), StatusCode::OK);

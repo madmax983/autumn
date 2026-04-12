@@ -125,7 +125,9 @@ mod tests {
             .body(())?;
         let (mut parts, ()) = req.into_parts();
 
-        let hx = HxRequest::from_request_parts(&mut parts, &()).await.expect("infallible");
+        let hx = HxRequest::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
 
         assert!(hx.is_htmx);
         assert_eq!(hx.target.as_deref(), Some("my-div"));
@@ -143,7 +145,9 @@ mod tests {
         let req = Request::builder().body(())?;
         let (mut parts, ()) = req.into_parts();
 
-        let hx = HxRequest::from_request_parts(&mut parts, &()).await.expect("infallible");
+        let hx = HxRequest::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
 
         assert!(!hx.is_htmx);
         assert_eq!(hx.target, None);

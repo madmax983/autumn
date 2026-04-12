@@ -1044,7 +1044,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_replays_multiple_activities_in_sequence() -> Result<(), crate::error::HarvestError> {
+    async fn context_replays_multiple_activities_in_sequence()
+    -> Result<(), crate::error::HarvestError> {
         let id1 = ActivityExecId::new();
         let id2 = ActivityExecId::new();
         let output1 = serde_json::json!({"email_id": "msg-001"});
