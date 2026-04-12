@@ -1,9 +1,10 @@
 use autumn_web::AppState;
 use autumn_web::config::DatabaseConfig;
 use autumn_web_harvest::{
-    HarvestDbPool, WorkflowStartRequest, drain_workflow_start_outbox_once,
-    enqueue_workflow_start_outbox,
+    HarvestDbPool, HarvestOutboxConfig, WorkflowStartRequest, drain_workflow_start_outbox_once,
+    enqueue_workflow_start_outbox, flush_workflow_start_outbox,
 };
+use diesel::QueryableByName;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -18,9 +19,22 @@ const OUTBOX_INIT_SQL: &str =
 const HARVEST_INIT_SQL: &str =
     include_str!("../../autumn-harvest/migrations/20260409000000_harvest_initial/up.sql");
 
+#[derive(Debug, QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+#[derive(Debug, QueryableByName)]
+struct DelayRow {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    seconds: f64,
+}
+
 #[tokio::test]
 async fn framework_outbox_delivers_to_split_harvest_store() {
-    let (state, mut app_conn, _harvest_url, _container) = setup_split_test_databases(true).await;
+    let (state, mut app_conn, _app_url, _harvest_url, _container) =
+        setup_split_test_databases(true).await;
 
     let request = WorkflowStartRequest {
         workflow_name: "user_onboarding".to_string(),
@@ -52,7 +66,8 @@ async fn framework_outbox_delivers_to_split_harvest_store() {
 
 #[tokio::test]
 async fn framework_outbox_retries_failed_delivery() {
-    let (state, mut app_conn, _harvest_url, _container) = setup_split_test_databases(false).await;
+    let (state, mut app_conn, _app_url, _harvest_url, _container) =
+        setup_split_test_databases(false).await;
 
     let request = WorkflowStartRequest {
         workflow_name: "post_publication".to_string(),
@@ -82,11 +97,119 @@ async fn framework_outbox_retries_failed_delivery() {
     assert_eq!(delivered, 0, "failed delivery should not report success");
 }
 
+#[tokio::test]
+async fn framework_outbox_flush_keeps_draining_full_failed_batches() {
+    let (state, mut app_conn, _app_url, _harvest_url, _container) =
+        setup_split_test_databases(false).await;
+    state.insert_extension(HarvestOutboxConfig {
+        batch_size: 2,
+        ..HarvestOutboxConfig::default()
+    });
+
+    for workflow_id in [
+        "post-publication:1",
+        "post-publication:2",
+        "post-publication:3",
+    ] {
+        enqueue_workflow_start_outbox(
+            &mut app_conn,
+            &WorkflowStartRequest {
+                workflow_name: "post_publication".to_string(),
+                workflow_id: workflow_id.to_string(),
+                queue_name: "default".to_string(),
+                input: serde_json::json!({ "workflow_id": workflow_id }),
+                memo: None,
+                search_attrs: None,
+            },
+        )
+        .await
+        .expect("outbox row should persist before drain");
+    }
+
+    let delivered = flush_workflow_start_outbox(&state)
+        .await
+        .expect("flush should keep draining full failed batches");
+    assert_eq!(delivered, 0, "failed rows should not count as delivered");
+
+    let attempts: CountRow = diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM harvest_workflow_outbox WHERE delivery_attempts = 1",
+    )
+    .get_result(&mut app_conn)
+    .await
+    .expect("should count processed outbox rows");
+    assert_eq!(
+        attempts.count, 3,
+        "flush should process every due row even when the first full batch only fails",
+    );
+}
+
+#[tokio::test]
+async fn framework_outbox_retry_delay_tracks_database_clock() {
+    let (_state, mut app_conn, app_url, harvest_url, _container) =
+        setup_split_test_databases(false).await;
+    app_conn
+        .batch_execute("SET TIME ZONE 'America/Chicago'")
+        .await
+        .expect("app session should accept a non-UTC timezone");
+
+    let state = build_test_state(&app_url, &harvest_url, 1);
+    state.insert_extension(HarvestOutboxConfig {
+        base_retry_delay_ms: 1_000,
+        max_retry_delay_ms: 1_000,
+        ..HarvestOutboxConfig::default()
+    });
+    let mut pooled = state
+        .pool()
+        .expect("state should expose the app pool")
+        .get()
+        .await
+        .expect("failed to borrow pooled app connection");
+    pooled
+        .batch_execute("SET TIME ZONE 'America/Chicago'")
+        .await
+        .expect("pooled app session should accept a non-UTC timezone");
+    drop(pooled);
+
+    enqueue_workflow_start_outbox(
+        &mut app_conn,
+        &WorkflowStartRequest {
+            workflow_name: "post_publication".to_string(),
+            workflow_id: "post-publication:timezone".to_string(),
+            queue_name: "default".to_string(),
+            input: serde_json::json!({ "post_id": 42 }),
+            memo: None,
+            search_attrs: None,
+        },
+    )
+    .await
+    .expect("outbox row should persist before failure");
+
+    let delivered = drain_workflow_start_outbox_once(&state, 1)
+        .await
+        .expect("drain should record the failed delivery");
+    assert_eq!(delivered, 0, "failed delivery should not report success");
+
+    let delay: DelayRow = diesel::sql_query(
+        "SELECT EXTRACT(EPOCH FROM (next_attempt_at - created_at)) AS seconds \
+         FROM harvest_workflow_outbox \
+         WHERE workflow_id = 'post-publication:timezone'",
+    )
+    .get_result(&mut app_conn)
+    .await
+    .expect("should compute the retry delay from persisted timestamps");
+    assert!(
+        (0.5..5.0).contains(&delay.seconds),
+        "retry delay should stay close to one second regardless of session timezone, got {}s",
+        delay.seconds,
+    );
+}
+
 async fn setup_split_test_databases(
     apply_harvest_migrations: bool,
 ) -> (
     AppState,
     AsyncPgConnection,
+    String,
     String,
     ContainerAsync<Postgres>,
 ) {
@@ -140,20 +263,24 @@ async fn setup_split_test_databases(
             .expect("failed to apply harvest migrations");
     }
 
-    let app_pool = build_pool(&app_url);
-    let harvest_pool = build_pool(&harvest_url);
-    let state = AppState::for_test().with_pool(app_pool);
-    state.insert_extension(HarvestDbPool::from(harvest_pool));
+    let state = build_test_state(&app_url, &harvest_url, 4);
 
-    (state, app_conn, harvest_url, container)
+    (state, app_conn, app_url, harvest_url, container)
+}
+
+fn build_test_state(app_url: &str, harvest_url: &str, pool_size: usize) -> AppState {
+    let state = AppState::for_test().with_pool(build_pool(app_url, pool_size));
+    state.insert_extension(HarvestDbPool::from(build_pool(harvest_url, pool_size)));
+    state
 }
 
 fn build_pool(
     database_url: &str,
+    pool_size: usize,
 ) -> diesel_async::pooled_connection::deadpool::Pool<AsyncPgConnection> {
     autumn_web::db::create_pool(&DatabaseConfig {
         url: Some(database_url.to_owned()),
-        pool_size: 4,
+        pool_size,
         ..DatabaseConfig::default()
     })
     .expect("failed to build pool config")

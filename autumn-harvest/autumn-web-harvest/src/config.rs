@@ -37,10 +37,22 @@ pub struct HarvestRuntimeConfig {
 }
 
 impl HarvestRuntimeConfig {
+    /// Load Harvest runtime configuration from Autumn config files and process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when config files cannot be read or parsed, environment overrides
+    /// are invalid, or the resulting topology configuration is not valid.
     pub fn load() -> Result<Self, ConfigError> {
         Self::load_with_env(&OsEnv)
     }
 
+    /// Load Harvest runtime configuration using an explicit environment provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when config files cannot be read or parsed, environment overrides
+    /// are invalid, or the resulting topology configuration is not valid.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
         let profile = resolve_profile(env);
         let mut config = Self::default();

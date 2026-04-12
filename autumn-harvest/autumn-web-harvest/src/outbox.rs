@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use autumn_web::AppState;
 use autumn_web::error::AutumnError;
-use chrono::{NaiveDateTime, Utc};
-use diesel::ExpressionMethods;
-use diesel::QueryDsl;
+use chrono::NaiveDateTime;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
@@ -41,7 +39,7 @@ diesel::table! {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowStartRequest {
     pub workflow_name: String,
     pub workflow_id: String,
@@ -83,6 +81,12 @@ struct NewHarvestWorkflowOutboxRow<'a> {
     search_attrs: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct OutboxDrainStats {
+    claimed: usize,
+    delivered: usize,
+}
+
 impl HarvestWorkflowOutboxRow {
     fn request(&self) -> WorkflowStartRequest {
         WorkflowStartRequest {
@@ -96,6 +100,13 @@ impl HarvestWorkflowOutboxRow {
     }
 }
 
+/// Persist a workflow-start request in the application database outbox.
+///
+/// Duplicate `(workflow_name, workflow_id)` requests are ignored so callers can retry safely.
+///
+/// # Errors
+///
+/// Returns a Diesel error if the outbox insert cannot be executed.
 pub async fn enqueue_workflow_start_outbox(
     conn: &mut AsyncPgConnection,
     request: &WorkflowStartRequest,
@@ -120,13 +131,30 @@ pub async fn enqueue_workflow_start_outbox(
     Ok(())
 }
 
+/// Claim one batch of due outbox rows and attempt delivery to Harvest storage.
+///
+/// The returned count is the number of rows successfully delivered, not the number claimed.
+///
+/// # Errors
+///
+/// Returns an [`AutumnError`] when the app database pool is unavailable or row claiming/updating
+/// fails.
 pub async fn drain_workflow_start_outbox_once(
     state: &AppState,
     limit: i64,
 ) -> Result<usize, AutumnError> {
+    drain_workflow_start_outbox_batch(state, limit)
+        .await
+        .map(|stats| stats.delivered)
+}
+
+async fn drain_workflow_start_outbox_batch(
+    state: &AppState,
+    limit: i64,
+) -> Result<OutboxDrainStats, AutumnError> {
     let config = outbox_config(state);
     if !config.enabled {
-        return Ok(0);
+        return Ok(OutboxDrainStats::default());
     }
 
     let Some(app_pool) = state.pool().cloned() else {
@@ -144,6 +172,7 @@ pub async fn drain_workflow_start_outbox_once(
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
 
+    let claimed = rows.len();
     let mut delivered = 0usize;
     for row in rows {
         match dispatch_workflow_start_request(state, &row.request()).await {
@@ -163,9 +192,16 @@ pub async fn drain_workflow_start_outbox_once(
         }
     }
 
-    Ok(delivered)
+    Ok(OutboxDrainStats { claimed, delivered })
 }
 
+/// Drain all currently due workflow-start outbox rows.
+///
+/// The returned count is the number of rows successfully delivered.
+///
+/// # Errors
+///
+/// Returns an [`AutumnError`] when claiming or marking any outbox row fails.
 pub async fn flush_workflow_start_outbox(state: &AppState) -> Result<usize, AutumnError> {
     let config = outbox_config(state);
     if !config.enabled {
@@ -173,11 +209,12 @@ pub async fn flush_workflow_start_outbox(state: &AppState) -> Result<usize, Autu
     }
 
     let batch_limit = config.batch_size.max(1);
+    let batch_limit_usize = usize::try_from(batch_limit).unwrap_or(usize::MAX);
     let mut total = 0usize;
     loop {
-        let delivered = drain_workflow_start_outbox_once(state, batch_limit).await?;
-        total += delivered;
-        if delivered < batch_limit as usize {
+        let drain = drain_workflow_start_outbox_batch(state, batch_limit).await?;
+        total += drain.delivered;
+        if drain.claimed < batch_limit_usize {
             break;
         }
     }
@@ -202,7 +239,7 @@ pub(crate) fn spawn_workflow_start_outbox_relay(
 
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => {
+                () = shutdown.cancelled() => {
                     debug!("Harvest workflow outbox relay shutting down");
                     break;
                 }
@@ -266,7 +303,7 @@ async fn claim_due_outbox_rows(
     config: &HarvestOutboxConfig,
 ) -> Result<Vec<HarvestWorkflowOutboxRow>, diesel::result::Error> {
     diesel::sql_query(
-        r#"
+        r"
         WITH due AS (
             SELECT id
             FROM harvest_workflow_outbox
@@ -286,9 +323,9 @@ async fn claim_due_outbox_rows(
         FROM due
         WHERE outbox.id = due.id
         RETURNING outbox.*
-        "#,
+        ",
     )
-    .bind::<diesel::sql_types::BigInt, _>(config.claim_ttl_ms as i64)
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(config.claim_ttl_ms).unwrap_or(i64::MAX))
     .bind::<diesel::sql_types::BigInt, _>(limit)
     .bind::<diesel::sql_types::Text, _>(claimant)
     .load::<HarvestWorkflowOutboxRow>(conn)
@@ -301,20 +338,22 @@ async fn mark_outbox_row_delivered(
     claimant: &str,
     exec_id: ExecutionId,
 ) -> Result<(), diesel::result::Error> {
-    diesel::update(
-        harvest_workflow_outbox::table
-            .find(row_id)
-            .filter(harvest_workflow_outbox::claimed_by.eq(Some(claimant.to_owned()))),
+    diesel::sql_query(
+        r"
+        UPDATE harvest_workflow_outbox
+        SET delivery_attempts = delivery_attempts + 1,
+            last_error = NULL,
+            delivered_execution_id = $3,
+            delivered_at = NOW(),
+            claimed_at = NULL,
+            claimed_by = NULL
+        WHERE id = $1
+          AND claimed_by = $2
+        ",
     )
-    .set((
-        harvest_workflow_outbox::delivery_attempts
-            .eq(harvest_workflow_outbox::delivery_attempts + 1_i64),
-        harvest_workflow_outbox::last_error.eq::<Option<String>>(None),
-        harvest_workflow_outbox::delivered_execution_id.eq(Some(exec_id.to_string())),
-        harvest_workflow_outbox::delivered_at.eq(Some(Utc::now().naive_utc())),
-        harvest_workflow_outbox::claimed_at.eq::<Option<NaiveDateTime>>(None),
-        harvest_workflow_outbox::claimed_by.eq::<Option<String>>(None),
-    ))
+    .bind::<diesel::sql_types::BigInt, _>(row_id)
+    .bind::<diesel::sql_types::Text, _>(claimant)
+    .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
     .execute(conn)
     .await
     .map(|_| ())
@@ -327,29 +366,31 @@ async fn mark_outbox_row_failed(
     config: &HarvestOutboxConfig,
     error: &str,
 ) -> Result<(), diesel::result::Error> {
-    let next_attempt_at =
-        Utc::now().naive_utc() + chrono::Duration::milliseconds(retry_delay_ms(config, row) as i64);
+    let retry_delay_ms = i64::try_from(retry_delay_ms(config, row)).unwrap_or(i64::MAX);
 
-    diesel::update(
-        harvest_workflow_outbox::table
-            .find(row.id)
-            .filter(harvest_workflow_outbox::claimed_by.eq(Some(claimant.to_owned()))),
+    diesel::sql_query(
+        r"
+        UPDATE harvest_workflow_outbox
+        SET delivery_attempts = delivery_attempts + 1,
+            last_error = $3,
+            next_attempt_at = NOW() + ($4 * INTERVAL '1 millisecond'),
+            claimed_at = NULL,
+            claimed_by = NULL
+        WHERE id = $1
+          AND claimed_by = $2
+        ",
     )
-    .set((
-        harvest_workflow_outbox::delivery_attempts
-            .eq(harvest_workflow_outbox::delivery_attempts + 1_i64),
-        harvest_workflow_outbox::last_error.eq(Some(error.to_owned())),
-        harvest_workflow_outbox::next_attempt_at.eq(next_attempt_at),
-        harvest_workflow_outbox::claimed_at.eq::<Option<NaiveDateTime>>(None),
-        harvest_workflow_outbox::claimed_by.eq::<Option<String>>(None),
-    ))
+    .bind::<diesel::sql_types::BigInt, _>(row.id)
+    .bind::<diesel::sql_types::Text, _>(claimant)
+    .bind::<diesel::sql_types::Text, _>(error)
+    .bind::<diesel::sql_types::BigInt, _>(retry_delay_ms)
     .execute(conn)
     .await
     .map(|_| ())
 }
 
 fn retry_delay_ms(config: &HarvestOutboxConfig, row: &HarvestWorkflowOutboxRow) -> u64 {
-    let attempt = row.delivery_attempts.max(0) as u32;
+    let attempt = u32::try_from(row.delivery_attempts.max(0)).unwrap_or(u32::MAX);
     let multiplier = 1_u64 << attempt.min(16);
     config
         .base_retry_delay_ms
@@ -360,6 +401,7 @@ fn retry_delay_ms(config: &HarvestOutboxConfig, row: &HarvestWorkflowOutboxRow) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn retry_delay_caps_growth() {

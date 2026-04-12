@@ -22,6 +22,8 @@ mod tests {
     use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
 
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
+    const MIGRATION_DOWN_SQL: &str =
+        include_str!("../migrations/00000000000000_create_reddit/down.sql");
 
     #[test]
     fn migration_uses_bigserial_ids() {
@@ -46,6 +48,14 @@ mod tests {
                 "Migration must create the '{table}' table",
             );
         }
+    }
+
+    #[test]
+    fn migration_down_drops_live_feed_events() {
+        assert!(
+            MIGRATION_DOWN_SQL.contains("DROP TABLE IF EXISTS live_feed_events"),
+            "Rollback migration must drop the live_feed_events table added by up.sql",
+        );
     }
 
     #[test]

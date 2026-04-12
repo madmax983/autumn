@@ -33,7 +33,7 @@ pub struct HarvestRunnerResources {
 impl HarvestRunnerResources {
     /// Create a new resource bundle with the required Harvest storage pool.
     #[must_use]
-    pub fn new(harvest_pool: DbPool) -> Self {
+    pub const fn new(harvest_pool: DbPool) -> Self {
         Self {
             app_state: None,
             app_pool: None,
@@ -152,7 +152,7 @@ impl HarvestRunner {
         });
         let scheduler = if config.scheduler_enabled && !dag_catalog.is_empty() {
             Some(SchedulerRuntime::spawn(
-                harvest_pool.clone(),
+                harvest_pool,
                 Arc::clone(&registry),
                 Arc::clone(&dag_catalog),
             ))

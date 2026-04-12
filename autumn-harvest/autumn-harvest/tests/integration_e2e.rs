@@ -18,8 +18,8 @@ use autumn_harvest::store;
 use autumn_harvest::types::{ActivityExecId, ExecutionId};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{
-    ActivityContext, HarvestBuilder, HarvestError, TimeoutType, WorkerConfig, WorkflowContext,
-    queue, timeout,
+    ActivityContext, HarvestBuilder, HarvestError, StartWorkflowParams, TimeoutType, WorkerConfig,
+    WorkflowContext, queue, start_or_load_workflow_execution, timeout,
 };
 
 use chrono::Utc;
@@ -27,8 +27,10 @@ use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::SimpleAsyncConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use scoped_futures::ScopedFutureExt;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +76,25 @@ async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
 async fn setup_test_database_url() -> (String, ContainerAsync<Postgres>) {
     let container = Postgres::default()
         .with_init_sql(INIT_SQL.to_string().into_bytes())
+        .start()
+        .await
+        .expect("failed to start Postgres container");
+
+    let host = container
+        .get_host()
+        .await
+        .expect("failed to get container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("failed to get container port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    (database_url, container)
+}
+
+async fn setup_blank_test_database_url() -> (String, ContainerAsync<Postgres>) {
+    let container = Postgres::default()
         .start()
         .await
         .expect("failed to start Postgres container");
@@ -204,6 +225,74 @@ async fn insert_workflow_execution(conn: &mut AsyncPgConnection) -> ExecutionId 
         .expect("failed to insert workflow execution");
 
     exec_id
+}
+
+#[tokio::test]
+async fn legacy_workflow_uniqueness_schema_can_be_upgraded_for_idempotent_starts() {
+    let (database_url, _container) = setup_blank_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+    let legacy_init_sql = INIT_SQL.replacen(
+        "UNIQUE (workflow_name, workflow_id)",
+        "UNIQUE (workflow_id, run_id)",
+        1,
+    );
+    conn.batch_execute(&legacy_init_sql)
+        .await
+        .expect("failed to apply legacy harvest schema");
+
+    let request = StartWorkflowParams {
+        workflow_name: "upgrade_test",
+        workflow_id: "workflow-42",
+        shard_id: 0,
+        input: serde_json::json!({ "workflow_id": 42 }),
+        parent_id: None,
+        queue_name: "default",
+        execution_timeout: None,
+        memo: None,
+        search_attrs: None,
+    };
+
+    let legacy_error = start_or_load_workflow_execution(&mut conn, request.clone())
+        .await
+        .expect_err("legacy schema should reject the new ON CONFLICT target");
+    assert!(
+        matches!(legacy_error, HarvestError::Database(_)),
+        "legacy schema should fail with a database error, got {legacy_error:?}",
+    );
+
+    let upgrade_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations/20260410010000_harvest_workflow_start_uniqueness/up.sql");
+    let upgrade_sql = std::fs::read_to_string(&upgrade_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read harvest upgrade migration at {}: {error}",
+            upgrade_path.display()
+        )
+    });
+    conn.batch_execute(&upgrade_sql)
+        .await
+        .expect("failed to apply harvest upgrade migration");
+
+    let first = start_or_load_workflow_execution(&mut conn, request.clone())
+        .await
+        .expect("upgrade migration should restore workflow start");
+    let second = start_or_load_workflow_execution(&mut conn, request)
+        .await
+        .expect("upgrade migration should restore idempotent workflow start");
+
+    assert!(
+        first.created,
+        "first start should create a workflow execution"
+    );
+    assert!(
+        !second.created,
+        "second start should reuse the existing workflow execution",
+    );
+    assert_eq!(
+        first.exec_id, second.exec_id,
+        "idempotent starts should point at the same execution after the upgrade migration",
+    );
 }
 
 async fn enqueue_started_workflow_task(

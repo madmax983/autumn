@@ -209,7 +209,6 @@ fn start_harvest_runtime(
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
     let harvest_config = HarvestRuntimeConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    ensure_supported_topology(&harvest_config)?;
     ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
 
     let runtime_state = state.clone();
@@ -232,9 +231,9 @@ fn start_harvest_runtime(
     let built = registration.builder.build();
     state.insert_extension(harvest_config.outbox.clone());
     let mut runner_resources =
-        HarvestRunnerResources::new(harvest_pool.clone()).with_app_state(runtime_state.clone());
-    if let Some(app_pool) = app_pool.clone() {
-        runner_resources = runner_resources.with_app_pool(app_pool);
+        HarvestRunnerResources::new(harvest_pool).with_app_state(runtime_state.clone());
+    if let Some(app_pool) = app_pool.as_ref() {
+        runner_resources = runner_resources.with_app_pool(app_pool.clone());
     }
     let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
     let harvest_db_pool = runner.storage_pool();
@@ -257,12 +256,6 @@ fn start_harvest_runtime(
         guard.runtime = Some(HarvestRuntime { runner, outbox });
     }
     Ok(())
-}
-
-fn ensure_supported_topology(config: &HarvestRuntimeConfig) -> autumn_web::AutumnResult<()> {
-    match config.mode {
-        HarvestMode::Embedded | HarvestMode::Split | HarvestMode::External => Ok(()),
-    }
 }
 
 fn resolve_harvest_pool(
@@ -497,23 +490,15 @@ mod tests {
     }
 
     #[test]
-    fn harvest_ext_embedded_mode_is_supported() {
+    fn harvest_ext_embedded_mode_reuses_app_pool() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let state = AppState::for_test().with_pool(app_pool);
         let config = HarvestRuntimeConfig::default();
 
-        assert!(ensure_supported_topology(&config).is_ok());
-    }
+        let harvest_pool =
+            resolve_harvest_pool(&state, &config).expect("embedded mode should reuse app pool");
 
-    #[test]
-    fn harvest_ext_split_mode_is_supported() {
-        let config = HarvestRuntimeConfig {
-            mode: HarvestMode::Split,
-            database: HarvestDatabaseConfig {
-                url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
-            },
-            ..HarvestRuntimeConfig::default()
-        };
-
-        ensure_supported_topology(&config).expect("split mode should now be supported");
+        assert_eq!(harvest_pool.status().max_size, 3);
     }
 
     #[test]
@@ -539,11 +524,8 @@ mod tests {
     fn injected_runtime_state_contains_explicit_app_and_harvest_pool_roles() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
         let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 7);
-        let injected = injected_runtime_state(
-            Some(AppState::for_test().with_pool(app_pool.clone())),
-            Some(app_pool.clone()),
-            harvest_pool.clone(),
-        );
+        let app_state = AppState::for_test().with_pool(app_pool.clone());
+        let injected = injected_runtime_state(Some(app_state), Some(app_pool), harvest_pool);
 
         let app_db = injected
             .get(&TypeId::of::<AppDbPool>())
@@ -564,7 +546,9 @@ mod tests {
     }
 
     #[test]
-    fn harvest_ext_external_mode_is_supported_when_runtime_is_externalized() {
+    fn harvest_ext_external_mode_builds_dedicated_harvest_pool() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let state = AppState::for_test().with_pool(app_pool);
         let config = HarvestRuntimeConfig {
             mode: HarvestMode::External,
             worker_enabled: false,
@@ -575,25 +559,9 @@ mod tests {
             outbox: crate::config::HarvestOutboxConfig::default(),
         };
 
-        ensure_supported_topology(&config)
-            .expect("external mode should allow a web app without local worker ownership");
-    }
+        let harvest_pool = resolve_harvest_pool(&state, &config)
+            .expect("external mode should resolve a dedicated harvest pool");
 
-    #[test]
-    fn harvest_ext_allows_worker_and_scheduler_toggles_to_be_managed_independently() {
-        let worker_only = HarvestRuntimeConfig {
-            worker_enabled: true,
-            scheduler_enabled: false,
-            ..HarvestRuntimeConfig::default()
-        };
-        let scheduler_only = HarvestRuntimeConfig {
-            worker_enabled: false,
-            scheduler_enabled: true,
-            ..HarvestRuntimeConfig::default()
-        };
-
-        ensure_supported_topology(&worker_only).expect("worker-only ownership should be supported");
-        ensure_supported_topology(&scheduler_only)
-            .expect("scheduler-only ownership should be supported");
+        assert_eq!(harvest_pool.status().max_size, 10);
     }
 }
