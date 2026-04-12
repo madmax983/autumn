@@ -246,73 +246,109 @@ impl ConfigProperties {
         let mut props = HashMap::new();
         let profile_str = profile.to_string();
 
-        // Server properties
+        Self::track_server_props(&mut props, config, &defaults, &profile_str);
+        Self::track_db_props(&mut props, config, &defaults, &profile_str);
+        Self::track_log_props(&mut props, config, &defaults, &profile_str);
+        Self::track_telemetry_props(&mut props, config, &defaults, &profile_str);
+        Self::track_health_props(&mut props, config, &defaults, &profile_str);
+        Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
+        Self::track_session_props(&mut props, config, &defaults, &profile_str);
+
+        Self {
+            inner: Arc::new(RwLock::new(props)),
+        }
+    }
+
+    fn track_server_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "server.host",
             &config.server.host,
             &defaults.server.host,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "server.port",
             &config.server.port.to_string(),
             &defaults.server.port.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "server.shutdown_timeout_secs",
             &config.server.shutdown_timeout_secs.to_string(),
             &defaults.server.shutdown_timeout_secs.to_string(),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Database properties
+    fn track_db_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         let db_url = config.database.url.as_deref().unwrap_or("").to_string();
-        Self::track_property(&mut props, "database.url", &db_url, "", &profile_str);
+        Self::track_property(props, "database.url", &db_url, "", profile_str);
         Self::track_property(
-            &mut props,
+            props,
             "database.pool_size",
             &config.database.pool_size.to_string(),
             &defaults.database.pool_size.to_string(),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Log properties
+    fn track_log_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "log.level",
             &config.log.level,
             &defaults.log.level,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "log.format",
             &format!("{:?}", config.log.format),
             &format!("{:?}", defaults.log.format),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Telemetry properties
+    fn track_telemetry_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.enabled",
             &config.telemetry.enabled.to_string(),
             &defaults.telemetry.enabled.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.service_name",
             &config.telemetry.service_name,
             &defaults.telemetry.service_name,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.service_namespace",
             config.telemetry.service_namespace.as_deref().unwrap_or(""),
             defaults
@@ -320,176 +356,188 @@ impl ConfigProperties {
                 .service_namespace
                 .as_deref()
                 .unwrap_or(""),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.service_version",
             &config.telemetry.service_version,
             &defaults.telemetry.service_version,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.environment",
             &config.telemetry.environment,
             &defaults.telemetry.environment,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.otlp_endpoint",
             config.telemetry.otlp_endpoint.as_deref().unwrap_or(""),
             defaults.telemetry.otlp_endpoint.as_deref().unwrap_or(""),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.protocol",
             &format!("{:?}", config.telemetry.protocol),
             &format!("{:?}", defaults.telemetry.protocol),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "telemetry.strict",
             &config.telemetry.strict.to_string(),
             &defaults.telemetry.strict.to_string(),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Health properties
+    fn track_health_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "health.path",
             &config.health.path,
             &defaults.health.path,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "health.live_path",
             &config.health.live_path,
             &defaults.health.live_path,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "health.ready_path",
             &config.health.ready_path,
             &defaults.health.ready_path,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "health.startup_path",
             &config.health.startup_path,
             &defaults.health.startup_path,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "health.detailed",
             &config.health.detailed.to_string(),
             &defaults.health.detailed.to_string(),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Actuator properties
+    fn track_actuator_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "actuator.prefix",
             &config.actuator.prefix,
             &defaults.actuator.prefix,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "actuator.sensitive",
             &config.actuator.sensitive.to_string(),
             &defaults.actuator.sensitive.to_string(),
-            &profile_str,
+            profile_str,
         );
+    }
 
-        // Session properties
+    fn track_session_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
         Self::track_property(
-            &mut props,
+            props,
             "session.backend",
             &format!("{:?}", config.session.backend),
             &format!("{:?}", defaults.session.backend),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.cookie_name",
             &config.session.cookie_name,
             &defaults.session.cookie_name,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.max_age_secs",
             &config.session.max_age_secs.to_string(),
             &defaults.session.max_age_secs.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.secure",
             &config.session.secure.to_string(),
             &defaults.session.secure.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.same_site",
             &config.session.same_site,
             &defaults.session.same_site,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.http_only",
             &config.session.http_only.to_string(),
             &defaults.session.http_only.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.path",
             &config.session.path,
             &defaults.session.path,
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.allow_memory_in_production",
             &config.session.allow_memory_in_production.to_string(),
             &defaults.session.allow_memory_in_production.to_string(),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.redis.url",
             config.session.redis.url.as_deref().unwrap_or(""),
             defaults.session.redis.url.as_deref().unwrap_or(""),
-            &profile_str,
+            profile_str,
         );
         Self::track_property(
-            &mut props,
+            props,
             "session.redis.key_prefix",
             &config.session.redis.key_prefix,
             &defaults.session.redis.key_prefix,
-            &profile_str,
+            profile_str,
         );
-
-        Self {
-            inner: Arc::new(RwLock::new(props)),
-        }
     }
 
-    /// Track a single config property, determining its source by checking
-    /// for env var overrides and comparing against defaults.
     fn track_property(
         props: &mut HashMap<String, ConfigProperty>,
         key: &str,
