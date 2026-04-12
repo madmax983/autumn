@@ -411,6 +411,171 @@ impl ConfigProperties {
             &profile_str,
         );
 
+        // Cors properties
+        Self::track_property(
+            &mut props,
+            "cors.allowed_origins",
+            &config.cors.allowed_origins.join(","),
+            &defaults.cors.allowed_origins.join(","),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "cors.allowed_methods",
+            &config.cors.allowed_methods.join(","),
+            &defaults.cors.allowed_methods.join(","),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "cors.allowed_headers",
+            &config.cors.allowed_headers.join(","),
+            &defaults.cors.allowed_headers.join(","),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "cors.allow_credentials",
+            &config.cors.allow_credentials.to_string(),
+            &defaults.cors.allow_credentials.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "cors.max_age_secs",
+            &config.cors.max_age_secs.to_string(),
+            &defaults.cors.max_age_secs.to_string(),
+            &profile_str,
+        );
+
+        // Auth properties
+        Self::track_property(
+            &mut props,
+            "auth.bcrypt_cost",
+            &config.auth.bcrypt_cost.to_string(),
+            &defaults.auth.bcrypt_cost.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "auth.session_key",
+            &config.auth.session_key,
+            &defaults.auth.session_key,
+            &profile_str,
+        );
+
+        // Security properties
+        Self::track_property(
+            &mut props,
+            "security.headers.x_frame_options",
+            &config.security.headers.x_frame_options,
+            &defaults.security.headers.x_frame_options,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.x_content_type_options",
+            &config.security.headers.x_content_type_options.to_string(),
+            &defaults.security.headers.x_content_type_options.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.xss_protection",
+            &config.security.headers.xss_protection.to_string(),
+            &defaults.security.headers.xss_protection.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.strict_transport_security",
+            &config
+                .security
+                .headers
+                .strict_transport_security
+                .to_string(),
+            &defaults
+                .security
+                .headers
+                .strict_transport_security
+                .to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.hsts_max_age_secs",
+            &config.security.headers.hsts_max_age_secs.to_string(),
+            &defaults.security.headers.hsts_max_age_secs.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.hsts_include_subdomains",
+            &config.security.headers.hsts_include_subdomains.to_string(),
+            &defaults
+                .security
+                .headers
+                .hsts_include_subdomains
+                .to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.content_security_policy",
+            &config.security.headers.content_security_policy,
+            &defaults.security.headers.content_security_policy,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.referrer_policy",
+            &config.security.headers.referrer_policy,
+            &defaults.security.headers.referrer_policy,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.headers.permissions_policy",
+            &config.security.headers.permissions_policy,
+            &defaults.security.headers.permissions_policy,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.csrf.enabled",
+            &config.security.csrf.enabled.to_string(),
+            &defaults.security.csrf.enabled.to_string(),
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.csrf.cookie_name",
+            &config.security.csrf.cookie_name,
+            &defaults.security.csrf.cookie_name,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.csrf.form_field",
+            &config.security.csrf.form_field,
+            &defaults.security.csrf.form_field,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.csrf.token_header",
+            &config.security.csrf.token_header,
+            &defaults.security.csrf.token_header,
+            &profile_str,
+        );
+        Self::track_property(
+            &mut props,
+            "security.csrf.safe_methods",
+            &config.security.csrf.safe_methods.join(","),
+            &defaults.security.csrf.safe_methods.join(","),
+            &profile_str,
+        );
+
         // Session properties
         Self::track_property(
             &mut props,
