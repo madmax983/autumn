@@ -57,13 +57,14 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
             current_num.clear();
-            match ch {
-                's' => total_secs += num,
-                'm' => total_secs += num * 60,
-                'h' => total_secs += num * 3600,
-                'd' => total_secs += num * 86400,
+            let multiplier = match ch {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
                 _ => return None,
-            }
+            };
+            total_secs = total_secs.checked_add(num.checked_mul(multiplier)?)?;
         } else if ch == ' ' {
             // Skip spaces between components
         } else {
@@ -146,5 +147,14 @@ mod tests {
     #[test]
     fn compound_trailing_number() {
         assert!(parse_duration("1h 30").is_none());
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn doesnt_crash_on_large_numbers(num in "[0-9]{18}[smhd]") {
+            let _ = super::parse_duration(&num);
+        }
     }
 }
