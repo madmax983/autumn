@@ -768,12 +768,14 @@ pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
         .get()
         .await
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-    let cutoff = Utc::now().naive_utc() - chrono::Duration::days(LIVE_EVENT_RETENTION_DAYS);
 
-    let deleted =
-        diesel::delete(live_feed_events::table.filter(live_feed_events::created_at.lt(cutoff)))
-            .execute(&mut conn)
-            .await?;
+    let deleted = diesel::sql_query(
+        "DELETE FROM live_feed_events \
+         WHERE created_at < NOW() - ($1 * INTERVAL '1 day')",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(LIVE_EVENT_RETENTION_DAYS)
+    .execute(&mut conn)
+    .await?;
 
     if deleted > 0 {
         debug!(deleted, "pruned expired reddit-clone live-feed events");
@@ -1036,6 +1038,8 @@ mod tests {
     use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
     use autumn_web::config::DatabaseConfig;
     use autumn_web::db;
+    use diesel::QueryableByName;
+    use diesel_async::SimpleAsyncConnection;
     use testcontainers::ContainerAsync;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::redis::{REDIS_PORT, Redis};
@@ -1043,7 +1047,14 @@ mod tests {
 
     const REDDIT_INIT_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
 
+    #[derive(Debug, QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn relay_rebroadcasts_runner_events_into_web_channels() {
         let (_container, database_url, web_state, runner_state) = setup_live_event_states().await;
         let mut feed = web_state.channels().subscribe("feed");
@@ -1096,6 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn relay_notify_path_beats_long_poll_interval() {
         let (_container, database_url, web_state, runner_state) = setup_live_event_states().await;
         let mut feed = web_state.channels().subscribe("feed");
@@ -1138,6 +1150,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_bus_rebroadcasts_runner_events_into_web_channels() {
         let (_pg, _redis, database_url, redis_url, web_state, runner_state) =
             setup_live_event_states_with_redis().await;
@@ -1192,6 +1205,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_bus_still_wakes_on_postgres_backup_when_publish_is_missed() {
         let (_pg, _redis, database_url, redis_url, web_state, runner_state) =
             setup_live_event_states_with_redis().await;
@@ -1245,6 +1259,50 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn prune_live_feed_events_uses_database_clock_for_retention() {
+        let (_container, state) = setup_live_event_prune_state().await;
+        let mut conn = state
+            .pool()
+            .expect("prune state should have a database pool")
+            .get()
+            .await
+            .expect("pool should provide a connection");
+        conn.batch_execute("SET TIME ZONE 'America/Chicago'")
+            .await
+            .expect("test connection should accept a non-UTC timezone");
+        diesel::sql_query(
+            "INSERT INTO live_feed_events (subreddit_slug, event, created_at) VALUES \
+             ('rust', '{\"type\":\"old\"}'::jsonb, NOW() - INTERVAL '7 days' - INTERVAL '1 minute'), \
+             ('rust', '{\"type\":\"keep\"}'::jsonb, NOW() - INTERVAL '7 days' + INTERVAL '1 minute')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("test should seed retention boundary events");
+        drop(conn);
+
+        prune_live_feed_events(state.clone())
+            .await
+            .expect("prune should succeed");
+
+        let mut conn = state
+            .pool()
+            .expect("prune state should have a database pool")
+            .get()
+            .await
+            .expect("pool should provide a connection");
+        let remaining: CountRow =
+            diesel::sql_query("SELECT COUNT(*) AS count FROM live_feed_events")
+                .get_result(&mut conn)
+                .await
+                .expect("test should count remaining live events");
+        assert_eq!(
+            remaining.count, 1,
+            "prune should use the database clock so the just-inside-retention row survives",
+        );
+    }
+
+    #[tokio::test]
     async fn comment_event_payload_includes_preview_and_path() {
         let event = comment_created_event(
             7,
@@ -1268,6 +1326,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn relay_health_snapshot_reports_runtime_state() {
         let (_container, database_url, web_state, runner_state) = setup_live_event_states().await;
         let (listener, wake_tx) = test_listener_pair("test-postgres");
@@ -1318,6 +1377,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn relay_reconnects_after_listener_drop() {
         let (_container, database_url, web_state, runner_state) = setup_live_event_states().await;
         let (stale_listener, stale_wake_tx) = test_listener_pair("stale-listener");
@@ -1393,6 +1453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn relay_health_tracks_publish_and_wake_sources() {
         let success_state = AppState::detached().with_profile("relay-metrics-success");
         install_live_event_bus_with_config(&success_state, LiveFeedBusConfig::default())
@@ -1504,6 +1565,33 @@ mod tests {
             .with_pool(runner_pool);
 
         (container, database_url, web_state, runner_state)
+    }
+
+    async fn setup_live_event_prune_state() -> (ContainerAsync<Postgres>, AppState) {
+        let container = Postgres::default()
+            .with_init_sql(REDDIT_INIT_SQL.to_string().into_bytes())
+            .start()
+            .await
+            .expect("failed to start Postgres container");
+
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to get container host");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to get container port");
+        let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        let pool = db::create_pool(&DatabaseConfig {
+            url: Some(database_url),
+            pool_size: 1,
+            ..DatabaseConfig::default()
+        })
+        .expect("prune pool config should build")
+        .expect("prune pool should exist");
+
+        (container, AppState::for_test().with_pool(pool))
     }
 
     async fn setup_live_event_states_with_redis() -> (

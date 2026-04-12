@@ -347,6 +347,7 @@ mod tests {
     );
 
     #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn duplicate_publication_reuses_existing_execution() {
         let (mut conn, _container) = setup_test_db().await;
         let workflow_id = onboarding_workflow_id(42);
