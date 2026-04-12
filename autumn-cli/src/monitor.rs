@@ -37,6 +37,14 @@ struct HealthResponse {
     checks: Option<HealthChecks>,
 }
 
+pub type ConfigPropsResponse = std::collections::HashMap<String, ConfigProperty>;
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ConfigProperty {
+    value: serde_json::Value,
+    source: String,
+}
+
 #[derive(Debug, Deserialize, Default, Clone)]
 struct LoggersResponse {
     #[serde(default)]
@@ -167,6 +175,7 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
     loggers: LoggersResponse,
+    config_props: ConfigPropsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -197,6 +206,7 @@ impl DashboardState {
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
+            config_props: ConfigPropsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -231,6 +241,7 @@ impl DashboardState {
         self.fetch_metrics(&client);
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
+        self.fetch_config_props(&client);
 
         self.last_poll = Instant::now();
     }
@@ -319,6 +330,17 @@ impl DashboardState {
             }
         }
     }
+
+    fn fetch_config_props(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/configprops", self.base_url))
+            .send()
+        {
+            if let Ok(c) = resp.json::<ConfigPropsResponse>() {
+                self.config_props = c;
+            }
+        }
+    }
 }
 
 // ── TUI rendering ─────────────────────────────────────────────
@@ -367,11 +389,11 @@ fn run_loop(
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 3;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
                             if state.active_tab == 0 {
-                                state.active_tab = 2;
+                                state.active_tab = 3;
                             } else {
                                 state.active_tab -= 1;
                             }
@@ -419,6 +441,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_config_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -462,7 +485,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes", "Loggers"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Config"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -1081,6 +1104,72 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
     frame.render_widget(table, area);
 }
 
+
+fn draw_config_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Configuration Properties ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Property").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Value").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Source").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut props: Vec<_> = state.config_props.iter().collect();
+    props.sort_by(|a, b| a.0.cmp(b.0));
+
+    let rows: Vec<Row> = props
+        .into_iter()
+        .map(|(k, v)| {
+            let val_str = match &v.value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+
+            Row::new(vec![
+                Cell::from(k.clone()).style(Style::default().fg(Color::White)),
+                Cell::from(val_str).style(Style::default().fg(Color::Cyan)),
+                Cell::from(v.source.clone()).style(Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Percentage(35),
+        Constraint::Percentage(45),
+        Constraint::Percentage(20),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
+
+    frame.render_widget(table, area);
+}
+
 fn draw_footer(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let elapsed = state.last_poll.elapsed().as_secs();
 
@@ -1618,6 +1707,14 @@ mod tests {
         render_frame(&state, 120, 40);
     }
 
+
+    #[test]
+    fn render_config_tab() {
+        let mut state = test_state();
+        state.active_tab = 3;
+        render_frame(&state, 120, 40);
+    }
+
     #[test]
     fn render_loggers_tab() {
         let mut state = test_state();
@@ -1795,18 +1892,18 @@ mod tests {
         state.active_tab = 0;
 
         if state.active_tab == 0 {
-            state.active_tab = 2;
+                                state.active_tab = 3;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 3);
+
+        if state.active_tab == 0 {
+                                state.active_tab = 3;
         } else {
             state.active_tab -= 1;
         }
         assert_eq!(state.active_tab, 2);
-
-        if state.active_tab == 0 {
-            state.active_tab = 2;
-        } else {
-            state.active_tab -= 1;
-        }
-        assert_eq!(state.active_tab, 1);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+sed -i 's/pub struct ConfigPropsResponse/pub type ConfigPropsResponse = std::collections::HashMap<String, ConfigProperty>;\n\n#[derive(Debug, Deserialize, Default, Clone)]\nstruct ConfigProperty {\n    value: serde_json::Value,\n    source: String,\n}/g' autumn-cli/src/monitor.rs
