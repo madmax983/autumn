@@ -1,3 +1,33 @@
+//! The framework router builder.
+//!
+//! This module provides the core logic for constructing the [`axum::Router`]
+//! that serves an Autumn application. It takes user-defined routes, merges
+//! them by path to prevent framework overlaps, and sequentially layers
+//! framework-provided functionality:
+//!
+//! - **Health & Actuators:** Automatically mounts `/health`, `/live`, and metrics endpoints.
+//! - **Static Serving:** Serves files from `static/` and optionally supports `dist/` with ISR.
+//! - **Security:** Applies CSRF protections, security headers, and CORS rules based on [`crate::config::AutumnConfig`].
+//! - **State & Session:** Injects the [`crate::state::AppState`] and configures the session layer.
+//! - **Error Handling:** Wraps the entire application in the `ExceptionFilterLayer` to catch panics and format errors into HTML or JSON.
+//!
+//! # Examples
+//!
+//! Typically, you do not use this module directly. Instead, you use [`crate::app::AppBuilder`]
+//! which delegates to [`build_router`] under the hood:
+//!
+//! ```rust
+//! use autumn_web::{app::AppBuilder, route::Route};
+//!
+//! # async fn example() {
+//! let app = AppBuilder::new()
+//!     .routes(vec![Route::get("/", || async { "Hello World" })])
+//!     .build()
+//!     .await
+//!     .unwrap();
+//! # }
+//! ```
+
 use std::sync::Arc;
 
 use crate::app::ScopedGroup;
@@ -14,14 +44,42 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
+/// Errors that can occur during framework router assembly.
+///
+/// This error is returned when the framework attempts to build the final `axum::Router`
+/// but detects an invalid configuration or a routing conflict that prevents safe execution.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::{config::AutumnConfig, router::try_build_router, state::AppState, session::SessionBackend};
+///
+/// # async fn test_err() {
+/// let mut config = AutumnConfig::default();
+/// // Intentionally create a bad config by requesting Redis without providing a URL
+/// config.session.backend = SessionBackend::Redis;
+///
+/// let state = AppState::new_for_test();
+/// let result = try_build_router(vec![], &config, state);
+///
+/// assert!(result.is_err());
+/// # }
+/// ```
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RouterBuildError {
+    /// The configured session backend could not be initialized (e.g., missing Redis URL).
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+
+    /// A user-defined or actuator route attempted to mount at a path already reserved
+    /// by a framework system route (like `/health`).
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
+        /// The conflicting URI path (e.g., `/health`).
         path: String,
+        /// The name of the framework component that already owns this path.
         existing: &'static str,
+        /// The name of the new component attempting to claim the path.
         incoming: &'static str,
     },
 }
