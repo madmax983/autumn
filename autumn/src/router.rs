@@ -16,15 +16,17 @@
 //! Typically, you do not use this module directly. Instead, you use [`crate::app::AppBuilder`]
 //! which delegates to [`build_router`] under the hood:
 //!
-//! ```rust
-//! use autumn_web::{app::AppBuilder, route::Route};
+//! ```rust,no_run
+//! use autumn_web::prelude::*;
+//!
+//! #[get("/")]
+//! async fn hello() -> &'static str { "Hello World" }
 //!
 //! # async fn example() {
-//! let app = AppBuilder::new()
-//!     .routes(vec![Route::get("/", || async { "Hello World" })])
-//!     .build()
-//!     .await
-//!     .unwrap();
+//! autumn_web::app()
+//!     .routes(routes![hello])
+//!     .run()
+//!     .await;
 //! # }
 //! ```
 
@@ -54,16 +56,14 @@ use thiserror::Error;
 /// ```rust
 /// use autumn_web::{config::AutumnConfig, router::try_build_router, state::AppState, session::SessionBackend};
 ///
-/// # async fn test_err() {
 /// let mut config = AutumnConfig::default();
 /// // Intentionally create a bad config by requesting Redis without providing a URL
 /// config.session.backend = SessionBackend::Redis;
 ///
-/// let state = AppState::new_for_test();
+/// let state = AppState::for_test();
 /// let result = try_build_router(vec![], &config, state);
 ///
 /// assert!(result.is_err());
-/// # }
 /// ```
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RouterBuildError {
