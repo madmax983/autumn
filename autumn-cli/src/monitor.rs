@@ -1104,7 +1104,6 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
     frame.render_widget(table, area);
 }
 
-
 fn draw_config_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let block = Block::default()
         .title(Span::styled(
@@ -1707,7 +1706,6 @@ mod tests {
         render_frame(&state, 120, 40);
     }
 
-
     #[test]
     fn render_config_tab() {
         let mut state = test_state();
@@ -1892,14 +1890,14 @@ mod tests {
         state.active_tab = 0;
 
         if state.active_tab == 0 {
-                                state.active_tab = 3;
+            state.active_tab = 3;
         } else {
             state.active_tab -= 1;
         }
         assert_eq!(state.active_tab, 3);
 
         if state.active_tab == 0 {
-                                state.active_tab = 3;
+            state.active_tab = 3;
         } else {
             state.active_tab -= 1;
         }
