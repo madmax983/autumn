@@ -1,7 +1,6 @@
 use crate::schema::{comments, posts, subreddits, users, votes};
 
-// ── User ───────────────────────────────────────────────────────
-// Manual model — password_hash should never be auto-exposed via API.
+// Manual model -- password_hash should never be auto-exposed via API.
 
 #[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
 #[diesel(table_name = users)]
@@ -15,14 +14,12 @@ pub struct User {
     pub created_at: chrono::NaiveDateTime,
 }
 
-#[derive(Debug, diesel::Insertable, serde::Deserialize)]
+#[derive(Debug, Clone, diesel::Insertable, serde::Deserialize)]
 #[diesel(table_name = users)]
 pub struct NewUser {
     pub username: String,
     pub password_hash: String,
 }
-
-// ── Subreddit ──────────────────────────────────────────────────
 
 #[autumn_web::model]
 pub struct Subreddit {
@@ -40,8 +37,6 @@ pub struct Subreddit {
     #[default]
     pub created_at: chrono::NaiveDateTime,
 }
-
-// ── Post ───────────────────────────────────────────────────────
 
 #[autumn_web::model]
 pub struct Post {
@@ -69,8 +64,6 @@ pub struct Post {
     pub updated_at: chrono::NaiveDateTime,
 }
 
-// ── Comment ────────────────────────────────────────────────────
-
 #[autumn_web::model]
 pub struct Comment {
     #[id]
@@ -88,8 +81,7 @@ pub struct Comment {
     pub created_at: chrono::NaiveDateTime,
 }
 
-// ── Vote ───────────────────────────────────────────────────────
-// Manual model — complex constraints.
+// Manual model -- complex constraints.
 
 #[allow(dead_code)] // Used by generated API routes; not directly referenced in app code
 #[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]

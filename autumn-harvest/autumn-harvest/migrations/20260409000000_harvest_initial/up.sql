@@ -26,7 +26,7 @@ CREATE TABLE harvest_workflow_executions (
     memo                JSONB,
     search_attrs        JSONB,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (workflow_id, run_id)
+    UNIQUE (workflow_name, workflow_id)
 );
 
 CREATE INDEX idx_harvest_we_shard  ON harvest_workflow_executions (shard_id);

@@ -22,7 +22,7 @@ showcasing the framework's major features in a single cohesive application.
 | CSRF protection (`CsrfToken` + htmx header injection) | `routes/layout.rs`, all forms |
 | Field validation (`#[validate(length(min, max))]`) | `models.rs` |
 | Scheduled background tasks (`#[scheduled(every = "15m")]`) | `tasks.rs` |
-| **WebSockets** (`#[ws]`, `Channels` pub/sub, `CancellationToken`) | `routes/live.rs` |
+| **WebSockets** (`#[ws]`, `Channels`, durable app-db relay, pluggable live-event bus, `CancellationToken`, relay health JSON) | `routes/live.rs`, `live_events.rs`, `live_bus.rs` |
 | **Durable Workflows** (real autumn-harvest onboarding + post-publication flows + management API) | `workflows.rs`, `/api/harvest/*` |
 | Actuator endpoints (`/health`, `/actuator/*`) | Auto-mounted |
 | Maud HTML templates | All route files |
@@ -33,12 +33,15 @@ showcasing the framework's major features in a single cohesive application.
 ## Running
 
 ```bash
-# Start PostgreSQL
+# Start PostgreSQL + Redis
+# Fresh volumes are recommended if you want the split example too, because the
+# container init script creates the separate `reddit_harvest` database once.
 docker compose up -d
 
 # Run the app in dev mode
-# The first boot applies both the reddit-clone schema and the embedded
-# autumn-harvest workflow tables.
+# The first boot applies the reddit-clone schema, the framework-owned Harvest
+# workflow outbox on the app database, and the Harvest storage tables on the
+# configured Harvest database role.
 cargo run -p reddit-clone
 
 # Optional: watch mode from the workspace root
@@ -47,10 +50,83 @@ cargo run -p reddit-clone
 # Visit http://localhost:3000
 ```
 
-If Harvest logs errors like `relation "harvest_task_queue" does not exist`, you
-are pointing the app at a database that never received the embedded Harvest
-migrations. Start the example once in dev mode against that database before
-using a release/profile-specific run.
+If Harvest logs errors like `relation "harvest_task_queue" does not exist`, the
+configured Harvest storage database never received its migrations. Start the
+example once in dev mode against that database before using a release or
+profile-specific run.
+
+If app writes succeed but workflow publication stays pending, inspect the
+framework-owned `harvest_workflow_outbox` table in the app database. Delivery
+from that table into Harvest storage is intentionally at-least-once and depends
+on idempotent workflow start.
+
+The live-feed relay also exposes an operator-facing JSON snapshot:
+
+```bash
+curl http://localhost:3000/api/live/relay/health
+```
+
+## External Runner Escape Hatch
+
+`reddit-clone` stays the embedded happy path, but the Harvest topology seam is
+real now. If the app grows large enough to want a dedicated Harvest cluster and
+separate runtime ownership, the web process can keep the API and outbox while a
+different process owns worker/scheduler execution.
+
+For a local two-process demo, use the checked-in split profiles:
+
+```bash
+# Reset Postgres so the init script creates both `reddit` and `reddit_harvest`
+docker compose down -v
+docker compose up -d
+
+# Web process: app DB + Harvest API/outbox, but no local worker/scheduler
+AUTUMN_PROFILE=split-web cargo run -p reddit-clone
+
+# Separate process: owns Harvest worker/scheduler against the harvest DB
+AUTUMN_PROFILE=split-runner cargo run -p reddit-clone --bin reddit-clone-harvest-runner
+```
+
+Those profiles live in:
+
+- `autumn-split-web.toml`
+- `autumn-split-runner.toml`
+
+The runner binary reuses the same workflow/activity registration as the web app;
+it just changes runtime ownership. For a true external deployment, keep the
+same binary and commands, but point `harvest.database.url` at a separate
+cluster instead of the local `reddit_harvest` logical database.
+
+The live WebSocket feed keeps the app database as durable truth via
+`live_feed_events`, but the wakeup path is now pluggable:
+
+- Default/embedded mode uses Postgres `LISTEN/NOTIFY`
+- Split profiles use Redis pub/sub for cross-process wakeups
+- Split mode also keeps Postgres `NOTIFY` as a safety-net, so missed Redis
+  publishes still wake web nodes immediately from the durable event log
+- Polling is now the last fallback only when neither wake path is available
+
+That means the database still owns replay correctness while Redis takes over
+the “please wake up now” job once you outgrow letting Postgres moonlight as a
+bus.
+
+## Live Feed Operations
+
+`/api/live/relay/health` reports the current relay state for the local process.
+The important fields are:
+
+- `listener_state`: which wake path is currently active (`postgres`, `redis`, `redis+postgres`, or `polling`)
+- `reconnect_attempts` / `reconnect_successes` / `reconnect_failures`: whether the process is healing broken listeners or just taking notes about them
+- `wake_redis`, `wake_postgres`, `wake_poll`: which path is actually waking the relay
+- `replayed_events`, `last_seen_id`, `last_replayed_at`: whether durable rows are still flowing through replay
+- `last_error`: the last relay or publish error seen by this process
+
+Operator heuristics:
+
+- Sustained growth in `wake_poll` means the process is living on fallback instead of a real bus.
+- Growing `reconnect_failures` with a flat `reconnect_successes` means the configured wake path is still broken.
+- A stale `last_replayed_at` while app writes continue means live updates are stuck before rebroadcast.
+- In split mode, `listener_state = "redis+postgres"` is healthy: Redis is primary and Postgres is the backup wake path.
 
 ## WebSocket Live Feed
 
@@ -87,7 +163,9 @@ src/
   schema.rs         # Diesel table definitions
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)
-  tasks.rs          # #[scheduled] hot-rank recalculator
+  live_bus.rs       # Live-feed bus config and backend selection
+  live_events.rs    # Durable app-db live-feed relay with Postgres/Redis wakeups
+  tasks.rs          # Scheduled hot-rank + live-feed retention jobs
   workflows.rs      # real autumn-harvest onboarding + post-publication workflows and activities
   slugify.rs        # URL slug generation utility
   routes/
@@ -98,6 +176,6 @@ src/
     posts.rs        # Front page, submit, view, edit, delete
     comments.rs     # Comment creation and lazy loading
     votes.rs        # htmx-powered upvote/downvote with toggle + ON CONFLICT
-    live.rs         # #[ws] WebSocket feeds with Channels pub/sub
+    live.rs         # #[ws] WebSocket feeds consuming process-local Channels
     about.rs        # #[static_get] pre-rendered about page
 ```

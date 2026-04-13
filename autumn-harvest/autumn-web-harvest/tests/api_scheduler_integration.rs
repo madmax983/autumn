@@ -11,12 +11,18 @@ use autumn_harvest::policy::Schedule;
 use autumn_harvest::scheduler::{
     DagCatalog, SchedulerMonitor, compile_dag_catalog, register_schedules, tick_once,
 };
-use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::schema::{
+    harvest_dag_runs, harvest_schedules, harvest_task_queue, harvest_workflow_executions,
+};
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
 use autumn_web::AppState;
 use autumn_web::reexports::axum;
+use autumn_web_harvest::HarvestDbPool;
 use autumn_web_harvest::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
+use autumn_web_harvest::{
+    HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use diesel::ExpressionMethods;
@@ -67,6 +73,10 @@ fn build_test_pool(database_url: &str) -> DbPool {
 
 fn test_app_state(pool: DbPool) -> AppState {
     AppState::for_test().with_pool(pool).with_profile("test")
+}
+
+fn test_app_state_without_database() -> AppState {
+    AppState::for_test().with_profile("test")
 }
 
 fn build_test_worker(registry: Arc<HandlerRegistry>) -> Arc<Worker> {
@@ -219,6 +229,39 @@ async fn load_execution_from_url(database_url: &str, exec_id: &str) -> WorkflowE
         .first(&mut conn)
         .await
         .expect("failed to reload workflow execution")
+}
+
+async fn load_workflow_rows_from_url(
+    database_url: &str,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> Vec<WorkflowExecution> {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for workflow lookup");
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .order(harvest_workflow_executions::created_at.asc())
+        .select(WorkflowExecution::as_select())
+        .load(&mut conn)
+        .await
+        .expect("failed to load workflow rows by workflow key")
+}
+
+async fn count_workflow_tasks_from_url(database_url: &str, exec_id: &str) -> i64 {
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(database_url)
+        .await
+        .expect("failed to connect fresh Postgres client for task lookup");
+    let exec_id = exec_id
+        .parse::<autumn_harvest::ExecutionId>()
+        .expect("invalid execution id");
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id.as_uuid())))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("failed to count workflow tasks")
 }
 
 async fn load_schedule_from_url(database_url: &str, dag_name: &str) -> HarvestSchedule {
@@ -403,15 +446,16 @@ fn manual_interval_pipeline_info() -> DagInfo {
 }
 
 #[tokio::test]
-async fn harvest_api_starts_queries_and_signals_workflows() {
+async fn harvest_api_uses_installed_storage_pool_when_app_state_has_no_database() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let registry = approval_registry();
     let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        "test-worker".to_string(),
+        Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
     ));
@@ -419,7 +463,7 @@ async fn harvest_api_starts_queries_and_signals_workflows() {
     let worker = build_test_worker(Arc::clone(&registry));
     let worker_task = spawn_test_worker(Arc::clone(&worker), pool.clone());
 
-    let app = harvest_api_router(api_state.clone()).with_state(test_app_state(pool.clone()));
+    let app = harvest_api_router(api_state.clone()).with_state(test_app_state_without_database());
 
     let (start_status, start_json) = post_json(
         &app,
@@ -486,15 +530,154 @@ async fn harvest_api_starts_queries_and_signals_workflows() {
 }
 
 #[tokio::test]
+async fn harvest_api_duplicate_start_reuses_existing_execution() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let registry = approval_registry();
+    let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
+    api_state.install(HarvestApiRuntime::new(
+        Arc::clone(&registry),
+        Arc::new(HashMap::new()),
+        Some("test-worker".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+    ));
+    let app = harvest_api_router(api_state).with_state(test_app_state(pool));
+
+    let payload = json!({
+        "workflow_id": "approval-duplicate",
+        "input": { "request_id": "dup-1" },
+    });
+
+    let (first_status, first_json) =
+        post_json(&app, "/workflows/approval_workflow/start", payload.clone()).await;
+    assert_eq!(first_status, StatusCode::CREATED);
+    let first_exec_id = first_json["execution_id"]
+        .as_str()
+        .expect("first execution_id must be a string")
+        .to_owned();
+
+    let (second_status, second_json) =
+        post_json(&app, "/workflows/approval_workflow/start", payload).await;
+    assert_eq!(
+        second_status,
+        StatusCode::OK,
+        "duplicate start should reuse the existing execution"
+    );
+    assert_eq!(
+        second_json["execution_id"].as_str(),
+        Some(first_exec_id.as_str()),
+        "duplicate start should return the original execution id"
+    );
+
+    let executions =
+        load_workflow_rows_from_url(&database_url, "approval_workflow", "approval-duplicate").await;
+    assert_eq!(
+        executions.len(),
+        1,
+        "duplicate start should not create a second workflow row"
+    );
+    let tasks = count_workflow_tasks_from_url(&database_url, &first_exec_id).await;
+    assert_eq!(
+        tasks, 1,
+        "duplicate start should not enqueue duplicate workflow tasks"
+    );
+}
+
+#[tokio::test]
+async fn external_runner_processes_workflows_started_via_management_api() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let pool = build_test_pool(&database_url);
+    let api_state = HarvestApiState::new();
+
+    let web_runtime = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "approval_workflow",
+                module: "tests",
+                handler: approval_workflow,
+            }])
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: autumn_web_harvest::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_web_harvest::HarvestOutboxConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .expect("external web runtime should start without local ownership");
+
+    let runner = HarvestRunner::start(
+        autumn_harvest::HarvestBuilder::new()
+            .workflows(vec![WorkflowInfo {
+                name: "approval_workflow",
+                module: "tests",
+                handler: approval_workflow,
+            }])
+            .build(),
+        &HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: true,
+            scheduler_enabled: false,
+            database: autumn_web_harvest::HarvestDatabaseConfig {
+                url: Some(database_url.clone()),
+            },
+            outbox: autumn_web_harvest::HarvestOutboxConfig::default(),
+        },
+        HarvestRunnerResources::new(pool.clone()),
+    )
+    .expect("external runner should start");
+
+    api_state.install_storage_pool(web_runtime.storage_pool());
+    api_state.install(web_runtime.api_runtime());
+    let app = harvest_api_router(api_state).with_state(test_app_state_without_database());
+
+    let (start_status, start_json) = post_json(
+        &app,
+        "/workflows/approval_workflow/start",
+        json!({
+            "workflow_id": "approval-external-runner",
+            "input": { "request_id": "external-runner" },
+        }),
+    )
+    .await;
+    assert_eq!(start_status, StatusCode::CREATED);
+    let exec_id = start_json["execution_id"]
+        .as_str()
+        .expect("execution_id must be present")
+        .to_string();
+
+    let (signal_status, _signal_json) = post_json(
+        &app,
+        format!("/workflows/{exec_id}/signal/approved"),
+        json!({ "approved": true }),
+    )
+    .await;
+    assert_eq!(signal_status, StatusCode::ACCEPTED);
+
+    let execution = wait_for_workflow_state(&database_url, &exec_id, "COMPLETED").await;
+    assert_eq!(execution.workflow_name, "approval_workflow");
+
+    runner.stop().await;
+    web_runtime.stop().await;
+}
+
+#[tokio::test]
 async fn harvest_api_signal_does_not_wake_timer_waits_early() {
     let (database_url, _container) = setup_test_database_url().await;
     let pool = build_test_pool(&database_url);
     let registry = approval_and_timer_signal_registry();
     let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::new(HashMap::new()),
-        "test-worker".to_string(),
+        Some("test-worker".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
     ));
@@ -604,10 +787,11 @@ async fn harvest_api_lists_and_triggers_manual_dags() {
     .await;
 
     let api_state = HarvestApiState::new();
+    api_state.install_storage_pool(HarvestDbPool::from(pool.clone()));
     api_state.install(HarvestApiRuntime::new(
         Arc::clone(&registry),
         Arc::clone(&dag_catalog),
-        "scheduler-only".to_string(),
+        Some("scheduler-only".to_string()),
         vec!["default".to_string()],
         SchedulerMonitor::offline(),
     ));

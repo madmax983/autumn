@@ -55,6 +55,9 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: Some("dev".into()),
@@ -143,6 +146,9 @@ mod tests {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
             .with_state(AppState {
+                extensions: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
                 pool: Some(pool),
                 profile: Some("prod".into()),
                 started_at: std::time::Instant::now(),

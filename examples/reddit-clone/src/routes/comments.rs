@@ -6,9 +6,15 @@
 
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::State;
 use diesel::prelude::*;
+use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 
+use crate::live_events::{
+    comment_created_event, publish_stored_live_event_best_effort, store_activity_event,
+};
 use crate::models::Comment;
 use crate::schema::{comments, posts, subreddits, users};
 
@@ -24,6 +30,7 @@ pub struct CommentForm {
 #[post("/r/{sub_slug}/posts/{post_slug}/comments")]
 pub async fn create(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<CommentForm>,
@@ -34,38 +41,68 @@ pub async fn create(
         .ok_or_else(|| AutumnError::unauthorized_msg("Login required"))?
         .parse()
         .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
+    let author_username = session
+        .get("username")
+        .await
+        .unwrap_or_else(|| format!("user-{user_id}"));
 
     let body = form.0.body.trim().to_string();
     if body.is_empty() {
         return Err(AutumnError::unprocessable_msg("Comment cannot be empty"));
     }
 
-    // Find the post
-    let post_id: i64 = posts::table
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
-        .filter(subreddits::slug.eq(&sub_slug))
-        .filter(posts::slug.eq(&post_slug))
-        .select(posts::id)
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+    let sub_slug_for_event = sub_slug.clone();
+    let post_slug_for_event = post_slug.clone();
+    let body_for_insert = body.clone();
+    let author_username_for_event = author_username.clone();
+    let event_id = (*db)
+        .transaction::<i64, AutumnError, _>(|conn| {
+            let sub_slug = sub_slug_for_event.clone();
+            let post_slug = post_slug_for_event.clone();
+            let body = body_for_insert.clone();
+            let author_username = author_username_for_event.clone();
+            async move {
+                let post_id: i64 = posts::table
+                    .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+                    .filter(subreddits::slug.eq(&sub_slug))
+                    .filter(posts::slug.eq(&post_slug))
+                    .select(posts::id)
+                    .first(conn)
+                    .await
+                    .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    // Insert comment
-    diesel::insert_into(comments::table)
-        .values((
-            comments::body.eq(&body),
-            comments::author_id.eq(user_id),
-            comments::post_id.eq(post_id),
-            comments::score.eq(1_i64),
-        ))
-        .execute(&mut *db)
-        .await?;
+                let comment_id: i64 = diesel::insert_into(comments::table)
+                    .values((
+                        comments::body.eq(&body),
+                        comments::author_id.eq(user_id),
+                        comments::post_id.eq(post_id),
+                        comments::score.eq(1_i64),
+                    ))
+                    .returning(comments::id)
+                    .get_result(conn)
+                    .await?;
 
-    // Update comment count on post
-    diesel::update(posts::table.find(post_id))
-        .set(posts::comment_count.eq(posts::comment_count + 1))
-        .execute(&mut *db)
+                diesel::update(posts::table.find(post_id))
+                    .set(posts::comment_count.eq(posts::comment_count + 1))
+                    .execute(conn)
+                    .await?;
+
+                let event = comment_created_event(
+                    comment_id,
+                    post_id,
+                    &post_slug,
+                    &sub_slug,
+                    &author_username,
+                    &body,
+                );
+                let event_id = store_activity_event(conn, &sub_slug, &event).await?;
+
+                Ok(event_id)
+            }
+            .scope_boxed()
+        })
         .await?;
+    publish_stored_live_event_best_effort(&state, event_id).await;
 
     Ok(redirect_to(&format!("/r/{sub_slug}/posts/{post_slug}")))
 }

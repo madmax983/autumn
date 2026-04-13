@@ -230,6 +230,9 @@ mod tests {
         }
 
         let app = Router::new().route("/", get(handler)).with_state(AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),

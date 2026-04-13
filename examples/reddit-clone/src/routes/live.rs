@@ -1,10 +1,11 @@
 //! WebSocket live feed — real-time notifications for post and comment activity.
 //!
 //! Demonstrates: `#[ws]` macro, `Channels` pub/sub, `CancellationToken`
-//! for graceful shutdown, and the two-function pattern (pre-upgrade
-//! extractor access + post-upgrade socket handling).
+//! for graceful shutdown, and the durable app-db relay that keeps separate
+//! web and worker processes on the same live-feed stream.
 
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::State;
 use autumn_web::ws::{Message, WebSocket, WithShutdown, WsHandler};
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +47,24 @@ pub async fn live_feed(state: AppState) -> impl WsHandler {
     )
 }
 
+/// JSON health snapshot for the durable live-feed relay.
+///
+/// Operators can poll this endpoint to see which wake path the process is
+/// currently using, whether reconnect attempts are happening, and whether the
+/// relay has recently replayed durable events.
+#[get("/api/live/relay/health")]
+pub async fn live_feed_health(
+    State(state): State<AppState>,
+) -> AutumnResult<Json<crate::live_events::LiveFeedRelayHealthSnapshot>> {
+    crate::live_events::live_feed_relay_health_snapshot(&state)
+        .map(Json)
+        .ok_or_else(|| {
+            AutumnError::service_unavailable_msg(
+                "reddit-clone live-feed relay health is not installed",
+            )
+        })
+}
+
 /// WebSocket endpoint for a specific subreddit's activity.
 ///
 /// Clients connect to `/ws/r/{slug}` and receive JSON notifications
@@ -82,19 +101,4 @@ pub async fn subreddit_feed(
             }
         },
     )
-}
-
-/// Publish a feed event to the global and subreddit-specific channels.
-///
-/// Called from post/comment creation routes to broadcast activity.
-#[allow(dead_code)] // Available for routes that want to broadcast events
-pub fn publish_activity(state: &AppState, subreddit_slug: &str, event: &str) {
-    let channels = state.channels();
-    // Broadcast to global feed
-    channels.sender("feed").send(event).ok();
-    // Broadcast to subreddit-specific feed
-    channels
-        .sender(&format!("r/{subreddit_slug}"))
-        .send(event)
-        .ok();
 }

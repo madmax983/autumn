@@ -68,3 +68,10 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
     tracing::info!("hot-rank: recalculated {updated} posts");
     Ok(())
 }
+
+/// Prune durable live-feed rows after a short retention window so the
+/// cross-process broadcast log does not grow without bound.
+#[scheduled(every = "1h", name = "live-feed-retention")]
+pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
+    crate::live_events::prune_live_feed_events(state).await
+}
