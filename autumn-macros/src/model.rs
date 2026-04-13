@@ -208,7 +208,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let field_enum_variants: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
-            let ident = f.ident.as_ref().unwrap();
+            let ident = f
+                .ident
+                .as_ref()
+                .expect("Expected field to have an identifier in model macro");
             let variant = format_ident!("{}", pascal_case(&ident.to_string()));
             quote! { #variant }
         })
@@ -225,7 +228,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let merge_arms: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
-            let ident = f.ident.as_ref().unwrap();
+            let ident = f
+                .ident
+                .as_ref()
+                .expect("Expected field to have an identifier in model macro");
             let is_option = is_option_type(&f.ty);
             if is_option {
                 quote! {
@@ -255,7 +261,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let draft_accessor_sigs: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
-            let ident = f.ident.as_ref().unwrap();
+            let ident = f
+                .ident
+                .as_ref()
+                .expect("Expected field to have an identifier in model macro");
             let ty = &f.ty;
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty>;
@@ -267,7 +276,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let draft_accessors: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
-            let ident = f.ident.as_ref().unwrap();
+            let ident = f.ident.as_ref().expect("Expected field to have an identifier in model macro");
             let ty = &f.ty;
             quote! {
                 fn #ident(&mut self) -> ::autumn_web::hooks::DraftField<'_, #ty> {
@@ -299,7 +308,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let changeset_conversions: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
-            let ident = f.ident.as_ref().unwrap();
+            let ident = f
+                .ident
+                .as_ref()
+                .expect("Expected field to have an identifier in model macro");
             let is_option = is_option_type(&f.ty);
             if is_option {
                 // For nullable fields: Set(v) -> Some(v), Clear -> Some(None), Unchanged -> None

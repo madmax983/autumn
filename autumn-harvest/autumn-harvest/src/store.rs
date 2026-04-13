@@ -284,7 +284,10 @@ mod tests {
         // Deserialize each row's event_data back into WorkflowEvent
         let deserialized: Vec<WorkflowEvent> = rows
             .iter()
-            .map(|row| serde_json::from_value(row.event_data.clone()).unwrap())
+            .map(|row| {
+                serde_json::from_value(row.event_data.clone())
+                    .expect("Failed to deserialize JSON to WorkflowEvent")
+            })
             .collect();
 
         assert_eq!(deserialized.len(), 3);

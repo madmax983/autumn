@@ -91,7 +91,10 @@ fn generated_project_compiles_runs_and_serves() {
     // ── 6. Pick a free port and launch the server ───────────────────
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind ephemeral port");
-        listener.local_addr().unwrap().port()
+        listener
+            .local_addr()
+            .expect("Failed to get local address of test listener")
+            .port()
     };
 
     let child = Command::new("cargo")
@@ -124,7 +127,7 @@ fn generated_project_compiles_runs_and_serves() {
     // GET / -> 200 with welcome text
     let resp = client.get(format!("{base}/")).send().expect("GET / failed");
     assert_eq!(resp.status(), 200, "GET / status");
-    let body = resp.text().unwrap();
+    let body = resp.text().expect("Failed to read response body text");
     assert!(
         body.contains("Welcome to Autumn!"),
         "GET / body missing welcome text, got: {body}",
@@ -136,7 +139,7 @@ fn generated_project_compiles_runs_and_serves() {
         .send()
         .expect("GET /hello/world failed");
     assert_eq!(resp.status(), 200, "GET /hello/world status");
-    let body = resp.text().unwrap();
+    let body = resp.text().expect("Failed to read response body text");
     assert!(
         body.contains("Hello, world!"),
         "GET /hello/world body missing greeting, got: {body}",

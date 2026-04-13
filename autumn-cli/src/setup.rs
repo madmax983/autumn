@@ -277,7 +277,8 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ./tailwindcss-
 a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f  ./tailwindcss-windows-x64.exe
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-macos-arm64
 ";
-        let hash = parse_checksum_file(body, "tailwindcss-windows-x64.exe").unwrap();
+        let hash = parse_checksum_file(body, "tailwindcss-windows-x64.exe")
+            .expect("Failed to download or verify setup checksums");
         assert_eq!(
             hash,
             "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
@@ -287,7 +288,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
     #[test]
     fn parse_works_without_prefix() {
         let body = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  tailwindcss-linux-x64\n";
-        let hash = parse_checksum_file(body, "tailwindcss-linux-x64").unwrap();
+        let hash = parse_checksum_file(body, "tailwindcss-linux-x64")
+            .expect("Failed to download or verify setup checksums");
         assert_eq!(
             hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -297,7 +299,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
     #[test]
     fn parse_uppercase_hex() {
         let body = "A948904F2F0F479B8F8564E9D7A8F22E32D13E73845F1B0EA0E2975A02C8B87F  tailwindcss-linux-x64\n";
-        let hash = parse_checksum_file(body, "tailwindcss-linux-x64").unwrap();
+        let hash = parse_checksum_file(body, "tailwindcss-linux-x64")
+            .expect("Failed to download or verify setup checksums");
         assert_eq!(
             hash,
             "a948904f2f0f479b8f8564e9d7a8f22e32d13e73845f1b0ea0e2975a02c8b87f"
@@ -327,9 +330,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
 
     #[test]
     fn sha256_file_matches_bytes() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(tmp.path(), b"test data").unwrap();
-        let file_hash = sha256_file(tmp.path()).unwrap();
+        let tmp =
+            tempfile::NamedTempFile::new().expect("Failed to download or verify setup checksums");
+        fs::write(tmp.path(), b"test data").expect("Failed to download or verify setup checksums");
+        let file_hash =
+            sha256_file(tmp.path()).expect("Failed to download or verify setup checksums");
         let byte_hash = sha256_bytes(b"test data");
         assert_eq!(file_hash, byte_hash);
     }
@@ -348,22 +353,26 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  ./tailwindcss-
     #[test]
     #[ignore = "requires network access to download Tailwind binary"]
     fn download_and_verify_tailwind() {
-        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().expect("Failed to download or verify setup checksums");
         let install_dir = tmp.path().join("target/autumn");
-        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&install_dir).expect("Failed to download or verify setup checksums");
 
-        let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let binary_name = detect_platform(std::env::consts::OS, std::env::consts::ARCH)
+            .expect("Failed to download or verify setup checksums");
         let download_url = format!("{RELEASE_BASE_URL}/{TAILWIND_VERSION}/{binary_name}");
         let checksums_url = format!("{RELEASE_BASE_URL}/{TAILWIND_VERSION}/sha256sums.txt");
 
-        let expected_hash = fetch_expected_checksum(&checksums_url, &binary_name).unwrap();
+        let expected_hash = fetch_expected_checksum(&checksums_url, &binary_name)
+            .expect("Failed to download or verify setup checksums");
         let dest = install_dir.join(".tailwindcss.tmp");
-        download_with_progress(&download_url, &dest).unwrap();
+        download_with_progress(&download_url, &dest)
+            .expect("Failed to download or verify setup checksums");
 
-        let actual_hash = sha256_file(&dest).unwrap();
-        verify_checksum(&expected_hash, &actual_hash).unwrap();
+        let actual_hash = sha256_file(&dest).expect("Failed to download or verify setup checksums");
+        verify_checksum(&expected_hash, &actual_hash)
+            .expect("Failed to download or verify setup checksums");
 
-        let meta = fs::metadata(&dest).unwrap();
+        let meta = fs::metadata(&dest).expect("Failed to download or verify setup checksums");
         assert!(
             meta.len() > 1_000_000,
             "binary too small: {} bytes",

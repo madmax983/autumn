@@ -46,7 +46,7 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
     // Use std::time for a simple timestamp as chrono is not available
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("Failed to parse export configuration or read JSON")
         .as_secs();
 
     let snapshot = json!({
@@ -60,7 +60,8 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
 
     match File::create(output) {
         Ok(mut file) => {
-            let json_str = serde_json::to_string_pretty(&snapshot).unwrap();
+            let json_str = serde_json::to_string_pretty(&snapshot)
+                .expect("Failed to parse export configuration or read JSON");
             if let Err(e) = file.write_all(json_str.as_bytes()) {
                 return Err(format!("Failed to write to file '{output}': {e}"));
             }
@@ -97,8 +98,12 @@ mod tests {
     use std::thread;
 
     fn spawn_mock_server(status_line: &str, body: &str, num_requests: usize) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to parse export configuration or read JSON");
+        let port = listener
+            .local_addr()
+            .expect("Failed to parse export configuration or read JSON")
+            .port();
         let url = format!("http://127.0.0.1:{port}");
 
         let status_line = status_line.to_string();
@@ -150,14 +155,18 @@ mod tests {
 
     #[test]
     fn test_fetch_endpoint_failure() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to parse export configuration or read JSON");
+        let port = listener
+            .local_addr()
+            .expect("Failed to parse export configuration or read JSON")
+            .port();
         drop(listener); // Close so connection fails
 
         let client = Client::builder()
             .timeout(Duration::from_millis(100))
             .build()
-            .unwrap();
+            .expect("Failed to parse export configuration or read JSON");
         let val = fetch_endpoint(&client, &format!("http://127.0.0.1:{port}"), "/test");
         assert!(val.get("error").is_some());
     }
@@ -168,21 +177,32 @@ mod tests {
 
         let client = Client::new();
         let val = fetch_endpoint(&client, &url, "/test");
-        assert!(val["error"].as_str().unwrap().contains("HTTP 404"));
+        assert!(
+            val["error"]
+                .as_str()
+                .expect("Failed to parse export configuration or read JSON")
+                .contains("HTTP 404")
+        );
     }
 
     #[test]
     fn test_run_inner_success() {
         let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
 
-        let output_file = tempfile::NamedTempFile::new().unwrap();
-        let output_path = output_file.path().to_str().unwrap();
+        let output_file = tempfile::NamedTempFile::new()
+            .expect("Failed to parse export configuration or read JSON");
+        let output_path = output_file
+            .path()
+            .to_str()
+            .expect("Failed to parse export configuration or read JSON");
 
         let result = run_inner(&url, output_path);
         assert!(result.is_ok());
 
-        let contents = std::fs::read_to_string(output_path).unwrap();
-        let json: Value = serde_json::from_str(&contents).unwrap();
+        let contents = std::fs::read_to_string(output_path)
+            .expect("Failed to parse export configuration or read JSON");
+        let json: Value = serde_json::from_str(&contents)
+            .expect("Failed to parse export configuration or read JSON");
 
         assert_eq!(json["url"], url);
         assert_eq!(json["health"]["status"], "ok");
@@ -200,7 +220,7 @@ mod tests {
         assert!(
             val["error"]
                 .as_str()
-                .unwrap()
+                .expect("Failed to parse export configuration or read JSON")
                 .contains("Failed to parse JSON")
         );
     }

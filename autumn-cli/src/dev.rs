@@ -1088,7 +1088,8 @@ mod tests {
         let child = start_server(Path::new("/bin/sleep"), None);
         assert!(child.is_some());
         // Clean up
-        let mut child = child.unwrap();
+        let mut child =
+            child.expect("Failed to handle child process or path resolution in dev mode");
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1125,7 +1126,7 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects/hello"));
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let path = result.expect("Failed to handle child process or path resolution in dev mode");
         assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
     }
 
@@ -1134,7 +1135,7 @@ mod tests {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
         assert!(result.is_ok());
-        let path = result.unwrap();
+        let path = result.expect("Failed to handle child process or path resolution in dev mode");
         assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
     }
 
@@ -1218,7 +1219,10 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("multi"), Path::new("/projects/multi"));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
+        assert_eq!(
+            result.expect("Failed to handle child process or path resolution in dev mode"),
+            expected_binary("/tmp/target/debug/server")
+        );
     }
 
     #[test]
@@ -1240,7 +1244,10 @@ mod tests {
         });
         let result = resolve_binary_from_metadata(&metadata, Some("app-b"), Path::new("/projects"));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/app-b"));
+        assert_eq!(
+            result.expect("Failed to handle child process or path resolution in dev mode"),
+            expected_binary("/tmp/target/debug/app-b")
+        );
     }
 
     // ── stop_server tests ──────────────────────────────────────────

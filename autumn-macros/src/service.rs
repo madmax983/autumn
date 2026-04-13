@@ -149,7 +149,7 @@ mod tests {
                 fn deps(order_repo: PgOrderRepository, email: EmailClient);
             }",
         );
-        let deps = parse_deps(&t).unwrap();
+        let deps = parse_deps(&t).expect("Failed to parse service trait dependencies");
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0].name, "order_repo");
         assert_eq!(deps[1].name, "email");
@@ -162,7 +162,7 @@ mod tests {
                 fn deps();
             }",
         );
-        let deps = parse_deps(&t).unwrap();
+        let deps = parse_deps(&t).expect("Failed to parse service trait dependencies");
         assert!(deps.is_empty());
     }
 

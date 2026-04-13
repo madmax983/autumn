@@ -110,7 +110,8 @@ mod tests {
 
     #[test]
     fn parse_new_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"])
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::New { ref name } => {
                 assert_eq!(name, "my-app");
@@ -121,7 +122,8 @@ mod tests {
 
     #[test]
     fn parse_new_with_underscores() {
-        let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "new", "my_app"])
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::New { ref name } => {
                 assert_eq!(name, "my_app");
@@ -132,13 +134,14 @@ mod tests {
 
     #[test]
     fn parse_setup_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "setup"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "setup"]).expect("Failed to parse CLI arguments");
         assert!(matches!(cli.command, Commands::Setup { force: false }));
     }
 
     #[test]
     fn parse_setup_with_force() {
-        let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "setup", "--force"])
+            .expect("Failed to parse CLI arguments");
         assert!(matches!(cli.command, Commands::Setup { force: true }));
     }
 
@@ -164,7 +167,7 @@ mod tests {
 
     #[test]
     fn parse_build_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "build"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "build"]).expect("Failed to parse CLI arguments");
         assert!(matches!(
             cli.command,
             Commands::Build {
@@ -176,7 +179,8 @@ mod tests {
 
     #[test]
     fn parse_build_debug() {
-        let cli = Cli::try_parse_from(["autumn", "build", "--debug"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "build", "--debug"])
+            .expect("Failed to parse CLI arguments");
         assert!(matches!(
             cli.command,
             Commands::Build {
@@ -188,7 +192,8 @@ mod tests {
 
     #[test]
     fn parse_build_with_package() {
-        let cli = Cli::try_parse_from(["autumn", "build", "-p", "blog"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "build", "-p", "blog"])
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Build { debug, package } => {
                 assert!(!debug);
@@ -200,7 +205,8 @@ mod tests {
 
     #[test]
     fn parse_build_with_long_package() {
-        let cli = Cli::try_parse_from(["autumn", "build", "--package", "blog", "--debug"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "build", "--package", "blog", "--debug"])
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Build { debug, package } => {
                 assert!(debug);
@@ -212,7 +218,7 @@ mod tests {
 
     #[test]
     fn parse_dev_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "dev"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "dev"]).expect("Failed to parse CLI arguments");
         assert!(matches!(
             cli.command,
             Commands::Dev {
@@ -224,7 +230,8 @@ mod tests {
 
     #[test]
     fn parse_dev_with_package() {
-        let cli = Cli::try_parse_from(["autumn", "dev", "-p", "hello"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "dev", "-p", "hello"])
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Dev {
                 package,
@@ -239,7 +246,8 @@ mod tests {
 
     #[test]
     fn parse_dev_with_show_config() {
-        let cli = Cli::try_parse_from(["autumn", "dev", "--show-config"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "dev", "--show-config"])
+            .expect("Failed to parse CLI arguments");
         assert!(matches!(
             cli.command,
             Commands::Dev {
@@ -251,13 +259,15 @@ mod tests {
 
     #[test]
     fn parse_migrate_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["autumn", "migrate"]).expect("Failed to parse CLI arguments");
         assert!(matches!(cli.command, Commands::Migrate { action: None }));
     }
 
     #[test]
     fn parse_migrate_status() {
-        let cli = Cli::try_parse_from(["autumn", "migrate", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "migrate", "status"])
+            .expect("Failed to parse CLI arguments");
         assert!(matches!(
             cli.command,
             Commands::Migrate {
@@ -268,7 +278,8 @@ mod tests {
 
     #[test]
     fn parse_monitor_defaults() {
-        let cli = Cli::try_parse_from(["autumn", "monitor"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["autumn", "monitor"]).expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Monitor { url, interval } => {
                 assert_eq!(url, "http://localhost:3000");
@@ -281,7 +292,7 @@ mod tests {
     #[test]
     fn parse_monitor_custom_url() {
         let cli = Cli::try_parse_from(["autumn", "monitor", "-u", "http://prod:8080", "-i", "5"])
-            .unwrap();
+            .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Monitor { url, interval } => {
                 assert_eq!(url, "http://prod:8080");
@@ -293,7 +304,7 @@ mod tests {
 
     #[test]
     fn parse_export_defaults() {
-        let cli = Cli::try_parse_from(["autumn", "export"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "export"]).expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Export { url, output } => {
                 assert_eq!(url, "http://localhost:3000");
@@ -313,7 +324,7 @@ mod tests {
             "-o",
             "snapshot.json",
         ])
-        .unwrap();
+        .expect("Failed to parse CLI arguments");
         match cli.command {
             Commands::Export { url, output } => {
                 assert_eq!(url, "http://prod:8080");

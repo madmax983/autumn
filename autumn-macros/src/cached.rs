@@ -226,7 +226,8 @@ mod tests {
 
     #[test]
     fn parse_empty_attrs() {
-        let attrs = parse_cached_args(TokenStream::new()).unwrap();
+        let attrs =
+            parse_cached_args(TokenStream::new()).expect("Failed to parse cached macro arguments");
         assert!(attrs.ttl.is_none());
         assert!(attrs.max.is_none());
         assert!(!attrs.result);
@@ -235,7 +236,7 @@ mod tests {
     #[test]
     fn parse_ttl_only() {
         let tokens: TokenStream = quote! { ttl = "5m" };
-        let attrs = parse_cached_args(tokens).unwrap();
+        let attrs = parse_cached_args(tokens).expect("Failed to parse cached macro arguments");
         assert_eq!(attrs.ttl.as_deref(), Some("5m"));
         assert!(attrs.max.is_none());
         assert!(!attrs.result);
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn parse_all_attrs() {
         let tokens: TokenStream = quote! { ttl = "1h", max = 100, result };
-        let attrs = parse_cached_args(tokens).unwrap();
+        let attrs = parse_cached_args(tokens).expect("Failed to parse cached macro arguments");
         assert_eq!(attrs.ttl.as_deref(), Some("1h"));
         assert_eq!(attrs.max, Some(100));
         assert!(attrs.result);
@@ -253,14 +254,14 @@ mod tests {
     #[test]
     fn parse_max_as_integer() {
         let tokens: TokenStream = quote! { max = 500 };
-        let attrs = parse_cached_args(tokens).unwrap();
+        let attrs = parse_cached_args(tokens).expect("Failed to parse cached macro arguments");
         assert_eq!(attrs.max, Some(500));
     }
 
     #[test]
     fn parse_result_flag_only() {
         let tokens: TokenStream = quote! { result };
-        let attrs = parse_cached_args(tokens).unwrap();
+        let attrs = parse_cached_args(tokens).expect("Failed to parse cached macro arguments");
         assert!(attrs.result);
     }
 

@@ -59,7 +59,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             api_path = Some(value.value());
             Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
-            model_name = Some(meta.path.get_ident().unwrap().clone());
+            model_name = Some(
+                meta.path
+                    .get_ident()
+                    .expect("Failed to parse expected repository args")
+                    .clone(),
+            );
             Ok(())
         } else {
             Err(meta
@@ -680,14 +685,16 @@ mod tests {
 
     #[test]
     fn parse_find_by_single_field() {
-        let q = parse_query_name("find_by_title").unwrap();
+        let q =
+            parse_query_name("find_by_title").expect("Failed to parse expected repository args");
         assert_eq!(q.prefix, "find");
         assert_eq!(q.fields, vec!["title"]);
     }
 
     #[test]
     fn parse_find_by_two_fields() {
-        let q = parse_query_name("find_by_title_and_published").unwrap();
+        let q = parse_query_name("find_by_title_and_published")
+            .expect("Failed to parse expected repository args");
         assert_eq!(q.prefix, "find");
         assert_eq!(q.fields, vec!["title", "published"]);
         assert_eq!(q.combinator, "and");
@@ -695,20 +702,23 @@ mod tests {
 
     #[test]
     fn parse_count_by() {
-        let q = parse_query_name("count_by_published").unwrap();
+        let q = parse_query_name("count_by_published")
+            .expect("Failed to parse expected repository args");
         assert_eq!(q.prefix, "count");
         assert_eq!(q.fields, vec!["published"]);
     }
 
     #[test]
     fn parse_delete_by() {
-        let q = parse_query_name("delete_by_published").unwrap();
+        let q = parse_query_name("delete_by_published")
+            .expect("Failed to parse expected repository args");
         assert_eq!(q.prefix, "delete");
     }
 
     #[test]
     fn parse_exists_by() {
-        let q = parse_query_name("exists_by_title").unwrap();
+        let q =
+            parse_query_name("exists_by_title").expect("Failed to parse expected repository args");
         assert_eq!(q.prefix, "exists");
     }
 
@@ -725,8 +735,10 @@ mod tests {
 
     #[test]
     fn parse_repo_args_with_hooks() {
-        let tokens: proc_macro2::TokenStream = "Post, hooks = PostHooks".parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = "Post, hooks = PostHooks"
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(
             config
@@ -739,17 +751,20 @@ mod tests {
 
     #[test]
     fn parse_repo_args_without_hooks() {
-        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = "Post"
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert_eq!(config.model_name.to_string(), "Post");
         assert!(config.hooks_type.is_none());
     }
 
     #[test]
     fn parse_repo_args_with_table_and_hooks() {
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, table = "blog_posts", hooks = PostHooks"#.parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = r#"Post, table = "blog_posts", hooks = PostHooks"#
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.table_name, "blog_posts");
         assert_eq!(
@@ -763,17 +778,20 @@ mod tests {
 
     #[test]
     fn parse_repo_args_with_api() {
-        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#.parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = r#"Post, api = "/api/posts""#
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert_eq!(config.model_name.to_string(), "Post");
         assert_eq!(config.api_path.as_deref(), Some("/api/posts"));
     }
 
     #[test]
     fn parse_repo_args_with_hooks_and_api() {
-        let tokens: proc_macro2::TokenStream =
-            r#"Post, hooks = PostHooks, api = "/api/v1/posts""#.parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = r#"Post, hooks = PostHooks, api = "/api/v1/posts""#
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert_eq!(config.model_name.to_string(), "Post");
         assert!(config.hooks_type.is_some());
         assert_eq!(config.api_path.as_deref(), Some("/api/v1/posts"));
@@ -781,8 +799,10 @@ mod tests {
 
     #[test]
     fn parse_repo_args_without_api() {
-        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
-        let config = parse_repo_args(tokens).unwrap();
+        let tokens: proc_macro2::TokenStream = "Post"
+            .parse()
+            .expect("Failed to parse expected repository args");
+        let config = parse_repo_args(tokens).expect("Failed to parse expected repository args");
         assert!(config.api_path.is_none());
     }
 

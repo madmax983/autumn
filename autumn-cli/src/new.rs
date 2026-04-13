@@ -228,8 +228,9 @@ mod tests {
 
     #[test]
     fn generates_all_expected_files() {
-        let tmp = TempDir::new().unwrap();
-        generate("test-app", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("test-app", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
@@ -248,30 +249,36 @@ mod tests {
 
     #[test]
     fn cargo_toml_has_project_name() {
-        let tmp = TempDir::new().unwrap();
-        generate("my-cool-app", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("my-cool-app", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains(r#"name = "my-cool-app""#));
         assert!(content.contains("autumn-web = "));
     }
 
     #[test]
     fn cargo_toml_has_autumn_version() {
-        let tmp = TempDir::new().unwrap();
-        generate("ver-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("ver-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml"))
+            .expect("Failed to generate or read project files in new template");
         let expected = format!(r#"autumn-web = "{}""#, env!("CARGO_PKG_VERSION"));
         assert!(content.contains(&expected));
     }
 
     #[test]
     fn main_rs_has_sample_routes() {
-        let tmp = TempDir::new().unwrap();
-        generate("route-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("route-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("route-check/src/main.rs")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("route-check/src/main.rs"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains(r#"#[get("/")]"#));
         assert!(content.contains(r#"#[get("/hello")]"#));
         assert!(content.contains(r#"#[get("/hello/{name}")]"#));
@@ -281,10 +288,12 @@ mod tests {
 
     #[test]
     fn autumn_toml_has_defaults() {
-        let tmp = TempDir::new().unwrap();
-        generate("cfg-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("cfg-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("cfg-check/autumn.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("cfg-check/autumn.toml"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains("port = 3000"));
         assert!(content.contains(r#"host = "127.0.0.1""#));
         assert!(content.contains(r#"level = "info""#));
@@ -293,19 +302,23 @@ mod tests {
 
     #[test]
     fn autumn_toml_has_crate_name_in_db_url() {
-        let tmp = TempDir::new().unwrap();
-        generate("my-db-app", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("my-db-app", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains("my_db_app"));
     }
 
     #[test]
     fn gitignore_excludes_target_and_css() {
-        let tmp = TempDir::new().unwrap();
-        generate("gi-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("gi-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains("/target"));
         assert!(content.contains("static/css/autumn.css"));
         assert!(!content.contains("static/autumn/"));
@@ -313,10 +326,12 @@ mod tests {
 
     #[test]
     fn generated_build_rs_reruns_on_css_input_changes() {
-        let tmp = TempDir::new().unwrap();
-        generate("css-watch-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("css-watch-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
-        let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs"))
+            .expect("Failed to generate or read project files in new template");
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
         assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
         assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
@@ -324,12 +339,14 @@ mod tests {
 
     #[test]
     fn no_unsubstituted_placeholders() {
-        let tmp = TempDir::new().unwrap();
-        generate("placeholder-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("placeholder-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
 
         let p = tmp.path().join("placeholder-check");
         for entry in walkdir(&p) {
-            let content = fs::read_to_string(&entry).unwrap();
+            let content = fs::read_to_string(&entry)
+                .expect("Failed to generate or read project files in new template");
             assert!(
                 !content.contains("{{"),
                 "unsubstituted placeholder in {}",
@@ -340,8 +357,9 @@ mod tests {
 
     #[test]
     fn already_exists_error() {
-        let tmp = TempDir::new().unwrap();
-        generate("dupe-check", tmp.path()).unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
+        generate("dupe-check", tmp.path())
+            .expect("Failed to generate or read project files in new template");
         let err = generate("dupe-check", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
         assert!(err.to_string().contains("already exists"));
@@ -349,7 +367,7 @@ mod tests {
 
     #[test]
     fn invalid_name_error() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = TempDir::new().expect("Failed to generate or read project files in new template");
         let err = generate("123bad", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::InvalidName(_, _)));
     }

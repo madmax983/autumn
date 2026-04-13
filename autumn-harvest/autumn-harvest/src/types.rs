@@ -178,10 +178,26 @@ mod tests {
     }
 
     #[test]
+    fn execution_id_display_roundtrip() {
+        let id = ExecutionId::new();
+        let s = id.to_string();
+        let parsed: ExecutionId = s.parse().expect("Failed to parse ExecutionId string");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
     fn activity_exec_id_display_roundtrip() {
         let id = ActivityExecId::new();
         let s = id.to_string();
-        let parsed: ActivityExecId = s.parse().unwrap();
+        let parsed: ActivityExecId = s.parse().expect("Failed to parse ActivityExecId string");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn timer_id_display_roundtrip() {
+        let id = TimerId::new("timer-123");
+        let s = id.to_string();
+        let parsed = TimerId::new(s);
         assert_eq!(id, parsed);
     }
 }

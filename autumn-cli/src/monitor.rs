@@ -1348,13 +1348,17 @@ mod tests {
     #[test]
     fn test_poll_updates_state() {
         // Start a mock server
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to execute monitor draw or IO operation");
+        let port = listener
+            .local_addr()
+            .expect("Failed to execute monitor draw or IO operation")
+            .port();
         let url = format!("http://127.0.0.1:{port}");
 
         thread::spawn(move || {
             for stream in listener.incoming().take(4) {
-                let mut stream = stream.unwrap();
+                let mut stream = stream.expect("Failed to execute monitor draw or IO operation");
                 let mut reader = BufReader::new(&mut stream);
                 let mut req_line = String::new();
                 if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
@@ -1411,8 +1415,12 @@ mod tests {
     #[test]
     fn test_poll_handles_connection_error() {
         // Use an invalid port to force connection error
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("Failed to execute monitor draw or IO operation");
+        let port = listener
+            .local_addr()
+            .expect("Failed to execute monitor draw or IO operation")
+            .port();
         drop(listener); // Ensure the port is immediately closed and unreachable
 
         let mut state = DashboardState::new(format!("http://127.0.0.1:{port}"));
@@ -1426,12 +1434,12 @@ mod tests {
             state
                 .last_error
                 .as_ref()
-                .unwrap()
+                .expect("Failed to execute monitor draw or IO operation")
                 .contains("Connection failed")
                 || state
                     .last_error
                     .as_ref()
-                    .unwrap()
+                    .expect("Failed to execute monitor draw or IO operation")
                     .contains("HTTP client error")
         );
     }
@@ -1461,7 +1469,8 @@ mod tests {
     #[test]
     fn deserialize_health_response() {
         let json = r#"{"status":"ok","version":"0.1.0","profile":"dev","uptime":"1h 23m"}"#;
-        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        let health: HealthResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(health.status, "ok");
         assert_eq!(health.profile, "dev");
         assert_eq!(health.version, "0.1.0");
@@ -1475,8 +1484,13 @@ mod tests {
             "status":"ok","version":"0.1.0","profile":"dev","uptime":"1h",
             "checks":{"database":{"status":"ok","pool_size":10,"active_connections":3,"idle_connections":7}}
         }"#;
-        let health: HealthResponse = serde_json::from_str(json).unwrap();
-        let db = health.checks.unwrap().database.unwrap();
+        let health: HealthResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
+        let db = health
+            .checks
+            .expect("Failed to execute monitor draw or IO operation")
+            .database
+            .expect("Failed to execute monitor draw or IO operation");
         assert_eq!(db.status, "ok");
         assert_eq!(db.pool_size, 10);
         assert_eq!(db.active_connections, 3);
@@ -1486,7 +1500,8 @@ mod tests {
     #[test]
     fn deserialize_health_minimal() {
         let json = r#"{"status":"up"}"#;
-        let health: HealthResponse = serde_json::from_str(json).unwrap();
+        let health: HealthResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(health.status, "up");
         assert!(health.version.is_empty());
     }
@@ -1504,7 +1519,8 @@ mod tests {
                 "by_status": {"2xx": 140, "3xx": 5, "4xx": 3, "5xx": 2}
             }
         }"#;
-        let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
+        let metrics: MetricsResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(metrics.http.requests_total, 150);
         assert_eq!(metrics.http.requests_active, 3);
         assert_eq!(metrics.http.latency_ms.p50, 5);
@@ -1528,8 +1544,11 @@ mod tests {
                      "by_route": {}, "by_status": {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}},
             "database": {"pool_size": 10, "active_connections": 2, "idle_connections": 8}
         }"#;
-        let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
-        let db = metrics.database.unwrap();
+        let metrics: MetricsResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
+        let db = metrics
+            .database
+            .expect("Failed to execute monitor draw or IO operation");
         assert_eq!(db.pool_size, 10);
         assert_eq!(db.active_connections, 2);
         assert_eq!(db.idle_connections, 8);
@@ -1538,7 +1557,8 @@ mod tests {
     #[test]
     fn deserialize_metrics_minimal() {
         let json = r#"{"http":{}}"#;
-        let metrics: MetricsResponse = serde_json::from_str(json).unwrap();
+        let metrics: MetricsResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(metrics.http.requests_total, 0);
         assert!(metrics.database.is_none());
     }
@@ -1546,7 +1566,8 @@ mod tests {
     #[test]
     fn deserialize_tasks_response() {
         let json = r#"{"scheduled_tasks":{"cleanup":{"schedule":"every 5m","status":"idle","total_runs":10,"total_failures":1}}}"#;
-        let tasks: TasksResponse = serde_json::from_str(json).unwrap();
+        let tasks: TasksResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(tasks.scheduled_tasks["cleanup"].total_runs, 10);
         assert_eq!(tasks.scheduled_tasks["cleanup"].total_failures, 1);
         assert_eq!(tasks.scheduled_tasks["cleanup"].schedule, "every 5m");
@@ -1558,7 +1579,8 @@ mod tests {
         let json = r#"{"scheduled_tasks":{"sync":{"schedule":"cron 0 * * * *","status":"idle",
             "last_run":"2026-01-01T00:00:00Z","last_duration_ms":150,"last_result":"failed",
             "last_error":"connection refused","total_runs":5,"total_failures":2}}}"#;
-        let tasks: TasksResponse = serde_json::from_str(json).unwrap();
+        let tasks: TasksResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         let sync = &tasks.scheduled_tasks["sync"];
         assert_eq!(sync.last_error.as_deref(), Some("connection refused"));
         assert_eq!(sync.total_failures, 2);
@@ -1567,14 +1589,16 @@ mod tests {
     #[test]
     fn deserialize_tasks_empty() {
         let json = r#"{"scheduled_tasks":{}}"#;
-        let tasks: TasksResponse = serde_json::from_str(json).unwrap();
+        let tasks: TasksResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert!(tasks.scheduled_tasks.is_empty());
     }
 
     #[test]
     fn deserialize_loggers_response() {
         let json = r#"{"current_level":"info","available_levels":["trace","debug","info","warn","error"],"loggers":{"my_module":"debug","other_module":"trace"}}"#;
-        let loggers: LoggersResponse = serde_json::from_str(json).unwrap();
+        let loggers: LoggersResponse =
+            serde_json::from_str(json).expect("Failed to execute monitor draw or IO operation");
         assert_eq!(loggers.current_level, "info");
         assert_eq!(loggers.available_levels.len(), 5);
         assert_eq!(loggers.loggers["my_module"], "debug");
@@ -1601,8 +1625,11 @@ mod tests {
 
     fn render_frame(state: &DashboardState, width: u16, height: u16) {
         let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, state)).unwrap();
+        let mut terminal =
+            Terminal::new(backend).expect("Failed to execute monitor draw or IO operation");
+        terminal
+            .draw(|frame| draw(frame, state))
+            .expect("Failed to execute monitor draw or IO operation");
     }
 
     #[test]

@@ -170,7 +170,10 @@ mod tests {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let result =
             resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"));
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(
+            result.expect("Failed to read generated build artifacts"),
+            expected_binary("/tmp/target/debug/hello")
+        );
     }
 
     #[test]
@@ -178,7 +181,10 @@ mod tests {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let result =
             resolve_binary_from_metadata(&metadata, true, None, Path::new("/projects/hello"));
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(
+            result.expect("Failed to read generated build artifacts"),
+            expected_binary("/tmp/target/debug/hello")
+        );
     }
 
     #[test]
@@ -187,7 +193,7 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, false, Some("hello"), Path::new("/projects"));
         assert_eq!(
-            result.unwrap(),
+            result.expect("Failed to read generated build artifacts"),
             expected_binary("/tmp/target/release/hello")
         );
     }

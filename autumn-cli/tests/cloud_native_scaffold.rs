@@ -33,7 +33,8 @@ fn cloud_native_scaffold_emits_container_artifacts() {
 #[test]
 fn cloud_native_scaffold_includes_probe_and_telemetry_examples() {
     let temp_dir = scaffold("ops-app");
-    let config = fs::read_to_string(temp_dir.path().join("ops-app/autumn.toml")).unwrap();
+    let config = fs::read_to_string(temp_dir.path().join("ops-app/autumn.toml"))
+        .expect("Failed to read scaffolded file");
 
     assert!(config.contains(r#"# live_path = "/live""#));
     assert!(config.contains(r#"# ready_path = "/ready""#));
@@ -47,8 +48,10 @@ fn cloud_native_scaffold_includes_probe_and_telemetry_examples() {
 fn cloud_native_scaffold_dockerfile_is_production_ready() {
     let temp_dir = scaffold("container-app");
     let project_dir = temp_dir.path().join("container-app");
-    let dockerfile = fs::read_to_string(project_dir.join("Dockerfile")).unwrap();
-    let dockerignore = fs::read_to_string(project_dir.join(".dockerignore")).unwrap();
+    let dockerfile =
+        fs::read_to_string(project_dir.join("Dockerfile")).expect("Failed to read scaffolded file");
+    let dockerignore = fs::read_to_string(project_dir.join(".dockerignore"))
+        .expect("Failed to read scaffolded file");
 
     assert!(dockerfile.contains("FROM rust:1.86-bookworm AS builder"));
     assert!(dockerfile.contains("FROM debian:bookworm-slim AS runtime"));
