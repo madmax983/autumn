@@ -1076,7 +1076,7 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
     if let Ok(mut parsed_url) = url::Url::parse(url) {
         if parsed_url.password().is_some() {
             let _ = parsed_url.set_password(Some("****"));
-            return format!("{} (pool_size={})", parsed_url, pool_size);
+            return format!("{parsed_url} (pool_size={pool_size})");
         }
     }
     format!("{url} (pool_size={pool_size})")
