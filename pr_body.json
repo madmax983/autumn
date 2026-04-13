@@ -1,0 +1,6 @@
+{
+  "title": "🔒 Warden: Secure mask_database_url parsing",
+  "body": "## 🦠 Threat\nThe `mask_database_url` function previously relied on fragile custom string manipulation to mask passwords in database connection strings before logging. This could potentially leak passwords if the URL was formatted differently than expected (e.g. if the password contained URL encoded `@` or `:` characters).\n\n## 🛡️ Defense\nReplaced the custom string parsing with the robust `url` crate. The function now correctly parses the string into a `url::Url` struct, safely blanks the password using the built-in `.set_password(Some(\"****\"))` method, and serializes it back to a string.\n\n## 💥 Severity\nModerate. If an incorrectly formatted URL or a URL with special characters in the password was used, the logging mechanism might log the password in plain text, causing a data exposure vulnerability.\n\n## 🧪 Verification\n- `cargo clippy`, `cargo fmt`, and `cargo test` run successfully.\n- New unit tests added to cover edge cases like URL encoded characters and no usernames in the `mask_database_url_edge_cases` test.",
+  "head": "jules-9338176395697038110-56728ba2",
+  "base": "main"
+}
