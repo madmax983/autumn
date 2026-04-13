@@ -112,36 +112,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hx_request_extractor_parses_headers() {
+    async fn hx_request_extractor_parses_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder()
             .header("hx-request", "true")
             .header("hx-target", "my-div")
+            .header("hx-trigger", "btn")
+            .header("hx-trigger-name", "btn-name")
+            .header("hx-current-url", "http://example.com")
+            .header("hx-history-restore-request", "true")
+            .header("hx-prompt", "yes")
             .header("hx-boosted", "true")
-            .body(())
-            .unwrap();
+            .body(())?;
         let (mut parts, ()) = req.into_parts();
 
         let hx = HxRequest::from_request_parts(&mut parts, &())
             .await
-            .unwrap();
+            .expect("infallible");
 
         assert!(hx.is_htmx);
         assert_eq!(hx.target.as_deref(), Some("my-div"));
+        assert_eq!(hx.trigger.as_deref(), Some("btn"));
+        assert_eq!(hx.trigger_name.as_deref(), Some("btn-name"));
+        assert_eq!(hx.current_url.as_deref(), Some("http://example.com"));
+        assert!(hx.history_restore_request);
+        assert_eq!(hx.prompt.as_deref(), Some("yes"));
         assert!(hx.boosted);
-        assert_eq!(hx.trigger, None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn hx_request_extractor_handles_missing_headers() {
-        let req = Request::builder().body(()).unwrap();
+    async fn hx_request_extractor_handles_missing_headers() -> Result<(), axum::http::Error> {
+        let req = Request::builder().body(())?;
         let (mut parts, ()) = req.into_parts();
 
         let hx = HxRequest::from_request_parts(&mut parts, &())
             .await
-            .unwrap();
+            .expect("infallible");
 
         assert!(!hx.is_htmx);
         assert_eq!(hx.target, None);
+        assert_eq!(hx.trigger, None);
+        assert_eq!(hx.trigger_name, None);
+        assert_eq!(hx.current_url, None);
+        assert!(!hx.history_restore_request);
+        assert_eq!(hx.prompt, None);
         assert!(!hx.boosted);
+        Ok(())
     }
 }

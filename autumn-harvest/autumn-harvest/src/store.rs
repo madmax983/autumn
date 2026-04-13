@@ -259,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn history_from_rows_deserializes_events() {
+    fn history_from_rows_deserializes_events() -> Result<(), serde_json::Error> {
         let exec_id = ExecutionId::new();
         let events = vec![
             WorkflowEvent::WorkflowStarted {
@@ -282,10 +282,11 @@ mod tests {
         assert_eq!(rows.len(), 3);
 
         // Deserialize each row's event_data back into WorkflowEvent
-        let deserialized: Vec<WorkflowEvent> = rows
+        let deserialized: Result<Vec<WorkflowEvent>, _> = rows
             .iter()
-            .map(|row| serde_json::from_value(row.event_data.clone()).unwrap())
+            .map(|row| serde_json::from_value(row.event_data.clone()))
             .collect();
+        let deserialized = deserialized?;
 
         assert_eq!(deserialized.len(), 3);
         assert!(matches!(
@@ -327,6 +328,7 @@ mod tests {
         } else {
             panic!("expected WorkflowCompleted");
         }
+        Ok(())
     }
 
     #[test]

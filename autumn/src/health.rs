@@ -76,72 +76,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_no_database_returns_ok() {
+    async fn health_no_database_returns_ok() -> Result<(), Box<dyn std::error::Error>> {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
 
         assert_eq!(json["status"], "ok");
         assert!(json["version"].is_string());
         assert_eq!(json["profile"], "dev");
         assert!(json["uptime"].is_string());
         assert!(json.get("pool").is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn health_no_database_returns_json_content_type() {
+    async fn health_no_database_returns_json_content_type() -> Result<(), Box<dyn std::error::Error>>
+    {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
 
         let content_type = response
             .headers()
             .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
+            .ok_or("missing content type")?
+            .to_str()?;
         assert!(
             content_type.contains("application/json"),
             "Expected application/json, got {content_type}"
         );
+        Ok(())
     }
 
     #[cfg(feature = "db")]
     #[tokio::test]
-    async fn health_with_pool_returns_pool_status() {
+    async fn health_with_pool_returns_pool_status() -> Result<(), Box<dyn std::error::Error>> {
         let config = crate::config::DatabaseConfig {
             url: Some("postgres://localhost/test".into()),
             pool_size: 5,
             ..Default::default()
         };
-        let pool = crate::db::create_pool(&config).unwrap().unwrap();
+        let pool = crate::db::create_pool(&config)?.ok_or("no pool created")?;
 
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
@@ -165,54 +153,40 @@ mod tests {
             });
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
 
         assert_eq!(json["status"], "ok");
         assert!(json["version"].is_string());
         assert_eq!(json["pool"]["size"], 5);
         assert!(json["pool"]["available"].is_number());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn health_response_includes_version() {
+    async fn health_response_includes_version() -> Result<(), Box<dyn std::error::Error>> {
         let app = axum::Router::new()
             .route("/health", axum::routing::get(handler))
             .with_state(test_state());
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
 
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn health_detailed_false_omits_details() {
+    async fn health_detailed_false_omits_details() -> Result<(), Box<dyn std::error::Error>> {
         let mut state = test_state();
         state.health_detailed = false;
 
@@ -221,26 +195,19 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+            .oneshot(Request::builder().uri("/health").body(Body::empty())?)
+            .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
 
         assert_eq!(json["status"], "ok");
         assert!(json.get("version").is_none());
         assert!(json.get("profile").is_none());
         assert!(json.get("uptime").is_none());
         assert!(json.get("pool").is_none());
+        Ok(())
     }
 }

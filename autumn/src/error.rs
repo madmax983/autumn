@@ -647,17 +647,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_response_has_json_body() {
+    async fn into_response_has_json_body() -> Result<(), axum::Error> {
         let err = AutumnError::not_found(TestError("not found".into()));
         let response = err.into_response();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
 
         assert_eq!(json["error"]["status"], 404);
         assert_eq!(json["error"]["message"], "not found");
+        Ok(())
     }
 
     #[test]
@@ -669,30 +668,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msg_constructor_produces_valid_json_response() {
+    async fn msg_constructor_produces_valid_json_response() -> Result<(), axum::Error> {
         let err = AutumnError::unprocessable_msg("title required");
         let response = err.into_response();
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["error"]["status"], 422);
         assert_eq!(json["error"]["message"], "title required");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn service_unavailable_response_is_503() {
+    async fn service_unavailable_response_is_503() -> Result<(), axum::Error> {
         let err = AutumnError::service_unavailable_msg("db down");
         let response = err.into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["error"]["status"], 503);
         assert_eq!(json["error"]["message"], "db down");
+        Ok(())
     }
 }
