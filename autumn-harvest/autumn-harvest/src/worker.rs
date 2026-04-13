@@ -1859,27 +1859,29 @@ mod tests {
     }
 
     #[test]
-    fn worker_shutdown_cancels_token() {
+    fn worker_shutdown_cancels_token() -> Result<(), crate::error::HarvestError> {
         let cfg = default_runtime_config();
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
-        let worker = Worker::new(cfg, registry).unwrap();
+        let worker = Worker::new(cfg, registry)?;
 
         assert!(!worker.shutdown.is_cancelled());
         worker.shutdown();
         assert!(worker.shutdown.is_cancelled());
+        Ok(())
     }
 
     #[test]
-    fn claimed_task_kind_uses_lowercase_db_values() {
+    fn claimed_task_kind_uses_lowercase_db_values() -> Result<(), crate::error::HarvestError> {
         assert_eq!(
-            ClaimedTaskKind::from_db("workflow").unwrap(),
+            ClaimedTaskKind::from_db("workflow")?,
             ClaimedTaskKind::Workflow
         );
         assert_eq!(
-            ClaimedTaskKind::from_db("activity").unwrap(),
+            ClaimedTaskKind::from_db("activity")?,
             ClaimedTaskKind::Activity
         );
         assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
+        Ok(())
     }
 
     #[test]
