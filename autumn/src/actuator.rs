@@ -16,7 +16,26 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+/// Trait to abstract the state requirements for actuator handlers.
+pub trait ProvideActuatorState {
+    fn metrics(&self) -> &crate::middleware::MetricsCollector;
+    fn log_levels(&self) -> &LogLevels;
+    fn task_registry(&self) -> &TaskRegistry;
+    fn config_props(&self) -> &ConfigProperties;
+    fn profile(&self) -> &str;
+    fn uptime_display(&self) -> String;
+
+    #[cfg(feature = "ws")]
+    fn channels(&self) -> &crate::channels::Channels;
+
+    #[cfg(feature = "ws")]
+    fn shutdown_token(&self) -> tokio_util::sync::CancellationToken;
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
 
 // ── Shared types for AppState ──────────────────────────────────
 
@@ -611,13 +630,15 @@ struct DatabaseCheck {
 
 /// `GET <actuator-prefix>/health`
 #[allow(unused_variables, clippy::useless_let_if_seq)]
-pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     let db_check;
     let overall_healthy;
 
     #[cfg(feature = "db")]
     {
-        if let Some(pool) = state.pool.as_ref() {
+        if let Some(pool) = state.pool() {
             let status = pool.status();
             let available = status.available as u64;
             let size = status.max_size as u64;
@@ -690,7 +711,9 @@ struct RuntimeInfo {
 }
 
 /// `GET <actuator-prefix>/info`
-pub(crate) async fn info(State(state): State<AppState>) -> Json<ActuatorInfo> {
+pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
             name: std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into()),
@@ -732,9 +755,11 @@ fn should_redact(key: &str) -> bool {
 }
 
 /// `GET /actuator/env` — only available when actuator sensitive mode is enabled.
-pub(crate) async fn env_endpoint(State(state): State<AppState>) -> Json<ActuatorEnv> {
+pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<ActuatorEnv> {
     let properties = state
-        .config_props
+        .config_props()
         .snapshot()
         .into_iter()
         .map(|(key, prop)| (key, prop.value))
@@ -750,13 +775,15 @@ pub(crate) async fn env_endpoint(State(state): State<AppState>) -> Json<Actuator
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
 #[allow(unused_variables, unused_mut)]
-pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let snapshot = state.metrics.snapshot();
+pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool.as_ref() {
+    if let Some(pool) = state.pool() {
         let status = pool.status();
         let db_stats = serde_json::json!({
             "pool_size": status.max_size,
@@ -774,10 +801,12 @@ pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serd
 // ── Prometheus ─────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
-pub(crate) async fn prometheus_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     use std::fmt::Write;
 
-    let snapshot = state.metrics.snapshot();
+    let snapshot = state.metrics().snapshot();
     let mut out = String::with_capacity(1024);
 
     // requests_total
@@ -850,8 +879,10 @@ pub(crate) async fn prometheus_endpoint(State(state): State<AppState>) -> impl I
 // ── Config Properties (sensitive) ──────────────────────────────
 
 /// `GET <actuator-prefix>/configprops` -- all config properties with source tracking.
-pub(crate) async fn configprops_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let props = state.config_props.snapshot();
+pub(crate) async fn configprops_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let props = state.config_props().snapshot();
 
     Json(serde_json::json!({
         "active_profile": state.profile(),
@@ -873,11 +904,13 @@ pub(crate) struct LoggersResponse {
 }
 
 /// `GET <actuator-prefix>/loggers` -- view current log levels.
-pub(crate) async fn loggers_get(State(state): State<AppState>) -> Json<LoggersResponse> {
+pub(crate) async fn loggers_get<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<LoggersResponse> {
     Json(LoggersResponse {
-        current_level: state.log_levels.current_level(),
+        current_level: state.log_levels().current_level(),
         available_levels: AVAILABLE_LEVELS.to_vec(),
-        loggers: state.log_levels.logger_overrides(),
+        loggers: state.log_levels().logger_overrides(),
     })
 }
 
@@ -888,8 +921,8 @@ pub(crate) struct SetLoggerRequest {
 }
 
 /// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
-pub(crate) async fn loggers_put(
-    State(state): State<AppState>,
+pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
     Path(name): Path<String>,
     Json(body): Json<SetLoggerRequest>,
 ) -> impl IntoResponse {
@@ -910,7 +943,7 @@ pub(crate) async fn loggers_put(
         );
     }
 
-    let previous = state.log_levels.set_logger_level(&name, &level);
+    let previous = state.log_levels().set_logger_level(&name, &level);
 
     (
         StatusCode::OK,
@@ -925,8 +958,10 @@ pub(crate) async fn loggers_put(
 // ── Tasks (sensitive) ──────────────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks` -- scheduled task status.
-pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let tasks = state.task_registry.snapshot();
+pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let tasks = state.task_registry().snapshot();
 
     Json(serde_json::json!({
         "scheduled_tasks": tasks,
@@ -937,8 +972,8 @@ pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_
 
 /// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
 #[cfg(feature = "ws")]
-pub(crate) async fn tasks_stream_endpoint(
-    State(state): State<AppState>,
+pub(crate) async fn tasks_stream_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
@@ -1030,60 +1065,67 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
-pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
+pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
+    sensitive: bool,
+) -> axum::Router<S> {
     actuator_router_with_prefix("/actuator", sensitive)
 }
 
 /// Build the actuator router at a configured prefix.
 ///
 /// This is the prefix-aware variant used by the framework router.
-pub(crate) fn actuator_router_with_prefix(prefix: &str, sensitive: bool) -> axum::Router<AppState> {
+pub(crate) fn actuator_router_with_prefix<
+    S: ProvideActuatorState + Send + Sync + Clone + 'static,
+>(
+    prefix: &str,
+    sensitive: bool,
+) -> axum::Router<S> {
     let mut router = axum::Router::new()
         .route(
             &actuator_route_path(prefix, "/health"),
-            axum::routing::get(health),
+            axum::routing::get(health::<S>),
         )
         .route(
             &actuator_route_path(prefix, "/info"),
-            axum::routing::get(info),
+            axum::routing::get(info::<S>),
         )
         .route(
             &actuator_route_path(prefix, "/metrics"),
-            axum::routing::get(metrics_endpoint),
+            axum::routing::get(metrics_endpoint::<S>),
         );
 
     if sensitive {
         router = router
             .route(
                 &actuator_route_path(prefix, "/env"),
-                axum::routing::get(env_endpoint),
+                axum::routing::get(env_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/configprops"),
-                axum::routing::get(configprops_endpoint),
+                axum::routing::get(configprops_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/loggers"),
-                axum::routing::get(loggers_get),
+                axum::routing::get(loggers_get::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/loggers/{name}"),
-                axum::routing::put(loggers_put),
+                axum::routing::put(loggers_put::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/tasks"),
-                axum::routing::get(tasks_endpoint),
+                axum::routing::get(tasks_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/prometheus"),
-                axum::routing::get(prometheus_endpoint),
+                axum::routing::get(prometheus_endpoint::<S>),
             );
 
         #[cfg(feature = "ws")]
         {
             router = router.route(
                 &actuator_route_path(prefix, "/tasks/stream"),
-                axum::routing::get(tasks_stream_endpoint),
+                axum::routing::get(tasks_stream_endpoint::<S>),
             );
         }
     }
@@ -1095,6 +1137,7 @@ pub(crate) fn actuator_router_with_prefix(prefix: &str, sensitive: bool) -> axum
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
+    use crate::state::AppState;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -1276,8 +1319,8 @@ mod tests {
     #[tokio::test]
     async fn actuator_metrics_returns_http_stats() {
         let state = test_state();
-        state.metrics.record("GET", "/test", 200, 10);
-        state.metrics.record("POST", "/test", 500, 50);
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("POST", "/test", 500, 50);
 
         let app = actuator_router(true).with_state(state);
         let resp = app
@@ -1430,7 +1473,7 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["message"], "Logger 'autumn_web' set to 'debug'");
 
-        let overrides = state.log_levels.logger_overrides();
+        let overrides = state.log_levels().logger_overrides();
         assert_eq!(
             overrides.get("autumn_web").map(String::as_str),
             Some("debug")
@@ -1498,8 +1541,8 @@ mod tests {
     #[tokio::test]
     async fn actuator_prometheus_returns_metrics() {
         let state = test_state();
-        state.metrics.record("GET", "/test", 200, 10);
-        state.metrics.record("POST", "/test", 500, 50);
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("POST", "/test", 500, 50);
 
         let app = actuator_router(true).with_state(state);
         let resp = app
@@ -1559,9 +1602,9 @@ mod tests {
     #[tokio::test]
     async fn actuator_tasks_returns_registered_tasks() {
         let state = test_state();
-        state.task_registry.register("cleanup", "every 5m");
-        state.task_registry.record_start("cleanup");
-        state.task_registry.record_success("cleanup", 150);
+        state.task_registry().register("cleanup", "every 5m");
+        state.task_registry().record_start("cleanup");
+        state.task_registry().record_success("cleanup", 150);
 
         let app = actuator_router(true).with_state(state);
         let resp = app
