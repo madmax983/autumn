@@ -106,11 +106,27 @@ pub enum LiveFeedBusConfigLoadError {
 }
 
 fn resolve_manifest_dir(env: &dyn Env) -> PathBuf {
-    env.var("AUTUMN_MANIFEST_DIR")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    let build_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    if let Ok(value) = env.var("AUTUMN_MANIFEST_DIR") {
+        if !value.is_empty() {
+            let manifest_dir = PathBuf::from(value);
+            if manifest_dir.is_dir() {
+                return manifest_dir;
+            }
+            return process_working_dir_or(build_manifest_dir);
+        }
+    }
+
+    if build_manifest_dir.is_dir() {
+        return build_manifest_dir;
+    }
+
+    process_working_dir_or(build_manifest_dir)
+}
+
+fn process_working_dir_or(fallback: PathBuf) -> PathBuf {
+    std::env::current_dir().unwrap_or(fallback)
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
@@ -182,4 +198,33 @@ fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
 
 fn empty_distributed_section() -> toml::Value {
     toml::Value::Table(toml::map::Map::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use autumn_web::config::MockEnv;
+
+    #[test]
+    fn resolve_manifest_dir_falls_back_to_process_dir_when_env_dir_is_missing() {
+        let missing_dir = std::env::temp_dir().join(format!(
+            "reddit-clone-missing-manifest-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let env = MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            missing_dir
+                .to_str()
+                .expect("temp path should be valid unicode"),
+        );
+
+        let resolved = resolve_manifest_dir(&env);
+
+        assert_eq!(
+            resolved,
+            std::env::current_dir().expect("test process should have a current directory"),
+            "missing AUTUMN_MANIFEST_DIR should fall back to the process working directory",
+        );
+    }
 }
