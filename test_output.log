@@ -1,0 +1,1451 @@
+warning: bookmarks-distributed@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+warning: todo-app@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+warning: blog@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+warning: reddit-clone@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+warning: wiki@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+warning: bookmarks@0.1.0: Tailwind CSS CLI not found — CSS will not be compiled. Run `autumn setup` or install tailwindcss manually.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/main.rs (target/debug/deps/autumn-ef388b454ba24bcf)
+
+running 178 tests
+test build::tests::resolve_binary_by_cwd ... ok
+test build::tests::resolve_binary_by_package_name ... ok
+test build::tests::resolve_binary_reports_missing_targets ... ok
+test build::tests::resolve_binary_reports_missing_package ... ok
+test build::tests::resolve_binary_uses_release_profile ... ok
+test dev::tests::build_command_with_package ... ok
+test dev::tests::build_command_without_package ... ok
+test dev::tests::build_rs_change_requires_build_restart ... ok
+test dev::tests::build_tailwind_command_for_sets_expected_args ... ok
+test dev::tests::build_restart_overrides_tailwind_only_changes ... ok
+test dev::tests::cargo_lock_triggers_rebuild ... ok
+test dev::tests::collect_changes_handles_empty_events ... ok
+test dev::tests::collect_changes_filters_irrelevant ... ok
+test dev::tests::collect_changes_returns_empty_for_no_relevant ... ok
+test dev::tests::css_input_change_runs_tailwind_without_build ... ok
+test dev::tests::debounce_interval_is_reasonable ... ok
+test dev::tests::describe_plan_covers_each_user_visible_action ... ok
+test dev::tests::dev_reload_state_signal_none_is_noop ... ok
+test dev::tests::dev_reload_state_signal_rejects_overflow ... ok
+test dev::tests::has_component_matches_exact_path_components ... ok
+test dev::tests::dev_reload_state_signal_writes_css_and_full_versions ... ok
+test dev::tests::ignores_generated_dev_reload_state_file ... ok
+test dev::tests::ignores_generated_tailwind_output ... ok
+test dev::tests::ignores_file_without_extension ... ok
+test dev::tests::ignores_hidden_directory_nested ... ok
+test dev::tests::ignores_irrelevant_extensions ... ok
+test dev::tests::ignores_non_any_events ... ok
+test dev::tests::ignores_hidden_files ... ok
+test dev::tests::ignores_target_directory ... ok
+test dev::tests::ignores_target_nested_deeply ... ok
+test dev::tests::mixed_config_and_css_changes_restart_and_rebuild_css ... ok
+test dev::tests::profile_config_change_requires_restart_only ... ok
+test dev::tests::profile_config_file_requires_named_toml_suffix ... ok
+test dev::tests::relevant_cargo_toml ... ok
+test dev::tests::relevant_css_file ... ok
+test dev::tests::relevant_html_file ... ok
+test dev::tests::relevant_image_files_trigger_browser_reload ... ok
+test dev::tests::relevant_js_file ... ok
+test dev::tests::relevant_nested_rust_file ... ok
+test dev::tests::relevant_rust_file ... ok
+test dev::tests::relevant_sql_migration ... ok
+test dev::tests::relevant_toml_config ... ok
+test dev::tests::resolve_binary_by_cwd ... ok
+test dev::tests::resolve_binary_by_package_name ... ok
+test dev::tests::resolve_binary_missing_packages ... ok
+test dev::tests::resolve_binary_missing_target_directory ... ok
+test dev::tests::resolve_binary_no_match_by_cwd ... ok
+test dev::tests::resolve_binary_package_not_found ... ok
+test dev::tests::resolve_binary_picks_first_bin_in_multi_target ... ok
+test dev::tests::resolve_binary_skips_lib_targets ... ok
+test dev::tests::resolve_binary_with_multiple_packages ... ok
+test dev::tests::cargo_metadata_includes_target_directory_and_packages ... ok
+/bin/sleep: missing operand
+Try '/bin/sleep --help' for more information.
+test dev::tests::start_server_returns_child_for_valid_binary ... ok
+test dev::tests::start_server_returns_none_for_missing_binary ... ok
+test dev::tests::static_asset_change_triggers_browser_reload_only ... ok
+test dev::tests::find_binary_resolves_workspace_package ... ok
+test dev::tests::stop_server_with_none_is_noop ... ok
+test dev::tests::resolve_target_directory_returns_workspace_target ... ok
+test dev::tests::resolve_dev_reload_state_path_uses_target_autumn_file ... ok
+test dev::tests::watch_dirs_are_non_empty ... ok
+test dev::tests::watch_files_are_non_empty ... ok
+test dev::tests::which_finds_binary_on_path ... ok
+test dev::tests::which_returns_none_when_binary_missing ... ok
+test migrate::tests::default_migrations_dir_is_migrations ... ok
+test migrate::tests::migrate_action_eq ... ok
+test migrate::tests::resolve_database_url_from_database_url_env ... ok
+test migrate::tests::resolve_database_url_from_env ... ok
+test monitor::tests::back_tab_wrap_logic ... ok
+test monitor::tests::dashboard_state_initial ... ok
+test monitor::tests::dashboard_state_with_trailing_slash ... ok
+test monitor::tests::default_types ... ok
+test monitor::tests::deserialize_health_minimal ... ok
+test monitor::tests::deserialize_health_response ... ok
+test monitor::tests::deserialize_health_with_db_check ... ok
+test monitor::tests::deserialize_loggers_response ... ok
+test monitor::tests::deserialize_metrics_minimal ... ok
+test monitor::tests::deserialize_metrics_response ... ok
+test monitor::tests::deserialize_metrics_with_db ... ok
+test monitor::tests::deserialize_tasks_empty ... ok
+test monitor::tests::deserialize_tasks_response ... ok
+test monitor::tests::deserialize_tasks_with_error ... ok
+test monitor::tests::format_number_boundary ... ok
+test monitor::tests::format_number_millions ... ok
+test monitor::tests::format_number_plain ... ok
+test monitor::tests::format_number_thousands ... ok
+test monitor::tests::info_line_produces_two_spans ... ok
+test monitor::tests::latency_color_cyan_for_moderate ... ok
+test monitor::tests::latency_color_green_for_fast ... ok
+test monitor::tests::latency_color_orange_for_very_slow ... ok
+test monitor::tests::latency_color_red_for_slow ... ok
+test monitor::tests::latency_color_yellow_for_slow ... ok
+test monitor::tests::make_card_block_has_title ... ok
+test monitor::tests::render_all_zero_status_codes ... ok
+test dev::tests::stop_server_terminates_child ... ok
+test dev::tests::wait_with_timeout_succeeds_for_fast_process ... ok
+test monitor::tests::render_degraded_health ... ok
+test monitor::tests::render_disconnected ... ok
+test monitor::tests::render_invalid_tab_does_not_panic ... ok
+test monitor::tests::render_empty_profile ... ok
+test monitor::tests::render_high_latency_values ... ok
+test monitor::tests::render_loggers_tab ... ok
+test monitor::tests::render_large_request_counts ... ok
+test monitor::tests::render_no_db_info ... ok
+test monitor::tests::render_no_routes ... ok
+test monitor::tests::render_no_tasks ... ok
+test monitor::tests::render_overview_tab ... ok
+test monitor::tests::render_small_terminal ... ok
+test monitor::tests::render_routes_tab ... ok
+test dev::tests::wait_with_timeout_times_out_for_long_process ... ok
+test monitor::tests::render_task_unknown_status ... ok
+test monitor::tests::render_with_tasks ... ok
+test monitor::tests::render_with_error_in_footer ... ok
+test monitor::tests::render_with_health_checks_db ... ok
+test monitor::tests::render_wide_terminal ... ok
+test monitor::tests::status_color_mapping ... ok
+test monitor::tests::truncate_exact_length ... ok
+test monitor::tests::truncate_long_string ... ok
+test monitor::tests::truncate_short_string ... ok
+test new::tests::already_exists_error ... ok
+test new::tests::autumn_toml_has_crate_name_in_db_url ... ok
+test monitor::tests::test_poll_handles_connection_error ... ok
+test new::tests::autumn_toml_has_defaults ... ok
+test new::tests::cargo_toml_has_project_name ... ok
+test new::tests::cargo_toml_has_autumn_version ... ok
+test new::tests::empty_name_rejected ... ok
+test new::tests::generated_build_rs_reruns_on_css_input_changes ... ok
+test new::tests::generates_all_expected_files ... ok
+test new::tests::gitignore_excludes_target_and_css ... ok
+test new::tests::keyword_async_rejected ... ok
+test new::tests::invalid_name_error ... ok
+test new::tests::keyword_rejected ... ok
+test new::tests::main_rs_has_sample_routes ... ok
+test new::tests::no_unsubstituted_placeholders ... ok
+test monitor::tests::test_poll_updates_state ... ok
+test new::tests::special_chars_rejected ... ok
+test new::tests::valid_name_simple ... ok
+test new::tests::valid_name_with_digits ... ok
+test new::tests::valid_name_with_hyphens ... ok
+test new::tests::valid_name_with_underscores ... ok
+test setup::tests::detect_platform_supported_combinations ... ok
+test setup::tests::detect_unsupported_arch ... ok
+test setup::tests::detect_unsupported_os ... ok
+test setup::tests::download_and_verify_tailwind ... ignored, requires network access to download Tailwind binary
+test new::tests::starts_with_hyphen_rejected ... ok
+test setup::tests::install_path_is_correct ... ok
+test setup::tests::parse_empty_file_fails ... ok
+test setup::tests::parse_finds_correct_binary ... ok
+test setup::tests::parse_missing_binary_fails ... ok
+test new::tests::starts_with_digit_rejected ... ok
+test setup::tests::parse_uppercase_hex ... ok
+test setup::tests::parse_works_without_prefix ... ok
+test setup::tests::sha256_hello_world ... ok
+test setup::tests::sha256_known_value ... ok
+test setup::tests::verify_checksum_match ... ok
+test setup::tests::verify_checksum_mismatch ... ok
+test setup::tests::parse_non_hex_fails ... ok
+test setup::tests::sha256_file_matches_bytes ... ok
+test tests::new_missing_name_is_error ... ok
+test tests::new_rejects_removed_wasm_flag ... ok
+test tests::no_args_is_error ... ok
+test tests::parse_build_subcommand ... ok
+test tests::parse_build_debug ... ok
+test tests::parse_build_with_long_package ... ok
+test tests::parse_dev_subcommand ... ok
+test tests::parse_dev_with_package ... ok
+test tests::parse_dev_with_show_config ... ok
+test tests::parse_build_with_package ... ok
+test tests::parse_migrate_status ... ok
+test tests::parse_migrate_subcommand ... ok
+test tests::parse_monitor_custom_url ... ok
+test tests::parse_monitor_defaults ... ok
+test tests::parse_new_with_underscores ... ok
+test tests::parse_new_subcommand ... ok
+test tests::parse_setup_subcommand ... ok
+test tests::parse_setup_with_force ... ok
+test tests::unknown_subcommand_is_error ... ok
+test tests::setup_rejects_removed_wasm_flag ... ok
+test monitor::tests::render_zero_throughput ... ok
+
+test result: ok. 177 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s
+
+     Running tests/e2e.rs (target/debug/deps/e2e-6d4c440efcf22e2b)
+
+running 1 test
+test generated_project_compiles_runs_and_serves ... ignored, slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/autumn_macros-d34a250e4ae5c4a6)
+
+running 47 tests
+test cached::tests::default_max_capacity ... ok
+test cached::tests::generated_output_result_mode ... ok
+test cached::tests::generated_output_uses_moka ... ok
+test cached::tests::parse_empty_attrs ... ok
+test cached::tests::parse_all_attrs ... ok
+test cached::tests::no_args_function ... ok
+test cached::tests::parse_max_as_integer ... ok
+test cached::tests::parse_ttl_only ... ok
+test cached::tests::parse_result_flag_only ... ok
+test cached::tests::parse_unknown_attr_errors ... ok
+test collect::tests::test_collect_companions_empty ... ok
+test collect::tests::test_collect_companions_invalid_input ... ok
+test cached::tests::self_receiver_errors ... ok
+test collect::tests::test_collect_companions_module_path ... ok
+test collect::tests::test_collect_companions_single ... ok
+test collect::tests::test_collect_companions_multiple ... ok
+test model::tests::infer_table_name_multi_word ... ok
+test model::tests::infer_table_name_simple ... ok
+test model::tests::pascal_case_multi_word ... ok
+test model::tests::pascal_case_simple ... ok
+test model::tests::pascal_case_single_char ... ok
+test model::tests::pascal_to_snake_multi_word ... ok
+test model::tests::pascal_to_snake_simple ... ok
+test model::tests::pascal_to_snake_three_words ... ok
+test repository::tests::mixed_and_or_returns_none ... ok
+test repository::tests::parse_count_by ... ok
+test repository::tests::parse_delete_by ... ok
+test repository::tests::parse_exists_by ... ok
+test repository::tests::parse_find_by_single_field ... ok
+test repository::tests::parse_find_by_two_fields ... ok
+test repository::tests::parse_repo_args_with_api ... ok
+test repository::tests::parse_repo_args_with_hooks ... ok
+test repository::tests::parse_repo_args_without_api ... ok
+test repository::tests::parse_repo_args_with_hooks_and_api ... ok
+test repository::tests::parse_repo_args_with_table_and_hooks ... ok
+test repository::tests::parse_repo_args_without_hooks ... ok
+test repository::tests::parse_unknown_returns_none ... ok
+test repository::tests::snake_case_already_lower ... ok
+test repository::tests::snake_case_multi_word ... ok
+test repository::tests::snake_case_simple ... ok
+test service::tests::parse_deps_empty_is_ok ... ok
+test service::tests::parse_deps_duplicate_returns_error ... ok
+test service::tests::generated_output_contains_struct_and_extractor ... ok
+test service::tests::naming_convention ... ok
+test service::tests::parse_deps_extracts_fields ... ok
+test service::tests::parse_deps_missing_returns_error ... ok
+test service::tests::parse_deps_self_returns_error ... ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/autumn_web-d34f34dcdcaa3932)
+
+running 429 tests
+test actuator::tests::actuator_configprops_hidden_in_nonsensitive_mode ... ok
+test actuator::tests::actuator_env_available_in_sensitive_mode ... ok
+test actuator::tests::actuator_env_hidden_in_nonsensitive_mode ... ok
+test actuator::tests::actuator_configprops_returns_properties ... ok
+test actuator::tests::actuator_health_returns_ok ... ok
+test actuator::tests::actuator_loggers_hidden_in_nonsensitive_mode ... ok
+test actuator::tests::actuator_loggers_get_returns_levels ... ok
+test actuator::tests::actuator_info_returns_metadata ... ok
+test actuator::tests::actuator_loggers_put_changes_level ... ok
+test actuator::tests::actuator_loggers_put_rejects_invalid_level ... ok
+test actuator::tests::actuator_tasks_hidden_in_nonsensitive_mode ... ok
+test actuator::tests::actuator_metrics_available_in_nonsensitive_mode ... ok
+test actuator::tests::configprops_redacts_sensitive_values ... ok
+test actuator::tests::configprops_returns_default_when_values_match ... ok
+test actuator::tests::configprops_tracks_custom_profile ... ok
+test actuator::tests::configprops_tracks_default_source ... ok
+test actuator::tests::configprops_tracks_dev_prod_profiles ... ok
+test actuator::tests::configprops_tracks_profile_source ... ok
+test actuator::tests::actuator_tasks_returns_registered_tasks ... ok
+test actuator::tests::actuator_metrics_returns_http_stats ... ok
+test actuator::tests::log_levels_root_updates_current ... ok
+test actuator::tests::log_levels_set_and_get ... ok
+test actuator::tests::redaction_patterns ... ok
+test actuator::tests::task_registry_empty_snapshot ... ok
+test actuator::tests::task_registry_records_failure ... ok
+test actuator::tests::task_registry_records_multiple_successes_and_failures ... ok
+test app::tests::app_builder_accepts_static_routes ... ok
+test app::tests::app_builder_routes_adds_routes ... ok
+test actuator::tests::log_levels_accepts_existing_key_at_capacity ... ok
+test app::tests::build_router_adds_request_id_header ... ok
+test actuator::tests::log_levels_rejects_new_key_at_capacity ... ok
+test app::tests::build_router_disables_cache_for_static_assets_in_dev_reload_mode ... ok
+test app::tests::build_router_merges_methods_on_same_path ... ok
+test app::tests::build_router_injects_live_reload_script_when_enabled ... ok
+test app::tests::build_router_mounts_health_check_at_custom_path ... ok
+test app::tests::build_router_mounts_dev_reload_endpoint_when_enabled ... ok
+test app::tests::build_router_mounts_health_check_at_default_path ... ok
+test app::tests::build_router_mounts_user_routes ... ok
+test app::tests::build_router_multiple_routes ... ok
+test app::tests::build_router_serves_htmx_js ... ok
+test app::tests::build_router_post_route ... ok
+test app::tests::build_router_unknown_route_returns_404 ... ok
+test app::tests::build_router_with_static_none_dist ... ok
+test app::tests::build_router_with_static_skips_without_manifest ... ok
+test app::tests::build_router_serves_static_files_for_unmatched_paths ... ok
+test app::tests::cors_disabled_when_no_origins ... ok
+test app::tests::cors_wildcard_allows_any_origin ... ok
+test app::tests::cors_preflight_returns_204 ... ok
+test app::tests::cors_specific_origin_reflected ... ok
+test app::tests::format_config_summary_with_db ... ok
+test app::tests::format_config_summary_with_profile ... ok
+test app::tests::format_middleware_list_with_cors_and_csrf ... ok
+test app::tests::format_route_lines_includes_framework_routes ... ok
+test app::tests::format_route_lines_lists_user_routes ... ok
+test app::tests::format_task_lines_cron ... ok
+test app::tests::format_task_lines_fixed_delay ... ok
+test app::tests::format_task_lines_none_when_empty ... ok
+test app::tests::format_config_summary_defaults ... ok
+test app::tests::format_middleware_list_default ... ok
+test app::tests::log_startup_transparency_no_tasks ... ok
+test app::tests::log_startup_transparency_runs_without_panic ... ok
+test app::tests::mask_database_url_with_password ... ok
+test app::tests::htmx_handler_returns_javascript_with_correct_headers ... ok
+test app::tests::mask_database_url_without_password ... ok
+test app::tests::project_dir_defaults_to_subdir ... ok
+test auth::tests::auth_config_defaults ... ok
+test auth::tests::auth_extractor_returns_401_when_no_user ... ok
+test auth::tests::auth_extractor_returns_user_when_present ... ok
+test auth::tests::auth_rejection_display ... ok
+test auth::tests::auth_rejection_is_401 ... ok
+test auth::tests::check_secured_allows_any_of_multiple_roles ... ok
+test auth::tests::check_secured_allows_authenticated ... ok
+test auth::tests::check_secured_allows_matching_role ... ok
+test app::tests::start_task_scheduler_broadcasts_events ... ok
+test app::tests::start_task_scheduler_broadcasts_failure_events ... ok
+test auth::tests::check_secured_rejects_wrong_role ... ok
+test auth::tests::check_secured_rejects_unauthenticated ... ok
+test auth::tests::require_auth_rejects_unauthenticated ... ok
+test auth::tests::require_auth_allows_authenticated ... ok
+test auth::tests::secured_macro_allows_authenticated ... ok
+test auth::tests::secured_macro_rejects_unauthenticated ... ok
+test auth::tests::secured_macro_with_role_rejects_wrong_role ... ok
+test auth::tests::verify_invalid_hash_returns_error ... ok
+test cache::layer::tests::caches_get_responses ... ok
+test cache::layer::tests::different_uris_cached_separately ... ok
+test auth::tests::secured_macro_with_multiple_roles_allows_match ... ok
+test cache::layer::tests::does_not_cache_non_200_responses ... ok
+test cache::layer::tests::does_not_cache_post_requests ... ok
+test cache::layer::tests::from_shared_accepts_arc ... ok
+test cache::moka_impl::tests::basic_insert_and_get ... ok
+test cache::moka_impl::tests::builder_pattern ... ok
+test cache::moka_impl::tests::clear_removes_all ... ok
+test cache::moka_impl::tests::heterogeneous_types ... ok
+test cache::moka_impl::tests::invalidate_removes_key ... ok
+test cache::moka_impl::tests::concurrent_access ... ok
+test cache::moka_impl::tests::max_capacity_evicts ... ok
+test cache::moka_impl::tests::type_mismatch_returns_none ... ok
+test cache::tests::cache_key_deterministic ... ok
+test cache::tests::cache_key_differs_by_args ... ok
+test cache::tests::cache_key_differs_by_fn_name ... ok
+test cache::tests::cache_key_no_args ... ok
+test channels::tests::channel_message_conversions ... ok
+test channels::tests::channels_is_clone ... ok
+test channels::tests::create_channels ... ok
+test channels::tests::gc_removes_dead_channels ... ok
+test channels::tests::multiple_subscribers ... ok
+test channels::tests::send_and_receive ... ok
+test channels::tests::sender_creates_channel_lazily ... ok
+test channels::tests::sender_receiver_count ... ok
+test channels::tests::subscribe_creates_channel_lazily ... ok
+test config::tests::actuator_defaults ... ok
+test config::tests::actuator_prefix_in_full_config ... ok
+test config::tests::cors_defaults ... ok
+test config::tests::cors_in_full_config_defaults ... ok
+test config::tests::custom_profile_no_smart_defaults ... ok
+test config::tests::database_defaults ... ok
+test config::tests::deep_merge_handles_deep_nesting ... ok
+test config::tests::deep_merge_non_table_overlay_replaces_base ... ok
+test config::tests::deep_merge_stops_at_max_depth ... ok
+test config::tests::deep_merge_tables ... ok
+test config::tests::deep_merge_when_base_not_table ... ok
+test config::tests::deserialize_empty_object_uses_all_defaults ... ok
+test config::tests::deserialize_partial_config_merges_with_defaults ... ok
+test config::tests::dev_profile_smart_defaults ... ok
+test config::tests::env_override_connect_timeout ... ok
+test config::tests::env_override_cors_allow_credentials ... ok
+test config::tests::env_override_cors_allowed_origins ... ok
+test config::tests::env_override_cors_max_age ... ok
+test config::tests::env_override_database_url ... ok
+test config::tests::env_override_health_detailed ... ok
+test config::tests::env_override_health_detailed_false ... ok
+test config::tests::env_override_health_detailed_zero ... ok
+test config::tests::env_override_health_path ... ok
+test config::tests::env_override_invalid_log_format_ignored ... ok
+test config::tests::env_override_invalid_pool_size_ignored ... ok
+test config::tests::env_override_invalid_server_port_ignored ... ok
+test config::tests::env_override_invalid_shutdown_timeout_ignored ... ok
+test config::tests::env_override_log_format_auto ... ok
+test config::tests::env_override_log_format_json ... ok
+test config::tests::env_override_log_format_pretty ... ok
+test config::tests::env_override_log_level ... ok
+test config::tests::env_override_pool_size ... ok
+test config::tests::env_override_server_host ... ok
+test config::tests::env_override_server_port ... ok
+test config::tests::env_override_server_shutdown_timeout ... ok
+test config::tests::env_overrides_toml_values ... ok
+test config::tests::find_config_file_falls_back_to_cwd ... ok
+test config::tests::find_config_file_falls_back_when_manifest_dir_missing_file ... ok
+test config::tests::find_config_file_uses_manifest_dir_when_file_exists ... ok
+test config::tests::health_defaults ... ok
+test config::tests::levenshtein_basic ... ok
+test config::tests::levenshtein_threshold_in_warn_profile_typo ... ok
+test config::tests::load_custom_profile_without_toml_warns ... ok
+test config::tests::load_dev_profile_no_profile_toml_no_warn ... ok
+test config::tests::load_empty_file_returns_defaults ... ok
+test config::tests::load_from_io_error_is_not_swallowed ... ok
+test config::tests::load_invalid_toml_returns_error ... ok
+test config::tests::load_missing_file_returns_defaults ... ok
+test config::tests::load_partial_config_merges_with_defaults ... ok
+test config::tests::load_raw_toml_directory_returns_io_error ... ok
+test config::tests::load_raw_toml_missing_file_returns_none ... ok
+test config::tests::load_raw_toml_valid_file_returns_some ... ok
+test config::tests::load_uses_profile_layering ... ok
+test config::tests::load_valid_full_config ... ok
+test config::tests::log_defaults ... ok
+test config::tests::log_format_variants_deserialize ... ok
+test config::tests::prod_profile_smart_defaults ... ok
+test config::tests::profile_name_accessor ... ok
+test config::tests::profile_toml_overrides_base_toml ... ok
+test config::tests::resolve_profile_auto_detect_debug ... ok
+test config::tests::resolve_profile_auto_detect_release ... ok
+test config::tests::resolve_profile_cli_flag_exact_match ... ok
+test config::tests::resolve_profile_from_env ... ok
+test config::tests::server_defaults ... ok
+test config::tests::suggest_profile_close_match ... ok
+test config::tests::suggest_profile_exact_known_profile ... ok
+test config::tests::suggest_profile_no_match_when_distant ... ok
+test config::tests::suggest_profile_prd ... ok
+test config::tests::top_level_default_populates_all_sections ... ok
+test config::tests::validate_accepts_no_url ... ok
+test config::tests::validate_accepts_postgres_url ... ok
+test config::tests::validate_accepts_postgresql_url ... ok
+test config::tests::validate_rejects_invalid_url_scheme ... ok
+test config::tests::warn_profile_typo_runs_without_panic ... ok
+test db::tests::create_pool_with_no_url_returns_none ... ok
+test db::tests::create_pool_with_url_returns_some ... ok
+test db::tests::db_extractor_rejects_when_no_pool ... ok
+test db::tests::pool_clamps_size_to_one_if_zero ... ok
+test db::tests::pool_respects_max_size ... ok
+test error::tests::bad_request_is_400 ... ok
+test error::tests::bad_request_msg_is_400 ... ok
+test error::tests::blanket_from_defaults_to_500 ... ok
+test error::tests::debug_shows_status_and_inner ... ok
+test error::tests::display_uses_inner_message ... ok
+test error::tests::forbidden_is_403 ... ok
+test error::tests::forbidden_msg_is_403 ... ok
+test error::tests::into_response_has_correct_status ... ok
+test error::tests::into_response_has_json_body ... ok
+test error::tests::msg_constructor_produces_valid_json_response ... ok
+test error::tests::not_found_is_404 ... ok
+test error::tests::not_found_msg_is_404 ... ok
+test error::tests::service_unavailable_is_503 ... ok
+test error::tests::service_unavailable_msg_is_503 ... ok
+test error::tests::service_unavailable_response_is_503 ... ok
+test error::tests::test_not_found_error ... ok
+test error::tests::unauthorized_is_401 ... ok
+test error::tests::unauthorized_msg_is_401 ... ok
+test error::tests::unprocessable_is_422 ... ok
+test error::tests::unprocessable_msg_is_422 ... ok
+test error::tests::validation_is_422 ... ok
+test error::tests::with_status_overrides ... ok
+test error_pages::defaults::tests::default_404_contains_path ... ok
+test error_pages::defaults::tests::default_422_shows_validation_details ... ok
+test error_pages::defaults::tests::default_500_contains_request_id ... ok
+test error_pages::defaults::tests::default_500_hides_error_details_in_prod ... ok
+test error_pages::defaults::tests::default_generic_error_page ... ok
+test error_pages::defaults::tests::error_page_is_valid_html ... ok
+test error_pages::dev_badge::tests::badge_contains_message ... ok
+test error_pages::dev_badge::tests::badge_contains_request_id ... ok
+test error_pages::dev_badge::tests::badge_contains_status_code ... ok
+test error_pages::dev_badge::tests::badge_hides_source_section_when_absent ... ok
+test error_pages::dev_badge::tests::badge_shows_source_location_when_present ... ok
+test error_pages::dev_badge::tests::badge_uses_inline_css ... ok
+test health::tests::health_no_database_returns_json_content_type ... ok
+test health::tests::health_no_database_returns_ok ... ok
+test health::tests::health_response_includes_version ... ok
+test health::tests::health_with_pool_returns_pool_status ... ok
+test hooks::tests::draft_field_changed ... ok
+test hooks::tests::draft_field_changed_from ... ok
+test hooks::tests::draft_field_changed_to ... ok
+test hooks::tests::draft_field_option_was_cleared ... ok
+test hooks::tests::draft_field_option_was_set ... ok
+test hooks::tests::draft_field_set_mutates_after ... ok
+test hooks::tests::draft_field_unchanged ... ok
+test hooks::tests::field_diff_changed ... ok
+test hooks::tests::field_diff_changed_from ... ok
+test hooks::tests::field_diff_changed_to ... ok
+test hooks::tests::field_diff_option_was_cleared ... ok
+test hooks::tests::field_diff_option_was_set ... ok
+test hooks::tests::field_diff_set_updates_after ... ok
+test hooks::tests::field_diff_unchanged ... ok
+test hooks::tests::mutation_context_auto_populates ... ok
+test hooks::tests::mutation_context_with_actor ... ok
+test hooks::tests::mutation_op_as_str ... ok
+test hooks::tests::mutation_op_display ... ok
+test hooks::tests::no_hooks_all_methods_are_noop ... ok
+test hooks::tests::patch_clear_is_clear ... ok
+test hooks::tests::patch_into_option_clear ... ok
+test hooks::tests::patch_into_option_set ... ok
+test hooks::tests::patch_into_option_unchanged ... ok
+test hooks::tests::patch_serde_absent_field_is_unchanged ... ok
+test hooks::tests::patch_serde_clear_serializes_as_null ... ok
+test hooks::tests::patch_serde_explicit_null_is_clear ... ok
+test hooks::tests::patch_serde_null_deserializes_as_clear ... ok
+test hooks::tests::patch_serde_set_roundtrip ... ok
+test hooks::tests::patch_set_holds_value ... ok
+test hooks::tests::patch_unchanged_is_default ... ok
+test hooks::tests::update_draft_before_after ... ok
+test hooks::tests::update_draft_into_after ... ok
+test hooks::tests::update_draft_new_clones ... ok
+test htmx::tests::htmx_js_is_not_empty ... ok
+test htmx::tests::htmx_js_looks_like_javascript ... ok
+test htmx::tests::htmx_version_matches_expected ... ok
+test logging::tests::auto_format_is_not_json_in_non_production ... ok
+test logging::tests::invalid_filter_falls_back ... ok
+test logging::tests::is_production_false_by_default ... ok
+test logging::tests::json_format_is_always_json ... ok
+test logging::tests::pretty_format_is_never_json ... ok
+test logging::tests::valid_filter_parses ... ok
+test middleware::dev::tests::disable_static_cache_only_marks_static_paths ... ok
+test middleware::dev::tests::inject_live_reload_into_response_skips_encoded_html ... ok
+test middleware::dev::tests::inject_live_reload_into_response_updates_html_and_length ... ok
+test middleware::dev::tests::inject_live_reload_middleware_leaves_non_html_responses_alone ... ok
+test middleware::dev::tests::inject_snippet_inserts_before_body_or_appends_to_html_shell ... ok
+test middleware::dev::tests::is_enabled_requires_both_env_vars ... ok
+test middleware::dev::tests::is_static_path_matches_root_and_nested_assets ... ok
+test middleware::dev::tests::live_reload_state_handler_defaults_when_state_missing ... ok
+test middleware::error_page_filter::tests::accepts_html_for_browser ... ok
+test middleware::error_page_filter::tests::accepts_html_for_wildcard ... ok
+test middleware::error_page_filter::tests::custom_renderer_works ... ok
+test middleware::error_page_filter::tests::dev_badge_appears_in_dev_mode ... ok
+test middleware::error_page_filter::tests::dev_badge_hidden_in_prod_mode ... ok
+test middleware::error_page_filter::tests::html_404_returns_styled_page ... ok
+test middleware::error_page_filter::tests::html_500_returns_styled_page ... ok
+test middleware::error_page_filter::tests::json_api_gets_json_errors ... ok
+test middleware::error_page_filter::tests::prefers_html_when_html_first ... ok
+test middleware::error_page_filter::tests::prefers_json_when_json_first ... ok
+test middleware::error_page_filter::tests::rejects_html_for_empty_accept ... ok
+test middleware::error_page_filter::tests::rejects_html_for_json_api ... ok
+test middleware::error_page_filter::tests::success_responses_not_affected ... ok
+test middleware::exception_filter::tests::error_info_into_default_response ... ok
+test middleware::exception_filter::tests::filter_can_replace_response ... ok
+test middleware::exception_filter::tests::filter_receives_error_info ... ok
+test middleware::exception_filter::tests::multiple_filters_run_in_order ... ok
+test middleware::exception_filter::tests::success_responses_bypass_filters ... ok
+test middleware::metrics::tests::active_connection_tracking ... ok
+test middleware::metrics::tests::collector_records_request ... ok
+test middleware::metrics::tests::empty_collector_snapshot ... ok
+test middleware::metrics::tests::metrics_layer_handles_errors ... ok
+test middleware::metrics::tests::metrics_layer_records_requests ... ok
+test middleware::metrics::tests::percentiles_computed_correctly ... ok
+test middleware::request_id::tests::each_request_gets_unique_id ... ok
+test middleware::request_id::tests::request_id_available_in_extensions ... ok
+test middleware::request_id::tests::request_id_display ... ok
+test middleware::request_id::tests::response_has_request_id_header ... ok
+test migrate::tests::migration_error_display_connection ... ok
+test migrate::tests::migration_error_display_migration ... ok
+test migrate::tests::migration_result_debug ... ok
+test prelude::tests::error_types_work_through_prelude ... ok
+test prelude::tests::json_type_works_through_prelude ... ok
+test prelude::tests::maud_types_work_through_prelude ... ok
+test prelude::tests::prelude_types_are_accessible ... ok
+test security::config::tests::csrf_config_defaults ... ok
+test security::config::tests::csrf_config_deserialize ... ok
+test security::config::tests::full_security_config_deserialize ... ok
+test security::config::tests::headers_config_deserialize ... ok
+test security::config::tests::security_config_defaults ... ok
+test security::csrf::post_with_empty_form_tokens_returns_403 ... ok
+test security::csrf::post_with_empty_tokens_returns_403 ... ok
+test security::csrf::tests::csrf_token_extractor_works ... ok
+test security::csrf::tests::extract_cookie_from_header ... ok
+test security::csrf::tests::missing_cookie_returns_none ... ok
+test security::csrf::tests::post_with_empty_cookie_but_valid_form_field ... ok
+test security::csrf::tests::post_with_empty_cookie_but_valid_header ... ok
+test cache::moka_impl::tests::ttl_expiry ... ok
+test security::csrf::tests::post_with_mismatched_token_returns_403 ... ok
+test security::csrf::tests::post_with_valid_cookie_but_empty_form_field ... ok
+test security::csrf::tests::post_with_large_body_fails_csrf ... ok
+test security::csrf::tests::post_with_valid_cookie_but_empty_header ... ok
+test security::csrf::tests::post_without_token_returns_403 ... ok
+test security::csrf::tests::post_with_valid_token_passes ... ok
+test security::csrf::tests::safe_method_passes_without_token ... ok
+test security::csrf::tests::safe_method_sets_csrf_cookie ... ok
+test security::headers::tests::csp_header_when_configured ... ok
+test security::headers::tests::default_headers_applied ... ok
+test security::headers::tests::empty_x_frame_options_not_sent ... ok
+test security::headers::tests::hsts_header_when_enabled ... ok
+test security::headers::tests::hsts_without_subdomains ... ok
+test security::headers::tests::permissions_policy_when_configured ... ok
+test session::tests::build_expire_cookie_has_zero_max_age ... ok
+test session::tests::build_set_cookie_contains_required_parts ... ok
+test session::tests::memory_store_destroy ... ok
+test session::tests::memory_store_load_missing ... ok
+test session::tests::get_cookie_extracts_value ... ok
+test session::tests::memory_store_save_and_load ... ok
+test session::tests::session_clear ... ok
+test session::tests::session_config_defaults ... ok
+test session::tests::session_contains_key ... ok
+test session::tests::session_destroy_expires_cookie ... ok
+test session::tests::session_destroy_marks_destroyed ... ok
+test session::tests::session_insert_and_get ... ok
+test session::tests::session_layer_sets_cookie_on_new_session ... ok
+test session::tests::session_layer_persists_data_across_requests ... ok
+test session::tests::session_remove ... ok
+test state::tests::app_state_accessors ... ok
+test state::tests::app_state_debug_with_pool ... ok
+test state::tests::app_state_debug_without_pool ... ok
+test state::tests::app_state_is_clone ... ok
+test state::tests::app_state_profile_accessor ... ok
+test state::tests::app_state_profile_default ... ok
+test state::tests::app_state_uptime_display ... ok
+test static_gen::build::tests::mixed_simple_and_parameterized_routes ... ok
+test static_gen::build::tests::cleans_stale_dist_before_build ... ok
+test static_gen::build::tests::parameterized_route_manifest_includes_revalidate ... ok
+test static_gen::build::tests::rejects_non_2xx_response ... ok
+test static_gen::build::tests::renders_multi_param_route ... ok
+test static_gen::build::tests::renders_parameterized_route ... ok
+test static_gen::build::tests::renders_multiple_routes_concurrently ... ok
+test static_gen::build::tests::renders_single_route_to_dist ... ok
+test static_gen::build::tests::renders_root_route ... ok
+test static_gen::build::tests::simple_route_with_revalidate ... ok
+test static_gen::build::tests::substitute_params_no_placeholders ... ok
+test static_gen::build::tests::substitute_params_multiple ... ok
+test static_gen::build::tests::substitute_params_single ... ok
+test static_gen::middleware::tests::file_mtime_age_missing_file ... ok
+test static_gen::middleware::tests::file_mtime_age_fresh_file ... ok
+test static_gen::middleware::tests::isr_state_built_for_revalidate_routes ... ok
+test actuator::havoc_proptest::log_levels_memory_exhaustion ... ok
+test static_gen::middleware::tests::layer_loads_from_valid_dist ... ok
+test static_gen::middleware::tests::layer_returns_none_without_manifest ... ok
+test static_gen::middleware::tests::manifest_accessor ... ok
+test static_gen::middleware::tests::regenerate_page_fails_on_non_2xx ... ok
+test static_gen::middleware::tests::regenerate_page_writes_atomically ... ok
+test static_gen::middleware::tests::resolve_finds_known_route ... ok
+test static_gen::middleware::tests::resolve_finds_parameterized_routes ... ok
+test static_gen::middleware::tests::resolve_finds_root ... ok
+test static_gen::middleware::tests::resolve_returns_none_for_non_generated_param ... ok
+test static_gen::middleware::tests::resolve_returns_none_for_unknown_route ... ok
+test static_gen::types::tests::manifest_roundtrip ... ok
+test static_gen::types::tests::static_params_macro ... ok
+test static_gen::types::tests::static_params_macro_empty ... ok
+test static_gen::types::tests::static_params_macro_multiple ... ok
+test static_gen::types::tests::static_route_meta_clone ... ok
+test static_gen::types::tests::static_route_meta_debug ... ok
+test static_gen::types::tests::static_route_meta_with_params_fn ... ok
+test static_gen::types::tests::url_to_file_path_nested ... ok
+test static_gen::types::tests::url_to_file_path_root ... ok
+test static_gen::types::tests::url_to_file_path_simple ... ok
+test static_gen::types::tests::url_to_file_path_trailing_slash ... ok
+test task::tests::empty ... ok
+test task::tests::invalid_unit ... ok
+test task::tests::parse_compound ... ok
+test task::tests::parse_day ... ok
+test task::tests::parse_hours ... ok
+test task::tests::parse_minutes ... ok
+test task::tests::parse_seconds ... ok
+test task::tests::trailing_number ... ok
+test test::tests::test_app_get_request ... ok
+test test::tests::test_app_post_json ... ok
+test test::tests::test_client_default ... ok
+test test::tests::test_custom_header ... ok
+test test::tests::test_not_found ... ok
+test test::tests::test_response_assert_status ... ok
+test test::tests::test_response_assert_success ... ok
+test test::tests::test_response_json_deserialization ... ok
+test tests::app_fn_creates_builder ... ok
+test validation::tests::validate_ext_err ... ok
+test validation::tests::validate_ext_ok ... ok
+test validation::tests::validated_as_ref ... ok
+test validation::tests::validated_deref ... ok
+test validation::tests::validated_into_inner ... ok
+test validation::tests::validation_errors_convert_to_autumn_error ... ok
+test validation::tests::validation_errors_to_map_basic ... ok
+test validation::tests::validation_errors_to_map_fallback_message ... ok
+test ws::tests::with_shutdown_compiles ... ok
+test ws::tests::ws_handler_is_object_safe_enough ... ok
+test static_gen::middleware::tests::isr_triggers_regeneration_for_stale_page ... ok
+test static_gen::middleware::tests::isr_does_not_retrigger_while_in_flight ... ok
+test auth::tests::hash_and_verify_password ... ok
+
+test result: ok. 429 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.21s
+
+     Running tests/app_builder.rs (target/debug/deps/app_builder-fb7d25edcdc5c6f5)
+
+running 3 tests
+test app_builder_multiple_route_calls ... ok
+test app_builder_accepts_routes ... ok
+test empty_routes_panics - should panic ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/chaos_channels.rs (target/debug/deps/chaos_channels-8f7d9c9c94eb7bbd)
+
+running 1 test
+test test_sender_orphaned_by_gc ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/compile_fail.rs (target/debug/deps/compile_fail-1a874709b5799c8d)
+
+running 2 tests
+    Checking cfg-if v1.0.4
+    Checking libc v0.2.184
+    Checking bytes v1.11.1
+    Checking pin-project-lite v0.2.17
+    Checking smallvec v1.15.1
+    Checking itoa v1.0.18
+    Checking serde_core v1.0.228
+    Checking typenum v1.19.0
+    Checking memchr v2.8.0
+    Checking log v0.4.29
+    Checking once_cell v1.21.4
+    Checking futures-core v0.3.32
+    Checking scopeguard v1.2.0
+    Checking parking_lot_core v0.9.12
+    Checking lock_api v0.4.14
+    Checking errno v0.3.14
+    Checking signal-hook-registry v1.4.8
+    Checking mio v1.2.0
+    Checking parking_lot v0.12.5
+    Checking socket2 v0.6.3
+    Checking http v1.4.0
+    Checking futures-sink v0.3.32
+    Checking tracing-core v0.1.36
+    Checking tokio v1.51.0
+    Checking slab v0.4.12
+    Checking futures-channel v0.3.32
+    Checking futures-io v0.3.32
+    Checking futures-task v0.3.32
+    Checking tracing v0.1.44
+    Checking serde v1.0.228
+    Checking futures-util v0.3.32
+    Checking generic-array v0.14.7
+    Checking getrandom v0.3.4
+    Checking httparse v1.10.1
+    Checking equivalent v1.0.2
+    Checking hashbrown v0.16.1
+    Checking zerofrom v0.1.7
+    Checking zerocopy v0.8.48
+    Checking indexmap v2.13.1
+    Checking crypto-common v0.1.7
+    Checking rand_core v0.9.5
+    Checking http-body v1.0.1
+    Checking stable_deref_trait v1.2.1
+    Checking yoke v0.8.2
+    Checking num-traits v0.2.19
+    Checking percent-encoding v2.3.2
+    Checking tower-service v0.3.3
+    Checking fnv v1.0.7
+    Checking base64 v0.22.1
+    Checking zerovec v0.11.6
+    Checking block-buffer v0.10.4
+    Checking httpdate v1.0.3
+    Checking try-lock v0.2.5
+    Checking atomic-waker v1.1.2
+    Checking want v0.3.1
+    Checking digest v0.10.7
+    Checking cpufeatures v0.2.17
+    Checking tokio-util v0.7.18
+    Checking rand_core v0.10.0
+    Checking bitflags v2.11.0
+    Checking zeroize v1.8.2
+    Checking sha1 v0.10.6
+    Checking thiserror v2.0.18
+    Checking zmij v1.0.21
+    Checking http-body-util v0.1.3
+    Checking data-encoding v2.10.0
+    Checking h2 v0.4.13
+    Checking mime v0.3.17
+    Checking tower-layer v0.3.3
+    Checking serde_json v1.0.149
+    Checking rustls-pki-types v1.14.0
+    Checking getrandom v0.4.2
+    Checking tinystr v0.8.3
+    Checking ppv-lite86 v0.2.21
+    Checking form_urlencoded v1.2.2
+    Checking getrandom v0.2.17
+    Checking writeable v0.6.3
+    Checking rand_chacha v0.9.0
+    Checking sync_wrapper v1.0.2
+    Checking litemap v0.8.2
+    Checking untrusted v0.9.0
+    Checking ring v0.17.14
+    Checking rand v0.9.2
+    Checking icu_locale_core v2.2.0
+    Checking potential_utf v0.1.5
+    Checking zerotrie v0.2.4
+    Checking hybrid-array v0.4.10
+    Checking subtle v2.6.1
+    Checking utf8_iter v1.0.4
+    Checking utf-8 v0.7.6
+    Checking tungstenite v0.28.0
+    Checking rustls-webpki v0.103.10
+    Checking icu_collections v2.2.0
+    Checking icu_provider v2.2.0
+    Checking axum-core v0.5.6
+    Checking ryu v1.0.23
+    Checking cmov v0.5.3
+    Checking regex-syntax v0.8.10
+    Checking ctutils v0.4.2
+    Checking serde_urlencoded v0.7.1
+    Checking rustls v0.23.37
+    Checking hyper v1.9.0
+    Checking icu_normalizer_data v2.2.0
+    Checking tokio-tungstenite v0.28.0
+    Checking icu_properties_data v2.2.0
+    Checking block-buffer v0.12.0
+    Checking crypto-common v0.2.1
+    Checking hyper-util v0.1.20
+    Checking tower v0.5.3
+    Checking tokio-stream v0.1.18
+    Checking serde_path_to_error v0.1.20
+    Checking aho-corasick v1.1.4
+    Checking byteorder v1.5.0
+    Checking const-oid v0.10.2
+    Checking matchit v0.8.4
+    Checking linux-raw-sys v0.12.1
+    Checking axum v0.8.8
+    Checking digest v0.11.2
+    Checking rustix v1.1.4
+    Checking regex-automata v0.4.14
+    Checking hyper-timeout v0.5.2
+    Checking pin-project v1.1.11
+    Checking icu_properties v2.2.0
+    Checking icu_normalizer v2.2.0
+    Checking prost v0.14.3
+    Checking num-integer v0.1.46
+    Checking cpufeatures v0.3.0
+    Checking tinyvec_macros v0.1.1
+    Checking tinyvec v1.11.0
+    Checking idna_adapter v1.2.1
+    Checking ureq-proto v0.6.0
+    Checking powerfmt v0.2.0
+    Checking iana-time-zone v0.1.65
+    Checking utf8-zero v0.8.1
+    Checking ureq v3.3.0
+    Checking chrono v0.4.44
+    Checking deranged v0.5.8
+    Checking unicode-normalization v0.1.25
+    Checking idna v1.1.0
+    Checking portable-atomic v1.13.1
+    Checking num-bigint v0.4.6
+    Checking chacha20 v0.10.0
+    Checking prost-types v0.14.3
+    Checking winnow v0.7.15
+    Checking tonic v0.14.5
+    Checking time-core v0.1.8
+    Checking num-conv v0.2.1
+    Checking unicode-properties v0.1.4
+    Checking unicode-bidi v0.3.18
+    Checking time v0.3.47
+    Checking stringprep v0.1.5
+    Checking num-rational v0.4.2
+    Checking tonic-prost v0.14.5
+    Checking rand v0.10.0
+    Checking url v2.5.8
+    Checking bollard-buildkit-proto v0.7.0
+    Checking regex v1.12.3
+    Checking pq-src v0.3.11+libpq-18.3
+    Checking num-iter v0.1.45
+    Checking sha2 v0.11.0
+    Checking hmac v0.13.0
+    Checking md-5 v0.11.0
+    Checking tokio-rustls v0.26.4
+    Checking num-complex v0.4.6
+    Checking hex v0.4.3
+    Checking openssl-probe v0.2.1
+    Checking fallible-iterator v0.2.0
+    Checking winnow v1.0.1
+    Checking siphasher v1.0.2
+    Checking phf_shared v0.13.1
+    Checking postgres-protocol v0.6.11
+    Checking toml_parser v1.1.2+spec-1.1.0
+    Checking num v0.4.3
+    Checking rustls-native-certs v0.8.3
+    Checking hyperlocal v0.9.1
+    Checking async-stream v0.3.6
+    Checking hyper-rustls v0.27.7
+    Checking pq-sys v0.7.5
+    Checking libsqlite3-sys v0.36.0
+    Checking crossbeam-utils v0.8.21
+    Checking xattr v1.6.1
+    Checking futures-executor v0.3.32
+    Checking inout v0.1.4
+    Checking toml_datetime v0.7.5+spec-1.1.0
+    Checking serde_spanned v1.1.1
+    Checking filetime v0.2.27
+    Checking base64 v0.21.7
+    Checking home v0.5.12
+    Checking either v1.15.0
+    Checking downcast-rs v2.0.2
+    Checking rustc-hash v2.1.2
+    Checking astral-tokio-tar v0.6.0
+    Checking itertools v0.14.0
+    Checking docker_credential v1.3.2
+    Checking diesel v2.3.7
+    Checking bollard-stubs v1.52.1-rc.29.1.3
+    Checking toml v0.9.12+spec-1.1.0
+    Checking cipher v0.4.4
+    Checking futures v0.3.32
+    Checking serde_with v3.18.0
+    Checking parse-display v0.9.1
+    Checking postgres-types v0.2.13
+    Checking phf v0.13.1
+    Checking ferroid v0.8.9
+    Checking uuid v1.23.0
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+    Checking whoami v2.1.1
+    Checking num_cpus v1.17.0
+    Checking etcetera v0.11.0
+    Checking unicase v2.9.0
+    Checking toml_write v0.1.2
+    Checking deadpool-runtime v0.3.1
+    Checking lazy_static v1.5.0
+    Checking fastrand v2.3.0
+    Checking sharded-slab v0.1.7
+    Checking tempfile v3.27.0
+    Checking deadpool v0.13.0
+    Checking toml_edit v0.22.27
+    Checking mime_guess v2.0.5
+    Checking tokio-postgres v0.7.17
+    Checking blowfish v0.9.1
+    Checking migrations_internals v2.3.0
+    Checking crossbeam-epoch v0.9.18
+    Checking crossbeam-channel v0.5.15
+    Checking croner v2.2.0
+    Checking matchers v0.2.0
+    Checking tracing-serde v0.2.0
+    Checking tracing-log v0.2.0
+    Checking wait-timeout v0.2.1
+    Checking scoped-futures v0.1.4
+    Checking thread_local v1.1.9
+    Checking http-range-header v0.4.2
+    Checking bit-vec v0.8.0
+    Checking nu-ansi-term v0.50.3
+    Checking quick-error v1.2.3
+    Checking tagptr v0.2.0
+    Checking rusty-fork v0.3.1
+    Checking moka v0.12.15
+    Checking tracing-subscriber v0.3.23
+    Checking bit-set v0.8.0
+    Checking tower-http v0.6.8
+    Checking tokio-cron-scheduler v0.13.0
+    Checking bcrypt v0.17.1
+    Checking maud v0.27.0
+    Checking toml v0.8.23
+    Checking validator v0.20.0
+    Checking tungstenite v0.29.0
+    Checking rand_xorshift v0.4.0
+    Checking unarray v0.1.4
+    Checking proptest v1.11.0
+    Checking tokio-tungstenite v0.29.0
+    Checking bollard v0.20.2
+    Checking testcontainers v0.27.2
+    Checking testcontainers-modules v0.15.0
+    Checking diesel_migrations v2.3.1
+    Checking diesel-async v0.8.0
+    Checking autumn-web v0.1.0 (/app/autumn)
+test compile_fail_tests has been running for over 60 seconds
+test compile_pass_tests has been running for over 60 seconds
+    Checking autumn-web-tests v0.0.0 (/app/target/tests/trybuild/autumn-web)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 00s
+
+
+test [0m[1mtests/compile-fail/empty_path.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/missing_leading_slash.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/non_async.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/non_async_main.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/non_function.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/routes_nonexistent.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/static_get_path_params.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/static_get_non_async.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/static_get_params_no_placeholders.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/model_on_enum.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/repository_hooks_not_default.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-fail/cached_self_receiver.rs[0m ... [0m[32mok
+[0m
+
+test compile_fail_tests ... ok
+   Compiling autumn-web-tests v0.0.0 (/app/target/tests/trybuild/autumn-web)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.85s
+
+
+test [0m[1mtests/compile-pass/valid_handlers.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/async_main.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/static_get_basic.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/static_routes_basic.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/static_get_parameterized.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/intercept_basic.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/json_form_handlers.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/model_derive.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/model_field_enum.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/model_draft_accessors.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/repository_no_hooks.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/repository_with_hooks.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/repository_with_api.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/repository_with_hooks_and_api.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/cached_basic.rs[0m ... [0m[32mok
+[0mtest [0m[1mtests/compile-pass/cached_result.rs[0m ... [0m[32mok
+[0m
+
+test compile_pass_tests ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 187.94s
+
+     Running tests/db_hooks_lifecycle.rs (target/debug/deps/db_hooks_lifecycle-b640ff2e7970af81)
+
+running 3 tests
+test before_create_rejection_prevents_insert ... ignored, requires Docker (testcontainers)
+test before_update_rewrites_derived_field ... ignored, requires Docker (testcontainers)
+test draft_field_accessors_match_persisted_diff ... ignored, requires Docker (testcontainers)
+
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/extractors.rs (target/debug/deps/extractors-44ac863cd40e5520)
+
+running 3 tests
+test form_extraction_works ... ok
+test invalid_json_returns_error ... ok
+test json_extractor_and_response ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/hooks_lifecycle.rs (target/debug/deps/hooks_lifecycle-e077032851977c68)
+
+running 6 tests
+test mutation_context_has_uuid_request_id ... ok
+test field_diff_set_rewrite ... ok
+test mutation_op_roundtrip ... ok
+test no_hooks_methods_are_all_ok ... ok
+test patch_default_is_unchanged ... ok
+test patch_tristate_coverage ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/htmx_serving.rs (target/debug/deps/htmx_serving-4a0d57c7b3387fb6)
+
+running 1 test
+test htmx_version_is_accessible ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/maud_render.rs (target/debug/deps/maud_render-ddb722e1a4ed8b61)
+
+running 1 test
+test maud_handler_returns_html ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/middleware_pipeline.rs (target/debug/deps/middleware_pipeline-555ec5bfd7805cda)
+
+running 4 tests
+test app_builder_scoped_compiles ... ok
+test app_builder_exception_filter_compiles ... ok
+test exception_filter_on_error_response ... ok
+test scoped_middleware_applies_only_to_group ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/raw_router_escape_hatch.rs (target/debug/deps/raw_router_escape_hatch-ffdf356e5e91fef0)
+
+running 13 tests
+test app_builder_merge_compiles ... ok
+test app_builder_multiple_merge_and_nest ... ok
+test app_builder_nest_compiles ... ok
+test merged_route_adds_different_method_to_same_path ... ok
+test annotated_and_merged_routes_coexist ... ok
+test autumn_middleware_applies_to_merged_routes ... ok
+test app_state_accessible_for_external_router_construction ... ok
+test nested_route_gets_autumn_middleware ... ok
+test merged_route_receives_app_state ... ok
+test multiple_merged_routers_accumulate ... ok
+test merged_route_is_accessible ... ok
+test nested_route_receives_app_state ... ok
+test nested_route_works_under_prefix ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/route_macro.rs (target/debug/deps/route_macro-41f9a2b2ccb52201)
+
+running 20 tests
+test delete_route_info_has_correct_method ... ok
+test delete_route_info_has_correct_name ... ok
+test hello_route_info_has_correct_method ... ok
+test delete_route_info_has_correct_path ... ok
+test json_return_type_compiles_with_debug_handler ... ok
+test index_route_info_has_correct_fields ... ok
+test hello_route_info_has_correct_name ... ok
+test hello_route_info_has_correct_path ... ok
+test nested_route_info_has_correct_path ... ok
+test path_param_route_preserves_pattern ... ok
+test path_param_route_has_correct_name ... ok
+test multi_path_params_route_preserves_pattern ... ok
+test post_route_info_has_correct_method ... ok
+test post_route_info_has_correct_name ... ok
+test post_route_info_has_correct_path ... ok
+test put_route_info_has_correct_method ... ok
+test put_route_info_has_correct_name ... ok
+test status_code_return_type_compiles_with_debug_handler ... ok
+test put_route_info_has_correct_path ... ok
+test string_return_type_compiles_with_debug_handler ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/routes_macro.rs (target/debug/deps/routes_macro-a1200351705090f1)
+
+running 4 tests
+test routes_collects_single_handler ... ok
+test routes_collects_multiple_handlers ... ok
+test routes_empty_returns_empty_vec ... ok
+test routes_trailing_comma ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/security_tests.rs (target/debug/deps/security_tests-06ddfd280e21a552)
+
+running 7 tests
+test security::csrf_form_bypass::eris_csrf_form_bypass_fixed ... ok
+test security::csrf_empty_bypass::test_csrf_bypass_empty_form_tokens ... ok
+test security::session_fixation::test_rotate_id ... ok
+test security::csrf_empty_bypass::test_csrf_bypass_empty_tokens ... ok
+test security::csrf_timing::test_csrf_timing_attack ... ok
+test security::session_fixation::test_session_fixation ... ok
+test security::auth_dos::eris_auth_dos_poc ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.34s
+
+     Running tests/static_build_mode.rs (target/debug/deps/static_build_mode-b9847f467fe0eec8)
+
+running 1 test
+test build_mode_renders_through_real_router ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/static_gen_serving.rs (target/debug/deps/static_gen_serving-87d38df985c56d34)
+
+running 5 tests
+test dynamic_routes_still_work_without_dist ... ok
+test post_requests_pass_through_static_layer ... ok
+test head_requests_served_for_static_routes ... ok
+test static_files_take_priority_over_dynamic_routes ... ok
+test unknown_routes_fall_through_to_dynamic ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/static_serving.rs (target/debug/deps/static_serving-d18bb5b6fac1f40d)
+
+running 5 tests
+test explicit_route_takes_priority_over_serve_dir ... ok
+test missing_file_returns_404 ... ok
+test missing_static_directory_returns_404 ... ok
+test serves_static_files_with_correct_mime_type ... ok
+test serves_subdirectories ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/test_app_integration.rs (target/debug/deps/test_app_integration-d0c22c2a585d1518)
+
+running 15 tests
+test custom_profile_configuration ... ok
+test delete_user_returns_204 ... ok
+test form_submission ... ok
+test full_crud_lifecycle ... ok
+test get_index_returns_200 ... ok
+test health_endpoint_returns_json ... ok
+test json_response_has_content_type ... ok
+test create_user_returns_201 ... ok
+test get_user_by_id_test ... ok
+test not_found_returns_404 ... ok
+test post_echo_returns_same_body ... ok
+test response_has_request_id_header ... ok
+test update_user_by_id ... ok
+test validation_error_returns_400 ... ok
+test validation_success ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/test_db_integration.rs (target/debug/deps/test_db_integration-55f10a511d6e4df8)
+
+running 5 tests
+test db_tests::create_and_retrieve_item ... ignored, requires Docker (testcontainers)
+test db_tests::create_multiple_items_and_list ... ignored, requires Docker (testcontainers)
+test db_tests::get_nonexistent_item_returns_404 ... ignored, requires Docker (testcontainers)
+test db_tests::list_items_empty ... ignored, requires Docker (testcontainers)
+test db_tests::shared_container_is_reused ... ignored, requires Docker (testcontainers)
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/websocket.rs (target/debug/deps/websocket-073a21310c182112)
+
+running 11 tests
+test channels_on_app_state ... ok
+test non_upgrade_get_returns_error ... ok
+test real_websocket_echo_works ... ok
+test real_websocket_with_shutdown_works ... ok
+test shutdown_token_propagates ... ok
+test upgrade_request_without_real_tcp_returns_426 ... ok
+test ws_with_shutdown_generates_route ... ok
+test ws_macro_generates_route_info ... ok
+test ws_routes_coexist_with_http_routes ... ok
+test ws_with_state_generates_route ... ok
+test actuator_tasks_stream_receives_messages ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running unittests src/main.rs (target/debug/deps/blog-064a84a86e82f670)
+
+running 2 tests
+test tests::migration_uses_bigserial_ids ... ok
+test tests::upgrade_migration_widens_existing_ids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/bookmarks-b9dfc37343a03982)
+
+running 2 tests
+test tests::migration_uses_bigserial_ids ... ok
+test tests::upgrade_migration_widens_existing_ids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/bookmarks_distributed-3d14be06ced2fd1f)
+
+running 24 tests
+test config::tests::resolves_manifest_dir_override_when_present ... ok
+test config::tests::resolves_runtime_profile_with_autumn_precedence ... ok
+test config::tests::missing_distributed_section_is_an_error ... ok
+test repositories::tests::advisory_lock_is_exclusive_and_reacquirable ... ignored, requires Docker (testcontainers)
+test config::tests::parses_primary_and_replica_urls_from_toml ... ok
+test config::tests::loads_layered_distributed_section_from_example_files ... ok
+test repositories::tests::bookmark_shards_wrap_across_fixed_partition_count ... ok
+test repositories::tests::mark_dead_reports_success_when_a_row_was_updated ... ok
+test repositories::tests::mark_dead_missing_rows_are_tolerated ... ok
+test repositories::tests::read_operations_use_replica_and_writes_use_primary ... ok
+test repositories::tests::advisory_lock_keys_are_stable_per_shard ... ok
+test repositories::tests::missing_row_errors_are_explicit_for_write_paths ... ok
+test repositories::tests::update_missing_row_maps_to_explicit_not_found_error ... ok
+test state::tests::state_keeps_config_and_dual_pools_together ... ok
+test db::tests::builds_primary_and_replica_pools ... ok
+test state::tests::install_global_is_single_assignment ... ok
+test tasks::tests::head_fallback_is_limited_to_head_unsupported_statuses ... ok
+test tasks::tests::head_405_falls_back_to_get_before_marking_dead ... ok
+test tasks::tests::hard_head_failures_do_not_trigger_fallback ... ok
+test routes::bookmarks::tests::bookmark_delete_flow_uses_delete_swap_contract ... ok
+test tests::migration_uses_bigserial_ids ... ok
+test tasks::tests::successful_head_probe_marks_link_reachable ... ok
+test tasks::tests::reachable_statuses_match_link_checker_expectation ... ok
+test tests::upgrade_migration_widens_existing_ids ... ok
+
+test result: ok. 23 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/bin/migrate.rs (target/debug/deps/migrate-cd5880ccfd588e1b)
+
+running 7 tests
+test config::tests::missing_distributed_section_is_an_error ... ok
+test config::tests::loads_layered_distributed_section_from_example_files ... ok
+test config::tests::resolves_manifest_dir_override_when_present ... ok
+test tests::migrate_binary_uses_primary_url ... ok
+test config::tests::parses_primary_and_replica_urls_from_toml ... ok
+test config::tests::resolves_runtime_profile_with_autumn_precedence ... ok
+test tests::migrate_binary_rejects_missing_primary_url ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/hello-22a929b8a71be557)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/reddit_clone-ecaf8d541c08a6be)
+
+running 6 tests
+test slugify::tests::special_characters ... ok
+test slugify::tests::simple_title ... ok
+test slugify::tests::already_slug ... ok
+test tests::migration_creates_all_tables ... ok
+test tests::migration_uses_bigserial_ids ... ok
+test tests::dev_profile_enables_csrf_for_forms ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/debug/deps/todo_app-c04ae5c3bb46c8d1)
+
+running 2 tests
+test tests::migration_uses_bigserial_ids ... ok
+test tests::upgrade_migration_widens_existing_ids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/wiki-bd4920a4effe1d1b)
+
+running 4 tests
+test slugify::tests::special_characters ... ok
+test slugify::tests::already_slug ... ok
+test slugify::tests::leading_trailing_spaces ... ok
+test slugify::tests::simple_title ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests autumn_macros
+
+running 18 tests
+test autumn-macros/src/lib.rs - cached (line 382) ... ignored
+test autumn-macros/src/lib.rs - delete (line 111) ... ignored
+test autumn-macros/src/lib.rs - get (line 42) ... ignored
+test autumn-macros/src/lib.rs - main (line 155) ... ignored
+test autumn-macros/src/lib.rs - model (line 181) ... ignored
+test autumn-macros/src/lib.rs - model (line 193) ... ignored
+test autumn-macros/src/lib.rs - post (line 65) ... ignored
+test autumn-macros/src/lib.rs - put (line 88) ... ignored
+test autumn-macros/src/lib.rs - repository (line 214) ... ignored
+test autumn-macros/src/lib.rs - routes (line 132) ... ignored
+test autumn-macros/src/lib.rs - scheduled (line 231) ... ignored
+test autumn-macros/src/lib.rs - secured (line 295) ... ignored
+test autumn-macros/src/lib.rs - service (line 336) ... ignored
+test autumn-macros/src/lib.rs - static_get (line 254) ... ignored
+test autumn-macros/src/lib.rs - static_routes (line 311) ... ignored
+test autumn-macros/src/lib.rs - tasks (line 269) ... ignored
+test autumn-macros/src/lib.rs - ws (line 413) ... ignored
+test autumn-macros/src/ws.rs - ws::ws_macro (line 31) ... ignored
+
+test result: ok. 0 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.51s; merged doctests compilation took 0.43s
+   Doc-tests autumn_web
+
+running 112 tests
+test autumn/src/app.rs - app::AppBuilder::error_pages (line 230) - compile ... ok
+test autumn/src/app.rs - app (line 12) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder (line 89) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder::exception_filter (line 190) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder::merge (line 323) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder::migrations (line 395) ... ignored
+test autumn/src/app.rs - app::AppBuilder::nest (line 361) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder::routes (line 142) - compile ... ok
+test autumn/src/auth.rs - auth (line 9) - compile ... ok
+test autumn/src/auth.rs - auth::Auth (line 185) - compile ... ok
+test autumn/src/auth.rs - auth::RequireAuth (line 249) - compile ... ok
+test autumn/src/app.rs - app::AppBuilder::scoped (line 268) - compile ... ok
+test autumn/src/app.rs - app::app (line 49) - compile ... ok
+test autumn/src/cache/layer.rs - cache::layer (line 8) ... ignored
+test autumn/src/cache/mod.rs - cache (line 22) ... ignored
+test autumn/src/channels.rs - channels (line 12) ... ok
+test autumn/src/cache/moka_impl.rs - cache::moka_impl::MokaCache (line 23) ... ok
+test autumn/src/channels.rs - channels::Channels::sender (line 187) ... ok
+test autumn/src/channels.rs - channels::Channels::new (line 160) ... ok
+test autumn/src/channels.rs - channels::Channels::subscribe (line 226) ... ok
+test autumn/src/config.rs - config (line 24) ... ok
+test autumn/src/config.rs - config::AutumnConfig (line 377) ... ok
+test autumn/src/config.rs - config::ConfigError (line 335) ... ok
+test autumn/src/config.rs - config::DatabaseConfig (line 766) ... ok
+test autumn/src/config.rs - config::CorsConfig (line 954) ... ok
+test autumn/src/config.rs - config::HealthConfig (line 873) ... ok
+test autumn/src/config.rs - config::LogConfig (line 816) ... ok
+test autumn/src/config.rs - config::LogFormat (line 850) ... ok
+test autumn/src/db.rs - db (line 18) - compile ... ok
+test autumn/src/db.rs - db::Db (line 87) - compile ... ok
+test autumn/src/config.rs - config::ServerConfig (line 719) ... ok
+test autumn/src/error.rs - error::AutumnError (line 85) - compile ... ok
+test autumn/src/error.rs - error::AutumnError (line 97) - compile ... ok
+test autumn/src/error.rs - error (line 32) ... ok
+test autumn/src/error.rs - error::AutumnError::bad_request (line 195) ... ok
+test autumn/src/error.rs - error::AutumnError::bad_request_msg (line 322) ... ok
+test autumn/src/error.rs - error::AutumnError::forbidden (line 274) ... ok
+test autumn/src/error.rs - error::AutumnError::not_found (line 176) ... ok
+test autumn/src/error.rs - error::AutumnError::not_found_msg (line 306) ... ok
+test autumn/src/error.rs - error::AutumnError::forbidden_msg (line 367) ... ok
+test autumn/src/error.rs - error::AutumnError::service_unavailable_msg (line 382) ... ok
+test autumn/src/error.rs - error::AutumnError::service_unavailable (line 236) ... ok
+test autumn/src/error.rs - error::AutumnError::unauthorized (line 255) ... ok
+test autumn/src/error.rs - error::AutumnError::status (line 397) ... ok
+test autumn/src/error.rs - error::AutumnError::unauthorized_msg (line 352) ... ok
+test autumn/src/error.rs - error::AutumnError::unprocessable_msg (line 337) ... ok
+test autumn/src/error.rs - error::AutumnError::unprocessable (line 217) ... ok
+test autumn/src/error.rs - error::AutumnResult (line 130) - compile ... ok
+test autumn/src/error_pages/mod.rs - error_pages (line 10) - compile ... ok
+test autumn/src/error_pages/mod.rs - error_pages (line 27) ... ignored
+test autumn/src/error_pages/renderer.rs - error_pages::renderer::ErrorPageRenderer (line 37) - compile ... ok
+test autumn/src/extract.rs - extract::Form (line 27) - compile ... ok
+test autumn/src/extract.rs - extract::Path (line 57) - compile ... ok
+test autumn/src/extract.rs - extract::Query (line 75) - compile ... ok
+test autumn/src/hooks.rs - hooks (line 11) ... ignored
+test autumn/src/hooks.rs - hooks::DraftField (line 455) ... ignored
+test autumn/src/hooks.rs - hooks::MutationHooks::before_update (line 158) ... ignored
+test autumn/src/hooks.rs - hooks::UpdateDraft (line 379) ... ignored
+test autumn/src/lib.rs - (line 11) - compile ... ok
+test autumn/src/lib.rs - Json (line 542) - compile ... ok
+test autumn/src/lib.rs - Markup (line 483) - compile ... ok
+test autumn/src/lib.rs - Path (line 568) - compile ... ok
+test autumn/src/error.rs - error::AutumnError::with_status (line 158) ... ok
+test autumn/src/lib.rs - PreEscaped (line 504) ... ok
+test autumn/src/lib.rs - cached (line 360) ... ignored
+test autumn/src/lib.rs - delete (line 166) - compile ... ok
+test autumn/src/lib.rs - get (line 185) - compile ... ok
+test autumn/src/lib.rs - app (line 109) - compile ... ok
+test autumn/src/lib.rs - main (line 201) - compile ... ok
+test autumn/src/lib.rs - model (line 228) ... ignored
+test autumn/src/lib.rs - model (line 240) ... ignored
+test autumn/src/lib.rs - html (line 520) ... ok
+test autumn/src/lib.rs - put (line 313) - compile ... ok
+test autumn/src/lib.rs - routes (line 331) - compile ... ok
+test autumn/src/lib.rs - secured (line 423) - compile ... ok
+test autumn/src/lib.rs - service (line 266) ... ignored
+test autumn/src/lib.rs - static_get (line 464) - compile ... ok
+test autumn/src/lib.rs - ws (line 381) ... ignored
+test autumn/src/middleware/exception_filter.rs - middleware::exception_filter (line 17) - compile ... ok
+test autumn/src/lib.rs - post (line 294) - compile ... ok
+test autumn/src/middleware/request_id.rs - middleware::request_id (line 15) - compile ... ok
+test autumn/src/middleware/exception_filter.rs - middleware::exception_filter::ExceptionFilter (line 92) ... ok
+test autumn/src/middleware/request_id.rs - middleware::request_id::RequestIdLayer (line 81) - compile ... ok
+test autumn/src/migrate.rs - migrate (line 13) ... ignored
+test autumn/src/prelude.rs - prelude (line 5) ... ignored
+test autumn/src/route.rs - route::Route (line 25) - compile ... ok
+test autumn/src/middleware/request_id.rs - middleware::request_id::RequestId (line 49) - compile ... ok
+test autumn/src/security/csrf.rs - security::csrf (line 24) ... ignored
+test autumn/src/security/csrf.rs - security::csrf::CsrfToken (line 67) ... ignored
+test autumn/src/security/headers.rs - security::headers (line 24) - compile ... ok
+test autumn/src/security/mod.rs - security (line 54) ... ignored
+test autumn/src/security/config.rs - security::config::SecurityConfig (line 41) ... ok
+test autumn/src/session.rs - session::SessionLayer (line 371) - compile ... ok
+test autumn/src/session.rs - session (line 10) - compile ... ok
+test autumn/src/state.rs - state::AppState (line 22) ... ok
+test autumn/src/static_gen/types.rs - static_gen::types::static_params (line 25) ... ok
+test autumn/src/test.rs - test (line 13) - compile ... ok
+test autumn/src/test.rs - test (line 46) ... ignored
+test autumn/src/test.rs - test (line 7) ... ignored
+test autumn/src/test.rs - test::TestApp (line 88) - compile ... ok
+test autumn/src/test.rs - test::TestClient (line 205) ... ignored
+test autumn/src/test.rs - test::TestDb (line 536) ... ignored
+test autumn/src/test.rs - test::TestDb::execute_sql (line 628) ... ignored
+test autumn/src/test.rs - test::TestResponse (line 361) ... ignored
+test autumn/src/validation.rs - validation (line 8) ... ignored
+test autumn/src/validation.rs - validation::Valid (line 101) ... ignored
+test autumn/src/ws.rs - ws (line 19) ... ignored
+test autumn/src/ws.rs - ws::WithShutdown (line 117) ... ignored
+test autumn/src/ws.rs - ws::WsHandler (line 76) ... ignored
+test autumn/src/static_gen/types.rs - static_gen::types::StaticParams (line 13) ... ok
+test autumn/src/auth.rs - auth::hash_password (line 83) ... ok
+test autumn/src/auth.rs - auth::verify_password (line 111) ... ok
+
+test result: ok. 83 passed; 0 failed; 29 ignored; 0 measured; 0 filtered out; finished in 6.52s
+
+all doctests ran in 14.63s; merged doctests compilation took 8.04s
