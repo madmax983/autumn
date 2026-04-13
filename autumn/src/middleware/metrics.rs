@@ -394,7 +394,9 @@ where
                     let method = this.method.take().unwrap_or_default();
                     let method_str = method.as_str();
                     let route = this.route.take();
-                    let route_str = route.as_ref().map_or("_unmatched", axum::extract::MatchedPath::as_str);
+                    let route_str = route
+                        .as_ref()
+                        .map_or("_unmatched", axum::extract::MatchedPath::as_str);
                     let status = response.status().as_u16();
                     collector.record(method_str, route_str, status, latency_ms);
                     collector.decrement_active();
