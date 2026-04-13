@@ -91,3 +91,7 @@ loom = "0.7.2"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "task_overflow"
+path = "tests/security/task_overflow.rs"
