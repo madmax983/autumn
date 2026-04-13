@@ -19,7 +19,7 @@
 //! let mut rx = channels.subscribe("lobby");
 //!
 //! tx.send("hello").ok();
-//! # // In async context: let msg = rx.recv().await.unwrap();
+//! # // In async context: let msg = rx.recv().await.expect("should receive");
 //! ```
 
 use std::collections::HashMap;
@@ -305,29 +305,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_and_receive() {
+    async fn send_and_receive() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let tx = channels.sender("chat");
         let mut rx = channels.subscribe("chat");
 
-        tx.send("hello").unwrap();
-        let msg = rx.recv().await.unwrap();
+        tx.send("hello").expect("should send");
+        let msg = rx.recv().await?;
         assert_eq!(msg.as_str(), "hello");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn multiple_subscribers() {
+    async fn multiple_subscribers() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let tx = channels.sender("chat");
         let mut rx1 = channels.subscribe("chat");
         let mut rx2 = channels.subscribe("chat");
 
-        tx.send("broadcast").unwrap();
+        tx.send("broadcast").expect("should send");
 
-        let msg1 = rx1.recv().await.unwrap();
-        let msg2 = rx2.recv().await.unwrap();
+        let msg1 = rx1.recv().await?;
+        let msg2 = rx2.recv().await?;
         assert_eq!(msg1.as_str(), "broadcast");
         assert_eq!(msg2.as_str(), "broadcast");
+        Ok(())
     }
 
     #[test]

@@ -228,6 +228,7 @@ pub trait SessionStore: Send + Sync + 'static {
     fn destroy(&self, id: &str) -> impl Future<Output = Result<(), SessionStoreError>> + Send;
 }
 
+/// An error that occurred during a session store operation.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 #[error("{message}")]
 pub struct SessionStoreError {
@@ -235,6 +236,7 @@ pub struct SessionStoreError {
 }
 
 impl SessionStoreError {
+    /// Create a new session store error from an underlying backend error.
     #[must_use]
     pub fn backend(operation: &'static str, error: impl std::fmt::Display) -> Self {
         Self {
@@ -332,11 +334,14 @@ pub struct SessionConfig {
     pub redis: SessionRedisConfig,
 }
 
+/// Supported session storage backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionBackend {
+    /// In-memory storage. Resets on application restart.
     #[default]
     Memory,
+    /// Redis-backed storage. Suitable for production and multi-instance deployments.
     Redis,
 }
 
@@ -350,11 +355,14 @@ impl SessionBackend {
     }
 }
 
+/// Configuration specific to the Redis session backend.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SessionRedisConfig {
+    /// The Redis connection URL (e.g. `redis://127.0.0.1:6379`).
     #[serde(default)]
     pub url: Option<String>,
 
+    /// Prefix used for session keys in Redis. Defaults to `autumn:sessions`.
     #[serde(default = "default_redis_key_prefix")]
     pub key_prefix: String,
 }
@@ -372,18 +380,33 @@ fn default_redis_key_prefix() -> String {
     "autumn:sessions".to_owned()
 }
 
+/// Represents the resolved plan for which session backend to initialize.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionBackendPlan {
-    Memory { warn_in_production: bool },
-    Redis { url: String, key_prefix: String },
+    /// Use the in-memory store.
+    Memory {
+        /// Whether to log a warning because memory sessions are used in production.
+        warn_in_production: bool,
+    },
+    /// Use the Redis store.
+    Redis {
+        /// The validated Redis connection URL.
+        url: String,
+        /// The prefix to use for session keys.
+        key_prefix: String,
+    },
 }
 
+/// Errors that can occur when resolving the session backend configuration.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SessionBackendConfigError {
+    /// Redis was selected, but no URL was provided.
     #[error("session.backend=redis requires session.redis.url")]
     MissingRedisUrl,
+    /// The provided Redis URL could not be parsed.
     #[error("session.redis.url is not a valid Redis URL: {0}")]
     InvalidRedisUrl(String),
+    /// Redis was selected, but the `redis` crate feature is not enabled.
     #[error("session.backend=redis requires the `redis` feature")]
     RedisFeatureDisabled,
 }

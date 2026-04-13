@@ -1,3 +1,8 @@
+//! Internal test utilities.
+//!
+//! Provides helpers like [`EnvGuard`] for safely manipulating the environment
+//! during tests without causing race conditions across threads.
+
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 

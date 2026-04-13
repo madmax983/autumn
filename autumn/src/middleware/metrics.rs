@@ -26,14 +26,19 @@ pub struct MetricsCollector {
     inner: Arc<MetricsInner>,
 }
 
+#[derive(Debug, Default)]
+struct Shard {
+    by_route: HashMap<String, RouteMetrics>,
+}
+
 #[derive(Debug)]
 struct MetricsInner {
     /// Total number of requests received.
     requests_total: AtomicU64,
     /// Currently active (in-flight) requests.
     requests_active: AtomicU64,
-    /// Per-route metrics: key is "METHOD /path".
-    by_route: RwLock<HashMap<String, RouteMetrics>>,
+    /// Per-route metrics sharded to reduce lock contention: key is "METHOD /path".
+    shards: Vec<RwLock<Shard>>,
     /// Status code buckets: 2xx, 3xx, 4xx, 5xx.
     by_status: StatusBuckets,
     /// Global latency samples (bounded ring buffer).
@@ -66,16 +71,21 @@ impl Default for RouteMetrics {
 
 /// Maximum number of latency samples to keep per route.
 const MAX_LATENCY_SAMPLES: usize = 10_000;
+const SHARD_COUNT: usize = 16;
 
 impl MetricsCollector {
     /// Create a new empty metrics collector.
     #[must_use]
     pub fn new() -> Self {
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+        for _ in 0..SHARD_COUNT {
+            shards.push(RwLock::new(Shard::default()));
+        }
         Self {
             inner: Arc::new(MetricsInner {
                 requests_total: AtomicU64::new(0),
                 requests_active: AtomicU64::new(0),
-                by_route: RwLock::new(HashMap::new()),
+                shards,
                 by_status: StatusBuckets::default(),
                 latencies_ms: RwLock::new(VecDeque::with_capacity(MAX_LATENCY_SAMPLES)),
             }),
@@ -112,22 +122,31 @@ impl MetricsCollector {
         };
 
         // Global latency
-        if let Ok(mut latencies) = self.inner.latencies_ms.write() {
-            if latencies.len() >= MAX_LATENCY_SAMPLES {
-                latencies.pop_front();
+        {
+            if let Ok(mut latencies) = self.inner.latencies_ms.write() {
+                if latencies.len() >= MAX_LATENCY_SAMPLES {
+                    latencies.pop_front();
+                }
+                latencies.push_back(latency_ms);
             }
-            latencies.push_back(latency_ms);
         }
 
-        // Per-route
+        // Per-route (sharded)
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(route, &mut hasher);
+        #[allow(clippy::cast_possible_truncation)]
+        let shard_idx = (std::hash::Hasher::finish(&hasher) % (SHARD_COUNT as u64)) as usize;
+
         let key = format!("{method} {route}");
-        if let Ok(mut routes) = self.inner.by_route.write() {
-            let entry = routes.entry(key).or_default();
-            entry.count += 1;
-            if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                entry.latencies_ms.pop_front();
+        {
+            if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+                let entry = shard.by_route.entry(key).or_default();
+                entry.count += 1;
+                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+                    entry.latencies_ms.pop_front();
+                }
+                entry.latencies_ms.push_back(latency_ms);
             }
-            entry.latencies_ms.push_back(latency_ms);
         }
     }
 
@@ -149,28 +168,23 @@ impl MetricsCollector {
             .map(|v| compute_percentiles(&v))
             .unwrap_or_default();
 
-        let by_route = self
-            .inner
-            .by_route
-            .read()
-            .map(|routes| {
-                routes
-                    .iter()
-                    .map(|(k, v)| {
-                        let pcts = compute_percentiles(&v.latencies_ms);
-                        (
-                            k.clone(),
-                            RouteSnapshot {
-                                count: v.count,
-                                p50_ms: pcts.p50,
-                                p95_ms: pcts.p95,
-                                p99_ms: pcts.p99,
-                            },
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut by_route = HashMap::new();
+        for shard_lock in &self.inner.shards {
+            if let Ok(shard) = shard_lock.read() {
+                for (k, v) in &shard.by_route {
+                    let pcts = compute_percentiles(&v.latencies_ms);
+                    by_route.insert(
+                        k.clone(),
+                        RouteSnapshot {
+                            count: v.count,
+                            p50_ms: pcts.p50,
+                            p95_ms: pcts.p95,
+                            p99_ms: pcts.p99,
+                        },
+                    );
+                }
+            }
+        }
 
         MetricsSnapshot {
             http: HttpMetrics {
@@ -347,19 +361,16 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let method = req.method().to_string();
-        let route = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map_or_else(|| "_unmatched".to_owned(), |p| p.as_str().to_owned());
+        let method = req.method().clone();
+        let route = req.extensions().get::<MatchedPath>().cloned();
 
         self.collector.increment_active();
 
         MetricsFuture {
             inner: self.inner.call(req),
             collector: Some(self.collector.clone()),
-            method: Some(method),
-            route: Some(route),
+            method,
+            route,
             start: Instant::now(),
         }
     }
@@ -371,8 +382,8 @@ pin_project! {
         #[pin]
         inner: F,
         collector: Option<MetricsCollector>,
-        method: Option<String>,
-        route: Option<String>,
+        method: axum::http::Method,
+        route: Option<MatchedPath>,
         start: Instant,
     }
 }
@@ -390,10 +401,13 @@ where
                 if let Some(collector) = this.collector.take() {
                     let latency_ms =
                         u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let method = this.method.take().unwrap_or_default();
-                    let route = this.route.take().unwrap_or_default();
+                    let method_str = this.method.as_str();
+                    let route_str = this
+                        .route
+                        .as_ref()
+                        .map_or("_unmatched", axum::extract::MatchedPath::as_str);
                     let status = response.status().as_u16();
-                    collector.record(&method, &route, status, latency_ms);
+                    collector.record(method_str, route_str, status, latency_ms);
                     collector.decrement_active();
                 }
                 Poll::Ready(Ok(response))

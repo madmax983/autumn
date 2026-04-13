@@ -1,3 +1,8 @@
+//! Redis-backed session storage.
+//!
+//! Provides the [`RedisStore`] implementation for the [`SessionStore`] trait,
+//! using the `redis` crate to persist session data in a Redis database.
+
 use std::collections::HashMap;
 
 use redis::AsyncCommands;
