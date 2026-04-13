@@ -650,11 +650,13 @@ impl AppBuilder {
             &config,
             state.clone(),
             dist_ref,
-            exception_filters,
-            scoped_groups,
-            merge_routers,
-            nest_routers,
-            error_page_renderer,
+            crate::router::RouterContext {
+                exception_filters,
+                scoped_groups,
+                merge_routers,
+                nest_routers,
+                error_page_renderer,
+            },
         )
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to build router");
