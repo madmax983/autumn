@@ -73,6 +73,10 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 subtle = "2.6.1"
 
+[[test]]
+name = "integer_overflow"
+path = "tests/security/integer_overflow.rs"
+
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }
 filetime = "0.2"
