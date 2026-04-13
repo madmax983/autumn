@@ -921,6 +921,42 @@ pub(crate) async fn tasks_stream_endpoint(
     })
 }
 
+// ── Traffic Stream (WebSocket) ─────────────────────────────────
+
+/// `GET <actuator-prefix>/traffic/stream` -- stream live traffic metrics events.
+#[cfg(feature = "ws")]
+pub(crate) async fn traffic_stream_endpoint(
+    State(state): State<AppState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = state.channels().subscribe("sys:traffic");
+        let shutdown = state.shutdown_token();
+
+        loop {
+            tokio::select! {
+                res = rx.recv() => {
+                    match res {
+                        Ok(msg) => {
+                            let ws_msg = axum::extract::ws::Message::Text(msg.into_string().into());
+                            if socket.send(ws_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                () = shutdown.cancelled() => {
+                    let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+                    break;
+                }
+                else => break,
+            }
+        }
+    })
+}
+
 // ── Router builder ──────────────────────────────────────────────
 
 pub(crate) fn normalize_actuator_prefix(prefix: &str) -> String {
@@ -1033,10 +1069,15 @@ pub(crate) fn actuator_router_with_prefix(prefix: &str, sensitive: bool) -> axum
 
         #[cfg(feature = "ws")]
         {
-            router = router.route(
-                &actuator_route_path(prefix, "/tasks/stream"),
-                axum::routing::get(tasks_stream_endpoint),
-            );
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/traffic/stream"),
+                    axum::routing::get(traffic_stream_endpoint),
+                );
         }
     }
 
@@ -1206,6 +1247,22 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/actuator/env")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "ws")]
+    async fn actuator_traffic_stream_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/traffic/stream")
                     .body(Body::empty())
                     .unwrap(),
             )

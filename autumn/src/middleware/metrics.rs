@@ -20,6 +20,9 @@ use pin_project_lite::pin_project;
 use serde::Serialize;
 use tower::{Layer, Service};
 
+#[cfg(feature = "ws")]
+use crate::channels::Channels;
+
 /// Shared metrics collector that aggregates request statistics.
 #[derive(Debug, Clone)]
 pub struct MetricsCollector {
@@ -306,13 +309,27 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
 #[derive(Clone)]
 pub struct MetricsLayer {
     collector: MetricsCollector,
+    #[cfg(feature = "ws")]
+    channels: Option<Channels>,
 }
 
 impl MetricsLayer {
     /// Create a new metrics layer backed by the given collector.
     #[must_use]
     pub const fn new(collector: MetricsCollector) -> Self {
-        Self { collector }
+        Self {
+            collector,
+            #[cfg(feature = "ws")]
+            channels: None,
+        }
+    }
+
+    /// Provide a channels registry for live traffic streaming over `WebSockets`.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels(mut self, channels: Channels) -> Self {
+        self.channels = Some(channels);
+        self
     }
 }
 
@@ -323,6 +340,8 @@ impl<S> Layer<S> for MetricsLayer {
         MetricsService {
             inner,
             collector: self.collector.clone(),
+            #[cfg(feature = "ws")]
+            channels: self.channels.clone(),
         }
     }
 }
@@ -332,6 +351,8 @@ impl<S> Layer<S> for MetricsLayer {
 pub struct MetricsService<S> {
     inner: S,
     collector: MetricsCollector,
+    #[cfg(feature = "ws")]
+    channels: Option<Channels>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for MetricsService<S>
@@ -361,10 +382,27 @@ where
             method: Some(method),
             route: Some(route),
             start: Instant::now(),
+            #[cfg(feature = "ws")]
+            channels: self.channels.clone(),
         }
     }
 }
 
+#[cfg(feature = "ws")]
+pin_project! {
+    /// Future that records metrics after the inner service completes.
+    pub struct MetricsFuture<F> {
+        #[pin]
+        inner: F,
+        collector: Option<MetricsCollector>,
+        method: Option<String>,
+        route: Option<String>,
+        start: Instant,
+        channels: Option<Channels>,
+    }
+}
+
+#[cfg(not(feature = "ws"))]
 pin_project! {
     /// Future that records metrics after the inner service completes.
     pub struct MetricsFuture<F> {
@@ -395,6 +433,21 @@ where
                     let status = response.status().as_u16();
                     collector.record(&method, &route, status, latency_ms);
                     collector.decrement_active();
+
+                    #[cfg(feature = "ws")]
+                    if let Some(channels) = this.channels.take() {
+                        let tx = channels.sender("sys:traffic");
+                        if tx.receiver_count() > 0 {
+                            let msg = serde_json::json!({
+                                "method": method,
+                                "route": route,
+                                "status": status,
+                                "latency_ms": latency_ms,
+                            })
+                            .to_string();
+                            let _ = tx.send(msg);
+                        }
+                    }
                 }
                 Poll::Ready(Ok(response))
             }

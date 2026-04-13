@@ -344,10 +344,14 @@ pub(crate) fn try_build_router_inner(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
+    let metrics_layer = crate::middleware::MetricsLayer::new(state.metrics.clone());
+    #[cfg(feature = "ws")]
+    let metrics_layer = metrics_layer.with_channels(state.channels.clone());
+
     let mut router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+        .layer(metrics_layer);
 
     if dev_reload_enabled {
         router = router
