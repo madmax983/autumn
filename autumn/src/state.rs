@@ -345,6 +345,76 @@ impl DbState for AppState {
     }
 }
 
+impl crate::probe::ProvideProbeState for AppState {
+    fn probes(&self) -> &crate::probe::ProbeState {
+        &self.probes
+    }
+
+    fn health_detailed(&self) -> bool {
+        self.health_detailed
+    }
+
+    fn profile(&self) -> &str {
+        self.profile()
+    }
+
+    fn uptime_display(&self) -> String {
+        self.uptime_display()
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.as_ref()
+    }
+}
+
+impl crate::actuator::ProvideActuatorState for AppState {
+    fn metrics(&self) -> &crate::middleware::MetricsCollector {
+        &self.metrics
+    }
+
+    fn log_levels(&self) -> &crate::actuator::LogLevels {
+        &self.log_levels
+    }
+
+    fn task_registry(&self) -> &crate::actuator::TaskRegistry {
+        &self.task_registry
+    }
+
+    fn config_props(&self) -> &crate::actuator::ConfigProperties {
+        &self.config_props
+    }
+
+    fn profile(&self) -> &str {
+        self.profile()
+    }
+
+    fn uptime_display(&self) -> String {
+        self.uptime_display()
+    }
+
+    #[cfg(feature = "ws")]
+    fn channels(&self) -> &crate::channels::Channels {
+        &self.channels
+    }
+
+    #[cfg(feature = "ws")]
+    fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token()
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.as_ref()
+    }
+}
+
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("AppState");
