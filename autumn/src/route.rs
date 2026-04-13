@@ -1,7 +1,7 @@
 //! Route descriptor types used by macro-generated code.
 //!
 //! Each route macro ([`get`](crate::get), [`post`](crate::post), etc.)
-//! generates a companion function that returns a [`Route`]. The
+//! generates a companion function that returns a [`crate::route::Route`]. The
 //! [`routes!`](crate::routes) macro collects these into a `Vec<Route>`
 //! for the [`AppBuilder`](crate::app::AppBuilder).
 //!
