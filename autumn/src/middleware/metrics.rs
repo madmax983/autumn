@@ -361,19 +361,16 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let method = req.method().to_string();
-        let route = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map_or_else(|| "_unmatched".to_owned(), |p| p.as_str().to_owned());
+        let method = req.method().clone();
+        let route = req.extensions().get::<MatchedPath>().cloned();
 
         self.collector.increment_active();
 
         MetricsFuture {
             inner: self.inner.call(req),
             collector: Some(self.collector.clone()),
-            method: Some(method),
-            route: Some(route),
+            method,
+            route,
             start: Instant::now(),
         }
     }
@@ -385,8 +382,8 @@ pin_project! {
         #[pin]
         inner: F,
         collector: Option<MetricsCollector>,
-        method: Option<String>,
-        route: Option<String>,
+        method: axum::http::Method,
+        route: Option<MatchedPath>,
         start: Instant,
     }
 }
@@ -404,10 +401,13 @@ where
                 if let Some(collector) = this.collector.take() {
                     let latency_ms =
                         u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let method = this.method.take().unwrap_or_default();
-                    let route = this.route.take().unwrap_or_default();
+                    let method_str = this.method.as_str();
+                    let route_str = this
+                        .route
+                        .as_ref()
+                        .map_or("_unmatched", axum::extract::MatchedPath::as_str);
                     let status = response.status().as_u16();
-                    collector.record(&method, &route, status, latency_ms);
+                    collector.record(method_str, route_str, status, latency_ms);
                     collector.decrement_active();
                 }
                 Poll::Ready(Ok(response))
