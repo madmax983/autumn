@@ -1,0 +1,6 @@
+{
+  "title": "⚡ Bolt: [performance improvement]",
+  "body": "💡 What: Changed the way `MetricsFuture` tracks request methods and routes by storing `axum::http::Method` and `axum::extract::MatchedPath` directly instead of pre-allocating strings.\n🎯 Why: Calling `.to_string()` on the method and `.to_owned()` on the route proactively allocates strings on the heap before they are strictly needed.\n📊 Impact: Eliminates two heap allocations per HTTP request on the hot path.\n🔬 Measurement: Run `cargo bench` (if available) or observe allocation count during a load test with a profiler like `dhat`. `cargo test -p autumn-web --lib middleware::metrics` confirms logic remains intact.",
+  "head": "bolt/metrics-zero-alloc",
+  "base": "main"
+}

@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use axum::extract::MatchedPath;
-use axum::http::{Request, Response};
+use axum::http::{Method, Request, Response};
 use pin_project_lite::pin_project;
 use serde::Serialize;
 use tower::{Layer, Service};
@@ -347,11 +347,8 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let method = req.method().to_string();
-        let route = req
-            .extensions()
-            .get::<MatchedPath>()
-            .map_or_else(|| "_unmatched".to_owned(), |p| p.as_str().to_owned());
+        let method = req.method().clone();
+        let route = req.extensions().get::<MatchedPath>().cloned();
 
         self.collector.increment_active();
 
@@ -359,7 +356,7 @@ where
             inner: self.inner.call(req),
             collector: Some(self.collector.clone()),
             method: Some(method),
-            route: Some(route),
+            route,
             start: Instant::now(),
         }
     }
@@ -367,12 +364,16 @@ where
 
 pin_project! {
     /// Future that records metrics after the inner service completes.
+    ///
+    /// **Performance Optimization:** Stores `Method` and `MatchedPath` instead of proactively
+    /// allocating `String`s. This avoids heap allocations on the hot path. The strings are
+    /// extracted as references (`&str`) during recording only when necessary.
     pub struct MetricsFuture<F> {
         #[pin]
         inner: F,
         collector: Option<MetricsCollector>,
-        method: Option<String>,
-        route: Option<String>,
+        method: Option<Method>,
+        route: Option<MatchedPath>,
         start: Instant,
     }
 }
@@ -391,9 +392,11 @@ where
                     let latency_ms =
                         u64::try_from(this.start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let method = this.method.take().unwrap_or_default();
-                    let route = this.route.take().unwrap_or_default();
+                    let method_str = method.as_str();
+                    let route = this.route.take();
+                    let route_str = route.as_ref().map_or("_unmatched", axum::extract::MatchedPath::as_str);
                     let status = response.status().as_u16();
-                    collector.record(&method, &route, status, latency_ms);
+                    collector.record(method_str, route_str, status, latency_ms);
                     collector.decrement_active();
                 }
                 Poll::Ready(Ok(response))
