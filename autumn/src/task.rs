@@ -57,13 +57,14 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
         } else if ch.is_ascii_alphabetic() {
             let num: u64 = current_num.parse().ok()?;
             current_num.clear();
-            match ch {
-                's' => total_secs += num,
-                'm' => total_secs += num * 60,
-                'h' => total_secs += num * 3600,
-                'd' => total_secs += num * 86400,
+            let secs = match ch {
+                's' => num,
+                'm' => num.checked_mul(60)?,
+                'h' => num.checked_mul(3600)?,
+                'd' => num.checked_mul(86400)?,
                 _ => return None,
-            }
+            };
+            total_secs = total_secs.checked_add(secs)?;
         } else if ch == ' ' {
             // Skip spaces between components
         } else {
@@ -85,6 +86,16 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_duration_does_not_panic(s in "[0-9]{1,30}[smhd]") {
+            // It might fail to parse and return None (due to overflow),
+            // but it should never panic.
+            let _ = parse_duration(&s);
+        }
+    }
 
     #[test]
     fn parse_seconds() {
