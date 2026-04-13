@@ -199,19 +199,19 @@ pub(crate) fn try_build_router_inner(
     if mounted_probe_paths.insert(config.health.live_path.as_str()) {
         router = router.route(
             &config.health.live_path,
-            axum::routing::get(crate::probe::live_handler),
+            axum::routing::get(crate::probe::live_handler::<AppState>),
         );
     }
     if mounted_probe_paths.insert(config.health.ready_path.as_str()) {
         router = router.route(
             &config.health.ready_path,
-            axum::routing::get(crate::probe::ready_handler),
+            axum::routing::get(crate::probe::ready_handler::<AppState>),
         );
     }
     if mounted_probe_paths.insert(config.health.startup_path.as_str()) {
         router = router.route(
             &config.health.startup_path,
-            axum::routing::get(crate::probe::startup_handler),
+            axum::routing::get(crate::probe::startup_handler::<AppState>),
         );
     }
     if mounted_probe_paths.insert(config.health.path.as_str()) {
