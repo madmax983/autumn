@@ -1,3 +1,10 @@
+//! Router construction and configuration.
+//!
+//! This module handles assembling the final [`axum::Router`] from the various
+//! components configured in [`AppBuilder`](crate::app::AppBuilder), including
+//! user routes, static files, middleware, error pages, and framework endpoints
+//! like actuators and probes.
+
 use std::sync::Arc;
 
 use crate::app::ScopedGroup;

@@ -41,8 +41,8 @@
 //! - [`config`] -- Layered configuration: defaults, `autumn.toml`, env overrides.
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
-//! - [`extract`] -- Re-exported Axum extractors ([`Form`](axum::extract::Form),
-//!   [`Json`], [`Path`], [`Query`](axum::extract::Query)).
+//! - [`extract`] -- Re-exported Axum extractors ([`Form`],
+//!   [`Json`], [`Path`], [`Query`]).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 //! - [`logging`] -- Structured logging via `tracing-subscriber`.
 //! - [`middleware`] -- Built-in middleware (request IDs).
