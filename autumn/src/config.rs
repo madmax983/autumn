@@ -1476,6 +1476,34 @@ mod tests {
     }
 
     #[test]
+    fn autumn_config_validate_ok() {
+        let config = AutumnConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn autumn_config_validate_session_err() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = None;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        if let Err(ConfigError::Validation(msg)) = result {
+            assert!(msg.contains("session.backend=redis requires session.redis.url"));
+        } else {
+            panic!("Expected ConfigError::Validation");
+        }
+    }
+
+    #[test]
+    fn autumn_config_validate_database_err() {
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("mysql://localhost/test".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn log_defaults() {
         let config = LogConfig::default();
         assert_eq!(config.level, "info");
