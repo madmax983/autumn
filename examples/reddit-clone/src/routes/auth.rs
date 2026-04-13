@@ -6,8 +6,12 @@
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
+use autumn_web::reexports::axum::extract::State;
+use autumn_web_harvest::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use diesel::prelude::*;
+use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
+use scoped_futures::ScopedFutureExt;
 use tracing::warn;
 
 use crate::models::{NewUser, User};
@@ -71,6 +75,7 @@ pub struct RegisterForm {
 
 #[post("/register")]
 pub async fn register(
+    State(state): State<AppState>,
     mut db: Db,
     session: Session,
     form: Form<RegisterForm>,
@@ -114,19 +119,34 @@ pub async fn register(
         password_hash: hashed,
     };
 
-    let user: User = diesel::insert_into(users::table)
-        .values(&new_user)
-        .returning(User::as_returning())
-        .get_result(&mut *db)
-        .await
-        .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
+    let user = (*db)
+        .transaction::<User, AutumnError, _>(|conn| {
+            let new_user = new_user.clone();
+            async move {
+                let user: User = diesel::insert_into(users::table)
+                    .values(&new_user)
+                    .returning(User::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-    if let Err(error) = crate::workflows::start_user_onboarding(&mut db, &user).await {
+                let request = crate::workflows::user_onboarding_dispatch(&user);
+                enqueue_workflow_start_outbox(conn, &request)
+                    .await
+                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+
+                Ok(user)
+            }
+            .scope_boxed()
+        })
+        .await?;
+
+    if let Err(error) = flush_workflow_start_outbox(&state).await {
         warn!(
             user_id = user.id,
             username = %user.username,
             error = %error,
-            "failed to enqueue onboarding workflow"
+            "failed to flush onboarding workflow outbox"
         );
     }
 

@@ -446,6 +446,9 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -495,6 +498,9 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -552,6 +558,9 @@ mod tests {
         use crate::state::AppState;
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -663,6 +672,9 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -726,6 +738,9 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -794,6 +809,9 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -858,6 +876,9 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -915,6 +936,9 @@ mod tests {
         store.save("valid-session", session_data).await.unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,

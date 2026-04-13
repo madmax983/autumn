@@ -893,6 +893,9 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -933,6 +936,7 @@ mod tests {
 
     fn test_state() -> crate::state::AppState {
         crate::state::AppState {
+            extensions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -1056,24 +1060,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_returns_503_when_store_load_fails() {
-        use crate::state::AppState;
-
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        let state = test_state();
 
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
@@ -1103,24 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_returns_503_when_store_save_fails() {
-        use crate::state::AppState;
-
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        let state = test_state();
 
         let app = Router::new()
             .route(

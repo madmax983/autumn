@@ -11,8 +11,10 @@ repository.workspace = true
 autumn-harvest = { path = "../autumn-harvest" }
 autumn-web = { path = "../../autumn" }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

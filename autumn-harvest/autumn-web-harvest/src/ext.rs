@@ -1,28 +1,37 @@
 //! Autumn `AppBuilder` integration for Harvest worker lifecycle.
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
+use autumn_web::config::AutumnConfig;
+use autumn_web::config::DatabaseConfig;
+use autumn_web::db;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
-use crate::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
+use crate::api::{HarvestApiState, harvest_api_router};
+use crate::config::{HarvestMode, HarvestRuntimeConfig};
+use crate::outbox::spawn_workflow_start_outbox_relay;
+use crate::runner::{HarvestRunner, HarvestRunnerResources};
 use autumn_harvest::builder::{HarvestBuilder, WorkerConfig};
-use autumn_harvest::context::SharedStateMap;
 use autumn_harvest::info::{ActivityInfo, DagInfo, WorkflowInfo};
-use autumn_harvest::scheduler::{SchedulerMonitor, SchedulerRuntime, compile_dag_catalog};
-use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
+use autumn_harvest::worker::DbPool;
 
 const HARVEST_MIGRATIONS: EmbeddedMigrations = embed_migrations!("../autumn-harvest/migrations");
+const OUTBOX_MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
+
+struct OutboxRuntime {
+    shutdown: CancellationToken,
+    handle: JoinHandle<()>,
+}
 
 struct HarvestRuntime {
-    worker: Arc<Worker>,
-    worker_handle: JoinHandle<()>,
-    scheduler: Option<SchedulerRuntime>,
+    runner: HarvestRunner,
+    outbox: Option<OutboxRuntime>,
 }
 
 #[derive(Default)]
@@ -171,7 +180,6 @@ where
     let shutdown_api_state = api_state;
 
     let builder = builder
-        .migrations(HARVEST_MIGRATIONS)
         .on_startup(move |state| {
             let shared = Arc::clone(&startup_shared);
             let api_state = startup_api_state.clone();
@@ -197,10 +205,15 @@ fn start_harvest_runtime(
     shared: &Arc<Mutex<HarvestIntegrationShared>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
+    let app_config = AutumnConfig::load()
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    let harvest_config = HarvestRuntimeConfig::load()
+        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+    ensure_runtime_migrations(state.profile(), &app_config, &harvest_config)?;
+
     let runtime_state = state.clone();
-    let pool = state.pool().ok_or_else(|| {
-        AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
-    })?;
+    let app_pool = state.pool().cloned();
+    let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
 
     let (registration, runtime_already_started) = {
         let mut guard = shared.lock().expect("harvest lock poisoned");
@@ -216,55 +229,57 @@ fn start_harvest_runtime(
     }
 
     let built = registration.builder.build();
-    let (registry, dags, worker_config) = built.into_worker_parts_with_extra_state(
-        injected_runtime_state(runtime_state, Some(pool.clone())),
-    );
-    let dag_catalog = Arc::new(
-        compile_dag_catalog(dags)
-            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
-    );
-    let runtime_config = WorkerRuntimeConfig::from(worker_config);
-    let worker_id = runtime_config.worker_id.clone();
-    let queues = runtime_config.queues.clone();
-    let registry = Arc::new(registry);
-    let worker = Arc::new(
-        Worker::new(runtime_config, Arc::clone(&registry))
-            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?,
-    );
-    let worker_pool = pool.clone();
-    let worker_handle = {
-        let worker = Arc::clone(&worker);
-        tokio::spawn(async move {
-            worker.run(&worker_pool).await;
-        })
-    };
-    let scheduler = (!dag_catalog.is_empty()).then(|| {
-        SchedulerRuntime::spawn(
-            pool.clone(),
-            Arc::clone(&registry),
-            Arc::clone(&dag_catalog),
-        )
+    state.insert_extension(harvest_config.outbox.clone());
+    let mut runner_resources =
+        HarvestRunnerResources::new(harvest_pool).with_app_state(runtime_state.clone());
+    if let Some(app_pool) = app_pool.as_ref() {
+        runner_resources = runner_resources.with_app_pool(app_pool.clone());
+    }
+    let runner = HarvestRunner::start(built, &harvest_config, runner_resources)?;
+    let harvest_db_pool = runner.storage_pool();
+    state.insert_extension(harvest_db_pool.clone());
+    api_state.install_storage_pool(harvest_db_pool);
+    let outbox = app_pool.as_ref().and_then(|_| {
+        if harvest_config.outbox.enabled {
+            let shutdown = CancellationToken::new();
+            let handle =
+                spawn_workflow_start_outbox_relay(runtime_state.clone(), shutdown.child_token());
+            Some(OutboxRuntime { shutdown, handle })
+        } else {
+            None
+        }
     });
-    let scheduler_monitor = scheduler
-        .as_ref()
-        .map_or_else(SchedulerMonitor::offline, SchedulerRuntime::monitor);
-    api_state.install(HarvestApiRuntime::new(
-        registry,
-        dag_catalog,
-        worker_id,
-        queues,
-        scheduler_monitor,
-    ));
+    api_state.install(runner.api_runtime());
 
     {
         let mut guard = shared.lock().expect("harvest lock poisoned");
-        guard.runtime = Some(HarvestRuntime {
-            worker,
-            worker_handle,
-            scheduler,
-        });
+        guard.runtime = Some(HarvestRuntime { runner, outbox });
     }
     Ok(())
+}
+
+fn resolve_harvest_pool(
+    state: &AppState,
+    config: &HarvestRuntimeConfig,
+) -> autumn_web::AutumnResult<DbPool> {
+    match config.mode {
+        HarvestMode::Embedded => state.pool().cloned().ok_or_else(|| {
+            AutumnError::service_unavailable_msg("autumn-harvest requires a configured database")
+        }),
+        HarvestMode::Split | HarvestMode::External => {
+            let database = DatabaseConfig {
+                url: config.database.url.clone(),
+                ..DatabaseConfig::default()
+            };
+            db::create_pool(&database)
+                .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
+                .ok_or_else(|| {
+                    AutumnError::service_unavailable_msg(
+                        "harvest.database.url must resolve to a dedicated database pool",
+                    )
+                })
+        }
+    }
 }
 
 async fn stop_harvest_runtime(
@@ -278,33 +293,107 @@ async fn stop_harvest_runtime(
         return;
     };
 
-    runtime.worker.shutdown();
-    if let Some(scheduler) = runtime.scheduler {
-        scheduler.shutdown();
-        if let Err(error) = scheduler.join().await {
-            tracing::warn!(error = %error, "harvest scheduler task failed during shutdown");
+    if let Some(outbox) = runtime.outbox {
+        outbox.shutdown.cancel();
+        if let Err(error) = outbox.handle.await {
+            if !error.is_cancelled() {
+                tracing::warn!(error = %error, "harvest outbox relay failed during shutdown");
+            }
         }
     }
-    if let Err(error) = runtime.worker_handle.await {
-        tracing::warn!(error = %error, "harvest worker task failed during shutdown");
-    }
+    runtime.runner.stop().await;
     api_state.clear();
 }
 
-fn injected_runtime_state(pool_state: AppState, pool: Option<DbPool>) -> SharedStateMap {
-    let mut state: HashMap<TypeId, Box<dyn Any + Send + Sync>> = HashMap::new();
-    state.insert(TypeId::of::<AppState>(), Box::new(pool_state));
-    if let Some(pool) = pool {
-        state.insert(TypeId::of::<DbPool>(), Box::new(pool));
+fn ensure_runtime_migrations(
+    profile: &str,
+    app_config: &AutumnConfig,
+    harvest_config: &HarvestRuntimeConfig,
+) -> autumn_web::AutumnResult<()> {
+    if let Some(app_database_url) = app_config.database.url.as_deref() {
+        apply_migrations_for_profile(
+            profile,
+            app_database_url,
+            OUTBOX_MIGRATIONS,
+            "Harvest workflow outbox",
+        )?;
     }
-    state
+
+    let harvest_database_url = match harvest_config.mode {
+        HarvestMode::Embedded => app_config.database.url.as_deref().ok_or_else(|| {
+            AutumnError::service_unavailable_msg(
+                "autumn-harvest requires database.url when harvest.mode is embedded",
+            )
+        })?,
+        HarvestMode::Split | HarvestMode::External => {
+            harvest_config.database.url.as_deref().ok_or_else(|| {
+                AutumnError::service_unavailable_msg(
+                    "harvest.database.url is required for dedicated Harvest storage",
+                )
+            })?
+        }
+    };
+
+    apply_migrations_for_profile(
+        profile,
+        harvest_database_url,
+        HARVEST_MIGRATIONS,
+        "Harvest storage",
+    )
+}
+
+fn apply_migrations_for_profile(
+    profile: &str,
+    database_url: &str,
+    migrations: EmbeddedMigrations,
+    label: &str,
+) -> autumn_web::AutumnResult<()> {
+    if profile == "dev" {
+        let result = autumn_web::migrate::run_pending(database_url, migrations)
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        if result.applied.is_empty() {
+            tracing::info!(target = label, "No pending migrations");
+        } else {
+            for migration in result.applied {
+                tracing::info!(target = label, migration = %migration, "Applied migration");
+            }
+        }
+        return Ok(());
+    }
+
+    match autumn_web::migrate::pending_migrations(database_url, migrations) {
+        Ok(pending) if pending.is_empty() => {
+            tracing::info!(target = label, "Database migrations are up to date");
+        }
+        Ok(pending) => {
+            tracing::warn!(
+                target = label,
+                count = pending.len(),
+                "Pending migrations detected. Run `autumn migrate` to apply them."
+            );
+            for migration in pending {
+                tracing::warn!(target = label, migration = %migration, "Pending migration");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target = label, error = %error, "Could not check migration status");
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::TypeId;
+
+    use crate::config::{HarvestDatabaseConfig, HarvestMode, HarvestRuntimeConfig};
+    use crate::runner::injected_runtime_state;
+    use crate::{AppDbPool, HarvestDbPool};
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
+    use autumn_web::config::DatabaseConfig;
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
             name: "echo",
@@ -344,6 +433,16 @@ mod tests {
         AppState::for_test()
     }
 
+    fn test_pool(database_url: &str, pool_size: usize) -> DbPool {
+        autumn_web::db::create_pool(&DatabaseConfig {
+            url: Some(database_url.to_owned()),
+            pool_size,
+            ..DatabaseConfig::default()
+        })
+        .expect("test pool config should build")
+        .expect("test pool should exist")
+    }
+
     #[test]
     fn harvest_ext_accumulates_registration_on_app_builder() {
         let builder = autumn_web::app()
@@ -380,12 +479,89 @@ mod tests {
     #[test]
     fn injected_runtime_state_contains_app_state() {
         let state = test_app_state();
-        let injected = injected_runtime_state(state.clone(), None);
+        let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 4);
+        let injected = injected_runtime_state(Some(state.clone()), None, harvest_pool);
         let stored = injected
             .get(&TypeId::of::<AppState>())
             .and_then(|value| value.downcast_ref::<AppState>())
             .expect("app state should be injected");
 
         assert_eq!(stored.profile(), state.profile());
+    }
+
+    #[test]
+    fn harvest_ext_embedded_mode_reuses_app_pool() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let state = AppState::for_test().with_pool(app_pool);
+        let config = HarvestRuntimeConfig::default();
+
+        let harvest_pool =
+            resolve_harvest_pool(&state, &config).expect("embedded mode should reuse app pool");
+
+        assert_eq!(harvest_pool.status().max_size, 3);
+    }
+
+    #[test]
+    fn harvest_ext_split_mode_builds_dedicated_harvest_pool() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let state = AppState::for_test().with_pool(app_pool.clone());
+        let config = HarvestRuntimeConfig {
+            mode: HarvestMode::Split,
+            database: HarvestDatabaseConfig {
+                url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
+            },
+            ..HarvestRuntimeConfig::default()
+        };
+
+        let harvest_pool = resolve_harvest_pool(&state, &config)
+            .expect("split mode should resolve a dedicated harvest pool");
+
+        assert_eq!(app_pool.status().max_size, 3);
+        assert_eq!(harvest_pool.status().max_size, 10);
+    }
+
+    #[test]
+    fn injected_runtime_state_contains_explicit_app_and_harvest_pool_roles() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 7);
+        let app_state = AppState::for_test().with_pool(app_pool.clone());
+        let injected = injected_runtime_state(Some(app_state), Some(app_pool), harvest_pool);
+
+        let app_db = injected
+            .get(&TypeId::of::<AppDbPool>())
+            .and_then(|value| value.downcast_ref::<AppDbPool>())
+            .expect("app db pool should be injected");
+        let harvest_db = injected
+            .get(&TypeId::of::<HarvestDbPool>())
+            .and_then(|value| value.downcast_ref::<HarvestDbPool>())
+            .expect("harvest db pool should be injected");
+        let legacy_harvest_db = injected
+            .get(&TypeId::of::<DbPool>())
+            .and_then(|value| value.downcast_ref::<DbPool>())
+            .expect("legacy harvest db pool should still be injected");
+
+        assert_eq!(app_db.status().max_size, 3);
+        assert_eq!(harvest_db.status().max_size, 7);
+        assert_eq!(legacy_harvest_db.status().max_size, 7);
+    }
+
+    #[test]
+    fn harvest_ext_external_mode_builds_dedicated_harvest_pool() {
+        let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
+        let state = AppState::for_test().with_pool(app_pool);
+        let config = HarvestRuntimeConfig {
+            mode: HarvestMode::External,
+            worker_enabled: false,
+            scheduler_enabled: false,
+            database: HarvestDatabaseConfig {
+                url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
+            },
+            outbox: crate::config::HarvestOutboxConfig::default(),
+        };
+
+        let harvest_pool = resolve_harvest_pool(&state, &config)
+            .expect("external mode should resolve a dedicated harvest pool");
+
+        assert_eq!(harvest_pool.status().max_size, 10);
     }
 }
