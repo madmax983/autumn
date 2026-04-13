@@ -610,6 +610,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.to_string(), "authentication required");
     }
 
     #[tokio::test]
@@ -631,6 +632,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.to_string(), "insufficient permissions");
     }
 
     #[tokio::test]
@@ -988,6 +990,7 @@ mod tests {
         #[derive(Clone)]
         struct MockService {
             ready: bool,
+            poll_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl Service<axum::extract::Request> for MockService {
@@ -996,6 +999,8 @@ mod tests {
             type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
             fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.poll_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if self.ready {
                     Poll::Ready(Ok(()))
                 } else {
@@ -1009,7 +1014,11 @@ mod tests {
         }
 
         let layer = RequireAuth::new("user_id");
-        let mock_service = MockService { ready: false };
+        let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock_service = MockService {
+            ready: false,
+            poll_count: poll_count.clone(),
+        };
         let mut service = layer.layer(mock_service);
 
         let waker = futures::task::noop_waker();
@@ -1018,11 +1027,36 @@ mod tests {
         // When inner is not ready, RequireAuthService should not be ready
         let poll = service.poll_ready(&mut cx);
         assert!(poll.is_pending());
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // When inner is ready, RequireAuthService should be ready
-        let mock_service_ready = MockService { ready: true };
+        let mock_service_ready = MockService {
+            ready: true,
+            poll_count: poll_count.clone(),
+        };
         let mut service_ready = layer.layer(mock_service_ready);
         let poll_ready = service_ready.poll_ready(&mut cx);
         assert!(poll_ready.is_ready());
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn auth_rejection_into_response() {
+        let rejection = AuthRejection;
+        let response = rejection.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["status"], 401);
+        assert_eq!(json["error"]["message"], "authentication required");
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = AuthConfig::default();
+        assert_eq!(config.bcrypt_cost, DEFAULT_BCRYPT_COST);
+        assert_eq!(config.session_key, "user_id");
     }
 }
