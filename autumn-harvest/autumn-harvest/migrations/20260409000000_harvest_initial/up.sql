@@ -1,3 +1,4 @@
+-- autumn-harvest/migrations/20260409000000_harvest_initial/up.sql
 -- Workflow execution tracking and event history for autumn-harvest.
 -- All tables prefixed with harvest_ to avoid collisions with application tables.
 
@@ -25,7 +26,7 @@ CREATE TABLE harvest_workflow_executions (
     memo                JSONB,
     search_attrs        JSONB,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (workflow_id, run_id)
+    UNIQUE (workflow_name, workflow_id)
 );
 
 CREATE INDEX idx_harvest_we_shard  ON harvest_workflow_executions (shard_id);
@@ -37,7 +38,7 @@ CREATE INDEX idx_harvest_we_search ON harvest_workflow_executions USING GIN (sea
 CREATE TABLE harvest_events (
     id               BIGSERIAL PRIMARY KEY,
     workflow_exec_id UUID NOT NULL REFERENCES harvest_workflow_executions(id) ON DELETE CASCADE,
-    event_id         INT NOT NULL,
+    event_id         INT NOT NULL,      -- 0, 1, 2, ... within a workflow
     event_type       TEXT NOT NULL,
     event_data       JSONB NOT NULL,
     timestamp        TIMESTAMPTZ NOT NULL DEFAULT NOW(),

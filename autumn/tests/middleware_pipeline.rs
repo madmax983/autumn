@@ -14,17 +14,7 @@ use axum::response::Response;
 use tower::ServiceExt;
 
 fn test_state() -> AppState {
-    AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-    }
+    AppState::for_test()
 }
 
 // ── Exception Filter tests ─────────────────────────────────────────
@@ -56,7 +46,7 @@ async fn exception_filter_on_error_response() {
     let config = AutumnConfig::default();
 
     let router =
-        autumn_web::app::build_router(routes![ok_handler, fail_handler], &config, test_state());
+        autumn_web::router::build_router(routes![ok_handler, fail_handler], &config, test_state());
     // Manually layer the exception filter (build_router doesn't take filters)
     let router = router.layer(ExceptionFilterLayer::new(vec![Arc::new(
         MarkCalledFilter {

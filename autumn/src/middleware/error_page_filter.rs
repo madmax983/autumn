@@ -43,12 +43,16 @@ impl ExceptionFilter for ErrorPageFilter {
         let request_id = response
             .extensions()
             .get::<ErrorPageRequestContext>()
-            .and_then(|ctx| ctx.request_id.clone());
+            .and_then(|ctx| {
+                ctx.request_id
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+            });
 
         let path = response
             .extensions()
             .get::<ErrorPageRequestContext>()
-            .map(|ctx| ctx.path.clone())
+            .map(|ctx| ctx.uri.path().to_string())
             .unwrap_or_default();
 
         let ctx = ErrorContext {
@@ -108,8 +112,8 @@ pub struct WantsHtml(pub bool);
 /// Request context stored in response extensions for the error page filter.
 #[derive(Clone, Debug)]
 pub struct ErrorPageRequestContext {
-    pub path: String,
-    pub request_id: Option<String>,
+    pub uri: axum::http::Uri,
+    pub request_id: Option<crate::middleware::RequestId>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -150,16 +154,16 @@ where
 
     fn call(&mut self, req: axum::http::Request<ReqBody>) -> Self::Future {
         let wants_html = accepts_html(&req);
-        let path = req.uri().path().to_string();
+        let uri = req.uri().clone();
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .map(std::string::ToString::to_string);
+            .cloned();
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
             wants_html,
-            path,
+            uri,
             request_id,
         }
     }
@@ -170,8 +174,8 @@ pin_project_lite::pin_project! {
         #[pin]
         inner: F,
         wants_html: bool,
-        path: String,
-        request_id: Option<String>,
+        uri: axum::http::Uri,
+        request_id: Option<crate::middleware::RequestId>,
     }
 }
 
@@ -192,7 +196,7 @@ where
                     .extensions_mut()
                     .insert(WantsHtml(*this.wants_html));
                 response.extensions_mut().insert(ErrorPageRequestContext {
-                    path: this.path.clone(),
+                    uri: this.uri.clone(),
                     request_id: this.request_id.clone(),
                 });
                 std::task::Poll::Ready(Ok(response))
@@ -542,5 +546,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"all good");
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_creates_correct_error() {
+        let uri = axum::http::Uri::from_static("/some/unknown/path");
+        let error = fallback_404_handler(uri).await;
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.to_string(), "No route matches /some/unknown/path");
     }
 }

@@ -46,14 +46,20 @@
 //!
 //! ```toml
 //! [session]
+//! backend = "memory"
 //! cookie_name = "autumn.sid"
 //! max_age_secs = 86400       # 24 hours
 //! secure = false              # true in prod profile
 //! same_site = "Lax"
+//!
+//! [session.redis]
+//! url = "redis://127.0.0.1:6379"
+//! key_prefix = "autumn:sessions"
 //! ```
 //!
-//! Or via environment variables: `AUTUMN_SESSION__COOKIE_NAME`,
-//! `AUTUMN_SESSION__MAX_AGE_SECS`, etc.
+//! Or via environment variables: `AUTUMN_SESSION__BACKEND`,
+//! `AUTUMN_SESSION__COOKIE_NAME`, `AUTUMN_SESSION__MAX_AGE_SECS`,
+//! `AUTUMN_SESSION__REDIS__URL`, etc.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -62,15 +68,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{FromRequestParts, Request};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use http::HeaderValue;
+use http::StatusCode;
 use http::header::{COOKIE, SET_COOKIE};
 use http::request::Parts;
+use thiserror::Error;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
 use uuid::Uuid;
-
-use crate::state::AppState;
 
 // ── Session data ────────────────────────────────────────────────
 
@@ -89,6 +95,7 @@ pub struct Session {
 #[derive(Debug)]
 struct SessionInner {
     id: String,
+    old_id: Option<String>,
     data: HashMap<String, String>,
     dirty: bool,
     destroyed: bool,
@@ -106,6 +113,7 @@ impl Session {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
+                old_id: None,
                 data,
                 dirty: false,
                 destroyed: false,
@@ -147,6 +155,20 @@ impl Session {
         inner.dirty = true;
     }
 
+    /// Rotate the session ID, generating a new ID for the same data.
+    ///
+    /// This is critical to call during privilege elevation (e.g., login)
+    /// to prevent Session Fixation attacks.
+    pub async fn rotate_id(&self) {
+        let mut inner = self.inner.write().await;
+        let new_id = Uuid::new_v4().to_string();
+        if inner.old_id.is_none() {
+            inner.old_id = Some(inner.id.clone());
+        }
+        inner.id = new_id;
+        inner.dirty = true;
+    }
+
     /// Destroy the session entirely. A new session ID will be issued
     /// on the next request.
     pub async fn destroy(&self) {
@@ -162,12 +184,15 @@ impl Session {
     }
 }
 
-impl FromRequestParts<AppState> for Session {
+impl<S> FromRequestParts<S> for Session
+where
+    S: Send + Sync,
+{
     type Rejection = std::convert::Infallible;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let session = parts
             .extensions
@@ -187,13 +212,37 @@ impl FromRequestParts<AppState> for Session {
 pub trait SessionStore: Send + Sync + 'static {
     /// Load session data for the given ID. Returns `None` if the session
     /// does not exist or has expired.
-    fn load(&self, id: &str) -> impl Future<Output = Option<HashMap<String, String>>> + Send;
+    fn load(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<HashMap<String, String>>, SessionStoreError>> + Send;
 
     /// Save session data under the given ID.
-    fn save(&self, id: &str, data: HashMap<String, String>) -> impl Future<Output = ()> + Send;
+    fn save(
+        &self,
+        id: &str,
+        data: HashMap<String, String>,
+    ) -> impl Future<Output = Result<(), SessionStoreError>> + Send;
 
     /// Delete session data for the given ID.
-    fn destroy(&self, id: &str) -> impl Future<Output = ()> + Send;
+    fn destroy(&self, id: &str) -> impl Future<Output = Result<(), SessionStoreError>> + Send;
+}
+
+/// An error that occurred during a session store operation.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{message}")]
+pub struct SessionStoreError {
+    message: String,
+}
+
+impl SessionStoreError {
+    /// Create a new session store error from an underlying backend error.
+    #[must_use]
+    pub fn backend(operation: &'static str, error: impl std::fmt::Display) -> Self {
+        Self {
+            message: format!("{operation} failed: {error}"),
+        }
+    }
 }
 
 // ── In-memory store ─────────────────────────────────────────────
@@ -216,16 +265,18 @@ impl MemoryStore {
 }
 
 impl SessionStore for MemoryStore {
-    async fn load(&self, id: &str) -> Option<HashMap<String, String>> {
-        self.sessions.read().await.get(id).cloned()
+    async fn load(&self, id: &str) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+        Ok(self.sessions.read().await.get(id).cloned())
     }
 
-    async fn save(&self, id: &str, data: HashMap<String, String>) {
+    async fn save(&self, id: &str, data: HashMap<String, String>) -> Result<(), SessionStoreError> {
         self.sessions.write().await.insert(id.to_owned(), data);
+        Ok(())
     }
 
-    async fn destroy(&self, id: &str) {
+    async fn destroy(&self, id: &str) -> Result<(), SessionStoreError> {
         self.sessions.write().await.remove(id);
+        Ok(())
     }
 }
 
@@ -239,12 +290,17 @@ impl SessionStore for MemoryStore {
 /// |-------|---------|
 /// | `cookie_name` | `"autumn.sid"` |
 /// | `max_age_secs` | `86400` (24 hours) |
+/// | `backend` | `memory` |
 /// | `secure` | `false` |
 /// | `same_site` | `"Lax"` |
 /// | `http_only` | `true` |
 /// | `path` | `"/"` |
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SessionConfig {
+    /// Storage backend used for session data.
+    #[serde(default)]
+    pub backend: SessionBackend,
+
     /// Name of the session cookie.
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
@@ -268,6 +324,91 @@ pub struct SessionConfig {
     /// Path scope for the cookie.
     #[serde(default = "default_path")]
     pub path: String,
+
+    /// Suppress the production warning for process-local session storage.
+    #[serde(default)]
+    pub allow_memory_in_production: bool,
+
+    /// Redis session backend configuration.
+    #[serde(default)]
+    pub redis: SessionRedisConfig,
+}
+
+/// Supported session storage backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionBackend {
+    /// In-memory storage. Resets on application restart.
+    #[default]
+    Memory,
+    /// Redis-backed storage. Suitable for production and multi-instance deployments.
+    Redis,
+}
+
+impl SessionBackend {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// Configuration specific to the Redis session backend.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SessionRedisConfig {
+    /// The Redis connection URL (e.g. `redis://127.0.0.1:6379`).
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Prefix used for session keys in Redis. Defaults to `autumn:sessions`.
+    #[serde(default = "default_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for SessionRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_redis_key_prefix() -> String {
+    "autumn:sessions".to_owned()
+}
+
+/// Represents the resolved plan for which session backend to initialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionBackendPlan {
+    /// Use the in-memory store.
+    Memory {
+        /// Whether to log a warning because memory sessions are used in production.
+        warn_in_production: bool,
+    },
+    /// Use the Redis store.
+    Redis {
+        /// The validated Redis connection URL.
+        url: String,
+        /// The prefix to use for session keys.
+        key_prefix: String,
+    },
+}
+
+/// Errors that can occur when resolving the session backend configuration.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SessionBackendConfigError {
+    /// Redis was selected, but no URL was provided.
+    #[error("session.backend=redis requires session.redis.url")]
+    MissingRedisUrl,
+    /// The provided Redis URL could not be parsed.
+    #[error("session.redis.url is not a valid Redis URL: {0}")]
+    InvalidRedisUrl(String),
+    /// Redis was selected, but the `redis` crate feature is not enabled.
+    #[error("session.backend=redis requires the `redis` feature")]
+    RedisFeatureDisabled,
 }
 
 fn default_cookie_name() -> String {
@@ -289,32 +430,93 @@ fn default_path() -> String {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
+            backend: SessionBackend::default(),
             cookie_name: default_cookie_name(),
             max_age_secs: default_max_age_secs(),
             secure: false,
             same_site: default_same_site(),
             http_only: default_true(),
             path: default_path(),
+            allow_memory_in_production: false,
+            redis: SessionRedisConfig::default(),
         }
     }
+}
+
+impl SessionConfig {
+    /// Resolve the concrete session backend plan from config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionBackendConfigError`] when the configured backend is
+    /// incomplete or invalid, such as Redis without a URL.
+    pub fn backend_plan(
+        &self,
+        profile: Option<&str>,
+    ) -> Result<SessionBackendPlan, SessionBackendConfigError> {
+        match self.backend {
+            SessionBackend::Memory => Ok(SessionBackendPlan::Memory {
+                warn_in_production: is_production_profile(profile)
+                    && !self.allow_memory_in_production,
+            }),
+            SessionBackend::Redis => {
+                let Some(url) = self.redis.url.clone().filter(|url| !url.trim().is_empty()) else {
+                    return Err(SessionBackendConfigError::MissingRedisUrl);
+                };
+
+                #[cfg(feature = "redis")]
+                {
+                    if let Err(error) = redis::Client::open(url.clone()) {
+                        return Err(SessionBackendConfigError::InvalidRedisUrl(
+                            error.to_string(),
+                        ));
+                    }
+
+                    Ok(SessionBackendPlan::Redis {
+                        url,
+                        key_prefix: self.redis.key_prefix.clone(),
+                    })
+                }
+
+                #[cfg(not(feature = "redis"))]
+                {
+                    let _ = url;
+                    Err(SessionBackendConfigError::RedisFeatureDisabled)
+                }
+            }
+        }
+    }
+}
+
+fn is_production_profile(profile: Option<&str>) -> bool {
+    matches!(profile, Some("prod" | "production"))
 }
 
 // ── Cookie helpers ──────────────────────────────────────────────
 
 /// Extract a named cookie value from the Cookie header.
 fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
-    headers.get_all(COOKIE).iter().find_map(|value| {
-        value.to_str().ok().and_then(|s| {
-            s.split(';').map(str::trim).find_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                if k.trim() == name {
-                    Some(v.trim().to_owned())
-                } else {
-                    None
+    let mut found_token = None;
+
+    for cookie_header in headers.get_all(COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for pair in cookie_str.split(';') {
+                let pair = pair.trim();
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k.trim() == name {
+                        if found_token.is_some() {
+                            // Multiple cookies with the same name found.
+                            // This indicates a potential Cookie Tossing attack!
+                            // Reject by returning None.
+                            return None;
+                        }
+                        found_token = Some(v.trim().to_owned());
+                    }
                 }
-            })
-        })
-    })
+            }
+        }
+    }
+    found_token
 }
 
 /// Build a Set-Cookie header value.
@@ -393,15 +595,14 @@ pub struct SessionService<S: SessionStore, Inner> {
     config: Arc<SessionConfig>,
 }
 
-impl<St, Inner, ResBody> Service<Request> for SessionService<St, Inner>
+impl<St, Inner> Service<Request> for SessionService<St, Inner>
 where
     St: SessionStore + Clone,
-    Inner: Service<Request, Response = Response<ResBody>> + Clone + Send + 'static,
+    Inner: Service<Request, Response = Response> + Clone + Send + 'static,
     Inner::Future: Send + 'static,
     Inner::Error: Send + 'static,
-    ResBody: Default + Send + 'static,
 {
-    type Response = Response<ResBody>;
+    type Response = Response;
     type Error = Inner::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -419,10 +620,18 @@ where
         Box::pin(async move {
             // 1. Extract or create session ID
             let existing_id = get_cookie(req.headers(), &config.cookie_name);
+            let mut generated_new_id = false;
             let (session_id, data) = if let Some(ref id) = existing_id {
-                let data = store.load(id).await.unwrap_or_default();
-                (id.clone(), data)
+                match store.load(id).await {
+                    Ok(Some(data)) => (id.clone(), data),
+                    Ok(None) => {
+                        generated_new_id = true;
+                        (Uuid::new_v4().to_string(), HashMap::new())
+                    }
+                    Err(error) => return Ok(session_store_unavailable_response(&error)),
+                }
             } else {
+                generated_new_id = true;
                 (Uuid::new_v4().to_string(), HashMap::new())
             };
 
@@ -436,15 +645,24 @@ where
             // 4. Save or destroy session based on state
             let inner_guard = session.inner.read().await;
             if inner_guard.destroyed {
-                store.destroy(&session_id).await;
+                if let Err(error) = store.destroy(&session_id).await {
+                    return Ok(session_store_unavailable_response(&error));
+                }
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
-            } else if inner_guard.dirty || existing_id.is_none() {
+            } else if inner_guard.dirty || generated_new_id {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
+                if let Some(ref old_id) = inner_guard.old_id {
+                    if let Err(error) = store.destroy(old_id).await {
+                        return Ok(session_store_unavailable_response(&error));
+                    }
+                }
                 drop(inner_guard);
-                store.save(&sid, data).await;
+                if let Err(error) = store.save(&sid, data).await {
+                    return Ok(session_store_unavailable_response(&error));
+                }
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &sid)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
@@ -452,6 +670,42 @@ where
 
             Ok(response)
         })
+    }
+}
+
+fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
+    tracing::error!("session store unavailable: {error}");
+    (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
+}
+
+pub(crate) fn apply_session_layer(
+    router: axum::Router<crate::state::AppState>,
+    config: &SessionConfig,
+    profile: Option<&str>,
+) -> Result<axum::Router<crate::state::AppState>, SessionBackendConfigError> {
+    match config.backend_plan(profile)? {
+        SessionBackendPlan::Memory { warn_in_production } => {
+            if warn_in_production {
+                tracing::warn!(
+                    "prod profile is using in-memory sessions; set session.backend=redis or \
+                     session.allow_memory_in_production=true to acknowledge the risk"
+                );
+            }
+            Ok(router.layer(SessionLayer::new(MemoryStore::new(), config.clone())))
+        }
+        SessionBackendPlan::Redis { .. } => {
+            #[cfg(feature = "redis")]
+            {
+                let store = crate::session_redis::RedisStore::from_config(config)?;
+                Ok(router.layer(SessionLayer::new(store, config.clone())))
+            }
+
+            #[cfg(not(feature = "redis"))]
+            {
+                let _ = router;
+                Err(SessionBackendConfigError::RedisFeatureDisabled)
+            }
+        }
     }
 }
 
@@ -464,14 +718,54 @@ mod tests {
     use http::Request as HttpRequest;
     use tower::ServiceExt;
 
+    #[derive(Clone)]
+    struct FailingStore {
+        fail_on_load: bool,
+        fail_on_save: bool,
+        fail_on_destroy: bool,
+    }
+
+    impl SessionStore for FailingStore {
+        async fn load(
+            &self,
+            _id: &str,
+        ) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+            if self.fail_on_load {
+                Err(SessionStoreError::backend("load", "boom"))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn save(
+            &self,
+            _id: &str,
+            _data: HashMap<String, String>,
+        ) -> Result<(), SessionStoreError> {
+            if self.fail_on_save {
+                Err(SessionStoreError::backend("save", "boom"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn destroy(&self, _id: &str) -> Result<(), SessionStoreError> {
+            if self.fail_on_destroy {
+                Err(SessionStoreError::backend("destroy", "boom"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[tokio::test]
     async fn memory_store_save_and_load() {
         let store = MemoryStore::new();
         let mut data = HashMap::new();
         data.insert("user".into(), "alice".into());
-        store.save("sess1", data).await;
+        store.save("sess1", data).await.unwrap();
 
-        let loaded = store.load("sess1").await;
+        let loaded = store.load("sess1").await.unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().get("user").unwrap(), "alice");
     }
@@ -479,15 +773,15 @@ mod tests {
     #[tokio::test]
     async fn memory_store_destroy() {
         let store = MemoryStore::new();
-        store.save("sess1", HashMap::new()).await;
-        store.destroy("sess1").await;
-        assert!(store.load("sess1").await.is_none());
+        store.save("sess1", HashMap::new()).await.unwrap();
+        store.destroy("sess1").await.unwrap();
+        assert!(store.load("sess1").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn memory_store_load_missing() {
         let store = MemoryStore::new();
-        assert!(store.load("nonexistent").await.is_none());
+        assert!(store.load("nonexistent").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -553,6 +847,21 @@ mod tests {
     }
 
     #[test]
+    fn get_cookie_rejects_multiple_cookies() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("autumn.sid=abc123; autumn.sid=xyz456"),
+        );
+        assert_eq!(get_cookie(&headers, "autumn.sid"), None);
+
+        let mut headers2 = http::HeaderMap::new();
+        headers2.append(COOKIE, HeaderValue::from_static("autumn.sid=abc123"));
+        headers2.append(COOKIE, HeaderValue::from_static("autumn.sid=xyz456"));
+        assert_eq!(get_cookie(&headers2, "autumn.sid"), None);
+    }
+
+    #[test]
     fn build_set_cookie_contains_required_parts() {
         let config = SessionConfig::default();
         let cookie = build_set_cookie(&config, "test-id");
@@ -573,31 +882,81 @@ mod tests {
     #[test]
     fn session_config_defaults() {
         let config = SessionConfig::default();
+        assert_eq!(config.backend, SessionBackend::Memory);
         assert_eq!(config.cookie_name, "autumn.sid");
         assert_eq!(config.max_age_secs, 86400);
         assert!(!config.secure);
         assert_eq!(config.same_site, "Lax");
         assert!(config.http_only);
         assert_eq!(config.path, "/");
+        assert!(!config.allow_memory_in_production);
+        assert!(config.redis.url.is_none());
+        assert_eq!(config.redis.key_prefix, "autumn:sessions");
+    }
+
+    #[test]
+    fn session_backend_plan_warns_for_prod_memory_without_ack() {
+        let config = SessionConfig::default();
+        let plan = config.backend_plan(Some("prod")).unwrap();
+        assert_eq!(
+            plan,
+            SessionBackendPlan::Memory {
+                warn_in_production: true
+            }
+        );
+    }
+
+    #[test]
+    fn session_backend_plan_suppresses_prod_warning_when_acknowledged() {
+        let config = SessionConfig {
+            allow_memory_in_production: true,
+            ..SessionConfig::default()
+        };
+        let plan = config.backend_plan(Some("prod")).unwrap();
+        assert_eq!(
+            plan,
+            SessionBackendPlan::Memory {
+                warn_in_production: false
+            }
+        );
+    }
+
+    #[test]
+    fn session_backend_plan_requires_redis_url() {
+        let config = SessionConfig {
+            backend: SessionBackend::Redis,
+            ..SessionConfig::default()
+        };
+        let error = config.backend_plan(None).unwrap_err();
+        assert_eq!(error, SessionBackendConfigError::MissingRedisUrl);
     }
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
+        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
             "ok".to_owned()
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
         let app = Router::new()
@@ -622,6 +981,26 @@ mod tests {
         assert!(cookie_str.contains("autumn.sid="));
     }
 
+    fn test_state() -> crate::state::AppState {
+        crate::state::AppState {
+            extensions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
     #[tokio::test]
     async fn session_layer_persists_data_across_requests() {
         async fn write_handler(session: Session) -> String {
@@ -635,17 +1014,7 @@ mod tests {
 
         let store = MemoryStore::new();
         let config = SessionConfig::default();
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-        };
+        let state = test_state();
 
         let app = Router::new()
             .route("/write", get(write_handler))
@@ -700,22 +1069,13 @@ mod tests {
             "destroyed".to_owned()
         }
 
-        let state = AppState {
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-        };
+        let state = test_state();
 
         let store = MemoryStore::new();
         store
             .save("existing-id", HashMap::from([("k".into(), "v".into())]))
-            .await;
+            .await
+            .unwrap();
 
         let app = Router::new()
             .route("/", get(handler))
@@ -742,6 +1102,66 @@ mod tests {
         assert!(cookie.contains("Max-Age=0"), "cookie should be expired");
 
         // Store should no longer have the session
-        assert!(store.load("existing-id").await.is_none());
+        assert!(store.load("existing-id").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn session_layer_returns_503_when_store_load_fails() {
+        let state = test_state();
+
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SessionLayer::new(
+                FailingStore {
+                    fail_on_load: true,
+                    fail_on_save: false,
+                    fail_on_destroy: false,
+                },
+                SessionConfig::default(),
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=existing-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn session_layer_returns_503_when_store_save_fails() {
+        let state = test_state();
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    "ok"
+                }),
+            )
+            .layer(SessionLayer::new(
+                FailingStore {
+                    fail_on_load: false,
+                    fail_on_save: true,
+                    fail_on_destroy: false,
+                },
+                SessionConfig::default(),
+            ))
+            .with_state(state);
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

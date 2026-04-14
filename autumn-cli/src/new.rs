@@ -9,6 +9,8 @@ mod templates {
     pub const CARGO_TOML: &str = include_str!("templates/Cargo.toml.tmpl");
     pub const MAIN_RS: &str = include_str!("templates/main.rs.tmpl");
     pub const AUTUMN_TOML: &str = include_str!("templates/autumn.toml.tmpl");
+    pub const DOCKERFILE: &str = include_str!("templates/Dockerfile.tmpl");
+    pub const DOCKERIGNORE: &str = include_str!("templates/.dockerignore.tmpl");
     pub const BUILD_RS: &str = include_str!("templates/build.rs.tmpl");
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
@@ -31,7 +33,7 @@ pub enum NewError {
     Io(#[from] std::io::Error),
 }
 
-/// Entry point called from `main.rs` — resolves CWD and delegates.
+/// Entry point called from `main.rs` and delegates to [`generate`].
 pub fn run(name: &str) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("Error: cannot determine current directory: {e}");
@@ -55,12 +57,10 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     let crate_name = name.replace('-', "_");
     let autumn_version = env!("CARGO_PKG_VERSION");
 
-    // Create directory structure
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
 
-    // Render templates with substitution
     let render = |template: &str| -> String {
         template
             .replace("{{project_name}}", name)
@@ -77,6 +77,14 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
         project_dir.join("autumn.toml"),
         render(templates::AUTUMN_TOML),
     )?;
+    fs::write(
+        project_dir.join("Dockerfile"),
+        render(templates::DOCKERFILE),
+    )?;
+    fs::write(
+        project_dir.join(".dockerignore"),
+        render(templates::DOCKERIGNORE),
+    )?;
     fs::write(project_dir.join("build.rs"), render(templates::BUILD_RS))?;
     fs::write(
         project_dir.join("static/css/input.css"),
@@ -92,6 +100,8 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
+    println!("  Created {name}/Dockerfile");
+    println!("  Created {name}/.dockerignore");
     println!("  Created {name}/build.rs");
     println!("  Created {name}/src/main.rs");
     println!("  Created {name}/static/css/input.css");
@@ -160,8 +170,6 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    // ── Name validation ──────────────────────────────────────────
-
     #[test]
     fn valid_name_simple() {
         assert!(validate_name("myapp").is_ok());
@@ -218,8 +226,6 @@ mod tests {
         assert!(err.to_string().contains("keyword"));
     }
 
-    // ── Project generation ───────────────────────────────────────
-
     #[test]
     fn generates_all_expected_files() {
         let tmp = TempDir::new().unwrap();
@@ -229,11 +235,15 @@ mod tests {
         assert!(p.join("Cargo.toml").is_file());
         assert!(p.join("src/main.rs").is_file());
         assert!(p.join("autumn.toml").is_file());
+        assert!(p.join("Dockerfile").is_file());
+        assert!(p.join(".dockerignore").is_file());
         assert!(p.join("build.rs").is_file());
         assert!(p.join(".gitignore").is_file());
         assert!(p.join("static/css/input.css").is_file());
         assert!(p.join("tailwind.config.js").is_file());
         assert!(p.join("migrations/.gitkeep").is_file());
+        assert!(!p.join("src/lib.rs").exists());
+        assert!(!p.join("src/client.rs").exists());
     }
 
     #[test]
@@ -287,7 +297,6 @@ mod tests {
         generate("my-db-app", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml")).unwrap();
-        // Hyphens should become underscores in the database URL
         assert!(content.contains("my_db_app"));
     }
 
@@ -299,6 +308,18 @@ mod tests {
         let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore")).unwrap();
         assert!(content.contains("/target"));
         assert!(content.contains("static/css/autumn.css"));
+        assert!(!content.contains("static/autumn/"));
+    }
+
+    #[test]
+    fn generated_build_rs_reruns_on_css_input_changes() {
+        let tmp = TempDir::new().unwrap();
+        generate("css-watch-check", tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
+        assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
+        assert!(content.contains("cargo:rerun-if-changed=target/autumn/tailwindcss"));
+        assert!(content.contains("cargo:rerun-if-env-changed=PATH"));
     }
 
     #[test]
@@ -317,8 +338,6 @@ mod tests {
         }
     }
 
-    // ── Error cases ──────────────────────────────────────────────
-
     #[test]
     fn already_exists_error() {
         let tmp = TempDir::new().unwrap();
@@ -335,9 +354,6 @@ mod tests {
         assert!(matches!(err, NewError::InvalidName(_, _)));
     }
 
-    // ── Helpers ──────────────────────────────────────────────────
-
-    /// Recursively collect all files (not directories) under a path.
     fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
         let mut files = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {

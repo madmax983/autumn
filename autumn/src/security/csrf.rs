@@ -50,7 +50,7 @@ use std::task::{Context, Poll};
 use axum::extract::FromRequestParts;
 use axum::http::{Request, Response, StatusCode};
 use http::header::HeaderName;
-use pin_project_lite::pin_project;
+
 use tower::{Layer, Service};
 use uuid::Uuid;
 
@@ -117,6 +117,7 @@ where
 struct CsrfSettings {
     cookie_name: String,
     token_header: HeaderName,
+    form_field: String,
     safe_methods: Vec<http::Method>,
 }
 
@@ -147,6 +148,7 @@ impl CsrfLayer {
             settings: Arc::new(CsrfSettings {
                 cookie_name: config.cookie_name.clone(),
                 token_header,
+                form_field: config.form_field.clone(),
                 safe_methods,
             }),
         }
@@ -171,38 +173,78 @@ pub struct CsrfService<S> {
     settings: Arc<CsrfSettings>,
 }
 
-/// Extract the CSRF cookie value from the Cookie header.
-fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Option<String> {
-    req_headers
-        .get_all(http::header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|cookie_str| cookie_str.split(';'))
-        .map(str::trim)
-        .find_map(|pair| {
-            let (name, value) = pair.split_once('=')?;
-            if name.trim() == cookie_name {
-                Some(value.trim().to_owned())
-            } else {
-                None
-            }
-        })
+use subtle::{Choice, ConstantTimeEq};
+
+/// Constant-time string comparison to prevent timing attacks when verifying CSRF tokens.
+///
+/// The comparison always processes exactly `b.len()` bytes so that execution
+/// time is independent of the length of the submitted token `a`.  Neither a
+/// length mismatch nor a short input causes an early exit.
+#[inline(never)]
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+
+    // Constant-time length check — no early exit.
+    let len_eq = a.len().ct_eq(&b.len());
+
+    // Iterate over `a` (the trusted stored token) so the loop count is fixed
+    // at the server-side token length, regardless of what the caller submits
+    // as `b`.  Callers pass the attacker-controlled value as `b`, so iterating
+    // over `a` ensures every submission — short or long — executes the same
+    // amount of work.  Out-of-range positions in `b` use the sentinel 0xFF,
+    // which can never match a valid ASCII/UTF-8 token byte.
+    let mut bytes_eq = Choice::from(1u8);
+    for (i, &a_byte) in a.iter().enumerate() {
+        let b_byte = *b.get(i).unwrap_or(&0xFF);
+        bytes_eq &= a_byte.ct_eq(&b_byte);
+    }
+
+    (len_eq & bytes_eq).into()
 }
 
-impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for CsrfService<S>
+/// Extract the CSRF cookie value from the Cookie header.
+fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Option<String> {
+    let mut found_token = None;
+
+    for cookie_header in &req_headers.get_all(http::header::COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for pair in cookie_str.split(';') {
+                let pair = pair.trim();
+                if let Some((name, value)) = pair.split_once('=') {
+                    if name.trim() == cookie_name {
+                        if found_token.is_some() {
+                            // Multiple cookies with the same name found.
+                            // This indicates a potential Cookie Tossing attack!
+                            // Reject by returning None.
+                            return None;
+                        }
+                        found_token = Some(value.trim().to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    found_token
+}
+
+impl<S, ResBody> Service<Request<axum::body::Body>> for CsrfService<S>
 where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone,
-    ResBody: Default,
+    S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ResBody: Default + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = CsrfFuture<S::Future>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         let is_safe = self.settings.safe_methods.contains(req.method());
         let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
@@ -214,25 +256,7 @@ where
         // Insert CsrfToken into request extensions for handler access
         req.extensions_mut().insert(CsrfToken(token.clone()));
 
-        if !is_safe {
-            // Validate: the header token must match the cookie token
-            let header_token = req
-                .headers()
-                .get(&self.settings.token_header)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-
-            if cookie_token.is_none() || header_token.as_deref() != cookie_token.as_deref() {
-                // CSRF validation failed -- reject via flag in the future
-                return CsrfFuture {
-                    inner: self.inner.call(req),
-                    csrf_rejected: true,
-                    set_cookie: None,
-                };
-            }
-        }
-
-        // Set cookie if not already present
+        // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {
             Some(format!(
                 "{}={}; Path=/; SameSite=Lax; HttpOnly",
@@ -242,55 +266,94 @@ where
             None
         };
 
-        CsrfFuture {
-            inner: self.inner.call(req),
-            csrf_rejected: false,
-            set_cookie,
-        }
-    }
-}
+        let settings = Arc::clone(&self.settings);
+        let mut inner = self.inner.clone();
 
-pin_project! {
-    /// Future for the CSRF middleware.
-    pub struct CsrfFuture<F> {
-        #[pin]
-        inner: F,
-        csrf_rejected: bool,
-        set_cookie: Option<String>,
-    }
-}
+        // Swap to ensure correct poll_ready semantics
+        std::mem::swap(&mut self.inner, &mut inner);
 
-impl<F, ResBody, E> Future for CsrfFuture<F>
-where
-    F: Future<Output = Result<Response<ResBody>, E>>,
-    ResBody: Default,
-{
-    type Output = Result<Response<ResBody>, E>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.project();
-
-        if *this.csrf_rejected {
-            // Build a 403 response
-            let mut response = Response::new(ResBody::default());
-            *response.status_mut() = StatusCode::FORBIDDEN;
-            return Poll::Ready(Ok(response));
-        }
-
-        match this.inner.poll(cx) {
-            Poll::Ready(Ok(mut response)) => {
-                // Add Set-Cookie header for new CSRF tokens
-                if let Some(cookie) = this.set_cookie.take() {
-                    if let Ok(val) = http::HeaderValue::from_str(&cookie) {
-                        response.headers_mut().append(http::header::SET_COOKIE, val);
-                    }
-                }
-                Poll::Ready(Ok(response))
+        Box::pin(async move {
+            if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = StatusCode::FORBIDDEN;
+                return Ok(response);
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+
+            // Validation passed (or method is safe)
+            let mut response = inner.call(req).await?;
+
+            if let Some(cookie) = set_cookie {
+                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(http::header::SET_COOKIE, val);
+                }
+            }
+
+            Ok(response)
+        })
+    }
+}
+
+async fn verify_csrf_token(
+    req: &mut Request<axum::body::Body>,
+    settings: &CsrfSettings,
+    cookie_token: Option<&str>,
+) -> bool {
+    let mut token_found = false;
+
+    // 1. Check header
+    let header_token = req
+        .headers()
+        .get(&settings.token_header)
+        .and_then(|v| v.to_str().ok());
+
+    if let (Some(c), Some(h)) = (cookie_token, header_token) {
+        if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
+            token_found = true;
         }
     }
+
+    if token_found {
+        return true;
+    }
+
+    // 2. Check form field (if not found in header)
+    let content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    if !content_type.starts_with("application/x-www-form-urlencoded") {
+        return false;
+    }
+
+    // Temporarily take ownership of the body
+    let body = std::mem::replace(req.body_mut(), axum::body::Body::empty());
+
+    // Limit body size to avoid DoS when extracting form field
+    let bytes = axum::body::to_bytes(body, 2 * 1024 * 1024)
+        .await
+        .unwrap_or_else(|_| axum::body::Bytes::new());
+
+    if let Ok(body_str) = std::str::from_utf8(&bytes) {
+        for pair in body_str.split('&') {
+            if let Some((key, value)) = pair.split_once('=') {
+                if key == settings.form_field {
+                    if let Some(c) = cookie_token {
+                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
+                            token_found = true;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Restore request body
+    *req.body_mut() = axum::body::Body::from(bytes);
+
+    token_found
 }
 
 #[cfg(test)]
@@ -462,5 +525,219 @@ mod tests {
     fn missing_cookie_returns_none() {
         let headers = http::HeaderMap::new();
         assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
+    }
+
+    #[test]
+    fn extract_cookie_rejects_multiple_cookies() {
+        // Multiple cookies with the same name in a single header
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            "autumn-csrf=abc123; autumn-csrf=xyz456".parse().unwrap(),
+        );
+        assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
+
+        // Multiple headers with the same cookie
+        let mut headers2 = http::HeaderMap::new();
+        headers2.append(http::header::COOKIE, "autumn-csrf=abc123".parse().unwrap());
+        headers2.append(http::header::COOKIE, "autumn-csrf=xyz456".parse().unwrap());
+        assert_eq!(extract_cookie_token(&headers2, "autumn-csrf"), None);
+    }
+
+    #[test]
+    fn extract_cookie_ignores_malformed_cookies() {
+        let mut headers = http::HeaderMap::new();
+        // Missing '='
+        headers.insert(http::header::COOKIE, "autumn-csrf abc123".parse().unwrap());
+        assert_eq!(extract_cookie_token(&headers, "autumn-csrf"), None);
+
+        // Multiple spaces
+        headers.insert(
+            http::header::COOKIE,
+            "   autumn-csrf  =  abc123  ; other=xyz".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_cookie_token(&headers, "autumn-csrf"),
+            Some("abc123".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(super::constant_time_eq("abc", "abc"));
+        assert!(!super::constant_time_eq("abc", "ab"));
+        assert!(!super::constant_time_eq("abc", "abd"));
+        assert!(super::constant_time_eq("", ""));
+        assert!(!super::constant_time_eq("a", "b"));
+        assert!(!super::constant_time_eq("a", "A"));
+    }
+
+    #[tokio::test]
+    async fn post_with_empty_cookie_but_valid_header() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("X-CSRF-Token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_valid_cookie_but_empty_header() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("X-CSRF-Token", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_empty_cookie_but_valid_form_field() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_valid_cookie_but_empty_form_field() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_csrf="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_large_body_fails_csrf() {
+        let token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        // Create a body just slightly over 2MB. The CSRF extractor limits to 2MB.
+        let large_padding = "a".repeat(2 * 1024 * 1024 + 10);
+        let body_content = format!("_csrf={token}&pad={large_padding}");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body_content))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_empty_tokens_returns_403() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&CsrfConfig {
+                enabled: true,
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("X-CSRF-Token", "")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_with_empty_form_tokens_returns_403() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&CsrfConfig {
+                enabled: true,
+                ..Default::default()
+            }));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_csrf="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

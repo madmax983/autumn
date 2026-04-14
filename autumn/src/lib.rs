@@ -4,7 +4,7 @@
 //!
 //! Autumn assembles proven Rust crates ([Axum], [Maud], [Diesel], htmx, Tailwind)
 //! into a Spring Boot-style developer experience with proc-macro-driven
-//! conventions and escape hatches at every level.
+//! conventions and customization options at every level.
 //!
 //! ## Quick start
 //!
@@ -41,13 +41,14 @@
 //! - [`config`] -- Layered configuration: defaults, `autumn.toml`, env overrides.
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
-//! - [`extract`] -- Re-exported Axum extractors ([`Form`](axum::extract::Form),
-//!   [`Json`], [`Path`](axum::extract::Path), [`Query`](axum::extract::Query)).
-//! - [`health`] -- Auto-mounted health check endpoint.
+//! - [`extract`] -- Re-exported Axum extractors ([`Form`],
+//!   [`Json`], [`Path`], [`Query`]).
+//! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 //! - [`logging`] -- Structured logging via `tracing-subscriber`.
 //! - [`middleware`] -- Built-in middleware (request IDs).
 //! - [`prelude`] -- Glob import for the most common types.
 //! - [`route`] -- Route descriptor used by macro-generated code.
+//! - [`telemetry`] -- OTLP runtime planning and subscriber wiring.
 //!
 //! ## Zero-config defaults
 //!
@@ -68,6 +69,9 @@ extern crate self as autumn_web;
 pub mod actuator;
 pub mod app;
 pub mod auth;
+pub mod cache;
+#[cfg(feature = "ws")]
+pub mod channels;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
@@ -79,10 +83,23 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub mod probe;
+
+/// Router construction and integration with Axum.
+///
+/// This module is responsible for taking the application's configuration,
+/// defined routes, middleware, and state, and building the final `axum::Router`
+/// that will handle incoming HTTP requests.
+pub mod router;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,
 };
+#[cfg(feature = "flash")]
+pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub mod logging;
@@ -91,9 +108,15 @@ pub mod prelude;
 pub mod route;
 pub mod security;
 pub mod session;
+#[cfg(feature = "redis")]
+pub(crate) mod session_redis;
+/// Static site generation support.
 pub mod static_gen;
 pub mod task;
+pub mod telemetry;
 pub mod validation;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 /// Create a new [`app::AppBuilder`] for configuring and launching an Autumn server.
 ///
@@ -151,7 +174,7 @@ pub use validation::ValidateExt;
 
 /// Annotate an async function as a `DELETE` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -170,7 +193,7 @@ pub use autumn_macros::delete;
 
 /// Annotate an async function as a `GET` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -186,7 +209,6 @@ pub use autumn_macros::delete;
 /// }
 /// ```
 pub use autumn_macros::get;
-
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup
@@ -280,7 +302,7 @@ pub use autumn_macros::service;
 
 /// Annotate an async function as a `POST` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -299,7 +321,7 @@ pub use autumn_macros::post;
 
 /// Annotate an async function as a `PUT` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -340,6 +362,57 @@ pub use autumn_macros::put;
 /// # }
 /// ```
 pub use autumn_macros::routes;
+
+/// Cache the return value of a function based on its arguments.
+///
+/// Wraps a function with an in-memory cache backed by a static
+/// [`MokaCache`](cache::MokaCache) (default) via the [`Cache`](cache::Cache)
+/// trait. Arguments must implement `Hash + Clone`; the return type must
+/// be `Clone + Send + Sync + 'static`.
+///
+/// Use `result` to only cache `Ok` values from `Result`-returning
+/// functions (common with [`AutumnResult`]).
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::cached;
+///
+/// #[cached(ttl = "5m", max = 100, result)]
+/// async fn get_user(id: i64) -> AutumnResult<User> {
+///     db.find(id).await
+/// }
+/// ```
+pub use autumn_macros::cached;
+
+/// Annotate an async function as a WebSocket route handler.
+///
+/// The function follows the **two-function pattern**: it runs at HTTP
+/// upgrade time and returns a closure implementing [`ws::WsHandler`]
+/// that handles the live WebSocket connection.
+///
+/// Generates a GET route for the WebSocket upgrade, compatible with
+/// [`routes!`]. Requires the `ws` feature.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::ws::{WebSocket, Message, WsHandler};
+///
+/// #[ws("/echo")]
+/// async fn echo() -> impl WsHandler {
+///     |mut socket: WebSocket| async move {
+///         while let Some(Ok(msg)) = socket.recv().await {
+///             if let Message::Text(text) = msg {
+///                 socket.send(Message::Text(text)).await.ok();
+///             }
+///         }
+///     }
+/// }
+/// ```
+#[cfg(feature = "ws")]
+pub use autumn_macros::ws;
 
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
@@ -501,6 +574,31 @@ pub use maud::html;
 /// ```
 pub use crate::extract::Json;
 
+/// Path extractor.
+///
+/// Extract typed path parameters from the URL.
+///
+/// Re-exported from [Axum](https://docs.rs/axum). See
+/// [`axum::extract::Path`] for full documentation.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+/// ```
+pub use crate::extract::Path;
+
+/// Form data extractor.
+pub use crate::extract::Form;
+
+/// Query extractor.
+pub use crate::extract::Query;
+
 /// Re-exports of upstream crates used in macro-generated code.
 ///
 /// These are public so that code generated by `autumn-macros` can reference
@@ -529,11 +627,19 @@ pub mod reexports {
     pub use diesel_async;
     pub use http;
     pub use tokio;
+    pub use tokio_util;
     pub use tracing;
     pub use validator;
 }
 
+/// Shared application state passed to route handlers.
 pub mod state;
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::field_reassign_with_default
+)]
+pub mod test;
 pub use state::AppState;
 
 #[cfg(test)]

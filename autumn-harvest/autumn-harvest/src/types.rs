@@ -12,12 +12,15 @@ use uuid::Uuid;
 /// User-provided idempotency key for a workflow execution.
 ///
 /// This is the business-level identifier chosen by the caller (e.g.
-/// `"user-123"` or `"order-456"`). It is NOT the run ID — multiple
-/// runs of the same workflow may share a `WorkflowId` in a retry scenario.
+/// `"user-123"` or `"order-456"`). It is NOT the run ID. Reusing the same
+/// `WorkflowId` for the same workflow name should resolve to the same logical
+/// workflow start; explicit reruns should use a fresh key until Harvest grows a
+/// dedicated restart API.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkflowId(String);
 
 impl WorkflowId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
@@ -41,12 +44,18 @@ impl fmt::Display for WorkflowId {
 pub struct ExecutionId(Uuid);
 
 impl ExecutionId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    #[must_use]
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -75,12 +84,13 @@ impl FromStr for ExecutionId {
 pub struct ActivityExecId(Uuid);
 
 impl ActivityExecId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
 
     #[must_use]
-    pub fn as_uuid(&self) -> Uuid {
+    pub const fn as_uuid(&self) -> Uuid {
         self.0
     }
 }
@@ -109,8 +119,14 @@ impl FromStr for ActivityExecId {
 pub struct TimerId(String);
 
 impl TimerId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -125,8 +141,14 @@ impl fmt::Display for TimerId {
 pub struct WorkerId(String);
 
 impl WorkerId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -156,10 +178,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_exec_id_display_roundtrip() {
+    fn activity_exec_id_display_roundtrip() -> Result<(), uuid::Error> {
         let id = ActivityExecId::new();
         let s = id.to_string();
-        let parsed: ActivityExecId = s.parse().unwrap();
+        let parsed: ActivityExecId = s.parse()?;
         assert_eq!(id, parsed);
+        Ok(())
     }
 }

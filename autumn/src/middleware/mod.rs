@@ -8,6 +8,7 @@
 //! - [`ExceptionFilterLayer`] / [`ExceptionFilter`] -- intercepts error
 //!   responses and runs a user-registered filter chain for logging,
 //!   transformation, or replacement.
+//! - Dev-only live reload helpers used by `autumn dev`.
 //!
 //! The [`RequestIdLayer`] is applied automatically by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run); you do not need to
@@ -15,6 +16,7 @@
 //! when at least one exception filter is registered via
 //! [`AppBuilder::exception_filter`](crate::app::AppBuilder::exception_filter).
 
+pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub mod exception_filter;
 pub mod metrics;

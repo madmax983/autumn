@@ -2,11 +2,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::parse::Parser;
-use syn::{ItemFn, LitStr};
+use syn::{Expr, ItemFn, LitStr, parse::Parser as _};
 
 struct ActivityAttrs {
-    retry: Option<TokenStream>,
+    retry: Option<Expr>,
     start_to_close: Option<String>,
     heartbeat_timeout: Option<String>,
     schedule_to_start: Option<String>,
@@ -24,9 +23,10 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
 
     syn::meta::parser(|meta| {
         if meta.path.is_ident("retry") {
-            let value = meta.value()?;
-            let expr: syn::Expr = value.parse()?;
-            result.retry = Some(quote! { #expr });
+            // Parse as Expr so nested function calls with commas work correctly,
+            // e.g. `retry = RetryPolicy::fixed(3, Duration::from_secs(1))`.
+            let value: Expr = meta.value()?.parse()?;
+            result.retry = Some(value);
             Ok(())
         } else if meta.path.is_ident("start_to_close") {
             let value: LitStr = meta.value()?.parse()?;
@@ -45,10 +45,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<ActivityAttrs> {
             result.queue = Some(value.value());
             Ok(())
         } else {
-            Err(meta.error(
-                "unsupported attribute: expected retry, start_to_close, \
-                 heartbeat_timeout, schedule_to_start, or queue",
-            ))
+            Err(meta.error("unsupported attribute: expected retry, start_to_close, heartbeat_timeout, schedule_to_start, or queue"))
         }
     })
     .parse2(attr)?;
@@ -63,6 +60,10 @@ fn duration_expr(s: &str) -> TokenStream {
     }
 }
 
+// The function necessarily handles multiple code-gen paths (0/1/N params,
+// 5 optional attribute fields, quote! blocks) — splitting it further would
+// hurt readability more than the length lint helps.
+#[allow(clippy::too_many_lines)]
 pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = match parse_attrs(attr) {
         Ok(a) => a,
@@ -136,9 +137,11 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let dispatch = if param_names.is_empty() {
         quote! {
             let result = #fn_name(ctx).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else if param_names.len() == 1 {
         let name = &param_names[0];
@@ -146,13 +149,15 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let #name = ::autumn_harvest::serde_json::from_value(input)
                 .map_err(|e| e.to_string())?;
             let result = #fn_name(ctx, #name).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     } else {
         let indices = (0..param_names.len()).map(syn::Index::from);
-        let names = &param_names;
+        let names = param_names.clone();
         quote! {
             let args: ::autumn_harvest::serde_json::Value = input;
             #(
@@ -160,9 +165,11 @@ pub fn activity_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| e.to_string())?;
             )*
             let result = #fn_name(ctx, #(#names),*).await;
-            result.map(|v| ::autumn_harvest::serde_json::to_value(v)
-                .unwrap_or(::autumn_harvest::serde_json::Value::Null))
-                .map_err(|e| e.to_string())
+            result.map_err(|e| e.to_string())
+                .and_then(|v| {
+                    ::autumn_harvest::serde_json::to_value(v)
+                        .map_err(|e| e.to_string())
+                })
         }
     };
 

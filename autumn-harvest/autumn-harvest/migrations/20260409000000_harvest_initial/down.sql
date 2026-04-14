@@ -1,3 +1,4 @@
+-- autumn-harvest/migrations/20260409000000_harvest_initial/down.sql
 DROP TABLE IF EXISTS harvest_dead_letters;
 DROP TABLE IF EXISTS harvest_timers;
 DROP TABLE IF EXISTS harvest_signals;

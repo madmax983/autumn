@@ -4,6 +4,9 @@
 //! appended to `harvest_events`. Replay re-executes the workflow function
 //! from the beginning, feeding recorded results back instead of re-executing
 //! activities.
+//!
+//! **Append-only invariant:** Never remove or reorder variants. Stored JSON
+//! must deserialize into the same variants after deployment.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,9 +15,6 @@ use crate::error::TimeoutType;
 use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
 
 /// All possible events in a workflow's history.
-///
-/// This enum is append-only — never remove or reorder variants, since stored
-/// JSON must deserialize into the same variants after deployment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WorkflowEvent {
@@ -65,7 +65,7 @@ pub enum WorkflowEvent {
     // ── Timers ────────────────────────────────────────────────────
     TimerStarted {
         timer_id: TimerId,
-        /// Duration in seconds (serde_json doesn't handle Duration natively).
+        /// Duration in seconds (Duration is not JSON-serializable natively).
         duration_secs: u64,
     },
     TimerFired {
@@ -93,7 +93,7 @@ pub enum WorkflowEvent {
         error: String,
     },
 
-    // ── Markers (user checkpoints) ────────────────────────────────
+    // ── Markers ───────────────────────────────────────────────────
     MarkerRecorded {
         name: String,
         details: serde_json::Value,
@@ -104,7 +104,7 @@ impl WorkflowEvent {
     /// Stable string identifier for this event variant, stored in
     /// `harvest_events.event_type`.
     #[must_use]
-    pub fn type_name(&self) -> &'static str {
+    pub const fn type_name(&self) -> &'static str {
         match self {
             Self::WorkflowStarted { .. } => "WorkflowStarted",
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",
@@ -134,27 +134,29 @@ mod tests {
     use chrono::Utc;
 
     #[test]
-    fn workflow_started_round_trips_serde() {
+    fn workflow_started_round_trips_serde() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::WorkflowStarted {
             input: serde_json::json!({"user_id": 42}),
             timestamp: Utc::now(),
         };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::WorkflowStarted { .. }));
+        Ok(())
     }
 
     #[test]
-    fn activity_scheduled_round_trips() {
+    fn activity_scheduled_round_trips() -> Result<(), serde_json::Error> {
         let event = WorkflowEvent::ActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "send_email".into(),
             input: serde_json::Value::Null,
             queue: "default".into(),
         };
-        let json = serde_json::to_string(&event).unwrap();
-        let back: WorkflowEvent = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&event)?;
+        let back: WorkflowEvent = serde_json::from_str(&json)?;
         assert!(matches!(back, WorkflowEvent::ActivityScheduled { .. }));
+        Ok(())
     }
 
     #[test]
@@ -163,5 +165,82 @@ mod tests {
             output: serde_json::Value::Null,
         };
         assert_eq!(e.type_name(), "WorkflowCompleted");
+    }
+
+    #[test]
+    fn all_type_names_are_unique() {
+        use crate::types::{ActivityExecId, ExecutionId, TimerId, WorkerId};
+        use std::collections::HashSet;
+
+        let events = vec![
+            WorkflowEvent::WorkflowStarted {
+                input: serde_json::Value::Null,
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::WorkflowFailed { error: "x".into() },
+            WorkflowEvent::WorkflowCancelled { reason: "x".into() },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "a".into(),
+                input: serde_json::Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: ActivityExecId::new(),
+                worker_id: WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: ActivityExecId::new(),
+                error: "x".into(),
+                attempt: 1,
+            },
+            WorkflowEvent::ActivityTimedOut {
+                activity_id: ActivityExecId::new(),
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: ActivityExecId::new(),
+                details: serde_json::Value::Null,
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: TimerId::new("t"),
+                duration_secs: 10,
+            },
+            WorkflowEvent::TimerFired {
+                timer_id: TimerId::new("t"),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "s".into(),
+                payload: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: ExecutionId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: ExecutionId::new(),
+                error: "x".into(),
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: serde_json::Value::Null,
+            },
+        ];
+
+        assert_eq!(events.len(), 17);
+        let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
+        assert_eq!(names.len(), 17, "duplicate type names detected");
     }
 }

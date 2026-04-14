@@ -17,8 +17,7 @@ use crate::schema::bookmarks;
 #[scheduled(every = "1h", name = "link-checker")]
 pub async fn check_links(state: AppState) -> AutumnResult<()> {
     let pool = state
-        .pool
-        .as_ref()
+        .pool()
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
 
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
@@ -42,7 +41,7 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
         .build()
         .map_err(|e| AutumnError::from(std::io::Error::other(e.to_string())))?;
 
-    let mut dead_count = 0u32;
+    let mut dead_ids = Vec::new();
     for (id, url) in &alive {
         let reachable = client
             .head(url)
@@ -52,12 +51,17 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
 
         if !reachable {
             tracing::warn!("link-checker: dead link id={id} url={url}");
-            diesel::update(bookmarks::table.find(id))
-                .set(bookmarks::alive.eq(false))
-                .execute(&mut conn)
-                .await?;
-            dead_count += 1;
+            dead_ids.push(*id);
         }
+    }
+
+    let dead_count = dead_ids.len();
+
+    if !dead_ids.is_empty() {
+        diesel::update(bookmarks::table.filter(bookmarks::id.eq_any(&dead_ids)))
+            .set(bookmarks::alive.eq(false))
+            .execute(&mut conn)
+            .await?;
     }
 
     tracing::info!(

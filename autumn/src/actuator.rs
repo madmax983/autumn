@@ -1,7 +1,7 @@
 //! Actuator endpoints for operational observability.
 //!
 //! Provides health, info, env, metrics, configprops, loggers, and tasks
-//! endpoints at `/actuator/*`.
+//! endpoints under the configured actuator prefix.
 //!
 //! Sensitive endpoints are gated by profile-aware defaults:
 //! - **dev**: all endpoints enabled
@@ -16,11 +16,30 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
-use crate::state::AppState;
+/// Trait to abstract the state requirements for actuator handlers.
+pub trait ProvideActuatorState {
+    fn metrics(&self) -> &crate::middleware::MetricsCollector;
+    fn log_levels(&self) -> &LogLevels;
+    fn task_registry(&self) -> &TaskRegistry;
+    fn config_props(&self) -> &ConfigProperties;
+    fn profile(&self) -> &str;
+    fn uptime_display(&self) -> String;
+
+    #[cfg(feature = "ws")]
+    fn channels(&self) -> &crate::channels::Channels;
+
+    #[cfg(feature = "ws")]
+    fn shutdown_token(&self) -> tokio_util::sync::CancellationToken;
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
 
 // ── Shared types for AppState ──────────────────────────────────
 
-/// Runtime log level management for the `/actuator/loggers` endpoint.
+/// Runtime log level management for the loggers actuator endpoint.
 ///
 /// Stores the current effective log level and per-logger overrides.
 /// Changes are ephemeral -- they reset on restart.
@@ -69,6 +88,11 @@ impl LogLevels {
     #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
         if let Ok(mut guard) = self.inner.write() {
+            // Prevent unbounded memory growth from arbitrary logger names
+            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+                return None;
+            }
+
             let previous = guard.logger_overrides.get(name).cloned();
             guard
                 .logger_overrides
@@ -233,6 +257,7 @@ pub struct ConfigProperties {
 impl ConfigProperties {
     /// Build config properties with source tracking from the loaded config.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn from_config(config: &crate::config::AutumnConfig) -> Self {
         let profile = config.profile.as_deref().unwrap_or("default");
         let defaults = crate::config::AutumnConfig::default();
@@ -240,95 +265,298 @@ impl ConfigProperties {
         let mut props = HashMap::new();
         let profile_str = profile.to_string();
 
-        // Server properties
-        Self::track_property(
-            &mut props,
-            "server.host",
-            &config.server.host,
-            &defaults.server.host,
-            &profile_str,
-        );
-        Self::track_property(
-            &mut props,
-            "server.port",
-            &config.server.port.to_string(),
-            &defaults.server.port.to_string(),
-            &profile_str,
-        );
-        Self::track_property(
-            &mut props,
-            "server.shutdown_timeout_secs",
-            &config.server.shutdown_timeout_secs.to_string(),
-            &defaults.server.shutdown_timeout_secs.to_string(),
-            &profile_str,
-        );
-
-        // Database properties
-        let db_url = config.database.url.as_deref().unwrap_or("").to_string();
-        Self::track_property(&mut props, "database.url", &db_url, "", &profile_str);
-        Self::track_property(
-            &mut props,
-            "database.pool_size",
-            &config.database.pool_size.to_string(),
-            &defaults.database.pool_size.to_string(),
-            &profile_str,
-        );
-
-        // Log properties
-        Self::track_property(
-            &mut props,
-            "log.level",
-            &config.log.level,
-            &defaults.log.level,
-            &profile_str,
-        );
-        Self::track_property(
-            &mut props,
-            "log.format",
-            &format!("{:?}", config.log.format),
-            &format!("{:?}", defaults.log.format),
-            &profile_str,
-        );
-
-        // Health properties
-        Self::track_property(
-            &mut props,
-            "health.path",
-            &config.health.path,
-            &defaults.health.path,
-            &profile_str,
-        );
-        Self::track_property(
-            &mut props,
-            "health.detailed",
-            &config.health.detailed.to_string(),
-            &defaults.health.detailed.to_string(),
-            &profile_str,
-        );
-
-        // Actuator properties
-        Self::track_property(
-            &mut props,
-            "actuator.prefix",
-            &config.actuator.prefix,
-            &defaults.actuator.prefix,
-            &profile_str,
-        );
-        Self::track_property(
-            &mut props,
-            "actuator.sensitive",
-            &config.actuator.sensitive.to_string(),
-            &defaults.actuator.sensitive.to_string(),
-            &profile_str,
-        );
+        Self::track_server_props(&mut props, config, &defaults, &profile_str);
+        Self::track_db_props(&mut props, config, &defaults, &profile_str);
+        Self::track_log_props(&mut props, config, &defaults, &profile_str);
+        Self::track_telemetry_props(&mut props, config, &defaults, &profile_str);
+        Self::track_health_props(&mut props, config, &defaults, &profile_str);
+        Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
+        Self::track_session_props(&mut props, config, &defaults, &profile_str);
 
         Self {
             inner: Arc::new(RwLock::new(props)),
         }
     }
 
-    /// Track a single config property, determining its source by checking
-    /// for env var overrides and comparing against defaults.
+    fn track_server_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "server.host",
+            &config.server.host,
+            &defaults.server.host,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "server.port",
+            &config.server.port.to_string(),
+            &defaults.server.port.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "server.shutdown_timeout_secs",
+            &config.server.shutdown_timeout_secs.to_string(),
+            &defaults.server.shutdown_timeout_secs.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_db_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        let db_url = config.database.url.as_deref().unwrap_or("").to_string();
+        Self::track_property(props, "database.url", &db_url, "", profile_str);
+        Self::track_property(
+            props,
+            "database.pool_size",
+            &config.database.pool_size.to_string(),
+            &defaults.database.pool_size.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_log_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "log.level",
+            &config.log.level,
+            &defaults.log.level,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.format",
+            &format!("{:?}", config.log.format),
+            &format!("{:?}", defaults.log.format),
+            profile_str,
+        );
+    }
+
+    fn track_telemetry_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "telemetry.enabled",
+            &config.telemetry.enabled.to_string(),
+            &defaults.telemetry.enabled.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.service_name",
+            &config.telemetry.service_name,
+            &defaults.telemetry.service_name,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.service_namespace",
+            config.telemetry.service_namespace.as_deref().unwrap_or(""),
+            defaults
+                .telemetry
+                .service_namespace
+                .as_deref()
+                .unwrap_or(""),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.service_version",
+            &config.telemetry.service_version,
+            &defaults.telemetry.service_version,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.environment",
+            &config.telemetry.environment,
+            &defaults.telemetry.environment,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.otlp_endpoint",
+            config.telemetry.otlp_endpoint.as_deref().unwrap_or(""),
+            defaults.telemetry.otlp_endpoint.as_deref().unwrap_or(""),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.protocol",
+            &format!("{:?}", config.telemetry.protocol),
+            &format!("{:?}", defaults.telemetry.protocol),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "telemetry.strict",
+            &config.telemetry.strict.to_string(),
+            &defaults.telemetry.strict.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_health_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "health.path",
+            &config.health.path,
+            &defaults.health.path,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "health.live_path",
+            &config.health.live_path,
+            &defaults.health.live_path,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "health.ready_path",
+            &config.health.ready_path,
+            &defaults.health.ready_path,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "health.startup_path",
+            &config.health.startup_path,
+            &defaults.health.startup_path,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "health.detailed",
+            &config.health.detailed.to_string(),
+            &defaults.health.detailed.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_actuator_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "actuator.prefix",
+            &config.actuator.prefix,
+            &defaults.actuator.prefix,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "actuator.sensitive",
+            &config.actuator.sensitive.to_string(),
+            &defaults.actuator.sensitive.to_string(),
+            profile_str,
+        );
+    }
+
+    fn track_session_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "session.backend",
+            &format!("{:?}", config.session.backend),
+            &format!("{:?}", defaults.session.backend),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.cookie_name",
+            &config.session.cookie_name,
+            &defaults.session.cookie_name,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.max_age_secs",
+            &config.session.max_age_secs.to_string(),
+            &defaults.session.max_age_secs.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.secure",
+            &config.session.secure.to_string(),
+            &defaults.session.secure.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.same_site",
+            &config.session.same_site,
+            &defaults.session.same_site,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.http_only",
+            &config.session.http_only.to_string(),
+            &defaults.session.http_only.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.path",
+            &config.session.path,
+            &defaults.session.path,
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.allow_memory_in_production",
+            &config.session.allow_memory_in_production.to_string(),
+            &defaults.session.allow_memory_in_production.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.redis.url",
+            config.session.redis.url.as_deref().unwrap_or(""),
+            defaults.session.redis.url.as_deref().unwrap_or(""),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "session.redis.key_prefix",
+            &config.session.redis.key_prefix,
+            &defaults.session.redis.key_prefix,
+            profile_str,
+        );
+    }
+
     fn track_property(
         props: &mut HashMap<String, ConfigProperty>,
         key: &str,
@@ -400,33 +628,41 @@ struct DatabaseCheck {
     idle_connections: u64,
 }
 
-/// `GET /actuator/health`
-#[allow(unused_variables, clippy::useless_let_if_seq)]
-pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let mut db_check = None;
-    let mut overall_healthy = true;
+/// `GET <actuator-prefix>/health`
+#[allow(unused_variables)]
+pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let (overall_healthy, db_check) = {
+        #[cfg(feature = "db")]
+        {
+            #[allow(clippy::option_if_let_else)]
+            if let Some(pool) = state.pool() {
+                let status = pool.status();
+                let available = status.available as u64;
+                let size = status.max_size as u64;
+                let waiting = status.waiting as u64;
+                let idle = available;
+                let active = size.saturating_sub(available);
 
-    #[cfg(feature = "db")]
-    if let Some(pool) = state.pool.as_ref() {
-        let status = pool.status();
-        let available = status.available as u64;
-        let size = status.max_size as u64;
-        let waiting = status.waiting as u64;
-        let idle = available;
-        let active = size.saturating_sub(available);
-
-        let healthy = available > 0 || waiting == 0;
-        if !healthy {
-            overall_healthy = false;
+                let overall_healthy = available > 0 || waiting == 0;
+                let db_check = Some(DatabaseCheck {
+                    status: if overall_healthy { "ok" } else { "down" },
+                    pool_size: size,
+                    active_connections: active,
+                    idle_connections: idle,
+                });
+                (overall_healthy, db_check)
+            } else {
+                (true, None)
+            }
         }
 
-        db_check = Some(DatabaseCheck {
-            status: if healthy { "ok" } else { "down" },
-            pool_size: size,
-            active_connections: active,
-            idle_connections: idle,
-        });
-    }
+        #[cfg(not(feature = "db"))]
+        {
+            (true, None)
+        }
+    };
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
@@ -473,8 +709,10 @@ struct RuntimeInfo {
     uptime: String,
 }
 
-/// `GET /actuator/info`
-pub(crate) async fn info(State(state): State<AppState>) -> Json<ActuatorInfo> {
+/// `GET <actuator-prefix>/info`
+pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<ActuatorInfo> {
     Json(ActuatorInfo {
         app: AppInfo {
             name: std::env::var("CARGO_PKG_NAME").unwrap_or_else(|_| "unknown".into()),
@@ -516,45 +754,35 @@ fn should_redact(key: &str) -> bool {
 }
 
 /// `GET /actuator/env` — only available when actuator sensitive mode is enabled.
-pub(crate) async fn env_endpoint(State(state): State<AppState>) -> Json<ActuatorEnv> {
-    let props = vec![
-        ("server.host", "127.0.0.1"),
-        ("server.port", "3000"),
-        ("log.level", "info"),
-        ("log.format", "Auto"),
-        ("health.path", "/health"),
-        ("database.url", "postgres://..."),
-    ];
-
-    let redacted: std::collections::HashMap<String, serde_json::Value> = props
+pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<ActuatorEnv> {
+    let properties = state
+        .config_props()
+        .snapshot()
         .into_iter()
-        .map(|(k, v)| {
-            let val = if should_redact(k) {
-                serde_json::Value::String("****".into())
-            } else {
-                serde_json::Value::String(v.into())
-            };
-            (k.to_string(), val)
-        })
+        .map(|(key, prop)| (key, prop.value))
         .collect();
 
     Json(ActuatorEnv {
         active_profile: state.profile().to_owned(),
-        properties: redacted,
+        properties,
     })
 }
 
 // ── Metrics ────────────────────────────────────────────────────
 
-/// `GET /actuator/metrics` -- request metrics, latency, status codes, DB pool stats.
+/// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
 #[allow(unused_variables, unused_mut)]
-pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let snapshot = state.metrics.snapshot();
+pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let snapshot = state.metrics().snapshot();
     let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool.as_ref() {
+    if let Some(pool) = state.pool() {
         let status = pool.status();
         let db_stats = serde_json::json!({
             "pool_size": status.max_size,
@@ -569,11 +797,91 @@ pub(crate) async fn metrics_endpoint(State(state): State<AppState>) -> Json<serd
     Json(result)
 }
 
+// ── Prometheus ─────────────────────────────────────────────────
+
+/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
+pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    use std::fmt::Write;
+
+    let snapshot = state.metrics().snapshot();
+    let mut out = String::with_capacity(1024);
+
+    // requests_total
+    out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
+    out.push_str("# TYPE autumn_http_requests_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_requests_total {}",
+        snapshot.http.requests_total
+    );
+
+    // requests_active
+    out.push_str("# HELP autumn_http_requests_active Currently active HTTP requests\n");
+    out.push_str("# TYPE autumn_http_requests_active gauge\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_requests_active {}",
+        snapshot.http.requests_active
+    );
+
+    // by_status
+    out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
+    out.push_str("# TYPE autumn_http_responses_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"2xx\"}} {}",
+        snapshot.http.by_status.s2xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"3xx\"}} {}",
+        snapshot.http.by_status.s3xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"4xx\"}} {}",
+        snapshot.http.by_status.s4xx
+    );
+    let _ = writeln!(
+        out,
+        "autumn_http_responses_total{{status=\"5xx\"}} {}",
+        snapshot.http.by_status.s5xx
+    );
+
+    // by_route
+    if !snapshot.http.by_route.is_empty() {
+        out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
+        out.push_str("# TYPE autumn_http_route_requests_total counter\n");
+        for (route_key, metrics) in &snapshot.http.by_route {
+            // route_key is formatted as "METHOD /path"
+            if let Some((method, path)) = route_key.split_once(' ') {
+                let _ = writeln!(
+                    out,
+                    "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
+                    method, path, metrics.count
+                );
+            }
+        }
+    }
+
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+}
+
 // ── Config Properties (sensitive) ──────────────────────────────
 
-/// `GET /actuator/configprops` -- all config properties with source tracking.
-pub(crate) async fn configprops_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let props = state.config_props.snapshot();
+/// `GET <actuator-prefix>/configprops` -- all config properties with source tracking.
+pub(crate) async fn configprops_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let props = state.config_props().snapshot();
 
     Json(serde_json::json!({
         "active_profile": state.profile(),
@@ -586,7 +894,7 @@ pub(crate) async fn configprops_endpoint(State(state): State<AppState>) -> Json<
 /// Available log levels for the loggers endpoint.
 const AVAILABLE_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
 
-/// Response for `GET /actuator/loggers`.
+/// Response for `GET <actuator-prefix>/loggers`.
 #[derive(Serialize)]
 pub(crate) struct LoggersResponse {
     current_level: String,
@@ -594,24 +902,26 @@ pub(crate) struct LoggersResponse {
     loggers: HashMap<String, String>,
 }
 
-/// `GET /actuator/loggers` -- view current log levels.
-pub(crate) async fn loggers_get(State(state): State<AppState>) -> Json<LoggersResponse> {
+/// `GET <actuator-prefix>/loggers` -- view current log levels.
+pub(crate) async fn loggers_get<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<LoggersResponse> {
     Json(LoggersResponse {
-        current_level: state.log_levels.current_level(),
+        current_level: state.log_levels().current_level(),
         available_levels: AVAILABLE_LEVELS.to_vec(),
-        loggers: state.log_levels.logger_overrides(),
+        loggers: state.log_levels().logger_overrides(),
     })
 }
 
-/// Request body for `PUT /actuator/loggers/{name}`.
+/// Request body for `PUT <actuator-prefix>/loggers/{name}`.
 #[derive(Deserialize)]
 pub(crate) struct SetLoggerRequest {
     level: String,
 }
 
-/// `PUT /actuator/loggers/{name}` -- change a logger's level at runtime.
-pub(crate) async fn loggers_put(
-    State(state): State<AppState>,
+/// `PUT <actuator-prefix>/loggers/{name}` -- change a logger's level at runtime.
+pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
     Path(name): Path<String>,
     Json(body): Json<SetLoggerRequest>,
 ) -> impl IntoResponse {
@@ -632,7 +942,7 @@ pub(crate) async fn loggers_put(
         );
     }
 
-    let previous = state.log_levels.set_logger_level(&name, &level);
+    let previous = state.log_levels().set_logger_level(&name, &level);
 
     (
         StatusCode::OK,
@@ -646,37 +956,198 @@ pub(crate) async fn loggers_put(
 
 // ── Tasks (sensitive) ──────────────────────────────────────────
 
-/// `GET /actuator/tasks` -- scheduled task status.
-pub(crate) async fn tasks_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let tasks = state.task_registry.snapshot();
+/// `GET <actuator-prefix>/tasks` -- scheduled task status.
+pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let tasks = state.task_registry().snapshot();
 
     Json(serde_json::json!({
         "scheduled_tasks": tasks,
     }))
 }
 
+// ── Channels (sensitive) ───────────────────────────────────────
+
+/// `GET <actuator-prefix>/channels` -- get current channel snapshots.
+#[cfg(feature = "ws")]
+pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let channels = state.channels().snapshot();
+    Json(serde_json::json!({
+        "channels": channels,
+    }))
+}
+
+// ── Tasks Stream (WebSocket) ───────────────────────────────────
+
+/// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
+#[cfg(feature = "ws")]
+pub(crate) async fn tasks_stream_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket| async move {
+        let mut rx = state.channels().subscribe("sys:tasks");
+        let shutdown = state.shutdown_token();
+
+        loop {
+            tokio::select! {
+                res = rx.recv() => {
+                    match res {
+                        Ok(msg) => {
+                            let ws_msg = axum::extract::ws::Message::Text(msg.into_string().into());
+                            if socket.send(ws_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                () = shutdown.cancelled() => {
+                    let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+                    break;
+                }
+                else => break,
+            }
+        }
+    })
+}
+
 // ── Router builder ──────────────────────────────────────────────
+
+pub(crate) fn normalize_actuator_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        String::new()
+    } else {
+        let trimmed = trimmed.trim_end_matches('/');
+        if trimmed.starts_with('/') {
+            trimmed.to_owned()
+        } else {
+            format!("/{trimmed}")
+        }
+    }
+}
+
+pub(crate) fn actuator_route_glob(prefix: &str) -> String {
+    let prefix = normalize_actuator_prefix(prefix);
+    if prefix.is_empty() {
+        "/*".to_owned()
+    } else {
+        format!("{prefix}/*")
+    }
+}
+
+pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
+    let prefix = normalize_actuator_prefix(prefix);
+    if prefix.is_empty() {
+        suffix.to_owned()
+    } else {
+        format!("{prefix}{suffix}")
+    }
+}
+
+pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<String> {
+    let mut paths = vec![
+        actuator_route_path(prefix, "/health"),
+        actuator_route_path(prefix, "/info"),
+        actuator_route_path(prefix, "/metrics"),
+    ];
+
+    if sensitive {
+        paths.extend([
+            actuator_route_path(prefix, "/env"),
+            actuator_route_path(prefix, "/configprops"),
+            actuator_route_path(prefix, "/loggers"),
+            actuator_route_path(prefix, "/tasks"),
+            actuator_route_path(prefix, "/prometheus"),
+        ]);
+
+        #[cfg(feature = "ws")]
+        {
+            paths.push(actuator_route_path(prefix, "/tasks/stream"));
+            paths.push(actuator_route_path(prefix, "/channels"));
+        }
+    }
+
+    paths
+}
 
 /// Build the actuator router with profile-aware endpoint exposure.
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
-pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
+pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
+    sensitive: bool,
+) -> axum::Router<S> {
+    actuator_router_with_prefix("/actuator", sensitive)
+}
+
+/// Build the actuator router at a configured prefix.
+///
+/// This is the prefix-aware variant used by the framework router.
+pub(crate) fn actuator_router_with_prefix<
+    S: ProvideActuatorState + Send + Sync + Clone + 'static,
+>(
+    prefix: &str,
+    sensitive: bool,
+) -> axum::Router<S> {
     let mut router = axum::Router::new()
-        .route("/actuator/health", axum::routing::get(health))
-        .route("/actuator/info", axum::routing::get(info))
-        .route("/actuator/metrics", axum::routing::get(metrics_endpoint));
+        .route(
+            &actuator_route_path(prefix, "/health"),
+            axum::routing::get(health::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/info"),
+            axum::routing::get(info::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/metrics"),
+            axum::routing::get(metrics_endpoint::<S>),
+        );
 
     if sensitive {
         router = router
-            .route("/actuator/env", axum::routing::get(env_endpoint))
             .route(
-                "/actuator/configprops",
-                axum::routing::get(configprops_endpoint),
+                &actuator_route_path(prefix, "/env"),
+                axum::routing::get(env_endpoint::<S>),
             )
-            .route("/actuator/loggers", axum::routing::get(loggers_get))
-            .route("/actuator/loggers/{name}", axum::routing::put(loggers_put))
-            .route("/actuator/tasks", axum::routing::get(tasks_endpoint));
+            .route(
+                &actuator_route_path(prefix, "/configprops"),
+                axum::routing::get(configprops_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/loggers"),
+                axum::routing::get(loggers_get::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/loggers/{name}"),
+                axum::routing::put(loggers_put::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/tasks"),
+                axum::routing::get(tasks_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/prometheus"),
+                axum::routing::get(prometheus_endpoint::<S>),
+            );
+
+        #[cfg(feature = "ws")]
+        {
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/channels"),
+                    axum::routing::get(channels_endpoint::<S>),
+                );
+        }
     }
 
     router
@@ -685,21 +1156,35 @@ pub fn actuator_router(sensitive: bool) -> axum::Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AutumnConfig;
+    use crate::state::AppState;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
+        test_state_with_config(&AutumnConfig::default())
+    }
+
+    fn test_state_with_config(config: &AutumnConfig) -> AppState {
         AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
-            profile: Some("dev".into()),
+            profile: config.profile.clone().or_else(|| Some("dev".into())),
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
-            config_props: ConfigProperties::default(),
+            config_props: ConfigProperties::from_config(config),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -727,6 +1212,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_routes_respect_custom_prefix() {
+        let app = actuator_router_with_prefix("/ops", true).with_state(test_state());
+
+        let prefixed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ops/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prefixed.status(), StatusCode::OK);
+
+        let legacy = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn actuator_route_helpers_normalize_prefixes() {
+        assert_eq!(actuator_route_glob("ops/"), "/ops/*");
+        assert_eq!(actuator_route_path("ops/", "/health"), "/ops/health");
+        assert_eq!(actuator_route_glob("/"), "/*");
+    }
+
+    #[tokio::test]
     async fn actuator_info_returns_metadata() {
         let app = actuator_router(true).with_state(test_state());
         let resp = app
@@ -750,7 +1270,25 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_env_available_in_sensitive_mode() {
-        let app = actuator_router(true).with_state(test_state());
+        let config = AutumnConfig {
+            profile: Some("prod".into()),
+            server: crate::config::ServerConfig {
+                port: 4100,
+                ..crate::config::ServerConfig::default()
+            },
+            telemetry: crate::config::TelemetryConfig {
+                enabled: true,
+                service_name: "cloud-app".into(),
+                ..crate::config::TelemetryConfig::default()
+            },
+            health: crate::config::HealthConfig {
+                path: "/healthz".into(),
+                ..crate::config::HealthConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+
+        let app = actuator_router(true).with_state(test_state_with_config(&config));
         let resp = app
             .oneshot(
                 Request::builder()
@@ -761,6 +1299,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["active_profile"], "prod");
+        assert_eq!(json["properties"]["server.port"], "4100");
+        assert_eq!(json["properties"]["telemetry.enabled"], "true");
+        assert_eq!(json["properties"]["telemetry.service_name"], "cloud-app");
+        assert_eq!(json["properties"]["health.path"], "/healthz");
     }
 
     #[tokio::test]
@@ -792,8 +1339,8 @@ mod tests {
     #[tokio::test]
     async fn actuator_metrics_returns_http_stats() {
         let state = test_state();
-        state.metrics.record("GET", "/test", 200, 10);
-        state.metrics.record("POST", "/test", 500, 50);
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("POST", "/test", 500, 50);
 
         let app = actuator_router(true).with_state(state);
         let resp = app
@@ -946,7 +1493,7 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["message"], "Logger 'autumn_web' set to 'debug'");
 
-        let overrides = state.log_levels.logger_overrides();
+        let overrides = state.log_levels().logger_overrides();
         assert_eq!(
             overrides.get("autumn_web").map(String::as_str),
             Some("debug")
@@ -1009,14 +1556,75 @@ mod tests {
         assert_eq!(levels.current_level(), "trace");
     }
 
+    // ── Prometheus endpoint tests ──────────────────────────────
+
+    #[tokio::test]
+    async fn actuator_prometheus_returns_metrics() {
+        let state = test_state();
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("POST", "/test", 500, 50);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; version=0.0.4"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("# HELP autumn_http_requests_total Total number of HTTP requests"));
+        assert!(text.contains("# TYPE autumn_http_requests_total counter"));
+        assert!(text.contains("autumn_http_requests_total 2"));
+
+        assert!(text.contains("autumn_http_requests_active "));
+        assert!(text.contains("autumn_http_responses_total{status=\"2xx\"} 1"));
+        assert!(text.contains("autumn_http_responses_total{status=\"5xx\"} 1"));
+
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
+        );
+        assert!(
+            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
+        );
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     // ── Tasks endpoint tests ───────────────────────────────────
 
     #[tokio::test]
     async fn actuator_tasks_returns_registered_tasks() {
         let state = test_state();
-        state.task_registry.register("cleanup", "every 5m");
-        state.task_registry.record_start("cleanup");
-        state.task_registry.record_success("cleanup", 150);
+        state.task_registry().register("cleanup", "every 5m");
+        state.task_registry().record_start("cleanup");
+        state.task_registry().record_success("cleanup", 150);
 
         let app = actuator_router(true).with_state(state);
         let resp = app
@@ -1078,5 +1686,116 @@ mod tests {
     fn task_registry_empty_snapshot() {
         let registry = TaskRegistry::new();
         assert!(registry.snapshot().is_empty());
+    }
+    #[test]
+    fn log_levels_rejects_new_key_at_capacity() {
+        let levels = LogLevels::new("info");
+        // Fill to capacity
+        for i in 0..1000 {
+            let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
+        }
+
+        // Try to add a new key, should be rejected
+        let result = levels.set_logger_level("logger_1000", "warn");
+        assert_eq!(result, None);
+        assert_eq!(levels.logger_overrides().len(), 1000);
+        assert_eq!(levels.logger_overrides().get("logger_1000"), None);
+    }
+
+    #[test]
+    fn log_levels_accepts_existing_key_at_capacity() {
+        let levels = LogLevels::new("info");
+        // Fill to capacity
+        for i in 0..1000 {
+            let _ = levels.set_logger_level(&format!("logger_{i}"), "debug");
+        }
+
+        // Try to update an existing key, should succeed
+        let prev = levels.set_logger_level("logger_999", "warn");
+        assert_eq!(prev.as_deref(), Some("debug"));
+        assert_eq!(levels.logger_overrides().len(), 1000);
+        assert_eq!(
+            levels
+                .logger_overrides()
+                .get("logger_999")
+                .map(String::as_str),
+            Some("warn")
+        );
+    }
+
+    #[test]
+    fn task_registry_records_multiple_successes_and_failures() {
+        let registry = TaskRegistry::new();
+        registry.register("my_task", "cron * * * * *");
+
+        // 1st success
+        registry.record_start("my_task");
+        registry.record_success("my_task", 100);
+
+        // 2nd success
+        registry.record_start("my_task");
+        registry.record_success("my_task", 110);
+
+        let snapshot = registry.snapshot();
+        let task = &snapshot["my_task"];
+        assert_eq!(task.total_runs, 2);
+        assert_eq!(task.total_failures, 0);
+
+        // 1st failure
+        registry.record_start("my_task");
+        registry.record_failure("my_task", 50, "failed");
+
+        let snapshot2 = registry.snapshot();
+        let task2 = &snapshot2["my_task"];
+        assert_eq!(task2.total_runs, 3);
+        assert_eq!(task2.total_failures, 1);
+    }
+
+    #[test]
+    fn configprops_tracks_custom_profile() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(
+            &mut props,
+            "log.level",
+            "debug",
+            "info",
+            "custom_profile",
+        );
+        assert_eq!(props["log.level"].source, "autumn.toml");
+    }
+
+    #[test]
+    fn configprops_tracks_dev_prod_profiles() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "log.level", "debug", "info", "dev");
+        assert_eq!(props["log.level"].source, "profile_default:dev");
+
+        ConfigProperties::track_property(&mut props, "log.format", "json", "text", "prod");
+        assert_eq!(props["log.format"].source, "profile_default:prod");
+    }
+
+    #[test]
+    fn configprops_returns_default_when_values_match() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "log.level", "info", "info", "dev");
+        assert_eq!(props["log.level"].source, "default");
+    }
+}
+
+#[cfg(test)]
+mod havoc_proptest {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1))]
+        #[test]
+        fn log_levels_memory_exhaustion(names in proptest::collection::vec(".*", 5000)) {
+            let levels = LogLevels::new("info");
+            for name in names {
+                let _ = levels.set_logger_level(&name, "debug");
+            }
+            assert!(levels.logger_overrides().len() <= 1000, "Memory leak: unbounded loggers inserted");
+        }
     }
 }

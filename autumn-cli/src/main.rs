@@ -2,10 +2,13 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod dev;
+mod export;
 mod migrate;
 mod monitor;
 mod new;
 mod setup;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 /// The Autumn web framework CLI.
 #[derive(Parser)]
@@ -37,6 +40,9 @@ enum Commands {
         /// Package to run (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Log all registered routes, tasks, middleware, and config at startup
+        #[arg(long)]
+        show_config: bool,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -58,6 +64,15 @@ enum Commands {
         #[arg(short, long, default_value = "1")]
         interval: u64,
     },
+    /// Export an offline diagnostic snapshot of the application
+    Export {
+        /// URL of the running Autumn application
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
+        /// Output file for diagnostics
+        #[arg(short, long, default_value = "autumn-diag.json")]
+        output: String,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -71,7 +86,10 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
-        Commands::Dev { package } => dev::run(package.as_deref()),
+        Commands::Dev {
+            package,
+            show_config,
+        } => dev::run(package.as_deref(), show_config),
         Commands::Migrate { action } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -80,6 +98,7 @@ fn main() {
             migrate::run(action);
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
+        Commands::Export { url, output } => export::run(&url, &output),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -93,7 +112,9 @@ mod tests {
     fn parse_new_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => assert_eq!(name, "my-app"),
+            Commands::New { ref name } => {
+                assert_eq!(name, "my-app");
+            }
             _ => panic!("expected New command"),
         }
     }
@@ -102,7 +123,9 @@ mod tests {
     fn parse_new_with_underscores() {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => assert_eq!(name, "my_app"),
+            Commands::New { ref name } => {
+                assert_eq!(name, "my_app");
+            }
             _ => panic!("expected New command"),
         }
     }
@@ -117,6 +140,16 @@ mod tests {
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
         assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn new_rejects_removed_wasm_flag() {
+        assert!(Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).is_err());
+    }
+
+    #[test]
+    fn setup_rejects_removed_wasm_flag() {
+        assert!(Cli::try_parse_from(["autumn", "setup", "--wasm"]).is_err());
     }
 
     #[test]
@@ -180,18 +213,40 @@ mod tests {
     #[test]
     fn parse_dev_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "dev"]).unwrap();
-        assert!(matches!(cli.command, Commands::Dev { package: None }));
+        assert!(matches!(
+            cli.command,
+            Commands::Dev {
+                package: None,
+                show_config: false
+            }
+        ));
     }
 
     #[test]
     fn parse_dev_with_package() {
         let cli = Cli::try_parse_from(["autumn", "dev", "-p", "hello"]).unwrap();
         match cli.command {
-            Commands::Dev { package } => {
+            Commands::Dev {
+                package,
+                show_config,
+            } => {
                 assert_eq!(package.as_deref(), Some("hello"));
+                assert!(!show_config);
             }
             _ => panic!("expected Dev command"),
         }
+    }
+
+    #[test]
+    fn parse_dev_with_show_config() {
+        let cli = Cli::try_parse_from(["autumn", "dev", "--show-config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Dev {
+                package: None,
+                show_config: true
+            }
+        ));
     }
 
     #[test]
@@ -233,6 +288,38 @@ mod tests {
                 assert_eq!(interval, 5);
             }
             _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "export"]).unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://localhost:3000");
+                assert_eq!(output, "autumn-diag.json");
+            }
+            _ => panic!("expected Export command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_custom() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "export",
+            "-u",
+            "http://prod:8080",
+            "-o",
+            "snapshot.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://prod:8080");
+                assert_eq!(output, "snapshot.json");
+            }
+            _ => panic!("expected Export command"),
         }
     }
 

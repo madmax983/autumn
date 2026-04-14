@@ -1,9 +1,9 @@
 //! Integration test: verify `render_static_routes` works with a real
 //! Autumn router (not just a mock fallback handler).
 
-use autumn_web::app::build_router;
 use autumn_web::config::AutumnConfig;
 use autumn_web::route::Route;
+use autumn_web::router::build_router;
 use autumn_web::static_gen::{StaticRouteMeta, render_static_routes};
 
 fn about_route() -> Route {
@@ -25,17 +25,7 @@ const fn about_meta() -> StaticRouteMeta {
 }
 
 fn test_state() -> autumn_web::AppState {
-    autumn_web::AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-    }
+    autumn_web::AppState::for_test()
 }
 
 #[tokio::test]

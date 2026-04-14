@@ -188,15 +188,8 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
-                // Check if this response came from AutumnError
-                let has_error_info = response.extensions().get::<AutumnErrorInfo>().is_some();
-                if has_error_info {
-                    // Clone the info out before consuming the response
-                    let error_info = response
-                        .extensions()
-                        .get::<AutumnErrorInfo>()
-                        .cloned()
-                        .unwrap();
+                // Check if this response came from AutumnError and clone the info out
+                if let Some(error_info) = response.extensions().get::<AutumnErrorInfo>().cloned() {
                     let mut response = response;
                     let filters = this.filters;
                     for filter in filters.iter() {

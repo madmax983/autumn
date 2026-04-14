@@ -87,7 +87,7 @@ struct ErrorInner {
 ///
 /// #[get("/")]
 /// async fn handler() -> AutumnResult<&'static str> {
-///     std::fs::read_to_string("missing.txt")?; // becomes 500 on error
+///     autumn_web::reexports::tokio::fs::read_to_string("missing.txt").await?; // becomes 500 on error
 ///     Ok("ok")
 /// }
 /// ```
@@ -167,6 +167,25 @@ impl AutumnError {
     pub const fn with_status(mut self, status: StatusCode) -> Self {
         self.status = status;
         self
+    }
+
+    /// Create a `500 Internal Server Error`.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::internal_server_error(std::io::Error::other("boom"));
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    pub fn internal_server_error(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            details: None,
+        }
     }
 
     /// Create a `404 Not Found` error.
@@ -288,6 +307,25 @@ impl AutumnError {
 
     /// Create a `422 Unprocessable Entity` error with field-level
     /// validation details.
+    ///
+    /// Use this when a request fails multiple field-specific validation rules
+    /// (e.g., in a form submission). It attaches the `details` parameter, a mapping
+    /// of field names to their respective error messages, so the client can display
+    /// errors next to the relevant inputs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut errors = HashMap::new();
+    /// errors.insert("username".to_string(), vec!["Username is taken".to_string()]);
+    ///
+    /// let err = AutumnError::validation(errors);
+    /// assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    /// ```
     #[must_use]
     pub fn validation(details: std::collections::HashMap<String, Vec<String>>) -> Self {
         Self {
@@ -299,32 +337,108 @@ impl AutumnError {
 
     // ── String-message convenience constructors ────────────────
 
+    /// Create a `500 Internal Server Error` from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::internal_server_error_msg("Database explosion");
+    /// assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    /// ```
+    pub fn internal_server_error_msg(msg: impl Into<String>) -> Self {
+        Self::internal_server_error(StringError(msg.into()))
+    }
+
     /// Create a `404 Not Found` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::not_found_msg("No such user");
+    /// assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    /// assert_eq!(err.to_string(), "No such user");
+    /// ```
     pub fn not_found_msg(msg: impl Into<String>) -> Self {
         Self::not_found(StringError(msg.into()))
     }
 
     /// Create a `400 Bad Request` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::bad_request_msg("Invalid input parameter");
+    /// assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    /// ```
     pub fn bad_request_msg(msg: impl Into<String>) -> Self {
         Self::bad_request(StringError(msg.into()))
     }
 
     /// Create a `422 Unprocessable Entity` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unprocessable_msg("Title is required");
+    /// assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    /// ```
     pub fn unprocessable_msg(msg: impl Into<String>) -> Self {
         Self::unprocessable(StringError(msg.into()))
     }
 
     /// Create a `401 Unauthorized` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::unauthorized_msg("Please log in to continue");
+    /// assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    /// ```
     pub fn unauthorized_msg(msg: impl Into<String>) -> Self {
         Self::unauthorized(StringError(msg.into()))
     }
 
     /// Create a `403 Forbidden` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::forbidden_msg("You lack admin privileges");
+    /// assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    /// ```
     pub fn forbidden_msg(msg: impl Into<String>) -> Self {
         Self::forbidden(StringError(msg.into()))
     }
 
     /// Create a `503 Service Unavailable` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::service_unavailable_msg("Database connection pool exhausted");
+    /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    /// ```
     pub fn service_unavailable_msg(msg: impl Into<String>) -> Self {
         Self::service_unavailable(StringError(msg.into()))
     }
@@ -412,6 +526,18 @@ mod tests {
     }
 
     #[test]
+    fn internal_server_error_is_500() {
+        let err = AutumnError::internal_server_error(TestError("boom".into()));
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_not_found_error() {
+        let err = AutumnError::not_found(std::io::Error::other("no such user"));
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
     fn not_found_is_404() {
         let err = AutumnError::not_found(TestError("missing".into()));
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
@@ -430,9 +556,36 @@ mod tests {
     }
 
     #[test]
+    fn unauthorized_is_401() {
+        let err = AutumnError::unauthorized(TestError("unauthorized".into()));
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn forbidden_is_403() {
+        let err = AutumnError::forbidden(TestError("forbidden".into()));
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn validation_is_422() {
+        let mut details = std::collections::HashMap::new();
+        details.insert("field".to_string(), vec!["error".to_string()]);
+        let err = AutumnError::validation(details);
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
     fn service_unavailable_is_503() {
         let err = AutumnError::service_unavailable(TestError("pool exhausted".into()));
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn internal_server_error_msg_is_500() {
+        let err = AutumnError::internal_server_error_msg("db failure");
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.to_string(), "db failure");
     }
 
     #[test]
@@ -452,6 +605,18 @@ mod tests {
     fn unprocessable_msg_is_422() {
         let err = AutumnError::unprocessable_msg("title required");
         assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn unauthorized_msg_is_401() {
+        let err = AutumnError::unauthorized_msg("login required");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn forbidden_msg_is_403() {
+        let err = AutumnError::forbidden_msg("no access");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -482,17 +647,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_response_has_json_body() {
+    async fn into_response_has_json_body() -> Result<(), axum::Error> {
         let err = AutumnError::not_found(TestError("not found".into()));
         let response = err.into_response();
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
 
         assert_eq!(json["error"]["status"], 404);
         assert_eq!(json["error"]["message"], "not found");
+        Ok(())
     }
 
     #[test]
@@ -504,30 +668,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn msg_constructor_produces_valid_json_response() {
+    async fn msg_constructor_produces_valid_json_response() -> Result<(), axum::Error> {
         let err = AutumnError::unprocessable_msg("title required");
         let response = err.into_response();
 
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["error"]["status"], 422);
         assert_eq!(json["error"]["message"], "title required");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn service_unavailable_response_is_503() {
+    async fn service_unavailable_response_is_503() -> Result<(), axum::Error> {
         let err = AutumnError::service_unavailable_msg("db down");
         let response = err.into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["error"]["status"], 503);
         assert_eq!(json["error"]["message"], "db down");
+        Ok(())
     }
 }

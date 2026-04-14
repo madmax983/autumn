@@ -3,7 +3,7 @@
 //! This module provides async Postgres connectivity via `diesel-async` with
 //! the `deadpool` connection pool. The pool is created at startup by
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
-//! [`AppState`].
+//! [`crate::state::AppState`].
 //!
 //! When no `database.url` is configured, [`create_pool`] returns `Ok(None)`
 //! and the application runs without a database -- useful for static-site or
@@ -29,10 +29,18 @@ use axum::extract::FromRequestParts;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use std::time::Duration;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
-use crate::state::AppState;
+
+/// Trait to abstract the state requirement for the `Db` extractor.
+/// This breaks the circular dependency between the database extractor
+/// and the central `AppState`.
+pub trait DbState {
+    /// Returns the database connection pool, if configured.
+    fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
+}
 
 /// Error type for pool creation failures.
 ///
@@ -54,8 +62,14 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
         return Ok(None);
     };
 
+    let timeout = Duration::from_secs(config.connect_timeout_secs);
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    let pool = Pool::builder(manager).max_size(config.pool_size).build()?;
+    let pool = Pool::builder(manager)
+        .max_size(config.pool_size.max(1))
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()?;
 
     Ok(Some(pool))
 }
@@ -106,16 +120,18 @@ impl std::ops::DerefMut for Db {
     }
 }
 
-impl FromRequestParts<AppState> for Db {
+impl<S> FromRequestParts<S> for Db
+where
+    S: DbState + Send + Sync,
+{
     type Rejection = AutumnError;
 
     async fn from_request_parts(
         _parts: &mut axum::http::request::Parts,
-        state: &AppState,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
         let pool = state
-            .pool
-            .as_ref()
+            .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
         let conn = pool.get().await.map_err(|e| {
@@ -131,6 +147,7 @@ impl FromRequestParts<AppState> for Db {
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
+    use std::time::Duration;
 
     // ── Pool creation tests ──────────────────────────────────────
 
@@ -164,10 +181,44 @@ mod tests {
         assert_eq!(pool.status().max_size, 5);
     }
 
+    #[test]
+    fn pool_clamps_size_to_one_if_zero() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            pool_size: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("should build pool")
+            .expect("should be Some");
+        assert_eq!(
+            pool.status().max_size,
+            1,
+            "Pool size should be clamped to 1"
+        );
+    }
+
     // ── Db extractor tests ───────────────────────────────────────
+
+    #[test]
+    fn config_runtime_drift_pool_applies_connect_timeout_to_wait_and_create() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            connect_timeout_secs: 7,
+            ..Default::default()
+        };
+        let pool = create_pool(&config)
+            .expect("should build pool")
+            .expect("should be Some");
+
+        let timeouts = pool.timeouts();
+        assert_eq!(timeouts.wait, Some(Duration::from_secs(7)));
+        assert_eq!(timeouts.create, Some(Duration::from_secs(7)));
+    }
 
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -179,14 +230,22 @@ mod tests {
         }
 
         let app = Router::new().route("/", get(handler)).with_state(AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
         });
 
         let response = app
