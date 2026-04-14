@@ -14,9 +14,24 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Serialize;
 
-use crate::state::AppState;
+/// Trait to abstract the state requirements for probe handlers.
+pub trait ProvideProbeState {
+    fn probes(&self) -> &ProbeState;
+    fn health_detailed(&self) -> bool;
+    fn profile(&self) -> &str;
+    fn uptime_display(&self) -> String;
 
-/// Shared probe lifecycle state stored in [`AppState`].
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+
+    fn mark_startup_complete(&self) {
+        self.probes().mark_startup_complete();
+    }
+}
+
+/// Shared probe lifecycle state stored in `AppState`.
 #[derive(Clone, Debug, Default)]
 pub struct ProbeState {
     startup_complete: Arc<AtomicBool>,
@@ -115,10 +130,10 @@ pub(crate) struct PoolStatus {
     waiting: u64,
 }
 
-fn dependency_readiness(state: &AppState) -> (bool, Option<PoolStatus>) {
+fn dependency_readiness<S: ProvideProbeState>(state: &S) -> (bool, Option<PoolStatus>) {
     #[cfg(feature = "db")]
     {
-        if let Some(pool) = state.pool.as_ref() {
+        if let Some(pool) = state.pool() {
             let status = pool.status();
             let available = status.available as u64;
             let size = status.max_size as u64;
@@ -138,7 +153,10 @@ fn dependency_readiness(state: &AppState) -> (bool, Option<PoolStatus>) {
     (true, None)
 }
 
-fn probe_response(state: &AppState, kind: ProbeKind) -> (StatusCode, Json<ProbeResponse>) {
+fn probe_response<S: ProvideProbeState>(
+    state: &S,
+    kind: ProbeKind,
+) -> (StatusCode, Json<ProbeResponse>) {
     let startup_complete = state.probes().is_startup_complete();
     let shutting_down = state.probes().is_shutting_down();
     let (dependencies_ready, pool_status) = dependency_readiness(state);
@@ -153,7 +171,7 @@ fn probe_response(state: &AppState, kind: ProbeKind) -> (StatusCode, Json<ProbeR
         ProbeKind::Ready => (StatusCode::SERVICE_UNAVAILABLE, "degraded"),
     };
 
-    let detailed = state.health_detailed;
+    let detailed = state.health_detailed();
     let body = ProbeResponse {
         status,
         version: if detailed {
@@ -178,21 +196,29 @@ fn probe_response(state: &AppState, kind: ProbeKind) -> (StatusCode, Json<ProbeR
 }
 
 /// `GET /live`
-pub async fn live_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     probe_response(&state, ProbeKind::Live)
 }
 
 /// `GET /ready`
-pub async fn ready_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     probe_response(&state, ProbeKind::Ready)
 }
 
 /// `GET /startup`
-pub async fn startup_handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn startup_handler<S: ProvideProbeState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     probe_response(&state, ProbeKind::Startup)
 }
 
 /// Compatibility alias for the legacy `/health` endpoint.
-pub(crate) fn readiness_response(state: &AppState) -> (StatusCode, Json<ProbeResponse>) {
+pub(crate) fn readiness_response<S: ProvideProbeState>(
+    state: &S,
+) -> (StatusCode, Json<ProbeResponse>) {
     probe_response(state, ProbeKind::Ready)
 }

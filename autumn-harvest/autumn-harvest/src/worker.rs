@@ -816,17 +816,16 @@ async fn ingest_pending_signals(
         return Ok(());
     }
 
-    let signal_events = pending_signals
-        .iter()
-        .map(|signal| WorkflowEvent::SignalReceived {
-            signal_name: signal.signal_name.clone(),
-            payload: signal.payload.clone(),
-        })
-        .collect::<Vec<_>>();
-    let signal_ids = pending_signals
-        .iter()
-        .map(|signal| signal.id)
-        .collect::<Vec<_>>();
+    let mut signal_events = Vec::with_capacity(pending_signals.len());
+    let mut signal_ids = Vec::with_capacity(pending_signals.len());
+
+    for signal in pending_signals {
+        signal_ids.push(signal.id);
+        signal_events.push(WorkflowEvent::SignalReceived {
+            signal_name: signal.signal_name,
+            payload: signal.payload,
+        });
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -864,13 +863,15 @@ async fn ingest_fired_timers(
         return Ok(());
     }
 
-    let timer_events = due_timers
-        .iter()
-        .map(|timer| WorkflowEvent::TimerFired {
-            timer_id: TimerId::new(timer.timer_id.clone()),
-        })
-        .collect::<Vec<_>>();
-    let timer_row_ids = due_timers.iter().map(|timer| timer.id).collect::<Vec<_>>();
+    let mut timer_events = Vec::with_capacity(due_timers.len());
+    let mut timer_row_ids = Vec::with_capacity(due_timers.len());
+
+    for timer in due_timers {
+        timer_row_ids.push(timer.id);
+        timer_events.push(WorkflowEvent::TimerFired {
+            timer_id: TimerId::new(timer.timer_id),
+        });
+    }
 
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
@@ -1858,27 +1859,29 @@ mod tests {
     }
 
     #[test]
-    fn worker_shutdown_cancels_token() {
+    fn worker_shutdown_cancels_token() -> Result<(), crate::error::HarvestError> {
         let cfg = default_runtime_config();
         let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
-        let worker = Worker::new(cfg, registry).unwrap();
+        let worker = Worker::new(cfg, registry)?;
 
         assert!(!worker.shutdown.is_cancelled());
         worker.shutdown();
         assert!(worker.shutdown.is_cancelled());
+        Ok(())
     }
 
     #[test]
-    fn claimed_task_kind_uses_lowercase_db_values() {
+    fn claimed_task_kind_uses_lowercase_db_values() -> Result<(), crate::error::HarvestError> {
         assert_eq!(
-            ClaimedTaskKind::from_db("workflow").unwrap(),
+            ClaimedTaskKind::from_db("workflow")?,
             ClaimedTaskKind::Workflow
         );
         assert_eq!(
-            ClaimedTaskKind::from_db("activity").unwrap(),
+            ClaimedTaskKind::from_db("activity")?,
             ClaimedTaskKind::Activity
         );
         assert!(ClaimedTaskKind::from_db("WORKFLOW").is_err());
+        Ok(())
     }
 
     #[test]

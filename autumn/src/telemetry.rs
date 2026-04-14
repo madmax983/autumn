@@ -80,7 +80,12 @@ pub enum TelemetryInitError {
     EmptyServiceName,
     /// OTLP endpoint was not a valid absolute URI.
     #[error("invalid OTLP endpoint {endpoint:?}: {reason}")]
-    InvalidEndpoint { endpoint: String, reason: String },
+    InvalidEndpoint {
+        /// The endpoint that was provided.
+        endpoint: String,
+        /// The reason the endpoint is considered invalid.
+        reason: String,
+    },
     /// The exporter feature is not compiled in.
     #[error("telemetry-otlp cargo feature is not enabled")]
     FeatureDisabled,

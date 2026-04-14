@@ -3,8 +3,13 @@ use std::time::Instant;
 
 #[tokio::test]
 async fn eris_auth_timing_test() {
-    // 1. Time the verification of a valid hash
     let valid_hash = hash_password("secret123").await.unwrap();
+
+    // 0. Warm up the bcrypt library to avoid lazy initialization overhead in timing
+    let _ = verify_password("secret123", &valid_hash).await;
+    let _ = verify_password("secret123", "invalid_hash_format").await;
+
+    // 1. Time the verification of a valid hash
     let start_valid = Instant::now();
     let _ = verify_password("secret123", &valid_hash).await;
     let elapsed_valid = start_valid.elapsed();

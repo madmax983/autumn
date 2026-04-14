@@ -41,8 +41,8 @@
 //! - [`config`] -- Layered configuration: defaults, `autumn.toml`, env overrides.
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
-//! - [`extract`] -- Re-exported Axum extractors ([`Form`](axum::extract::Form),
-//!   [`Json`], [`Path`], [`Query`](axum::extract::Query)).
+//! - [`extract`] -- Re-exported Axum extractors ([`Form`],
+//!   [`Json`], [`Path`], [`Query`]).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 //! - [`logging`] -- Structured logging via `tracing-subscriber`.
 //! - [`middleware`] -- Built-in middleware (request IDs).
@@ -84,7 +84,14 @@ pub mod hooks;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod probe;
+
+/// Router construction and integration with Axum.
+///
+/// This module is responsible for taking the application's configuration,
+/// defined routes, middleware, and state, and building the final `axum::Router`
+/// that will handle incoming HTTP requests.
 pub mod router;
+
 #[cfg(test)]
 pub(crate) mod test_utils;
 #[cfg(feature = "db")]
@@ -167,7 +174,7 @@ pub use validation::ValidateExt;
 
 /// Annotate an async function as a `DELETE` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -186,7 +193,7 @@ pub use autumn_macros::delete;
 
 /// Annotate an async function as a `GET` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -295,7 +302,7 @@ pub use autumn_macros::service;
 
 /// Annotate an async function as a `POST` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).
@@ -314,7 +321,7 @@ pub use autumn_macros::post;
 
 /// Annotate an async function as a `PUT` route handler.
 ///
-/// Generates a companion function that returns a [`route::Route`]
+/// Generates a companion function that returns a [`crate::route::Route`]
 /// pairing the path with an Axum handler. In debug builds
 /// `#[axum::debug_handler]` is applied automatically for better error
 /// messages (zero cost in release).

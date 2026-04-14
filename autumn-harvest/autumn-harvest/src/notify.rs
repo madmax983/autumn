@@ -44,10 +44,21 @@ fn quote_pg_identifier(identifier: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Payload sent via Postgres NOTIFY when a task is enqueued.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotifyPayload {
     /// The UUID of the newly enqueued task.
     pub task_id: Uuid,
+}
+
+/// Outcome of waiting on a queue listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueWaitOutcome {
+    /// A notification payload arrived before the timeout elapsed.
+    Notification(NotifyPayload),
+    /// No payload arrived before `poll_interval` elapsed.
+    TimedOut,
+    /// The listener channel closed because the underlying connection died.
+    ChannelClosed,
 }
 
 // ---------------------------------------------------------------------------
@@ -183,20 +194,29 @@ impl QueueListener {
         &mut self,
         poll_interval: Duration,
     ) -> HarvestResult<Option<NotifyPayload>> {
+        match self.wait_for_notification_outcome(poll_interval).await? {
+            QueueWaitOutcome::Notification(payload) => Ok(Some(payload)),
+            QueueWaitOutcome::TimedOut | QueueWaitOutcome::ChannelClosed => Ok(None),
+        }
+    }
+
+    /// Wait for a notification and distinguish timeout from listener shutdown.
+    ///
+    /// This is useful for callers that need to reconnect after the underlying
+    /// LISTEN connection dies instead of treating every wake miss as a normal
+    /// timeout.
+    pub async fn wait_for_notification_outcome(
+        &mut self,
+        poll_interval: Duration,
+    ) -> HarvestResult<QueueWaitOutcome> {
         match tokio::time::timeout(poll_interval, self.rx.recv()).await {
             Ok(Some(notification)) => {
                 let payload: NotifyPayload = serde_json::from_str(notification.payload())
                     .map_err(|e| HarvestError::Database(format!("bad notify payload: {e}")))?;
-                Ok(Some(payload))
+                Ok(QueueWaitOutcome::Notification(payload))
             }
-            Ok(None) => {
-                // Channel closed -- connection died.
-                Ok(None)
-            }
-            Err(_elapsed) => {
-                // Timeout -- no notification received, fall back to poll.
-                Ok(None)
-            }
+            Ok(None) => Ok(QueueWaitOutcome::ChannelClosed),
+            Err(_elapsed) => Ok(QueueWaitOutcome::TimedOut),
         }
     }
 

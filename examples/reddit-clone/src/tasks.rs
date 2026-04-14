@@ -4,12 +4,9 @@
 // every 15 minutes. Uses a simplified version of Reddit's hot
 // ranking algorithm based on score and age.
 
-use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use autumn_web::prelude::*;
-
-use crate::schema::posts;
 
 /// Compute Reddit-style hot rank from score and age.
 #[must_use]
@@ -40,31 +37,32 @@ pub async fn recalculate_hot_ranks(state: AppState) -> AutumnResult<()> {
 
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    // Load all posts with their scores and timestamps
-    let all_posts: Vec<(i64, i64, chrono::NaiveDateTime)> = posts::table
-        .select((posts::id, posts::score, posts::created_at))
-        .load(&mut conn)
-        .await?;
-
-    if all_posts.is_empty() {
-        tracing::info!("hot-rank: no posts to rank");
-        return Ok(());
-    }
-
     let now = chrono::Utc::now().naive_utc();
-    let mut updated = 0u64;
 
-    for (id, score, created_at) in &all_posts {
-        let hot_rank = calculate_hot_rank(*score, *created_at, now);
+    // Perform a single bulk update directly in the database
+    let query = diesel::sql_query(
+        "UPDATE posts \
+         SET hot_rank = \
+           (score::float8 / \
+             POWER( \
+               (EXTRACT(EPOCH FROM ($1 - created_at)) / 3600.0) + 2.0, \
+               1.5 \
+             ) \
+           )",
+    );
 
-        diesel::update(posts::table.find(*id))
-            .set(posts::hot_rank.eq(hot_rank))
-            .execute(&mut conn)
-            .await?;
-
-        updated += 1;
-    }
+    let updated = query
+        .bind::<diesel::sql_types::Timestamp, _>(now)
+        .execute(&mut conn)
+        .await?;
 
     tracing::info!("hot-rank: recalculated {updated} posts");
     Ok(())
+}
+
+/// Prune durable live-feed rows after a short retention window so the
+/// cross-process broadcast log does not grow without bound.
+#[scheduled(every = "1h", name = "live-feed-retention")]
+pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
+    crate::live_events::prune_live_feed_events(state).await
 }

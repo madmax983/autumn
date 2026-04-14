@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS live_feed_events;
 DROP TABLE IF EXISTS votes;
 DROP TABLE IF EXISTS comments;
 DROP TABLE IF EXISTS posts;

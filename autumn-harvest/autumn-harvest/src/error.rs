@@ -113,8 +113,9 @@ mod tests {
 
     #[test]
     #[allow(clippy::unnecessary_literal_unwrap)]
-    fn harvest_result_ok() {
+    fn harvest_result_ok() -> HarvestResult<()> {
         let r: HarvestResult<i32> = Ok(42);
-        assert_eq!(r.unwrap(), 42);
+        assert_eq!(r?, 42);
+        Ok(())
     }
 }

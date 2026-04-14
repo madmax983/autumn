@@ -61,10 +61,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    live_feed_events (id) {
+        id -> Int8,
+        subreddit_slug -> Text,
+        event -> Jsonb,
+        created_at -> Timestamp,
+    }
+}
+
 diesel::joinable!(posts -> users (author_id));
 diesel::joinable!(posts -> subreddits (subreddit_id));
 diesel::joinable!(comments -> users (author_id));
 diesel::joinable!(comments -> posts (post_id));
 diesel::joinable!(subreddits -> users (creator_id));
 
-diesel::allow_tables_to_appear_in_same_query!(users, subreddits, posts, comments, votes,);
+diesel::allow_tables_to_appear_in_same_query!(
+    users,
+    subreddits,
+    posts,
+    comments,
+    votes,
+    live_feed_events,
+);

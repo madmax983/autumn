@@ -146,13 +146,10 @@ struct TaskStatus {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    #[allow(dead_code)]
     last_run: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_duration_ms: Option<u64>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_result: Option<String>,
     #[serde(default)]
     last_error: Option<String>,
@@ -900,6 +897,35 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
                 Span::raw("")
             },
         ]));
+
+        if task.last_run.is_some() || task.last_duration_ms.is_some() || task.last_result.is_some()
+        {
+            let mut run_info = vec![Span::raw("  ")];
+            if let Some(last_run) = &task.last_run {
+                run_info.push(Span::styled(
+                    format!("last run: {last_run}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(dur) = task.last_duration_ms {
+                run_info.push(Span::styled(
+                    format!(" ({dur}ms)"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(res) = &task.last_result {
+                run_info.push(Span::raw(" ["));
+                let res_color =
+                    if res.eq_ignore_ascii_case("ok") || res.eq_ignore_ascii_case("success") {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    };
+                run_info.push(Span::styled(res, Style::default().fg(res_color)));
+                run_info.push(Span::raw("]"));
+            }
+            lines.push(Line::from(run_info));
+        }
 
         if let Some(err) = &task.last_error {
             lines.push(Line::from(vec![

@@ -9,25 +9,20 @@ use autumn_web::reexports::axum;
 use axum::Extension;
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::routing::{get, patch, post};
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
-use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
-use scoped_futures::ScopedFutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
-use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::models::{DagRun, HarvestSchedule, NewWorkflowExecution, WorkflowExecution};
-use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::models::{DagRun, HarvestSchedule, WorkflowExecution};
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -36,23 +31,27 @@ use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::{StartWorkflowParams, start_or_load_workflow_execution};
+
+use crate::state::HarvestDbPool;
 
 #[derive(Clone)]
 pub struct HarvestApiRuntime {
     registry: Arc<HandlerRegistry>,
     dags: Arc<DagCatalog>,
-    worker_id: String,
+    worker_id: Option<String>,
     queues: Vec<String>,
     scheduler: SchedulerMonitor,
 }
 
 impl HarvestApiRuntime {
-    /// Build an API runtime snapshot from the live worker and scheduler state.
+    /// Build an API runtime snapshot from the available Harvest registrations
+    /// and any locally owned worker/scheduler state.
     #[must_use]
     pub const fn new(
         registry: Arc<HandlerRegistry>,
         dags: Arc<DagCatalog>,
-        worker_id: String,
+        worker_id: Option<String>,
         queues: Vec<String>,
         scheduler: SchedulerMonitor,
     ) -> Self {
@@ -69,6 +68,7 @@ impl HarvestApiRuntime {
 #[derive(Clone, Default)]
 pub struct HarvestApiState {
     runtime: Arc<Mutex<Option<HarvestApiRuntime>>>,
+    storage_pool: Arc<Mutex<Option<HarvestDbPool>>>,
 }
 
 impl HarvestApiState {
@@ -89,6 +89,18 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned") = Some(runtime);
     }
 
+    /// Install the Harvest storage pool used by management routes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal API-state mutex is poisoned.
+    pub fn install_storage_pool(&self, pool: HarvestDbPool) {
+        *self
+            .storage_pool
+            .lock()
+            .expect("harvest api state lock poisoned") = Some(pool);
+    }
+
     /// Clear the currently running Harvest runtime snapshot.
     ///
     /// # Panics
@@ -99,6 +111,10 @@ impl HarvestApiState {
             .runtime
             .lock()
             .expect("harvest api state lock poisoned") = None;
+        *self
+            .storage_pool
+            .lock()
+            .expect("harvest api state lock poisoned") = None;
     }
 
     fn runtime(&self) -> HarvestResult<HarvestApiRuntime> {
@@ -107,6 +123,16 @@ impl HarvestApiState {
             .expect("harvest api state lock poisoned")
             .clone()
             .ok_or_else(|| HarvestError::Config("harvest runtime is not started".to_string()))
+    }
+
+    fn storage_pool(&self) -> HarvestResult<HarvestDbPool> {
+        self.storage_pool
+            .lock()
+            .expect("harvest api state lock poisoned")
+            .clone()
+            .ok_or_else(|| {
+                HarvestError::Config("harvest storage pool is not configured".to_string())
+            })
     }
 }
 
@@ -193,10 +219,10 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<AppState> {
 }
 
 async fn list_workflows(
-    State(state): State<AppState>,
+    Extension(api_state): Extension<HarvestApiState>,
     Query(query): Query<WorkflowListQuery>,
 ) -> Result<Json<Vec<WorkflowExecution>>, AutumnError> {
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let workflows = harvest_workflow_executions::table
         .order(harvest_workflow_executions::created_at.desc())
@@ -210,11 +236,11 @@ async fn list_workflows(
 }
 
 async fn get_workflow(
-    State(state): State<AppState>,
+    Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<WorkflowDetailsResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -235,7 +261,6 @@ async fn get_workflow(
 }
 
 async fn start_workflow(
-    State(state): State<AppState>,
     Extension(api_state): Extension<HarvestApiState>,
     Path(workflow_name): Path<String>,
     Json(request): Json<StartWorkflowRequest>,
@@ -247,73 +272,57 @@ async fn start_workflow(
         )));
     }
 
-    let mut conn = db_conn(&state).await?;
-    let exec_id = ExecutionId::new();
-    let workflow_id = request.workflow_id.unwrap_or_else(|| exec_id.to_string());
+    let mut conn = db_conn(&api_state).await?;
+    let workflow_id = request
+        .workflow_id
+        .unwrap_or_else(|| ExecutionId::new().to_string());
     let queue_name = request
         .queue
         .or_else(|| runtime.queues.as_slice().first().cloned())
         .unwrap_or_else(|| "default".to_string());
     let input = request.input.unwrap_or(Value::Null);
 
-    let row = NewWorkflowExecution {
-        id: exec_id.as_uuid(),
-        workflow_name: &workflow_name,
-        workflow_id: &workflow_id,
-        run_id: Uuid::new_v4(),
-        shard_id: 0,
-        input: input.clone(),
-        parent_id: None,
-        queue_name: &queue_name,
-        execution_timeout: request
-            .execution_timeout_secs
-            .map(chrono::Duration::seconds),
-        memo: request.memo.clone(),
-        search_attrs: request.search_attrs.clone(),
-    };
-    let started_event = WorkflowEvent::WorkflowStarted {
-        input: input.clone(),
-        timestamp: chrono::Utc::now(),
-    };
-    let mut params = EnqueueParams::new(queue_name.clone(), TaskType::Workflow, input);
-    params.workflow_exec_id = Some(exec_id.as_uuid());
-
-    conn.transaction::<(), HarvestError, _>(|conn| {
-        let row = row;
-        let params = params.clone();
-        async move {
-            diesel::insert_into(harvest_workflow_executions::table)
-                .values(&row)
-                .execute(conn)
-                .await
-                .map_err(database_error)?;
-            store::append_events(conn, exec_id, &[started_event], 0).await?;
-            queue::enqueue(conn, &params).await?;
-            Ok(())
-        }
-        .scope_boxed()
-    })
+    let start = start_or_load_workflow_execution(
+        &mut conn,
+        StartWorkflowParams {
+            workflow_name: &workflow_name,
+            workflow_id: &workflow_id,
+            shard_id: 0,
+            input,
+            parent_id: None,
+            queue_name: &queue_name,
+            execution_timeout: request
+                .execution_timeout_secs
+                .map(chrono::Duration::seconds),
+            memo: request.memo.clone(),
+            search_attrs: request.search_attrs.clone(),
+        },
+    )
     .await
     .map_err(map_error)?;
 
     Ok((
-        axum::http::StatusCode::CREATED,
+        if start.created {
+            axum::http::StatusCode::CREATED
+        } else {
+            axum::http::StatusCode::OK
+        },
         Json(StartWorkflowResponse {
-            execution_id: exec_id.to_string(),
-            workflow_name,
-            workflow_id,
-            state: "RUNNING".to_string(),
+            execution_id: start.exec_id.to_string(),
+            workflow_name: start.workflow_name,
+            workflow_id: start.workflow_id,
+            state: start.state,
         }),
     ))
 }
 
 async fn signal_workflow(
-    State(state): State<AppState>,
+    Extension(api_state): Extension<HarvestApiState>,
     Path((id, signal_name)): Path<(String, String)>,
     Json(payload): Json<Value>,
 ) -> Result<(axum::http::StatusCode, Json<BasicAck>), AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -328,13 +337,12 @@ async fn signal_workflow(
 }
 
 async fn query_workflow(
-    State(state): State<AppState>,
     Extension(api_state): Extension<HarvestApiState>,
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let exec_id = parse_execution_id(&id)?;
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let execution = load_execution(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
@@ -367,11 +375,10 @@ async fn query_workflow(
 }
 
 async fn list_dags(
-    State(state): State<AppState>,
     Extension(api_state): Extension<HarvestApiState>,
 ) -> Result<Json<Vec<DagSummary>>, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let schedules = harvest_schedules::table
         .order(harvest_schedules::dag_name.asc())
         .select(HarvestSchedule::as_select())
@@ -400,10 +407,10 @@ async fn list_dags(
 }
 
 async fn list_dag_runs(
-    State(state): State<AppState>,
+    Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
 ) -> Result<Json<Vec<DagRun>>, AutumnError> {
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let runs = harvest_dag_runs::table
         .filter(harvest_dag_runs::dag_name.eq(&dag_name))
         .order(harvest_dag_runs::created_at.desc())
@@ -416,17 +423,14 @@ async fn list_dag_runs(
 }
 
 async fn trigger_dag_run(
-    State(state): State<AppState>,
     Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
     Json(request): Json<DagTriggerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<DagRun>), AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
-    let pool = state
-        .pool()
-        .ok_or_else(|| AutumnError::service_unavailable_msg("database is not configured"))?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
     let run = trigger_dag(
-        pool.clone(),
+        pool.clone_inner(),
         Arc::clone(&runtime.registry),
         Arc::clone(&runtime.dags),
         &dag_name,
@@ -439,13 +443,13 @@ async fn trigger_dag_run(
 }
 
 async fn patch_dag(
-    State(state): State<AppState>,
+    Extension(api_state): Extension<HarvestApiState>,
     Path(dag_name): Path<String>,
     Json(request): Json<DagPauseRequest>,
 ) -> Result<Json<HarvestSchedule>, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
 
-    let mut conn = db_conn(&state).await?;
+    let mut conn = db_conn(&api_state).await?;
     let updated = diesel::update(dsl::harvest_schedules.filter(dsl::dag_name.eq(&dag_name)))
         .set((
             dsl::is_paused.eq(request.paused),
@@ -482,7 +486,9 @@ async fn health(
 
     Ok(Json(HarvestHealth {
         runtime_ready: runtime.is_some(),
-        worker_id: runtime.as_ref().map(|runtime| runtime.worker_id.clone()),
+        worker_id: runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_id.clone()),
         queues: runtime
             .as_ref()
             .map_or_else(Vec::new, |runtime| runtime.queues.clone()),
@@ -506,7 +512,7 @@ async fn load_execution(
 }
 
 async fn db_conn(
-    state: &AppState,
+    api_state: &HarvestApiState,
 ) -> Result<
     deadpool::managed::Object<
         diesel_async::pooled_connection::AsyncDieselConnectionManager<
@@ -515,9 +521,7 @@ async fn db_conn(
     >,
     AutumnError,
 > {
-    let pool = state
-        .pool()
-        .ok_or_else(|| AutumnError::service_unavailable_msg("database is not configured"))?;
+    let pool = api_state.storage_pool().map_err(map_error)?;
     let conn = pool
         .get()
         .await

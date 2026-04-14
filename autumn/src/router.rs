@@ -1,3 +1,10 @@
+//! Router construction and configuration.
+//!
+//! This module handles assembling the final [`axum::Router`] from the various
+//! components configured in [`AppBuilder`](crate::app::AppBuilder), including
+//! user routes, static files, middleware, error pages, and framework endpoints
+//! like actuators and probes.
+
 use std::sync::Arc;
 
 use crate::app::ScopedGroup;
@@ -14,14 +21,23 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
+/// Errors that can occur during the router build process.
+///
+/// These errors are typically fatal and represent configuration or routing
+/// definition issues that must be fixed before the application can start.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RouterBuildError {
+    /// The session backend configuration is invalid (e.g. Redis without a URL).
     #[error("invalid session backend configuration: {0}")]
     InvalidSessionBackend(#[from] crate::session::SessionBackendConfigError),
+    /// A user-defined route conflicts with a framework-provided route.
     #[error("framework route overlap at {path}: {existing} conflicts with {incoming}")]
     FrameworkRouteOverlap {
+        /// The HTTP path where the overlap occurred.
         path: String,
+        /// The name of the existing framework route.
         existing: &'static str,
+        /// The name of the incoming user route.
         incoming: &'static str,
     },
 }
@@ -51,6 +67,21 @@ pub fn build_router(
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
+pub(crate) struct RouterContext {
+    pub exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    pub scoped_groups: Vec<ScopedGroup>,
+    pub merge_routers: Vec<axum::Router<AppState>>,
+    pub nest_routers: Vec<(String, axum::Router<AppState>)>,
+    pub error_page_renderer: Option<SharedRenderer>,
+}
+
+/// Checked variant of [`build_router`] that returns configuration errors
+/// instead of panicking.
+///
+/// # Errors
+///
+/// Returns [`RouterBuildError`] when router assembly encounters invalid
+/// framework configuration, such as an unusable session backend.
 pub fn try_build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -61,11 +92,13 @@ pub fn try_build_router(
         route_list,
         config,
         state,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
+        RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            error_page_renderer: None,
+        },
     )?;
     Ok(apply_startup_barrier(
         router,
@@ -114,11 +147,13 @@ pub fn try_build_router_merged(
         route_list,
         config,
         state,
-        Vec::new(),
-        Vec::new(),
-        merge_routers,
-        nest_routers,
-        None,
+        RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers,
+            nest_routers,
+            error_page_renderer: None,
+        },
     )?;
     Ok(apply_startup_barrier(
         router,
@@ -127,19 +162,52 @@ pub fn try_build_router_merged(
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
 pub(crate) fn try_build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-    error_page_renderer: Option<SharedRenderer>,
+    ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
+    let mut router = group_and_mount_routes(route_list);
+
+    let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
+
+    router = mount_framework_routes(router, dev_reload_enabled);
+
+    let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
+    router = router_with_probes;
+
+    router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
+
+    // Static file serving from project's static/ directory.
+    let env = crate::config::OsEnv;
+    let static_dir = crate::app::project_dir("static", &env);
+    router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+
+    router = mount_scoped_groups(router, ctx.scoped_groups);
+
+    router = mount_raw_routers(router, ctx.merge_routers, ctx.nest_routers);
+
+    router = apply_middleware(
+        router,
+        config,
+        &state,
+        ctx.exception_filters,
+        ctx.error_page_renderer,
+    )?;
+
+    if dev_reload_enabled {
+        router = router
+            .layer(axum::middleware::from_fn(dev::disable_static_cache))
+            .layer(axum::middleware::from_fn(dev::inject_live_reload));
+    }
+
+    Ok(router.with_state(state))
+}
+
+fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
     // MethodRouter. Axum 0.7+ panics if .route() is called twice
@@ -167,9 +235,13 @@ pub(crate) fn try_build_router_inner(
     for (path, method_router) in grouped {
         router = router.route(path, method_router);
     }
+    router
+}
 
-    let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
-
+fn mount_framework_routes(
+    mut router: axum::Router<AppState>,
+    dev_reload_enabled: bool,
+) -> axum::Router<AppState> {
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
@@ -193,28 +265,35 @@ pub(crate) fn try_build_router_inner(
         );
     }
 
+    router
+}
+
+fn mount_probe_endpoints(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+) -> (std::collections::HashSet<String>, axum::Router<AppState>) {
     // Probe endpoints (auto-mounted)
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
-    if mounted_probe_paths.insert(config.health.live_path.as_str()) {
+    if mounted_probe_paths.insert(config.health.live_path.clone()) {
         router = router.route(
             &config.health.live_path,
-            axum::routing::get(crate::probe::live_handler),
+            axum::routing::get(crate::probe::live_handler::<AppState>),
         );
     }
-    if mounted_probe_paths.insert(config.health.ready_path.as_str()) {
+    if mounted_probe_paths.insert(config.health.ready_path.clone()) {
         router = router.route(
             &config.health.ready_path,
-            axum::routing::get(crate::probe::ready_handler),
+            axum::routing::get(crate::probe::ready_handler::<AppState>),
         );
     }
-    if mounted_probe_paths.insert(config.health.startup_path.as_str()) {
+    if mounted_probe_paths.insert(config.health.startup_path.clone()) {
         router = router.route(
             &config.health.startup_path,
-            axum::routing::get(crate::probe::startup_handler),
+            axum::routing::get(crate::probe::startup_handler::<AppState>),
         );
     }
-    if mounted_probe_paths.insert(config.health.path.as_str()) {
+    if mounted_probe_paths.insert(config.health.path.clone()) {
         router = router.route(
             &config.health.path,
             axum::routing::get(crate::health::handler),
@@ -228,6 +307,14 @@ pub(crate) fn try_build_router_inner(
         "Mounted probe endpoints"
     );
 
+    (mounted_probe_paths, router)
+}
+
+fn mount_actuator_endpoints(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    mounted_probe_paths: &std::collections::HashSet<String>,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
     // Actuator endpoints
     let actuator_sensitive = config.actuator.sensitive;
     let actuator_paths =
@@ -251,12 +338,13 @@ pub(crate) fn try_build_router_inner(
         prefix = %config.actuator.prefix,
         "Mounted actuator endpoints"
     );
+    Ok(router)
+}
 
-    // Static file serving from project's static/ directory.
-    let env = crate::config::OsEnv;
-    let static_dir = crate::app::project_dir("static", &env);
-    router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
-
+fn mount_scoped_groups(
+    mut router: axum::Router<AppState>,
+    scoped_groups: Vec<ScopedGroup>,
+) -> axum::Router<AppState> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
         let mut sub_router = axum::Router::new();
@@ -273,7 +361,14 @@ pub(crate) fn try_build_router_inner(
         sub_router = (group.apply_layer)(sub_router);
         router = router.nest(&group.prefix, sub_router);
     }
+    router
+}
 
+fn mount_raw_routers(
+    mut router: axum::Router<AppState>,
+    merge_routers: Vec<axum::Router<AppState>>,
+    nest_routers: Vec<(String, axum::Router<AppState>)>,
+) -> axum::Router<AppState> {
     // Merge user-supplied raw Axum routers (escape hatch).
     // Merged after annotated routes so annotated routes take precedence.
     for raw_router in merge_routers {
@@ -286,7 +381,16 @@ pub(crate) fn try_build_router_inner(
         tracing::debug!(prefix = %prefix, "Nested raw Axum router");
         router = router.nest(&prefix, raw_router);
     }
+    router
+}
 
+fn apply_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    error_page_renderer: Option<SharedRenderer>,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -344,18 +448,12 @@ pub(crate) fn try_build_router_inner(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
-    let mut router = router
+    let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
 
-    if dev_reload_enabled {
-        router = router
-            .layer(axum::middleware::from_fn(dev::disable_static_cache))
-            .layer(axum::middleware::from_fn(dev::inject_live_reload));
-    }
-
-    Ok(router.with_state(state))
+    Ok(router)
 }
 
 /// Build the router with optional static-file-first serving.
@@ -407,37 +505,25 @@ pub fn try_build_router_with_static(
         config,
         state,
         dist_dir,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
+        RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            error_page_renderer: None,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-    error_page_renderer: Option<SharedRenderer>,
+    ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
-    let app_router = try_build_router_inner(
-        route_list,
-        config,
-        state,
-        exception_filters,
-        scoped_groups,
-        merge_routers,
-        nest_routers,
-        error_page_renderer,
-    )?;
+    let app_router = try_build_router_inner(route_list, config, state, ctx)?;
 
     let Some(dist) = dist_dir else {
         return Ok(apply_startup_barrier(
@@ -687,6 +773,9 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: Some("test".to_owned()),

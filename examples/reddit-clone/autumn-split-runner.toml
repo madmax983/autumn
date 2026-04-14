@@ -1,0 +1,14 @@
+[database]
+url = "postgres://autumn:autumn@localhost:5432/reddit"
+
+[harvest]
+mode = "split"
+worker_enabled = true
+scheduler_enabled = true
+
+[harvest.database]
+url = "postgres://autumn:autumn@localhost:5432/reddit_harvest"
+
+[distributed.live_feed_bus]
+kind = "redis_pubsub"
+redis_url = "redis://127.0.0.1:6379/"
