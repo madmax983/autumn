@@ -468,7 +468,7 @@ async fn activate_queued_runs(
         }
         let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
 
-        let updated_runs = diesel::update(
+        let mut updated_runs = diesel::update(
             dag_runs_dsl::harvest_dag_runs.filter(dag_runs_dsl::id.eq_any(queued_ids)),
         )
         .set((
@@ -479,6 +479,8 @@ async fn activate_queued_runs(
         .get_results::<DagRun>(conn)
         .await
         .map_err(crate::error::database_error)?;
+
+        updated_runs.sort_by_key(|r| r.logical_date);
 
         for updated in updated_runs {
             runnable.push((updated, dag.clone()));
