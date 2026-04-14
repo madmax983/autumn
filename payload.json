@@ -1,4 +1,0 @@
-{
-  "title": "🧪 Sentry: [test coverage improvement] for DatabaseConfig validate",
-  "body": "🎯 Target\n- Testing gap identified in `DatabaseConfig::validate` inside `autumn/src/config.rs:797`.\n- Existing tests checked some valid paths but didn't exhaustively check various edge cases like upper casing, empty strings, and trailing slashes.\n\n💣 Risk\n- The validation logic parses database connection strings without thoroughly testing all formatting corner cases that might break standard parsing or lead to invalid credentials being passed down.\n\n🧪 Strategy\n- Added `database_validate_url_edge_cases` test inside `mod tests` block.\n- The test iterates over a suite of malformed URLs including upper case POSTGRES schemes, blank paths, and non-sensical strings.\n\n🔬 Verification\n- Tests successfully pass using `cargo test -p autumn-web --lib config::tests`."
-}
