@@ -753,6 +753,7 @@ mod tests {
         );
         assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:03:00Z")));
     }
+
     #[test]
     fn create_new_dag_runs_generates_correct_rows() {
         let first_due = parse_utc("2026-04-06T12:00:00Z");
@@ -764,7 +765,21 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].dag_name, "test_dag");
         assert_eq!(rows[0].logical_date, first_due);
+        assert_eq!(rows[0].data_interval_start, first_due);
+        assert_eq!(rows[0].data_interval_end, first_due);
+        assert_eq!(rows[0].workflow_exec_id, None);
+        assert_eq!(rows[0].conf, None);
         assert_eq!(rows[1].dag_name, "test_dag");
         assert_eq!(rows[1].logical_date, second_due);
+        assert_eq!(rows[1].data_interval_start, second_due);
+        assert_eq!(rows[1].data_interval_end, second_due);
+        assert_eq!(rows[1].workflow_exec_id, None);
+        assert_eq!(rows[1].conf, None);
+    }
+
+    #[test]
+    fn create_new_dag_runs_returns_empty_for_no_dates() {
+        let rows = create_new_dag_runs("test_dag", &[]);
+        assert!(rows.is_empty());
     }
 }
