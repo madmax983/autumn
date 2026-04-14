@@ -51,6 +51,7 @@ pub enum RouterBuildError {
 ///
 /// Panics when framework router assembly encounters invalid configuration.
 /// Use [`try_build_router`] to handle configuration errors explicitly.
+#[allow(dead_code)]
 pub fn build_router(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -67,7 +68,7 @@ pub fn build_router(
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
-pub(crate) struct RouterContext {
+pub struct RouterContext {
     pub exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     pub scoped_groups: Vec<ScopedGroup>,
     pub merge_routers: Vec<axum::Router<AppState>>,
@@ -117,6 +118,7 @@ pub fn try_build_router(
 ///
 /// Panics when framework router assembly encounters invalid configuration.
 /// Use [`try_build_router_merged`] to handle configuration errors explicitly.
+#[allow(dead_code)]
 pub fn build_router_merged(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -135,6 +137,7 @@ pub fn build_router_merged(
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
+#[allow(dead_code)]
 pub fn try_build_router_merged(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -164,7 +167,7 @@ pub fn try_build_router_merged(
 
 #[allow(clippy::cognitive_complexity)]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn try_build_router_inner(
+pub fn try_build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
@@ -477,6 +480,7 @@ fn apply_middleware(
 /// Panics when framework router assembly encounters invalid configuration.
 /// Use [`try_build_router_with_static`] to handle configuration errors
 /// explicitly.
+#[allow(dead_code)]
 pub fn build_router_with_static(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -494,6 +498,7 @@ pub fn build_router_with_static(
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
+#[allow(dead_code)]
 pub fn try_build_router_with_static(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -515,7 +520,7 @@ pub fn try_build_router_with_static(
     )
 }
 
-pub(crate) fn try_build_router_with_static_inner(
+pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
@@ -714,7 +719,7 @@ fn path_matches_route_prefix(path: &str, prefix: &str) -> bool {
 /// Build a `tower_http::cors::CorsLayer` from the framework's [`crate::config::CorsConfig`].
 ///
 /// Called only when `config.cors.allowed_origins` is non-empty.
-pub(crate) fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::CorsLayer {
+pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::CorsLayer {
     use http::header::HeaderName;
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -749,7 +754,7 @@ pub(crate) fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::
 }
 
 #[cfg(feature = "htmx")]
-pub(crate) async fn htmx_handler() -> axum::response::Response {
+pub async fn htmx_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
     (
         [

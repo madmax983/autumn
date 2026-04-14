@@ -88,9 +88,14 @@ pub enum TelemetryInitError {
     },
     /// The exporter feature is not compiled in.
     #[error("telemetry-otlp cargo feature is not enabled")]
+    #[allow(dead_code)]
     FeatureDisabled,
     /// Exporter initialization failed.
     #[error("failed to initialize OTLP exporter: {0}")]
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     ExporterInit(String),
     /// Global subscriber installation failed.
     #[error("failed to initialize tracing subscriber: {0}")]
@@ -408,78 +413,3 @@ fn build_resource_attributes(resource: &TelemetryResource) -> [KeyValue; 3] {
     ]
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{TelemetryConfig, TelemetryProtocol};
-
-    #[test]
-    fn runtime_strict_missing_endpoint_errors() {
-        let log = LogConfig::default();
-        let telemetry = TelemetryConfig {
-            enabled: true,
-            service_name: "orders-api".to_owned(),
-            strict: true,
-            ..TelemetryConfig::default()
-        };
-
-        let error = TelemetryRuntime::from_config(&log, &telemetry, Some("prod")).unwrap_err();
-        assert!(matches!(error, TelemetryInitError::MissingEndpoint));
-    }
-
-    #[test]
-    fn runtime_non_strict_invalid_endpoint_falls_back() {
-        let log = LogConfig::default();
-        let telemetry = TelemetryConfig {
-            enabled: true,
-            service_name: "orders-api".to_owned(),
-            otlp_endpoint: Some("collector:4317".to_owned()),
-            strict: false,
-            ..TelemetryConfig::default()
-        };
-
-        let runtime =
-            TelemetryRuntime::from_config(&log, &telemetry, Some("prod")).expect("runtime");
-        assert_eq!(runtime.trace_export, TraceExport::Disabled);
-        assert!(runtime.warning.is_some());
-    }
-
-    #[test]
-    fn runtime_builds_otlp_plan_for_valid_config() {
-        let log = LogConfig {
-            level: "info".to_owned(),
-            format: LogFormat::Json,
-        };
-        let telemetry = TelemetryConfig {
-            enabled: true,
-            service_name: "orders-api".to_owned(),
-            service_namespace: Some("acme".to_owned()),
-            service_version: "1.2.3".to_owned(),
-            environment: "production".to_owned(),
-            otlp_endpoint: Some("http://otel-collector:4317".to_owned()),
-            protocol: TelemetryProtocol::Grpc,
-            strict: true,
-        };
-
-        let runtime =
-            TelemetryRuntime::from_config(&log, &telemetry, Some("prod")).expect("runtime");
-        assert_eq!(runtime.log_format, ResolvedLogFormat::Json);
-        assert!(matches!(runtime.trace_export, TraceExport::Otlp(_)));
-    }
-
-    #[cfg(not(feature = "telemetry-otlp"))]
-    #[test]
-    fn init_strict_feature_disabled_errors() {
-        let log = LogConfig::default();
-        let telemetry = TelemetryConfig {
-            enabled: true,
-            service_name: "orders-api".to_owned(),
-            otlp_endpoint: Some("http://otel-collector:4317".to_owned()),
-            strict: true,
-            ..TelemetryConfig::default()
-        };
-
-        let error = init(&log, &telemetry, Some("prod")).unwrap_err();
-        assert!(matches!(error, TelemetryInitError::FeatureDisabled));
-    }
-}

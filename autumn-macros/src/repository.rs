@@ -480,8 +480,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #list_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #list_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#list_fn),
@@ -499,8 +499,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #get_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #get_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#get_fn),
@@ -517,8 +517,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #create_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #create_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::POST,
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::post(#create_fn),
@@ -536,8 +536,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #update_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #update_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::PUT,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::put(#update_fn),
@@ -554,8 +554,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #delete_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #delete_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::DELETE,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::delete(#delete_fn),

@@ -67,8 +67,8 @@ pub fn route_macro(
         #input_fn
 
         #[doc(hidden)]
-        #vis fn #route_info_name() -> ::autumn_web::route::Route {
-            ::autumn_web::route::Route {
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            ::autumn_web::Route {
                 method: ::autumn_web::reexports::http::Method::#method_const,
                 path: #path,
                 handler: #handler_expr,
