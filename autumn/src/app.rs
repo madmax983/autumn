@@ -576,7 +576,10 @@ impl AppBuilder {
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations);
+        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -732,7 +735,10 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, vec![]);
+        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
         let mut state = build_state(
             &config,
@@ -940,14 +946,12 @@ fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuar
 fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
-) -> Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> {
-    let pool = match crate::db::create_pool(&config.database) {
-        Ok(pool) => pool,
-        Err(e) => {
-            tracing::error!("Failed to create database pool: {e}");
-            std::process::exit(1);
-        }
-    };
+) -> Result<
+    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    String,
+> {
+    let pool = crate::db::create_pool(&config.database)
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
     if let Some(url) = &config.database.url {
         for mig in migrations {
@@ -955,7 +959,7 @@ fn setup_database(
         }
     }
 
-    pool
+    Ok(pool)
 }
 
 fn build_state(
