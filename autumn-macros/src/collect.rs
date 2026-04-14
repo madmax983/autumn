@@ -74,7 +74,9 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = handler; } __prefix_handler() }] })
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = handler; } __prefix_handler() }] }
+            )
         );
     }
 
@@ -84,7 +86,9 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = a; } __prefix_a() }, { #[allow(clippy::no_effect)] { let _ = b; } __prefix_b() }, { #[allow(clippy::no_effect)] { let _ = c; } __prefix_c() }] })
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = a; } __prefix_a() }, { #[allow(clippy::no_effect)] { let _ = b; } __prefix_b() }, { #[allow(clippy::no_effect)] { let _ = c; } __prefix_c() }] }
+            )
         );
     }
 
@@ -94,7 +98,9 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = users::list; } users::__prefix_list() }, { #[allow(clippy::no_effect)] { let _ = auth::login; } auth::__prefix_login() }] })
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = users::list; } users::__prefix_list() }, { #[allow(clippy::no_effect)] { let _ = auth::login; } auth::__prefix_login() }] }
+            )
         );
     }
 
