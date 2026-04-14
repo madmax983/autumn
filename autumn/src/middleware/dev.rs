@@ -396,6 +396,30 @@ mod tests {
     }
 
     #[test]
+    fn inject_snippet_edge_cases() {
+        // Multiple </body> tags: Should insert before the *last* </body> tag.
+        let multi_body = inject_snippet(b"<html><body>text</body> <!-- </body> --> </html>");
+        let multi_body_str = std::str::from_utf8(&multi_body).expect("utf-8");
+        assert!(multi_body_str.ends_with("</script></body> --> </html>"));
+
+        // <html tag with attributes.
+        let html_attr = inject_snippet(b"<html lang=\"en\"><main>ok</main>");
+        let html_attr_str = std::str::from_utf8(&html_attr).expect("utf-8");
+        assert!(html_attr_str.ends_with("</script>"));
+
+        // Only </html> tag.
+        let html_close = inject_snippet(b"<div>content</div></html>");
+        let html_close_str = std::str::from_utf8(&html_close).expect("utf-8");
+        assert!(html_close_str.ends_with("</script>"));
+
+        // Invalid UTF-8 sequence, but containing </body>.
+        let invalid_utf8 = b"<html><body>\xFF\xFE</body></html>".to_vec();
+        let invalid_result = inject_snippet(&invalid_utf8);
+        // String::from_utf8_lossy Replaces invalid bytes with U+FFFD.
+        assert!(String::from_utf8_lossy(&invalid_result).contains("</script></body></html>"));
+    }
+
+    #[test]
     fn is_static_path_matches_root_and_nested_assets() {
         assert!(is_static_path("/static"));
         assert!(is_static_path("/static/css/autumn.css"));
