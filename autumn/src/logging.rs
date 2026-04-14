@@ -23,6 +23,7 @@ use crate::config::{LogConfig, TelemetryConfig};
 /// Panics if called a second time. The global tracing subscriber can
 /// only be set once per process.
 ///
+#[allow(dead_code)]
 pub fn init(config: &LogConfig) {
     let profile = crate::config::resolve_profile(&crate::config::OsEnv);
     let _ = init_with_telemetry(config, &TelemetryConfig::default(), profile.as_deref())

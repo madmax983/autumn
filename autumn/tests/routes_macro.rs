@@ -28,7 +28,7 @@ fn routes_collects_multiple_handlers() {
 
 #[test]
 fn routes_empty_returns_empty_vec() {
-    let r: Vec<autumn_web::route::Route> = routes![];
+    let r: Vec<autumn_web::Route> = routes![];
     assert!(r.is_empty());
 }
 

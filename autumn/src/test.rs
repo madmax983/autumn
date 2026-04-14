@@ -67,7 +67,7 @@ use tower::ServiceExt;
 
 use crate::config::AutumnConfig;
 use crate::route::Route;
-use crate::router::build_router;
+
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
@@ -103,6 +103,8 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// ```
 pub struct TestApp {
     routes: Vec<Route>,
+    merge_routers: Vec<axum::Router<crate::state::AppState>>,
+    nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     config: AutumnConfig,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
@@ -119,6 +121,8 @@ impl TestApp {
 
         Self {
             routes: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
             config,
             #[cfg(feature = "db")]
             pool: None,
@@ -128,6 +132,23 @@ impl TestApp {
     /// Register routes with the test application.
     ///
     /// Can be called multiple times -- routes are combined additively.
+    #[must_use]
+    pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
+        self.merge_routers.push(router);
+        self
+    }
+
+    #[must_use]
+    pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
+        self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    #[must_use]
+    pub const fn from_router(router: axum::Router) -> TestClient {
+        TestClient { router }
+    }
+
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
@@ -183,7 +204,14 @@ impl TestApp {
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
-        let router = build_router(self.routes, &self.config, state);
+        let router = crate::router::try_build_router_merged(
+            self.routes,
+            &self.config,
+            state,
+            self.merge_routers,
+            self.nest_routers,
+        )
+        .unwrap();
         TestClient { router }
     }
 }
@@ -231,7 +259,10 @@ pub struct TestClient {
 
 impl TestClient {
     /// Start building a GET request.
-    #[must_use]
+    pub fn into_router(self) -> axum::Router {
+        self.router
+    }
+
     pub fn get(&self, uri: &str) -> RequestBuilder {
         RequestBuilder::new(self.router.clone(), Method::GET, uri)
     }

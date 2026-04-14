@@ -1,37 +1,17 @@
-use autumn_web::AppState;
 use autumn_web::config::AutumnConfig;
-use autumn_web::router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use tower::ServiceExt;
+use autumn_web::test::TestApp;
 
 #[tokio::test]
 async fn config_runtime_drift_actuator_prefix_is_mounted() {
+    #[allow(clippy::field_reassign_with_default)]
     let mut config = AutumnConfig::default();
     config.actuator.prefix = "/ops".to_owned();
 
-    let app = router::build_router(Vec::new(), &config, AppState::for_test());
+    let app = TestApp::new().config(config).build();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/ops/health")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let response = app.get("/ops/health").send().await;
+    response.assert_status(200);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/actuator/health")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = app.get("/actuator/health").send().await;
+    response.assert_status(404);
 }
