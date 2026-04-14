@@ -1,3 +1,0 @@
-📖 Chapter: The Core Extractors and Observability State Traits
-🔦 Insight: Added missing `Form` and `Query` extractors with executable examples. Fully documented `ProvideActuatorState` and `ProvideProbeState` trait methods, explaining *why* they exist instead of using `allow(missing_docs)`.
-🧪 Example: Added executable examples to `Form` and `Query` extractors in `lib.rs`.
