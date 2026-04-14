@@ -972,7 +972,9 @@ pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
 
 /// `GET <actuator-prefix>/channels` -- get current channel snapshots.
 #[cfg(feature = "ws")]
-pub(crate) async fn channels_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
+pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
     let channels = state.channels().snapshot();
     Json(serde_json::json!({
         "channels": channels,
@@ -1144,7 +1146,7 @@ pub(crate) fn actuator_router_with_prefix<
                 )
                 .route(
                     &actuator_route_path(prefix, "/channels"),
-                    axum::routing::get(channels_endpoint),
+                    axum::routing::get(channels_endpoint::<S>),
                 );
         }
     }
