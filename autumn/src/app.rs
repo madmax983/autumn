@@ -589,7 +589,11 @@ impl AppBuilder {
         }
 
         // 6. Build the router (with optional static-file layer)
-        let state = build_state(&config, #[cfg(feature = "db")] pool);
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            pool,
+        );
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -730,7 +734,11 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let pool = setup_database(&config, vec![]);
 
-        let mut state = build_state(&config, #[cfg(feature = "db")] pool);
+        let mut state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            pool,
+        );
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
