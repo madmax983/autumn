@@ -222,3 +222,144 @@ pub(crate) fn readiness_response<S: ProvideProbeState>(
 ) -> (StatusCode, Json<ProbeResponse>) {
     probe_response(state, ProbeKind::Ready)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestProbeState {
+        probes: ProbeState,
+        health_detailed: bool,
+        profile: String,
+    }
+
+    impl ProvideProbeState for TestProbeState {
+        fn probes(&self) -> &ProbeState {
+            &self.probes
+        }
+
+        fn health_detailed(&self) -> bool {
+            self.health_detailed
+        }
+
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+
+        fn uptime_display(&self) -> String {
+            "test uptime".to_string()
+        }
+
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            None
+        }
+    }
+
+    impl TestProbeState {
+        fn new() -> Self {
+            Self {
+                probes: ProbeState::pending_startup(),
+                health_detailed: true,
+                profile: "test".to_string(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_handler_returns_ok() {
+        let state = TestProbeState::new();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Live);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_startup_handler_pending() {
+        let state = TestProbeState::new();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "starting");
+    }
+
+    #[tokio::test]
+    async fn test_startup_handler_complete() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_pending_startup() {
+        let state = TestProbeState::new();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_complete_startup() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_shutting_down() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state.probes().begin_shutdown();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_probe_state_set_draining() {
+        let state = ProbeState::starting();
+        assert!(!state.draining());
+        state.set_draining(true);
+        assert!(state.draining());
+    }
+
+    #[tokio::test]
+    async fn test_probe_state_set_startup_complete() {
+        let state = ProbeState::starting();
+        assert!(!state.is_startup_complete());
+        state.set_startup_complete(true);
+        assert!(state.is_startup_complete());
+    }
+
+    #[tokio::test]
+    async fn test_ready_for_test() {
+        let state = ProbeState::ready_for_test();
+        assert!(state.is_startup_complete());
+    }
+
+    #[tokio::test]
+    async fn test_health_detailed_false() {
+        let mut state = TestProbeState::new();
+        state.health_detailed = false;
+
+        let (_, Json(response)) = probe_response(&state, ProbeKind::Live);
+        assert!(response.version.is_none());
+        assert!(response.profile.is_none());
+        assert!(response.uptime.is_none());
+        assert!(response.pool.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_begin_draining() {
+        let state = ProbeState::ready_for_test();
+        assert!(!state.draining());
+        state.begin_draining();
+        assert!(state.draining());
+    }
+}
