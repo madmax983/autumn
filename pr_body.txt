@@ -1,4 +1,0 @@
-🎯 **Target:** missing test coverage for `DagBuilder` in `autumn-harvest/autumn-harvest/src/dag.rs`.
-💣 **Risk:** Lack of unit tests for the Directed Acyclic Graph builder could lead to unhandled edge cases (such as dependency cycles, cross-builder connections, or incorrect queue/rule propagations) escaping into production unnoticed.
-🧪 **Strategy:** Added a comprehensive suite of unit tests directly in `dag.rs` specifically designed to test `DagBuilder::new()`, `DagTaskRef::upstream()`, metadata updates (e.g. `trigger_rule`, `queue`), linear/fan-out graph generations, and `DagBuildError::CycleDetected`.
-🔬 **Verification:** Evaluated coverage experimentally via isolated `cargo test --lib dag::tests`, ensuring all new logic completes without regression (confirmed by running the full test suite). Also verified that tests are styled correctly via `cargo clippy` and `cargo fmt`.
