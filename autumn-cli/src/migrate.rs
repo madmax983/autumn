@@ -75,7 +75,8 @@ where
     let config_path = Path::new("autumn.toml");
     if config_path.exists() {
         if let Ok(contents) = std::fs::read_to_string(config_path) {
-            if let Ok(value) = contents.parse::<toml::Value>() {
+            if let Ok(table) = toml::from_str::<toml::Table>(&contents) {
+                let value = toml::Value::Table(table);
                 if let Some(url) = value
                     .get("database")
                     .and_then(|db: &toml::Value| db.get("url"))

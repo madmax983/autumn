@@ -147,14 +147,12 @@ fn load_distributed_section(
 ) -> Result<Option<toml::Value>, LiveFeedBusConfigLoadError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let config: toml::Value =
-                contents
-                    .parse()
-                    .map_err(|source| LiveFeedBusConfigLoadError::Parse {
-                        path: path.to_path_buf(),
-                        source: Box::new(source),
-                    })?;
-            Ok(config.get("distributed").cloned())
+            let table: toml::Table =
+                toml::from_str(&contents).map_err(|source| LiveFeedBusConfigLoadError::Parse {
+                    path: path.to_path_buf(),
+                    source: Box::new(source),
+                })?;
+            Ok(toml::Value::Table(table).get("distributed").cloned())
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(LiveFeedBusConfigLoadError::Io {
