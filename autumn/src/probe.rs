@@ -16,16 +16,22 @@ use serde::Serialize;
 
 /// Trait to abstract the state requirements for probe handlers.
 pub trait ProvideProbeState {
+    /// Provide access to the core probe lifecycle flags (startup, shutdown).
     fn probes(&self) -> &ProbeState;
+    /// Determine if detailed subsystem errors should be exposed in health check responses.
     fn health_detailed(&self) -> bool;
+    /// Identify the current running profile to determine acceptable degradation levels.
     fn profile(&self) -> &str;
+    /// Present a formatted uptime string for operational monitoring tools.
     fn uptime_display(&self) -> String;
 
     #[cfg(feature = "db")]
+    /// Share the database pool to verify dependency readiness before routing traffic.
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
 
+    /// Signals that all initialization logic has finished successfully, opening the application to traffic.
     fn mark_startup_complete(&self) {
         self.probes().mark_startup_complete();
     }

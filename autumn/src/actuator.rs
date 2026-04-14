@@ -18,20 +18,29 @@ use serde::{Deserialize, Serialize};
 
 /// Trait to abstract the state requirements for actuator handlers.
 pub trait ProvideActuatorState {
+    /// Expose the application's metrics collector for Prometheus scraping.
     fn metrics(&self) -> &crate::middleware::MetricsCollector;
+    /// Expose the application's current log levels for dynamic log level adjustment.
     fn log_levels(&self) -> &LogLevels;
+    /// Provide access to the scheduled background tasks to show their status.
     fn task_registry(&self) -> &TaskRegistry;
+    /// Share tracked application configuration properties securely for troubleshooting.
     fn config_props(&self) -> &ConfigProperties;
+    /// Reveal the active execution profile (e.g., `dev` or `prod`) to gate sensitive endpoints.
     fn profile(&self) -> &str;
+    /// Calculate the human-readable uptime duration for the info endpoint.
     fn uptime_display(&self) -> String;
 
     #[cfg(feature = "ws")]
+    /// Supply the application's websocket channels for real-time observability streaming.
     fn channels(&self) -> &crate::channels::Channels;
 
     #[cfg(feature = "ws")]
+    /// Expose the application's cancellation token to trigger graceful shutdown.
     fn shutdown_token(&self) -> tokio_util::sync::CancellationToken;
 
     #[cfg(feature = "db")]
+    /// Provide the optional database connection pool for database health checks.
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
