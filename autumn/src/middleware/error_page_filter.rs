@@ -90,6 +90,8 @@ impl ExceptionFilter for ErrorPageFilter {
             }
         }
 
+        let content_length = html_body.len();
+
         let mut resp = (
             error.status,
             [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -99,6 +101,13 @@ impl ExceptionFilter for ErrorPageFilter {
 
         // Re-attach error info so downstream filters still see it
         resp.extensions_mut().insert(error.clone());
+
+        // Ensure content-length is set correctly, as middleware might otherwise
+        // drop it in some environments like fallback routes.
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(content_length),
+        );
 
         resp
     }
@@ -355,9 +364,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let content_length = resp
+            .headers()
+            .get("content-length")
+            .expect("Content-Length header should be set")
+            .to_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
+
+        assert_eq!(content_length, body.len());
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("<!DOCTYPE html>"), "should be HTML");
         assert!(body_str.contains("404"), "should contain status code");

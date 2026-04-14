@@ -30,7 +30,17 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
             if let Some(last) = companion.segments.last_mut() {
                 last.ident = format_ident!("{}{}", prefix, last.ident);
             }
-            quote! { #companion() }
+            // Emit a dummy use of the original path so that typos surface
+            // errors on the user's identifier, not just the generated macro prefix.
+            quote! {
+                {
+                    #[allow(clippy::no_effect)]
+                    {
+                        let _ = #path;
+                    }
+                    #companion()
+                }
+            }
         })
         .collect();
 
@@ -64,7 +74,7 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![__prefix_handler()] })
+            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = handler; } __prefix_handler() }] })
         );
     }
 
@@ -74,7 +84,7 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![__prefix_a(), __prefix_b(), __prefix_c()] })
+            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = a; } __prefix_a() }, { #[allow(clippy::no_effect)] { let _ = b; } __prefix_b() }, { #[allow(clippy::no_effect)] { let _ = c; } __prefix_c() }] })
         );
     }
 
@@ -84,7 +94,7 @@ mod tests {
         let result = collect_companions(input, "__prefix_");
         assert_eq!(
             tokens_to_string(&result),
-            tokens_to_string(&quote! { vec![users::__prefix_list(), auth::__prefix_login()] })
+            tokens_to_string(&quote! { vec![{ #[allow(clippy::no_effect)] { let _ = users::list; } users::__prefix_list() }, { #[allow(clippy::no_effect)] { let _ = auth::login; } auth::__prefix_login() }] })
         );
     }
 
