@@ -206,7 +206,8 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
-    use tower::ServiceExt;
+    use std::task::{Context, Poll};
+    use tower::{Layer, Service, ServiceExt};
 
     #[tokio::test]
     async fn default_headers_applied() {
@@ -307,6 +308,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_csp_not_sent() {
+        let config = HeadersConfig {
+            content_security_policy: String::new(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.headers().get("content-security-policy").is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_referrer_policy_not_sent() {
+        let config = HeadersConfig {
+            referrer_policy: String::new(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.headers().get("referrer-policy").is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_permissions_policy_not_sent() {
+        let config = HeadersConfig {
+            permissions_policy: String::new(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(response.headers().get("permissions-policy").is_none());
+    }
+
+    #[tokio::test]
     async fn referrer_policy_when_configured() {
         let config = HeadersConfig {
             referrer_policy: "strict-origin-when-cross-origin".to_owned(),
@@ -368,6 +423,37 @@ mod tests {
         assert_eq!(
             response.headers().get("strict-transport-security").unwrap(),
             "max-age=3600"
+        );
+    }
+
+    #[derive(Clone)]
+    struct PendingService;
+
+    impl<ReqBody> Service<Request<ReqBody>> for PendingService {
+        type Response = axum::response::Response;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn call(&mut self, _req: Request<ReqBody>) -> Self::Future {
+            unreachable!("poll_ready should block this")
+        }
+    }
+
+    #[test]
+    fn layer_poll_ready_passes_through() {
+        let layer = SecurityHeadersLayer::from_config(&HeadersConfig::default());
+        let mut service = layer.layer(PendingService);
+
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let poll = Service::<Request<axum::body::Body>>::poll_ready(&mut service, &mut cx);
+
+        assert!(
+            poll.is_pending(),
+            "poll_ready should pass through Pending from inner service"
         );
     }
 }
