@@ -636,7 +636,8 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     let (overall_healthy, db_check) = {
         #[cfg(feature = "db")]
         {
-            state.pool().map_or((true, None), |pool| {
+            #[allow(clippy::option_if_let_else)]
+            if let Some(pool) = state.pool() {
                 let status = pool.status();
                 let available = status.available as u64;
                 let size = status.max_size as u64;
@@ -652,7 +653,9 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
                     idle_connections: idle,
                 });
                 (overall_healthy, db_check)
-            })
+            } else {
+                (true, None)
+            }
         }
 
         #[cfg(not(feature = "db"))]
