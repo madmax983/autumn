@@ -204,7 +204,8 @@ impl Channels {
         let tx = if let Some(tx) = registry.get(name) {
             Arc::clone(tx)
         } else {
-            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
+            let capacity = std::cmp::max(1, self.inner.capacity);
+            let tx = Arc::new(broadcast::channel(capacity).0);
             registry.insert(name.to_owned(), Arc::clone(&tx));
             tx
         };
@@ -243,7 +244,8 @@ impl Channels {
         let tx = if let Some(tx) = registry.get(name) {
             Arc::clone(tx)
         } else {
-            let tx = Arc::new(broadcast::channel(self.inner.capacity).0);
+            let capacity = std::cmp::max(1, self.inner.capacity);
+            let tx = Arc::new(broadcast::channel(capacity).0);
             registry.insert(name.to_owned(), Arc::clone(&tx));
             tx
         };
