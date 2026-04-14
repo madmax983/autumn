@@ -1476,6 +1476,29 @@ mod tests {
     }
 
     #[test]
+    fn database_validate_url_edge_cases() {
+        let invalid_urls = vec![
+            "POSTGRES://localhost/db",
+            "postgres:/localhost/db",
+            "postgres:localhost/db",
+            "http://postgres",
+            "   postgres://localhost/db",
+            "",
+        ];
+
+        for invalid_url in invalid_urls {
+            let config = DatabaseConfig {
+                url: Some(invalid_url.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "URL should be invalid: {invalid_url}"
+            );
+        }
+    }
+
+    #[test]
     fn autumn_config_validate_ok() {
         let config = AutumnConfig::default();
         assert!(config.validate().is_ok());
