@@ -54,6 +54,9 @@ pub use crate::flash::{Flash, FlashLevel, FlashMessage};
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxRequest;
+/// Extension trait for adding htmx response headers.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::HxResponseExt;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.
