@@ -1,3 +1,9 @@
+error[E0425]: cannot find value `nonexistent_handler` in this scope
+ --> tests/compile-fail/routes_nonexistent.rs:4:21
+  |
+4 |     let _ = routes![nonexistent_handler];
+  |                     ^^^^^^^^^^^^^^^^^^^ not found in this scope
+
 error[E0425]: cannot find function `__autumn_route_info_nonexistent_handler` in this scope
  --> tests/compile-fail/routes_nonexistent.rs:4:21
   |
