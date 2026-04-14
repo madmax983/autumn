@@ -463,22 +463,24 @@ async fn activate_queued_runs(
             .await
             .map_err(crate::error::database_error)?;
 
-        for run in queued {
-            diesel::update(dag_runs_dsl::harvest_dag_runs.find(run.id))
-                .set((
-                    dag_runs_dsl::state.eq("RUNNING"),
-                    dag_runs_dsl::started_at.eq(Some(Utc::now())),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+        if queued.is_empty() {
+            continue;
+        }
+        let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
 
-            let updated = dag_runs_dsl::harvest_dag_runs
-                .find(run.id)
-                .select(DagRun::as_select())
-                .first(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+        let updated_runs = diesel::update(
+            dag_runs_dsl::harvest_dag_runs.filter(dag_runs_dsl::id.eq_any(queued_ids)),
+        )
+        .set((
+            dag_runs_dsl::state.eq("RUNNING"),
+            dag_runs_dsl::started_at.eq(Some(Utc::now())),
+        ))
+        .returning(DagRun::as_select())
+        .get_results::<DagRun>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        for updated in updated_runs {
             runnable.push((updated, dag.clone()));
         }
     }
