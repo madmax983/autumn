@@ -151,7 +151,10 @@ fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
 /// Returns `Ok(None)` if the file doesn't exist.
 fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents.parse::<toml::Value>()?)),
+        Ok(contents) => {
+            let table = toml::from_str::<toml::Table>(&contents)?;
+            Ok(Some(toml::Value::Table(table)))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ConfigError::Io(e)),
     }
