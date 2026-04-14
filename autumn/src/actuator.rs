@@ -629,41 +629,40 @@ struct DatabaseCheck {
 }
 
 /// `GET <actuator-prefix>/health`
-#[allow(unused_variables, clippy::useless_let_if_seq)]
+#[allow(unused_variables)]
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    let db_check;
-    let overall_healthy;
+    let (overall_healthy, db_check) = {
+        #[cfg(feature = "db")]
+        {
+            #[allow(clippy::option_if_let_else)]
+            if let Some(pool) = state.pool() {
+                let status = pool.status();
+                let available = status.available as u64;
+                let size = status.max_size as u64;
+                let waiting = status.waiting as u64;
+                let idle = available;
+                let active = size.saturating_sub(available);
 
-    #[cfg(feature = "db")]
-    {
-        if let Some(pool) = state.pool() {
-            let status = pool.status();
-            let available = status.available as u64;
-            let size = status.max_size as u64;
-            let waiting = status.waiting as u64;
-            let idle = available;
-            let active = size.saturating_sub(available);
-
-            overall_healthy = available > 0 || waiting == 0;
-            db_check = Some(DatabaseCheck {
-                status: if overall_healthy { "ok" } else { "down" },
-                pool_size: size,
-                active_connections: active,
-                idle_connections: idle,
-            });
-        } else {
-            overall_healthy = true;
-            db_check = None;
+                let overall_healthy = available > 0 || waiting == 0;
+                let db_check = Some(DatabaseCheck {
+                    status: if overall_healthy { "ok" } else { "down" },
+                    pool_size: size,
+                    active_connections: active,
+                    idle_connections: idle,
+                });
+                (overall_healthy, db_check)
+            } else {
+                (true, None)
+            }
         }
-    }
 
-    #[cfg(not(feature = "db"))]
-    {
-        overall_healthy = true;
-        db_check = None;
-    }
+        #[cfg(not(feature = "db"))]
+        {
+            (true, None)
+        }
+    };
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
