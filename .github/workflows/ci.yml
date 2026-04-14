@@ -60,10 +60,9 @@ jobs:
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info,autumn-harvest-lcov.info
           fail_ci_if_error: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   msrv:
     name: MSRV (1.86.0)
