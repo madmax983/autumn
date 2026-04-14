@@ -260,3 +260,152 @@ fn short_activity_name(type_name: &str) -> String {
         .unwrap_or(type_name)
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn dummy_activity() {}
+    fn dummy_activity2() {}
+    fn dummy_activity3() {}
+
+    #[test]
+    fn test_short_activity_name() {
+        assert_eq!(short_activity_name("dummy_activity"), "dummy_activity");
+        assert_eq!(
+            short_activity_name("my_crate::module::dummy_activity"),
+            "dummy_activity"
+        );
+        assert_eq!(short_activity_name("::dummy_activity"), "dummy_activity");
+    }
+
+    #[test]
+    fn test_empty_dag() {
+        let builder = DagBuilder::new();
+        let dag = builder.build().expect("build should succeed");
+        assert!(dag.tasks().is_empty());
+        assert!(dag.execution_levels().is_empty());
+    }
+
+    #[test]
+    fn test_single_activity() {
+        let mut builder = DagBuilder::new();
+        let _ = builder.activity(dummy_activity);
+
+        let dag = builder.build().expect("build should succeed");
+        let tasks = dag.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].activity_name, "dummy_activity");
+        assert!(tasks[0].upstreams.is_empty());
+        assert_eq!(tasks[0].trigger_rule, TriggerRule::AllSuccess);
+        assert!(tasks[0].retry_policy.is_none());
+        assert!(tasks[0].start_to_close.is_none());
+        assert!(tasks[0].queue.is_none());
+
+        let levels = dag.execution_levels();
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0], vec![0]);
+    }
+
+    #[test]
+    fn test_with_default_queue() {
+        let mut builder = DagBuilder::with_default_queue("custom_queue");
+        let _ = builder.activity(dummy_activity);
+
+        let dag = builder.build().unwrap();
+        assert_eq!(dag.tasks()[0].queue.as_deref(), Some("custom_queue"));
+    }
+
+    #[test]
+    fn test_modifying_task_parameters() {
+        let mut builder = DagBuilder::new();
+        let _ = builder
+            .activity(dummy_activity)
+            .trigger_rule(TriggerRule::AllDone)
+            .retry(RetryPolicy::fixed(3, Duration::from_secs(1)))
+            .start_to_close(Duration::from_secs(10))
+            .queue("specific_queue");
+
+        let dag = builder.build().unwrap();
+        let task = &dag.tasks()[0];
+
+        assert_eq!(task.trigger_rule, TriggerRule::AllDone);
+        assert_eq!(task.start_to_close, Some(Duration::from_secs(10)));
+        assert_eq!(task.queue.as_deref(), Some("specific_queue"));
+        assert!(task.retry_policy.is_some());
+        if let Some(rp) = &task.retry_policy {
+            assert_eq!(rp.max_attempts, 3);
+        }
+    }
+
+    #[test]
+    fn test_simple_dependency_chaining() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b = builder.activity(dummy_activity2).upstream(&a);
+        let _c = builder.activity(dummy_activity3).upstream(&a).upstream(&b);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks[0].upstreams.is_empty());
+        assert_eq!(tasks[1].upstreams, vec![0]);
+        // upstreams are inserted in order
+        assert_eq!(tasks[2].upstreams, vec![0, 1]);
+
+        let levels = dag.execution_levels();
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]); // a runs first
+        assert_eq!(levels[1], vec![1]); // b runs second
+        assert_eq!(levels[2], vec![2]); // c runs third
+    }
+
+    #[test]
+    fn test_fan_out_fan_in() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity); // 0
+        let b1 = builder.activity(dummy_activity).upstream(&a); // 1
+        let b2 = builder.activity(dummy_activity).upstream(&a); // 2
+        let _c = builder.activity(dummy_activity).upstream(&b1).upstream(&b2); // 3
+
+        let dag = builder.build().unwrap();
+        let levels = dag.execution_levels();
+
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec![0]);
+        assert_eq!(levels[1], vec![1, 2]); // b1 and b2 run in parallel
+        assert_eq!(levels[2], vec![3]);
+    }
+
+    #[test]
+    fn test_cycle_detection() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b = builder.activity(dummy_activity2).upstream(&a);
+
+        // create a cycle: a depends on b
+        let a_clone = a;
+        let _ = a_clone.upstream(&b);
+
+        let res = builder.build();
+        assert_eq!(res.unwrap_err(), DagBuildError::CycleDetected);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot connect tasks from different DagBuilder instances")]
+    fn test_cross_builder_panic() {
+        let mut builder1 = DagBuilder::new();
+        let a = builder1.activity(dummy_activity);
+
+        let mut builder2 = DagBuilder::new();
+        let _b = builder2.activity(dummy_activity2).upstream(&a);
+    }
+
+    #[test]
+    fn test_dag_build_error_display() {
+        let err = DagBuildError::CycleDetected;
+        assert_eq!(err.to_string(), "dag contains a dependency cycle");
+    }
+}
