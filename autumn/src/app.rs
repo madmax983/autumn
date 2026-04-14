@@ -31,8 +31,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::AutumnConfig;
-#[cfg(feature = "db")]
-use crate::db;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -553,22 +551,8 @@ impl AppBuilder {
 
         let all_routes = routes;
 
-        // 1. Load configuration (profile-aware)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
-
-        // 2. Initialize logging/telemetry immediately after config.
-        let _telemetry_guard = crate::logging::init_with_telemetry(
-            &config.log,
-            &config.telemetry,
-            config.profile.as_deref(),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
+        // 1 & 2. Load configuration and initialize logging/telemetry
+        let (config, _telemetry_guard) = load_config_and_telemetry();
 
         // 3. Validate routes
         assert!(
@@ -590,15 +574,12 @@ impl AppBuilder {
             log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
-        // 5. Create database pool (if configured)
+        // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -610,34 +591,12 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 5b. Run migrations if registered
-        #[cfg(feature = "db")]
-        if let Some(url) = &config.database.url {
-            for migrations in migrations {
-                migrate::auto_migrate(url, config.profile.as_deref(), migrations);
-            }
-        }
-
         // 6. Build the router (with optional static-file layer)
-        let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+        let state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            probes: crate::probe::ProbeState::pending_startup(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -766,19 +725,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
-        let _telemetry_guard = crate::logging::init_with_telemetry(
-            &config.log,
-            &config.telemetry,
-            config.profile.as_deref(),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
+        let (config, _telemetry_guard) = load_config_and_telemetry();
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -788,33 +735,18 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+        let mut state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            probes: crate::probe::ProbeState::default(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
+        // run_build_mode used ProbeState::default(), which does not start as pending
+        state.probes = crate::probe::ProbeState::default();
 
         // Build the full router (same as production)
         let router =
@@ -987,6 +919,72 @@ fn log_startup_transparency(
     tracing::info!("Active middleware: {}", format_middleware_list(config));
 
     tracing::info!("Configuration:{}", format_config_summary(config));
+}
+
+fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    // 1. Load configuration (profile-aware)
+    let config = AutumnConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load configuration: {e}");
+        std::process::exit(1);
+    });
+
+    // 2. Initialize logging/telemetry immediately after config.
+    let telemetry_guard = crate::logging::init_with_telemetry(
+        &config.log,
+        &config.telemetry,
+        config.profile.as_deref(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to initialize telemetry: {error}");
+        std::process::exit(1);
+    });
+
+    (config, telemetry_guard)
+}
+
+#[cfg(feature = "db")]
+fn setup_database(
+    config: &AutumnConfig,
+    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+) -> Result<
+    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    String,
+> {
+    let pool = crate::db::create_pool(&config.database)
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+    if let Some(url) = &config.database.url {
+        for mig in migrations {
+            crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+        }
+    }
+
+    Ok(pool)
+}
+
+fn build_state(
+    config: &AutumnConfig,
+    #[cfg(feature = "db")] pool: Option<
+        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    >,
+) -> AppState {
+    AppState {
+        extensions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        #[cfg(feature = "db")]
+        pool,
+        profile: config.profile.clone(),
+        started_at: std::time::Instant::now(),
+        health_detailed: config.health.detailed,
+        probes: crate::probe::ProbeState::pending_startup(),
+        metrics: crate::middleware::MetricsCollector::new(),
+        log_levels: crate::actuator::LogLevels::new(&config.log.level),
+        task_registry: crate::actuator::TaskRegistry::new(),
+        config_props: crate::actuator::ConfigProperties::from_config(config),
+        #[cfg(feature = "ws")]
+        channels: crate::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    }
 }
 
 /// Build the route listing string for the transparency log.
