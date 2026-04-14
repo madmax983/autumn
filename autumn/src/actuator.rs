@@ -968,6 +968,19 @@ pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     }))
 }
 
+// ── Channels (sensitive) ───────────────────────────────────────
+
+/// `GET <actuator-prefix>/channels` -- get current channel snapshots.
+#[cfg(feature = "ws")]
+pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let channels = state.channels().snapshot();
+    Json(serde_json::json!({
+        "channels": channels,
+    }))
+}
+
 // ── Tasks Stream (WebSocket) ───────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
@@ -1055,7 +1068,10 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         ]);
 
         #[cfg(feature = "ws")]
-        paths.push(actuator_route_path(prefix, "/tasks/stream"));
+        {
+            paths.push(actuator_route_path(prefix, "/tasks/stream"));
+            paths.push(actuator_route_path(prefix, "/channels"));
+        }
     }
 
     paths
@@ -1123,10 +1139,15 @@ pub(crate) fn actuator_router_with_prefix<
 
         #[cfg(feature = "ws")]
         {
-            router = router.route(
-                &actuator_route_path(prefix, "/tasks/stream"),
-                axum::routing::get(tasks_stream_endpoint::<S>),
-            );
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/channels"),
+                    axum::routing::get(channels_endpoint::<S>),
+                );
         }
     }
 

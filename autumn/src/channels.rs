@@ -278,6 +278,22 @@ impl Channels {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         registry.retain(|_, tx| tx.receiver_count() > 0 || Arc::strong_count(tx) > 1);
     }
+
+    /// Get a snapshot of all active channels and their subscriber counts.
+    ///
+    /// Returns a `HashMap` mapping channel names to their current active receiver count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<String, usize> {
+        let registry = self.inner.registry.lock().expect("channels lock poisoned");
+        registry
+            .iter()
+            .map(|(name, tx)| (name.clone(), tx.receiver_count()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +376,25 @@ mod tests {
     fn channels_is_clone() {
         let channels = Channels::new(16);
         let _cloned = channels.clone();
+    }
+
+    #[test]
+    fn snapshot_returns_counts() {
+        let channels = Channels::new(16);
+        let _tx = channels.sender("empty");
+
+        let _tx2 = channels.sender("one");
+        let _rx_one = channels.subscribe("one");
+
+        let _tx3 = channels.sender("two");
+        let _rx_two_1 = channels.subscribe("two");
+        let _rx_two_2 = channels.subscribe("two");
+
+        let snap = channels.snapshot();
+        assert_eq!(snap.get("empty"), Some(&0));
+        assert_eq!(snap.get("one"), Some(&1));
+        assert_eq!(snap.get("two"), Some(&2));
+        assert_eq!(snap.len(), 3);
     }
 
     #[test]
