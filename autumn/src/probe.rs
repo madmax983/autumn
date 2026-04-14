@@ -130,6 +130,7 @@ pub(crate) struct PoolStatus {
     waiting: u64,
 }
 
+#[allow(clippy::missing_const_for_fn, unused_variables)]
 fn dependency_readiness<S: ProvideProbeState>(state: &S) -> (bool, Option<PoolStatus>) {
     #[cfg(feature = "db")]
     {
