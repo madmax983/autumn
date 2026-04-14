@@ -480,6 +480,7 @@ async fn activate_queued_runs(
         .await
         .map_err(crate::error::database_error)?;
 
+        // Sort by logical_date to preserve the original queue ordering (logical_date ASC).
         updated_runs.sort_by_key(|r| r.logical_date);
 
         for updated in updated_runs {
