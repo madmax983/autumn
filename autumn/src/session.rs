@@ -496,18 +496,27 @@ fn is_production_profile(profile: Option<&str>) -> bool {
 
 /// Extract a named cookie value from the Cookie header.
 fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
-    headers.get_all(COOKIE).iter().find_map(|value| {
-        value.to_str().ok().and_then(|s| {
-            s.split(';').map(str::trim).find_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                if k.trim() == name {
-                    Some(v.trim().to_owned())
-                } else {
-                    None
+    let mut found_token = None;
+
+    for cookie_header in headers.get_all(COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            for pair in cookie_str.split(';') {
+                let pair = pair.trim();
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k.trim() == name {
+                        if found_token.is_some() {
+                            // Multiple cookies with the same name found.
+                            // This indicates a potential Cookie Tossing attack!
+                            // Reject by returning None.
+                            return None;
+                        }
+                        found_token = Some(v.trim().to_owned());
+                    }
                 }
-            })
-        })
-    })
+            }
+        }
+    }
+    found_token
 }
 
 /// Build a Set-Cookie header value.
@@ -835,6 +844,21 @@ mod tests {
         assert_eq!(get_cookie(&headers, "autumn.sid"), Some("abc123".into()));
         assert_eq!(get_cookie(&headers, "other"), Some("xyz".into()));
         assert_eq!(get_cookie(&headers, "missing"), None);
+    }
+
+    #[test]
+    fn get_cookie_rejects_multiple_cookies() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_static("autumn.sid=abc123; autumn.sid=xyz456"),
+        );
+        assert_eq!(get_cookie(&headers, "autumn.sid"), None);
+
+        let mut headers2 = http::HeaderMap::new();
+        headers2.append(COOKIE, HeaderValue::from_static("autumn.sid=abc123"));
+        headers2.append(COOKIE, HeaderValue::from_static("autumn.sid=xyz456"));
+        assert_eq!(get_cookie(&headers2, "autumn.sid"), None);
     }
 
     #[test]
