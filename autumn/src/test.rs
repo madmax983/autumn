@@ -146,9 +146,7 @@ impl TestApp {
 
     #[must_use]
     pub const fn from_router(router: axum::Router) -> TestClient {
-        TestClient {
-            router,
-        }
+        TestClient { router }
     }
 
     #[must_use]
@@ -206,7 +204,14 @@ impl TestApp {
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
-        let router = crate::router::try_build_router_merged(self.routes, &self.config, state, self.merge_routers, self.nest_routers).unwrap();
+        let router = crate::router::try_build_router_merged(
+            self.routes,
+            &self.config,
+            state,
+            self.merge_routers,
+            self.nest_routers,
+        )
+        .unwrap();
         TestClient { router }
     }
 }

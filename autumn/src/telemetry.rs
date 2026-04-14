@@ -412,4 +412,3 @@ fn build_resource_attributes(resource: &TelemetryResource) -> [KeyValue; 3] {
         KeyValue::new("deployment.environment", resource.environment.clone()),
     ]
 }
-

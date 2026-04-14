@@ -48,7 +48,6 @@
 //! - [`middleware`] -- Built-in middleware (request IDs).
 //! - [`prelude`] -- Glob import for the most common types.
 
-
 //!
 //! ## Zero-config defaults
 //!
