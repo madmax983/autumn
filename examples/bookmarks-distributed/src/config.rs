@@ -243,14 +243,13 @@ fn load_distributed_section(
 ) -> Result<Option<toml::Value>, DistributedConfigLoadError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let file_config: toml::Value =
-                contents
-                    .parse()
+            let table: toml::Table =
+                toml::from_str(&contents)
                     .map_err(|source| DistributedConfigLoadError::Parse {
                         path: path.to_path_buf(),
                         source: Box::new(source),
                     })?;
-            Ok(file_config.get("distributed").cloned())
+            Ok(toml::Value::Table(table).get("distributed").cloned())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(DistributedConfigLoadError::Io {
