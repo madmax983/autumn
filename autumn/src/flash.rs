@@ -2,7 +2,7 @@
 //!
 //! Provides a [`Flash`] extractor that allows storing and retrieving
 //! temporary messages across HTTP redirects, backed by the user's
-//! [`Session`](crate::session::Session).
+//! [`crate::session::Session`].
 //!
 //! # Examples
 //!
