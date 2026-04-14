@@ -547,4 +547,13 @@ mod tests {
             .unwrap();
         assert_eq!(&body[..], b"all good");
     }
+
+    #[tokio::test]
+    async fn fallback_404_handler_creates_correct_error() {
+        let uri = axum::http::Uri::from_static("/some/unknown/path");
+        let error = fallback_404_handler(uri).await;
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.to_string(), "No route matches /some/unknown/path");
+    }
 }
