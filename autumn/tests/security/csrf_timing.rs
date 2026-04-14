@@ -27,7 +27,7 @@ async fn test_csrf_timing_attack() {
     // Instead, we verify that the constant-time trait or verify is used.
     // As a PoC, we will simulate the behavior but testing actual timing is difficult.
 
-    // This test ensures that the code compiles with the fix,
+    // We'll write the test to ensure that the code compiles with the fix,
     // and that valid tokens still work and invalid tokens fail.
 
     let valid_req = Request::builder()
@@ -49,6 +49,43 @@ async fn test_csrf_timing_attack() {
         .body(Body::empty())
         .unwrap();
 
-    let response2 = app.oneshot(invalid_req).await.unwrap();
+    let response2 = app.clone().oneshot(invalid_req).await.unwrap();
     assert_eq!(response2.status(), StatusCode::FORBIDDEN);
+
+    // Let's actually simulate the timing attack
+    let iterations = 500;
+
+    // Early mismatch
+    let mut total_early = std::time::Duration::new(0, 0);
+    for _ in 0..iterations {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("Cookie", format!("autumn-csrf={token}"))
+            .header("X-CSRF-Token", "22345678-1234-1234-1234-123456789012") // Fails at first char
+            .body(Body::empty())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let _ = app.clone().oneshot(req).await.unwrap();
+        total_early += start.elapsed();
+    }
+
+    // Late mismatch
+    let mut total_late = std::time::Duration::new(0, 0);
+    for _ in 0..iterations {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/submit")
+            .header("Cookie", format!("autumn-csrf={token}"))
+            .header("X-CSRF-Token", "12345678-1234-1234-1234-123456789013") // Fails at last char
+            .body(Body::empty())
+            .unwrap();
+        let start = std::time::Instant::now();
+        let _ = app.clone().oneshot(req).await.unwrap();
+        total_late += start.elapsed();
+    }
+
+    // They should be roughly equivalent. If they differ by more than a certain ratio, it might be vulnerable.
+    // Since CI can be flaky, we don't strictly assert the exact timing equality, just that it runs without panicking.
+    println!("Timing: Early fail={total_early:?}, Late fail={total_late:?}");
 }
