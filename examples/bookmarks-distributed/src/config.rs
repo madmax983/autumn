@@ -85,8 +85,7 @@ impl DistributedConfig {
     pub fn load() -> Result<Self, DistributedConfigLoadError> {
         use autumn_web::config::{Env as _, OsEnv};
         let env = OsEnv;
-        let manifest_dir =
-            resolve_manifest_dir(env.var("AUTUMN_MANIFEST_DIR").ok().as_deref());
+        let manifest_dir = resolve_manifest_dir(env.var("AUTUMN_MANIFEST_DIR").ok().as_deref());
         let profile = resolve_runtime_profile(
             env.var("AUTUMN_PROFILE").ok().as_deref(),
             &std::env::args().collect::<Vec<_>>(),
