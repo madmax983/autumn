@@ -608,7 +608,7 @@ async fn persist_workflow_failure(
     .await
 }
 
-async fn persist_signal_wait_requeue(
+async fn persist_signal_wait_park(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
@@ -618,7 +618,7 @@ async fn persist_signal_wait_requeue(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::requeue_for_retry(conn, task_id, chrono::Duration::seconds(1)).await
+            queue::park_workflow_task(conn, task_id).await
         }
         .scope_boxed()
     })
@@ -1175,7 +1175,7 @@ async fn handle_suspended_workflow(
 ) -> HarvestResult<()> {
     if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
-        let result = persist_signal_wait_requeue(
+        let result = persist_signal_wait_park(
             conn,
             context.persistence.task.id,
             context.persistence.exec_id,
