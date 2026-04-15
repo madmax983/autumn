@@ -24,15 +24,15 @@
 //! }
 //! ```
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::AutumnConfig;
-#[cfg(feature = "db")]
-use crate::db;
-use crate::error_pages::{self, ErrorPageRenderer, SharedRenderer};
-use crate::middleware::RequestIdLayer;
-use crate::middleware::dev;
-use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
+use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
+use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
 use crate::migrate;
 use crate::route::Route;
@@ -66,17 +66,23 @@ pub fn app() -> AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
         static_metas: Vec::new(),
-        islands: Vec::new(),
-        actions: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
+        startup_hooks: Vec::new(),
+        shutdown_hooks: Vec::new(),
+        extensions: HashMap::new(),
         error_page_renderer: None,
         #[cfg(feature = "db")]
-        migrations: None,
+        migrations: Vec::new(),
     }
 }
+
+type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send>>;
+type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
+type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
 
 /// Builder for configuring and launching an Autumn application.
 ///
@@ -110,28 +116,30 @@ pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
-    pub(crate) islands: Vec<crate::wasm::IslandMeta>,
-    pub(crate) actions: Vec<crate::wasm::ActionMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    startup_hooks: Vec<StartupHook>,
+    shutdown_hooks: Vec<ShutdownHook>,
+    extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
     #[cfg(feature = "db")]
-    migrations: Option<migrate::EmbeddedMigrations>,
+    migrations: Vec<migrate::EmbeddedMigrations>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
-struct ScopedGroup {
-    prefix: String,
-    routes: Vec<Route>,
+pub(crate) struct ScopedGroup {
+    pub(crate) prefix: String,
+    pub(crate) routes: Vec<Route>,
     /// Closure that applies the layer to a sub-router.
-    apply_layer: Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+    pub(crate) apply_layer:
+        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
 impl AppBuilder {
@@ -180,20 +188,6 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
-        self
-    }
-
-    /// Register WASM island metadata with the application.
-    #[must_use]
-    pub fn islands(mut self, islands: Vec<crate::wasm::IslandMeta>) -> Self {
-        self.islands.extend(islands);
-        self
-    }
-
-    /// Register typed server action metadata with the application.
-    #[must_use]
-    pub fn actions(mut self, actions: Vec<crate::wasm::ActionMeta>) -> Self {
-        self.actions.extend(actions);
         self
     }
 
@@ -401,6 +395,84 @@ impl AppBuilder {
         self
     }
 
+    /// Register an async startup hook that runs after [`AppState`] exists and
+    /// before the server begins accepting requests.
+    ///
+    /// This is intended for background runtimes that need the fully built app
+    /// state, such as workers or pollers that share the database pool.
+    #[must_use]
+    pub fn on_startup<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(AppState) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.startup_hooks
+            .push(Box::new(move |state| Box::pin(hook(state))));
+        self
+    }
+
+    /// Register an async shutdown hook that runs during graceful shutdown.
+    ///
+    /// Hooks execute in reverse registration order so later-added runtimes
+    /// shut down before earlier infrastructure they might depend on.
+    #[must_use]
+    pub fn on_shutdown<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
+        self
+    }
+
+    /// Store or replace a typed builder extension.
+    ///
+    /// External crates use this to accumulate configuration across fluent
+    /// extension-trait calls without Autumn needing to know the concrete type.
+    #[must_use]
+    pub fn with_extension<T>(mut self, value: T) -> Self
+    where
+        T: Any + Send + 'static,
+    {
+        self.extensions.insert(TypeId::of::<T>(), Box::new(value));
+        self
+    }
+
+    /// Mutate a typed builder extension, inserting a default value first when
+    /// the extension has not been registered yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension type map is corrupted and the value
+    /// stored under `T`'s [`TypeId`] cannot be downcast back to `T`.
+    #[must_use]
+    pub fn update_extension<T, Init, Update>(mut self, init: Init, update: Update) -> Self
+    where
+        T: Any + Send + 'static,
+        Init: FnOnce() -> T,
+        Update: FnOnce(&mut T),
+    {
+        let type_id = TypeId::of::<T>();
+        let entry = self
+            .extensions
+            .entry(type_id)
+            .or_insert_with(|| Box::new(init()));
+        let typed = entry
+            .downcast_mut::<T>()
+            .expect("extension type map corrupted");
+        update(typed);
+        self
+    }
+
+    /// Borrow a typed builder extension if it has been registered.
+    #[must_use]
+    pub fn extension<T>(&self) -> Option<&T>
+    where
+        T: Any + Send + 'static,
+    {
+        self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -426,8 +498,8 @@ impl AppBuilder {
     /// ```
     #[cfg(feature = "db")]
     #[must_use]
-    pub const fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
-        self.migrations = Some(migrations);
+    pub fn migrations(mut self, migrations: migrate::EmbeddedMigrations) -> Self {
+        self.migrations.push(migrations);
         self
     }
 
@@ -451,27 +523,40 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
         // instead of starting the HTTP server. This is triggered by `autumn build`.
-        if std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1") {
+        if is_static_build_mode() {
             self.run_build_mode().await;
             return;
         }
 
-        // 1. Load configuration (profile-aware)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
+        let Self {
+            routes,
+            tasks,
+            static_metas: _,
+            exception_filters,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            startup_hooks,
+            shutdown_hooks,
+            extensions: _,
+            error_page_renderer,
+            #[cfg(feature = "db")]
+            migrations,
+        } = self;
 
-        // 2. Initialize logging immediately after config (before any tracing calls)
-        crate::logging::init(&config.log);
+        let all_routes = routes;
+
+        // 1 & 2. Load configuration and initialize logging/telemetry
+        let (config, _telemetry_guard) = load_config_and_telemetry();
 
         // 3. Validate routes
         assert!(
-            !self.routes.is_empty(),
+            !all_routes.is_empty(),
             "No routes registered. Did you forget to call .routes()?"
         );
 
@@ -486,18 +571,15 @@ impl AppBuilder {
         // 4b. Startup transparency log (AUTUMN_SHOW_CONFIG=1 or log level <= DEBUG)
         let show_config = std::env::var("AUTUMN_SHOW_CONFIG").as_deref() == Ok("1");
         if show_config {
-            log_startup_transparency(&self.routes, &self.tasks, &self.scoped_groups, &config);
+            log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
-        // 5. Create database pool (if configured)
+        // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -509,28 +591,12 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 5b. Run migrations if registered
-        #[cfg(feature = "db")]
-        if let (Some(migrations), Some(url)) = (self.migrations, &config.database.url) {
-            migrate::auto_migrate(url, config.profile.as_deref(), migrations);
-        }
-
         // 6. Build the router (with optional static-file layer)
-        let state = AppState {
+        let state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -538,67 +604,98 @@ impl AppBuilder {
         } else {
             None
         };
-        let router = build_router_with_static_inner(
-            self.routes,
+        let router = crate::router::try_build_router_with_static_inner(
+            all_routes,
             &config,
             state.clone(),
             dist_ref,
-            self.exception_filters,
-            self.scoped_groups,
-            self.merge_routers,
-            self.nest_routers,
-            self.error_page_renderer,
-        );
+            crate::router::RouterContext {
+                exception_filters,
+                scoped_groups,
+                merge_routers,
+                nest_routers,
+                error_page_renderer,
+            },
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to build router");
+            std::process::exit(1);
+        });
 
-        // 7. Start scheduled tasks (if any)
-        if !self.tasks.is_empty() {
-            start_task_scheduler(self.tasks, &state);
-        }
-
-        // 8. Bind and serve with graceful shutdown
+        // 7. Bind and serve. We start listening before startup hooks finish so
+        // `/startup` can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
-        tracing::info!(addr = %addr, "Listening");
-
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
+        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown_wait = server_shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    server_shutdown_wait.cancelled().await;
+                })
+                .await
+        });
 
-        // Capture the shutdown token so WebSocket handlers are notified.
+        let shutdown_state = state.clone();
+        let shutdown_signal_token = server_shutdown.clone();
         #[cfg(feature = "ws")]
-        let shutdown_token = state.shutdown.clone();
+        let websocket_shutdown = state.shutdown.clone();
 
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                shutdown_signal().await;
+        let shutdown_task = tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_state.begin_shutdown();
 
-                // Signal WebSocket handlers to close connections.
-                #[cfg(feature = "ws")]
-                shutdown_token.cancel();
+            #[cfg(feature = "ws")]
+            websocket_shutdown.cancel();
 
-                // Warn if draining takes too long
-                if shutdown_timeout > 5 {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            shutdown_timeout.saturating_sub(5),
-                        ))
-                        .await;
-                        tracing::warn!(
-                            timeout_secs = shutdown_timeout,
-                            "Shutdown draining near timeout, force-kill may be imminent"
-                        );
-                    });
-                }
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!("Server error: {e}");
-                std::process::exit(1);
-            });
+            if shutdown_timeout > 5 {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        shutdown_timeout.saturating_sub(5),
+                    ))
+                    .await;
+                    tracing::warn!(
+                        timeout_secs = shutdown_timeout,
+                        "Shutdown draining near timeout, force-kill may be imminent"
+                    );
+                });
+            }
+
+            run_shutdown_hooks(&shutdown_hooks).await;
+            shutdown_signal_token.cancel();
+        });
+
+        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+            tracing::error!(error = %error, "startup hook failed");
+            server_shutdown.cancel();
+            server_task.abort();
+            std::process::exit(1);
+        }
+
+        if !state.probes().is_shutting_down() {
+            if !tasks.is_empty() {
+                start_task_scheduler(tasks, &state);
+            }
+            state.probes().mark_startup_complete();
+        }
+
+        let server_result = server_task.await.unwrap_or_else(|e| {
+            tracing::error!("Server task join error: {e}");
+            std::process::exit(1);
+        });
+        shutdown_task.abort();
+        server_result.unwrap_or_else(|e| {
+            tracing::error!("Server error: {e}");
+            std::process::exit(1);
+        });
 
         tracing::info!("Server shut down cleanly");
     }
@@ -609,14 +706,28 @@ impl AppBuilder {
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
     async fn run_build_mode(self) {
-        // Load config (same as normal startup)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
-        crate::logging::init(&config.log);
+        let Self {
+            routes,
+            tasks: _,
+            static_metas,
+            exception_filters: _,
+            scoped_groups: _,
+            merge_routers: _,
+            nest_routers: _,
+            startup_hooks: _,
+            shutdown_hooks: _,
+            extensions: _,
+            error_page_renderer: _,
+            #[cfg(feature = "db")]
+                migrations: _,
+        } = self;
 
-        if self.static_metas.is_empty() {
+        let all_routes = routes;
+
+        // Load config (same as normal startup)
+        let (config, _telemetry_guard) = load_config_and_telemetry();
+
+        if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
             eprintln!("Hint: use .static_routes(static_routes![...]) on your AppBuilder.");
             std::process::exit(1);
@@ -624,39 +735,32 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
-        let state = AppState {
+        let mut state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
+        // run_build_mode used ProbeState::default(), which does not start as pending
+        state.probes = crate::probe::ProbeState::default();
 
         // Build the full router (same as production)
-        let router = build_router(self.routes, &config, state);
+        let router =
+            crate::router::try_build_router(all_routes, &config, state).unwrap_or_else(|error| {
+                eprintln!("Failed to build router: {error}");
+                std::process::exit(1);
+            });
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
 
-        eprintln!("Building {} static route(s)...", self.static_metas.len());
+        eprintln!("Building {} static route(s)...", static_metas.len());
 
-        match crate::static_gen::render_static_routes(router, &self.static_metas, &dist_dir).await {
+        match crate::static_gen::render_static_routes(router, &static_metas, &dist_dir).await {
             Ok(()) => {
                 eprintln!(
                     "\n  \u{2713} Static build complete \u{2192} {}",
@@ -671,11 +775,16 @@ impl AppBuilder {
     }
 }
 
+pub(crate) fn is_static_build_mode() -> bool {
+    std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
 /// Start scheduled tasks in background Tokio tasks.
 ///
 /// Each task runs in its own spawned task with error logging.
 /// Uses simple `tokio::time` for fixed-delay scheduling.
 #[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cognitive_complexity)]
 fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
@@ -701,6 +810,16 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                         tokio::time::sleep(delay).await;
                         tracing::debug!(task = %name, "Running scheduled task");
                         state.task_registry.record_start(&name);
+                        #[cfg(feature = "ws")]
+                        {
+                            let msg = serde_json::json!({
+                                "event": "started",
+                                "task": name,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+                        }
+
                         let start = std::time::Instant::now();
                         match (handler)(state.clone()).await {
                             Ok(()) => {
@@ -708,16 +827,40 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 state.task_registry.record_success(&name, duration_ms);
                                 tracing::debug!(task = %name, "Task completed");
+
+                                #[cfg(feature = "ws")]
+                                {
+                                    let msg = serde_json::json!({
+                                        "event": "success",
+                                        "task": name,
+                                        "duration_ms": duration_ms,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    let _ =
+                                        state.channels().sender("sys:tasks").send(msg.to_string());
+                                }
                             }
                             Err(e) => {
                                 let duration_ms =
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                state.task_registry.record_failure(
-                                    &name,
-                                    duration_ms,
-                                    &e.to_string(),
-                                );
+                                let error_str = e.to_string();
+                                state
+                                    .task_registry
+                                    .record_failure(&name, duration_ms, &error_str);
                                 tracing::warn!(task = %name, error = %e, "Task failed");
+
+                                #[cfg(feature = "ws")]
+                                {
+                                    let msg = serde_json::json!({
+                                        "event": "failure",
+                                        "task": name,
+                                        "duration_ms": duration_ms,
+                                        "error": error_str,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    });
+                                    let _ =
+                                        state.channels().sender("sys:tasks").send(msg.to_string());
+                                }
                             }
                         }
                     }
@@ -738,12 +881,26 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
     }
 }
 
+async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::AutumnResult<()> {
+    for hook in hooks {
+        hook(state.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
+    for hook in hooks.iter().rev() {
+        hook().await;
+    }
+}
+
 /// Log a structured startup transparency report.
 ///
 /// Activated by setting `AUTUMN_SHOW_CONFIG=1` (or `autumn dev --show-config`).
 /// Prints all registered routes, scheduled tasks, active middleware, and
 /// resolved configuration to the `INFO` log so developers can see exactly
 /// what the macros and conventions configured.
+#[allow(clippy::cognitive_complexity)]
 fn log_startup_transparency(
     routes: &[Route],
     tasks: &[crate::task::TaskInfo],
@@ -762,6 +919,72 @@ fn log_startup_transparency(
     tracing::info!("Active middleware: {}", format_middleware_list(config));
 
     tracing::info!("Configuration:{}", format_config_summary(config));
+}
+
+fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    // 1. Load configuration (profile-aware)
+    let config = AutumnConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load configuration: {e}");
+        std::process::exit(1);
+    });
+
+    // 2. Initialize logging/telemetry immediately after config.
+    let telemetry_guard = crate::logging::init_with_telemetry(
+        &config.log,
+        &config.telemetry,
+        config.profile.as_deref(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to initialize telemetry: {error}");
+        std::process::exit(1);
+    });
+
+    (config, telemetry_guard)
+}
+
+#[cfg(feature = "db")]
+fn setup_database(
+    config: &AutumnConfig,
+    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+) -> Result<
+    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    String,
+> {
+    let pool = crate::db::create_pool(&config.database)
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+    if let Some(url) = &config.database.url {
+        for mig in migrations {
+            crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+        }
+    }
+
+    Ok(pool)
+}
+
+fn build_state(
+    config: &AutumnConfig,
+    #[cfg(feature = "db")] pool: Option<
+        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    >,
+) -> AppState {
+    AppState {
+        extensions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        #[cfg(feature = "db")]
+        pool,
+        profile: config.profile.clone(),
+        started_at: std::time::Instant::now(),
+        health_detailed: config.health.detailed,
+        probes: crate::probe::ProbeState::pending_startup(),
+        metrics: crate::middleware::MetricsCollector::new(),
+        log_levels: crate::actuator::LogLevels::new(&config.log.level),
+        task_registry: crate::actuator::TaskRegistry::new(),
+        config_props: crate::actuator::ConfigProperties::from_config(config),
+        #[cfg(feature = "ws")]
+        channels: crate::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    }
 }
 
 /// Build the route listing string for the transparency log.
@@ -789,8 +1012,23 @@ fn format_route_lines(
             );
         }
     }
-    let _ = write!(out, "\n    {} {:<8} -> health", config.health.path, "GET");
-    out.push_str("\n    /actuator/* GET      -> actuator");
+    let mut probe_paths = std::collections::HashSet::new();
+    for (path, name) in [
+        (config.health.live_path.as_str(), "live"),
+        (config.health.ready_path.as_str(), "ready"),
+        (config.health.startup_path.as_str(), "startup"),
+        (config.health.path.as_str(), "health"),
+    ] {
+        if probe_paths.insert(path) {
+            let _ = write!(out, "\n    {} {:<8} -> {}", path, "GET", name);
+        }
+    }
+    let _ = write!(
+        out,
+        "\n    {} {:<8} -> actuator",
+        crate::actuator::actuator_route_glob(&config.actuator.prefix),
+        "GET"
+    );
     #[cfg(feature = "htmx")]
     out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
     out
@@ -835,13 +1073,10 @@ fn format_middleware_list(config: &AutumnConfig) -> String {
 
 /// Mask a database URL password for safe logging.
 fn mask_database_url(url: &str, pool_size: usize) -> String {
-    if let Some(at_pos) = url.find('@') {
-        if let Some(colon_pos) = url[..at_pos].rfind(':') {
-            return format!(
-                "{}:****@{} (pool_size={pool_size})",
-                &url[..colon_pos],
-                &url[at_pos + 1..],
-            );
+    if let Ok(mut parsed_url) = url::Url::parse(url) {
+        if parsed_url.password().is_some() {
+            let _ = parsed_url.set_password(Some("****"));
+            return format!("{parsed_url} (pool_size={pool_size})");
         }
     }
     format!("{url} (pool_size={pool_size})")
@@ -854,6 +1089,16 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         || "not configured".to_owned(),
         |url| mask_database_url(url, config.database.pool_size),
     );
+    let telemetry_status = if config.telemetry.enabled {
+        let endpoint = config
+            .telemetry
+            .otlp_endpoint
+            .as_deref()
+            .unwrap_or("<missing endpoint>");
+        format!("{:?} -> {endpoint}", config.telemetry.protocol)
+    } else {
+        "disabled".to_owned()
+    };
     format!(
         "\
         \n    profile:    {profile}\
@@ -861,6 +1106,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         \n    database:   {db_status}\
         \n    log_level:  {}\
         \n    log_format: {:?}\
+        \n    telemetry:  {telemetry_status}\
         \n    health:     {} (detailed={})\
         \n    actuator:   sensitive={}\
         \n    shutdown:   {}s",
@@ -875,426 +1121,13 @@ fn format_config_summary(config: &AutumnConfig) -> String {
     )
 }
 
-/// Build the fully-configured Axum router from routes, config, and state.
-///
-/// Extracted from `AppBuilder::run` so the router construction logic is
 /// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
 /// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
-fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
+pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
     env.var("AUTUMN_MANIFEST_DIR").map_or_else(
         |_| std::path::PathBuf::from(subdir),
         |d| std::path::PathBuf::from(d).join(subdir),
     )
-}
-
-/// testable without binding a real TCP listener.
-pub fn build_router(
-    route_list: Vec<Route>,
-    config: &AutumnConfig,
-    state: AppState,
-) -> axum::Router {
-    build_router_inner(
-        route_list,
-        config,
-        state,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-}
-
-/// Build a router that includes user-supplied raw Axum routers.
-///
-/// Like [`build_router`], but also merges and nests additional raw
-/// Axum routers. This is primarily useful for integration testing;
-/// in production, use [`AppBuilder::merge`] and [`AppBuilder::nest`].
-pub fn build_router_merged(
-    route_list: Vec<Route>,
-    config: &AutumnConfig,
-    state: AppState,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-) -> axum::Router {
-    build_router_inner(
-        route_list,
-        config,
-        state,
-        Vec::new(),
-        Vec::new(),
-        merge_routers,
-        nest_routers,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_router_inner(
-    route_list: Vec<Route>,
-    config: &AutumnConfig,
-    state: AppState,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-    error_page_renderer: Option<SharedRenderer>,
-) -> axum::Router {
-    // Group routes by path so multiple methods on the same path
-    // (e.g. GET /admin + POST /admin) are merged into a single
-    // MethodRouter. Axum 0.7+ panics if .route() is called twice
-    // with the same path — merging avoids this.
-    let mut grouped: indexmap::IndexMap<&str, axum::routing::MethodRouter<AppState>> =
-        indexmap::IndexMap::new();
-    for route in &route_list {
-        tracing::debug!(
-            method = %route.method,
-            path = route.path,
-            name = route.name,
-            "Mounted route"
-        );
-    }
-    for route in route_list {
-        grouped
-            .entry(route.path)
-            .and_modify(|existing| {
-                *existing = existing.clone().merge(route.handler.clone());
-            })
-            .or_insert(route.handler);
-    }
-
-    let mut router = axum::Router::new();
-    for (path, method_router) in grouped {
-        router = router.route(path, method_router);
-    }
-
-    let dev_reload_enabled = dev::is_enabled();
-
-    // Framework-provided routes
-    #[cfg(feature = "htmx")]
-    {
-        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
-        tracing::debug!(
-            method = "GET",
-            path = "/static/js/htmx.min.js",
-            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-            "Mounted route"
-        );
-    }
-
-    if dev_reload_enabled {
-        router = router.route(
-            dev::LIVE_RELOAD_PATH,
-            axum::routing::get(dev::live_reload_state_handler),
-        );
-        tracing::debug!(
-            path = dev::LIVE_RELOAD_PATH,
-            "Mounted dev live reload endpoint"
-        );
-    }
-
-    // Health check endpoint (auto-mounted)
-    router = router.route(
-        &config.health.path,
-        axum::routing::get(crate::health::handler),
-    );
-    tracing::debug!(path = %config.health.path, "Mounted health check");
-
-    // Actuator endpoints
-    let actuator_sensitive = config.actuator.sensitive;
-    router = router.merge(crate::actuator::actuator_router(actuator_sensitive));
-    tracing::debug!(
-        sensitive = actuator_sensitive,
-        "Mounted actuator endpoints at /actuator/*"
-    );
-
-    // Static file serving from project's static/ directory.
-    let env = crate::config::OsEnv;
-    let static_dir = project_dir("static", &env);
-    router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
-
-    // Mount scoped route groups (each with its own middleware layer).
-    for group in scoped_groups {
-        let mut sub_router = axum::Router::new();
-        for route in group.routes {
-            tracing::debug!(
-                method = %route.method,
-                path = route.path,
-                name = route.name,
-                scope = %group.prefix,
-                "Mounted scoped route"
-            );
-            sub_router = sub_router.route(route.path, route.handler);
-        }
-        sub_router = (group.apply_layer)(sub_router);
-        router = router.nest(&group.prefix, sub_router);
-    }
-
-    // Merge user-supplied raw Axum routers (escape hatch).
-    // Merged after annotated routes so annotated routes take precedence.
-    for raw_router in merge_routers {
-        tracing::debug!("Merged raw Axum router");
-        router = router.merge(raw_router);
-    }
-
-    // Nest user-supplied raw Axum routers under path prefixes.
-    for (prefix, raw_router) in nest_routers {
-        tracing::debug!(prefix = %prefix, "Nested raw Axum router");
-        router = router.nest(&prefix, raw_router);
-    }
-
-    // CORS middleware (only applied when allowed_origins is non-empty)
-    if !config.cors.allowed_origins.is_empty() {
-        let cors = build_cors_layer(&config.cors);
-        tracing::info!(
-            origins = ?config.cors.allowed_origins,
-            credentials = config.cors.allow_credentials,
-            "CORS enabled"
-        );
-        router = router.layer(cors);
-    }
-
-    // CSRF middleware (only applied when enabled)
-    if config.security.csrf.enabled {
-        let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
-        tracing::info!("CSRF protection enabled");
-        router = router.layer(csrf_layer);
-    }
-
-    // Session management layer (always enabled with default in-memory store)
-    let session_layer = crate::session::SessionLayer::new(
-        crate::session::MemoryStore::new(),
-        config.session.clone(),
-    );
-    tracing::debug!("Session management enabled (in-memory store)");
-
-    // Security headers layer (always applied)
-    let security_headers =
-        crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
-    tracing::debug!("Security headers enabled");
-
-    // 404 fallback handler for unmatched routes
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
-
-    // Apply framework middleware. Exception filters wrap outermost so they
-    // see all error responses regardless of scoping or interceptors.
-    let router = router
-        .layer(RequestIdLayer)
-        .layer(security_headers)
-        .layer(session_layer);
-
-    // Error page filter: renders HTML error pages for browser requests.
-    // Always registered (uses default renderer if no custom one is provided).
-    let is_dev = config
-        .profile
-        .as_deref()
-        .map_or(cfg!(debug_assertions), |p| p == "dev");
-    let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
-    let error_page_filter =
-        crate::middleware::error_page_filter::ErrorPageFilter { renderer, is_dev };
-
-    // Combine the error page filter with user exception filters.
-    // The error page filter runs first (innermost), then user filters.
-    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![Arc::new(error_page_filter)];
-    all_filters.extend(exception_filters);
-
-    let count = all_filters.len();
-    tracing::debug!(
-        count,
-        "Registered exception filters (including error page filter)"
-    );
-
-    // Error page context layer must be inner to the exception filter so
-    // WantsHtml is set on the response before the filter inspects it.
-    // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
-    let mut router = router
-        .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
-        .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
-
-    if dev_reload_enabled {
-        router = router
-            .layer(axum::middleware::from_fn(dev::disable_static_cache))
-            .layer(axum::middleware::from_fn(dev::inject_live_reload));
-    }
-
-    router.with_state(state)
-}
-
-/// Build the router with optional static-file-first serving.
-///
-/// If `dist_dir` is `Some` and contains a valid `manifest.json`, the
-/// returned router uses `ServeDir` to serve pre-built HTML files first
-/// and falls back to the dynamic Axum router for any path not found on
-/// disk.  This is the "static-first, SSR-fallback" pattern.
-///
-/// When `dist_dir` is `None` or the manifest is missing, the returned
-/// router is identical to [`build_router`].
-///
-/// This function is public primarily for integration testing.
-pub fn build_router_with_static(
-    route_list: Vec<Route>,
-    config: &AutumnConfig,
-    state: AppState,
-    dist_dir: Option<&std::path::Path>,
-) -> axum::Router {
-    build_router_with_static_inner(
-        route_list,
-        config,
-        state,
-        dist_dir,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_router_with_static_inner(
-    route_list: Vec<Route>,
-    config: &AutumnConfig,
-    state: AppState,
-    dist_dir: Option<&std::path::Path>,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-    error_page_renderer: Option<SharedRenderer>,
-) -> axum::Router {
-    let app_router = build_router_inner(
-        route_list,
-        config,
-        state,
-        exception_filters,
-        scoped_groups,
-        merge_routers,
-        nest_routers,
-        error_page_renderer,
-    );
-
-    let Some(dist) = dist_dir else {
-        return app_router;
-    };
-
-    let Some(layer) = crate::static_gen::StaticFileLayer::new(dist) else {
-        tracing::debug!(
-            dist = %dist.display(),
-            "No valid manifest.json in dist dir; skipping static file layer"
-        );
-        return app_router;
-    };
-
-    // Enable ISR regeneration by attaching the app router to the static layer.
-    // Routes with `revalidate` set will spawn background re-render tasks
-    // when their files become stale.
-    let has_isr = layer
-        .manifest()
-        .routes
-        .values()
-        .any(|e| e.revalidate.is_some());
-    let layer = if has_isr {
-        layer.with_router(app_router.clone())
-    } else {
-        layer
-    };
-
-    for (route, entry) in &layer.manifest().routes {
-        tracing::debug!(
-            route = %route,
-            file = %entry.file,
-            revalidate = ?entry.revalidate,
-            "Static route"
-        );
-    }
-
-    // Store the layer in an Arc so the ISR check middleware can use it.
-    let layer = Arc::new(layer);
-
-    // Mount static files as a fallback on the app router rather than
-    // wrapping the app behind ServeDir. The previous approach
-    // (ServeDir.fallback(app)) caused 405 errors for POST/PUT/DELETE
-    // because ServeDir only handles GET/HEAD — non-GET requests never
-    // reached the app router's fallback.
-    //
-    // With this approach: explicit routes (GET, POST, etc.) always win.
-    // Only requests that match NO dynamic route fall through to ServeDir,
-    // which then serves static files (e.g. /about/ → dist/about/index.html).
-    //
-    // ISR staleness checking: before ServeDir handles the request, we
-    // trigger resolve() on the StaticFileLayer to check for stale pages
-    // and spawn background regeneration tasks if needed.
-    let isr_layer = layer;
-    let serve_dir = tower_http::services::ServeDir::new(dist);
-    app_router
-        .layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let isr_layer = isr_layer.clone();
-                async move {
-                    // Trigger ISR check for GET requests (resolves the path
-                    // and spawns background regeneration if stale)
-                    if req.method() == http::Method::GET {
-                        let _ = isr_layer.resolve(req.uri().path());
-                    }
-                    next.run(req).await
-                }
-            },
-        ))
-        .fallback_service(serve_dir)
-}
-
-/// Build a `tower_http::cors::CorsLayer` from the framework's [`crate::config::CorsConfig`].
-///
-/// Called only when `config.cors.allowed_origins` is non-empty.
-fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::CorsLayer {
-    use http::header::HeaderName;
-    use tower_http::cors::{AllowOrigin, CorsLayer};
-
-    let layer = if cors.allowed_origins.iter().any(|o| o == "*") {
-        CorsLayer::new().allow_origin(AllowOrigin::any())
-    } else {
-        let origins: Vec<http::HeaderValue> = cors
-            .allowed_origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
-        CorsLayer::new().allow_origin(origins)
-    };
-
-    let methods: Vec<http::Method> = cors
-        .allowed_methods
-        .iter()
-        .filter_map(|m| m.parse().ok())
-        .collect();
-
-    let headers: Vec<HeaderName> = cors
-        .allowed_headers
-        .iter()
-        .filter_map(|h| h.parse().ok())
-        .collect();
-
-    layer
-        .allow_methods(methods)
-        .allow_headers(headers)
-        .allow_credentials(cors.allow_credentials)
-        .max_age(std::time::Duration::from_secs(cors.max_age_secs))
-}
-
-#[cfg(feature = "htmx")]
-async fn htmx_handler() -> axum::response::Response {
-    use axum::response::IntoResponse;
-    (
-        [
-            (http::header::CONTENT_TYPE, "application/javascript"),
-            (
-                http::header::CACHE_CONTROL,
-                "public, max-age=31536000, immutable",
-            ),
-        ],
-        crate::htmx::HTMX_JS,
-    )
-        .into_response()
 }
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
@@ -1330,67 +1163,24 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::EnvGuard;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
 
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
-
     /// Helper to build a test router with default config and no database.
-    fn test_router(routes: Vec<Route>) -> axum::Router {
+    pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1400,17 +1190,107 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        build_router(routes, &config, state)
+        crate::router::build_router(routes, &config, state)
     }
 
     /// Helper to create a simple GET route for testing.
-    fn test_get_route(path: &'static str, name: &'static str) -> Route {
+    pub fn test_get_route(path: &'static str, name: &'static str) -> Route {
         Route {
             method: http::Method::GET,
             path,
             handler: axum::routing::get(|| async { "ok" }),
             name,
         }
+    }
+
+    #[test]
+    fn app_builder_routes_adds_routes() {
+        let builder = app();
+        assert_eq!(builder.routes.len(), 0);
+
+        let builder = builder.routes(vec![test_get_route("/1", "route1")]);
+        assert_eq!(builder.routes.len(), 1);
+
+        let builder = builder.routes(vec![
+            test_get_route("/2", "route2"),
+            test_get_route("/3", "route3"),
+        ]);
+        assert_eq!(builder.routes.len(), 3);
+
+        assert_eq!(builder.routes[0].path, "/1");
+        assert_eq!(builder.routes[1].path, "/2");
+        assert_eq!(builder.routes[2].path, "/3");
+    }
+
+    #[test]
+    fn app_builder_extensions_store_and_update_typed_values() {
+        let builder = app()
+            .with_extension::<String>("haunted".into())
+            .update_extension::<String, _, _>(String::new, |value| value.push_str(" harvest"));
+
+        let value = builder
+            .extension::<String>()
+            .expect("string extension should be present");
+        assert_eq!(value, "haunted harvest");
+    }
+
+    #[tokio::test]
+    async fn startup_and_shutdown_hooks_run_in_expected_order() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let startup_events = Arc::clone(&events);
+        let shutdown_a = Arc::clone(&events);
+        let shutdown_b = Arc::clone(&events);
+        let builder = app()
+            .on_startup(move |_state| {
+                let startup_events = Arc::clone(&startup_events);
+                async move {
+                    startup_events
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("start");
+                    Ok(())
+                }
+            })
+            .on_shutdown(move || {
+                let shutdown_a = Arc::clone(&shutdown_a);
+                async move {
+                    shutdown_a
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("stop-a");
+                }
+            })
+            .on_shutdown(move || {
+                let shutdown_b = Arc::clone(&shutdown_b);
+                async move {
+                    shutdown_b
+                        .lock()
+                        .expect("events lock poisoned")
+                        .push("stop-b");
+                }
+            });
+
+        run_startup_hooks(&builder.startup_hooks, AppState::for_test())
+            .await
+            .expect("startup hooks should succeed");
+        run_shutdown_hooks(&builder.shutdown_hooks).await;
+
+        let recorded_events = events.lock().expect("events lock poisoned").clone();
+        assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
+    }
+
+    #[tokio::test]
+    async fn startup_hook_errors_propagate() {
+        let builder = app().on_startup(|_state| async {
+            Err(crate::AutumnError::service_unavailable_msg(
+                "startup ritual failed",
+            ))
+        });
+
+        let error = run_startup_hooks(&builder.startup_hooks, AppState::for_test())
+            .await
+            .expect_err("startup hook should fail");
+        assert!(error.to_string().contains("startup ritual failed"));
     }
 
     #[tokio::test]
@@ -1427,25 +1307,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
-    }
-
-    #[test]
-    fn app_builder_tracks_wasm_metadata() {
-        let app = app()
-            .islands(vec![crate::wasm::IslandMeta {
-                name: "counter",
-                mount_id: "counter-root",
-                props_type: "CounterProps",
-            }])
-            .actions(vec![crate::wasm::ActionMeta {
-                name: "increment",
-                path: "/actions/increment",
-            }]);
-
-        assert_eq!(app.islands.len(), 1);
-        assert_eq!(app.actions.len(), 1);
-        assert_eq!(app.islands[0].mount_id, "counter-root");
-        assert_eq!(app.actions[0].path, "/actions/increment");
     }
 
     #[tokio::test]
@@ -1475,11 +1336,15 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.health.path = "/healthz".to_owned();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1489,7 +1354,8 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router = build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
+        let router =
+            crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
 
         let response = router
             .oneshot(
@@ -1556,11 +1422,15 @@ mod tests {
         }];
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1570,7 +1440,7 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router = build_router(post_routes, &config, state);
+        let router = crate::router::build_router(post_routes, &config, state);
 
         let response = router
             .oneshot(
@@ -1604,11 +1474,15 @@ mod tests {
         ];
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1618,7 +1492,7 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router = build_router(route_list, &config, state);
+        let router = crate::router::build_router(route_list, &config, state);
 
         // GET /admin should return "list"
         let resp = router
@@ -1658,8 +1532,10 @@ mod tests {
     #[cfg(feature = "htmx")]
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
-        let app =
-            axum::Router::new().route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+        let app = axum::Router::new().route(
+            "/static/js/htmx.min.js",
+            axum::routing::get(crate::router::htmx_handler),
+        );
 
         let response = app
             .oneshot(
@@ -1762,11 +1638,15 @@ mod tests {
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1776,15 +1656,15 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router = build_router_with_static(
+        let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
             &config,
             state,
             Some(dist.as_path()),
         );
 
-        // GET /docs/ should serve the static file via ServeDir fallback
-        // (no dynamic route competes for this path).
+        // GET /docs/ should serve the pre-built HTML via static-first
+        // middleware (manifest lookup with trailing-slash normalization).
         let response = router
             .oneshot(
                 Request::builder()
@@ -1800,6 +1680,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "<h1>Static Docs</h1>");
+    }
+
+    #[tokio::test]
+    async fn build_mode_static_rendering_bypasses_startup_barrier() {
+        let _env = EnvGuard::set_many(&[("AUTUMN_BUILD_STATIC", Some("1"))]);
+        let config = AutumnConfig::default();
+        let state = AppState::for_test().with_startup_complete(false);
+        let router = crate::router::build_router(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/about",
+                handler: axum::routing::get(|| async { "About Page Content" }),
+                name: "about",
+            }],
+            &config,
+            state,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+
+        let result = crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/about",
+                name: "about",
+                revalidate: None,
+                params_fn: None,
+            }],
+            &dist,
+        )
+        .await;
+
+        assert!(result.is_ok(), "build failed: {:?}", result.err());
+        let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
+        assert_eq!(html, "About Page Content");
     }
 
     #[tokio::test]
@@ -1929,13 +1844,17 @@ mod tests {
     }
 
     /// Helper to build a test router with custom config.
-    fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
+    pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -1945,7 +1864,7 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        build_router(routes, config, state)
+        crate::router::build_router(routes, config, state)
     }
 
     #[tokio::test]
@@ -2066,11 +1985,15 @@ mod tests {
 
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -2080,7 +2003,7 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router = build_router_with_static(
+        let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
             &config,
             state,
@@ -2099,11 +2022,15 @@ mod tests {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -2113,8 +2040,12 @@ mod tests {
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
-        let router =
-            build_router_with_static(vec![test_get_route("/test", "test")], &config, state, None);
+        let router = crate::router::build_router_with_static(
+            vec![test_get_route("/test", "test")],
+            &config,
+            state,
+            None,
+        );
 
         let response = router
             .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
@@ -2140,11 +2071,12 @@ mod tests {
     }
 
     #[test]
-    fn format_route_lines_includes_framework_routes() {
-        let config = AutumnConfig::default();
+    fn config_runtime_drift_format_route_lines_uses_actuator_prefix() {
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/ops".to_owned();
         let output = format_route_lines(&[], &[], &config);
         assert!(output.contains("-> health"));
-        assert!(output.contains("/actuator/*"));
+        assert!(output.contains("/ops/*"));
     }
 
     #[test]
@@ -2229,6 +2161,25 @@ mod tests {
     }
 
     #[test]
+    fn mask_database_url_edge_cases() {
+        // Special chars in password
+        // The url crate parses `p@ssw:rd!` where `@` creates problems if unencoded,
+        // but url crate seems to treat `user:p` as auth and `@ssw:rd!` as host if it's poorly formed,
+        // let's stick to valid URL formats for testing.
+
+        // URL encoded characters
+        let masked2 = mask_database_url("postgres://user:p%40ssw%3Ard%21@localhost:5432/mydb", 10);
+        assert!(masked2.contains("****"));
+        assert!(!masked2.contains("p%40ssw%3Ard%21"));
+        assert!(masked2.contains("postgres://user:****@localhost:5432/mydb"));
+
+        // No user, just password
+        let masked3 = mask_database_url("postgres://:secret@localhost:5432/mydb", 10);
+        assert!(masked3.contains("****"));
+        assert!(!masked3.contains("secret"));
+        assert!(masked3.contains("postgres://:****@localhost:5432/mydb"));
+    }
+    #[test]
     fn format_config_summary_defaults() {
         let config = AutumnConfig::default();
         let output = format_config_summary(&config);
@@ -2236,6 +2187,7 @@ mod tests {
         assert!(output.contains("server:     127.0.0.1:3000"));
         assert!(output.contains("database:   not configured"));
         assert!(output.contains("log_level:"));
+        assert!(output.contains("telemetry:  disabled"));
         assert!(output.contains("health:     /health"));
     }
 
@@ -2266,6 +2218,21 @@ mod tests {
     }
 
     #[test]
+    fn format_config_summary_with_telemetry() {
+        let config = AutumnConfig {
+            telemetry: crate::config::TelemetryConfig {
+                enabled: true,
+                service_name: "orders-api".into(),
+                otlp_endpoint: Some("http://otel-collector:4317".into()),
+                ..crate::config::TelemetryConfig::default()
+            },
+            ..AutumnConfig::default()
+        };
+        let output = format_config_summary(&config);
+        assert!(output.contains("telemetry:  Grpc -> http://otel-collector:4317"));
+    }
+
+    #[test]
     fn log_startup_transparency_runs_without_panic() {
         // Exercises the tracing::info! calls inside log_startup_transparency.
         // No subscriber installed, so output is discarded -- we just verify
@@ -2285,5 +2252,111 @@ mod tests {
         let routes = vec![test_get_route("/health", "check")];
         let config = AutumnConfig::default();
         log_startup_transparency(&routes, &[], &[], &config);
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn start_task_scheduler_broadcasts_events() {
+        let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            channels: crate::channels::Channels::new(32),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let mut rx = state.channels().subscribe("sys:tasks");
+
+        let task = crate::task::TaskInfo {
+            name: "test_broadcaster".into(),
+            // 1ms delay so it fires immediately
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            handler: |_| Box::pin(async { Ok(()) }),
+        };
+
+        // Start scheduler in background so we don't block
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            super::start_task_scheduler(vec![task], &state_clone);
+        });
+
+        // First message should be "started"
+        let msg1 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for start event")
+            .expect("channel closed");
+        let json1: serde_json::Value = serde_json::from_str(msg1.as_str()).unwrap();
+        assert_eq!(json1["event"], "started");
+        assert_eq!(json1["task"], "test_broadcaster");
+
+        // Second message should be "success"
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for success event")
+            .expect("channel closed");
+        let json2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
+        assert_eq!(json2["event"], "success");
+        assert_eq!(json2["task"], "test_broadcaster");
+        assert!(json2.get("duration_ms").is_some());
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn start_task_scheduler_broadcasts_failure_events() {
+        let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            #[cfg(feature = "db")]
+            pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: true,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            channels: crate::channels::Channels::new(32),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let mut rx = state.channels().subscribe("sys:tasks");
+
+        let task = crate::task::TaskInfo {
+            name: "test_failing_task".into(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            handler: |_| {
+                Box::pin(async { Err(crate::AutumnError::bad_request_msg("forced error")) })
+            },
+        };
+
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            super::start_task_scheduler(vec![task], &state_clone);
+        });
+
+        // First message: started
+        let _ = rx.recv().await.unwrap();
+
+        // Second message: failure
+        let msg2 = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for failure event")
+            .expect("channel closed");
+        let json2: serde_json::Value = serde_json::from_str(msg2.as_str()).unwrap();
+        assert_eq!(json2["event"], "failure");
+        assert_eq!(json2["task"], "test_failing_task");
+        assert_eq!(json2["error"], "forced error");
     }
 }

@@ -43,13 +43,34 @@
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
+//! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
+//! | `AUTUMN_TELEMETRY__SERVICE_NAME` | `telemetry.service_name` | `String` |
+//! | `AUTUMN_TELEMETRY__SERVICE_NAMESPACE` | `telemetry.service_namespace` | `String` |
+//! | `AUTUMN_TELEMETRY__SERVICE_VERSION` | `telemetry.service_version` | `String` |
+//! | `AUTUMN_TELEMETRY__ENVIRONMENT` | `telemetry.environment` | `String` |
+//! | `AUTUMN_TELEMETRY__OTLP_ENDPOINT` | `telemetry.otlp_endpoint` | `String` |
+//! | `AUTUMN_TELEMETRY__PROTOCOL` | `telemetry.protocol` | `Grpc` / `HttpProtobuf` |
+//! | `AUTUMN_TELEMETRY__STRICT` | `telemetry.strict` | `bool` |
 //! | `AUTUMN_HEALTH__PATH` | `health.path` | `String` |
+//! | `AUTUMN_HEALTH__LIVE_PATH` | `health.live_path` | `String` |
+//! | `AUTUMN_HEALTH__READY_PATH` | `health.ready_path` | `String` |
+//! | `AUTUMN_HEALTH__STARTUP_PATH` | `health.startup_path` | `String` |
 //! | `AUTUMN_HEALTH__DETAILED` | `health.detailed` | `bool` |
 //! | `AUTUMN_CORS__ALLOWED_ORIGINS` | `cors.allowed_origins` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_METHODS` | `cors.allowed_methods` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOW_CREDENTIALS` | `cors.allow_credentials` | `bool` |
 //! | `AUTUMN_CORS__MAX_AGE_SECS` | `cors.max_age_secs` | `u64` |
+//! | `AUTUMN_SESSION__BACKEND` | `session.backend` | `memory` / `redis` |
+//! | `AUTUMN_SESSION__COOKIE_NAME` | `session.cookie_name` | `String` |
+//! | `AUTUMN_SESSION__MAX_AGE_SECS` | `session.max_age_secs` | `u64` |
+//! | `AUTUMN_SESSION__SECURE` | `session.secure` | `bool` |
+//! | `AUTUMN_SESSION__SAME_SITE` | `session.same_site` | `String` |
+//! | `AUTUMN_SESSION__HTTP_ONLY` | `session.http_only` | `bool` |
+//! | `AUTUMN_SESSION__PATH` | `session.path` | `String` |
+//! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
+//! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
+//! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -130,7 +151,10 @@ fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
 /// Returns `Ok(None)` if the file doesn't exist.
 fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents.parse::<toml::Value>()?)),
+        Ok(contents) => {
+            let table = toml::from_str::<toml::Table>(&contents)?;
+            Ok(Some(toml::Value::Table(table)))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ConfigError::Io(e)),
     }
@@ -141,7 +165,7 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
 /// 1. `AUTUMN_PROFILE` env var (highest priority)
 /// 2. `--profile <name>` CLI flag
 /// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
-fn resolve_profile(env: &dyn Env) -> Option<String> {
+pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
     // 1. Env var
     if let Ok(profile) = env.var("AUTUMN_PROFILE") {
         if !profile.is_empty() {
@@ -185,6 +209,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             log.insert("format".into(), "Pretty".into());
             table.insert("log".into(), toml::Value::Table(log));
 
+            let mut telemetry = toml::map::Map::new();
+            telemetry.insert("environment".into(), "development".into());
+            table.insert("telemetry".into(), toml::Value::Table(telemetry));
+
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "127.0.0.1".into());
             server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
@@ -212,6 +240,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             log.insert("level".into(), "info".into());
             log.insert("format".into(), "Json".into());
             table.insert("log".into(), toml::Value::Table(log));
+
+            let mut telemetry = toml::map::Map::new();
+            telemetry.insert("environment".into(), "production".into());
+            table.insert("telemetry".into(), toml::Value::Table(telemetry));
 
             let mut server = toml::map::Map::new();
             server.insert("host".into(), "0.0.0.0".into());
@@ -262,20 +294,22 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
         return;
     }
 
-    if base.is_table() && overlay.is_table() {
-        if let toml::Value::Table(overlay_table) = overlay {
-            let base_table = base.as_table_mut().expect("checked is_table above");
-            for (key, overlay_val) in overlay_table {
-                if overlay_val.is_table() {
-                    if let Some(base_val) = base_table.get_mut(&key) {
-                        if base_val.is_table() {
-                            deep_merge_with_depth(base_val, overlay_val, depth + 1);
-                            continue;
-                        }
-                    }
-                }
-                base_table.insert(key, overlay_val);
-            }
+    let toml::Value::Table(overlay_table) = overlay else {
+        return;
+    };
+    let Some(base_table) = base.as_table_mut() else {
+        return;
+    };
+
+    for (key, overlay_val) in overlay_table {
+        let is_recursive_merge =
+            overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
+
+        if is_recursive_merge {
+            let base_val = base_table.get_mut(&key).unwrap();
+            deep_merge_with_depth(base_val, overlay_val, depth + 1);
+        } else {
+            base_table.insert(key, overlay_val);
         }
     }
 }
@@ -305,15 +339,18 @@ fn warn_profile_typo(profile: &str) {
 }
 
 /// Levenshtein edit distance between two strings.
+///
+/// ⚡ Bolt Optimization:
+/// Avoids allocating two `Vec<char>` buffers by iterating directly over `Chars`.
+/// While this re-evaluates UTF-8 boundaries in the inner loop, avoiding the heap
+/// allocations is typically faster for the short strings compared here (e.g., config profile typos).
 fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let n = b.len();
+    let n = b.chars().count();
     let mut prev = (0..=n).collect::<Vec<_>>();
     let mut curr = vec![0; n + 1];
-    for (i, a_ch) in a.iter().enumerate() {
+    for (i, a_ch) in a.chars().enumerate() {
         curr[0] = i + 1;
-        for (j, b_ch) in b.iter().enumerate() {
+        for (j, b_ch) in b.chars().enumerate() {
             let cost = usize::from(a_ch != b_ch);
             curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
         }
@@ -398,6 +435,10 @@ pub struct AutumnConfig {
     /// Logging configuration (level, format).
     #[serde(default)]
     pub log: LogConfig,
+
+    /// Telemetry configuration (OTLP tracing and service metadata).
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 
     /// Health check endpoint settings.
     #[serde(default)]
@@ -491,7 +532,7 @@ impl AutumnConfig {
         // Layer 5: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
-        config.database.validate()?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -507,10 +548,35 @@ impl AutumnConfig {
     /// [`ConfigError::Parse`] if the file contains invalid TOML.
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
-            Ok(contents) => Ok(toml::from_str(&contents)?),
+            Ok(contents) => {
+                let config: Self = toml::from_str(&contents)?;
+                config.validate()?;
+                Ok(config)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(ConfigError::Io(e)),
         }
+    }
+
+    /// Validate the resolved configuration for semantic errors.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Validation`] when a field combination is
+    /// syntactically well-formed TOML but semantically invalid.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.database.validate()?;
+        match self.session.backend_plan(self.profile.as_deref()) {
+            Ok(crate::session::SessionBackendPlan::Memory {
+                warn_in_production: true,
+            }) => eprintln!(
+                "Warning: prod profile is using in-memory sessions. Configure \
+                 `session.backend = \"redis\"` or set \
+                 `session.allow_memory_in_production = true` to acknowledge the risk."
+            ),
+            Ok(_) => {}
+            Err(error) => return Err(ConfigError::Validation(error.to_string())),
+        }
+        Ok(())
     }
 
     /// Apply environment variable overrides to the loaded config.
@@ -532,15 +598,40 @@ impl AutumnConfig {
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
     /// - `AUTUMN_LOG__FORMAT` → `log.format` (Auto | Pretty | Json)
     ///
-    /// # Health
+    /// # Telemetry
+    /// - `AUTUMN_TELEMETRY__ENABLED` -> `telemetry.enabled` (bool)
+    /// - `AUTUMN_TELEMETRY__SERVICE_NAME` -> `telemetry.service_name` (String)
+    /// - `AUTUMN_TELEMETRY__SERVICE_NAMESPACE` -> `telemetry.service_namespace` (String)
+    /// - `AUTUMN_TELEMETRY__SERVICE_VERSION` -> `telemetry.service_version` (String)
+    /// - `AUTUMN_TELEMETRY__ENVIRONMENT` -> `telemetry.environment` (String)
+    /// - `AUTUMN_TELEMETRY__OTLP_ENDPOINT` -> `telemetry.otlp_endpoint` (String)
+    /// - `AUTUMN_TELEMETRY__PROTOCOL` -> `telemetry.protocol` (`Grpc` | `HttpProtobuf`)
+    /// - `AUTUMN_TELEMETRY__STRICT` -> `telemetry.strict` (bool)
+    ///
+    /// # Health / Probes
     /// - `AUTUMN_HEALTH__PATH` → `health.path` (String)
+    /// - `AUTUMN_HEALTH__LIVE_PATH` → `health.live_path` (String)
+    /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
+    /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
+    /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
 
     /// Apply environment overrides using the provided env abstraction.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
-        // ── Server ──────────────────────────────────────────────
+        self.apply_server_env_overrides_with_env(env);
+        self.apply_database_env_overrides_with_env(env);
+        self.apply_log_env_overrides_with_env(env);
+        self.apply_telemetry_env_overrides_with_env(env);
+        self.apply_health_env_overrides_with_env(env);
+        self.apply_cors_env_overrides_with_env(env);
+        self.apply_session_env_overrides_with_env(env);
+        self.apply_auth_env_overrides_with_env(env);
+        self.apply_security_env_overrides_with_env(env);
+    }
+
+    fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_SERVER__PORT", &mut self.server.port);
         parse_env_string(env, "AUTUMN_SERVER__HOST", &mut self.server.host);
         parse_env(
@@ -548,8 +639,9 @@ impl AutumnConfig {
             "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
             &mut self.server.shutdown_timeout_secs,
         );
+    }
 
-        // ── Database ────────────────────────────────────────────
+    fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
@@ -563,8 +655,9 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
         );
+    }
 
-        // ── Log ─────────────────────────────────────────────────
+    fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(env, "AUTUMN_LOG__LEVEL", &mut self.log.level);
         if let Ok(val) = env.var("AUTUMN_LOG__FORMAT") {
             match val.as_str() {
@@ -577,12 +670,65 @@ impl AutumnConfig {
                 ),
             }
         }
+    }
 
+    fn apply_telemetry_env_overrides_with_env(&mut self, env: &dyn Env) {
         // ── Health ──────────────────────────────────────────────
-        parse_env_string(env, "AUTUMN_HEALTH__PATH", &mut self.health.path);
-        parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+        parse_env_bool(
+            env,
+            "AUTUMN_TELEMETRY__ENABLED",
+            &mut self.telemetry.enabled,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_TELEMETRY__SERVICE_NAME",
+            &mut self.telemetry.service_name,
+        );
+        if let Ok(val) = env.var("AUTUMN_TELEMETRY__SERVICE_NAMESPACE") {
+            self.telemetry.service_namespace = if val.is_empty() { None } else { Some(val) };
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_TELEMETRY__SERVICE_VERSION",
+            &mut self.telemetry.service_version,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_TELEMETRY__ENVIRONMENT",
+            &mut self.telemetry.environment,
+        );
+        if let Ok(val) = env.var("AUTUMN_TELEMETRY__OTLP_ENDPOINT") {
+            self.telemetry.otlp_endpoint = if val.is_empty() { None } else { Some(val) };
+        }
+        if let Ok(val) = env.var("AUTUMN_TELEMETRY__PROTOCOL") {
+            match TelemetryProtocol::from_env_value(&val) {
+                Some(protocol) => self.telemetry.protocol = protocol,
+                None => eprintln!(
+                    "Warning: AUTUMN_TELEMETRY__PROTOCOL={val:?} is not valid \
+                     (expected Grpc or HttpProtobuf), ignoring"
+                ),
+            }
+        }
+        parse_env_bool(env, "AUTUMN_TELEMETRY__STRICT", &mut self.telemetry.strict);
+    }
 
-        // ── CORS ────────────────────────────────────────────────
+    fn apply_health_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_HEALTH__PATH", &mut self.health.path);
+        parse_env_string(env, "AUTUMN_HEALTH__LIVE_PATH", &mut self.health.live_path);
+        parse_env_string(
+            env,
+            "AUTUMN_HEALTH__READY_PATH",
+            &mut self.health.ready_path,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_HEALTH__STARTUP_PATH",
+            &mut self.health.startup_path,
+        );
+        parse_env_bool(env, "AUTUMN_HEALTH__DETAILED", &mut self.health.detailed);
+    }
+
+    fn apply_cors_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_csv(
             env,
             "AUTUMN_CORS__ALLOWED_ORIGINS",
@@ -608,13 +754,23 @@ impl AutumnConfig {
             "AUTUMN_CORS__MAX_AGE_SECS",
             &mut self.cors.max_age_secs,
         );
+    }
 
-        // ── Session ────────────────────────────────────────────
+    fn apply_session_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(
             env,
             "AUTUMN_SESSION__COOKIE_NAME",
             &mut self.session.cookie_name,
         );
+        if let Ok(val) = env.var("AUTUMN_SESSION__BACKEND") {
+            match crate::session::SessionBackend::from_env_value(&val) {
+                Some(backend) => self.session.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_SESSION__BACKEND={val:?} is not valid \
+                     (expected memory or redis), ignoring"
+                ),
+            }
+        }
         parse_env(
             env,
             "AUTUMN_SESSION__MAX_AGE_SECS",
@@ -626,13 +782,30 @@ impl AutumnConfig {
             "AUTUMN_SESSION__SAME_SITE",
             &mut self.session.same_site,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_SESSION__HTTP_ONLY",
+            &mut self.session.http_only,
+        );
+        parse_env_string(env, "AUTUMN_SESSION__PATH", &mut self.session.path);
+        parse_env_bool(
+            env,
+            "AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION",
+            &mut self.session.allow_memory_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_SESSION__REDIS__URL") {
+            self.session.redis.url = if val.is_empty() { None } else { Some(val) };
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_SESSION__REDIS__KEY_PREFIX",
+            &mut self.session.redis.key_prefix,
+        );
+    }
 
-        // ── Auth ───────────────────────────────────────────────
+    fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
-
-        // ── Security ────────────────────────────────────────
-        self.apply_security_env_overrides_with_env(env);
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
@@ -779,7 +952,8 @@ pub struct DatabaseConfig {
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
 
-    /// Seconds to wait when acquiring a connection from the pool.
+    /// Seconds to wait while acquiring a pooled connection, including
+    /// creating a new connection when the pool grows.
     /// Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
@@ -860,6 +1034,72 @@ pub enum LogFormat {
     Json,
 }
 
+/// Telemetry configuration.
+///
+/// Controls whether Autumn enables OTLP trace export and how the process
+/// identifies itself in resource metadata.
+#[derive(Debug, Deserialize)]
+pub struct TelemetryConfig {
+    /// Enable framework-managed telemetry. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Logical service name. Default: `"autumn-app"`.
+    #[serde(default = "default_telemetry_service_name")]
+    pub service_name: String,
+
+    /// Optional service namespace (e.g. team, domain, or product family).
+    #[serde(default)]
+    pub service_namespace: Option<String>,
+
+    /// Service version string advertised in resource metadata.
+    #[serde(default = "default_telemetry_service_version")]
+    pub service_version: String,
+
+    /// Deployment environment label for trace resource metadata.
+    #[serde(default = "default_telemetry_environment")]
+    pub environment: String,
+
+    /// OTLP collector endpoint. Required when telemetry is enabled.
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+
+    /// OTLP transport protocol. Default: [`TelemetryProtocol::Grpc`].
+    #[serde(default)]
+    pub protocol: TelemetryProtocol,
+
+    /// When `true`, telemetry initialization failures abort startup.
+    #[serde(default)]
+    pub strict: bool,
+}
+
+/// OTLP transport protocol selection.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub enum TelemetryProtocol {
+    /// OTLP over gRPC.
+    #[serde(alias = "grpc", alias = "GRPC")]
+    #[default]
+    Grpc,
+    /// OTLP over HTTP/protobuf.
+    #[serde(
+        alias = "http-protobuf",
+        alias = "http_protobuf",
+        alias = "HTTP_PROTOBUF"
+    )]
+    HttpProtobuf,
+}
+
+impl TelemetryProtocol {
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value {
+            "Grpc" | "grpc" | "GRPC" => Some(Self::Grpc),
+            "HttpProtobuf" | "http-protobuf" | "http_protobuf" | "HTTP_PROTOBUF"
+            | "httpprotobuf" => Some(Self::HttpProtobuf),
+            _ => None,
+        }
+    }
+}
+
 /// Health check endpoint configuration.
 ///
 /// The health check is automatically mounted by [`AppBuilder::run`](crate::app::AppBuilder::run).
@@ -872,15 +1112,30 @@ pub enum LogFormat {
 ///
 /// let health = HealthConfig::default();
 /// assert_eq!(health.path, "/health");
+/// assert_eq!(health.live_path, "/live");
+/// assert_eq!(health.ready_path, "/ready");
+/// assert_eq!(health.startup_path, "/startup");
 /// assert!(!health.detailed);
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct HealthConfig {
-    /// URL path for the health check endpoint. Default: `"/health"`.
+    /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
-    /// Common alternatives: `"/healthz"`, `"/_health"`, `"/ready"`.
+    /// Common alternatives: `"/healthz"`, `"/_health"`.
     #[serde(default = "default_health_path")]
     pub path: String,
+
+    /// URL path for the liveness probe. Default: `"/live"`.
+    #[serde(default = "default_live_path")]
+    pub live_path: String,
+
+    /// URL path for the readiness probe. Default: `"/ready"`.
+    #[serde(default = "default_ready_path")]
+    pub ready_path: String,
+
+    /// URL path for the startup probe. Default: `"/startup"`.
+    #[serde(default = "default_startup_path")]
+    pub startup_path: String,
 
     /// When `true`, the health endpoint includes detailed info (profile,
     /// uptime, pool stats). Default: `false` (overridden to `true` for
@@ -1074,8 +1329,32 @@ fn default_log_level() -> String {
     "info".to_owned()
 }
 
+fn default_telemetry_service_name() -> String {
+    "autumn-app".to_owned()
+}
+
+fn default_telemetry_service_version() -> String {
+    "unknown".to_owned()
+}
+
+fn default_telemetry_environment() -> String {
+    "development".to_owned()
+}
+
 fn default_health_path() -> String {
     "/health".to_owned()
+}
+
+fn default_live_path() -> String {
+    "/live".to_owned()
+}
+
+fn default_ready_path() -> String {
+    "/ready".to_owned()
+}
+
+fn default_startup_path() -> String {
+    "/startup".to_owned()
 }
 
 // ── Default trait impls ────────────────────────────────────────────
@@ -1109,10 +1388,28 @@ impl Default for LogConfig {
     }
 }
 
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: default_telemetry_service_name(),
+            service_namespace: None,
+            service_version: default_telemetry_service_version(),
+            environment: default_telemetry_environment(),
+            otlp_endpoint: None,
+            protocol: TelemetryProtocol::default(),
+            strict: false,
+        }
+    }
+}
+
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             path: default_health_path(),
+            live_path: default_live_path(),
+            ready_path: default_ready_path(),
+            startup_path: default_startup_path(),
             detailed: false,
         }
     }
@@ -1139,6 +1436,100 @@ mod tests {
     }
 
     #[test]
+    fn database_validate_none_url_is_ok() {
+        let config = DatabaseConfig {
+            url: None,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_postgres_url_is_ok() {
+        let config = DatabaseConfig {
+            url: Some("postgres://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_postgresql_url_is_ok() {
+        let config = DatabaseConfig {
+            url: Some("postgresql://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_validate_invalid_url_is_err() {
+        let config = DatabaseConfig {
+            url: Some("mysql://user:pass@localhost/db".to_string()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        if let Err(ConfigError::Validation(msg)) = result {
+            assert!(msg.contains("Invalid database URL"));
+            assert!(msg.contains("must start with postgres:// or postgresql://"));
+        } else {
+            panic!("Expected ConfigError::Validation");
+        }
+    }
+
+    #[test]
+    fn database_validate_url_edge_cases() {
+        let invalid_urls = vec![
+            "POSTGRES://localhost/db",
+            "postgres:/localhost/db",
+            "postgres:localhost/db",
+            "http://postgres",
+            "   postgres://localhost/db",
+            "",
+        ];
+
+        for invalid_url in invalid_urls {
+            let config = DatabaseConfig {
+                url: Some(invalid_url.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "URL should be invalid: {invalid_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn autumn_config_validate_ok() {
+        let config = AutumnConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn autumn_config_validate_session_err() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = None;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        if let Err(ConfigError::Validation(msg)) = result {
+            assert!(msg.contains("session.backend=redis requires session.redis.url"));
+        } else {
+            panic!("Expected ConfigError::Validation");
+        }
+    }
+
+    #[test]
+    fn autumn_config_validate_database_err() {
+        let mut config = AutumnConfig::default();
+        config.database.url = Some("mysql://localhost/test".to_string());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn log_defaults() {
         let config = LogConfig::default();
         assert_eq!(config.level, "info");
@@ -1146,9 +1537,25 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_defaults() {
+        let config = TelemetryConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.service_name, "autumn-app");
+        assert!(config.service_namespace.is_none());
+        assert_eq!(config.service_version, "unknown");
+        assert_eq!(config.environment, "development");
+        assert!(config.otlp_endpoint.is_none());
+        assert_eq!(config.protocol, TelemetryProtocol::Grpc);
+        assert!(!config.strict);
+    }
+
+    #[test]
     fn health_defaults() {
         let config = HealthConfig::default();
         assert_eq!(config.path, "/health");
+        assert_eq!(config.live_path, "/live");
+        assert_eq!(config.ready_path, "/ready");
+        assert_eq!(config.startup_path, "/startup");
         assert!(!config.detailed);
     }
 
@@ -1397,11 +1804,61 @@ path = "/healthz"
     // ── Health env override tests ────────────────────────────────
 
     #[test]
+    fn env_override_telemetry_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_TELEMETRY__ENABLED", "true")
+            .with("AUTUMN_TELEMETRY__SERVICE_NAME", "orders-api")
+            .with("AUTUMN_TELEMETRY__SERVICE_NAMESPACE", "acme")
+            .with("AUTUMN_TELEMETRY__SERVICE_VERSION", "1.2.3")
+            .with("AUTUMN_TELEMETRY__ENVIRONMENT", "production")
+            .with(
+                "AUTUMN_TELEMETRY__OTLP_ENDPOINT",
+                "http://otel-collector:4317",
+            )
+            .with("AUTUMN_TELEMETRY__PROTOCOL", "HTTP_PROTOBUF")
+            .with("AUTUMN_TELEMETRY__STRICT", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.telemetry.enabled);
+        assert_eq!(config.telemetry.service_name, "orders-api");
+        assert_eq!(config.telemetry.service_namespace.as_deref(), Some("acme"));
+        assert_eq!(config.telemetry.service_version, "1.2.3");
+        assert_eq!(config.telemetry.environment, "production");
+        assert_eq!(
+            config.telemetry.otlp_endpoint.as_deref(),
+            Some("http://otel-collector:4317")
+        );
+        assert_eq!(config.telemetry.protocol, TelemetryProtocol::HttpProtobuf);
+        assert!(config.telemetry.strict);
+    }
+
+    #[test]
+    fn env_override_invalid_telemetry_protocol_ignored() {
+        let env = MockEnv::new().with("AUTUMN_TELEMETRY__PROTOCOL", "zipkin");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.telemetry.protocol, TelemetryProtocol::Grpc);
+    }
+
+    #[test]
     fn env_override_health_path() {
         let env = MockEnv::new().with("AUTUMN_HEALTH__PATH", "/healthz");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.health.path, "/healthz");
+    }
+
+    #[test]
+    fn env_override_probe_paths() {
+        let env = MockEnv::new()
+            .with("AUTUMN_HEALTH__LIVE_PATH", "/livez")
+            .with("AUTUMN_HEALTH__READY_PATH", "/readyz")
+            .with("AUTUMN_HEALTH__STARTUP_PATH", "/startupz");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.health.live_path, "/livez");
+        assert_eq!(config.health.ready_path, "/readyz");
+        assert_eq!(config.health.startup_path, "/startupz");
     }
 
     // ── Precedence test ──────────────────────────────────────────
@@ -1492,6 +1949,7 @@ path = "/healthz"
         assert_eq!(config.log.format, LogFormat::Pretty);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.shutdown_timeout_secs, 1);
+        assert_eq!(config.telemetry.environment, "development");
         assert!(config.health.detailed);
         assert_eq!(config.cors.allowed_origins, vec!["*"]);
     }
@@ -1506,6 +1964,7 @@ path = "/healthz"
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.shutdown_timeout_secs, 30);
+        assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
     }
 

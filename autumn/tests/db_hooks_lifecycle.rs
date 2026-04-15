@@ -1,7 +1,7 @@
 //! Database-level integration tests for mutation hook lifecycle.
 //!
 //! These tests spin up a real Postgres instance via testcontainers and validate
-//! that before/after hooks integrate correctly with actual database operations.
+//! that before hooks integrate correctly with actual database operations.
 //!
 //! **Requires Docker** to be running.
 
@@ -10,7 +10,7 @@ use autumn_web::hooks::{MutationContext, MutationHooks, MutationOp, UpdateDraft}
 use diesel::prelude::*;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -88,43 +88,6 @@ impl MutationHooks for RejectEmptyTitleHooks {
             ));
         }
         Ok(())
-    }
-}
-
-/// Always fails in `after_create` to test transaction rollback.
-#[derive(Clone, Default)]
-struct FailAfterCreateHooks;
-
-impl MutationHooks for FailAfterCreateHooks {
-    type Model = Article;
-    type NewModel = NewArticle;
-    type UpdateModel = ();
-
-    async fn after_create(
-        &self,
-        _ctx: &MutationContext,
-        _record: &Article,
-        _conn: &mut AsyncPgConnection,
-    ) -> AutumnResult<()> {
-        Err(autumn_web::AutumnError::bad_request_msg(
-            "after_create intentionally failed",
-        ))
-    }
-}
-
-/// Always fails in `after_commit` to test that committed data persists.
-#[derive(Clone, Default)]
-struct FailAfterCommitHooks;
-
-impl MutationHooks for FailAfterCommitHooks {
-    type Model = Article;
-    type NewModel = NewArticle;
-    type UpdateModel = ();
-
-    async fn after_commit(&self, _ctx: &MutationContext, _op: MutationOp) -> AutumnResult<()> {
-        Err(autumn_web::AutumnError::bad_request_msg(
-            "after_commit intentionally failed",
-        ))
     }
 }
 
@@ -248,102 +211,6 @@ async fn before_create_rejection_prevents_insert() {
         .await
         .unwrap();
     assert_eq!(count, 0);
-}
-
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
-async fn after_create_rejection_rolls_back() {
-    use diesel_async::scoped_futures::ScopedFutureExt;
-
-    let (pool, _container) = setup_pool().await;
-    let mut conn = pool.get().await.unwrap();
-
-    let hooks = FailAfterCreateHooks;
-    let ctx = MutationContext::new(MutationOp::Create);
-
-    // Wrap insert + after_create in a transaction.
-    let result: Result<Article, diesel::result::Error> = conn
-        .transaction::<Article, diesel::result::Error, _>(|conn| {
-            let hooks = hooks.clone();
-            let ctx = ctx.clone();
-            async move {
-                let record: Article = diesel::insert_into(test_articles::table)
-                    .values(&NewArticle {
-                        title: "Transactional".into(),
-                        slug: "transactional".into(),
-                        status: "draft".into(),
-                    })
-                    .get_result(conn)
-                    .await?;
-
-                // after_create returns Err -> we map to diesel error to trigger rollback.
-                if let Err(_e) = hooks.after_create(&ctx, &record, conn).await {
-                    return Err(diesel::result::Error::RollbackTransaction);
-                }
-
-                Ok(record)
-            }
-            .scope_boxed()
-        })
-        .await;
-
-    assert!(result.is_err());
-
-    // Verify rollback: no rows in DB.
-    let mut conn = pool.get().await.unwrap();
-    let count: i64 = test_articles::table
-        .count()
-        .get_result(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(count, 0);
-}
-
-#[tokio::test]
-#[ignore = "requires Docker (testcontainers)"]
-async fn after_commit_failure_does_not_rollback() {
-    use diesel_async::scoped_futures::ScopedFutureExt;
-
-    let (pool, _container) = setup_pool().await;
-    let mut conn = pool.get().await.unwrap();
-
-    let hooks = FailAfterCommitHooks;
-    let ctx = MutationContext::new(MutationOp::Create);
-
-    // Insert inside a transaction and commit.
-    let record: Article = conn
-        .transaction::<Article, diesel::result::Error, _>(|conn| {
-            async move {
-                let record: Article = diesel::insert_into(test_articles::table)
-                    .values(&NewArticle {
-                        title: "Committed".into(),
-                        slug: "committed".into(),
-                        status: "published".into(),
-                    })
-                    .get_result(conn)
-                    .await?;
-                Ok(record)
-            }
-            .scope_boxed()
-        })
-        .await
-        .unwrap();
-
-    // Transaction committed. Now call after_commit which returns Err.
-    let after_result = hooks.after_commit(&ctx, MutationOp::Create).await;
-    assert!(after_result.is_err(), "after_commit should return Err");
-
-    // Verify the row still exists despite after_commit failure.
-    let mut conn = pool.get().await.unwrap();
-    let persisted: Article = test_articles::table
-        .find(record.id)
-        .first(&mut conn)
-        .await
-        .unwrap();
-
-    assert_eq!(persisted.title, "Committed");
-    assert_eq!(persisted.slug, "committed");
-    assert_eq!(persisted.status, "published");
 }
 
 #[tokio::test]

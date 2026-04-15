@@ -30,11 +30,85 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
             if let Some(last) = companion.segments.last_mut() {
                 last.ident = format_ident!("{}{}", prefix, last.ident);
             }
-            quote! { #companion() }
+            // Emit a dummy use of the original path so that typos surface
+            // errors on the user's identifier, not just the generated macro prefix.
+            quote! {
+                {
+                    #[allow(clippy::no_effect)]
+                    {
+                        let _ = #path;
+                    }
+                    #companion()
+                }
+            }
         })
         .collect();
 
     quote! {
         vec![#(#calls),*]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quote::quote;
+
+    fn tokens_to_string(tokens: &TokenStream) -> String {
+        tokens.to_string()
+    }
+
+    #[test]
+    fn test_collect_companions_empty() {
+        let input = quote! {};
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(&quote! { ::std::vec::Vec::new() })
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_single() {
+        let input = quote! { handler };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = handler; } __prefix_handler() }] }
+            )
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_multiple() {
+        let input = quote! { a, b, c };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = a; } __prefix_a() }, { #[allow(clippy::no_effect)] { let _ = b; } __prefix_b() }, { #[allow(clippy::no_effect)] { let _ = c; } __prefix_c() }] }
+            )
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_module_path() {
+        let input = quote! { users::list, auth::login };
+        let result = collect_companions(input, "__prefix_");
+        assert_eq!(
+            tokens_to_string(&result),
+            tokens_to_string(
+                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = users::list; } users::__prefix_list() }, { #[allow(clippy::no_effect)] { let _ = auth::login; } auth::__prefix_login() }] }
+            )
+        );
+    }
+
+    #[test]
+    fn test_collect_companions_invalid_input() {
+        let input = quote! { struct };
+        let result = collect_companions(input, "__prefix_");
+        let result_str = tokens_to_string(&result);
+        assert!(result_str.contains("compile_error"));
     }
 }

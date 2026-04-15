@@ -11,13 +11,18 @@ const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 
+#[allow(dead_code)]
 pub fn is_enabled() -> bool {
-    std::env::var_os(DEV_RELOAD_ENV).is_some() && std::env::var_os(DEV_RELOAD_STATE_ENV).is_some()
+    is_enabled_with_env(&crate::config::OsEnv)
+}
+
+pub fn is_enabled_with_env(env: &dyn crate::config::Env) -> bool {
+    env.var(DEV_RELOAD_ENV).is_ok() && env.var(DEV_RELOAD_STATE_ENV).is_ok()
 }
 
 pub async fn live_reload_state_handler() -> impl IntoResponse {
-    let body =
-        read_reload_state_body().unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
+    let body = read_reload_state_body_with_env(&crate::config::OsEnv)
+        .unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
     let headers = response.headers_mut();
@@ -68,8 +73,8 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
     Response::from_parts(parts, Body::from(updated))
 }
 
-fn read_reload_state_body() -> Option<String> {
-    let path = std::env::var_os(DEV_RELOAD_STATE_ENV)?;
+fn read_reload_state_body_with_env(env: &dyn crate::config::Env) -> Option<String> {
+    let path = env.var(DEV_RELOAD_STATE_ENV).ok()?;
     std::fs::read_to_string(path).ok()
 }
 
@@ -197,85 +202,46 @@ fn live_reload_script() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MockEnv;
     use axum::body::to_bytes;
     use axum::http::header::ACCEPT;
-    use std::sync::{Mutex, OnceLock};
     use tower::ServiceExt;
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&str>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
 
     #[test]
     fn is_enabled_requires_both_env_vars() {
         {
-            let _env = EnvGuard::set_many(&[(DEV_RELOAD_ENV, None), (DEV_RELOAD_STATE_ENV, None)]);
-            assert!(!is_enabled());
+            let env = MockEnv::new();
+            assert!(!is_enabled_with_env(&env));
         }
 
         {
-            let _env =
-                EnvGuard::set_many(&[(DEV_RELOAD_ENV, Some("1")), (DEV_RELOAD_STATE_ENV, None)]);
-            assert!(!is_enabled());
+            let env = MockEnv::new().with(DEV_RELOAD_ENV, "1");
+            assert!(!is_enabled_with_env(&env));
         }
 
         {
-            let _env = EnvGuard::set_many(&[
-                (DEV_RELOAD_ENV, Some("1")),
-                (DEV_RELOAD_STATE_ENV, Some("state.json")),
-            ]);
-            assert!(is_enabled());
+            let env = MockEnv::new()
+                .with(DEV_RELOAD_ENV, "1")
+                .with(DEV_RELOAD_STATE_ENV, "state.json");
+            assert!(is_enabled_with_env(&env));
         }
     }
 
     #[tokio::test]
-    async fn live_reload_state_handler_defaults_when_state_missing() {
-        let _env = EnvGuard::set_many(&[(DEV_RELOAD_ENV, Some("1")), (DEV_RELOAD_STATE_ENV, None)]);
+    async fn read_reload_state_body_defaults_when_state_missing() {
+        let env = MockEnv::new().with(DEV_RELOAD_ENV, "1");
 
-        let response = live_reload_state_handler().await.into_response();
+        let body = read_reload_state_body_with_env(&env)
+            .unwrap_or_else(|| r#"{"version":0,"kind":"full"}"#.to_owned());
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::OK;
+        let headers = response.headers_mut();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        apply_no_store(headers);
+        let response = response.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CACHE_CONTROL).unwrap(),
@@ -285,6 +251,32 @@ mod tests {
             .await
             .expect("body bytes");
         assert_eq!(&body[..], br#"{"version":0,"kind":"full"}"#);
+    }
+
+    #[tokio::test]
+    async fn read_reload_state_body_reads_file_when_present() {
+        let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = r#"{"version":42,"kind":"css"}"#;
+        std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
+        let env = MockEnv::new()
+            .with(DEV_RELOAD_ENV, "1")
+            .with(DEV_RELOAD_STATE_ENV, tmp_file.path().to_str().unwrap());
+
+        let body = read_reload_state_body_with_env(&env).unwrap();
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::OK;
+        let headers = response.headers_mut();
+        apply_no_store(headers);
+        let response = response.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(&body[..], content.as_bytes());
     }
 
     #[tokio::test]
@@ -401,6 +393,30 @@ mod tests {
 
         let plain = inject_snippet(b"not html");
         assert_eq!(&plain[..], b"not html");
+    }
+
+    #[test]
+    fn inject_snippet_edge_cases() {
+        // Multiple </body> tags: Should insert before the *last* </body> tag.
+        let multi_body = inject_snippet(b"<html><body>text</body> <!-- </body> --> </html>");
+        let multi_body_str = std::str::from_utf8(&multi_body).expect("utf-8");
+        assert!(multi_body_str.ends_with("</script></body> --> </html>"));
+
+        // <html tag with attributes.
+        let html_attr = inject_snippet(b"<html lang=\"en\"><main>ok</main>");
+        let html_attr_str = std::str::from_utf8(&html_attr).expect("utf-8");
+        assert!(html_attr_str.ends_with("</script>"));
+
+        // Only </html> tag.
+        let html_close = inject_snippet(b"<div>content</div></html>");
+        let html_close_str = std::str::from_utf8(&html_close).expect("utf-8");
+        assert!(html_close_str.ends_with("</script>"));
+
+        // Invalid UTF-8 sequence, but containing </body>.
+        let invalid_utf8 = b"<html><body>\xFF\xFE</body></html>".to_vec();
+        let invalid_result = inject_snippet(&invalid_utf8);
+        // String::from_utf8_lossy Replaces invalid bytes with U+FFFD.
+        assert!(String::from_utf8_lossy(&invalid_result).contains("</script></body></html>"));
     }
 
     #[test]

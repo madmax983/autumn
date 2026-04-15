@@ -2,10 +2,13 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod dev;
+mod export;
 mod migrate;
 mod monitor;
 mod new;
 mod setup;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 /// The Autumn web framework CLI.
 #[derive(Parser)]
@@ -22,9 +25,6 @@ enum Commands {
     New {
         /// Project name (must be a valid Rust package name)
         name: String,
-        /// Scaffold with WASM islands boilerplate
-        #[arg(long)]
-        wasm: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -49,9 +49,6 @@ enum Commands {
         /// Re-download even if the binary already exists
         #[arg(long)]
         force: bool,
-        /// Validate that wasm32-unknown-unknown target is installed
-        #[arg(long)]
-        wasm: bool,
     },
     /// Run or inspect database migrations
     Migrate {
@@ -66,6 +63,15 @@ enum Commands {
         /// Polling interval in seconds
         #[arg(short, long, default_value = "1")]
         interval: u64,
+    },
+    /// Export an offline diagnostic snapshot of the application
+    Export {
+        /// URL of the running Autumn application
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
+        /// Output file for diagnostics
+        #[arg(short, long, default_value = "autumn-diag.json")]
+        output: String,
     },
 }
 
@@ -92,8 +98,9 @@ fn main() {
             migrate::run(action);
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
-        Commands::New { name, wasm } => new::run(&name, wasm),
-        Commands::Setup { force, wasm } => setup::run(force, wasm),
+        Commands::Export { url, output } => export::run(&url, &output),
+        Commands::New { name } => new::run(&name),
+        Commands::Setup { force } => setup::run(force),
     }
 }
 
@@ -103,11 +110,10 @@ mod tests {
 
     #[test]
     fn parse_new_subcommand() {
-        let cli = Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
-            Commands::New { ref name, wasm } => {
+            Commands::New { ref name } => {
                 assert_eq!(name, "my-app");
-                assert!(wasm);
             }
             _ => panic!("expected New command"),
         }
@@ -117,9 +123,8 @@ mod tests {
     fn parse_new_with_underscores() {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
-            Commands::New { ref name, wasm } => {
+            Commands::New { ref name } => {
                 assert_eq!(name, "my_app");
-                assert!(!wasm);
             }
             _ => panic!("expected New command"),
         }
@@ -128,25 +133,23 @@ mod tests {
     #[test]
     fn parse_setup_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "setup"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Setup {
-                force: false,
-                wasm: false
-            }
-        ));
+        assert!(matches!(cli.command, Commands::Setup { force: false }));
     }
 
     #[test]
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Setup {
-                force: true,
-                wasm: false
-            }
-        ));
+        assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn new_rejects_removed_wasm_flag() {
+        assert!(Cli::try_parse_from(["autumn", "new", "my-app", "--wasm"]).is_err());
+    }
+
+    #[test]
+    fn setup_rejects_removed_wasm_flag() {
+        assert!(Cli::try_parse_from(["autumn", "setup", "--wasm"]).is_err());
     }
 
     #[test]
@@ -285,6 +288,38 @@ mod tests {
                 assert_eq!(interval, 5);
             }
             _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "export"]).unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://localhost:3000");
+                assert_eq!(output, "autumn-diag.json");
+            }
+            _ => panic!("expected Export command"),
+        }
+    }
+
+    #[test]
+    fn parse_export_custom() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "export",
+            "-u",
+            "http://prod:8080",
+            "-o",
+            "snapshot.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Export { url, output } => {
+                assert_eq!(url, "http://prod:8080");
+                assert_eq!(output, "snapshot.json");
+            }
+            _ => panic!("expected Export command"),
         }
     }
 

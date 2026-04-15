@@ -32,7 +32,9 @@ pub enum Schedule {
     FixedDelay(Duration),
     /// Run on a cron schedule (6-field: sec min hour day month weekday).
     Cron {
+        /// The 6-field cron expression (e.g., `"0 * * * * *"` for every minute).
         expression: String,
+        /// The timezone for the cron expression (e.g., `"America/New_York"`).
         timezone: Option<String>,
     },
 }
@@ -56,10 +58,10 @@ pub fn parse_duration(s: &str) -> Option<Duration> {
             let num: u64 = current_num.parse().ok()?;
             current_num.clear();
             match ch {
-                's' => total_secs += num,
-                'm' => total_secs += num * 60,
-                'h' => total_secs += num * 3600,
-                'd' => total_secs += num * 86400,
+                's' => total_secs = total_secs.checked_add(num)?,
+                'm' => total_secs = total_secs.checked_add(num.checked_mul(60)?)?,
+                'h' => total_secs = total_secs.checked_add(num.checked_mul(3600)?)?,
+                'd' => total_secs = total_secs.checked_add(num.checked_mul(86400)?)?,
                 _ => return None,
             }
         } else if ch == ' ' {
@@ -122,5 +124,40 @@ mod tests {
     #[test]
     fn empty() {
         assert!(parse_duration("").is_none());
+    }
+
+    #[test]
+    fn zero_duration() {
+        assert!(parse_duration("0s").is_none());
+        assert!(parse_duration("0m").is_none());
+    }
+
+    #[test]
+    fn invalid_characters() {
+        assert!(parse_duration("1h_30m").is_none());
+        assert!(parse_duration("1h-30m").is_none());
+    }
+
+    #[test]
+    fn multiple_spaces() {
+        assert_eq!(parse_duration("1h   30m"), Some(Duration::from_secs(5400)));
+    }
+
+    #[test]
+    fn compound_trailing_number() {
+        assert!(parse_duration("1h 30").is_none());
+    }
+}
+
+#[cfg(test)]
+mod havoc_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_duration_fuzz_panic(s in "[0-9]{15,30}[smhd]") {
+            let _ = parse_duration(&s);
+        }
     }
 }

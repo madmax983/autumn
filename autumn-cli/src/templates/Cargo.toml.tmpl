@@ -3,8 +3,9 @@ name = "{{project_name}}"
 version = "0.1.0"
 edition = "2024"
 
-{{wasm_targets}}
-
 [dependencies]
+# Enable Redis-backed sessions later by switching to:
+# autumn-web = { version = "{{autumn_version}}", features = ["redis"] }
 autumn-web = "{{autumn_version}}"
-{{wasm_deps}}
+
+[workspace]

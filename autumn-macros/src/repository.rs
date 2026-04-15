@@ -183,7 +183,13 @@ fn generate_derived_query(
                 .map_err(::autumn_web::AutumnError::from)
             }
         }
-        _ => quote! { todo!() },
+        _ => {
+            let msg = format!(
+                "Unsupported query prefix: {}. Supported prefixes are find, count, delete, exists.",
+                query.prefix
+            );
+            quote! { ::core::compile_error!(#msg); }
+        }
     }
 }
 
@@ -268,7 +274,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // When `hooks_type` is present, the struct gains a `hooks` field,
     // the extractor initialises it with `Default::default()`, and the
     // save / update / delete methods are wrapped in a transactional
-    // hook lifecycle (before_* → persist → after_* → commit → after_commit).
+    // hook lifecycle (before_* → persist).
     //
     // When absent, the generated code is identical to the pre-hooks version
     // (zero-cost path).
@@ -297,36 +303,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let save_body = quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::diesel_async::scoped_futures::ScopedFutureExt;
             use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
             let mut input = new.clone();
             let mut ctx = MutationContext::new(MutationOp::Create);
 
-            // before_create can validate/reject/rewrite before the transaction
+            // before_create can validate/reject/rewrite
             self.hooks.before_create(&mut ctx, &mut input).await?;
 
-            // Transaction: persist + after_create
-            let hooks = &self.hooks;
-            let ctx_ref = &ctx;
-            let record = conn.transaction::<#model_name, ::autumn_web::AutumnError, _>(|conn| {
-                async move {
-                    let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                        .values(&input)
-                        .get_result::<#model_name>(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_create(ctx_ref, &record, conn).await?;
-                    Ok(record)
-                }.scope_boxed()
-            }).await?;
-
-            // after_commit: best-effort, errors logged but don't roll back
-            if let Err(e) = self.hooks.after_commit(&ctx, MutationOp::Create).await {
-                ::autumn_web::reexports::tracing::warn!("after_commit hook error: {e}");
-            }
+            let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                .values(&input)
+                .get_result::<#model_name>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
 
             Ok(record)
         };
@@ -336,8 +326,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let update_body = quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::diesel_async::scoped_futures::ScopedFutureExt;
             use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
 
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
@@ -362,23 +350,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // Persist the proposed state
             let proposed = draft.into_after();
-            let hooks = &self.hooks;
-            let ctx_ref = &ctx;
-            let record = conn.transaction::<#model_name, ::autumn_web::AutumnError, _>(|conn| {
-                async move {
-                    let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                        .set(&proposed)
-                        .get_result::<#model_name>(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_update(ctx_ref, &record, conn).await?;
-                    Ok(record)
-                }.scope_boxed()
-            }).await?;
-
-            if let Err(e) = self.hooks.after_commit(&ctx, MutationOp::Update).await {
-                ::autumn_web::reexports::tracing::warn!("after_commit hook error: {e}");
-            }
+            let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                .set(&proposed)
+                .get_result::<#model_name>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
 
             Ok(record)
         };
@@ -387,8 +363,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let delete_body = quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::reexports::diesel_async::AsyncConnection;
-            use ::autumn_web::reexports::diesel_async::scoped_futures::ScopedFutureExt;
             use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
 
             let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
@@ -407,23 +381,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             self.hooks.before_delete(&mut ctx, &record).await?;
 
-            // Transaction: delete + after_delete
-            let hooks = &self.hooks;
-            let ctx_ref = &ctx;
-            conn.transaction::<(), ::autumn_web::AutumnError, _>(|conn| {
-                async move {
-                    ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                        .execute(conn)
-                        .await
-                        .map_err(::autumn_web::AutumnError::from)?;
-                    hooks.after_delete(ctx_ref, id, conn).await?;
-                    Ok(())
-                }.scope_boxed()
-            }).await?;
-
-            if let Err(e) = self.hooks.after_commit(&ctx, MutationOp::Delete).await {
-                ::autumn_web::reexports::tracing::warn!("after_commit hook error: {e}");
-            }
+            ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                .execute(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)?;
 
             Ok(())
         };
@@ -519,8 +480,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #list_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #list_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#list_fn),
@@ -538,8 +499,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #get_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #get_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::GET,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#get_fn),
@@ -556,8 +517,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #create_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #create_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::POST,
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::post(#create_fn),
@@ -575,8 +536,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #update_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #update_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::PUT,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::put(#update_fn),
@@ -593,8 +554,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #[doc(hidden)]
-            #vis fn #delete_info() -> ::autumn_web::route::Route {
-                ::autumn_web::route::Route {
+            #vis fn #delete_info() -> ::autumn_web::Route {
+                ::autumn_web::Route {
                     method: ::autumn_web::reexports::http::Method::DELETE,
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::delete(#delete_fn),
@@ -702,8 +663,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 _parts: &mut ::autumn_web::reexports::http::request::Parts,
                 state: &::autumn_web::AppState,
             ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool
-                    .as_ref()
+                let pool = state.pool()
                     .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
                     .clone();
                 #extractor_init

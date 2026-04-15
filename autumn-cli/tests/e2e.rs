@@ -22,6 +22,26 @@ impl Drop for ServerGuard {
     }
 }
 
+fn patch_generated_cargo_toml(project_dir: &std::path::Path) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content =
+        std::fs::read_to_string(&cargo_toml_path).expect("failed to read generated Cargo.toml");
+
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root not found");
+    let autumn_web_crate = workspace_root.join("autumn");
+
+    write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web_crate.display().to_string().replace('\\', "/")
+    )
+    .expect("write to String is infallible");
+
+    std::fs::write(&cargo_toml_path, content).expect("failed to patch Cargo.toml");
+}
+
 #[test]
 #[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn generated_project_compiles_runs_and_serves() {
@@ -49,22 +69,7 @@ fn generated_project_compiles_runs_and_serves() {
     assert!(project_dir.join("src/main.rs").is_file());
 
     // ── 3. Patch Cargo.toml to use local autumn crate ───────────────
-    let cargo_toml_path = project_dir.join("Cargo.toml");
-    let mut content =
-        std::fs::read_to_string(&cargo_toml_path).expect("failed to read generated Cargo.toml");
-
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent() // autumn-cli -> workspace root
-        .expect("workspace root not found");
-    let autumn_crate = workspace_root.join("autumn");
-
-    write!(
-        content,
-        "\n[patch.crates-io]\nautumn = {{ path = \"{}\" }}\n",
-        autumn_crate.display().to_string().replace('\\', "/")
-    )
-    .expect("write to String is infallible");
-    std::fs::write(&cargo_toml_path, content).expect("failed to patch Cargo.toml");
+    patch_generated_cargo_toml(&project_dir);
 
     // ── 4. Remove build.rs (Tailwind CLI not needed for test) ───────
     let _ = std::fs::remove_file(project_dir.join("build.rs"));

@@ -1,5 +1,6 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-wasm", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/wiki"]
+members = ["autumn", "autumn-macros", "autumn-cli", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone"]
+exclude = ["autumn-harvest"]
 resolver = "3"
 
 [workspace.package]
@@ -24,11 +25,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 maud = { version = "0.27", features = ["axum"] }
-toml = "0.8"
+toml = "1.1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.32.1"
+opentelemetry = { version = "0.31.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.31.0", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-client"] }
+redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager"] }
 tokio-cron-scheduler = "0.13"
 validator = { version = "0.20", features = ["derive"] }
 bcrypt = "0.17"
@@ -37,7 +43,7 @@ indexmap = "2"
 moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 
 # Proc macro
 syn = { version = "2", features = ["full"] }

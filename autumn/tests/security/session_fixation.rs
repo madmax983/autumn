@@ -18,21 +18,7 @@ async fn test_session_fixation() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-        #[cfg(feature = "ws")]
-        channels: autumn_web::channels::Channels::new(32),
-        #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    };
+    let state = autumn_web::state::AppState::for_test();
 
     let app = Router::new()
         .route("/login", get(login_handler))
@@ -45,7 +31,7 @@ async fn test_session_fixation() {
     // in the server so it's considered valid.
     let mut initial_data = std::collections::HashMap::new();
     initial_data.insert("some_data".to_string(), "attacker_set".to_string());
-    store.save(attacker_session_id, initial_data).await;
+    store.save(attacker_session_id, initial_data).await.unwrap();
 
     let response = app
         .oneshot(
@@ -83,7 +69,7 @@ async fn test_session_fixation() {
 
     // The attacker's ID should have been destroyed in the store
     assert!(
-        store.load(attacker_session_id).await.is_none(),
+        store.load(attacker_session_id).await.unwrap().is_none(),
         "Old session ID was not destroyed"
     );
 
@@ -91,6 +77,7 @@ async fn test_session_fixation() {
     let new_data = store
         .load(new_id)
         .await
+        .unwrap()
         .expect("New session ID should be in store");
     assert_eq!(new_data.get("user_id").unwrap(), "123");
 }
@@ -107,21 +94,7 @@ async fn test_rotate_id() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState {
-        #[cfg(feature = "db")]
-        pool: None,
-        profile: None,
-        started_at: std::time::Instant::now(),
-        health_detailed: false,
-        metrics: autumn_web::middleware::MetricsCollector::new(),
-        log_levels: autumn_web::actuator::LogLevels::new("info"),
-        task_registry: autumn_web::actuator::TaskRegistry::new(),
-        config_props: autumn_web::actuator::ConfigProperties::default(),
-        #[cfg(feature = "ws")]
-        channels: autumn_web::channels::Channels::new(32),
-        #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    };
+    let state = autumn_web::state::AppState::for_test();
 
     let app = Router::new()
         .route("/rotate", get(rotate_handler))
@@ -132,7 +105,7 @@ async fn test_rotate_id() {
     let session_id = "initial-id-123";
     let mut initial_data = std::collections::HashMap::new();
     initial_data.insert("pre_existing".to_string(), "data".to_string());
-    store.save(session_id, initial_data).await;
+    store.save(session_id, initial_data).await.unwrap();
 
     let response = app
         .oneshot(
@@ -171,7 +144,7 @@ async fn test_rotate_id() {
 
     // The old ID should be deleted from the store
     assert!(
-        store.load(session_id).await.is_none(),
+        store.load(session_id).await.unwrap().is_none(),
         "Old session ID was not destroyed"
     );
 
@@ -179,6 +152,7 @@ async fn test_rotate_id() {
     let new_data = store
         .load(new_id)
         .await
+        .unwrap()
         .expect("New session ID should be in store");
     assert_eq!(new_data.get("pre_existing").unwrap(), "data");
     assert_eq!(new_data.get("user").unwrap(), "alice");

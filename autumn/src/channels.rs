@@ -19,7 +19,7 @@
 //! let mut rx = channels.subscribe("lobby");
 //!
 //! tx.send("hello").ok();
-//! # // In async context: let msg = rx.recv().await.unwrap();
+//! # // In async context: let msg = rx.recv().await.expect("should receive");
 //! ```
 
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ pub struct Channels {
 
 struct ChannelsInner {
     capacity: usize,
-    registry: Mutex<HashMap<String, broadcast::Sender<ChannelMessage>>>,
+    registry: Mutex<HashMap<String, Arc<broadcast::Sender<ChannelMessage>>>>,
 }
 
 /// A message sent through a broadcast channel.
@@ -101,7 +101,7 @@ impl std::fmt::Display for ChannelMessage {
 /// Sending to a channel with no active subscribers silently succeeds.
 #[derive(Clone)]
 pub struct Sender {
-    inner: broadcast::Sender<ChannelMessage>,
+    inner: Arc<broadcast::Sender<ChannelMessage>>,
 }
 
 impl Sender {
@@ -164,9 +164,12 @@ impl Channels {
     /// ```
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        // tokio::sync::broadcast channel capacity must be > 0 and <= usize::MAX / 2
+        // Furthermore, allocating huge capacities will OOM the process.
+        // Cap it at a reasonable maximum for an application, like 16384, and min 1.
         Self {
             inner: Arc::new(ChannelsInner {
-                capacity,
+                capacity: capacity.clamp(1, 16384),
                 registry: Mutex::new(HashMap::new()),
             }),
         }
@@ -194,10 +197,20 @@ impl Channels {
     #[must_use]
     pub fn sender(&self, name: &str) -> Sender {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        let tx = registry
-            .entry(name.to_owned())
-            .or_insert_with(|| broadcast::channel(self.inner.capacity).0);
-        let sender = Sender { inner: tx.clone() };
+
+        // ⚡ Bolt Optimization: Use get() first to avoid allocating a String key
+        // on every lookup for channels that already exist.
+        #[allow(clippy::option_if_let_else)]
+        let tx = if let Some(tx) = registry.get(name) {
+            Arc::clone(tx)
+        } else {
+            let capacity = std::cmp::max(1, self.inner.capacity);
+            let tx = Arc::new(broadcast::channel(capacity).0);
+            registry.insert(name.to_owned(), Arc::clone(&tx));
+            tx
+        };
+
+        let sender = Sender { inner: tx };
         drop(registry);
         sender
     }
@@ -224,9 +237,19 @@ impl Channels {
     #[must_use]
     pub fn subscribe(&self, name: &str) -> Subscriber {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        let tx = registry
-            .entry(name.to_owned())
-            .or_insert_with(|| broadcast::channel(self.inner.capacity).0);
+
+        // ⚡ Bolt Optimization: Use get() first to avoid allocating a String key
+        // on every lookup for channels that already exist.
+        #[allow(clippy::option_if_let_else)]
+        let tx = if let Some(tx) = registry.get(name) {
+            Arc::clone(tx)
+        } else {
+            let capacity = std::cmp::max(1, self.inner.capacity);
+            let tx = Arc::new(broadcast::channel(capacity).0);
+            registry.insert(name.to_owned(), Arc::clone(&tx));
+            tx
+        };
+
         let subscriber = Subscriber {
             inner: tx.subscribe(),
         };
@@ -255,7 +278,23 @@ impl Channels {
     /// Panics if the internal mutex is poisoned.
     pub fn gc(&self) {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        registry.retain(|_, tx| tx.receiver_count() > 0);
+        registry.retain(|_, tx| tx.receiver_count() > 0 || Arc::strong_count(tx) > 1);
+    }
+
+    /// Get a snapshot of all active channels and their subscriber counts.
+    ///
+    /// Returns a `HashMap` mapping channel names to their current active receiver count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<String, usize> {
+        let registry = self.inner.registry.lock().expect("channels lock poisoned");
+        registry
+            .iter()
+            .map(|(name, tx)| (name.clone(), tx.receiver_count()))
+            .collect()
     }
 }
 
@@ -284,29 +323,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_and_receive() {
+    async fn send_and_receive() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let tx = channels.sender("chat");
         let mut rx = channels.subscribe("chat");
 
-        tx.send("hello").unwrap();
-        let msg = rx.recv().await.unwrap();
+        tx.send("hello").expect("should send");
+        let msg = rx.recv().await?;
         assert_eq!(msg.as_str(), "hello");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn multiple_subscribers() {
+    async fn multiple_subscribers() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let tx = channels.sender("chat");
         let mut rx1 = channels.subscribe("chat");
         let mut rx2 = channels.subscribe("chat");
 
-        tx.send("broadcast").unwrap();
+        tx.send("broadcast").expect("should send");
 
-        let msg1 = rx1.recv().await.unwrap();
-        let msg2 = rx2.recv().await.unwrap();
+        let msg1 = rx1.recv().await?;
+        let msg2 = rx2.recv().await?;
         assert_eq!(msg1.as_str(), "broadcast");
         assert_eq!(msg2.as_str(), "broadcast");
+        Ok(())
     }
 
     #[test]
@@ -340,6 +381,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_returns_counts() {
+        let channels = Channels::new(16);
+        let _tx = channels.sender("empty");
+
+        let _tx2 = channels.sender("one");
+        let _rx_one = channels.subscribe("one");
+
+        let _tx3 = channels.sender("two");
+        let _rx_two_1 = channels.subscribe("two");
+        let _rx_two_2 = channels.subscribe("two");
+
+        let snap = channels.snapshot();
+        assert_eq!(snap.get("empty"), Some(&0));
+        assert_eq!(snap.get("one"), Some(&1));
+        assert_eq!(snap.get("two"), Some(&2));
+        assert_eq!(snap.len(), 3);
+    }
+
+    #[test]
     fn gc_removes_dead_channels() {
         let channels = Channels::new(16);
         let _tx = channels.sender("alive");
@@ -349,8 +409,8 @@ mod tests {
         }
         assert_eq!(channels.channel_count(), 2);
         channels.gc();
-        // Both channels have 0 receivers, but gc only checks receiver_count
-        // "alive" has no receivers either, so both get cleaned
-        assert_eq!(channels.channel_count(), 0);
+        // "alive" has an active sender (_tx), so it is kept (count = 1).
+        // "dead" has 0 receivers and 0 active senders (dropped), so it gets cleaned.
+        assert_eq!(channels.channel_count(), 1);
     }
 }

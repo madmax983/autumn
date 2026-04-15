@@ -1,10 +1,7 @@
 use autumn_web::AutumnResult;
 use autumn_web::hooks::{MutationContext, MutationHooks, UpdateDraft};
-use diesel_async::AsyncPgConnection;
-use diesel_async::RunQueryDsl;
 
-use crate::models::{NewPage, NewRevision, Page, UpdatePage};
-use crate::schema::revisions;
+use crate::models::{NewPage, Page, UpdatePage};
 use crate::slugify::slugify;
 
 #[derive(Clone, Default)]
@@ -31,31 +28,6 @@ impl MutationHooks for PageHooks {
         Ok(())
     }
 
-    async fn after_create(
-        &self,
-        ctx: &MutationContext,
-        record: &Page,
-        conn: &mut AsyncPgConnection,
-    ) -> AutumnResult<()> {
-        // Transactional revision audit — runs inside the same tx as the INSERT
-        let rev = NewRevision {
-            page_id: record.id,
-            op: "create".into(),
-            title: record.title.clone(),
-            body: record.body.clone(),
-            status: record.status.clone(),
-            changed_by: ctx.actor.clone(),
-            summary: Some("Page created".into()),
-        };
-
-        diesel::insert_into(revisions::table)
-            .values(&rev)
-            .execute(conn)
-            .await?;
-
-        Ok(())
-    }
-
     async fn before_update(
         &self,
         _ctx: &mut MutationContext,
@@ -68,28 +40,59 @@ impl MutationHooks for PageHooks {
 
         Ok(())
     }
+}
 
-    async fn after_update(
-        &self,
-        ctx: &MutationContext,
-        record: &Page,
-        conn: &mut AsyncPgConnection,
-    ) -> AutumnResult<()> {
-        let rev = NewRevision {
-            page_id: record.id,
-            op: "update".into(),
-            title: record.title.clone(),
-            body: record.body.clone(),
-            status: record.status.clone(),
-            changed_by: ctx.actor.clone(),
-            summary: Some("Page updated".into()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_web::hooks::MutationOp;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn test_before_update_updates_slug_if_title_changes() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "Old Title".into(),
+            slug: "old-title".into(),
+            body: "Old Content".into(),
+            status: "published".into(),
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
         };
 
-        diesel::insert_into(revisions::table)
-            .values(&rev)
-            .execute(conn)
-            .await?;
+        let mut after = before.clone();
+        after.title = "New Title".into();
 
-        Ok(())
+        let mut draft = UpdateDraft { before, after };
+
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+
+        assert_eq!(draft.after.slug, "new-title");
+    }
+
+    #[tokio::test]
+    async fn test_before_update_preserves_slug_if_title_unchanged() {
+        let hooks = PageHooks;
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let before = Page {
+            id: 1,
+            title: "Old Title".into(),
+            slug: "old-title".into(),
+            body: "Old Content".into(),
+            status: "published".into(),
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        };
+
+        let mut after = before.clone();
+        after.body = "New Content".into();
+
+        let mut draft = UpdateDraft { before, after };
+
+        hooks.before_update(&mut ctx, &mut draft).await.unwrap();
+
+        assert_eq!(draft.after.slug, "old-title");
     }
 }

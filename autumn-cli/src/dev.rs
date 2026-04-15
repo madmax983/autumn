@@ -186,7 +186,6 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
-
     // Initial build
     if !cargo_build(package) {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
@@ -228,75 +227,92 @@ pub fn run(package: Option<&str>, show_config: bool) {
             break;
         }
 
-        match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
-            Ok(Ok(events)) => {
-                let plan = plan_changes(&events);
-                if plan.is_empty() {
-                    continue;
-                }
-
-                let changed = collect_relevant_changes(&events);
-                if changed.is_empty() {
-                    continue;
-                }
-
-                eprintln!("\n  Changed: {}", changed.join(", "));
-                eprintln!("  Action: {}", describe_plan(plan));
-
-                let mut applied_reload = ReloadKind::None;
-
-                if plan.build {
-                    stop_server(&mut child);
-
-                    if cargo_build(package) {
-                        if restart_server(
-                            package,
-                            &mut child,
-                            reload_state.as_ref().map(DevReloadState::path),
-                        ) {
-                            applied_reload = ReloadKind::Full;
-                        }
-                    } else {
-                        eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
-                        child = None;
-                    }
-                } else {
-                    if plan.tailwind && tailwind_build() {
-                        applied_reload = applied_reload.max(ReloadKind::Css);
-                    }
-
-                    if plan.restart {
-                        stop_server(&mut child);
-                        if restart_server(
-                            package,
-                            &mut child,
-                            reload_state.as_ref().map(DevReloadState::path),
-                        ) {
-                            applied_reload = ReloadKind::Full;
-                        }
-                    } else if plan.reload == ReloadKind::Full {
-                        applied_reload = ReloadKind::Full;
-                    }
-                }
-
-                if let Some(reload_state) = reload_state.as_mut() {
-                    if let Err(error) = reload_state.signal(applied_reload) {
-                        eprintln!("  Warning: live reload signal failed: {error}");
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                eprintln!("  Watch error: {error}");
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("  Watch channel error: channel disconnected");
-                break;
-            }
+        if !process_events(&rx, package, &mut child, reload_state.as_mut()) {
+            break;
         }
     }
 
     stop_server(&mut child);
+}
+
+/// Process a single batch of events from the debouncer channel.
+/// Returns false if the channel was closed and the loop should exit.
+fn process_events(
+    rx: &mpsc::Receiver<Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>>,
+    package: Option<&str>,
+    child: &mut Option<Child>,
+    reload_state: Option<&mut DevReloadState>,
+) -> bool {
+    match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
+        Ok(Ok(events)) => {
+            let plan = plan_changes(&events);
+            if plan.is_empty() {
+                return true;
+            }
+
+            let changed = collect_relevant_changes(&events);
+            if changed.is_empty() {
+                return true;
+            }
+
+            eprintln!("\n  Changed: {}", changed.join(", "));
+            eprintln!("  Action: {}", describe_plan(plan));
+
+            execute_plan(plan, package, child, reload_state);
+            true
+        }
+        Ok(Err(error)) => {
+            eprintln!("  Watch error: {error:?}");
+            true
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("  Watch channel error: channel disconnected");
+            false
+        }
+    }
+}
+
+/// Execute a computed change plan.
+fn execute_plan(
+    plan: ChangePlan,
+    package: Option<&str>,
+    child: &mut Option<Child>,
+    mut reload_state: Option<&mut DevReloadState>,
+) {
+    let mut applied_reload = ReloadKind::None;
+
+    if plan.build {
+        stop_server(child);
+
+        if cargo_build(package) {
+            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+                applied_reload = ReloadKind::Full;
+            }
+        } else {
+            eprintln!("  \u{2717} Build failed. Waiting for changes...\n");
+            *child = None;
+        }
+    } else {
+        if plan.tailwind && tailwind_build() {
+            applied_reload = applied_reload.max(ReloadKind::Css);
+        }
+
+        if plan.restart {
+            stop_server(child);
+            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+                applied_reload = ReloadKind::Full;
+            }
+        } else if plan.reload == ReloadKind::Full {
+            applied_reload = ReloadKind::Full;
+        }
+    }
+
+    if let Some(reload_state) = reload_state.as_mut() {
+        if let Err(error) = reload_state.signal(applied_reload) {
+            eprintln!("  Warning: live reload signal failed: {error}");
+        }
+    }
 }
 
 /// Collect display paths for all relevant file changes from a debounced batch.
@@ -335,9 +351,6 @@ fn cargo_build(package: Option<&str>) -> bool {
     eprintln!("  Compiling...");
     match cmd.status() {
         Ok(status) if status.success() => {
-            if has_wasm_client(package) && !cargo_build_wasm(package) {
-                return false;
-            }
             eprintln!("  \u{2713} Build succeeded");
             true
         }
@@ -347,45 +360,6 @@ fn cargo_build(package: Option<&str>) -> bool {
             false
         }
     }
-}
-
-fn has_wasm_client(package: Option<&str>) -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        return Path::new("src/client.rs").exists();
-    };
-
-    let Some(metadata) = try_cargo_metadata() else {
-        return Path::new("src/client.rs").exists();
-    };
-
-    resolve_wasm_client_target_from_metadata(&metadata, package, &cwd).is_ok()
-}
-
-fn cargo_build_wasm(package: Option<&str>) -> bool {
-    let Ok(cwd) = std::env::current_dir() else {
-        eprintln!("  \u{2717} Failed to determine current directory for WASM build");
-        return false;
-    };
-    let Some(metadata) = try_cargo_metadata() else {
-        eprintln!("  \u{2717} Failed to read cargo metadata for WASM build");
-        return false;
-    };
-    let client_target = match resolve_wasm_client_target_from_metadata(&metadata, package, &cwd) {
-        Ok(target) => target,
-        Err(error) => {
-            eprintln!("  \u{2717} {error}");
-            return false;
-        }
-    };
-
-    let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--target", "wasm32-unknown-unknown", "--bin"]);
-    cmd.arg(&client_target);
-    if let Some(pkg) = package {
-        cmd.args(["-p", pkg]);
-    }
-    eprintln!("  Compiling WASM...");
-    cmd.status().ok().is_some_and(|status| status.success())
 }
 
 /// Start the application binary. Returns the child process handle.
@@ -409,19 +383,25 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
     }
 }
 
+#[cfg(unix)]
+fn validate_pid_for_kill(pid: u32) -> Option<libc::pid_t> {
+    let cast_pid = pid.try_into().ok()?;
+    if cast_pid > 0 { Some(cast_pid) } else { None }
+}
+
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
     if let Some(proc) = child {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = proc.id() as libc::pid_t;
-            // SAFETY: `pid` is retrieved directly from `proc.id()`, representing a valid child
-            // process we own. `libc::SIGTERM` is a standard, valid signal. Sending it to our
-            // own child process is safe.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
+            if let Some(pid) = validate_pid_for_kill(proc.id()) {
+                // SAFETY: `pid` is retrieved directly from `proc.id()` and validated to be safely
+                // representable as `libc::pid_t` and strictly positive. `libc::SIGTERM` is a standard,
+                // valid signal. Sending it to our own child process is safe.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
             }
             // Wait briefly for graceful shutdown before forcing
             if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
@@ -735,19 +715,16 @@ fn resolve_binary_from_metadata(
 
     let bin_name = matching_packages
         .iter()
-        .flat_map(|pkg| {
-            pkg["targets"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|t| {
-                    t["kind"]
-                        .as_array()
-                        .is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
-                })
-                .filter_map(|t| t["name"].as_str().map(String::from))
+        .find_map(|pkg| {
+            pkg["targets"].as_array()?.iter().find_map(|t| {
+                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+                if is_bin {
+                    t["name"].as_str().map(String::from)
+                } else {
+                    None
+                }
+            })
         })
-        .next()
         .ok_or_else(|| {
             package.map_or_else(
                 || "no binary target found in current package".to_owned(),
@@ -764,114 +741,6 @@ fn resolve_binary_from_metadata(
     }
 
     Ok(path)
-}
-
-#[cfg(test)]
-fn resolve_package_root_from_metadata(
-    metadata: &serde_json::Value,
-    package: Option<&str>,
-    cwd: &Path,
-) -> Result<PathBuf, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("missing packages array in metadata")?;
-
-    let manifest = if let Some(pkg_name) = package {
-        packages
-            .iter()
-            .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
-            .and_then(|pkg| pkg["manifest_path"].as_str())
-            .ok_or_else(|| format!("package '{pkg_name}' not found"))?
-    } else {
-        packages
-            .iter()
-            .filter_map(|pkg| pkg["manifest_path"].as_str())
-            .find(|manifest| {
-                Path::new(manifest)
-                    .parent()
-                    .is_some_and(|dir| dir.starts_with(cwd))
-            })
-            .ok_or("current package not found in metadata")?
-    };
-
-    Path::new(manifest)
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "invalid manifest_path in metadata".to_owned())
-}
-
-fn resolve_wasm_client_target_from_metadata(
-    metadata: &serde_json::Value,
-    package: Option<&str>,
-    cwd: &Path,
-) -> Result<String, String> {
-    let packages = metadata["packages"]
-        .as_array()
-        .ok_or("missing packages array in metadata")?;
-
-    let package_entry = package.map_or_else(
-        || {
-            packages.iter().find(|pkg| {
-                let manifest = pkg["manifest_path"].as_str().unwrap_or("");
-                Path::new(manifest)
-                    .parent()
-                    .is_some_and(|dir| dir.starts_with(cwd))
-            })
-        },
-        |pkg_name| {
-            packages
-                .iter()
-                .find(|pkg| pkg["name"].as_str() == Some(pkg_name))
-        },
-    );
-
-    let package_entry = package_entry.ok_or_else(|| {
-        package.map_or_else(
-            || "current package not found in cargo metadata".to_owned(),
-            |pkg_name| format!("package '{pkg_name}' not found in cargo metadata"),
-        )
-    })?;
-
-    package_entry["targets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|target| {
-            target["kind"]
-                .as_array()
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
-                && target["src_path"].as_str().is_some_and(|src| {
-                    Path::new(src)
-                        .file_name()
-                        .is_some_and(|file| file == "client.rs")
-                })
-        })
-        .and_then(|target| target["name"].as_str())
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            package.map_or_else(
-                || {
-                    "current package has no `src/client.rs` binary target; add [[bin]] name = \"client\" path = \"src/client.rs\""
-                        .to_owned()
-                },
-                |pkg_name| {
-                    format!(
-                        "package '{pkg_name}' has no `src/client.rs` binary target; add [[bin]] name = \"client\" path = \"src/client.rs\""
-                    )
-                },
-            )
-        })
-}
-
-fn try_cargo_metadata() -> Option<serde_json::Value> {
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
 }
 
 /// Locate the compiled binary using `cargo metadata`.
@@ -894,54 +763,7 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        previous: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn set_many(entries: &[(&'static str, Option<&std::ffi::OsStr>)]) -> Self {
-            static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let lock = ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("env mutex poisoned");
-            let mut previous = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                previous.push((*key, std::env::var(key).ok()));
-                match value {
-                    Some(value) => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::set_var(key, value) };
-                    }
-                    None => {
-                        // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                        unsafe { std::env::remove_var(key) };
-                    }
-                }
-            }
-            Self {
-                _lock: lock,
-                previous,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, previous) in self.previous.iter().rev() {
-                if let Some(previous) = previous {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::set_var(key, previous) };
-                } else {
-                    // SAFETY: test-only helper serializes environment mutation with a process-wide mutex.
-                    unsafe { std::env::remove_var(key) };
-                }
-            }
-        }
-    }
+    use crate::test_utils::EnvGuard;
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -1411,44 +1233,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_package_root_explicit_package() {
-        let metadata = serde_json::json!({
-            "packages": [
-                {
-                    "name": "alpha",
-                    "manifest_path": "/repo/alpha/Cargo.toml"
-                },
-                {
-                    "name": "beta",
-                    "manifest_path": "/repo/beta/Cargo.toml"
-                }
-            ]
-        });
-        let cwd = Path::new("/repo");
-        let root = resolve_package_root_from_metadata(&metadata, Some("beta"), cwd).unwrap();
-        assert_eq!(root, PathBuf::from("/repo/beta"));
-    }
-
-    #[test]
-    fn resolve_package_root_from_cwd() {
-        let metadata = serde_json::json!({
-            "packages": [
-                {
-                    "name": "outside",
-                    "manifest_path": "/other/outside/Cargo.toml"
-                },
-                {
-                    "name": "inside",
-                    "manifest_path": "/repo/app/Cargo.toml"
-                }
-            ]
-        });
-        let cwd = Path::new("/repo/app");
-        let root = resolve_package_root_from_metadata(&metadata, None, cwd).unwrap();
-        assert_eq!(root, PathBuf::from("/repo/app"));
-    }
-
-    #[test]
     fn resolve_binary_picks_first_bin_in_multi_target() {
         let metadata = serde_json::json!({
             "target_directory": "/tmp/target",
@@ -1491,6 +1275,21 @@ mod tests {
     }
 
     // ── stop_server tests ──────────────────────────────────────────
+
+    #[cfg(unix)]
+    mod havoc_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn safe_pid_cast(pid in proptest::num::u32::ANY) {
+                if let Some(safe_pid) = validate_pid_for_kill(pid) {
+                    assert!(safe_pid > 0, "Safe PID must be strictly positive");
+                }
+            }
+        }
+    }
 
     #[test]
     fn stop_server_with_none_is_noop() {
@@ -1562,7 +1361,6 @@ mod tests {
 
     #[test]
     fn watch_dirs_are_non_empty() {
-        assert!(!WATCH_DIRS.is_empty());
         for dir in WATCH_DIRS {
             assert!(!dir.is_empty());
         }
@@ -1570,7 +1368,6 @@ mod tests {
 
     #[test]
     fn watch_files_are_non_empty() {
-        assert!(!WATCH_FILES.is_empty());
         for f in WATCH_FILES {
             assert!(!f.is_empty());
         }

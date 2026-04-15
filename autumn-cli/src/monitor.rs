@@ -38,6 +38,17 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct LoggersResponse {
+    #[serde(default)]
+    current_level: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    available_levels: Vec<String>,
+    #[serde(default)]
+    loggers: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct HealthChecks {
     database: Option<DatabaseCheck>,
 }
@@ -117,6 +128,12 @@ struct DbPoolMetrics {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct ChannelsResponse {
+    #[serde(default)]
+    channels: HashMap<String, usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct TasksResponse {
     #[serde(default)]
     scheduled_tasks: HashMap<String, TaskStatus>,
@@ -129,13 +146,10 @@ struct TaskStatus {
     #[serde(default)]
     status: String,
     #[serde(default)]
-    #[allow(dead_code)]
     last_run: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_duration_ms: Option<u64>,
     #[serde(default)]
-    #[allow(dead_code)]
     last_result: Option<String>,
     #[serde(default)]
     last_error: Option<String>,
@@ -155,6 +169,8 @@ struct DashboardState {
     health: HealthResponse,
     metrics: MetricsResponse,
     tasks: TasksResponse,
+    loggers: LoggersResponse,
+    channels: ChannelsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -184,6 +200,8 @@ impl DashboardState {
             health: HealthResponse::default(),
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
+            loggers: LoggersResponse::default(),
+            channels: ChannelsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -211,7 +229,19 @@ impl DashboardState {
             }
         };
 
-        // Fetch health
+        if !self.fetch_health(&client) {
+            return;
+        }
+
+        self.fetch_metrics(&client);
+        self.fetch_tasks(&client);
+        self.fetch_loggers(&client);
+        self.fetch_channels(&client);
+
+        self.last_poll = Instant::now();
+    }
+
+    fn fetch_health(&mut self, client: &reqwest::blocking::Client) -> bool {
         match client
             .get(format!("{}/actuator/health", self.base_url))
             .send()
@@ -222,19 +252,22 @@ impl DashboardState {
                 if let Ok(h) = resp.json::<HealthResponse>() {
                     self.health = h;
                 }
+                true
             }
             Ok(resp) => {
                 self.connected = true;
                 self.last_error = Some(format!("Health returned {}", resp.status()));
+                true
             }
             Err(e) => {
                 self.connected = false;
                 self.last_error = Some(format!("Connection failed: {e}"));
-                return;
+                false
             }
         }
+    }
 
-        // Fetch metrics
+    fn fetch_metrics(&mut self, client: &reqwest::blocking::Client) {
         if let Ok(resp) = client
             .get(format!("{}/actuator/metrics", self.base_url))
             .send()
@@ -269,8 +302,9 @@ impl DashboardState {
                 self.metrics = m;
             }
         }
+    }
 
-        // Fetch tasks (best effort, may 404 in prod mode)
+    fn fetch_tasks(&mut self, client: &reqwest::blocking::Client) {
         if let Ok(resp) = client
             .get(format!("{}/actuator/tasks", self.base_url))
             .send()
@@ -279,8 +313,28 @@ impl DashboardState {
                 self.tasks = t;
             }
         }
+    }
 
-        self.last_poll = Instant::now();
+    fn fetch_loggers(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/loggers", self.base_url))
+            .send()
+        {
+            if let Ok(l) = resp.json::<LoggersResponse>() {
+                self.loggers = l;
+            }
+        }
+    }
+
+    fn fetch_channels(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/channels", self.base_url))
+            .send()
+        {
+            if let Ok(c) = resp.json::<ChannelsResponse>() {
+                self.channels = c;
+            }
+        }
     }
 }
 
@@ -335,10 +389,14 @@ fn run_loop(
                         }
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 2;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
-                            state.active_tab = usize::from(state.active_tab == 0);
+                            if state.active_tab == 0 {
+                                state.active_tab = 3;
+                            } else {
+                                state.active_tab -= 1;
+                            }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
                             state.route_scroll = state.route_scroll.saturating_add(1);
@@ -382,6 +440,8 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
     match state.active_tab {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
+        2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_channels_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -425,7 +485,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -730,58 +790,57 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
 
     // DB pool info
     if let Some(db) = &state.metrics.database {
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "Database Pool",
-            Style::default()
-                .fg(Color::Rgb(204, 120, 50))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )));
-        lines.push(info_line(
-            "Pool Size",
-            &db.pool_size.to_string(),
-            Color::White,
-        ));
-        lines.push(info_line(
-            "Active",
-            &db.active_connections.to_string(),
-            Color::Yellow,
-        ));
-        lines.push(info_line(
-            "Idle",
-            &db.idle_connections.to_string(),
-            Color::Green,
-        ));
+        push_db_pool_lines(
+            &mut lines,
+            None,
+            db.pool_size,
+            db.active_connections,
+            db.idle_connections,
+        );
     } else if let Some(checks) = &state.health.checks {
         if let Some(db) = &checks.database {
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "Database Pool",
-                Style::default()
-                    .fg(Color::Rgb(204, 120, 50))
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )));
-            lines.push(info_line("DB Status", &db.status, status_color(&db.status)));
-            lines.push(info_line(
-                "Pool Size",
-                &db.pool_size.to_string(),
-                Color::White,
-            ));
-            lines.push(info_line(
-                "Active",
-                &db.active_connections.to_string(),
-                Color::Yellow,
-            ));
-            lines.push(info_line(
-                "Idle",
-                &db.idle_connections.to_string(),
-                Color::Green,
-            ));
+            push_db_pool_lines(
+                &mut lines,
+                Some(&db.status),
+                db.pool_size,
+                db.active_connections,
+                db.idle_connections,
+            );
         }
     }
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn push_db_pool_lines(
+    lines: &mut Vec<Line<'static>>,
+    status: Option<&str>,
+    pool_size: u64,
+    active_connections: u64,
+    idle_connections: u64,
+) {
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Database Pool",
+        Style::default()
+            .fg(Color::Rgb(204, 120, 50))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )));
+    if let Some(status) = status {
+        lines.push(info_line("DB Status", status, status_color(status)));
+    }
+    lines.push(info_line("Pool Size", &pool_size.to_string(), Color::White));
+    lines.push(info_line(
+        "Active",
+        &active_connections.to_string(),
+        Color::Yellow,
+    ));
+    lines.push(info_line(
+        "Idle",
+        &idle_connections.to_string(),
+        Color::Green,
+    ));
 }
 
 fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
@@ -844,6 +903,35 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
             },
         ]));
 
+        if task.last_run.is_some() || task.last_duration_ms.is_some() || task.last_result.is_some()
+        {
+            let mut run_info = vec![Span::raw("  ")];
+            if let Some(last_run) = &task.last_run {
+                run_info.push(Span::styled(
+                    format!("last run: {last_run}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(dur) = task.last_duration_ms {
+                run_info.push(Span::styled(
+                    format!(" ({dur}ms)"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if let Some(res) = &task.last_result {
+                run_info.push(Span::raw(" ["));
+                let res_color =
+                    if res.eq_ignore_ascii_case("ok") || res.eq_ignore_ascii_case("success") {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    };
+                run_info.push(Span::styled(res, Style::default().fg(res_color)));
+                run_info.push(Span::raw("]"));
+            }
+            lines.push(Line::from(run_info));
+        }
+
         if let Some(err) = &task.last_error {
             lines.push(Line::from(vec![
                 Span::raw("  "),
@@ -859,6 +947,150 @@ fn draw_tasks_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
+}
+
+fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Loggers ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Logger Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Level").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut loggers: Vec<_> = state.loggers.loggers.iter().collect();
+    loggers.sort_by(|a, b| a.0.cmp(b.0));
+
+    // Also include the root logger
+    let mut rows = vec![Row::new(vec![
+        Cell::from("ROOT (current)").style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from(state.loggers.current_level.clone()).style(
+            Style::default()
+                .fg(match state.loggers.current_level.as_str() {
+                    "trace" => Color::Magenta,
+                    "debug" => Color::Cyan,
+                    "info" => Color::Green,
+                    "warn" => Color::Yellow,
+                    "error" => Color::Red,
+                    _ => Color::White,
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])];
+
+    for (name, level) in loggers {
+        let level_color = match level.as_str() {
+            "trace" => Color::Magenta,
+            "debug" => Color::Cyan,
+            "info" => Color::Green,
+            "warn" => Color::Yellow,
+            "error" => Color::Red,
+            _ => Color::White,
+        };
+
+        rows.push(Row::new(vec![
+            Cell::from(name.clone()).style(Style::default().fg(Color::White)),
+            Cell::from(level.clone()).style(
+                Style::default()
+                    .fg(level_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(70), Constraint::Percentage(30)],
+    )
+    .header(header)
+    .block(block)
+    .column_spacing(2);
+
+    frame.render_widget(table, area);
+}
+
+fn draw_channels_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Channels ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Channel Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Subscribers").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut rows = Vec::new();
+
+    if state.channels.channels.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from("No active channels").style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+        ]));
+    } else {
+        let mut sorted_channels: Vec<_> = state.channels.channels.iter().collect();
+        sorted_channels.sort_by_key(|(name, _)| *name);
+
+        for (name, count) in sorted_channels {
+            let count_color = if *count > 0 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+
+            rows.push(Row::new(vec![
+                Cell::from(name.clone()),
+                Cell::from(count.to_string()).style(Style::default().fg(count_color)),
+            ]));
+        }
+    }
+
+    let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
+
+    frame.render_widget(table, area);
 }
 
 fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
@@ -1223,6 +1455,101 @@ mod tests {
 
     // ── Dashboard state tests ─────────────────────────────────
 
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn test_poll_updates_state() {
+        // Start a mock server
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(4) {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+
+                // Consume all remaining headers until an empty line is reached
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+
+                let (body, status) = if req_line.contains("/actuator/health") {
+                    ("{\"status\":\"up\"}", "200 OK")
+                } else if req_line.contains("/actuator/metrics") {
+                    ("{\"http\":{\"requests_total\":42}}", "200 OK")
+                } else if req_line.contains("/actuator/tasks") {
+                    ("{\"scheduled_tasks\":{}}", "200 OK")
+                } else if req_line.contains("/actuator/loggers") {
+                    ("{\"current_level\":\"info\"}", "200 OK")
+                } else {
+                    ("", "404 NOT FOUND")
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        // Initially disconnected and metrics at 0
+        assert!(!state.connected);
+        assert_eq!(state.metrics.http.requests_total, 0);
+
+        // Run poll
+        state.poll();
+
+        // Check if state was updated correctly
+        assert!(state.connected);
+        assert_eq!(state.health.status, "up");
+        assert_eq!(state.metrics.http.requests_total, 42);
+        assert_eq!(state.loggers.current_level, "info");
+    }
+
+    #[test]
+    fn test_poll_handles_connection_error() {
+        // Use an invalid port to force connection error
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Ensure the port is immediately closed and unreachable
+
+        let mut state = DashboardState::new(format!("http://127.0.0.1:{port}"));
+        state.connected = true; // Assume it was previously connected
+
+        state.poll();
+
+        assert!(!state.connected);
+        assert!(state.last_error.is_some());
+        assert!(
+            state
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("Connection failed")
+                || state
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("HTTP client error")
+        );
+    }
+
     #[test]
     fn dashboard_state_initial() {
         let state = DashboardState::new("http://localhost:3000".to_string());
@@ -1359,6 +1686,25 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_loggers_response() {
+        let json = r#"{"current_level":"info","available_levels":["trace","debug","info","warn","error"],"loggers":{"my_module":"debug","other_module":"trace"}}"#;
+        let loggers: LoggersResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(loggers.current_level, "info");
+        assert_eq!(loggers.available_levels.len(), 5);
+        assert_eq!(loggers.loggers["my_module"], "debug");
+        assert_eq!(loggers.loggers["other_module"], "trace");
+    }
+
+    #[test]
+    fn deserialize_channels_response() {
+        let json = r#"{"channels":{"chat":10,"notifications":0}}"#;
+        let channels: ChannelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(channels.channels.len(), 2);
+        assert_eq!(channels.channels["chat"], 10);
+        assert_eq!(channels.channels["notifications"], 0);
+    }
+
+    #[test]
     fn default_types() {
         let _h = HealthResponse::default();
         let _m = MetricsResponse::default();
@@ -1371,6 +1717,8 @@ mod tests {
         let _hc = HealthChecks::default();
         let _dc = DatabaseCheck::default();
         let _db = DbPoolMetrics::default();
+        let _l = LoggersResponse::default();
+        let _c = ChannelsResponse::default();
     }
 
     // ── Rendering tests (TestBackend) ─────────────────────────
@@ -1391,6 +1739,45 @@ mod tests {
     fn render_routes_tab() {
         let mut state = test_state();
         state.active_tab = 1;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_channels_tab() {
+        let mut state = test_state();
+        state.active_tab = 3;
+        state.channels.channels.insert("chat".to_string(), 10);
+        state
+            .channels
+            .channels
+            .insert("notifications".to_string(), 0);
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_loggers_tab() {
+        let mut state = test_state();
+        state.active_tab = 2;
+        state.loggers = LoggersResponse {
+            current_level: "unknown_level".to_string(), // Test fallback color
+            available_levels: vec![
+                "trace".to_string(),
+                "debug".to_string(),
+                "info".to_string(),
+                "warn".to_string(),
+                "error".to_string(),
+            ],
+            loggers: vec![
+                ("my_module".to_string(), "debug".to_string()),
+                ("other_module".to_string(), "trace".to_string()),
+                ("mod_warn".to_string(), "warn".to_string()),
+                ("mod_error".to_string(), "error".to_string()),
+                ("mod_info".to_string(), "info".to_string()),
+                ("mod_unknown".to_string(), "unknown".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        };
         render_frame(&state, 120, 40);
     }
 
@@ -1536,6 +1923,26 @@ mod tests {
         let mut state = test_state();
         state.active_tab = 99;
         render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn back_tab_wrap_logic() {
+        let mut state = test_state();
+        state.active_tab = 0;
+
+        if state.active_tab == 0 {
+            state.active_tab = 3;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 3);
+
+        if state.active_tab == 0 {
+            state.active_tab = 3;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 2);
     }
 
     #[test]

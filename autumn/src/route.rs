@@ -29,7 +29,7 @@ use crate::state::AppState;
 /// async fn hello() -> &'static str { "hi" }
 ///
 /// // `routes!` expands to a Vec<Route>:
-/// let route_vec: Vec<autumn_web::route::Route> = routes![hello];
+/// let route_vec: Vec<autumn_web::Route> = routes![hello];
 /// assert_eq!(route_vec.len(), 1);
 /// ```
 pub struct Route {

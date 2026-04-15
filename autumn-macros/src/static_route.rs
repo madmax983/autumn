@@ -70,7 +70,7 @@ impl Parse for StaticGetAttrs {
 ///
 /// Emits:
 /// 1. The original `async fn` unchanged.
-/// 2. `__autumn_route_info_{name}()` returning `::autumn_web::route::Route`
+/// 2. `__autumn_route_info_{name}()` returning `::autumn_web::Route`
 ///    (identical to what `#[get]` produces).
 /// 3. `__autumn_static_meta_{name}()` returning
 ///    `::autumn_web::static_gen::StaticRouteMeta`.
@@ -154,8 +154,8 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #input_fn
 
         #[doc(hidden)]
-        #vis fn #route_info_name() -> ::autumn_web::route::Route {
-            ::autumn_web::route::Route {
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            ::autumn_web::Route {
                 method: ::autumn_web::reexports::http::Method::GET,
                 path: #path,
                 handler: ::autumn_web::reexports::axum::routing::get(#fn_name),

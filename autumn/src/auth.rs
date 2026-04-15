@@ -16,7 +16,7 @@
 //!
 //! #[post("/register")]
 //! async fn register() -> AutumnResult<&'static str> {
-//!     let hashed = hash_password("secret123")?;
+//!     let hashed = hash_password("secret123").await?;
 //!     // Save hashed password to database...
 //!     Ok("registered")
 //! }
@@ -25,7 +25,7 @@
 //! async fn login(session: Session) -> AutumnResult<&'static str> {
 //!     // Verify credentials...
 //!     let stored_hash = "$2b$12$..."; // from database
-//!     if verify_password("secret123", stored_hash)? {
+//!     if verify_password("secret123", stored_hash).await? {
 //!         session.insert("user_id", "42").await;
 //!         Ok("logged in")
 //!     } else {
@@ -63,8 +63,6 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
 
-use crate::state::AppState;
-
 // ── Password hashing ────────────────────────────────────────────
 
 /// Default bcrypt cost factor.
@@ -83,12 +81,19 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// ```rust
 /// use autumn_web::auth::hash_password;
 ///
-/// let hashed = hash_password("my_secret").unwrap();
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let hashed = hash_password("my_secret").await.unwrap();
 /// assert!(hashed.starts_with("$2b$"));
+/// # });
 /// ```
-pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
-    bcrypt::hash(password, DEFAULT_BCRYPT_COST)
-        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
+    let password = password.to_string();
+    tokio::task::spawn_blocking(move || {
+        bcrypt::hash(password, DEFAULT_BCRYPT_COST)
+            .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+    })
+    .await
+    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
 }
 
 /// Verify a plaintext password against a bcrypt hash.
@@ -104,13 +109,32 @@ pub fn hash_password(password: &str) -> crate::AutumnResult<String> {
 /// ```rust
 /// use autumn_web::auth::{hash_password, verify_password};
 ///
-/// let hashed = hash_password("my_secret").unwrap();
-/// assert!(verify_password("my_secret", &hashed).unwrap());
-/// assert!(!verify_password("wrong_password", &hashed).unwrap());
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let hashed = hash_password("my_secret").await.unwrap();
+/// assert!(verify_password("my_secret", &hashed).await.unwrap());
+/// assert!(!verify_password("wrong_password", &hashed).await.unwrap());
+/// # });
 /// ```
-pub fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
-    bcrypt::verify(password, hash)
-        .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
+pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
+    let password = password.to_string();
+    let hash = hash.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        // First try to verify.
+        bcrypt::verify(&password, &hash).map_or_else(
+            |_| {
+                // To prevent timing attacks where an invalid hash format returns instantly,
+                // we perform a dummy verification against a known hash with DEFAULT_BCRYPT_COST
+                // so the timing remains roughly the same as a real verification.
+                let dummy_hash = "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6";
+                let _ = bcrypt::verify(&password, dummy_hash);
+                Ok(false)
+            },
+            Ok,
+        )
+    })
+    .await
+    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
 }
 
 // ── Runtime check for #[secured] macro ──────────────────────────
@@ -181,15 +205,16 @@ pub async fn __check_secured(
 /// ```
 pub struct Auth<T>(pub T);
 
-impl<T> FromRequestParts<AppState> for Auth<T>
+impl<T, S> FromRequestParts<S> for Auth<T>
 where
     T: Clone + Send + Sync + 'static,
+    S: Send + Sync,
 {
     type Rejection = AuthRejection;
 
     fn from_request_parts(
         parts: &mut Parts,
-        _state: &AppState,
+        _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let user = parts.extensions.get::<T>().cloned();
         async move { user.map_or_else(|| Err(AuthRejection), |user| Ok(Self(user))) }
@@ -370,18 +395,19 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hash_and_verify_password() {
-        let hash = hash_password("test_password").unwrap();
+    #[tokio::test]
+    async fn hash_and_verify_password() {
+        let hash = hash_password("test_password").await.unwrap();
         assert!(hash.starts_with("$2b$"));
-        assert!(verify_password("test_password", &hash).unwrap());
-        assert!(!verify_password("wrong_password", &hash).unwrap());
+        assert!(verify_password("test_password", &hash).await.unwrap());
+        assert!(!verify_password("wrong_password", &hash).await.unwrap());
     }
 
-    #[test]
-    fn verify_invalid_hash_returns_error() {
-        let result = verify_password("test", "not-a-valid-hash");
-        assert!(result.is_err());
+    #[tokio::test]
+    async fn verify_invalid_hash_returns_false() {
+        let result = verify_password("test", "not-a-valid-hash").await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -405,6 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -420,11 +447,15 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -452,6 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
+        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -467,11 +499,15 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -520,13 +556,18 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
+        use crate::state::AppState;
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -569,6 +610,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(err.to_string(), "authentication required");
     }
 
     #[tokio::test]
@@ -590,6 +632,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.to_string(), "insufficient permissions");
     }
 
     #[tokio::test]
@@ -624,6 +667,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
+        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -631,11 +675,15 @@ mod tests {
         }
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -676,6 +724,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -688,14 +737,19 @@ mod tests {
                 "sess1",
                 std::collections::HashMap::from([("user_id".into(), "42".into())]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -738,6 +792,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured("admin")]
         async fn admin_only() -> crate::AutumnResult<&'static str> {
@@ -753,14 +808,19 @@ mod tests {
                     ("role".into(), "viewer".into()),
                 ]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -799,6 +859,7 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         #[autumn_macros::secured("admin", "editor")]
         async fn content_handler() -> crate::AutumnResult<&'static str> {
@@ -814,14 +875,19 @@ mod tests {
                     ("role".into(), "editor".into()),
                 ]),
             )
-            .await;
+            .await
+            .unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -864,19 +930,24 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
 
         let store = MemoryStore::new();
         // Pre-populate a session with user_id
         let mut session_data = std::collections::HashMap::new();
         session_data.insert("user_id".into(), "42".into());
-        store.save("valid-session", session_data).await;
+        store.save("valid-session", session_data).await.unwrap();
 
         let state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -909,5 +980,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn require_auth_poll_ready_propagates() {
+        use std::task::{Context, Poll};
+        use tower::{Layer, Service};
+
+        #[derive(Clone)]
+        struct MockService {
+            ready: bool,
+            poll_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Service<axum::extract::Request> for MockService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                self.poll_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.ready {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+
+            fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
+                std::future::ready(Ok(axum::response::Response::new(axum::body::Body::empty())))
+            }
+        }
+
+        let layer = RequireAuth::new("user_id");
+        let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock_service = MockService {
+            ready: false,
+            poll_count: poll_count.clone(),
+        };
+        let mut service = layer.layer(mock_service);
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // When inner is not ready, RequireAuthService should not be ready
+        let poll = service.poll_ready(&mut cx);
+        assert!(poll.is_pending());
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // When inner is ready, RequireAuthService should be ready
+        let mock_service_ready = MockService {
+            ready: true,
+            poll_count: poll_count.clone(),
+        };
+        let mut service_ready = layer.layer(mock_service_ready);
+        let poll_ready = service_ready.poll_ready(&mut cx);
+        assert!(poll_ready.is_ready());
+        assert_eq!(poll_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn auth_rejection_into_response() {
+        let rejection = AuthRejection;
+        let response = rejection.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["status"], 401);
+        assert_eq!(json["error"]["message"], "authentication required");
+    }
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = AuthConfig::default();
+        assert_eq!(config.bcrypt_cost, DEFAULT_BCRYPT_COST);
+        assert_eq!(config.session_key, "user_id");
     }
 }

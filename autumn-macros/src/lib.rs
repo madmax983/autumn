@@ -13,8 +13,6 @@
 
 mod cached;
 mod collect;
-mod island;
-mod islands_macro;
 mod main_macro;
 mod model;
 mod parse;
@@ -145,16 +143,6 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
-}
-
-#[proc_macro_attribute]
-pub fn island(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    island::island_macro(item.into()).into()
-}
-
-#[proc_macro]
-pub fn islands(input: TokenStream) -> TokenStream {
-    islands_macro::islands_macro(input.into()).into()
 }
 
 /// Set up the async runtime for an Autumn application.

@@ -13,8 +13,6 @@ async fn other_handler() -> &'static str {
 #[test]
 fn app_builder_accepts_routes() {
     let builder = autumn_web::app().routes(routes![test_handler]);
-    // Verify it compiles and doesn't panic — we can't call .run()
-    // without actually starting a server.
     let _ = builder;
 }
 

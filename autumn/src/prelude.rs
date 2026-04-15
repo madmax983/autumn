@@ -12,7 +12,7 @@
 //! |----------|-------|
 //! | Route macros | [`get`], [`post`], [`put`], [`delete`], [`routes`], [`main`] |
 //! | HTML rendering | [`Markup`], [`PreEscaped`], [`html!`](maud::html) |
-//! | Extractors | [`Db`], [`Json`], [`Form`] |
+//! | Extractors | [`Db`], [`Json`], [`Form`], [`Path`], [`Query`] |
 //! | Error handling | [`AutumnError`], [`AutumnResult`] |
 //! | State | [`AppState`] |
 //!
@@ -27,8 +27,8 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    cached, delete, get, island, islands, main, post, put, routes, scheduled, secured, service,
-    static_get, static_routes, tasks,
+    cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
+    static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -44,6 +44,19 @@ pub use crate::db::Db;
 pub use crate::extract::Form;
 /// JSON request/response type.
 pub use crate::extract::Json;
+/// Path extractor.
+pub use crate::extract::Path;
+/// Query extractor.
+pub use crate::extract::Query;
+/// Flash message extractor.
+#[cfg(feature = "flash")]
+pub use crate::flash::{Flash, FlashLevel, FlashMessage};
+/// htmx request extractor.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::HxRequest;
+/// Extension trait for adding htmx response headers.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::HxResponseExt;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.
@@ -82,10 +95,14 @@ mod tests {
     fn prelude_types_are_accessible() {
         #[cfg(feature = "db")]
         let _state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
@@ -97,9 +114,13 @@ mod tests {
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
+            extensions: std::sync::Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),

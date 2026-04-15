@@ -61,11 +61,14 @@ pub fn route_macro(
     // Custom compile_error! diagnostics (S-007) provide error guidance instead.
 
     quote! {
+        // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
+        // to import axum manually. However, the path resolution in Axum macros makes this impossible
+        // natively. Custom compile errors handle the type checks.
         #input_fn
 
         #[doc(hidden)]
-        #vis fn #route_info_name() -> ::autumn_web::route::Route {
-            ::autumn_web::route::Route {
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            ::autumn_web::Route {
                 method: ::autumn_web::reexports::http::Method::#method_const,
                 path: #path,
                 handler: #handler_expr,

@@ -118,8 +118,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #upgrade_handler
 
         #[doc(hidden)]
-        #vis fn #route_info_name() -> ::autumn_web::route::Route {
-            ::autumn_web::route::Route {
+        #vis fn #route_info_name() -> ::autumn_web::Route {
+            ::autumn_web::Route {
                 method: ::autumn_web::reexports::http::Method::GET,
                 path: #path,
                 handler: ::autumn_web::reexports::axum::routing::get(#upgrade_name),
