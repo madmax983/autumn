@@ -69,10 +69,10 @@ use std::task::{Context, Poll};
 
 use axum::extract::{FromRequestParts, Request};
 use axum::response::{IntoResponse, Response};
-use http::HeaderValue;
-use http::StatusCode;
 use http::header::{COOKIE, SET_COOKIE};
 use http::request::Parts;
+use http::HeaderValue;
+use http::StatusCode;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tower::{Layer, Service};
@@ -712,9 +712,9 @@ pub(crate) fn apply_session_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
+    use axum::Router;
     use http::Request as HttpRequest;
     use tower::ServiceExt;
 
@@ -767,7 +767,10 @@ mod tests {
 
         let loaded = store.load("sess1").await?;
         assert!(loaded.is_some());
-        assert_eq!(loaded.ok_or("missing")?.get("user").ok_or("missing user")?, "alice");
+        assert_eq!(
+            loaded.ok_or("missing")?.get("user").ok_or("missing user")?,
+            "alice"
+        );
         Ok(())
     }
 
@@ -903,7 +906,8 @@ mod tests {
     }
 
     #[test]
-    fn session_backend_plan_warns_for_prod_memory_without_ack() -> Result<(), Box<dyn std::error::Error>> {
+    fn session_backend_plan_warns_for_prod_memory_without_ack(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let config = SessionConfig::default();
         let plan = config.backend_plan(Some("prod"))?;
         assert_eq!(
@@ -916,7 +920,8 @@ mod tests {
     }
 
     #[test]
-    fn session_backend_plan_suppresses_prod_warning_when_acknowledged() -> Result<(), Box<dyn std::error::Error>> {
+    fn session_backend_plan_suppresses_prod_warning_when_acknowledged(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let config = SessionConfig {
             allow_memory_in_production: true,
             ..SessionConfig::default()
@@ -981,8 +986,7 @@ mod tests {
 
         let response = app
             .oneshot(HttpRequest::builder().uri("/").body(Body::empty())?)
-            .await
-            ?;
+            .await?;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         let set_cookie = response
@@ -1015,7 +1019,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_layer_persists_data_across_requests() -> Result<(), Box<dyn std::error::Error>> {
+    async fn session_layer_persists_data_across_requests() -> Result<(), Box<dyn std::error::Error>>
+    {
         async fn write_handler(session: Session) -> String {
             session.insert("user", "alice").await;
             "saved".to_owned()
@@ -1038,13 +1043,8 @@ mod tests {
         // First request: write to session
         let resp1 = app
             .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/write")
-                    .body(Body::empty())?,
-            )
-            .await
-            ?;
+            .oneshot(HttpRequest::builder().uri("/write").body(Body::empty())?)
+            .await?;
 
         let cookie = resp1
             .headers()
@@ -1063,12 +1063,9 @@ mod tests {
                     .header(COOKIE, session_cookie)
                     .body(Body::empty())?,
             )
-            .await
-            ?;
+            .await?;
 
-        let body = axum::body::to_bytes(resp2.into_body(), usize::MAX)
-            .await
-            ?;
+        let body = axum::body::to_bytes(resp2.into_body(), usize::MAX).await?;
         assert_eq!(std::str::from_utf8(&body)?, "alice");
         Ok(())
     }
@@ -1085,8 +1082,7 @@ mod tests {
         let store = MemoryStore::new();
         store
             .save("existing-id", HashMap::from([("k".into(), "v".into())]))
-            .await
-            ?;
+            .await?;
 
         let app = Router::new()
             .route("/", get(handler))
@@ -1100,15 +1096,13 @@ mod tests {
                     .header(COOKIE, "autumn.sid=existing-id")
                     .body(Body::empty())?,
             )
-            .await
-            ?;
+            .await?;
 
         let cookie = response
             .headers()
             .get(SET_COOKIE)
             .ok_or("missing cookie")?
-            .to_str()
-            ?;
+            .to_str()?;
         assert!(cookie.contains("Max-Age=0"), "cookie should be expired");
 
         // Store should no longer have the session
@@ -1117,7 +1111,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_layer_returns_503_when_store_load_fails() -> Result<(), Box<dyn std::error::Error>> {
+    async fn session_layer_returns_503_when_store_load_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let state = test_state();
 
         let app = Router::new()
@@ -1139,15 +1134,15 @@ mod tests {
                     .header(COOKIE, "autumn.sid=existing-id")
                     .body(Body::empty())?,
             )
-            .await
-            ?;
+            .await?;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 
     #[tokio::test]
-    async fn session_layer_returns_503_when_store_save_fails() -> Result<(), Box<dyn std::error::Error>> {
+    async fn session_layer_returns_503_when_store_save_fails(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let state = test_state();
 
         let app = Router::new()
@@ -1170,8 +1165,7 @@ mod tests {
 
         let response = app
             .oneshot(HttpRequest::builder().uri("/").body(Body::empty())?)
-            .await
-            ?;
+            .await?;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
