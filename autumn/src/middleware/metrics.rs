@@ -377,6 +377,7 @@ where
 }
 
 pin_project! {
+    #[project = MetricsFutureProj]
     /// Future that records metrics after the inner service completes.
     pub struct MetricsFuture<F> {
         #[pin]
@@ -385,6 +386,14 @@ pin_project! {
         method: axum::http::Method,
         route: Option<MatchedPath>,
         start: Instant,
+    }
+    impl<F> PinnedDrop for MetricsFuture<F> {
+        fn drop(this: Pin<&mut Self>) {
+            let this = this.project();
+            if let Some(collector) = this.collector.take() {
+                collector.decrement_active();
+            }
+        }
     }
 }
 
