@@ -18,7 +18,7 @@ proptest! {
 fn test_channels_zero_capacity_regression() {
     let channels = Channels::new(0);
 
-    // This should never panic even if capacity is 0 (which was the bug)
+    // This should never panic even if capacity is 0
     let _tx = channels.sender("test_channel");
     let _rx = channels.subscribe("test_channel");
 }
