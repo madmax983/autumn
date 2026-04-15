@@ -79,6 +79,17 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
+use std::sync::OnceLock;
+
+static MACRO_MANIFEST_DIR: OnceLock<String> = OnceLock::new();
+static MACRO_IS_DEBUG: OnceLock<bool> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn __set_macro_context(manifest_dir: String, is_debug: bool) {
+    let _ = MACRO_MANIFEST_DIR.set(manifest_dir);
+    let _ = MACRO_IS_DEBUG.set(is_debug);
+}
+
 pub trait Env {
     /// Read an environment variable.
     ///
@@ -93,6 +104,19 @@ pub struct OsEnv;
 
 impl Env for OsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            if let Some(dir) = MACRO_MANIFEST_DIR.get() {
+                return Ok(dir.clone());
+            }
+        } else if key == "AUTUMN_IS_DEBUG" {
+            if let Some(is_debug) = MACRO_IS_DEBUG.get() {
+                return Ok(if *is_debug {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                });
+            }
+        }
         std::env::var(key)
     }
 }
