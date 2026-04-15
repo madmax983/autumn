@@ -74,7 +74,7 @@ async fn eris_auth_dos_poc() {
     // A true DoS (blocking workers) would make this take 30+ seconds,
     // while the non-blocking implementation allows the ping to respond immediately.
     assert!(
-        ping_duration < Duration::from_secs(5),
+        ping_duration < Duration::from_millis(250),
         "Ping took too long ({ping_duration:?}), indicating a Denial of Service via blocked worker threads!"
     );
 
