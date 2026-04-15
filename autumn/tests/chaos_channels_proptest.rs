@@ -9,16 +9,24 @@ proptest! {
         let channels = Channels::new(capacity);
 
         // This should never panic on any capacity (see explicit zero test)
-        let _tx = channels.sender("test_channel");
+        let tx = channels.sender("test_channel");
         let _rx = channels.subscribe("test_channel");
+        prop_assert!(tx.send("test").is_ok());
     }
 }
 
-#[test]
-fn test_channels_zero_capacity_regression() {
+#[tokio::test]
+async fn test_channels_zero_capacity_regression() -> Result<(), Box<dyn std::error::Error>> {
     let channels = Channels::new(0);
 
     // This should never panic even if capacity is 0 (which was the bug)
-    let _tx = channels.sender("test_channel");
-    let _rx = channels.subscribe("test_channel");
+    let tx = channels.sender("test_channel");
+    let mut rx = channels.subscribe("test_channel");
+
+    // We shouldn't use expect/unwrap in tests
+    tx.send("test_message")?;
+    let msg = rx.recv().await?;
+    assert_eq!(msg.as_str(), "test_message");
+
+    Ok(())
 }
