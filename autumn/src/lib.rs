@@ -633,7 +633,7 @@ pub mod reexports {
 }
 
 /// Shared application state passed to route handlers.
-pub mod state;
+pub(crate) mod state;
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
