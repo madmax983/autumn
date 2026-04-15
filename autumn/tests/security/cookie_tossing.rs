@@ -18,7 +18,7 @@ async fn eris_session_cookie_tossing() {
             }),
         )
         .layer(SessionLayer::new(store.clone(), config))
-        .with_state(autumn_web::state::AppState::for_test());
+        .with_state(autumn_web::AppState::for_test());
 
     // Attacker pre-creates an evil session
     let mut evil_data = std::collections::HashMap::new();
