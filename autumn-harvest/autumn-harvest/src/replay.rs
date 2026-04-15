@@ -207,23 +207,54 @@ impl HistoryMatcher {
             }
 
             match &self.events[scan_cursor] {
-                WorkflowEvent::ActivityCompleted { activity_id: id, output } if *id == activity_id => {
-                    let result = HistoryMatch::Matched { output: output.clone() };
-                    return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id,
+                    output,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
-                WorkflowEvent::ActivityFailed { activity_id: id, error, attempt } if *id == activity_id => {
-                    let result = HistoryMatch::Failed { error: error.clone(), attempt: *attempt };
-                    return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
+                WorkflowEvent::ActivityFailed {
+                    activity_id: id,
+                    error,
+                    attempt,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
-                WorkflowEvent::ActivityTimedOut { activity_id: id, timeout_type } if *id == activity_id => {
-                    let result = HistoryMatch::TimedOut { timeout_type: timeout_type.clone() };
-                    return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
+                WorkflowEvent::ActivityTimedOut {
+                    activity_id: id,
+                    timeout_type,
+                } if *id == activity_id => {
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
                 // Skip heartbeats and started events for this activity.
-                WorkflowEvent::ActivityHeartbeat { activity_id: id, .. }
-                | WorkflowEvent::ActivityStarted { activity_id: id, .. }
-                    if *id == activity_id =>
-                {
+                WorkflowEvent::ActivityHeartbeat {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityStarted {
+                    activity_id: id, ..
+                } if *id == activity_id => {
                     scan_cursor += 1;
                 }
                 // Child workflows can run concurrently with activities.
@@ -234,9 +265,13 @@ impl HistoryMatcher {
                 }
                 // Signals can arrive at any time; stash them for later
                 // wait_for_signal calls and continue scanning.
-                WorkflowEvent::SignalReceived { signal_name, payload } => {
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
                     self.consumed_signal_events.insert(scan_cursor);
-                    self.pending_signals.push_back((signal_name.clone(), payload.clone()));
+                    self.pending_signals
+                        .push_back((signal_name.clone(), payload.clone()));
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -296,8 +331,14 @@ impl HistoryMatcher {
 
             if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
                 if id.as_str() == timer_id {
-                    let result = HistoryMatch::Matched { output: Value::Null };
-                    return self.settle_terminal(scan_cursor, first_interleaved_child_start, result);
+                    let result = HistoryMatch::Matched {
+                        output: Value::Null,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
             }
 
