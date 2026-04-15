@@ -57,6 +57,8 @@ pub use crate::htmx::HxRequest;
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
+/// Server-Sent Events (SSE) support.
+pub use crate::sse::{Event, Sse};
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.

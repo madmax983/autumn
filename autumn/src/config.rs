@@ -90,10 +90,25 @@ pub fn __set_macro_context(manifest_dir: String, is_debug: bool) {
     let _ = MACRO_IS_DEBUG.set(is_debug);
 }
 
+/// Trait for environment variable reading to allow testing overrides.
+///
+/// This abstracts the OS environment (`std::env::var`) so that
+/// configuration loading logic can be unit-tested deterministically
+/// by supplying a mock environment.
 pub trait Env {
     /// Read an environment variable.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use autumn_web::config::{Env, OsEnv};
+    /// let env = OsEnv;
+    /// let val = env.var("NON_EXISTENT_VAR");
+    /// assert!(val.is_err());
+    /// ```
+    ///
     /// # Errors
+    ///
     /// Returns [`std::env::VarError`] if the variable is not present or is not valid Unicode.
     fn var(&self, key: &str) -> Result<String, std::env::VarError>;
 }

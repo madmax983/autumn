@@ -1010,10 +1010,20 @@ fn rebroadcast_row(state: &AppState, row: &LiveFeedEventRow) {
         .ok();
 }
 
+/// ⚡ Bolt Optimization:
+/// Avoids an intermediate `Vec<&str>` heap allocation and `join` overhead
+/// by manually building the collapsed string into a pre-allocated buffer.
 fn comment_body_preview(body: &str) -> String {
     const MAX_PREVIEW_LEN: usize = 120;
 
-    let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut collapsed = String::with_capacity(body.len());
+    for word in body.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(word);
+    }
+
     if collapsed.len() <= MAX_PREVIEW_LEN {
         return collapsed;
     }

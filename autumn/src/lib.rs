@@ -110,6 +110,7 @@ pub mod session;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 /// Static site generation support.
+pub mod sse;
 pub mod static_gen;
 pub mod task;
 pub(crate) mod telemetry;
@@ -632,7 +633,7 @@ pub mod reexports {
 }
 
 /// Shared application state passed to route handlers.
-pub mod state;
+pub(crate) mod state;
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
