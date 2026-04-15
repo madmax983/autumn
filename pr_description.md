@@ -1,4 +1,7 @@
-🧨 **The Trigger:** A client disconnects or times out before the `MetricsFuture` resolves to completion.
-📉 **The Stack Trace:** N/A (Memory/resource leak instead of a panic). The `requests_active` metric continues to increment indefinitely, leading to permanently skewed active connection tracking.
-🧪 **Reproduction:** Run `cargo test --test chaos_metrics_leak -p autumn-web`. The test simulates a dropped future, revealing the counter stays stuck at 1 instead of decrementing.
+🛡️ Sentry: [test coverage improvement]
+
+🎯 **Target**: Tested `fallback_404_handler` function in `autumn/src/middleware/error_page_filter.rs`.
+💣 **Risk**: This function lacked any tests. If someone unknowingly modifies it, it could break our error handling capabilities and routing failovers.
+🧪 **Strategy**: Added the `fallback_404_handler_creates_correct_error` test that invokes the handler with an unmatched URI and asserts the correct properties in the return value (correct status and message).
+🔬 **Verification**: Ran `cargo test -p autumn-web --lib middleware::error_page_filter` directly testing the modified suite to ensure success.er stays stuck at 1 instead of decrementing.
 😈 **Comment:** You assumed every future runs to completion. You were wrong. Dropped futures left active requests dangling forever.
