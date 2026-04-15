@@ -17,20 +17,46 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 /// Trait to abstract the state requirements for actuator handlers.
+///
+/// Implement this trait on your application's state type to provide
+/// the necessary dependencies for actuator endpoints (e.g. `/actuator/metrics`).
+/// This avoids tight coupling between the actuator middleware and the specific `AppState`.
 pub trait ProvideActuatorState {
+    /// Returns a reference to the [`crate::middleware::MetricsCollector`]
+    /// tracking current HTTP traffic metrics.
     fn metrics(&self) -> &crate::middleware::MetricsCollector;
+
+    /// Returns a reference to the dynamic [`LogLevels`] configuration
+    /// allowing runtime adjustment of `tracing` filters.
     fn log_levels(&self) -> &LogLevels;
+
+    /// Returns a reference to the [`TaskRegistry`] holding status and metadata
+    /// for async scheduled background tasks.
     fn task_registry(&self) -> &TaskRegistry;
+
+    /// Returns a reference to the [`ConfigProperties`] snapshot, providing
+    /// active configuration state for the environment endpoint.
     fn config_props(&self) -> &ConfigProperties;
+
+    /// Returns the currently active execution profile (e.g. "dev", "prod")
+    /// which modifies what sensitive endpoints are exposed.
     fn profile(&self) -> &str;
+
+    /// Returns a human-readable string displaying how long the application
+    /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns a reference to the system [`crate::channels::Channels`] which
+    /// broadcasts operational events to WebSocket streams.
     #[cfg(feature = "ws")]
     fn channels(&self) -> &crate::channels::Channels;
 
+    /// Returns the main cancellation token that triggers a graceful framework shutdown.
     #[cfg(feature = "ws")]
     fn shutdown_token(&self) -> tokio_util::sync::CancellationToken;
 
+    /// Returns an optional reference to the database connection pool,
+    /// used to expose database connection metrics in the `/actuator/metrics` endpoint.
     #[cfg(feature = "db")]
     fn pool(
         &self,

@@ -129,26 +129,35 @@ impl TestApp {
         }
     }
 
-    /// Register routes with the test application.
+    /// Merge a router into the internal application state.
     ///
-    /// Can be called multiple times -- routes are combined additively.
+    /// This is useful when testing modular route definitions without building
+    /// the full application.
     #[must_use]
     pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
         self.merge_routers.push(router);
         self
     }
 
+    /// Nest a router under a specific path prefix for testing.
+    ///
+    /// This is useful for testing sub-applications or API versions.
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
         self
     }
 
+    /// Construct a [`TestClient`] directly from an `axum::Router`.
+    ///
+    /// Useful for bypassing `TestApp` builder if you just want to write requests
+    /// against a standard axum Router.
     #[must_use]
     pub const fn from_router(router: axum::Router) -> TestClient {
         TestClient { router }
     }
 
+    /// Register a collection of routes to be built into the `TestApp`.
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
@@ -258,11 +267,13 @@ pub struct TestClient {
 }
 
 impl TestClient {
-    /// Start building a GET request.
+    /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
     pub fn into_router(self) -> axum::Router {
         self.router
     }
 
+    /// Start building a GET request.
+    #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {
         RequestBuilder::new(self.router.clone(), Method::GET, uri)
     }

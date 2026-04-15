@@ -18,7 +18,7 @@ async fn test_session_fixation() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::AppState::for_test();
 
     let app = Router::new()
         .route("/login", get(login_handler))
@@ -94,7 +94,7 @@ async fn test_rotate_id() {
     let store = MemoryStore::new();
     let config = SessionConfig::default();
 
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::AppState::for_test();
 
     let app = Router::new()
         .route("/rotate", get(rotate_handler))

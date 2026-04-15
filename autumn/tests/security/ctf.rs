@@ -335,7 +335,7 @@ async fn ctf_09_session_fixation_is_blocked() {
     }
 
     let store = MemoryStore::new();
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::AppState::for_test();
     let app = Router::new()
         .route("/login", get(login_handler))
         .layer(SessionLayer::new(store.clone(), SessionConfig::default()))
@@ -403,7 +403,7 @@ async fn ctf_10_session_cookie_is_hardened_in_prod_config() {
         same_site: "Strict".to_owned(),
         ..SessionConfig::default()
     };
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::AppState::for_test();
     let app = Router::new()
         .route("/login", get(login_handler))
         .layer(SessionLayer::new(store, config))
@@ -511,7 +511,7 @@ async fn ctf_12_bouncer_turns_away_anonymous_visitors() {
         }
     }
 
-    let state = autumn_web::state::AppState::for_test();
+    let state = autumn_web::AppState::for_test();
     let app = Router::new()
         .route("/private", get(protected))
         .layer(SessionLayer::new(
