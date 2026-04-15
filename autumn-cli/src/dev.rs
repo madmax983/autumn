@@ -176,7 +176,10 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // SAFETY: `handle_sigint` only stores to an `AtomicBool`; it is
     // async-signal-safe. No threads have been spawned yet at this point.
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
     }
 
     let mut reload_state = match DevReloadState::initialize() {
