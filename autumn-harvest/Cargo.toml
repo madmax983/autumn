@@ -34,7 +34,7 @@ proc-macro2 = "1"
 
 # Dev / test
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
