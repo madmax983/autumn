@@ -8,12 +8,12 @@ use crate::error::HarvestResult;
 use crate::models::{HarvestSignal, NewHarvestSignal};
 use crate::types::ExecutionId;
 
-/// Queue a workflow signal for durable delivery.
+/// Queue a workflow signal for durable delivery and wake the parked workflow.
 ///
 /// # Errors
 ///
 /// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
-/// the insert fails.
+/// the insert or wake fails.
 #[cfg(feature = "db")]
 pub async fn send_signal(
     conn: &mut AsyncPgConnection,
@@ -35,7 +35,7 @@ pub async fn send_signal(
         .await
         .map_err(crate::error::database_error)?;
 
-    Ok(())
+    crate::queue::wake_workflow_task(conn, exec_id).await
 }
 
 /// Load all unconsumed queued signals for an execution, ordered by receive time.

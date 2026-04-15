@@ -608,7 +608,7 @@ async fn persist_workflow_failure(
     .await
 }
 
-async fn persist_signal_wait_requeue(
+async fn persist_signal_wait_park(
     conn: &mut AsyncPgConnection,
     task_id: uuid::Uuid,
     exec_id: ExecutionId,
@@ -618,11 +618,25 @@ async fn persist_signal_wait_requeue(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::requeue_for_retry(conn, task_id, chrono::Duration::seconds(1)).await
+            queue::park_workflow_task(conn, task_id).await
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    // A signal may have arrived while this task was actively running (before the
+    // park above).  `send_signal` would have called `wake_workflow_task` at that
+    // point but found no parked task to wake.  Re-check now that we are parked
+    // and self-wake if any unconsumed signals are waiting.
+    //
+    // Safety: if a new signal arrives *after* this check returns empty, its
+    // `send_signal` caller will call `wake_workflow_task` and find this
+    // RUNNING/parked task — so the wake is guaranteed regardless of timing.
+    let pending = signal::load_pending_signals(conn, exec_id).await?;
+    if !pending.is_empty() {
+        queue::wake_workflow_task(conn, exec_id).await?;
+    }
+    Ok(())
 }
 
 async fn persist_scheduled_activity(
@@ -1176,7 +1190,7 @@ async fn handle_suspended_workflow(
 ) -> HarvestResult<()> {
     if should_requeue_signal_wait(commands) {
         let marker_events = marker_events_from_commands(commands);
-        let result = persist_signal_wait_requeue(
+        let result = persist_signal_wait_park(
             conn,
             context.persistence.task.id,
             context.persistence.exec_id,
