@@ -92,7 +92,6 @@ pub mod probe;
 pub(crate) mod router;
 
 #[cfg(test)]
-pub(crate) mod test_utils;
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,

@@ -150,10 +150,6 @@ impl DevReloadState {
 
 /// Run the dev server with file watching.
 pub fn run(package: Option<&str>, show_config: bool) {
-    if show_config {
-        // SAFETY: called before spawning any threads; single-threaded at this point.
-        unsafe { std::env::set_var("AUTUMN_SHOW_CONFIG", "1") };
-    }
     eprintln!("\u{1F342} autumn dev\n");
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -169,7 +165,11 @@ pub fn run(package: Option<&str>, show_config: bool) {
     }
 
     let binary = find_binary(package);
-    let mut child = start_server(&binary, reload_state.as_ref().map(DevReloadState::path));
+    let mut child = start_server(
+        &binary,
+        reload_state.as_ref().map(DevReloadState::path),
+        show_config,
+    );
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -197,7 +197,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     // Main event loop
     loop {
-        if !process_events(&rx, package, &mut child, reload_state.as_mut()) {
+        if !process_events(&rx, package, &mut child, reload_state.as_mut(), show_config) {
             break;
         }
     }
@@ -212,6 +212,7 @@ fn process_events(
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
+    show_config: bool,
 ) -> bool {
     match rx.recv() {
         Ok(Ok(events)) => {
@@ -228,7 +229,7 @@ fn process_events(
             eprintln!("\n  Changed: {}", changed.join(", "));
             eprintln!("  Action: {}", describe_plan(plan));
 
-            execute_plan(plan, package, child, reload_state);
+            execute_plan(plan, package, child, reload_state, show_config);
             true
         }
         Ok(Err(error)) => {
@@ -248,6 +249,7 @@ fn execute_plan(
     package: Option<&str>,
     child: &mut Option<Child>,
     mut reload_state: Option<&mut DevReloadState>,
+    show_config: bool,
 ) {
     let mut applied_reload = ReloadKind::None;
 
@@ -255,7 +257,12 @@ fn execute_plan(
         stop_server(child);
 
         if cargo_build(package) {
-            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+            if restart_server(
+                package,
+                child,
+                reload_state.as_ref().map(|s| s.path()),
+                show_config,
+            ) {
                 applied_reload = ReloadKind::Full;
             }
         } else {
@@ -269,7 +276,12 @@ fn execute_plan(
 
         if plan.restart {
             stop_server(child);
-            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+            if restart_server(
+                package,
+                child,
+                reload_state.as_ref().map(|s| s.path()),
+                show_config,
+            ) {
                 applied_reload = ReloadKind::Full;
             }
         } else if plan.reload == ReloadKind::Full {
@@ -332,7 +344,11 @@ fn cargo_build(package: Option<&str>) -> bool {
 }
 
 /// Start the application binary. Returns the child process handle.
-fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child> {
+fn start_server(
+    binary: &Path,
+    reload_state_path: Option<&Path>,
+    show_config: bool,
+) -> Option<Child> {
     eprintln!("  Starting server...\n");
     let mut command = Command::new(binary);
     // Inherit stdio so tracing output (including --show-config) is visible.
@@ -341,6 +357,9 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
     if let Some(path) = reload_state_path {
         command.env(DEV_RELOAD_ENV, "1");
         command.env(DEV_RELOAD_STATE_ENV, path);
+    }
+    if show_config {
+        command.env("AUTUMN_SHOW_CONFIG", "1");
     }
 
     match command.spawn() {
@@ -533,9 +552,10 @@ fn restart_server(
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state_path: Option<&Path>,
+    show_config: bool,
 ) -> bool {
     let binary = find_binary(package);
-    *child = start_server(&binary, reload_state_path);
+    *child = start_server(&binary, reload_state_path, show_config);
     child.is_some()
 }
 
@@ -732,7 +752,6 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::EnvGuard;
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -1078,14 +1097,14 @@ mod tests {
 
     #[test]
     fn start_server_returns_none_for_missing_binary() {
-        let result = start_server(Path::new("/nonexistent/binary/path"), None);
+        let result = start_server(Path::new("/nonexistent/binary/path"), None, false);
         assert!(result.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn start_server_returns_child_for_valid_binary() {
-        let child = start_server(Path::new("/bin/sleep"), None);
+        let child = start_server(Path::new("/bin/sleep"), None, false);
         assert!(child.is_some());
         // Clean up
         let mut child = child.unwrap();
@@ -1500,18 +1519,18 @@ mod tests {
         let binary = dir.path().join(binary_name);
         std::fs::write(&binary, "echo tailwind").expect("write binary");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
-
-        let found = which("mocktailwind").expect("binary on PATH");
-        assert_eq!(found, binary);
+        temp_env::with_vars([("PATH", Some(path.as_os_str()))], || {
+            let found = which("mocktailwind").expect("binary on PATH");
+            assert_eq!(found, binary);
+        });
     }
 
     #[test]
     fn which_returns_none_when_binary_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
-
-        assert!(which("definitely-missing-binary").is_none());
+        temp_env::with_vars([("PATH", Some(path.as_os_str()))], || {
+            assert!(which("definitely-missing-binary").is_none());
+        });
     }
 }
