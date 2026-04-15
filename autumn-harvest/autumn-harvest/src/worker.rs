@@ -628,6 +628,10 @@ async fn persist_signal_wait_park(
     // park above).  `send_signal` would have called `wake_workflow_task` at that
     // point but found no parked task to wake.  Re-check now that we are parked
     // and self-wake if any unconsumed signals are waiting.
+    //
+    // Safety: if a new signal arrives *after* this check returns empty, its
+    // `send_signal` caller will call `wake_workflow_task` and find this
+    // RUNNING/parked task — so the wake is guaranteed regardless of timing.
     let pending = signal::load_pending_signals(conn, exec_id).await?;
     if !pending.is_empty() {
         queue::wake_workflow_task(conn, exec_id).await?;
