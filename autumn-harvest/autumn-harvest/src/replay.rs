@@ -227,6 +227,7 @@ impl HistoryMatcher {
                     scan_cursor += 1;
                 }
                 // Child workflows can run concurrently with activities.
+                // Preserve replay by scanning past interleaved child starts.
                 WorkflowEvent::ChildWorkflowStarted { .. } => {
                     first_interleaved_child_start.get_or_insert(scan_cursor);
                     scan_cursor += 1;
