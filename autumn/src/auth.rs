@@ -117,24 +117,29 @@ pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
 /// ```
 pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<bool> {
     let password = password.to_string();
-    let hash = hash.to_string();
 
-    tokio::task::spawn_blocking(move || {
-        // First try to verify.
-        bcrypt::verify(&password, &hash).map_or_else(
-            |_| {
-                // To prevent timing attacks where an invalid hash format returns instantly,
-                // we perform a dummy verification against a known hash with DEFAULT_BCRYPT_COST
-                // so the timing remains roughly the same as a real verification.
-                let dummy_hash = "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6";
-                let _ = bcrypt::verify(&password, dummy_hash);
-                Ok(false)
-            },
-            Ok,
-        )
+    // Parse the hash format outside the blocking task.
+    // A valid bcrypt hash is typically 60 characters and starts with "$".
+    let is_valid_format = hash.len() == 60 && hash.starts_with('$');
+
+    let hash_to_verify = if is_valid_format {
+        hash.to_string()
+    } else {
+        // To prevent timing attacks, perform a dummy verification against a known hash.
+        "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6".to_string()
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        bcrypt::verify(&password, &hash_to_verify)
     })
     .await
-    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?
+    .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?;
+
+    if !is_valid_format {
+        return Ok(false);
+    }
+
+    result.map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
 }
 
 // ── Runtime check for #[secured] macro ──────────────────────────
