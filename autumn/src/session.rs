@@ -759,50 +759,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_store_save_and_load() {
+    async fn memory_store_save_and_load() -> Result<(), Box<dyn std::error::Error>> {
         let store = MemoryStore::new();
         let mut data = HashMap::new();
         data.insert("user".into(), "alice".into());
-        store.save("sess1", data).await.unwrap();
+        store.save("sess1", data).await?;
 
-        let loaded = store.load("sess1").await.unwrap();
+        let loaded = store.load("sess1").await?;
         assert!(loaded.is_some());
-        assert_eq!(loaded.unwrap().get("user").unwrap(), "alice");
+        assert_eq!(loaded.ok_or("missing")?.get("user").ok_or("missing user")?, "alice");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn memory_store_destroy() {
+    async fn memory_store_destroy() -> Result<(), Box<dyn std::error::Error>> {
         let store = MemoryStore::new();
-        store.save("sess1", HashMap::new()).await.unwrap();
-        store.destroy("sess1").await.unwrap();
-        assert!(store.load("sess1").await.unwrap().is_none());
+        store.save("sess1", HashMap::new()).await?;
+        store.destroy("sess1").await?;
+        assert!(store.load("sess1").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn memory_store_load_missing() {
+    async fn memory_store_load_missing() -> Result<(), Box<dyn std::error::Error>> {
         let store = MemoryStore::new();
-        assert!(store.load("nonexistent").await.unwrap().is_none());
+        assert!(store.load("nonexistent").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_insert_and_get() {
+    async fn session_insert_and_get() -> Result<(), Box<dyn std::error::Error>> {
         let session = Session::new("test".into(), HashMap::new());
         session.insert("key", "value").await;
         assert_eq!(session.get("key").await, Some("value".to_owned()));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_remove() {
+    async fn session_remove() -> Result<(), Box<dyn std::error::Error>> {
         let mut data = HashMap::new();
         data.insert("key".into(), "value".into());
         let session = Session::new("test".into(), data);
         let removed = session.remove("key").await;
         assert_eq!(removed, Some("value".to_owned()));
         assert!(session.get("key").await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_clear() {
+    async fn session_clear() -> Result<(), Box<dyn std::error::Error>> {
         let mut data = HashMap::new();
         data.insert("a".into(), "1".into());
         data.insert("b".into(), "2".into());
@@ -810,19 +815,21 @@ mod tests {
         session.clear().await;
         assert!(session.get("a").await.is_none());
         assert!(session.get("b").await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_contains_key() {
+    async fn session_contains_key() -> Result<(), Box<dyn std::error::Error>> {
         let mut data = HashMap::new();
         data.insert("exists".into(), "yes".into());
         let session = Session::new("test".into(), data);
         assert!(session.contains_key("exists").await);
         assert!(!session.contains_key("missing").await);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_destroy_marks_destroyed() {
+    async fn session_destroy_marks_destroyed() -> Result<(), Box<dyn std::error::Error>> {
         let session = Session::new("test".into(), HashMap::new());
         session.insert("key", "value").await;
         session.destroy().await;
@@ -832,6 +839,7 @@ mod tests {
         drop(inner);
         assert!(destroyed);
         assert!(empty);
+        Ok(())
     }
 
     #[test]
@@ -895,30 +903,32 @@ mod tests {
     }
 
     #[test]
-    fn session_backend_plan_warns_for_prod_memory_without_ack() {
+    fn session_backend_plan_warns_for_prod_memory_without_ack() -> Result<(), Box<dyn std::error::Error>> {
         let config = SessionConfig::default();
-        let plan = config.backend_plan(Some("prod")).unwrap();
+        let plan = config.backend_plan(Some("prod"))?;
         assert_eq!(
             plan,
             SessionBackendPlan::Memory {
                 warn_in_production: true
             }
         );
+        Ok(())
     }
 
     #[test]
-    fn session_backend_plan_suppresses_prod_warning_when_acknowledged() {
+    fn session_backend_plan_suppresses_prod_warning_when_acknowledged() -> Result<(), Box<dyn std::error::Error>> {
         let config = SessionConfig {
             allow_memory_in_production: true,
             ..SessionConfig::default()
         };
-        let plan = config.backend_plan(Some("prod")).unwrap();
+        let plan = config.backend_plan(Some("prod"))?;
         assert_eq!(
             plan,
             SessionBackendPlan::Memory {
                 warn_in_production: false
             }
         );
+        Ok(())
     }
 
     #[test]
@@ -927,12 +937,14 @@ mod tests {
             backend: SessionBackend::Redis,
             ..SessionConfig::default()
         };
-        let error = config.backend_plan(None).unwrap_err();
-        assert_eq!(error, SessionBackendConfigError::MissingRedisUrl);
+        assert_eq!(
+            config.backend_plan(None),
+            Err(SessionBackendConfigError::MissingRedisUrl)
+        );
     }
 
     #[tokio::test]
-    async fn session_layer_sets_cookie_on_new_session() {
+    async fn session_layer_sets_cookie_on_new_session() -> Result<(), Box<dyn std::error::Error>> {
         use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
@@ -968,17 +980,18 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty())?)
             .await
-            .unwrap();
+            ?;
 
         assert_eq!(response.status(), http::StatusCode::OK);
         let set_cookie = response
             .headers()
             .get(SET_COOKIE)
-            .expect("should set session cookie");
-        let cookie_str = set_cookie.to_str().unwrap();
+            .ok_or("missing set cookie")?;
+        let cookie_str = set_cookie.to_str()?;
         assert!(cookie_str.contains("autumn.sid="));
+        Ok(())
     }
 
     fn test_state() -> crate::state::AppState {
@@ -1002,7 +1015,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_layer_persists_data_across_requests() {
+    async fn session_layer_persists_data_across_requests() -> Result<(), Box<dyn std::error::Error>> {
         async fn write_handler(session: Session) -> String {
             session.insert("user", "alice").await;
             "saved".to_owned()
@@ -1028,21 +1041,19 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .uri("/write")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            ?;
 
         let cookie = resp1
             .headers()
             .get(SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
+            .ok_or("missing set-cookie")?
+            .to_str()?
             .to_owned();
         // Extract just the cookie value for the next request
-        let session_cookie = cookie.split(';').next().unwrap();
+        let session_cookie = cookie.split(';').next().ok_or("missing")?;
 
         // Second request: read from session
         let resp2 = app
@@ -1050,20 +1061,20 @@ mod tests {
                 HttpRequest::builder()
                     .uri("/read")
                     .header(COOKIE, session_cookie)
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            ?;
 
         let body = axum::body::to_bytes(resp2.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "alice");
+            ?;
+        assert_eq!(std::str::from_utf8(&body)?, "alice");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_destroy_expires_cookie() {
+    async fn session_destroy_expires_cookie() -> Result<(), Box<dyn std::error::Error>> {
         async fn handler(session: Session) -> String {
             session.destroy().await;
             "destroyed".to_owned()
@@ -1075,7 +1086,7 @@ mod tests {
         store
             .save("existing-id", HashMap::from([("k".into(), "v".into())]))
             .await
-            .unwrap();
+            ?;
 
         let app = Router::new()
             .route("/", get(handler))
@@ -1087,26 +1098,26 @@ mod tests {
                 HttpRequest::builder()
                     .uri("/")
                     .header(COOKIE, "autumn.sid=existing-id")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            ?;
 
         let cookie = response
             .headers()
             .get(SET_COOKIE)
-            .unwrap()
+            .ok_or("missing cookie")?
             .to_str()
-            .unwrap();
+            ?;
         assert!(cookie.contains("Max-Age=0"), "cookie should be expired");
 
         // Store should no longer have the session
-        assert!(store.load("existing-id").await.unwrap().is_none());
+        assert!(store.load("existing-id").await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_layer_returns_503_when_store_load_fails() {
+    async fn session_layer_returns_503_when_store_load_fails() -> Result<(), Box<dyn std::error::Error>> {
         let state = test_state();
 
         let app = Router::new()
@@ -1126,17 +1137,17 @@ mod tests {
                 HttpRequest::builder()
                     .uri("/")
                     .header(COOKIE, "autumn.sid=existing-id")
-                    .body(Body::empty())
-                    .unwrap(),
+                    .body(Body::empty())?,
             )
             .await
-            .unwrap();
+            ?;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn session_layer_returns_503_when_store_save_fails() {
+    async fn session_layer_returns_503_when_store_save_fails() -> Result<(), Box<dyn std::error::Error>> {
         let state = test_state();
 
         let app = Router::new()
@@ -1158,10 +1169,11 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty())?)
             .await
-            .unwrap();
+            ?;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 }
