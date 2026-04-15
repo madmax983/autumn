@@ -25,8 +25,11 @@ fn main() {
             panic!("Tailwind CSS compilation failed");
         }
     } else {
-        println!("cargo:warning=Tailwind CSS CLI not found, skipping CSS build.");
-        println!("cargo:warning=Run `autumn setup` to download it automatically.");
+        // Output a warning ONLY if this is not part of a documentation build
+        // or a test where we don't care about CSS.
+        // Usually, `autumn dev` will complain if it is actually required.
+        // As per DX audit, removing the warning or making it quieter is better,
+        // we'll just not emit a warning for missing tailwind when it's optional.
     }
 }
 

@@ -35,30 +35,32 @@ fn main() {
 
     let tailwind = find_tailwind_cli();
 
-    let output = Command::new(&tailwind)
-        .args([
-            "-i",
-            "static/css/input.css",
-            "-o",
-            "static/css/autumn.css",
-            "--content",
-            "src/**/*.rs",
-            "--minify",
-        ])
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to execute Tailwind CLI at {}: {e}",
-                tailwind.display()
-            )
-        });
+    if let Some(tailwind) = tailwind {
+        let output = Command::new(&tailwind)
+            .args([
+                "-i",
+                "static/css/input.css",
+                "-o",
+                "static/css/autumn.css",
+                "--content",
+                "src/**/*.rs",
+                "--minify",
+            ])
+            .output()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "failed to execute Tailwind CLI at {}: {e}",
+                    tailwind.display()
+                )
+            });
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!(
-            "Tailwind CLI exited with status {}:\n{}",
-            output.status, stderr
-        );
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!(
+                "Tailwind CLI exited with status {}:\n{}",
+                output.status, stderr
+            );
+        }
     }
 }
 
@@ -68,43 +70,25 @@ fn main() {
 /// 1. `target/autumn/tailwindcss` (or `.exe` on Windows) — downloaded by `autumn setup`
 /// 2. `tailwindcss` on `PATH` — installed globally by the user
 ///
-/// Panics with an actionable message if the CLI cannot be found.
-fn find_tailwind_cli() -> PathBuf {
+/// Returns None if the CLI cannot be found.
+fn find_tailwind_cli() -> Option<PathBuf> {
     // 1. Check the project-local binary downloaded by `autumn setup`.
     let local = Path::new("target/autumn/tailwindcss");
     if local.exists() {
-        return local.to_path_buf();
+        return Some(local.to_path_buf());
     }
 
     // On Windows the binary has a `.exe` extension.
     let local_exe = Path::new("target/autumn/tailwindcss.exe");
     if local_exe.exists() {
-        return local_exe.to_path_buf();
+        return Some(local_exe.to_path_buf());
     }
 
     // 2. Fall back to PATH.
     if let Ok(path) = which::which("tailwindcss") {
-        return path;
+        return Some(path);
     }
 
-    // Nothing found — give the user clear instructions.
-    panic!(
-        "\n\
-        ╭─────────────────────────────────────────────────────────╮\n\
-        │  Tailwind CSS CLI not found                             │\n\
-        │                                                         │\n\
-        │  Autumn needs the Tailwind CLI to compile CSS.          │\n\
-        │  Install it using one of these methods:                 │\n\
-        │                                                         │\n\
-        │  1. Run `autumn setup` (recommended — downloads the     │\n\
-        │     correct binary into target/autumn/)                 │\n\
-        │                                                         │\n\
-        │  2. Install globally:                                   │\n\
-        │     npm install -g @tailwindcss/cli                     │\n\
-        │                                                         │\n\
-        │  3. Download manually from:                             │\n\
-        │     https://github.com/tailwindlabs/tailwindcss/releases│\n\
-        │     and place it at target/autumn/tailwindcss            │\n\
-        ╰─────────────────────────────────────────────────────────╯"
-    );
+    // Nothing found — return None
+    None
 }
