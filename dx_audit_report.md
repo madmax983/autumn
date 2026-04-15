@@ -58,3 +58,20 @@ To make the developer experience more robust ("idiot-proofing"):
 1.  **Broader Watching:** The watcher should ideally watch the entire project directory (excluding `target/`, `.git/`, etc.) rather than a hardcoded list of directories.
 2.  **Configurable Watching:** Alternatively, or additionally, the list of watched directories/files could be configurable in `autumn.toml`.
 3.  **Documentation:** If the hardcoded list remains, the documentation must explicitly state *which* directories are watched, so developers know where they can safely put their files and expect hot-reloading to work. Currently, `README.md` says "Development server with file watching" but doesn't specify limitations.
+
+
+# DX Audit Report: `routes![]` Macro Errors
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Attempted to add a new route handler in `routes![]` but misspelled the name.
+- Expected a simple 'cannot find function' error for the name I typed.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- Got two errors: one for my typo, and a second confusing one: `cannot find function __autumn_route_info_missing_route in this scope`.
+- The second error exposes internal macro generation details that I shouldn't have to care about.
+
+## 3. 📢 REPORT - The Complaint
+- If I make a typo, just tell me I made a typo. Don't yell at me about `__autumn_route_info_...` which isn't even in my code.
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Modifying the macro span does NOT remove the second error because rustc will eagerly resolve both. A dummy binding ensures the original user identifier error is surfaced so that developers have clear guidance on what went wrong. We must accept the second macro-level error as unavoidable cost for ergonomic macros.
