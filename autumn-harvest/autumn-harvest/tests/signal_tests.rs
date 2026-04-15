@@ -1,5 +1,7 @@
 #![cfg(feature = "db")]
 
+use autumn_harvest::models::NewWorkflowExecution;
+use autumn_harvest::schema::harvest_workflow_executions;
 use autumn_harvest::signal::{load_pending_signals, mark_signals_consumed, send_signal};
 use autumn_harvest::types::ExecutionId;
 use diesel_async::RunQueryDsl;
@@ -43,8 +45,6 @@ async fn test_send_and_load_signals() {
     let exec_id = ExecutionId::new();
 
     // Create workflow execution first (FK constraint)
-    use autumn_harvest::models::NewWorkflowExecution;
-    use autumn_harvest::schema::harvest_workflow_executions;
     let new_exec = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
@@ -88,8 +88,6 @@ async fn test_mark_signals_consumed() {
     let exec_id = ExecutionId::new();
 
     // Create workflow execution
-    use autumn_harvest::models::NewWorkflowExecution;
-    use autumn_harvest::schema::harvest_workflow_executions;
     let new_exec = NewWorkflowExecution {
         id: exec_id.as_uuid(),
         workflow_name: "test_workflow",
