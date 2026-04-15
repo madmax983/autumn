@@ -15,17 +15,57 @@ use axum::response::IntoResponse;
 use serde::Serialize;
 
 /// Trait to abstract the state requirements for probe handlers.
+///
+/// Implement this trait on your application's state type to provide
+/// the necessary dependencies for health/liveness probes.
+/// This prevents tight coupling between probe handlers and the specific `AppState`.
 pub trait ProvideProbeState {
+    /// Returns a reference to the shared [`ProbeState`] that tracks
+    /// lifecycle phases (startup, ready, draining).
     fn probes(&self) -> &ProbeState;
+
+    /// Returns whether detailed health information (e.g., uptime, pool stats)
+    /// should be included in the response.
     fn health_detailed(&self) -> bool;
+
+    /// Returns the currently active execution profile (e.g. "dev", "prod").
     fn profile(&self) -> &str;
+
+    /// Returns a human-readable string displaying how long the application
+    /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns an optional reference to the database connection pool,
+    /// used to evaluate database connectivity during a readiness check.
     #[cfg(feature = "db")]
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
 
+    /// Helper method to mark the application startup as complete.
+    ///
+    /// Delegates to [`ProbeState::mark_startup_complete`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use autumn_web::probe::{ProvideProbeState, ProbeState};
+    ///
+    /// struct MyState { probes: ProbeState }
+    /// impl ProvideProbeState for MyState {
+    ///     fn probes(&self) -> &ProbeState { &self.probes }
+    ///     fn health_detailed(&self) -> bool { false }
+    ///     fn profile(&self) -> &str { "dev" }
+    ///     fn uptime_display(&self) -> String { String::new() }
+    ///     #[cfg(feature = "db")]
+    ///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+    /// }
+    ///
+    /// let state = MyState { probes: ProbeState::pending_startup() };
+    /// assert!(!state.probes().is_startup_complete());
+    /// state.mark_startup_complete();
+    /// assert!(state.probes().is_startup_complete());
+    /// ```
     fn mark_startup_complete(&self) {
         self.probes().mark_startup_complete();
     }
