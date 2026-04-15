@@ -27,6 +27,7 @@ use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
 use autumn_harvest::schema::{harvest_dag_runs, harvest_schedules, harvest_workflow_executions};
+use autumn_harvest::queue;
 use autumn_harvest::signal;
 use autumn_harvest::store;
 use autumn_harvest::types::ExecutionId;
@@ -327,6 +328,9 @@ async fn signal_workflow(
         .await
         .map_err(map_error)?;
     signal::send_signal(&mut conn, exec_id, &signal_name, payload)
+        .await
+        .map_err(map_error)?;
+    queue::wake_workflow_task(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
 
