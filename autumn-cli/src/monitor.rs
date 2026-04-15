@@ -545,6 +545,29 @@ fn draw_overview_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
     draw_bottom_panels(frame, rows[2], state);
 }
 
+fn draw_stat_card(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    main_value: String,
+    main_color: Color,
+    subtitle: String,
+) {
+    let block = make_card_block(title);
+    let paragraph = Paragraph::new(Text::from(vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            main_value,
+            Style::default().fg(main_color).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(subtitle, Style::default().fg(Color::DarkGray))),
+    ]))
+    .alignment(Alignment::Center)
+    .block(block);
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -560,103 +583,59 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     let m = &state.metrics.http;
 
     // Card 1: Total Requests
-    let total_block = make_card_block("Total Requests");
-    let total = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format_number(m.requests_total),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{} active", m.requests_active),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(total_block);
-    frame.render_widget(total, chunks[0]);
+    draw_stat_card(
+        frame,
+        chunks[0],
+        "Total Requests",
+        format_number(m.requests_total),
+        Color::White,
+        format!("{} active", m.requests_active),
+    );
 
     // Card 2: Throughput (req/s)
     let rps = state.throughput_history.back().copied().unwrap_or(0);
-    let rps_block = make_card_block("Throughput");
-    let rps_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{rps}"),
-            Style::default()
-                .fg(if rps > 0 {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                })
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("req/s", Style::default().fg(Color::DarkGray))),
-    ]))
-    .alignment(Alignment::Center)
-    .block(rps_block);
-    frame.render_widget(rps_widget, chunks[1]);
+    draw_stat_card(
+        frame,
+        chunks[1],
+        "Throughput",
+        format!("{rps}"),
+        if rps > 0 {
+            Color::Green
+        } else {
+            Color::DarkGray
+        },
+        "req/s".to_string(),
+    );
 
     // Card 3: p50 Latency
-    let p50_block = make_card_block("p50 Latency");
-    let p50_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p50),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p50))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("median", Style::default().fg(Color::DarkGray))),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p50_block);
-    frame.render_widget(p50_widget, chunks[2]);
+    draw_stat_card(
+        frame,
+        chunks[2],
+        "p50 Latency",
+        format!("{}ms", m.latency_ms.p50),
+        latency_color(m.latency_ms.p50),
+        "median".to_string(),
+    );
 
     // Card 4: p95 Latency
-    let p95_block = make_card_block("p95 Latency");
-    let p95_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p95),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p95))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "95th pct",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p95_block);
-    frame.render_widget(p95_widget, chunks[3]);
+    draw_stat_card(
+        frame,
+        chunks[3],
+        "p95 Latency",
+        format!("{}ms", m.latency_ms.p95),
+        latency_color(m.latency_ms.p95),
+        "95th pct".to_string(),
+    );
 
     // Card 5: p99 Latency
-    let p99_block = make_card_block("p99 Latency");
-    let p99_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p99),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p99))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "99th pct",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p99_block);
-    frame.render_widget(p99_widget, chunks[4]);
+    draw_stat_card(
+        frame,
+        chunks[4],
+        "p99 Latency",
+        format!("{}ms", m.latency_ms.p99),
+        latency_color(m.latency_ms.p99),
+        "99th pct".to_string(),
+    );
 }
 
 fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
