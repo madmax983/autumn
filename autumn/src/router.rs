@@ -165,8 +165,6 @@ pub fn try_build_router_merged(
     ))
 }
 
-#[allow(clippy::cognitive_complexity)]
-#[allow(clippy::too_many_lines)]
 pub fn try_build_router_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
