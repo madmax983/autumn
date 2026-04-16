@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::AppState;
 use autumn_web::config::{AutumnConfig, DatabaseConfig};
 use autumn_web::db;

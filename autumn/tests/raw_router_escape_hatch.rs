@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::test::TestApp;
 use autumn_web::{AppState, get, routes};
 

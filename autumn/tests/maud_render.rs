@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 #![cfg(feature = "maud")]
 
 use autumn_web::{Markup, html};

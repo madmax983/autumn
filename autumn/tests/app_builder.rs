@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::{get, routes};
 
 #[get("/test")]

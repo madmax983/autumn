@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 //! Database-level integration tests for mutation hook lifecycle.
 //!
 //! These tests spin up a real Postgres instance via testcontainers and validate

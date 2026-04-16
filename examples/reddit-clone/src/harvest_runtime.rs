@@ -5,9 +5,11 @@ use autumn_web_harvest::HarvestExt;
 
 use crate::workflows;
 
+/// Item documentation.
 pub const HARVEST_API_PATH: &str = "/api/harvest";
 
 #[must_use]
+/// Function documentation.
 pub fn configured_worker_config() -> WorkerConfig {
     WorkerConfig {
         max_concurrent_workflows: 4,
@@ -17,6 +19,7 @@ pub fn configured_worker_config() -> WorkerConfig {
 }
 
 #[must_use]
+/// Function documentation.
 pub fn harvest_builder() -> HarvestBuilder {
     HarvestBuilder::new()
         .workflows(workflows::registered_workflows())
@@ -25,6 +28,7 @@ pub fn harvest_builder() -> HarvestBuilder {
 }
 
 #[must_use]
+/// Function documentation.
 pub fn configure_embedded_harvest(builder: AppBuilder) -> AppBuilder {
     let worker_config = configured_worker_config();
 

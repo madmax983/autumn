@@ -122,20 +122,35 @@ enum LiveFeedWakeOutcome {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+/// Struct documentation.
 pub struct LiveFeedRelayHealthSnapshot {
+/// Item documentation.
     pub bus_kind: String,
+/// Item documentation.
     pub listener_state: String,
+/// Item documentation.
     pub reconnect_attempts: u64,
+/// Item documentation.
     pub reconnect_successes: u64,
+/// Item documentation.
     pub reconnect_failures: u64,
+/// Item documentation.
     pub publish_successes: u64,
+/// Item documentation.
     pub publish_failures: u64,
+/// Item documentation.
     pub wake_redis: u64,
+/// Item documentation.
     pub wake_postgres: u64,
+/// Item documentation.
     pub wake_poll: u64,
+/// Item documentation.
     pub replayed_events: u64,
+/// Item documentation.
     pub last_seen_id: i64,
+/// Item documentation.
     pub last_replayed_at: Option<String>,
+/// Item documentation.
     pub last_error: Option<String>,
 }
 
@@ -445,6 +460,7 @@ impl LiveEventListenerConnector for DefaultLiveEventListenerConnector {
 }
 
 #[must_use]
+/// Function documentation.
 pub fn live_feed_relay_health_snapshot(state: &AppState) -> Option<LiveFeedRelayHealthSnapshot> {
     state
         .extension::<LiveFeedRelayHealth>()
@@ -467,10 +483,12 @@ fn ensure_live_feed_relay_health(
 }
 
 #[must_use]
+/// Function documentation.
 pub fn configure_live_feed(builder: AppBuilder) -> AppBuilder {
     builder.on_startup(start_live_event_relay)
 }
 
+/// Item documentation.
 pub async fn install_live_event_bus(state: &AppState) -> AutumnResult<()> {
     let config = LiveFeedBusConfig::load()
         .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
@@ -486,6 +504,7 @@ async fn install_live_event_bus_with_config(
     Ok(())
 }
 
+/// Item documentation.
 pub async fn publish_stored_live_event(state: &AppState, event_id: i64) -> AutumnResult<()> {
     let publisher = state.extension::<LiveEventBusPublisher>().ok_or_else(|| {
         AutumnError::service_unavailable_msg("reddit-clone live-event bus is not installed")
@@ -493,6 +512,7 @@ pub async fn publish_stored_live_event(state: &AppState, event_id: i64) -> Autum
     publisher.publish(event_id).await
 }
 
+/// Item documentation.
 pub async fn publish_stored_live_event_best_effort(state: &AppState, event_id: i64) {
     if let Err(error) = publish_stored_live_event(state, event_id).await {
         warn!(
@@ -503,6 +523,7 @@ pub async fn publish_stored_live_event_best_effort(state: &AppState, event_id: i
     }
 }
 
+/// Item documentation.
 pub async fn start_live_event_relay(state: AppState) -> AutumnResult<()> {
     if state.pool().is_none() {
         return Err(AutumnError::service_unavailable_msg(
@@ -742,6 +763,7 @@ fn spawn_live_event_relay_task(
     })
 }
 
+/// Item documentation.
 pub async fn store_activity_event(
     conn: &mut AsyncPgConnection,
     subreddit_slug: &str,
@@ -760,6 +782,7 @@ pub async fn store_activity_event(
     Ok(event_id)
 }
 
+/// Item documentation.
 pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
     let pool = state.pool().cloned().ok_or_else(|| {
         AutumnError::service_unavailable_msg("reddit-clone live-feed pruning requires database.url")
@@ -785,6 +808,7 @@ pub async fn prune_live_feed_events(state: AppState) -> AutumnResult<()> {
 }
 
 #[must_use]
+/// Function documentation.
 pub fn post_created_event(
     post_id: i64,
     title: &str,
@@ -804,6 +828,7 @@ pub fn post_created_event(
 }
 
 #[must_use]
+/// Function documentation.
 pub fn comment_created_event(
     comment_id: i64,
     post_id: i64,

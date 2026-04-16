@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");

@@ -22,6 +22,7 @@ use super::layout::{layout, redirect_to};
 // ── Register ───────────────────────────────────────────────────
 
 #[get("/register")]
+/// Item documentation.
 pub async fn register_form(csrf: CsrfToken) -> Markup {
     layout(
         "Sign Up",
@@ -68,12 +69,16 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
 }
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct RegisterForm {
+/// Item documentation.
     pub username: String,
+/// Item documentation.
     pub password: String,
 }
 
 #[post("/register")]
+/// Item documentation.
 pub async fn register(
     State(state): State<AppState>,
     mut db: Db,
@@ -162,6 +167,7 @@ pub async fn register(
 // ── Login ──────────────────────────────────────────────────────
 
 #[get("/login")]
+/// Item documentation.
 pub async fn login_form(csrf: CsrfToken) -> Markup {
     layout(
         "Log In",
@@ -206,12 +212,16 @@ pub async fn login_form(csrf: CsrfToken) -> Markup {
 }
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct LoginForm {
+/// Item documentation.
     pub username: String,
+/// Item documentation.
     pub password: String,
 }
 
 #[post("/login")]
+/// Item documentation.
 pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Markup> {
     let username = form.0.username.trim().to_lowercase();
 
@@ -238,6 +248,7 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
 // ── Logout ─────────────────────────────────────────────────────
 
 #[post("/logout")]
+/// Item documentation.
 pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::Response {
     session.destroy().await;
     super::layout::hx_redirect_to("/")
@@ -246,6 +257,7 @@ pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::
 // ── Profile ────────────────────────────────────────────────────
 
 #[get("/u/{username}")]
+/// Item documentation.
 pub async fn profile(
     Path(name): Path<String>,
     session: Session,

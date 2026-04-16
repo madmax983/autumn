@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 // Reddit Clone — an Autumn example showcasing the full feature set:
 //
 //   Route macros        -> #[get], #[post], #[delete], routes![], #[autumn_web::main]

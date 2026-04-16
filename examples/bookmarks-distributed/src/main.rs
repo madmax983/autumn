@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 // Bookmarks Distributed - sibling example scaffolded from bookmarks so the
 // future distributed retrofit has a clean, separate home:
 //

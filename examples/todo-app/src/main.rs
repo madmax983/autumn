@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 mod models;
 mod routes;
 mod schema;

@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::extract::{Form, Json};
 use axum::Router;
 use axum::body::Body;

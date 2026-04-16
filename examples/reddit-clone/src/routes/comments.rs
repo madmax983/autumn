@@ -21,7 +21,9 @@ use crate::schema::{comments, posts, subreddits, users};
 use super::layout::redirect_to;
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct CommentForm {
+/// Item documentation.
     pub body: String,
 }
 

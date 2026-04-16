@@ -4,20 +4,30 @@ use crate::schema::{comments, posts, subreddits, users, votes};
 
 #[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
 #[diesel(table_name = users)]
+/// Struct documentation.
 pub struct User {
+/// Item documentation.
     pub id: i64,
+/// Item documentation.
     pub username: String,
     #[serde(skip)]
+/// Item documentation.
     pub password_hash: String,
+/// Item documentation.
     pub karma: i64,
+/// Item documentation.
     pub role: String,
+/// Item documentation.
     pub created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, Clone, diesel::Insertable, serde::Deserialize)]
 #[diesel(table_name = users)]
+/// Struct documentation.
 pub struct NewUser {
+/// Item documentation.
     pub username: String,
+/// Item documentation.
     pub password_hash: String,
 }
 
@@ -86,20 +96,32 @@ pub struct Comment {
 #[allow(dead_code)] // Used by generated API routes; not directly referenced in app code
 #[derive(Debug, Clone, diesel::Queryable, diesel::Selectable, serde::Serialize)]
 #[diesel(table_name = votes)]
+/// Struct documentation.
 pub struct Vote {
+/// Item documentation.
     pub id: i64,
+/// Item documentation.
     pub user_id: i64,
+/// Item documentation.
     pub post_id: Option<i64>,
+/// Item documentation.
     pub comment_id: Option<i64>,
+/// Item documentation.
     pub value: i16,
+/// Item documentation.
     pub created_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, diesel::Insertable)]
 #[diesel(table_name = votes)]
+/// Struct documentation.
 pub struct NewVote {
+/// Item documentation.
     pub user_id: i64,
+/// Item documentation.
     pub post_id: Option<i64>,
+/// Item documentation.
     pub comment_id: Option<i64>,
+/// Item documentation.
     pub value: i16,
 }

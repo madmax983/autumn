@@ -36,6 +36,7 @@ type PostSummary = (
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
+/// Item documentation.
 pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
@@ -269,12 +270,17 @@ pub async fn submit_to_sub_form(
 }
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct SubmitPostForm {
+/// Item documentation.
     pub subreddit_id: i64,
+/// Item documentation.
     pub title: String,
     #[serde(default)]
+/// Item documentation.
     pub url: String,
     #[serde(default)]
+/// Item documentation.
     pub body: String,
 }
 
@@ -404,6 +410,7 @@ pub async fn submit(
 
 #[allow(clippy::too_many_lines)] // Template-heavy function
 #[get("/r/{sub_slug}/posts/{post_slug}")]
+/// Item documentation.
 pub async fn show(
     Path((sub_slug, post_slug)): Path<(String, String)>,
     session: Session,
@@ -644,9 +651,12 @@ pub async fn edit_form(
 }
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct EditPostForm {
+/// Item documentation.
     pub title: String,
     #[serde(default)]
+/// Item documentation.
     pub body: String,
 }
 

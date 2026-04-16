@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 mod hooks;
 mod models;
 mod repositories;

@@ -1,12 +1,20 @@
+/// Module documentation.
 pub mod harvest_runtime;
+/// Module documentation.
 pub mod hooks;
 pub mod live_bus;
 pub mod live_events;
+/// Module documentation.
 pub mod models;
+/// Module documentation.
 pub mod repositories;
+/// Module documentation.
 pub mod routes;
+/// Module documentation.
 pub mod schema;
+/// Module documentation.
 pub mod slugify;
+/// Module documentation.
 pub mod tasks;
 pub mod workflows;
 

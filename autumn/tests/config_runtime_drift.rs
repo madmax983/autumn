@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::TestApp;
 

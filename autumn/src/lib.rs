@@ -112,6 +112,7 @@ pub mod session;
 pub(crate) mod session_redis;
 /// Static site generation support.
 pub mod sse;
+/// Module documentation.
 pub mod static_gen;
 pub mod task;
 pub(crate) mod telemetry;

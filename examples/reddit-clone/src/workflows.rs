@@ -192,10 +192,12 @@ async fn broadcast_post_created(ctx: &ActivityContext, input: Value) -> HarvestR
     }))
 }
 
+/// Function documentation.
 pub fn registered_workflows() -> Vec<WorkflowInfo> {
     workflows![user_onboarding, post_publication]
 }
 
+/// Function documentation.
 pub fn registered_activities() -> Vec<ActivityInfo> {
     activities![
         award_starter_karma,

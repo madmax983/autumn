@@ -18,6 +18,7 @@ use super::layout::{layout, redirect_to, time_ago};
 // ── List all communities ───────────────────────────────────────
 
 #[get("/r")]
+/// Item documentation.
 pub async fn list(session: Session, repo: PgSubredditRepository) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let all = repo.find_all().await?;
@@ -119,8 +120,11 @@ pub async fn create_form(session: Session, csrf: CsrfToken) -> AutumnResult<Mark
 }
 
 #[derive(serde::Deserialize)]
+/// Struct documentation.
 pub struct CreateSubredditForm {
+/// Item documentation.
     pub name: String,
+/// Item documentation.
     pub description: String,
 }
 
@@ -170,6 +174,7 @@ pub async fn create(
 // ── Show subreddit with posts ──────────────────────────────────
 
 #[get("/r/{slug}")]
+/// Item documentation.
 pub async fn show(
     Path(slug): Path<String>,
     session: Session,

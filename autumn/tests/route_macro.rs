@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::extract::Path;
 use autumn_web::{delete, get, post, put};
 

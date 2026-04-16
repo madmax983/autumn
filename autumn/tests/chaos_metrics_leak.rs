@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 use autumn_web::middleware::{MetricsCollector, MetricsLayer};
 use axum::body::Body;
 use axum::http::Request;

@@ -10,6 +10,7 @@ use super::layout::layout;
 
 #[allow(clippy::too_many_lines)] // Template-heavy function
 #[static_get("/about")]
+/// Item documentation.
 pub async fn about() -> Markup {
     layout(
         "About",

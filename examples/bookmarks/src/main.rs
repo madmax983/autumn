@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 // Bookmarks - an Autumn example showcasing the post-v0.1.0 feature set:
 //
 //   Profiles        -> autumn.toml + autumn-dev.toml (dev auto-detected)
