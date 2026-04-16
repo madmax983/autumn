@@ -4,6 +4,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use autumn_web::AppState;
+
 use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
 use autumn_web::config::DatabaseConfig;
@@ -34,10 +35,19 @@ struct HarvestRuntime {
     outbox: Option<OutboxRuntime>,
 }
 
+type ApiMiddlewareFn = Box<
+    dyn FnOnce(
+            autumn_web::reexports::axum::Router<autumn_web::AppState>,
+        ) -> autumn_web::reexports::axum::Router<autumn_web::AppState>
+        + Send
+        + Sync,
+>;
+
 #[derive(Default)]
 struct HarvestRegistration {
     builder: HarvestBuilder,
     api_path: Option<String>,
+    api_middleware: Option<ApiMiddlewareFn>,
 }
 
 #[derive(Default)]
@@ -93,6 +103,27 @@ pub trait HarvestExt {
     /// Mount the Harvest management API under `path`.
     #[must_use]
     fn harvest_api(self, path: &str) -> Self;
+
+    /// Mount the Harvest management API under `path`, protected by the given middleware layer.
+    #[must_use]
+    fn harvest_api_with_auth<M>(self, path: &str, middleware: M) -> Self
+    where
+        M: tower::Layer<autumn_web::reexports::axum::routing::Route>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        M::Service: tower::Service<autumn_web::reexports::axum::extract::Request>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Response:
+            autumn_web::reexports::axum::response::IntoResponse + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Future:
+            Send + 'static;
 }
 
 impl HarvestExt for AppBuilder {
@@ -132,6 +163,32 @@ impl HarvestExt for AppBuilder {
             registration.api_path = Some(path);
         })
     }
+
+    fn harvest_api_with_auth<M>(self, path: &str, middleware: M) -> Self
+    where
+        M: tower::Layer<autumn_web::reexports::axum::routing::Route>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        M::Service: tower::Service<autumn_web::reexports::axum::extract::Request>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Response:
+            autumn_web::reexports::axum::response::IntoResponse + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Future:
+            Send + 'static,
+    {
+        let path = path.to_owned();
+        configure_harvest(self, move |registration| {
+            registration.api_path = Some(path);
+            registration.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
+        })
+    }
 }
 
 fn configure_harvest<F>(builder: AppBuilder, update: F) -> AppBuilder
@@ -140,6 +197,7 @@ where
 {
     let mut register_hooks = false;
     let mut api_mount = None;
+    let mut api_middleware = None;
     let builder = builder.update_extension::<HarvestIntegration, _, _>(
         HarvestIntegration::default,
         |integration| {
@@ -150,6 +208,7 @@ where
                     if let Some(path) = shared.registration.api_path.clone() {
                         integration.api_route_registered = true;
                         api_mount = Some((path, integration.api_state.clone()));
+                        api_middleware = shared.registration.api_middleware.take();
                     }
                 }
             }
@@ -163,7 +222,11 @@ where
 
     if !register_hooks {
         return if let Some((path, api_state)) = api_mount {
-            builder.nest(&path, harvest_api_router(api_state))
+            let mut router = harvest_api_router(api_state);
+            if let Some(mw) = api_middleware {
+                router = mw(router);
+            }
+            builder.nest(&path, router)
         } else {
             builder
         };
@@ -194,7 +257,11 @@ where
         });
 
     if let Some((path, api_state)) = api_mount {
-        builder.nest(&path, harvest_api_router(api_state))
+        let mut router = harvest_api_router(api_state);
+        if let Some(mw) = api_middleware {
+            router = mw(router);
+        }
+        builder.nest(&path, router)
     } else {
         builder
     }

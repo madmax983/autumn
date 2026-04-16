@@ -23,6 +23,7 @@ diesel-async = { workspace = true }
 diesel_migrations = { workspace = true }
 deadpool = { workspace = true }
 scoped-futures = "0.1"
+tower = "0.5"
 
 [dev-dependencies]
 tower = "0.5"
