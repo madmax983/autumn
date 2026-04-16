@@ -7,7 +7,6 @@ mod migrate;
 mod monitor;
 mod new;
 mod setup;
-mod simulate;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
@@ -74,18 +73,6 @@ enum Commands {
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
     },
-    /// Simulate traffic to a running Autumn application
-    Simulate {
-        /// URL of the running Autumn application
-        #[arg(short, long, default_value = "http://localhost:3000")]
-        url: String,
-        /// Number of concurrent workers
-        #[arg(short, long, default_value = "10")]
-        workers: usize,
-        /// Duration in seconds to run the simulation (default: run until interrupted)
-        #[arg(short, long)]
-        duration: Option<u64>,
-    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -112,11 +99,6 @@ fn main() {
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
-        Commands::Simulate {
-            url,
-            workers,
-            duration,
-        } => simulate::run(&url, workers, duration),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
     }
@@ -344,55 +326,5 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "bogus"]).is_err());
-    }
-}
-
-#[cfg(test)]
-mod simulate_cli_tests {
-    use super::*;
-    use clap::Parser;
-
-    #[test]
-    fn parse_simulate_defaults() {
-        let cli = Cli::try_parse_from(["autumn", "simulate"]).unwrap();
-        match cli.command {
-            Commands::Simulate {
-                url,
-                workers,
-                duration,
-            } => {
-                assert_eq!(url, "http://localhost:3000");
-                assert_eq!(workers, 10);
-                assert_eq!(duration, None);
-            }
-            _ => panic!("expected Simulate command"),
-        }
-    }
-
-    #[test]
-    fn parse_simulate_custom() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "simulate",
-            "-u",
-            "http://prod:8080",
-            "-w",
-            "50",
-            "-d",
-            "60",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Simulate {
-                url,
-                workers,
-                duration,
-            } => {
-                assert_eq!(url, "http://prod:8080");
-                assert_eq!(workers, 50);
-                assert_eq!(duration, Some(60));
-            }
-            _ => panic!("expected Simulate command"),
-        }
     }
 }
