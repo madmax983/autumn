@@ -615,14 +615,30 @@ async fn persist_signal_wait_requeue(
     next_event_id: i32,
     marker_events: &[WorkflowEvent],
 ) -> HarvestResult<()> {
+    // Park the workflow task (state=RUNNING, worker cleared) so it is not
+    // confused with a timer-waiting task (state=PENDING). This ensures that
+    // `wake_workflow_task` — which only targets RUNNING/parked rows — can
+    // reliably distinguish signal waits from timer waits and will not
+    // prematurely fire a pending timer when a signal is delivered.
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::requeue_for_retry(conn, task_id, chrono::Duration::seconds(1)).await
+            queue::park_workflow_task(conn, task_id).await
         }
         .scope_boxed()
     })
-    .await
+    .await?;
+
+    // After parking, check whether a signal already arrived before we cleared
+    // worker ownership. If the signal API ran wake_workflow_task while the task
+    // still had its worker set (a no-op at that point), we self-wake here so
+    // the task is immediately re-claimable rather than stuck parked forever.
+    let pending = signal::load_pending_signals(conn, exec_id).await?;
+    if !pending.is_empty() {
+        queue::wake_workflow_task(conn, exec_id).await?;
+    }
+
+    Ok(())
 }
 
 async fn persist_scheduled_activity(
