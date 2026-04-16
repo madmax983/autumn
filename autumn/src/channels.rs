@@ -183,7 +183,7 @@ impl Channels {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (indicates a prior panic
-    /// while holding the lock — a bug).
+    /// while holding the lock).
     ///
     /// # Examples
     ///
