@@ -359,10 +359,10 @@ pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> 
 /// Wake a parked workflow task for the given execution so replay can continue.
 ///
 /// This resets any parked workflow task row for `exec_id` back to `PENDING`
-/// and schedules it immediately. Already-parked `PENDING` rows and parked
-/// `RUNNING` rows with no worker ownership are eligible. Actively executing
-/// `RUNNING` rows are intentionally excluded. If no parked workflow task exists,
-/// this is a no-op.
+/// and schedules it immediately. Only parked `RUNNING` rows with no worker
+/// ownership are eligible. Actively executing `RUNNING` rows and `PENDING`
+/// rows (e.g. timer-scheduled tasks) are intentionally excluded. If no parked
+/// workflow task exists, this is a no-op.
 ///
 /// # Errors
 ///
@@ -378,10 +378,10 @@ pub async fn wake_workflow_task(
             .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
             .filter(
-                dsl::state.eq("PENDING").or(dsl::state
+                dsl::state
                     .eq("RUNNING")
                     .and(dsl::worker_id.is_null())
-                    .and(dsl::started_at.is_null())),
+                    .and(dsl::started_at.is_null()),
             ),
     )
     .set((

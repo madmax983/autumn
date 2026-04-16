@@ -740,4 +740,30 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+
+    #[test]
+    fn from_config_filters_invalid_methods() {
+        let config = CsrfConfig {
+            safe_methods: vec![
+                "GET".to_string(),
+                "INVALID METHOD".to_string(),
+                "POST".to_string(),
+            ],
+            ..Default::default()
+        };
+        let layer = CsrfLayer::from_config(&config);
+        assert_eq!(layer.settings.safe_methods.len(), 2);
+        assert!(layer.settings.safe_methods.contains(&http::Method::GET));
+        assert!(layer.settings.safe_methods.contains(&http::Method::POST));
+    }
+
+    #[test]
+    fn from_config_handles_invalid_header_name() {
+        let config = CsrfConfig {
+            token_header: "Invalid Header Name\n".to_string(),
+            ..Default::default()
+        };
+        let layer = CsrfLayer::from_config(&config);
+        assert_eq!(layer.settings.token_header.as_str(), "x-csrf-token");
+    }
 }
