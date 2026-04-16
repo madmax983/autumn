@@ -1,4 +1,4 @@
-🔭 Vantage: Spec for OAuth2 Support
+# S-059: OAuth2 / OIDC Support
 
 ## 👤 User Story
 As an Application Developer, I want to authenticate users using third-party providers (like Google, GitHub, or Okta) via OAuth2/OIDC, so that users can log in securely without creating new passwords, reducing onboarding friction and improving account security.
