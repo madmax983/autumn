@@ -122,9 +122,9 @@ pub async fn create_form(session: Session, csrf: CsrfToken) -> AutumnResult<Mark
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct CreateSubredditForm {
-/// Item documentation.
+    /// Item documentation.
     pub name: String,
-/// Item documentation.
+    /// Item documentation.
     pub description: String,
 }
 

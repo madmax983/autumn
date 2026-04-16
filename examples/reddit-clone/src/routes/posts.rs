@@ -272,15 +272,15 @@ pub async fn submit_to_sub_form(
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct SubmitPostForm {
-/// Item documentation.
+    /// Item documentation.
     pub subreddit_id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub title: String,
     #[serde(default)]
-/// Item documentation.
+    /// Item documentation.
     pub url: String,
     #[serde(default)]
-/// Item documentation.
+    /// Item documentation.
     pub body: String,
 }
 
@@ -653,10 +653,10 @@ pub async fn edit_form(
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct EditPostForm {
-/// Item documentation.
+    /// Item documentation.
     pub title: String,
     #[serde(default)]
-/// Item documentation.
+    /// Item documentation.
     pub body: String,
 }
 

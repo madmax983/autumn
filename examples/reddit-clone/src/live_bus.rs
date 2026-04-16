@@ -18,10 +18,10 @@ fn default_channel() -> String {
 /// Item documentation.
 pub enum LiveFeedBusKind {
     #[default]
-/// Missing documentation.
+    /// Missing documentation.
     PostgresNotify,
     #[serde(rename = "redis_pubsub")]
-/// Missing documentation.
+    /// Missing documentation.
     RedisPubSub,
 }
 
@@ -29,13 +29,13 @@ pub enum LiveFeedBusKind {
 /// Struct documentation.
 pub struct LiveFeedBusConfig {
     #[serde(default)]
-/// Item documentation.
+    /// Item documentation.
     pub kind: LiveFeedBusKind,
     #[serde(default)]
-/// Item documentation.
+    /// Item documentation.
     pub redis_url: Option<String>,
     #[serde(default = "default_channel")]
-/// Item documentation.
+    /// Item documentation.
     pub channel: String,
 }
 
@@ -56,12 +56,12 @@ struct DistributedConfig {
 }
 
 impl LiveFeedBusConfig {
-/// Function documentation.
+    /// Function documentation.
     pub fn load() -> Result<Self, LiveFeedBusConfigLoadError> {
         Self::load_with_env(&OsEnv)
     }
 
-/// Function documentation.
+    /// Function documentation.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, LiveFeedBusConfigLoadError> {
         let manifest_dir = resolve_manifest_dir(env);
         let profile = resolve_profile(env);
@@ -69,7 +69,7 @@ impl LiveFeedBusConfig {
         Self::load_from_dir(manifest_dir, profile.as_deref())
     }
 
-/// Function documentation.
+    /// Function documentation.
     pub fn load_from_dir(
         manifest_dir: impl AsRef<Path>,
         profile: Option<&str>,
@@ -103,21 +103,21 @@ impl LiveFeedBusConfig {
 /// Item documentation.
 pub enum LiveFeedBusConfigLoadError {
     #[error("failed to read live-feed bus config {path}: {source}")]
-/// Missing documentation.
+    /// Missing documentation.
     Io {
-/// Missing documentation.
+        /// Missing documentation.
         path: PathBuf,
         #[source]
-/// Missing documentation.
+        /// Missing documentation.
         source: std::io::Error,
     },
     #[error("failed to parse live-feed bus config {path}: {source}")]
-/// Missing documentation.
+    /// Missing documentation.
     Parse {
-/// Missing documentation.
+        /// Missing documentation.
         path: PathBuf,
         #[source]
-/// Missing documentation.
+        /// Missing documentation.
         source: Box<toml::de::Error>,
     },
 }

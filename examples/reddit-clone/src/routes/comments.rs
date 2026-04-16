@@ -23,7 +23,7 @@ use super::layout::redirect_to;
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct CommentForm {
-/// Item documentation.
+    /// Item documentation.
     pub body: String,
 }
 

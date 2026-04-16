@@ -124,33 +124,33 @@ enum LiveFeedWakeOutcome {
 #[derive(Debug, Clone, serde::Serialize)]
 /// Struct documentation.
 pub struct LiveFeedRelayHealthSnapshot {
-/// Item documentation.
+    /// Item documentation.
     pub bus_kind: String,
-/// Item documentation.
+    /// Item documentation.
     pub listener_state: String,
-/// Item documentation.
+    /// Item documentation.
     pub reconnect_attempts: u64,
-/// Item documentation.
+    /// Item documentation.
     pub reconnect_successes: u64,
-/// Item documentation.
+    /// Item documentation.
     pub reconnect_failures: u64,
-/// Item documentation.
+    /// Item documentation.
     pub publish_successes: u64,
-/// Item documentation.
+    /// Item documentation.
     pub publish_failures: u64,
-/// Item documentation.
+    /// Item documentation.
     pub wake_redis: u64,
-/// Item documentation.
+    /// Item documentation.
     pub wake_postgres: u64,
-/// Item documentation.
+    /// Item documentation.
     pub wake_poll: u64,
-/// Item documentation.
+    /// Item documentation.
     pub replayed_events: u64,
-/// Item documentation.
+    /// Item documentation.
     pub last_seen_id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub last_replayed_at: Option<String>,
-/// Item documentation.
+    /// Item documentation.
     pub last_error: Option<String>,
 }
 

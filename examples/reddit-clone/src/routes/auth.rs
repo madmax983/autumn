@@ -71,9 +71,9 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct RegisterForm {
-/// Item documentation.
+    /// Item documentation.
     pub username: String,
-/// Item documentation.
+    /// Item documentation.
     pub password: String,
 }
 
@@ -214,9 +214,9 @@ pub async fn login_form(csrf: CsrfToken) -> Markup {
 #[derive(serde::Deserialize)]
 /// Struct documentation.
 pub struct LoginForm {
-/// Item documentation.
+    /// Item documentation.
     pub username: String,
-/// Item documentation.
+    /// Item documentation.
     pub password: String,
 }
 

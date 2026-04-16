@@ -6,18 +6,18 @@ use crate::schema::{comments, posts, subreddits, users, votes};
 #[diesel(table_name = users)]
 /// Struct documentation.
 pub struct User {
-/// Item documentation.
+    /// Item documentation.
     pub id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub username: String,
     #[serde(skip)]
-/// Item documentation.
+    /// Item documentation.
     pub password_hash: String,
-/// Item documentation.
+    /// Item documentation.
     pub karma: i64,
-/// Item documentation.
+    /// Item documentation.
     pub role: String,
-/// Item documentation.
+    /// Item documentation.
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -25,9 +25,9 @@ pub struct User {
 #[diesel(table_name = users)]
 /// Struct documentation.
 pub struct NewUser {
-/// Item documentation.
+    /// Item documentation.
     pub username: String,
-/// Item documentation.
+    /// Item documentation.
     pub password_hash: String,
 }
 
@@ -98,17 +98,17 @@ pub struct Comment {
 #[diesel(table_name = votes)]
 /// Struct documentation.
 pub struct Vote {
-/// Item documentation.
+    /// Item documentation.
     pub id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub user_id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub post_id: Option<i64>,
-/// Item documentation.
+    /// Item documentation.
     pub comment_id: Option<i64>,
-/// Item documentation.
+    /// Item documentation.
     pub value: i16,
-/// Item documentation.
+    /// Item documentation.
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -116,12 +116,12 @@ pub struct Vote {
 #[diesel(table_name = votes)]
 /// Struct documentation.
 pub struct NewVote {
-/// Item documentation.
+    /// Item documentation.
     pub user_id: i64,
-/// Item documentation.
+    /// Item documentation.
     pub post_id: Option<i64>,
-/// Item documentation.
+    /// Item documentation.
     pub comment_id: Option<i64>,
-/// Item documentation.
+    /// Item documentation.
     pub value: i16,
 }
