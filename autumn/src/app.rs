@@ -895,110 +895,160 @@ fn start_task_scheduler(
     }
 }
 
-/// Run the `tokio-cron-scheduler` for all cron tasks, shutting down when the
-/// `shutdown` token is cancelled.
-async fn run_cron_scheduler(
+#[allow(unused_variables)]
+fn send_ws_sys_task_msg(
+    state: &AppState,
+    event: &str,
+    name: &str,
+    extra: Option<(&str, serde_json::Value)>,
+) {
+    #[cfg(feature = "ws")]
+    {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "event".to_string(),
+            serde_json::Value::String(event.to_string()),
+        );
+        map.insert(
+            "task".to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        map.insert(
+            "timestamp".to_string(),
+            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+        );
+        if let Some((k, v)) = extra {
+            map.insert(k.to_string(), v);
+        }
+        let msg = serde_json::Value::Object(map);
+        let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+    }
+}
+
+async fn execute_cron_task_result(
+    state: &AppState,
+    handler: crate::task::TaskHandler,
+    start: std::time::Instant,
+) -> Result<u64, (u64, String)> {
+    match (handler)(state.clone()).await {
+        Ok(()) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Ok(duration_ms)
+        }
+        Err(e) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Err((duration_ms, e.to_string()))
+        }
+    }
+}
+
+/// Handle the execution of a single cron task.
+async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
+    tracing::debug!(task = %name, "Running cron task");
+    state.task_registry.record_start(&name);
+
+    send_ws_sys_task_msg(&state, "started", &name, None);
+
+    let start = std::time::Instant::now();
+    match execute_cron_task_result(&state, handler, start).await {
+        Ok(duration_ms) => {
+            state.task_registry.record_success(&name, duration_ms);
+            tracing::debug!(task = %name, "Cron task completed");
+            send_ws_sys_task_msg(
+                &state,
+                "success",
+                &name,
+                Some(("duration_ms", serde_json::json!(duration_ms))),
+            );
+        }
+        Err((duration_ms, error_str)) => {
+            state
+                .task_registry
+                .record_failure(&name, duration_ms, &error_str);
+            tracing::warn!(task = %name, error = %error_str, "Cron task failed");
+            send_ws_sys_task_msg(
+                &state,
+                "failure",
+                &name,
+                Some(("error", serde_json::json!(error_str))),
+            );
+        }
+    }
+}
+
+async fn register_cron_task(
+    sched: &tokio_cron_scheduler::JobScheduler,
+    name: String,
+    expression: String,
+    timezone: Option<String>,
+    handler: crate::task::TaskHandler,
+    state: AppState,
+) {
+    let state_clone = state.clone();
+    let name_clone = name.clone();
+
+    let job_result = build_cron_job(&expression, timezone.as_deref(), move |_uuid, _lock| {
+        let state = state_clone.clone();
+        let name = name_clone.clone();
+        Box::pin(async move {
+            execute_cron_task(name, state, handler).await;
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+
+    match job_result {
+        Ok(job) => {
+            if let Err(e) = sched.add(job).await {
+                tracing::error!(task = %name, error = %e, "Failed to add cron task to scheduler");
+            }
+        }
+        Err(e) => {
+            tracing::error!(task = %name, error = %e, "Failed to create cron job");
+        }
+    }
+}
+
+async fn setup_cron_scheduler(
     tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
     state: AppState,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> Option<tokio_cron_scheduler::JobScheduler> {
     use tokio_cron_scheduler::JobScheduler;
 
     let sched = match JobScheduler::new().await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "Failed to create cron job scheduler");
-            return;
+            return None;
         }
     };
 
     for (name, expression, timezone, handler) in tasks {
-        let state_clone = state.clone();
-        let name_clone = name.clone();
-
-        let job_result = build_cron_job(&expression, timezone.as_deref(), move |_uuid, _lock| {
-            let state = state_clone.clone();
-            let name = name_clone.clone();
-            Box::pin(async move {
-                tracing::debug!(task = %name, "Running cron task");
-                state.task_registry.record_start(&name);
-
-                #[cfg(feature = "ws")]
-                {
-                    let msg = serde_json::json!({
-                        "event": "started",
-                        "task": name,
-                        "timestamp": chrono::Utc::now().to_rfc3339()
-                    });
-                    let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                }
-
-                let start = std::time::Instant::now();
-                match (handler)(state.clone()).await {
-                    Ok(()) => {
-                        let duration_ms =
-                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        state.task_registry.record_success(&name, duration_ms);
-                        tracing::debug!(task = %name, "Cron task completed");
-
-                        #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "success",
-                                "task": name,
-                                "duration_ms": duration_ms,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
-                    }
-                    Err(e) => {
-                        let duration_ms =
-                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        let error_str = e.to_string();
-                        state
-                            .task_registry
-                            .record_failure(&name, duration_ms, &error_str);
-                        tracing::warn!(task = %name, error = %e, "Cron task failed");
-
-                        #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "failure",
-                                "task": name,
-                                "duration_ms": duration_ms,
-                                "error": error_str,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
-                    }
-                }
-            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        });
-
-        match job_result {
-            Ok(job) => {
-                if let Err(e) = sched.add(job).await {
-                    tracing::error!(task = %name, error = %e, "Failed to add cron task to scheduler");
-                }
-            }
-            Err(e) => {
-                tracing::error!(task = %name, error = %e, "Failed to create cron job");
-            }
-        }
+        register_cron_task(&sched, name, expression, timezone, handler, state.clone()).await;
     }
 
     if let Err(e) = sched.start().await {
         tracing::error!(error = %e, "Failed to start cron scheduler");
-        return;
+        return None;
     }
+
+    Some(sched)
+}
+
+/// Run the `tokio-cron-scheduler` for all cron tasks, shutting down when the
+/// `shutdown` token is cancelled.
+#[allow(clippy::cognitive_complexity)]
+async fn run_cron_scheduler(
+    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    let Some(mut sched) = setup_cron_scheduler(tasks, state).await else {
+        return;
+    };
 
     tracing::info!("Cron scheduler started");
     shutdown.cancelled().await;
     tracing::info!("Shutting down cron scheduler");
 
-    let mut sched = sched;
     if let Err(e) = sched.shutdown().await {
         tracing::error!(error = %e, "Failed to shut down cron scheduler");
     }

@@ -385,13 +385,10 @@ fn mount_raw_routers(
     router
 }
 
-fn apply_middleware(
+fn apply_cors_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
-    state: &AppState,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    error_page_renderer: Option<SharedRenderer>,
-) -> Result<axum::Router<AppState>, RouterBuildError> {
+) -> axum::Router<AppState> {
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -402,13 +399,31 @@ fn apply_middleware(
         );
         router = router.layer(cors);
     }
+    router
+}
 
+fn apply_csrf_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+) -> axum::Router<AppState> {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
+    router
+}
+
+fn apply_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    error_page_renderer: Option<SharedRenderer>,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
+    router = apply_cors_middleware(router, config);
+    router = apply_csrf_middleware(router, config);
 
     // Security headers layer (always applied)
     let security_headers =

@@ -14,6 +14,7 @@ use autumn_web::prelude::*;
 
 use crate::schema::bookmarks;
 
+#[allow(clippy::cognitive_complexity)]
 #[scheduled(every = "1h", name = "link-checker")]
 pub async fn check_links(state: AppState) -> AutumnResult<()> {
     let pool = state

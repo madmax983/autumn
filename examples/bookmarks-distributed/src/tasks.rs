@@ -85,6 +85,26 @@ async fn process_shard(
     Ok((shard_checked_count, dead_count))
 }
 
+fn process_shard_result(
+    result: std::thread::Result<AutumnResult<(u32, u32)>>,
+    release_result: AutumnResult<()>,
+) -> AutumnResult<(u32, u32)> {
+    match (result, release_result) {
+        (Ok(Ok(counts)), Ok(())) => Ok(counts),
+        (Ok(Err(err)), Ok(())) => Err(err),
+        (Ok(Ok(_)), Err(err)) => Err(err),
+        (Ok(Err(err)), Err(release_err)) => {
+            tracing::warn!(release_error = %release_err, "link-checker shard release failed after shard error");
+            Err(err)
+        }
+        (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
+        (Err(panic), Err(release_err)) => {
+            tracing::error!(release_error = %release_err, "link-checker shard release failed after panic");
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 #[scheduled(every = "1h", name = "link-checker")]
 pub async fn check_links(_state: AppState) -> AutumnResult<()> {
     let repo = BookmarkRepository;
@@ -108,24 +128,10 @@ pub async fn check_links(_state: AppState) -> AutumnResult<()> {
             .await;
         let release_result = BookmarkRepository::release_shard_lease(lease).await;
 
-        match (result, release_result) {
-            (Ok(Ok((shard_checked_count, shard_dead_count))), Ok(())) => {
-                owned_shards += 1;
-                dead_count += shard_dead_count;
-                checked_count += shard_checked_count;
-            }
-            (Ok(Err(err)), Ok(())) => return Err(err),
-            (Ok(Ok(_)), Err(err)) => return Err(err),
-            (Ok(Err(err)), Err(release_err)) => {
-                tracing::warn!(release_error = %release_err, "link-checker shard release failed after shard error");
-                return Err(err);
-            }
-            (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
-            (Err(panic), Err(release_err)) => {
-                tracing::error!(release_error = %release_err, "link-checker shard release failed after panic");
-                std::panic::resume_unwind(panic);
-            }
-        }
+        let (shard_checked_count, shard_dead_count) = process_shard_result(result, release_result)?;
+        owned_shards += 1;
+        dead_count += shard_dead_count;
+        checked_count += shard_checked_count;
     }
 
     tracing::info!(
