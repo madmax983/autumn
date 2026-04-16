@@ -51,7 +51,7 @@ jobs:
           git commit -m "docs: update CHANGELOG.md for ${{ github.ref_name }}"
           git push origin HEAD:trunk
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           draft: false

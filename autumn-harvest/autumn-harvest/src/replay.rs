@@ -98,6 +98,56 @@ impl HistoryMatcher {
         }
     }
 
+    /// Drain any `SignalReceived` events at the current cursor into
+    /// `pending_signals`.
+    ///
+    /// Signals can be ingested into history at any point (when the worker
+    /// picks up a task), so they may appear before an `ActivityScheduled`,
+    /// `TimerStarted`, or `ChildWorkflowStarted` event even though the
+    /// workflow code only calls `wait_for_signal` later.  This helper
+    /// buffers those early signals so the normal matcher methods do not
+    /// mis-report them as non-determinism.
+    fn drain_early_signals(&mut self) {
+        while self.cursor < self.events.len() {
+            if let WorkflowEvent::SignalReceived {
+                signal_name,
+                payload,
+            } = &self.events[self.cursor]
+            {
+                self.consumed_signal_events.insert(self.cursor);
+                self.pending_signals
+                    .push_back((signal_name.clone(), payload.clone()));
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Advance the cursor after a terminal event, respecting any interleaved
+    /// child workflow start that needs to remain at the cursor for later replay.
+    ///
+    /// If `first_interleaved_child_start` is set, the terminal event is marked
+    /// consumed and the cursor is rewound to the child start position so
+    /// `match_child_workflow` can pick it up. Otherwise the cursor advances
+    /// past the terminal event normally.
+    fn settle_terminal(
+        &mut self,
+        terminal_cursor: usize,
+        first_interleaved_child_start: Option<usize>,
+        result: HistoryMatch,
+    ) -> HistoryMatch {
+        if let Some(child_start_cursor) = first_interleaved_child_start {
+            self.consumed_child_terminal_events.insert(terminal_cursor);
+            self.cursor = child_start_cursor;
+        } else {
+            self.cursor = terminal_cursor + 1;
+        }
+        self.advance_to_next_unconsumed_event();
+        result
+    }
+
     /// Match an `execute_activity` command against history.
     ///
     /// Expects `ActivityScheduled { name }` at the current cursor position,
@@ -112,6 +162,9 @@ impl HistoryMatcher {
     /// - [`HistoryMatch::Diverged`] if the event at cursor is not the expected activity
     pub fn match_activity(&mut self, activity_name: &str) -> HistoryMatch {
         self.advance_to_next_unconsumed_event();
+        // Signals may have been ingested before the activity was scheduled;
+        // buffer them so they can be consumed by a later wait_for_signal call.
+        self.drain_early_signals();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -146,7 +199,9 @@ impl HistoryMatcher {
         // Scan forward for Completed or Failed with matching activity_id,
         // skipping Started, Heartbeat, and other intermediate events.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+            if self.consumed_child_terminal_events.contains(&scan_cursor)
+                || self.consumed_signal_events.contains(&scan_cursor)
+            {
                 scan_cursor += 1;
                 continue;
             }
@@ -156,63 +211,48 @@ impl HistoryMatcher {
                     activity_id: id,
                     output,
                 } if *id == activity_id => {
-                    let output = output.clone();
-                    if let Some(child_start_cursor) = first_interleaved_child_start {
-                        self.consumed_child_terminal_events.insert(scan_cursor);
-                        self.cursor = child_start_cursor;
-                        self.advance_to_next_unconsumed_event();
-                        return HistoryMatch::Matched { output };
-                    }
-
-                    let result = HistoryMatch::Matched { output };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    let result = HistoryMatch::Matched {
+                        output: output.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
                 WorkflowEvent::ActivityFailed {
                     activity_id: id,
                     error,
                     attempt,
                 } if *id == activity_id => {
-                    let error = error.clone();
-                    let attempt = *attempt;
-                    if let Some(child_start_cursor) = first_interleaved_child_start {
-                        self.consumed_child_terminal_events.insert(scan_cursor);
-                        self.cursor = child_start_cursor;
-                        self.advance_to_next_unconsumed_event();
-                        return HistoryMatch::Failed { error, attempt };
-                    }
-
-                    let result = HistoryMatch::Failed { error, attempt };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    let result = HistoryMatch::Failed {
+                        error: error.clone(),
+                        attempt: *attempt,
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
                 WorkflowEvent::ActivityTimedOut {
                     activity_id: id,
                     timeout_type,
                 } if *id == activity_id => {
-                    let timeout_type = timeout_type.clone();
-                    if let Some(child_start_cursor) = first_interleaved_child_start {
-                        self.consumed_child_terminal_events.insert(scan_cursor);
-                        self.cursor = child_start_cursor;
-                        self.advance_to_next_unconsumed_event();
-                        return HistoryMatch::TimedOut { timeout_type };
-                    }
-
-                    let result = HistoryMatch::TimedOut { timeout_type };
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return result;
+                    let result = HistoryMatch::TimedOut {
+                        timeout_type: timeout_type.clone(),
+                    };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
-                // Skip heartbeats, started events, and other intermediate events
-                // for this activity
+                // Skip heartbeats and started events for this activity.
                 WorkflowEvent::ActivityHeartbeat {
                     activity_id: id, ..
-                } if *id == activity_id => {
-                    scan_cursor += 1;
                 }
-                WorkflowEvent::ActivityStarted {
+                | WorkflowEvent::ActivityStarted {
                     activity_id: id, ..
                 } if *id == activity_id => {
                     scan_cursor += 1;
@@ -221,6 +261,17 @@ impl HistoryMatcher {
                 // Preserve replay by scanning past interleaved child starts.
                 WorkflowEvent::ChildWorkflowStarted { .. } => {
                     first_interleaved_child_start.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                // Signals can arrive at any time; stash them for later
+                // wait_for_signal calls and continue scanning.
+                WorkflowEvent::SignalReceived {
+                    signal_name,
+                    payload,
+                } => {
+                    self.consumed_signal_events.insert(scan_cursor);
+                    self.pending_signals
+                        .push_back((signal_name.clone(), payload.clone()));
                     scan_cursor += 1;
                 }
                 // Any other event type is unexpected mid-activity
@@ -239,6 +290,9 @@ impl HistoryMatcher {
     /// `TimerFired` with the same `timer_id`.
     pub fn match_timer(&mut self, timer_id: &str) -> HistoryMatch {
         self.advance_to_next_unconsumed_event();
+        // Signals may have been ingested before the timer was started;
+        // buffer them so they can be consumed by a later wait_for_signal call.
+        self.drain_early_signals();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -266,29 +320,25 @@ impl HistoryMatcher {
         let mut scan_cursor = self.cursor;
         let mut first_interleaved_child_start = None;
 
-        // Scan forward for TimerFired, skipping consumed child terminals.
+        // Scan forward for TimerFired, skipping consumed child terminals and signals.
         while scan_cursor < self.events.len() {
-            if self.consumed_child_terminal_events.contains(&scan_cursor) {
+            if self.consumed_child_terminal_events.contains(&scan_cursor)
+                || self.consumed_signal_events.contains(&scan_cursor)
+            {
                 scan_cursor += 1;
                 continue;
             }
 
             if let WorkflowEvent::TimerFired { timer_id: id } = &self.events[scan_cursor] {
                 if id.as_str() == timer_id {
-                    if let Some(child_start_cursor) = first_interleaved_child_start {
-                        self.consumed_child_terminal_events.insert(scan_cursor);
-                        self.cursor = child_start_cursor;
-                        self.advance_to_next_unconsumed_event();
-                        return HistoryMatch::Matched {
-                            output: Value::Null,
-                        };
-                    }
-
-                    self.cursor = scan_cursor + 1;
-                    self.advance_to_next_unconsumed_event();
-                    return HistoryMatch::Matched {
+                    let result = HistoryMatch::Matched {
                         output: Value::Null,
                     };
+                    return self.settle_terminal(
+                        scan_cursor,
+                        first_interleaved_child_start,
+                        result,
+                    );
                 }
             }
 
@@ -297,6 +347,20 @@ impl HistoryMatcher {
                 WorkflowEvent::ChildWorkflowStarted { .. }
             ) {
                 first_interleaved_child_start.get_or_insert(scan_cursor);
+                scan_cursor += 1;
+                continue;
+            }
+
+            // Signals can arrive while a timer is pending; stash them for
+            // later wait_for_signal calls and continue scanning.
+            if let WorkflowEvent::SignalReceived {
+                signal_name,
+                payload,
+            } = &self.events[scan_cursor]
+            {
+                self.consumed_signal_events.insert(scan_cursor);
+                self.pending_signals
+                    .push_back((signal_name.clone(), payload.clone()));
                 scan_cursor += 1;
                 continue;
             }
@@ -376,6 +440,9 @@ impl HistoryMatcher {
     /// `child_id`.
     pub fn match_child_workflow(&mut self, workflow_name: &str, input: &Value) -> HistoryMatch {
         self.advance_to_next_unconsumed_event();
+        // Signals may have been ingested before the child workflow was started;
+        // buffer them so they can be consumed by a later wait_for_signal call.
+        self.drain_early_signals();
         if !self.is_replaying() {
             return HistoryMatch::NoMatch;
         }
@@ -1317,6 +1384,168 @@ mod tests {
             HistoryMatch::Matched {
                 output: Value::Null
             }
+        );
+    }
+
+    #[test]
+    fn matcher_activity_skips_signal_ingested_before_activity_scheduled() {
+        // A signal arrives before the workflow runs its first activity.
+        // ingest_pending_signals would place SignalReceived at position 0
+        // (the first position after WorkflowStarted is skipped).
+        // match_activity must buffer the early signal and still find
+        // ActivityScheduled + ActivityCompleted.
+        let activity_id = ActivityExecId::new();
+        let output = serde_json::json!({"email_id": "msg-001"});
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "send_email".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let activity = matcher.match_activity("send_email");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched { output },
+            "match_activity should skip the early signal and replay the activity"
+        );
+
+        // The buffered signal must be deliverable via a subsequent match_signal call.
+        let signal = matcher.match_signal("approved");
+        assert_eq!(
+            signal,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            },
+            "signal buffered during match_activity should be returned by match_signal"
+        );
+    }
+
+    #[test]
+    fn matcher_timer_skips_signal_ingested_before_timer_started() {
+        // Same scenario as above but for a timer: signal arrives before the
+        // timer is started, so it sits before TimerStarted in history.
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
+            },
+            "match_timer should skip the early signal and replay the timer"
+        );
+
+        let signal = matcher.match_signal("approved");
+        assert_eq!(
+            signal,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            },
+            "signal buffered during match_timer should be returned by match_signal"
+        );
+    }
+
+    #[test]
+    fn matcher_timer_skips_signal_interleaved_between_started_and_fired() {
+        // A signal is recorded while the timer is pending (between TimerStarted
+        // and TimerFired in history). match_timer must skip it and still find
+        // TimerFired.
+        let timer_id = TimerId::new("cooldown");
+        let events = vec![
+            WorkflowEvent::TimerStarted {
+                timer_id: timer_id.clone(),
+                duration_secs: 30,
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "approved".into(),
+                payload: serde_json::json!({"ok": true}),
+            },
+            WorkflowEvent::TimerFired { timer_id },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let timer = matcher.match_timer("cooldown");
+        assert_eq!(
+            timer,
+            HistoryMatch::Matched {
+                output: Value::Null
+            },
+            "match_timer should skip signals between TimerStarted and TimerFired"
+        );
+
+        let signal = matcher.match_signal("approved");
+        assert_eq!(
+            signal,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            },
+            "signal buffered during timer scan should be returned by match_signal"
+        );
+    }
+
+    #[test]
+    fn matcher_activity_skips_signal_interleaved_between_scheduled_and_completed() {
+        // A signal arrives while an activity is running (between ActivityScheduled
+        // and ActivityCompleted in history). match_activity must skip it and find
+        // ActivityCompleted.
+        let activity_id = ActivityExecId::new();
+        let output = serde_json::json!({"rows": 100});
+        let events = vec![
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: "import_data".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "cancel".into(),
+                payload: serde_json::json!({"reason": "manual"}),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output: output.clone(),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+
+        let activity = matcher.match_activity("import_data");
+        assert_eq!(
+            activity,
+            HistoryMatch::Matched { output },
+            "match_activity should skip signals interleaved during activity execution"
+        );
+
+        let signal = matcher.match_signal("cancel");
+        assert_eq!(
+            signal,
+            HistoryMatch::Matched {
+                output: serde_json::json!({"reason": "manual"})
+            },
+            "signal buffered during activity scan should be returned by match_signal"
         );
     }
 }
