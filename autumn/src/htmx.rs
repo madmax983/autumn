@@ -239,6 +239,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hx_response_ext_ignores_invalid_header_values() {
+        use axum::response::IntoResponse;
+
+        // This value is invalid because it contains a newline character.
+        // It should be gracefully ignored by the append_hx_header function.
+        let invalid_header_value = "invalid\nvalue";
+
+        let response = "hello"
+            .hx_push_url(invalid_header_value)
+            .hx_redirect(invalid_header_value)
+            .hx_refresh() // valid by default
+            .hx_replace_url(invalid_header_value)
+            .hx_reswap(invalid_header_value)
+            .hx_retarget(invalid_header_value)
+            .hx_trigger(invalid_header_value)
+            .hx_trigger_after_settle(invalid_header_value)
+            .hx_trigger_after_swap(invalid_header_value)
+            .into_response();
+
+        let headers = response.headers();
+        assert!(headers.get("hx-push-url").is_none());
+        assert!(headers.get("hx-redirect").is_none());
+        // hx_refresh is always set to "true" internally, so it will be present
+        assert_eq!(headers.get("hx-refresh").unwrap(), "true");
+        assert!(headers.get("hx-replace-url").is_none());
+        assert!(headers.get("hx-reswap").is_none());
+        assert!(headers.get("hx-retarget").is_none());
+        assert!(headers.get("hx-trigger").is_none());
+        assert!(headers.get("hx-trigger-after-settle").is_none());
+        assert!(headers.get("hx-trigger-after-swap").is_none());
+    }
+
+    #[tokio::test]
     async fn hx_request_extractor_handles_missing_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder().body(())?;
         let (mut parts, ()) = req.into_parts();
