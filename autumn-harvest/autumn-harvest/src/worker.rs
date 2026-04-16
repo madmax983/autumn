@@ -22,10 +22,10 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::builder::WorkerConfig;
-use crate::context::{ActivityContext, SharedState, WorkflowCommand, empty_shared_state};
+use crate::context::{empty_shared_state, ActivityContext, SharedState, WorkflowCommand};
 use crate::error::{HarvestError, HarvestResult};
 use crate::event::WorkflowEvent;
-use crate::executor::{WorkflowOutcome, run_workflow_with_state};
+use crate::executor::{run_workflow_with_state, WorkflowOutcome};
 use crate::info::{ActivityInfo, WorkflowInfo};
 use crate::models::{
     HarvestTimer, NewHarvestTimer, NewWorkflowExecution, TaskQueueItem, WorkflowExecution,
@@ -618,7 +618,7 @@ async fn persist_signal_wait_requeue(
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
-            queue::requeue_for_retry(conn, task_id, chrono::Duration::seconds(1)).await
+            queue::park_workflow_task(conn, task_id).await
         }
         .scope_boxed()
     })
