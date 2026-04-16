@@ -23,7 +23,6 @@ use serde_json::Value;
 use autumn_harvest::context::WorkflowContext;
 use autumn_harvest::error::{HarvestError, HarvestResult, database_error};
 use autumn_harvest::models::{DagRun, HarvestSchedule, WorkflowExecution};
-use autumn_harvest::queue;
 use autumn_harvest::scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerSnapshot, trigger_dag,
 };
@@ -328,9 +327,6 @@ async fn signal_workflow(
         .await
         .map_err(map_error)?;
     signal::send_signal(&mut conn, exec_id, &signal_name, payload)
-        .await
-        .map_err(map_error)?;
-    queue::wake_workflow_task(&mut conn, exec_id)
         .await
         .map_err(map_error)?;
 

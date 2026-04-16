@@ -200,8 +200,10 @@ async fn main() {
 
 ```rust
 fn main() {
-    unsafe { std::env::set_var("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR")); }
-    unsafe { std::env::set_var("AUTUMN_IS_DEBUG", "1"); }  // "0" in release
+    autumn_web::config::__set_macro_context(
+        env!("CARGO_MANIFEST_DIR").to_string(),
+        cfg!(debug_assertions),  // true in debug, false in release
+    );
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -83,12 +83,13 @@ impl Default for DistributedDatabaseConfig {
 
 impl DistributedConfig {
     pub fn load() -> Result<Self, DistributedConfigLoadError> {
-        let manifest_dir =
-            resolve_manifest_dir(std::env::var("AUTUMN_MANIFEST_DIR").ok().as_deref());
+        use autumn_web::config::{Env as _, OsEnv};
+        let env = OsEnv;
+        let manifest_dir = resolve_manifest_dir(env.var("AUTUMN_MANIFEST_DIR").ok().as_deref());
         let profile = resolve_runtime_profile(
-            std::env::var("AUTUMN_PROFILE").ok().as_deref(),
+            env.var("AUTUMN_PROFILE").ok().as_deref(),
             &std::env::args().collect::<Vec<_>>(),
-            std::env::var("AUTUMN_IS_DEBUG").ok().as_deref(),
+            env.var("AUTUMN_IS_DEBUG").ok().as_deref(),
         );
 
         Self::load_from_dir(manifest_dir, profile.as_deref())
@@ -243,14 +244,12 @@ fn load_distributed_section(
 ) -> Result<Option<toml::Value>, DistributedConfigLoadError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let file_config: toml::Value =
-                contents
-                    .parse()
-                    .map_err(|source| DistributedConfigLoadError::Parse {
-                        path: path.to_path_buf(),
-                        source: Box::new(source),
-                    })?;
-            Ok(file_config.get("distributed").cloned())
+            let table: toml::Table =
+                toml::from_str(&contents).map_err(|source| DistributedConfigLoadError::Parse {
+                    path: path.to_path_buf(),
+                    source: Box::new(source),
+                })?;
+            Ok(toml::Value::Table(table).get("distributed").cloned())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(source) => Err(DistributedConfigLoadError::Io {

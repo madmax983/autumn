@@ -14,6 +14,8 @@
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
+use http::header::{HeaderName, HeaderValue};
 use std::convert::Infallible;
 
 /// htmx 2.x minified JavaScript, embedded at compile time.
@@ -86,6 +88,69 @@ where
     }
 }
 
+/// Extension trait for adding htmx response headers to any `IntoResponse` type.
+///
+/// This trait provides a fluent API for controlling htmx behavior from the server.
+/// If an invalid header value is provided, it is gracefully ignored.
+///
+/// See <https://htmx.org/reference/#response_headers> for more details.
+pub trait HxResponseExt: IntoResponse + Sized {
+    /// Pushes a new URL into the history stack (`HX-Push-Url`).
+    fn hx_push_url(self, url: &str) -> Response {
+        append_hx_header(self, "hx-push-url", url)
+    }
+
+    /// Triggers a client-side redirect (`HX-Redirect`).
+    fn hx_redirect(self, url: &str) -> Response {
+        append_hx_header(self, "hx-redirect", url)
+    }
+
+    /// Tells the client to do a full page refresh (`HX-Refresh`).
+    fn hx_refresh(self) -> Response {
+        append_hx_header(self, "hx-refresh", "true")
+    }
+
+    /// Replaces the current URL in the location bar (`HX-Replace-Url`).
+    fn hx_replace_url(self, url: &str) -> Response {
+        append_hx_header(self, "hx-replace-url", url)
+    }
+
+    /// Specifies how the response will be swapped (`HX-Reswap`).
+    fn hx_reswap(self, swap: &str) -> Response {
+        append_hx_header(self, "hx-reswap", swap)
+    }
+
+    /// Specifies the target element to update (`HX-Retarget`).
+    fn hx_retarget(self, target: &str) -> Response {
+        append_hx_header(self, "hx-retarget", target)
+    }
+
+    /// Triggers client-side events (`HX-Trigger`).
+    fn hx_trigger(self, event: &str) -> Response {
+        append_hx_header(self, "hx-trigger", event)
+    }
+
+    /// Triggers client-side events after the settle step (`HX-Trigger-After-Settle`).
+    fn hx_trigger_after_settle(self, event: &str) -> Response {
+        append_hx_header(self, "hx-trigger-after-settle", event)
+    }
+
+    /// Triggers client-side events after the swap step (`HX-Trigger-After-Swap`).
+    fn hx_trigger_after_swap(self, event: &str) -> Response {
+        append_hx_header(self, "hx-trigger-after-swap", event)
+    }
+}
+
+impl<T: IntoResponse> HxResponseExt for T {}
+
+fn append_hx_header<T: IntoResponse>(response: T, name: &'static str, value: &str) -> Response {
+    let mut res = response.into_response();
+    if let Ok(v) = HeaderValue::from_str(value) {
+        res.headers_mut().insert(HeaderName::from_static(name), v);
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +203,39 @@ mod tests {
         assert_eq!(hx.prompt.as_deref(), Some("yes"));
         assert!(hx.boosted);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn hx_response_ext_adds_headers() {
+        use axum::response::IntoResponse;
+        let response = "hello"
+            .hx_push_url("/new-url")
+            .hx_redirect("/login")
+            .hx_refresh()
+            .hx_replace_url("/old-url")
+            .hx_reswap("innerHTML")
+            .hx_retarget("#target")
+            .hx_trigger("my-event")
+            .hx_trigger_after_settle("settled-event")
+            .hx_trigger_after_swap("swapped-event")
+            .into_response();
+
+        let headers = response.headers();
+        assert_eq!(headers.get("hx-push-url").unwrap(), "/new-url");
+        assert_eq!(headers.get("hx-redirect").unwrap(), "/login");
+        assert_eq!(headers.get("hx-refresh").unwrap(), "true");
+        assert_eq!(headers.get("hx-replace-url").unwrap(), "/old-url");
+        assert_eq!(headers.get("hx-reswap").unwrap(), "innerHTML");
+        assert_eq!(headers.get("hx-retarget").unwrap(), "#target");
+        assert_eq!(headers.get("hx-trigger").unwrap(), "my-event");
+        assert_eq!(
+            headers.get("hx-trigger-after-settle").unwrap(),
+            "settled-event"
+        );
+        assert_eq!(
+            headers.get("hx-trigger-after-swap").unwrap(),
+            "swapped-event"
+        );
     }
 
     #[tokio::test]

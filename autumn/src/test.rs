@@ -67,7 +67,7 @@ use tower::ServiceExt;
 
 use crate::config::AutumnConfig;
 use crate::route::Route;
-use crate::router::build_router;
+
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
@@ -103,6 +103,8 @@ use diesel_async::pooled_connection::deadpool::Pool;
 /// ```
 pub struct TestApp {
     routes: Vec<Route>,
+    merge_routers: Vec<axum::Router<crate::state::AppState>>,
+    nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     config: AutumnConfig,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
@@ -119,15 +121,43 @@ impl TestApp {
 
         Self {
             routes: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
             config,
             #[cfg(feature = "db")]
             pool: None,
         }
     }
 
-    /// Register routes with the test application.
+    /// Merge a router into the internal application state.
     ///
-    /// Can be called multiple times -- routes are combined additively.
+    /// This is useful when testing modular route definitions without building
+    /// the full application.
+    #[must_use]
+    pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
+        self.merge_routers.push(router);
+        self
+    }
+
+    /// Nest a router under a specific path prefix for testing.
+    ///
+    /// This is useful for testing sub-applications or API versions.
+    #[must_use]
+    pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
+        self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    /// Construct a [`TestClient`] directly from an `axum::Router`.
+    ///
+    /// Useful for bypassing `TestApp` builder if you just want to write requests
+    /// against a standard axum Router.
+    #[must_use]
+    pub const fn from_router(router: axum::Router) -> TestClient {
+        TestClient { router }
+    }
+
+    /// Register a collection of routes to be built into the `TestApp`.
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         self.routes.extend(routes);
@@ -183,7 +213,14 @@ impl TestApp {
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
-        let router = build_router(self.routes, &self.config, state);
+        let router = crate::router::try_build_router_merged(
+            self.routes,
+            &self.config,
+            state,
+            self.merge_routers,
+            self.nest_routers,
+        )
+        .unwrap();
         TestClient { router }
     }
 }
@@ -230,6 +267,11 @@ pub struct TestClient {
 }
 
 impl TestClient {
+    /// Unwrap the underlying [`axum::Router`] out of the [`TestClient`].
+    pub fn into_router(self) -> axum::Router {
+        self.router
+    }
+
     /// Start building a GET request.
     #[must_use]
     pub fn get(&self, uri: &str) -> RequestBuilder {

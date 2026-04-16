@@ -16,8 +16,22 @@
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// Debounce interval for checking the shutdown flag in the watch loop.
+const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
+
+/// Set to `true` by the SIGINT handler to request a clean shutdown.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// SIGINT handler: record the request and return so that the main loop can
+/// clean up the child process before exiting.
+#[cfg(unix)]
+extern "C" fn handle_sigint(_: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 /// Default debounce interval for file change events.
 const DEBOUNCE_MS: u64 = 500;
@@ -156,6 +170,18 @@ pub fn run(package: Option<&str>, show_config: bool) {
     }
     eprintln!("\u{1F342} autumn dev\n");
 
+    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
+    // of immediately terminating the process (and leaving the child running).
+    #[cfg(unix)]
+    // SAFETY: `handle_sigint` only stores to an `AtomicBool`; it is
+    // async-signal-safe. No threads have been spawned yet at this point.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
+    }
+
     let mut reload_state = match DevReloadState::initialize() {
         Ok(state) => Some(state),
         Err(error) => {
@@ -195,8 +221,15 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     eprintln!("  Watching for changes... (press Ctrl+C to stop)\n");
 
-    // Main event loop
+    // Main event loop – periodically checks the shutdown flag so that a
+    // Ctrl+C (caught by `handle_sigint`) breaks the loop and triggers
+    // graceful server shutdown via `stop_server` below.
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            eprintln!("\n  Shutting down...");
+            break;
+        }
+
         if !process_events(&rx, package, &mut child, reload_state.as_mut()) {
             break;
         }
@@ -213,7 +246,7 @@ fn process_events(
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
 ) -> bool {
-    match rx.recv() {
+    match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
         Ok(Ok(events)) => {
             let plan = plan_changes(&events);
             if plan.is_empty() {
@@ -235,8 +268,9 @@ fn process_events(
             eprintln!("  Watch error: {error:?}");
             true
         }
-        Err(e) => {
-            eprintln!("  Watch channel error: {e}");
+        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            eprintln!("  Watch channel error: channel disconnected");
             false
         }
     }

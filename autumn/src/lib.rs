@@ -44,11 +44,10 @@
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`],
 //!   [`Json`], [`Path`], [`Query`]).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
-//! - [`logging`] -- Structured logging via `tracing-subscriber`.
+
 //! - [`middleware`] -- Built-in middleware (request IDs).
 //! - [`prelude`] -- Glob import for the most common types.
-//! - [`route`] -- Route descriptor used by macro-generated code.
-//! - [`telemetry`] -- OTLP runtime planning and subscriber wiring.
+
 //!
 //! ## Zero-config defaults
 //!
@@ -90,7 +89,7 @@ pub mod probe;
 /// This module is responsible for taking the application's configuration,
 /// defined routes, middleware, and state, and building the final `axum::Router`
 /// that will handle incoming HTTP requests.
-pub mod router;
+pub(crate) mod router;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -102,18 +101,20 @@ pub use hooks::{
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
-pub mod logging;
+pub(crate) mod logging;
 pub mod middleware;
 pub mod prelude;
-pub mod route;
+pub(crate) mod route;
+pub use route::Route;
 pub mod security;
 pub mod session;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 /// Static site generation support.
+pub mod sse;
 pub mod static_gen;
 pub mod task;
-pub mod telemetry;
+pub(crate) mod telemetry;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;
@@ -633,7 +634,7 @@ pub mod reexports {
 }
 
 /// Shared application state passed to route handlers.
-pub mod state;
+pub(crate) mod state;
 #[allow(
     clippy::missing_panics_doc,
     clippy::must_use_candidate,

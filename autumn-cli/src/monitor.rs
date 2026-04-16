@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
@@ -128,6 +128,12 @@ struct DbPoolMetrics {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+struct ChannelsResponse {
+    #[serde(default)]
+    channels: HashMap<String, usize>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
 struct TasksResponse {
     #[serde(default)]
     scheduled_tasks: HashMap<String, TaskStatus>,
@@ -164,6 +170,7 @@ struct DashboardState {
     metrics: MetricsResponse,
     tasks: TasksResponse,
     loggers: LoggersResponse,
+    channels: ChannelsResponse,
     /// Rolling throughput samples (requests in last interval).
     throughput_history: VecDeque<u64>,
     /// Rolling p50 latency samples.
@@ -194,6 +201,7 @@ impl DashboardState {
             metrics: MetricsResponse::default(),
             tasks: TasksResponse::default(),
             loggers: LoggersResponse::default(),
+            channels: ChannelsResponse::default(),
             throughput_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p50_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
             latency_p99_history: VecDeque::with_capacity(SPARKLINE_DEPTH),
@@ -228,6 +236,7 @@ impl DashboardState {
         self.fetch_metrics(&client);
         self.fetch_tasks(&client);
         self.fetch_loggers(&client);
+        self.fetch_channels(&client);
 
         self.last_poll = Instant::now();
     }
@@ -316,6 +325,17 @@ impl DashboardState {
             }
         }
     }
+
+    fn fetch_channels(&mut self, client: &reqwest::blocking::Client) {
+        if let Ok(resp) = client
+            .get(format!("{}/actuator/channels", self.base_url))
+            .send()
+        {
+            if let Ok(c) = resp.json::<ChannelsResponse>() {
+                self.channels = c;
+            }
+        }
+    }
 }
 
 // ── TUI rendering ─────────────────────────────────────────────
@@ -362,13 +382,16 @@ fn run_loop(
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                         KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 3;
+                            state.active_tab = (state.active_tab + 1) % 4;
                         }
                         KeyCode::BackTab => {
                             if state.active_tab == 0 {
-                                state.active_tab = 2;
+                                state.active_tab = 3;
                             } else {
                                 state.active_tab -= 1;
                             }
@@ -416,6 +439,7 @@ fn draw(frame: &mut ratatui::Frame, state: &DashboardState) {
         0 => draw_overview_tab(frame, main_chunks[1], state),
         1 => draw_routes_tab(frame, main_chunks[1], state),
         2 => draw_loggers_tab(frame, main_chunks[1], state),
+        3 => draw_channels_tab(frame, main_chunks[1], state),
         _ => {}
     }
 
@@ -459,7 +483,7 @@ fn draw_header(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     frame.render_widget(title, chunks[0]);
 
     // Tabs
-    let tab_titles = vec!["Overview", "Routes", "Loggers"];
+    let tab_titles = vec!["Overview", "Routes", "Loggers", "Channels"];
     let tabs = Tabs::new(tab_titles)
         .select(state.active_tab)
         .style(Style::default().fg(Color::DarkGray))
@@ -524,6 +548,29 @@ fn draw_overview_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
     draw_bottom_panels(frame, rows[2], state);
 }
 
+fn draw_stat_card(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    main_value: String,
+    main_color: Color,
+    subtitle: String,
+) {
+    let block = make_card_block(title);
+    let paragraph = Paragraph::new(Text::from(vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            main_value,
+            Style::default().fg(main_color).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(subtitle, Style::default().fg(Color::DarkGray))),
+    ]))
+    .alignment(Alignment::Center)
+    .block(block);
+    frame.render_widget(paragraph, area);
+}
+
 fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -539,103 +586,59 @@ fn draw_stats_cards(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     let m = &state.metrics.http;
 
     // Card 1: Total Requests
-    let total_block = make_card_block("Total Requests");
-    let total = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format_number(m.requests_total),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{} active", m.requests_active),
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(total_block);
-    frame.render_widget(total, chunks[0]);
+    draw_stat_card(
+        frame,
+        chunks[0],
+        "Total Requests",
+        format_number(m.requests_total),
+        Color::White,
+        format!("{} active", m.requests_active),
+    );
 
     // Card 2: Throughput (req/s)
     let rps = state.throughput_history.back().copied().unwrap_or(0);
-    let rps_block = make_card_block("Throughput");
-    let rps_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{rps}"),
-            Style::default()
-                .fg(if rps > 0 {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                })
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("req/s", Style::default().fg(Color::DarkGray))),
-    ]))
-    .alignment(Alignment::Center)
-    .block(rps_block);
-    frame.render_widget(rps_widget, chunks[1]);
+    draw_stat_card(
+        frame,
+        chunks[1],
+        "Throughput",
+        format!("{rps}"),
+        if rps > 0 {
+            Color::Green
+        } else {
+            Color::DarkGray
+        },
+        "req/s".to_string(),
+    );
 
     // Card 3: p50 Latency
-    let p50_block = make_card_block("p50 Latency");
-    let p50_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p50),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p50))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled("median", Style::default().fg(Color::DarkGray))),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p50_block);
-    frame.render_widget(p50_widget, chunks[2]);
+    draw_stat_card(
+        frame,
+        chunks[2],
+        "p50 Latency",
+        format!("{}ms", m.latency_ms.p50),
+        latency_color(m.latency_ms.p50),
+        "median".to_string(),
+    );
 
     // Card 4: p95 Latency
-    let p95_block = make_card_block("p95 Latency");
-    let p95_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p95),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p95))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "95th pct",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p95_block);
-    frame.render_widget(p95_widget, chunks[3]);
+    draw_stat_card(
+        frame,
+        chunks[3],
+        "p95 Latency",
+        format!("{}ms", m.latency_ms.p95),
+        latency_color(m.latency_ms.p95),
+        "95th pct".to_string(),
+    );
 
     // Card 5: p99 Latency
-    let p99_block = make_card_block("p99 Latency");
-    let p99_widget = Paragraph::new(Text::from(vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            format!("{}ms", m.latency_ms.p99),
-            Style::default()
-                .fg(latency_color(m.latency_ms.p99))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "99th pct",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ]))
-    .alignment(Alignment::Center)
-    .block(p99_block);
-    frame.render_widget(p99_widget, chunks[4]);
+    draw_stat_card(
+        frame,
+        chunks[4],
+        "p99 Latency",
+        format!("{}ms", m.latency_ms.p99),
+        latency_color(m.latency_ms.p99),
+        "99th pct".to_string(),
+    );
 }
 
 fn draw_sparklines(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
@@ -1001,6 +1004,68 @@ fn draw_loggers_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSta
     .header(header)
     .block(block)
     .column_spacing(2);
+
+    frame.render_widget(table, area);
+}
+
+fn draw_channels_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " Channels ",
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::new(1, 1, 0, 0));
+
+    let header = Row::new(vec![
+        Cell::from("Channel Name").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("Subscribers").style(
+            Style::default()
+                .fg(Color::Rgb(204, 120, 50))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .height(1)
+    .bottom_margin(1);
+
+    let mut rows = Vec::new();
+
+    if state.channels.channels.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from("No active channels").style(Style::default().fg(Color::DarkGray)),
+            Cell::from(""),
+        ]));
+    } else {
+        let mut sorted_channels: Vec<_> = state.channels.channels.iter().collect();
+        sorted_channels.sort_by_key(|(name, _)| *name);
+
+        for (name, count) in sorted_channels {
+            let count_color = if *count > 0 {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+
+            rows.push(Row::new(vec![
+                Cell::from(name.clone()),
+                Cell::from(count.to_string()).style(Style::default().fg(count_color)),
+            ]));
+        }
+    }
+
+    let widths = [Constraint::Percentage(50), Constraint::Percentage(50)];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(2);
 
     frame.render_widget(table, area);
 }
@@ -1608,6 +1673,15 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_channels_response() {
+        let json = r#"{"channels":{"chat":10,"notifications":0}}"#;
+        let channels: ChannelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(channels.channels.len(), 2);
+        assert_eq!(channels.channels["chat"], 10);
+        assert_eq!(channels.channels["notifications"], 0);
+    }
+
+    #[test]
     fn default_types() {
         let _h = HealthResponse::default();
         let _m = MetricsResponse::default();
@@ -1621,6 +1695,7 @@ mod tests {
         let _dc = DatabaseCheck::default();
         let _db = DbPoolMetrics::default();
         let _l = LoggersResponse::default();
+        let _c = ChannelsResponse::default();
     }
 
     // ── Rendering tests (TestBackend) ─────────────────────────
@@ -1641,6 +1716,18 @@ mod tests {
     fn render_routes_tab() {
         let mut state = test_state();
         state.active_tab = 1;
+        render_frame(&state, 120, 40);
+    }
+
+    #[test]
+    fn render_channels_tab() {
+        let mut state = test_state();
+        state.active_tab = 3;
+        state.channels.channels.insert("chat".to_string(), 10);
+        state
+            .channels
+            .channels
+            .insert("notifications".to_string(), 0);
         render_frame(&state, 120, 40);
     }
 
@@ -1821,18 +1908,18 @@ mod tests {
         state.active_tab = 0;
 
         if state.active_tab == 0 {
-            state.active_tab = 2;
+            state.active_tab = 3;
+        } else {
+            state.active_tab -= 1;
+        }
+        assert_eq!(state.active_tab, 3);
+
+        if state.active_tab == 0 {
+            state.active_tab = 3;
         } else {
             state.active_tab -= 1;
         }
         assert_eq!(state.active_tab, 2);
-
-        if state.active_tab == 0 {
-            state.active_tab = 2;
-        } else {
-            state.active_tab -= 1;
-        }
-        assert_eq!(state.active_tab, 1);
     }
 
     #[test]

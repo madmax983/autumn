@@ -5,6 +5,7 @@
 //! no two workers will ever claim the same task.
 
 use chrono::{Duration, Utc};
+use diesel::BoolExpressionMethods;
 use diesel::ExpressionMethods;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
@@ -358,13 +359,10 @@ pub async fn park_workflow_task(conn: &mut AsyncPgConnection, task_id: Uuid) -> 
 /// Wake a parked workflow task for the given execution so replay can continue.
 ///
 /// This resets any parked workflow task row for `exec_id` back to `PENDING`
-/// and schedules it immediately. Only `RUNNING` rows with no worker ownership
-/// (i.e. tasks parked while waiting for an activity, signal, or child workflow)
-/// are eligible. Timer-waiting tasks, which sit in `PENDING` state until their
-/// `fires_at` timestamp, are intentionally excluded so that an incoming signal
-/// cannot prematurely fire a pending timer. Actively executing `RUNNING` rows
-/// (with a worker owner) are also excluded. If no parked workflow task exists,
-/// this is a no-op.
+/// and schedules it immediately. Only parked `RUNNING` rows with no worker
+/// ownership are eligible. Actively executing `RUNNING` rows and `PENDING`
+/// rows (e.g. timer-scheduled tasks) are intentionally excluded. If no parked
+/// workflow task exists, this is a no-op.
 ///
 /// # Errors
 ///
@@ -379,9 +377,12 @@ pub async fn wake_workflow_task(
         dsl::harvest_task_queue
             .filter(dsl::workflow_exec_id.eq(Some(exec_id.as_uuid())))
             .filter(dsl::task_type.eq(TaskType::Workflow.as_str()))
-            .filter(dsl::state.eq("RUNNING"))
-            .filter(dsl::worker_id.is_null())
-            .filter(dsl::started_at.is_null()),
+            .filter(
+                dsl::state
+                    .eq("RUNNING")
+                    .and(dsl::worker_id.is_null())
+                    .and(dsl::started_at.is_null()),
+            ),
     )
     .set((
         dsl::state.eq("PENDING"),

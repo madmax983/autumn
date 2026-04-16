@@ -79,10 +79,36 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Abstraction for reading environment variables, supporting dependency injection for testing.
+use std::sync::OnceLock;
+
+static MACRO_MANIFEST_DIR: OnceLock<String> = OnceLock::new();
+static MACRO_IS_DEBUG: OnceLock<bool> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn __set_macro_context(manifest_dir: String, is_debug: bool) {
+    let _ = MACRO_MANIFEST_DIR.set(manifest_dir);
+    let _ = MACRO_IS_DEBUG.set(is_debug);
+}
+
+/// Trait for environment variable reading to allow testing overrides.
+///
+/// This abstracts the OS environment (`std::env::var`) so that
+/// configuration loading logic can be unit-tested deterministically
+/// by supplying a mock environment.
 pub trait Env {
     /// Read an environment variable.
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// use autumn_web::config::{Env, OsEnv};
+    /// let env = OsEnv;
+    /// let val = env.var("NON_EXISTENT_VAR");
+    /// assert!(val.is_err());
+    /// ```
+    ///
     /// # Errors
+    ///
     /// Returns [`std::env::VarError`] if the variable is not present or is not valid Unicode.
     fn var(&self, key: &str) -> Result<String, std::env::VarError>;
 }
@@ -93,6 +119,19 @@ pub struct OsEnv;
 
 impl Env for OsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+        if key == "AUTUMN_MANIFEST_DIR" {
+            if let Some(dir) = MACRO_MANIFEST_DIR.get() {
+                return Ok(dir.clone());
+            }
+        } else if key == "AUTUMN_IS_DEBUG" {
+            if let Some(is_debug) = MACRO_IS_DEBUG.get() {
+                return Ok(if *is_debug {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                });
+            }
+        }
         std::env::var(key)
     }
 }
@@ -151,7 +190,10 @@ fn find_config_file_named(filename: &str, env: &dyn Env) -> PathBuf {
 /// Returns `Ok(None)` if the file doesn't exist.
 fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents.parse::<toml::Value>()?)),
+        Ok(contents) => {
+            let table = toml::from_str::<toml::Table>(&contents)?;
+            Ok(Some(toml::Value::Table(table)))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(ConfigError::Io(e)),
     }
@@ -1472,6 +1514,29 @@ mod tests {
             assert!(msg.contains("must start with postgres:// or postgresql://"));
         } else {
             panic!("Expected ConfigError::Validation");
+        }
+    }
+
+    #[test]
+    fn database_validate_url_edge_cases() {
+        let invalid_urls = vec![
+            "POSTGRES://localhost/db",
+            "postgres:/localhost/db",
+            "postgres:localhost/db",
+            "http://postgres",
+            "   postgres://localhost/db",
+            "",
+        ];
+
+        for invalid_url in invalid_urls {
+            let config = DatabaseConfig {
+                url: Some(invalid_url.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "URL should be invalid: {invalid_url}"
+            );
         }
     }
 

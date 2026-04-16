@@ -1,3 +1,0 @@
-📖 Chapter: The Missing Module Docs & Link Fixes
-🔦 Insight: Removed redundant explicit link targets in `lib.rs` to clean up `cargo doc` warnings. Added missing Module-Level (`//!`) documentation to `router.rs`, `session_redis.rs`, and `test_utils.rs` to provide high-level context and eliminate "Black Box" modules.
-🧪 Example: Cleaned up intra-doc links, for example transforming ``[`Form`](axum::extract::Form)`` to ``[`Form`]``.

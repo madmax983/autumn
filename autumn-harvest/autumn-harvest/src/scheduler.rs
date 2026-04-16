@@ -404,8 +404,15 @@ async fn create_due_runs(conn: &mut AsyncPgConnection, dags: &DagCatalog) -> Har
         let (created, next_run_at) =
             due_run_plan(dag.schedule.as_ref(), logical_date, now, dag.catchup);
 
-        for run_at in &created {
-            let _ = insert_dag_run(conn, &schedule.dag_name, *run_at, None).await?;
+        if !created.is_empty() {
+            let rows = create_new_dag_runs(&schedule.dag_name, &created);
+            diesel::insert_into(harvest_dag_runs::table)
+                .values(&rows)
+                .on_conflict((harvest_dag_runs::dag_name, harvest_dag_runs::logical_date))
+                .do_nothing()
+                .execute(conn)
+                .await
+                .map_err(crate::error::database_error)?;
         }
 
         diesel::update(dsl::harvest_schedules.find(schedule.id))
@@ -463,22 +470,27 @@ async fn activate_queued_runs(
             .await
             .map_err(crate::error::database_error)?;
 
-        for run in queued {
-            diesel::update(dag_runs_dsl::harvest_dag_runs.find(run.id))
-                .set((
-                    dag_runs_dsl::state.eq("RUNNING"),
-                    dag_runs_dsl::started_at.eq(Some(Utc::now())),
-                ))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+        if queued.is_empty() {
+            continue;
+        }
+        let queued_ids: Vec<_> = queued.iter().map(|r| r.id).collect();
 
-            let updated = dag_runs_dsl::harvest_dag_runs
-                .find(run.id)
-                .select(DagRun::as_select())
-                .first(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+        let mut updated_runs = diesel::update(
+            dag_runs_dsl::harvest_dag_runs.filter(dag_runs_dsl::id.eq_any(queued_ids)),
+        )
+        .set((
+            dag_runs_dsl::state.eq("RUNNING"),
+            dag_runs_dsl::started_at.eq(Some(Utc::now())),
+        ))
+        .returning(DagRun::as_select())
+        .get_results::<DagRun>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+        // Sort by logical_date to preserve the original queue ordering (logical_date ASC).
+        updated_runs.sort_by_key(|r| r.logical_date);
+
+        for updated in updated_runs {
             runnable.push((updated, dag.clone()));
         }
     }
@@ -611,6 +623,21 @@ fn task_input(conf: &Value, activity_name: &str) -> Value {
     }
 }
 
+fn create_new_dag_runs<'a>(dag_name: &'a str, run_dates: &[DateTime<Utc>]) -> Vec<NewDagRun<'a>> {
+    run_dates
+        .iter()
+        .map(|&logical_date| NewDagRun {
+            id: uuid::Uuid::new_v4(),
+            dag_name,
+            workflow_exec_id: None,
+            logical_date,
+            data_interval_start: logical_date,
+            data_interval_end: logical_date,
+            conf: None,
+        })
+        .collect()
+}
+
 async fn insert_dag_run(
     db: &mut AsyncPgConnection,
     dag_name: &str,
@@ -730,5 +757,34 @@ mod tests {
             ]
         );
         assert_eq!(next_run_at, Some(parse_utc("2026-04-06T12:03:00Z")));
+    }
+
+    #[test]
+    fn create_new_dag_runs_generates_correct_rows() {
+        let first_due = parse_utc("2026-04-06T12:00:00Z");
+        let second_due = parse_utc("2026-04-06T12:01:00Z");
+        let dates = vec![first_due, second_due];
+
+        let rows = create_new_dag_runs("test_dag", &dates);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].dag_name, "test_dag");
+        assert_eq!(rows[0].logical_date, first_due);
+        assert_eq!(rows[0].data_interval_start, first_due);
+        assert_eq!(rows[0].data_interval_end, first_due);
+        assert_eq!(rows[0].workflow_exec_id, None);
+        assert_eq!(rows[0].conf, None);
+        assert_eq!(rows[1].dag_name, "test_dag");
+        assert_eq!(rows[1].logical_date, second_due);
+        assert_eq!(rows[1].data_interval_start, second_due);
+        assert_eq!(rows[1].data_interval_end, second_due);
+        assert_eq!(rows[1].workflow_exec_id, None);
+        assert_eq!(rows[1].conf, None);
+    }
+
+    #[test]
+    fn create_new_dag_runs_returns_empty_for_no_dates() {
+        let rows = create_new_dag_runs("test_dag", &[]);
+        assert!(rows.is_empty());
     }
 }

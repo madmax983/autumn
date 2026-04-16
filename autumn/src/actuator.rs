@@ -17,20 +17,46 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 /// Trait to abstract the state requirements for actuator handlers.
+///
+/// Implement this trait on your application's state type to provide
+/// the necessary dependencies for actuator endpoints (e.g. `/actuator/metrics`).
+/// This avoids tight coupling between the actuator middleware and the specific `AppState`.
 pub trait ProvideActuatorState {
+    /// Returns a reference to the [`crate::middleware::MetricsCollector`]
+    /// tracking current HTTP traffic metrics.
     fn metrics(&self) -> &crate::middleware::MetricsCollector;
+
+    /// Returns a reference to the dynamic [`LogLevels`] configuration
+    /// allowing runtime adjustment of `tracing` filters.
     fn log_levels(&self) -> &LogLevels;
+
+    /// Returns a reference to the [`TaskRegistry`] holding status and metadata
+    /// for async scheduled background tasks.
     fn task_registry(&self) -> &TaskRegistry;
+
+    /// Returns a reference to the [`ConfigProperties`] snapshot, providing
+    /// active configuration state for the environment endpoint.
     fn config_props(&self) -> &ConfigProperties;
+
+    /// Returns the currently active execution profile (e.g. "dev", "prod")
+    /// which modifies what sensitive endpoints are exposed.
     fn profile(&self) -> &str;
+
+    /// Returns a human-readable string displaying how long the application
+    /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns a reference to the system [`crate::channels::Channels`] which
+    /// broadcasts operational events to WebSocket streams.
     #[cfg(feature = "ws")]
     fn channels(&self) -> &crate::channels::Channels;
 
+    /// Returns the main cancellation token that triggers a graceful framework shutdown.
     #[cfg(feature = "ws")]
     fn shutdown_token(&self) -> tokio_util::sync::CancellationToken;
 
+    /// Returns an optional reference to the database connection pool,
+    /// used to expose database connection metrics in the `/actuator/metrics` endpoint.
     #[cfg(feature = "db")]
     fn pool(
         &self,
@@ -629,41 +655,40 @@ struct DatabaseCheck {
 }
 
 /// `GET <actuator-prefix>/health`
-#[allow(unused_variables, clippy::useless_let_if_seq)]
+#[allow(unused_variables)]
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    let db_check;
-    let overall_healthy;
+    let (overall_healthy, db_check) = {
+        #[cfg(feature = "db")]
+        {
+            #[allow(clippy::option_if_let_else)]
+            if let Some(pool) = state.pool() {
+                let status = pool.status();
+                let available = status.available as u64;
+                let size = status.max_size as u64;
+                let waiting = status.waiting as u64;
+                let idle = available;
+                let active = size.saturating_sub(available);
 
-    #[cfg(feature = "db")]
-    {
-        if let Some(pool) = state.pool() {
-            let status = pool.status();
-            let available = status.available as u64;
-            let size = status.max_size as u64;
-            let waiting = status.waiting as u64;
-            let idle = available;
-            let active = size.saturating_sub(available);
-
-            overall_healthy = available > 0 || waiting == 0;
-            db_check = Some(DatabaseCheck {
-                status: if overall_healthy { "ok" } else { "down" },
-                pool_size: size,
-                active_connections: active,
-                idle_connections: idle,
-            });
-        } else {
-            overall_healthy = true;
-            db_check = None;
+                let overall_healthy = available > 0 || waiting == 0;
+                let db_check = Some(DatabaseCheck {
+                    status: if overall_healthy { "ok" } else { "down" },
+                    pool_size: size,
+                    active_connections: active,
+                    idle_connections: idle,
+                });
+                (overall_healthy, db_check)
+            } else {
+                (true, None)
+            }
         }
-    }
 
-    #[cfg(not(feature = "db"))]
-    {
-        overall_healthy = true;
-        db_check = None;
-    }
+        #[cfg(not(feature = "db"))]
+        {
+            (true, None)
+        }
+    };
 
     let checks = db_check.map(|db| HealthChecks { database: Some(db) });
 
@@ -968,6 +993,19 @@ pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     }))
 }
 
+// ── Channels (sensitive) ───────────────────────────────────────
+
+/// `GET <actuator-prefix>/channels` -- get current channel snapshots.
+#[cfg(feature = "ws")]
+pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let channels = state.channels().snapshot();
+    Json(serde_json::json!({
+        "channels": channels,
+    }))
+}
+
 // ── Tasks Stream (WebSocket) ───────────────────────────────────
 
 /// `GET <actuator-prefix>/tasks/stream` -- stream scheduled task events.
@@ -1055,7 +1093,10 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         ]);
 
         #[cfg(feature = "ws")]
-        paths.push(actuator_route_path(prefix, "/tasks/stream"));
+        {
+            paths.push(actuator_route_path(prefix, "/tasks/stream"));
+            paths.push(actuator_route_path(prefix, "/channels"));
+        }
     }
 
     paths
@@ -1123,10 +1164,15 @@ pub(crate) fn actuator_router_with_prefix<
 
         #[cfg(feature = "ws")]
         {
-            router = router.route(
-                &actuator_route_path(prefix, "/tasks/stream"),
-                axum::routing::get(tasks_stream_endpoint::<S>),
-            );
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/channels"),
+                    axum::routing::get(channels_endpoint::<S>),
+                );
         }
     }
 

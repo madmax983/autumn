@@ -31,8 +31,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::config::AutumnConfig;
-#[cfg(feature = "db")]
-use crate::db;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -553,22 +551,8 @@ impl AppBuilder {
 
         let all_routes = routes;
 
-        // 1. Load configuration (profile-aware)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
-
-        // 2. Initialize logging/telemetry immediately after config.
-        let _telemetry_guard = crate::logging::init_with_telemetry(
-            &config.log,
-            &config.telemetry,
-            config.profile.as_deref(),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
+        // 1 & 2. Load configuration and initialize logging/telemetry
+        let (config, _telemetry_guard) = load_config_and_telemetry();
 
         // 3. Validate routes
         assert!(
@@ -590,15 +574,12 @@ impl AppBuilder {
             log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
-        // 5. Create database pool (if configured)
+        // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                tracing::error!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
+            tracing::error!("{e}");
+            std::process::exit(1);
+        });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -610,34 +591,12 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
-        // 5b. Run migrations if registered
-        #[cfg(feature = "db")]
-        if let Some(url) = &config.database.url {
-            for migrations in migrations {
-                migrate::auto_migrate(url, config.profile.as_deref(), migrations);
-            }
-        }
-
         // 6. Build the router (with optional static-file layer)
-        let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+        let state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            probes: crate::probe::ProbeState::pending_startup(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -723,7 +682,7 @@ impl AppBuilder {
 
         if !state.probes().is_shutting_down() {
             if !tasks.is_empty() {
-                start_task_scheduler(tasks, &state);
+                start_task_scheduler(tasks, &state, server_shutdown.clone());
             }
             state.probes().mark_startup_complete();
         }
@@ -766,19 +725,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let config = AutumnConfig::load().unwrap_or_else(|e| {
-            eprintln!("Failed to load configuration: {e}");
-            std::process::exit(1);
-        });
-        let _telemetry_guard = crate::logging::init_with_telemetry(
-            &config.log,
-            &config.telemetry,
-            config.profile.as_deref(),
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize telemetry: {error}");
-            std::process::exit(1);
-        });
+        let (config, _telemetry_guard) = load_config_and_telemetry();
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -788,33 +735,18 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = match db::create_pool(&config.database) {
-            Ok(pool) => pool,
-            Err(e) => {
-                eprintln!("Failed to create database pool: {e}");
-                std::process::exit(1);
-            }
-        };
+        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+        let mut state = build_state(
+            &config,
             #[cfg(feature = "db")]
             pool,
-            profile: config.profile.clone(),
-            started_at: std::time::Instant::now(),
-            health_detailed: config.health.detailed,
-            probes: crate::probe::ProbeState::default(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new(&config.log.level),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::from_config(&config),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        };
+        );
+        // run_build_mode used ProbeState::default(), which does not start as pending
+        state.probes = crate::probe::ProbeState::default();
 
         // Build the full router (same as production)
         let router =
@@ -850,10 +782,16 @@ pub(crate) fn is_static_build_mode() -> bool {
 /// Start scheduled tasks in background Tokio tasks.
 ///
 /// Each task runs in its own spawned task with error logging.
-/// Uses simple `tokio::time` for fixed-delay scheduling.
+/// Uses `tokio::time` for fixed-delay scheduling and `tokio-cron-scheduler`
+/// for cron-based scheduling. The `shutdown` token is used to stop the cron
+/// scheduler gracefully when the server receives a termination signal.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
-fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
+fn start_task_scheduler(
+    tasks: Vec<crate::task::TaskInfo>,
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
         let schedule_desc = match &task_info.schedule {
@@ -862,6 +800,10 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
         };
         tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
     }
+
+    let mut cron_tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)> =
+        Vec::new();
+
     for task_info in tasks {
         let state = state.clone();
         let name = task_info.name.clone();
@@ -934,19 +876,166 @@ fn start_task_scheduler(tasks: Vec<crate::task::TaskInfo>, state: &AppState) {
                     }
                 });
             }
-            crate::task::Schedule::Cron { expression, .. } => {
-                // Register with the task registry even though cron is not yet implemented
+            crate::task::Schedule::Cron {
+                expression,
+                timezone,
+            } => {
                 let schedule_desc = format!("cron {expression}");
                 state.task_registry.register(&name, &schedule_desc);
+                cron_tasks.push((name, expression, timezone, handler));
+            }
+        }
+    }
 
-                tracing::info!(
-                    task = %name,
-                    cron = %expression,
-                    "Cron scheduling not yet implemented; task registered but will not run"
+    if !cron_tasks.is_empty() {
+        let state = state.clone();
+        tokio::spawn(async move {
+            run_cron_scheduler(cron_tasks, state, shutdown).await;
+        });
+    }
+}
+
+/// Run the `tokio-cron-scheduler` for all cron tasks, shutting down when the
+/// `shutdown` token is cancelled.
+async fn run_cron_scheduler(
+    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    use tokio_cron_scheduler::JobScheduler;
+
+    let sched = match JobScheduler::new().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to create cron job scheduler");
+            return;
+        }
+    };
+
+    for (name, expression, timezone, handler) in tasks {
+        let state_clone = state.clone();
+        let name_clone = name.clone();
+
+        let job_result = build_cron_job(&expression, timezone.as_deref(), move |_uuid, _lock| {
+            let state = state_clone.clone();
+            let name = name_clone.clone();
+            Box::pin(async move {
+                tracing::debug!(task = %name, "Running cron task");
+                state.task_registry.record_start(&name);
+
+                #[cfg(feature = "ws")]
+                {
+                    let msg = serde_json::json!({
+                        "event": "started",
+                        "task": name,
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    });
+                    let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+                }
+
+                let start = std::time::Instant::now();
+                match (handler)(state.clone()).await {
+                    Ok(()) => {
+                        let duration_ms =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        state.task_registry.record_success(&name, duration_ms);
+                        tracing::debug!(task = %name, "Cron task completed");
+
+                        #[cfg(feature = "ws")]
+                        {
+                            let msg = serde_json::json!({
+                                "event": "success",
+                                "task": name,
+                                "duration_ms": duration_ms,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+                        }
+                    }
+                    Err(e) => {
+                        let duration_ms =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        let error_str = e.to_string();
+                        state
+                            .task_registry
+                            .record_failure(&name, duration_ms, &error_str);
+                        tracing::warn!(task = %name, error = %e, "Cron task failed");
+
+                        #[cfg(feature = "ws")]
+                        {
+                            let msg = serde_json::json!({
+                                "event": "failure",
+                                "task": name,
+                                "duration_ms": duration_ms,
+                                "error": error_str,
+                                "timestamp": chrono::Utc::now().to_rfc3339()
+                            });
+                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+                        }
+                    }
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+
+        match job_result {
+            Ok(job) => {
+                if let Err(e) = sched.add(job).await {
+                    tracing::error!(task = %name, error = %e, "Failed to add cron task to scheduler");
+                }
+            }
+            Err(e) => {
+                tracing::error!(task = %name, error = %e, "Failed to create cron job");
+            }
+        }
+    }
+
+    if let Err(e) = sched.start().await {
+        tracing::error!(error = %e, "Failed to start cron scheduler");
+        return;
+    }
+
+    tracing::info!("Cron scheduler started");
+    shutdown.cancelled().await;
+    tracing::info!("Shutting down cron scheduler");
+
+    let mut sched = sched;
+    if let Err(e) = sched.shutdown().await {
+        tracing::error!(error = %e, "Failed to shut down cron scheduler");
+    }
+}
+
+/// Build a cron [`Job`](tokio_cron_scheduler::Job) for the given expression and optional
+/// IANA timezone string.
+///
+/// If `timezone` is `None` or cannot be parsed, UTC is used.
+fn build_cron_job<F>(
+    expression: &str,
+    timezone: Option<&str>,
+    run: F,
+) -> Result<tokio_cron_scheduler::Job, tokio_cron_scheduler::JobSchedulerError>
+where
+    F: 'static
+        + FnMut(
+            uuid::Uuid,
+            tokio_cron_scheduler::JobScheduler,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+{
+    use tokio_cron_scheduler::Job;
+
+    if let Some(tz_str) = timezone {
+        match tz_str.parse::<chrono_tz::Tz>() {
+            Ok(tz) => return Job::new_async_tz(expression, tz, run),
+            Err(_) => {
+                tracing::warn!(
+                    timezone = %tz_str,
+                    "Unrecognized timezone; falling back to UTC"
                 );
             }
         }
     }
+    Job::new_async(expression, run)
 }
 
 async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::AutumnResult<()> {
@@ -987,6 +1076,72 @@ fn log_startup_transparency(
     tracing::info!("Active middleware: {}", format_middleware_list(config));
 
     tracing::info!("Configuration:{}", format_config_summary(config));
+}
+
+fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    // 1. Load configuration (profile-aware)
+    let config = AutumnConfig::load().unwrap_or_else(|e| {
+        eprintln!("Failed to load configuration: {e}");
+        std::process::exit(1);
+    });
+
+    // 2. Initialize logging/telemetry immediately after config.
+    let telemetry_guard = crate::logging::init_with_telemetry(
+        &config.log,
+        &config.telemetry,
+        config.profile.as_deref(),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("Failed to initialize telemetry: {error}");
+        std::process::exit(1);
+    });
+
+    (config, telemetry_guard)
+}
+
+#[cfg(feature = "db")]
+fn setup_database(
+    config: &AutumnConfig,
+    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+) -> Result<
+    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+    String,
+> {
+    let pool = crate::db::create_pool(&config.database)
+        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+
+    if let Some(url) = &config.database.url {
+        for mig in migrations {
+            crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+        }
+    }
+
+    Ok(pool)
+}
+
+fn build_state(
+    config: &AutumnConfig,
+    #[cfg(feature = "db")] pool: Option<
+        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    >,
+) -> AppState {
+    AppState {
+        extensions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        #[cfg(feature = "db")]
+        pool,
+        profile: config.profile.clone(),
+        started_at: std::time::Instant::now(),
+        health_detailed: config.health.detailed,
+        probes: crate::probe::ProbeState::pending_startup(),
+        metrics: crate::middleware::MetricsCollector::new(),
+        log_levels: crate::actuator::LogLevels::new(&config.log.level),
+        task_registry: crate::actuator::TaskRegistry::new(),
+        config_props: crate::actuator::ConfigProperties::from_config(config),
+        #[cfg(feature = "ws")]
+        channels: crate::channels::Channels::new(32),
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    }
 }
 
 /// Build the route listing string for the transparency log.
@@ -2289,7 +2444,11 @@ mod tests {
         // Start scheduler in background so we don't block
         let state_clone = state.clone();
         tokio::spawn(async move {
-            super::start_task_scheduler(vec![task], &state_clone);
+            super::start_task_scheduler(
+                vec![task],
+                &state_clone,
+                tokio_util::sync::CancellationToken::new(),
+            );
         });
 
         // First message should be "started"
@@ -2345,7 +2504,11 @@ mod tests {
 
         let state_clone = state.clone();
         tokio::spawn(async move {
-            super::start_task_scheduler(vec![task], &state_clone);
+            super::start_task_scheduler(
+                vec![task],
+                &state_clone,
+                tokio_util::sync::CancellationToken::new(),
+            );
         });
 
         // First message: started

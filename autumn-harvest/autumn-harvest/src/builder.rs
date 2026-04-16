@@ -299,6 +299,12 @@ mod tests {
     }
 
     #[test]
+    fn worker_config_with_empty_queues_clears_list() {
+        let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
+        assert!(config.queues.is_empty());
+    }
+
+    #[test]
     fn worker_config_builder_sets_notification_database_url() {
         let config =
             WorkerConfig::default().with_notification_database_url("postgres://localhost/test");
