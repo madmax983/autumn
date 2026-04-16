@@ -461,6 +461,39 @@ fn slow_activity<'a>(
     })
 }
 
+fn signal_waiting_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let payload = ctx
+            .wait_for_signal("approve")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "approved_by": payload }))
+    })
+}
+
+fn activity_then_signal_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let activity_result = ctx
+            .execute_activity_raw("send_email", input, "default")
+            .await
+            .map_err(|e| e.to_string())?;
+        let signal_payload = ctx
+            .wait_for_signal("approve")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "activity": activity_result,
+            "signal": signal_payload,
+        }))
+    })
+}
+
 fn parent_workflow_with_child<'a>(
     ctx: &'a WorkflowContext,
     input: serde_json::Value,
@@ -1891,6 +1924,189 @@ async fn event_store_round_trip() {
         .expect("full load_history failed");
     assert_eq!(full_history.events.len(), 5);
     assert_eq!(full_history.next_event_id, 5);
+}
+
+/// Worker delivers a signal to a waiting workflow and the workflow completes.
+///
+/// This tests the full signal delivery path:
+/// 1. Workflow runs, hits `wait_for_signal` → no signal yet → requeued
+/// 2. Signal is written to the `harvest_signals` table
+/// 3. Worker retries the task, ingests the pending signal, replays the workflow
+/// 4. `wait_for_signal` replays with the ingested signal → workflow completes
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_completes_workflow_after_signal_delivery() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: serde_json::json!({}),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: signal_waiting_workflow,
+        }],
+        vec![],
+    ));
+    let worker = build_runtime_worker("worker-e2e-signal-wait", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    // Let the worker pick up the task and reach the signal-wait state.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Deliver the signal.
+    autumn_harvest::signal::send_signal(
+        &mut conn,
+        exec_id,
+        "approve",
+        serde_json::json!({"user": "alice"}),
+    )
+    .await
+    .expect("send_signal should succeed");
+
+    // Wake the parked task immediately so the test doesn't wait for the 1 s
+    // requeue delay.
+    queue::wake_workflow_task(&mut conn, exec_id)
+        .await
+        .expect("wake_workflow_task should succeed");
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    assert_eq!(
+        execution.output,
+        Some(serde_json::json!({"approved_by": {"user": "alice"}}))
+    );
+
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert!(
+        matches!(
+            history.events.as_slice(),
+            [
+                WorkflowEvent::WorkflowStarted { .. },
+                WorkflowEvent::SignalReceived { .. },
+                WorkflowEvent::WorkflowCompleted { .. },
+            ]
+        ),
+        "unexpected history: {:?}",
+        history.events
+    );
+}
+
+/// Signal arrives before the workflow's activity is scheduled.
+///
+/// `ingest_pending_signals` can append a `SignalReceived` event at the very
+/// start of history (right after `WorkflowStarted`) if the signal arrives
+/// while the workflow task is queued but not yet running.  The replay engine
+/// must skip those early signals when looking for `ActivityScheduled` and
+/// then deliver them when the workflow later calls `wait_for_signal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_handles_early_ingested_signal_before_activity() {
+    let (database_url, _container) = setup_test_database_url().await;
+    let mut conn = <AsyncPgConnection as diesel_async::AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect to Postgres container");
+
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    let workflow_input = serde_json::json!({"to": "bob@example.com"});
+
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: workflow_input.clone(),
+            timestamp: Utc::now(),
+        }],
+        0,
+    )
+    .await
+    .expect("append WorkflowStarted failed");
+
+    // Insert the signal into history BEFORE the workflow runs its activity,
+    // simulating the race where a signal arrives right after the workflow
+    // task is enqueued but before the worker picks it up.
+    store::append_events(
+        &mut conn,
+        exec_id,
+        &[WorkflowEvent::SignalReceived {
+            signal_name: "approve".into(),
+            payload: serde_json::json!({"early": true}),
+        }],
+        1,
+    )
+    .await
+    .expect("append early SignalReceived failed");
+
+    let mut params = EnqueueParams::new("default", TaskType::Workflow, workflow_input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(1);
+
+    queue::enqueue(&mut conn, &params)
+        .await
+        .expect("enqueue workflow task failed");
+
+    let registry = Arc::new(HandlerRegistry::new(
+        vec![WorkflowInfo {
+            name: "e2e_test_workflow",
+            module: "integration_e2e",
+            handler: activity_then_signal_workflow,
+        }],
+        vec![ActivityInfo {
+            name: "send_email",
+            module: "integration_e2e",
+            default_retry_policy: None,
+            default_start_to_close: None,
+            default_heartbeat_timeout: None,
+            default_schedule_to_start: None,
+            default_queue: Some("default"),
+            handler: send_email_activity,
+        }],
+    ));
+    let worker = build_runtime_worker("worker-e2e-early-signal", 1, 1, registry);
+    let pool = build_test_pool(&database_url);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool);
+
+    let execution = wait_for_execution_state(&database_url, exec_id, "COMPLETED").await;
+
+    worker.shutdown();
+    handle.await.expect("worker task should join");
+
+    let expected_activity_output = serde_json::json!({
+        "sent": true,
+        "to": "bob@example.com",
+    });
+    assert_eq!(
+        execution.output,
+        Some(serde_json::json!({
+            "activity": expected_activity_output,
+            "signal": {"early": true},
+        }))
+    );
 }
 
 #[tokio::test]
