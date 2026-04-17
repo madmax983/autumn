@@ -2574,4 +2574,29 @@ mod tests {
         assert_eq!(json2["task"], "test_failing_task");
         assert_eq!(json2["error"], "forced error");
     }
+
+    #[tokio::test]
+    async fn execute_cron_task_result_ok_returns_duration() {
+        let state = AppState::for_test();
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+        let start = std::time::Instant::now();
+        let result = super::execute_cron_task_result(&state, handler, start).await;
+        assert!(result.is_ok(), "expected Ok from successful handler");
+        // duration_ms should be a reasonable value (not MAX)
+        assert!(result.unwrap() < u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn execute_cron_task_result_err_returns_duration_and_message() {
+        let state = AppState::for_test();
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) })
+        };
+        let start = std::time::Instant::now();
+        let result = super::execute_cron_task_result(&state, handler, start).await;
+        assert!(result.is_err(), "expected Err from failing handler");
+        let (duration_ms, msg) = result.unwrap_err();
+        assert!(duration_ms < u64::MAX);
+        assert!(msg.contains("test error"));
+    }
 }

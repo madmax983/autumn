@@ -145,7 +145,8 @@ pub async fn check_links(_state: AppState) -> AutumnResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_requires_get_fallback, probe_outcome, response_is_reachable};
+    use super::{head_requires_get_fallback, probe_outcome, process_shard_result, response_is_reachable};
+    use autumn_web::error::AutumnError;
     use reqwest::StatusCode;
 
     #[test]
@@ -184,5 +185,55 @@ mod tests {
     fn hard_head_failures_do_not_trigger_fallback() {
         assert!(!probe_outcome(Ok(StatusCode::NOT_FOUND), None));
         assert!(!probe_outcome(Err(()), None));
+    }
+
+    #[test]
+    fn process_shard_result_both_ok_returns_counts() {
+        let result = process_shard_result(Ok(Ok((5, 2))), Ok(()));
+        assert_eq!(result.unwrap(), (5, 2));
+    }
+
+    #[test]
+    fn process_shard_result_shard_err_release_ok_returns_shard_error() {
+        let err = AutumnError::bad_request_msg("shard failure");
+        let result = process_shard_result(Ok(Err(err)), Ok(()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shard failure"));
+    }
+
+    #[test]
+    fn process_shard_result_shard_ok_release_err_returns_release_error() {
+        let release_err = AutumnError::bad_request_msg("release failure");
+        let result = process_shard_result(Ok(Ok((3, 1))), Err(release_err));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("release failure"));
+    }
+
+    #[test]
+    fn process_shard_result_both_err_returns_shard_error() {
+        let shard_err = AutumnError::bad_request_msg("shard error");
+        let release_err = AutumnError::bad_request_msg("release error");
+        let result = process_shard_result(Ok(Err(shard_err)), Err(release_err));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shard error"));
+    }
+
+    #[test]
+    fn process_shard_result_panic_with_ok_release_resumes_panic() {
+        let panic_payload = std::panic::catch_unwind(|| panic!("oh no")).unwrap_err();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = process_shard_result(Err(panic_payload), Ok(()));
+        }));
+        assert!(caught.is_err(), "panic should have been re-raised");
+    }
+
+    #[test]
+    fn process_shard_result_panic_with_release_err_resumes_panic() {
+        let panic_payload = std::panic::catch_unwind(|| panic!("oh no")).unwrap_err();
+        let release_err = AutumnError::bad_request_msg("release error");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = process_shard_result(Err(panic_payload), Err(release_err));
+        }));
+        assert!(caught.is_err(), "panic should have been re-raised");
     }
 }
