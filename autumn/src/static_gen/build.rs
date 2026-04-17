@@ -161,7 +161,7 @@ pub async fn render_static_routes(
     dist_dir: &Path,
 ) -> Result<(), BuildError> {
     // Phase 1: Expand all routes into concrete render jobs
-    let mut jobs = Vec::new();
+    let mut jobs = Vec::with_capacity(metas.len());
     for meta in metas {
         let expanded = expand_route(meta, &router).await?;
         eprintln!("  Route {} -> {} page(s)", meta.path, expanded.len());

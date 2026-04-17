@@ -802,7 +802,7 @@ fn start_task_scheduler(
     }
 
     let mut cron_tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)> =
-        Vec::new();
+        Vec::with_capacity(tasks.len());
 
     for task_info in tasks {
         let state = state.clone();
