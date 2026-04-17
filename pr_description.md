@@ -1,17 +1,17 @@
-🤖 Sentinel: [fix chaos channels panic test]
+🔭 Vantage: Spec for OAuth2 Support
 
-🦠 **Mutants Found:**
-The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
+👤 **User Story:**
+As an Application Developer, I want to authenticate users using third-party providers (like Google, GitHub, or Okta) via OAuth2/OIDC, so that users can log in securely without creating new passwords, reducing onboarding friction and improving account security.
 
-🎯 **Tests Added/Strengthened:**
-* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
-* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
+✅ **Acceptance Criteria:**
+- Must support standard OAuth2 Authorization Code flow.
+- Must support OpenID Connect (OIDC) for identity extraction.
+- Must provide configuration primitives in `autumn.toml` (e.g., `[auth.oauth2.github] client_id=...`).
+- Must provide a simple macro/extractor (e.g., `#[oauth2_callback]`) to handle the callback and extract user data securely.
+- Must integrate seamlessly with existing session management to log the user in after successful authentication.
+- Must handle state/nonce parameters automatically to prevent CSRF attacks during the OAuth flow.
 
-⚠️ **Suspected Bugs:**
-Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
-
-📊 **Kill Rate:**
-High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
-
-🔗 **Havoc Interaction:**
-These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
+🚫 **Out of Scope:**
+- Implementing custom identity providers.
+- Supporting legacy OAuth 1.0a.
+- Managing user profiles beyond initial authentication and identity extraction.
