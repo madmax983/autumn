@@ -345,7 +345,7 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
             overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
 
         if is_recursive_merge {
-            let base_val = base_table.get_mut(&key).unwrap();
+            let base_val = base_table.get_mut(&key).expect("test requirement failed");
             deep_merge_with_depth(base_val, overlay_val, depth + 1);
         } else {
             base_table.insert(key, overlay_val);
@@ -1645,14 +1645,14 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
-        let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml")).unwrap();
+        let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml")).expect("test requirement failed");
         assert_eq!(config.server.port, 3000);
         assert!(config.database.url.is_none());
     }
 
     #[test]
     fn load_valid_full_config() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("autumn.toml");
         std::fs::write(
             &path,
@@ -1675,9 +1675,9 @@ format = "Json"
 path = "/healthz"
 "#,
         )
-        .unwrap();
+        .expect("test requirement failed");
 
-        let config = AutumnConfig::load_from(&path).unwrap();
+        let config = AutumnConfig::load_from(&path).expect("test requirement failed");
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.shutdown_timeout_secs, 60);
@@ -1694,11 +1694,11 @@ path = "/healthz"
 
     #[test]
     fn load_partial_config_merges_with_defaults() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("autumn.toml");
-        std::fs::write(&path, "[server]\nport = 9090\n").unwrap();
+        std::fs::write(&path, "[server]\nport = 9090\n").expect("test requirement failed");
 
-        let config = AutumnConfig::load_from(&path).unwrap();
+        let config = AutumnConfig::load_from(&path).expect("test requirement failed");
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.database.pool_size, 10);
@@ -1707,9 +1707,9 @@ path = "/healthz"
 
     #[test]
     fn load_invalid_toml_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("autumn.toml");
-        std::fs::write(&path, "not valid [[[toml").unwrap();
+        std::fs::write(&path, "not valid [[[toml").expect("test requirement failed");
 
         let result = AutumnConfig::load_from(&path);
         assert!(result.is_err());
@@ -1719,11 +1719,11 @@ path = "/healthz"
 
     #[test]
     fn load_empty_file_returns_defaults() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("autumn.toml");
-        std::fs::write(&path, "").unwrap();
+        std::fs::write(&path, "").expect("test requirement failed");
 
-        let config = AutumnConfig::load_from(&path).unwrap();
+        let config = AutumnConfig::load_from(&path).expect("test requirement failed");
         assert_eq!(config.server.port, 3000);
     }
 
@@ -1905,10 +1905,10 @@ path = "/healthz"
     #[test]
     fn env_overrides_toml_values() {
         let env = MockEnv::new().with("AUTUMN_SERVER__PORT", "9999");
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("autumn.toml");
-        std::fs::write(&path, "[server]\nport = 4000\n").unwrap();
-        let mut config = AutumnConfig::load_from(&path).unwrap();
+        std::fs::write(&path, "[server]\nport = 4000\n").expect("test requirement failed");
+        let mut config = AutumnConfig::load_from(&path).expect("test requirement failed");
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.port, 9999); // env wins
     }
@@ -1981,8 +1981,8 @@ path = "/healthz"
     #[test]
     fn dev_profile_smart_defaults() {
         let defaults = profile_defaults_as_toml("dev");
-        let toml_str = toml::to_string(&defaults).unwrap();
-        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        let toml_str = toml::to_string(&defaults).expect("test requirement failed");
+        let config: AutumnConfig = toml::from_str(&toml_str).expect("test requirement failed");
 
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.log.format, LogFormat::Pretty);
@@ -1996,8 +1996,8 @@ path = "/healthz"
     #[test]
     fn prod_profile_smart_defaults() {
         let defaults = profile_defaults_as_toml("prod");
-        let toml_str = toml::to_string(&defaults).unwrap();
-        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        let toml_str = toml::to_string(&defaults).expect("test requirement failed");
+        let config: AutumnConfig = toml::from_str(&toml_str).expect("test requirement failed");
 
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Json);
@@ -2024,7 +2024,7 @@ path = "/healthz"
             pool_size = 10
             "#,
         )
-        .unwrap();
+        .expect("test requirement failed");
 
         let overlay: toml::Value = toml::from_str(
             r#"
@@ -2034,7 +2034,7 @@ path = "/healthz"
             url = "postgres://localhost/test"
             "#,
         )
-        .unwrap();
+        .expect("test requirement failed");
 
         deep_merge(&mut base, overlay);
 
@@ -2056,7 +2056,7 @@ path = "/healthz"
 
     #[test]
     fn profile_toml_overrides_base_toml() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let base_path = dir.path().join("autumn.toml");
         let dev_path = dir.path().join("autumn-dev.toml");
 
@@ -2069,7 +2069,7 @@ path = "/healthz"
             pool_size = 10
             ",
         )
-        .unwrap();
+        .expect("test requirement failed");
 
         std::fs::write(
             &dev_path,
@@ -2078,17 +2078,17 @@ path = "/healthz"
             url = "postgres://localhost/myapp_dev"
             "#,
         )
-        .unwrap();
+        .expect("test requirement failed");
 
         // Load base
         let mut merged = toml::Value::Table(toml::map::Map::new());
-        let base = load_raw_toml(&base_path).unwrap().unwrap();
+        let base = load_raw_toml(&base_path).expect("test requirement failed").expect("test requirement failed");
         deep_merge(&mut merged, base);
-        let profile = load_raw_toml(&dev_path).unwrap().unwrap();
+        let profile = load_raw_toml(&dev_path).expect("test requirement failed").expect("test requirement failed");
         deep_merge(&mut merged, profile);
 
-        let toml_str = toml::to_string(&merged).unwrap();
-        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        let toml_str = toml::to_string(&merged).expect("test requirement failed");
+        let config: AutumnConfig = toml::from_str(&toml_str).expect("test requirement failed");
 
         assert_eq!(config.server.port, 3000); // from base
         assert_eq!(config.database.pool_size, 10); // from base, preserved
@@ -2136,20 +2136,20 @@ path = "/healthz"
 
     #[test]
     fn find_config_file_uses_manifest_dir_when_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let config_path = dir.path().join("autumn.toml");
-        std::fs::write(&config_path, "").unwrap();
+        std::fs::write(&config_path, "").expect("test requirement failed");
 
-        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().expect("test requirement failed"));
         let path = find_config_file_named("autumn.toml", &env);
         assert_eq!(path, config_path);
     }
 
     #[test]
     fn find_config_file_falls_back_when_manifest_dir_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         // dir exists but the file doesn't
-        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().expect("test requirement failed"));
         let path = find_config_file_named("nonexistent.toml", &env);
         assert_eq!(path, PathBuf::from("nonexistent.toml"));
     }
@@ -2173,7 +2173,7 @@ path = "/healthz"
     fn deep_merge_non_table_overlay_replaces_base() {
         // When overlay is not a table, it should replace (not merge into) base.
         // This kills the `&& → ||` mutant on line 162.
-        let mut base: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
+        let mut base: toml::Value = toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
         let overlay = toml::Value::String("not_a_table".into());
 
         // When base is table and overlay is NOT table, base should be unchanged
@@ -2188,7 +2188,7 @@ path = "/healthz"
     fn deep_merge_when_base_not_table() {
         // When base is not a table, overlay should not merge
         let mut base = toml::Value::String("original".into());
-        let overlay: toml::Value = toml::from_str("[server]\nport = 3000\n").unwrap();
+        let overlay: toml::Value = toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
 
         deep_merge(&mut base, overlay);
         // base should be unchanged
@@ -2269,7 +2269,7 @@ path = "/healthz"
         // This kills the "replace load → Ok(Default::default())" mutant.
         let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
-        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let config = AutumnConfig::load_with_env(&env).expect("test requirement failed");
         // With dev profile, smart defaults should apply
         assert_eq!(config.profile.as_deref(), Some("dev"));
         assert_eq!(config.log.level, "debug"); // dev default
@@ -2284,7 +2284,7 @@ path = "/healthz"
         // This kills the match guard mutants on line 341.
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
 
-        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let config = AutumnConfig::load_with_env(&env).expect("test requirement failed");
         assert_eq!(config.profile.as_deref(), Some("staging"));
         // staging has no smart defaults, so values should be framework defaults
         assert_eq!(config.server.port, 3000);
@@ -2297,7 +2297,7 @@ path = "/healthz"
         // This tests the `None => {}` branch (line 342).
         let env = MockEnv::new().with("AUTUMN_PROFILE", "dev");
 
-        let config = AutumnConfig::load_with_env(&env).unwrap();
+        let config = AutumnConfig::load_with_env(&env).expect("test requirement failed");
         assert_eq!(config.profile.as_deref(), Some("dev"));
     }
 
@@ -2305,14 +2305,14 @@ path = "/healthz"
     fn load_from_io_error_is_not_swallowed() {
         // load_from should return Err on non-NotFound IO errors.
         // On all platforms, trying to read a directory as a file triggers an error.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let result = AutumnConfig::load_from(dir.path());
         assert!(result.is_err());
     }
 
     #[test]
     fn load_raw_toml_missing_file_returns_none() {
-        let result = load_raw_toml(Path::new("this_file_does_not_exist_12345.toml")).unwrap();
+        let result = load_raw_toml(Path::new("this_file_does_not_exist_12345.toml")).expect("test requirement failed");
         assert!(result.is_none());
     }
 
@@ -2321,20 +2321,20 @@ path = "/healthz"
         // Reading a directory is an IO error, NOT NotFound.
         // This kills the "replace match guard NotFound with true" mutant:
         // if the guard were always true, this would return Ok(None) instead of Err.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let result = load_raw_toml(dir.path());
         assert!(result.is_err());
     }
 
     #[test]
     fn load_raw_toml_valid_file_returns_some() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("test requirement failed");
         let path = dir.path().join("test.toml");
-        std::fs::write(&path, "[server]\nport = 3000\n").unwrap();
-        let result = load_raw_toml(&path).unwrap();
+        std::fs::write(&path, "[server]\nport = 3000\n").expect("test requirement failed");
+        let result = load_raw_toml(&path).expect("test requirement failed");
         assert!(result.is_some());
         assert_eq!(
-            result.unwrap()["server"]["port"],
+            result.expect("test requirement failed")["server"]["port"],
             toml::Value::Integer(3000)
         );
     }
@@ -2411,11 +2411,11 @@ path = "/healthz"
         for _ in 0..10_000 {
             if let toml::Value::Table(t) = current_base {
                 t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_base = t.get_mut("x").unwrap();
+                current_base = t.get_mut("x").expect("test requirement failed");
             }
             if let toml::Value::Table(t) = current_overlay {
                 t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_overlay = t.get_mut("x").unwrap();
+                current_overlay = t.get_mut("x").expect("test requirement failed");
             }
         }
 
@@ -2433,9 +2433,9 @@ path = "/healthz"
                 // Let the OS clean up the memory instead of dropping deeply nested structure
                 std::mem::forget(base);
             })
-            .unwrap()
+            .expect("test requirement failed")
             .join()
-            .unwrap();
+            .expect("test requirement failed");
     }
 
     #[test]
@@ -2450,11 +2450,11 @@ path = "/healthz"
         for _ in 0..=MAX_MERGE_DEPTH {
             if let toml::Value::Table(t) = current_base {
                 t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_base = t.get_mut("x").unwrap();
+                current_base = t.get_mut("x").expect("test requirement failed");
             }
             if let toml::Value::Table(t) = current_overlay {
                 t.insert("x".to_owned(), toml::Value::Table(toml::map::Map::new()));
-                current_overlay = t.get_mut("x").unwrap();
+                current_overlay = t.get_mut("x").expect("test requirement failed");
             }
         }
 
@@ -2469,7 +2469,7 @@ path = "/healthz"
         let mut current_base_check = &base;
         for _ in 0..=MAX_MERGE_DEPTH {
             if let toml::Value::Table(t) = current_base_check {
-                current_base_check = t.get("x").unwrap();
+                current_base_check = t.get("x").expect("test requirement failed");
             }
         }
 

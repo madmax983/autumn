@@ -123,7 +123,7 @@ where
                     axum::response::Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .expect("test requirement failed")
                 });
                 Ok(resp)
             });
@@ -146,7 +146,7 @@ where
                 let resp = axum::response::Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap();
+                    .expect("test requirement failed");
                 return Ok(resp);
             };
             let body_bytes = collected.to_bytes();
@@ -193,7 +193,7 @@ mod tests {
                 Ok(axum::response::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from(body))
-                    .unwrap())
+                    .expect("test requirement failed"))
             }
         })
     }
@@ -208,23 +208,23 @@ mod tests {
             .service(counting_service(counter.clone(), "hello"));
 
         // First request — cache miss
-        let req = Request::get("/test").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/test").body(Body::empty()).expect("test requirement failed");
+        let resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
-            .unwrap()
+            .expect("test requirement failed")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Second request — cache hit, inner service NOT called
-        let req = Request::get("/test").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/test").body(Body::empty()).expect("test requirement failed");
+        let resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
-            .unwrap()
+            .expect("test requirement failed")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
         assert_eq!(
@@ -243,12 +243,12 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(counting_service(counter.clone(), "created"));
 
-        let req = Request::post("/items").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::post("/items").body(Body::empty()).expect("test requirement failed");
+        let _resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        let req = Request::post("/items").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::post("/items").body(Body::empty()).expect("test requirement failed");
+        let _resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
@@ -271,7 +271,7 @@ mod tests {
                         axum::response::Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Body::from("not found"))
-                            .unwrap(),
+                            .expect("test requirement failed"),
                     )
                 }
             })
@@ -281,12 +281,12 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(svc_inner);
 
-        let req = Request::get("/missing").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/missing").body(Body::empty()).expect("test requirement failed");
+        let resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let req = Request::get("/missing").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/missing").body(Body::empty()).expect("test requirement failed");
+        let resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -304,10 +304,10 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(counting_service(counter.clone(), "ok"));
 
-        let req = Request::get("/a").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
-        let req = Request::get("/b").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/a").body(Body::empty()).expect("test requirement failed");
+        let _resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
+        let req = Request::get("/b").body(Body::empty()).expect("test requirement failed");
+        let _resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
@@ -315,8 +315,8 @@ mod tests {
         );
 
         // But repeating /a should hit
-        let req = Request::get("/a").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/a").body(Body::empty()).expect("test requirement failed");
+        let _resp = svc.ready().await.expect("test requirement failed").call(req).await.expect("test requirement failed");
         assert_eq!(counter.load(Ordering::SeqCst), 2, "/a should be cached");
     }
 

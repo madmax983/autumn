@@ -611,7 +611,7 @@ pub fn try_build_router_with_static_inner(
                                 .status(http::StatusCode::OK)
                                 .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
                                 .body(body)
-                                .unwrap();
+                                .expect("test requirement failed");
                         }
                     }
                 }
@@ -810,10 +810,10 @@ mod tests {
                 Request::builder()
                     .uri("/ops/health")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("test requirement failed"),
             )
             .await
-            .unwrap();
+            .expect("test requirement failed");
         assert_eq!(prefixed.status(), StatusCode::OK);
 
         let legacy = app
@@ -821,10 +821,10 @@ mod tests {
                 Request::builder()
                     .uri("/actuator/health")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("test requirement failed"),
             )
             .await
-            .unwrap();
+            .expect("test requirement failed");
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
     }
 
@@ -871,7 +871,7 @@ mod tests {
 
         assert!(result.is_ok(), "try_build_router panicked on route overlap");
         assert!(
-            result.unwrap().is_err(),
+            result.expect("test requirement failed").is_err(),
             "route overlap should be reported as a checked router build error"
         );
     }

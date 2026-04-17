@@ -396,7 +396,7 @@ mod tests {
         let resolved = layer.resolve("/about");
         assert!(resolved.is_some(), "/about should resolve");
         assert!(
-            resolved.unwrap().ends_with("about/index.html"),
+            resolved.expect("test requirement failed").ends_with("about/index.html"),
             "should point to about/index.html"
         );
     }
@@ -410,7 +410,7 @@ mod tests {
         let resolved = layer.resolve("/");
         assert!(resolved.is_some(), "/ should resolve");
         assert!(
-            resolved.unwrap().ends_with("index.html"),
+            resolved.expect("test requirement failed").ends_with("index.html"),
             "should point to index.html"
         );
     }
@@ -444,11 +444,11 @@ mod tests {
 
         let hello = layer.resolve("/posts/hello");
         assert!(hello.is_some(), "/posts/hello should resolve");
-        assert!(hello.unwrap().ends_with("posts/hello/index.html"));
+        assert!(hello.expect("test requirement failed").ends_with("posts/hello/index.html"));
 
         let world = layer.resolve("/posts/world");
         assert!(world.is_some(), "/posts/world should resolve");
-        assert!(world.unwrap().ends_with("posts/world/index.html"));
+        assert!(world.expect("test requirement failed").ends_with("posts/world/index.html"));
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Check if file was updated (only if mtime was successfully set)
-        let content = std::fs::read_to_string(&file).unwrap();
+        let content = std::fs::read_to_string(&file).expect("test requirement failed");
         // The content should be updated if ISR fired, or remain stale
         // if filetime wasn't available. Either way, resolve works.
         assert!(
@@ -582,7 +582,7 @@ mod tests {
         let result = regenerate_page(&router, "/test", &dest).await;
         assert!(result.is_ok(), "regeneration failed: {:?}", result.err());
 
-        let content = std::fs::read_to_string(&dest).unwrap();
+        let content = std::fs::read_to_string(&dest).expect("test requirement failed");
         assert_eq!(content, "new content");
 
         // Temp file should be cleaned up
@@ -602,7 +602,7 @@ mod tests {
         assert!(result.is_err());
 
         // Original file should be untouched
-        let content = std::fs::read_to_string(&dest).unwrap();
+        let content = std::fs::read_to_string(&dest).expect("test requirement failed");
         assert_eq!(content, "old content");
     }
 }

@@ -26,7 +26,7 @@ pub type StaticParams = HashMap<String, String>;
 /// use autumn_web::static_params;
 ///
 /// let params = static_params! { "slug" => "hello-world" };
-/// assert_eq!(params.get("slug").unwrap(), "hello-world");
+/// assert_eq!(params.get("slug").expect("test requirement failed"), "hello-world");
 /// ```
 #[macro_export]
 macro_rules! static_params {
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn static_params_macro() {
         let params = static_params! { "slug" => "hello-world" };
-        assert_eq!(params.get("slug").unwrap(), "hello-world");
+        assert_eq!(params.get("slug").expect("test requirement failed"), "hello-world");
     }
 
     #[test]
@@ -240,9 +240,9 @@ mod tests {
             "slug" => "hello",
         };
         assert_eq!(params.len(), 3);
-        assert_eq!(params.get("year").unwrap(), "2026");
-        assert_eq!(params.get("month").unwrap(), "03");
-        assert_eq!(params.get("slug").unwrap(), "hello");
+        assert_eq!(params.get("year").expect("test requirement failed"), "2026");
+        assert_eq!(params.get("month").expect("test requirement failed"), "03");
+        assert_eq!(params.get("slug").expect("test requirement failed"), "hello");
     }
 
     #[test]

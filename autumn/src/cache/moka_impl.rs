@@ -199,7 +199,7 @@ mod tests {
             .collect();
 
         for h in handles {
-            let (i, val) = h.join().unwrap();
+            let (i, val) = h.join().expect("test requirement failed");
             assert_eq!(val, Some(i * 10));
         }
     }

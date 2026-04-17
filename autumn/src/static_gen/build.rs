@@ -361,25 +361,25 @@ mod tests {
 
     #[tokio::test]
     async fn renders_single_route_to_dist() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
         let result =
             render_static_routes(echo_router(), &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_ok(), "render failed: {:?}", result.err());
-        let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
+        let html = std::fs::read_to_string(dist.join("about/index.html")).expect("test requirement failed");
         assert_eq!(html, "Hello from /about");
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
         assert_eq!(manifest.routes.len(), 1);
         assert!(manifest.routes.contains_key("/about"));
     }
 
     #[tokio::test]
     async fn renders_root_route() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
         let result = render_static_routes(echo_router(), &[test_meta("/", "index")], &dist).await;
         assert!(result.is_ok());
-        let html = std::fs::read_to_string(dist.join("index.html")).unwrap();
+        let html = std::fs::read_to_string(dist.join("index.html")).expect("test requirement failed");
         assert_eq!(html, "Hello from /");
     }
 
@@ -387,7 +387,7 @@ mod tests {
     async fn rejects_non_2xx_response() {
         let router =
             axum::Router::new().fallback(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") });
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
         let result = render_static_routes(router, &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_err());
@@ -401,10 +401,10 @@ mod tests {
 
     #[tokio::test]
     async fn cleans_stale_dist_before_build() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
-        std::fs::create_dir_all(&dist).unwrap();
-        std::fs::write(dist.join("stale.html"), "old").unwrap();
+        std::fs::create_dir_all(&dist).expect("test requirement failed");
+        std::fs::write(dist.join("stale.html"), "old").expect("test requirement failed");
         let result =
             render_static_routes(echo_router(), &[test_meta("/about", "about")], &dist).await;
         assert!(result.is_ok());
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn renders_multiple_routes_concurrently() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
         let result = render_static_routes(
             echo_router(),
@@ -427,7 +427,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
         assert_eq!(manifest.routes.len(), 3);
         // Verify all files exist
         assert!(dist.join("index.html").exists());
@@ -463,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn renders_parameterized_route() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
 
         let meta = StaticRouteMeta {
@@ -477,14 +477,14 @@ mod tests {
         assert!(result.is_ok(), "render failed: {:?}", result.err());
 
         // Verify both pages generated
-        let hello_html = std::fs::read_to_string(dist.join("posts/hello/index.html")).unwrap();
+        let hello_html = std::fs::read_to_string(dist.join("posts/hello/index.html")).expect("test requirement failed");
         assert_eq!(hello_html, "Hello from /posts/hello");
 
-        let world_html = std::fs::read_to_string(dist.join("posts/world/index.html")).unwrap();
+        let world_html = std::fs::read_to_string(dist.join("posts/world/index.html")).expect("test requirement failed");
         assert_eq!(world_html, "Hello from /posts/world");
 
         // Verify manifest
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
         assert_eq!(manifest.routes.len(), 2);
         assert!(manifest.routes.contains_key("/posts/hello"));
         assert!(manifest.routes.contains_key("/posts/world"));
@@ -492,7 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn renders_multi_param_route() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
 
         let meta = StaticRouteMeta {
@@ -508,7 +508,7 @@ mod tests {
         assert!(dist.join("blog/2026/hello/index.html").exists());
         assert!(dist.join("blog/2025/world/index.html").exists());
 
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
         assert_eq!(manifest.routes.len(), 2);
         assert!(manifest.routes.contains_key("/blog/2026/hello"));
         assert!(manifest.routes.contains_key("/blog/2025/world"));
@@ -516,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_simple_and_parameterized_routes() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
 
         let metas = vec![
@@ -533,7 +533,7 @@ mod tests {
         let result = render_static_routes(echo_router(), &metas, &dist).await;
         assert!(result.is_ok(), "render failed: {:?}", result.err());
 
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
         // 2 simple + 2 parameterized = 4 total
         assert_eq!(manifest.routes.len(), 4);
         assert!(manifest.routes.contains_key("/"));
@@ -544,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn parameterized_route_manifest_includes_revalidate() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
 
         let meta = StaticRouteMeta {
@@ -557,22 +557,22 @@ mod tests {
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
         assert!(result.is_ok());
 
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
-        let entry = manifest.routes.get("/posts/hello").unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
+        let entry = manifest.routes.get("/posts/hello").expect("test requirement failed");
         assert_eq!(entry.revalidate, Some(3600));
     }
 
     #[tokio::test]
     async fn simple_route_with_revalidate() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("test requirement failed");
         let dist = tmp.path().join("dist");
         let meta = test_meta_with_revalidate("/about", "about", 60);
 
         let result = render_static_routes(echo_router(), &[meta], &dist).await;
         assert!(result.is_ok());
 
-        let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
-        let entry = manifest.routes.get("/about").unwrap();
+        let manifest = StaticManifest::load(&dist.join("manifest.json")).expect("test requirement failed");
+        let entry = manifest.routes.get("/about").expect("test requirement failed");
         assert_eq!(entry.revalidate, Some(60));
     }
 }
