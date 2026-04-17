@@ -220,7 +220,8 @@ mod tests {
 
     #[test]
     fn process_shard_result_panic_with_ok_release_resumes_panic() {
-        let panic_payload = std::panic::catch_unwind(|| panic!("oh no")).unwrap_err();
+        let panic_payload =
+            std::panic::catch_unwind(|| panic!("test panic for process_shard_result")).unwrap_err();
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = process_shard_result(Err(panic_payload), Ok(()));
         }));
@@ -229,7 +230,8 @@ mod tests {
 
     #[test]
     fn process_shard_result_panic_with_release_err_resumes_panic() {
-        let panic_payload = std::panic::catch_unwind(|| panic!("oh no")).unwrap_err();
+        let panic_payload =
+            std::panic::catch_unwind(|| panic!("test panic for process_shard_result")).unwrap_err();
         let release_err = AutumnError::bad_request_msg("release error");
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = process_shard_result(Err(panic_payload), Err(release_err));
