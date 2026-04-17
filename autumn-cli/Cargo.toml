@@ -13,8 +13,10 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
+ctrlc = "3.5.2"
 hex = "0.4"
 indicatif = "0.18"
+nix = { version = "0.31.2", features = ["signal"] }
 notify = "8"
 notify-debouncer-mini = "0.7"
 ratatui = "0.30"

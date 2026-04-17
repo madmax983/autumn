@@ -26,13 +26,6 @@ const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
 /// Set to `true` by the SIGINT handler to request a clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// SIGINT handler: record the request and return so that the main loop can
-/// clean up the child process before exiting.
-#[cfg(unix)]
-extern "C" fn handle_sigint(_: libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-}
-
 /// Default debounce interval for file change events.
 const DEBOUNCE_MS: u64 = 500;
 
@@ -173,13 +166,12 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
     // of immediately terminating the process (and leaving the child running).
     #[cfg(unix)]
-    // SAFETY: `handle_sigint` only stores to an `AtomicBool`; it is
-    // async-signal-safe. No threads have been spawned yet at this point.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            handle_sigint as *const () as libc::sighandler_t,
-        );
+    {
+        if let Err(e) = ctrlc::set_handler(move || {
+            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        }) {
+            eprintln!("  Warning: failed to set Ctrl+C handler: {e}");
+        }
     }
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -399,12 +391,10 @@ fn stop_server(child: &mut Option<Child>) {
         #[cfg(unix)]
         {
             if let Some(pid) = validate_pid_for_kill(proc.id()) {
-                // SAFETY: `pid` is retrieved directly from `proc.id()` and validated to be safely
-                // representable as `libc::pid_t` and strictly positive. `libc::SIGTERM` is a standard,
-                // valid signal. Sending it to our own child process is safe.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                );
             }
             // Wait briefly for graceful shutdown before forcing
             if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {

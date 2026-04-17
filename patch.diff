@@ -1,0 +1,24 @@
+<<<<<<< SEARCH
+    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
+    // of immediately terminating the process (and leaving the child running).
+    #[cfg(unix)]
+    // SAFETY: `handle_sigint` only stores to an `AtomicBool`; it is
+    // async-signal-safe. No threads have been spawned yet at this point.
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
+    }
+=======
+    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
+    // of immediately terminating the process (and leaving the child running).
+    #[cfg(unix)]
+    {
+        if let Err(e) = ctrlc::set_handler(move || {
+            SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+        }) {
+            eprintln!("  Warning: failed to set Ctrl+C handler: {e}");
+        }
+    }
+>>>>>>> REPLACE
