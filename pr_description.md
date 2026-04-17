@@ -1,29 +1,17 @@
-🔭 Vantage: Spec for OAuth2 Support
+🤖 Sentinel: [fix chaos channels panic test]
 
-## 👤 User Story
-As an Application Developer, I want to authenticate users using third-party providers (like Google, GitHub, or Okta) via OAuth2/OIDC, so that users can log in securely without creating new passwords, reducing onboarding friction and improving account security.
+🦠 **Mutants Found:**
+The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
 
-## 💼 The "So What?" (Business Value)
-- **Lower Barrier to Entry:** Users are more likely to sign up if they can use existing accounts.
-- **Reduced Liability:** Delegating password management and 2FA to major identity providers reduces the security surface area.
-- **Enterprise Readiness:** Support for OIDC allows B2B applications to integrate with enterprise SSO solutions.
+🎯 **Tests Added/Strengthened:**
+* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
+* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
 
-## ✅ Acceptance Criteria
-- Must support standard OAuth2 Authorization Code flow.
-- Must support OpenID Connect (OIDC) for identity extraction.
-- Must provide configuration primitives in `autumn.toml` (e.g., `[auth.oauth2.github] client_id=...`).
-- Must provide a simple macro/extractor (e.g., `#[oauth2_callback]`) to handle the callback and extract user data securely.
-- Must integrate seamlessly with existing session management to log the user in after successful authentication.
-- Must handle state/nonce parameters automatically to prevent CSRF attacks during the OAuth flow.
+⚠️ **Suspected Bugs:**
+Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
 
-## 🚫 Out of Scope
-- Implementing custom identity providers.
-- Supporting legacy OAuth 1.0a.
-- Managing user profiles beyond initial authentication and identity extraction.
+📊 **Kill Rate:**
+High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
 
-## 📊 Metrics
-- Success = Developer can configure GitHub OAuth2 in < 5 minutes.
-- Success = End-user login flow takes < 2 seconds from callback to authenticated session.
-
-## 🔍 Gap Analysis
-- Existing standard libraries (like `oauth2-rs` or `openidconnect-rs`) provide the low-level building blocks but require significant boilerplate to integrate with Axum/Tower and session management. Autumn should provide the Spring Boot-style ergonomic abstraction layer on top of these.
+🔗 **Havoc Interaction:**
+These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
