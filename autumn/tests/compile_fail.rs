@@ -21,7 +21,7 @@ fn compile_fail_tests() {
 
     // Repository hooks failures (require db feature)
     #[cfg(feature = "db")]
-    t.compile_fail("tests/compile-fail/repository_hooks_not_default.rs");
+    compile_repository_hooks_not_default(&t);
 
     // Cached macro failures
     t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
@@ -70,4 +70,16 @@ fn compile_pass_tests() {
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
     t.pass("tests/compile-pass/cached_result.rs");
+}
+
+#[cfg(feature = "db")]
+#[rustversion::before(1.95)]
+fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
+    t.compile_fail("tests/compile-fail/repository_hooks_not_default.rs");
+}
+
+#[cfg(feature = "db")]
+#[rustversion::since(1.95)]
+fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
+    t.compile_fail("tests/compile-fail/repository_hooks_not_default_1_95.rs");
 }
