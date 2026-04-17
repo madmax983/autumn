@@ -1,17 +1,10 @@
-🤖 Sentinel: [fix chaos channels panic test]
+🧹 Code Health: Fix Unused Variables in Metrics Endpoint
 
-🦠 **Mutants Found:**
-The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
-
-🎯 **Tests Added/Strengthened:**
-* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
-* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
-
-⚠️ **Suspected Bugs:**
-Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
-
-📊 **Kill Rate:**
-High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
-
-🔗 **Havoc Interaction:**
-These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
+🎯 **What:** Removed the `#[allow(unused_variables, unused_mut)]` attribute from the `metrics_endpoint` function in `autumn/src/actuator.rs` and properly scoped the mutability of the `result` binding so it only uses `mut` when the `db` feature is enabled.
+💡 **Why:** Suppressing compiler warnings with `#[allow(...)]` attributes hides potentially useful signals and clutters the code. By structurally scoping the mutability based on the feature flags (`#[cfg(feature = "db")]`), we eliminate the unused mutability warning naturally. This improves maintainability and ensures the code accurately reflects its intent under different compilation profiles.
+✅ **Verification:**
+- Verified `cargo check` and `cargo check --no-default-features` pass without unused mutability warnings.
+- Verified `cargo clippy --all-targets --all-features -- -D warnings` passes.
+- Verified `cargo test -p autumn-web --all-features metrics` passes successfully.
+- Verified that the `result` binding is not modified if the `db` feature is not active.
+✨ **Result:** Clean, warning-free metrics endpoint that correctly configures mutability and removes unnecessary global suppression attributes.
