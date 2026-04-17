@@ -95,10 +95,70 @@ async fn eris_unauthenticated_list_dags_is_accessible() {
 }
 
 #[tokio::test]
+async fn eris_unauthenticated_get_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get("/workflows/00000000-0000-0000-0000-000000000001"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_signal_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(post_json(
+            "/workflows/00000000-0000-0000-0000-000000000001/signal/approve",
+            r#"{"approved": true}"#,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_query_workflow_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get(
+            "/workflows/00000000-0000-0000-0000-000000000001/query/status",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_list_dag_runs_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(get("/dags/my-dag/runs"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn eris_unauthenticated_trigger_dag_is_accessible() {
     let app = unauthenticated_app();
     let res = app
         .oneshot(post_json("/dags/my-dag/trigger", "{}"))
+        .await
+        .unwrap();
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn eris_unauthenticated_patch_dag_is_accessible() {
+    let app = unauthenticated_app();
+    let res = app
+        .oneshot(patch_json("/dags/my-dag", r#"{"paused": true}"#))
         .await
         .unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
