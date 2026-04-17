@@ -766,7 +766,7 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::EnvGuard;
+
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -1534,18 +1534,26 @@ mod tests {
         let binary = dir.path().join(binary_name);
         std::fs::write(&binary, "echo tailwind").expect("write binary");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
 
-        let found = which("mocktailwind").expect("binary on PATH");
-        assert_eq!(found, binary);
+        temp_env::with_vars(
+            [("PATH", Some(path.as_os_str()))],
+            || {
+                let found = which("mocktailwind").expect("binary on PATH");
+                assert_eq!(found, binary);
+            }
+        );
     }
 
     #[test]
     fn which_returns_none_when_binary_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = std::env::join_paths([dir.path()]).expect("join path");
-        let _env = EnvGuard::set_many(&[("PATH", Some(path.as_os_str()))]);
 
-        assert!(which("definitely-missing-binary").is_none());
+        temp_env::with_vars(
+            [("PATH", Some(path.as_os_str()))],
+            || {
+                assert!(which("definitely-missing-binary").is_none());
+            }
+        );
     }
 }

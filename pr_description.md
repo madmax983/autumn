@@ -1,17 +1,4 @@
-🤖 Sentinel: [fix chaos channels panic test]
-
-🦠 **Mutants Found:**
-The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
-
-🎯 **Tests Added/Strengthened:**
-* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
-* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
-
-⚠️ **Suspected Bugs:**
-Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
-
-📊 **Kill Rate:**
-High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
-
-🔗 **Havoc Interaction:**
-These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
+🦠 Threat: Using `unsafe { std::env::set_var(...) }` in a multithreaded test environment introduces data races and undefined behavior, as the process-wide mutex used by the custom `EnvGuard` does not prevent other threads (like tokio internals) from concurrently reading the environment.
+🛡️ Defense: Removed the custom `EnvGuard` and all `unsafe` environment manipulations across both `autumn-web` and `autumn-cli` test utilities. Replaced them with the safe `temp-env` crate, using `temp_env::with_vars` and `temp_env::async_with_vars` to securely isolate environment variables in tests.
+💥 Severity: Critical - Undefined Behavior / Data Races in test execution.
+🧪 Verification: Added `test_env_isolation_no_data_races` to explicitly verify safe multi-threaded environment variable handling using `temp-env`, and confirmed all existing test suites pass.
