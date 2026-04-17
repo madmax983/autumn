@@ -3,3 +3,5 @@ Cargo.lock
 .claude/
 mutants.out/
 mutants.out.old/
+pr_description.md
+*.sh
