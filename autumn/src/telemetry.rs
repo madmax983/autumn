@@ -263,8 +263,8 @@ fn is_production_profile(profile: Option<&str>) -> bool {
 
 fn is_production_env() -> bool {
     std::env::var("AUTUMN_ENV")
-        .map(|value| value.eq_ignore_ascii_case("production"))
-        .unwrap_or(false)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("production"))
+
 }
 
 fn validate_otlp_endpoint(endpoint: &str) -> Result<(), TelemetryInitError> {
