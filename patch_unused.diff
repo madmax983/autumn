@@ -1,9 +1,0 @@
---- autumn/src/flash.rs
-+++ autumn/src/flash.rs
-@@ -273,7 +273,6 @@
-     #[tokio::test]
-     #[cfg(feature = "htmx")]
-     async fn should_inject_hx_trigger() {
--        use axum::response::IntoResponse;
-         let session = Session::new_for_test("test_id".to_string(), HashMap::new());
-         let flash = Flash::new(session.clone());
