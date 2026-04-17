@@ -615,6 +615,11 @@ async fn persist_signal_wait_park(
     next_event_id: i32,
     marker_events: &[WorkflowEvent],
 ) -> HarvestResult<()> {
+    // Park the workflow task (state=RUNNING, worker cleared) so it is not
+    // confused with a timer-waiting task (state=PENDING). This ensures that
+    // `wake_workflow_task` — which only targets RUNNING/parked rows — can
+    // reliably distinguish signal waits from timer waits and will not
+    // prematurely fire a pending timer when a signal is delivered.
     conn.transaction::<(), HarvestError, _>(|conn| {
         async move {
             store::append_events(conn, exec_id, marker_events, next_event_id).await?;
