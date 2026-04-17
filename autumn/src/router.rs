@@ -896,10 +896,9 @@ mod tests {
         let config = AutumnConfig::default();
         assert!(config.cors.allowed_origins.is_empty());
 
-        let base: axum::Router<AppState> = axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "ok" }));
-        let router = apply_cors_middleware(base, &config)
-            .with_state(test_state());
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
 
         let response = router
             .oneshot(
@@ -914,7 +913,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
-            response.headers().get("access-control-allow-origin").is_none(),
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
             "CORS header must be absent when no origins are configured"
         );
     }
@@ -924,10 +926,9 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.cors.allowed_origins = vec!["https://example.com".to_owned()];
 
-        let base: axum::Router<AppState> = axum::Router::new()
-            .route("/test", axum::routing::get(|| async { "ok" }));
-        let router = apply_cors_middleware(base, &config)
-            .with_state(test_state());
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
 
         let response = router
             .oneshot(
@@ -942,7 +943,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
-            response.headers().get("access-control-allow-origin").is_some(),
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_some(),
             "CORS header must be present when origins are configured"
         );
     }
@@ -952,10 +956,9 @@ mod tests {
         let config = AutumnConfig::default();
         assert!(!config.security.csrf.enabled);
 
-        let base: axum::Router<AppState> = axum::Router::new()
-            .route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config)
-            .with_state(test_state());
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
+        let router = apply_csrf_middleware(base, &config).with_state(test_state());
 
         // Without CSRF the POST should pass through with no CSRF-specific response
         let response = router
@@ -977,10 +980,9 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.security.csrf.enabled = true;
 
-        let base: axum::Router<AppState> = axum::Router::new()
-            .route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config)
-            .with_state(test_state());
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
+        let router = apply_csrf_middleware(base, &config).with_state(test_state());
 
         // POST without CSRF token should be rejected
         let response = router

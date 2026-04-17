@@ -2589,9 +2589,8 @@ mod tests {
     #[tokio::test]
     async fn execute_cron_task_result_err_returns_duration_and_message() {
         let state = AppState::for_test();
-        let handler: crate::task::TaskHandler = |_| {
-            Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) })
-        };
+        let handler: crate::task::TaskHandler =
+            |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = std::time::Instant::now();
         let result = super::execute_cron_task_result(&state, handler, start).await;
         assert!(result.is_err(), "expected Err from failing handler");

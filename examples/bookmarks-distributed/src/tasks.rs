@@ -145,7 +145,9 @@ pub async fn check_links(_state: AppState) -> AutumnResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_requires_get_fallback, probe_outcome, process_shard_result, response_is_reachable};
+    use super::{
+        head_requires_get_fallback, probe_outcome, process_shard_result, response_is_reachable,
+    };
     use autumn_web::error::AutumnError;
     use reqwest::StatusCode;
 
