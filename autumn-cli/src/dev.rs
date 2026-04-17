@@ -26,13 +26,6 @@ const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
 /// Set to `true` by the SIGINT handler to request a clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// SIGINT handler: record the request and return so that the main loop can
-/// clean up the child process before exiting.
-#[cfg(unix)]
-extern "C" fn handle_sigint(_: libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-}
-
 /// Default debounce interval for file change events.
 const DEBOUNCE_MS: u64 = 500;
 
@@ -164,22 +157,14 @@ impl DevReloadState {
 
 /// Run the dev server with file watching.
 pub fn run(package: Option<&str>, show_config: bool) {
-    if show_config {
-        // SAFETY: called before spawning any threads; single-threaded at this point.
-        unsafe { std::env::set_var("AUTUMN_SHOW_CONFIG", "1") };
-    }
     eprintln!("\u{1F342} autumn dev\n");
 
     // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
     // of immediately terminating the process (and leaving the child running).
-    #[cfg(unix)]
-    // SAFETY: `handle_sigint` only stores to an `AtomicBool`; it is
-    // async-signal-safe. No threads have been spawned yet at this point.
-    unsafe {
-        libc::signal(
-            libc::SIGINT,
-            handle_sigint as *const () as libc::sighandler_t,
-        );
+    if let Err(err) = ctrlc::set_handler(move || {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }) {
+        eprintln!("  Warning: failed to set Ctrl-C handler: {err}");
     }
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -195,7 +180,11 @@ pub fn run(package: Option<&str>, show_config: bool) {
     }
 
     let binary = find_binary(package);
-    let mut child = start_server(&binary, reload_state.as_ref().map(DevReloadState::path));
+    let mut child = start_server(
+        &binary,
+        reload_state.as_ref().map(DevReloadState::path),
+        show_config,
+    );
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -222,7 +211,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("  Watching for changes... (press Ctrl+C to stop)\n");
 
     // Main event loop – periodically checks the shutdown flag so that a
-    // Ctrl+C (caught by `handle_sigint`) breaks the loop and triggers
+    // Ctrl+C breaks the loop and triggers
     // graceful server shutdown via `stop_server` below.
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
@@ -230,7 +219,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
             break;
         }
 
-        if !process_events(&rx, package, &mut child, reload_state.as_mut()) {
+        if !process_events(&rx, package, &mut child, reload_state.as_mut(), show_config) {
             break;
         }
     }
@@ -245,6 +234,7 @@ fn process_events(
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
+    show_config: bool,
 ) -> bool {
     match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
         Ok(Ok(events)) => {
@@ -261,7 +251,7 @@ fn process_events(
             eprintln!("\n  Changed: {}", changed.join(", "));
             eprintln!("  Action: {}", describe_plan(plan));
 
-            execute_plan(plan, package, child, reload_state);
+            execute_plan(plan, package, child, reload_state, show_config);
             true
         }
         Ok(Err(error)) => {
@@ -282,6 +272,7 @@ fn execute_plan(
     package: Option<&str>,
     child: &mut Option<Child>,
     mut reload_state: Option<&mut DevReloadState>,
+    show_config: bool,
 ) {
     let mut applied_reload = ReloadKind::None;
 
@@ -289,7 +280,12 @@ fn execute_plan(
         stop_server(child);
 
         if cargo_build(package) {
-            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+            if restart_server(
+                package,
+                child,
+                reload_state.as_ref().map(|s| s.path()),
+                show_config,
+            ) {
                 applied_reload = ReloadKind::Full;
             }
         } else {
@@ -303,7 +299,12 @@ fn execute_plan(
 
         if plan.restart {
             stop_server(child);
-            if restart_server(package, child, reload_state.as_ref().map(|s| s.path())) {
+            if restart_server(
+                package,
+                child,
+                reload_state.as_ref().map(|s| s.path()),
+                show_config,
+            ) {
                 applied_reload = ReloadKind::Full;
             }
         } else if plan.reload == ReloadKind::Full {
@@ -366,7 +367,11 @@ fn cargo_build(package: Option<&str>) -> bool {
 }
 
 /// Start the application binary. Returns the child process handle.
-fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child> {
+fn start_server(
+    binary: &Path,
+    reload_state_path: Option<&Path>,
+    show_config: bool,
+) -> Option<Child> {
     eprintln!("  Starting server...\n");
     let mut command = Command::new(binary);
     // Inherit stdio so tracing output (including --show-config) is visible.
@@ -375,6 +380,9 @@ fn start_server(binary: &Path, reload_state_path: Option<&Path>) -> Option<Child
     if let Some(path) = reload_state_path {
         command.env(DEV_RELOAD_ENV, "1");
         command.env(DEV_RELOAD_STATE_ENV, path);
+    }
+    if show_config {
+        command.env("AUTUMN_SHOW_CONFIG", "1");
     }
 
     match command.spawn() {
@@ -399,11 +407,11 @@ fn stop_server(child: &mut Option<Child>) {
         #[cfg(unix)]
         {
             if let Some(pid) = validate_pid_for_kill(proc.id()) {
-                // SAFETY: `pid` is retrieved directly from `proc.id()` and validated to be safely
-                // representable as `libc::pid_t` and strictly positive. `libc::SIGTERM` is a standard,
-                // valid signal. Sending it to our own child process is safe.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
+                if let Err(e) = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                ) {
+                    eprintln!("  Warning: failed to send SIGTERM to process: {e}");
                 }
             }
             // Wait briefly for graceful shutdown before forcing
@@ -567,9 +575,10 @@ fn restart_server(
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state_path: Option<&Path>,
+    show_config: bool,
 ) -> bool {
     let binary = find_binary(package);
-    *child = start_server(&binary, reload_state_path);
+    *child = start_server(&binary, reload_state_path, show_config);
     child.is_some()
 }
 
@@ -1112,14 +1121,14 @@ mod tests {
 
     #[test]
     fn start_server_returns_none_for_missing_binary() {
-        let result = start_server(Path::new("/nonexistent/binary/path"), None);
+        let result = start_server(Path::new("/nonexistent/binary/path"), None, false);
         assert!(result.is_none());
     }
 
     #[cfg(unix)]
     #[test]
     fn start_server_returns_child_for_valid_binary() {
-        let child = start_server(Path::new("/bin/sleep"), None);
+        let child = start_server(Path::new("/bin/sleep"), None, false);
         assert!(child.is_some());
         // Clean up
         let mut child = child.unwrap();
