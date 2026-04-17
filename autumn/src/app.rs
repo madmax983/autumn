@@ -1235,8 +1235,12 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
             let _ = parsed_url.set_password(Some("****"));
             return format!("{parsed_url} (pool_size={pool_size})");
         }
+        return format!("{url} (pool_size={pool_size})");
     }
-    format!("{url} (pool_size={pool_size})")
+
+    // If the URL is malformed and fails to parse, safely redact the entire string
+    // to prevent any potential password leakage from partial/failed parsing.
+    format!("**** (pool_size={pool_size})")
 }
 
 /// Build the configuration summary string.
@@ -2315,6 +2319,16 @@ mod tests {
         assert!(!masked.contains("****"));
         assert!(masked.contains("postgres://localhost/mydb"));
         assert!(masked.contains("pool_size=5"));
+    }
+
+    #[test]
+    fn mask_database_url_invalid_url_fallback() {
+        // Malformed URL that fails `url::Url::parse` but contains a password
+        let invalid = "postgres://user:my_secret_password@local host:5432/mydb";
+        let masked = mask_database_url(invalid, 10);
+        assert!(masked.contains("****"));
+        assert!(!masked.contains("my_secret_password"));
+        assert!(masked.contains("**** (pool_size=10)"));
     }
 
     #[test]
