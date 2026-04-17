@@ -413,6 +413,26 @@ mod tests {
         assert!(!result.unwrap());
     }
 
+    #[tokio::test]
+    async fn verify_password_rejects_invalid_hash_format_safely() {
+        // Test short hash
+        let result = verify_password("test", "short").await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
+        // Test hash with correct length but not starting with $
+        let bad_prefix = "a".repeat(60);
+        let result = verify_password("test", &bad_prefix).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+
+        // Test hash with incorrect length but starting with $
+        let bad_length = "$2b$12$short";
+        let result = verify_password("test", bad_length).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap());
+    }
+
     #[test]
     fn auth_config_defaults() {
         let config = AuthConfig::default();
