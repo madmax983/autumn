@@ -8,6 +8,7 @@
 //!
 //! ```rust,no_run
 //! use autumn_web::prelude::*;
+//! use axum::response::{IntoResponse, Redirect};
 //!
 //! #[post("/items")]
 //! async fn create_item(flash: Flash) -> impl IntoResponse {
@@ -139,6 +140,30 @@ impl Flash {
         }
         messages
     }
+
+    /// Injects pending flash messages into an HTMX response as `HX-Trigger` events.
+    ///
+    /// Consumes the messages from the session and sets the `HX-Trigger` header
+    /// with a JSON payload representing the messages. This allows the frontend
+    /// to display flash messages without a full page reload.
+    #[cfg(feature = "htmx")]
+    pub async fn inject_hx_trigger<T: axum::response::IntoResponse>(
+        &self,
+        response: T,
+    ) -> axum::response::Response {
+        let messages = self.consume().await;
+        let mut res = response.into_response();
+        if !messages.is_empty() {
+            let payload = serde_json::json!({
+                "flash": messages
+            });
+            if let Ok(v) = http::header::HeaderValue::from_str(&payload.to_string()) {
+                res.headers_mut()
+                    .insert(http::header::HeaderName::from_static("hx-trigger"), v);
+            }
+        }
+        res
+    }
 }
 
 impl<S> FromRequestParts<S> for Flash
@@ -247,5 +272,24 @@ mod tests {
         assert_eq!(messages[2].message, "Warning msg");
         assert_eq!(messages[3].level, FlashLevel::Error);
         assert_eq!(messages[3].message, "Error msg");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "htmx")]
+    async fn should_inject_hx_trigger() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session.clone());
+
+        flash.success("Item saved").await;
+
+        let response = flash.inject_hx_trigger("OK").await;
+        let header = response.headers().get("hx-trigger");
+        assert!(header.is_some());
+
+        let json_str = header.unwrap().to_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(json_str).unwrap();
+
+        assert_eq!(payload["flash"][0]["level"], "success");
+        assert_eq!(payload["flash"][0]["message"], "Item saved");
     }
 }
