@@ -787,6 +787,45 @@ pub(crate) fn is_static_build_mode() -> bool {
 /// scheduler gracefully when the server receives a termination signal.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
+#[cfg(feature = "ws")]
+fn broadcast_task_event(
+    state: &AppState,
+    event: &str,
+    task: &str,
+    duration_ms: Option<u64>,
+    error: Option<&str>,
+) {
+    let mut map = serde_json::Map::new();
+    map.insert(
+        "event".to_string(),
+        serde_json::Value::String(event.to_string()),
+    );
+    map.insert(
+        "task".to_string(),
+        serde_json::Value::String(task.to_string()),
+    );
+    map.insert(
+        "timestamp".to_string(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+
+    if let Some(d) = duration_ms {
+        map.insert(
+            "duration_ms".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(d)),
+        );
+    }
+    if let Some(e) = error {
+        map.insert(
+            "error".to_string(),
+            serde_json::Value::String(e.to_string()),
+        );
+    }
+
+    let msg = serde_json::Value::Object(map);
+    let _ = state.channels().sender("sys:tasks").send(msg.to_string());
+}
+
 fn start_task_scheduler(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
@@ -821,14 +860,7 @@ fn start_task_scheduler(
                         tracing::debug!(task = %name, "Running scheduled task");
                         state.task_registry.record_start(&name);
                         #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "started",
-                                "task": name,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
+                        broadcast_task_event(&state, "started", &name, None, None);
 
                         let start = std::time::Instant::now();
                         match (handler)(state.clone()).await {
@@ -839,16 +871,13 @@ fn start_task_scheduler(
                                 tracing::debug!(task = %name, "Task completed");
 
                                 #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "success",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
+                                broadcast_task_event(
+                                    &state,
+                                    "success",
+                                    &name,
+                                    Some(duration_ms),
+                                    None,
+                                );
                             }
                             Err(e) => {
                                 let duration_ms =
@@ -860,17 +889,13 @@ fn start_task_scheduler(
                                 tracing::warn!(task = %name, error = %e, "Task failed");
 
                                 #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "failure",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "error": error_str,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
+                                broadcast_task_event(
+                                    &state,
+                                    "failure",
+                                    &name,
+                                    Some(duration_ms),
+                                    Some(error_str.as_str()),
+                                );
                             }
                         }
                     }
@@ -924,14 +949,7 @@ async fn run_cron_scheduler(
                 state.task_registry.record_start(&name);
 
                 #[cfg(feature = "ws")]
-                {
-                    let msg = serde_json::json!({
-                        "event": "started",
-                        "task": name,
-                        "timestamp": chrono::Utc::now().to_rfc3339()
-                    });
-                    let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                }
+                broadcast_task_event(&state, "started", &name, None, None);
 
                 let start = std::time::Instant::now();
                 match (handler)(state.clone()).await {
@@ -942,15 +960,7 @@ async fn run_cron_scheduler(
                         tracing::debug!(task = %name, "Cron task completed");
 
                         #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "success",
-                                "task": name,
-                                "duration_ms": duration_ms,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
+                        broadcast_task_event(&state, "success", &name, Some(duration_ms), None);
                     }
                     Err(e) => {
                         let duration_ms =
@@ -962,16 +972,13 @@ async fn run_cron_scheduler(
                         tracing::warn!(task = %name, error = %e, "Cron task failed");
 
                         #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "failure",
-                                "task": name,
-                                "duration_ms": duration_ms,
-                                "error": error_str,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
+                        broadcast_task_event(
+                            &state,
+                            "failure",
+                            &name,
+                            Some(duration_ms),
+                            Some(error_str.as_str()),
+                        );
                     }
                 }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
