@@ -1,17 +1,13 @@
-🤖 Sentinel: [fix chaos channels panic test]
+🧪 Sentry: [test coverage improvement]
 
-🦠 **Mutants Found:**
-The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
+🎯 **Target**:
+Added test coverage for the JSON API fallback scenario inside the error exception filter logic. Specifically, verified that when an unmatched route hits the `fallback_404_handler` while expecting `application/json`, it appropriately bypasses HTML generation and returns the correctly formatted JSON error object.
 
-🎯 **Tests Added/Strengthened:**
-* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
-* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
+💣 **Risk**:
+Without this test, any unintentional behavioral change to the `ExceptionFilterLayer` or its reliance on `accepts_html` could have caused JSON API endpoints or 404 fallbacks for REST clients to start responding with an unexpected styled HTML payload.
 
-⚠️ **Suspected Bugs:**
-Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
+🧪 **Strategy**:
+Appended a test `json_api_fallback_gets_json_errors` that fires a request at an unmapped endpoint (`/nonexistent`) configured to solicit a JSON response. It validates the output payload, HTTP status code (`404`), and standard error-object structure (`{"error": {"status": 404, "message": "No route matches /nonexistent"}}`).
 
-📊 **Kill Rate:**
-High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
-
-🔗 **Havoc Interaction:**
-These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
+🔭 **Verification**:
+Executed `cargo test` verifying the new suite successfully parses and operates as designed without causing flakiness or regressions. Verified clean output from `cargo clippy`.

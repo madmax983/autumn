@@ -416,6 +416,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_api_fallback_gets_json_errors() {
+        let app = test_router_with_error_pages(false);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent")
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("application/json"),
+            "JSON API should get JSON response, got: {ct}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["status"], 404);
+        assert_eq!(json["error"]["message"], "No route matches /nonexistent");
+    }
+
+    #[tokio::test]
     async fn json_api_gets_json_errors() {
         let app = test_router_with_error_pages(false);
         let resp = app
