@@ -1,5 +1,0 @@
-Nova features examples:
-- The Mashup: Combine Module A + Module B.
-- The Interface: Add a TUI (Text UI) to a CLI tool using `ratatui`.
-- The Exporter: Add "Export to JSON/CSV/PNG" functionality.
-- The Simulator: Add a "Debug Mode" that auto-plays the game or queries the DB.
