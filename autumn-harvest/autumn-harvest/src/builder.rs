@@ -238,7 +238,11 @@ impl WorkerConfig {
     /// Replace the queue list.
     #[must_use]
     pub fn with_queues<'a>(mut self, queues: impl IntoIterator<Item = &'a str>) -> Self {
-        let new_queues: Vec<String> = queues.into_iter().filter(|q| !q.trim().is_empty()).map(str::to_owned).collect();
+        let new_queues: Vec<String> = queues
+            .into_iter()
+            .filter(|q| !q.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
         if !new_queues.is_empty() {
             self.queues = new_queues;
         }
