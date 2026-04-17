@@ -27,7 +27,7 @@ async fn test_csrf_timing_attack() {
     // Instead, we verify that the constant-time trait or verify is used.
     // As a PoC, we will simulate the behavior but testing actual timing is difficult.
 
-    // This test verifies that the implementation uses constant-time comparison,
+    // We'll write the test to ensure that the code compiles with the fix,
     // and that valid tokens still work and invalid tokens fail.
 
     let valid_req = Request::builder()
