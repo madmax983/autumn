@@ -396,7 +396,9 @@ mod tests {
         let resolved = layer.resolve("/about");
         assert!(resolved.is_some(), "/about should resolve");
         assert!(
-            resolved.expect("test requirement failed").ends_with("about/index.html"),
+            resolved
+                .expect("test requirement failed")
+                .ends_with("about/index.html"),
             "should point to about/index.html"
         );
     }
@@ -410,7 +412,9 @@ mod tests {
         let resolved = layer.resolve("/");
         assert!(resolved.is_some(), "/ should resolve");
         assert!(
-            resolved.expect("test requirement failed").ends_with("index.html"),
+            resolved
+                .expect("test requirement failed")
+                .ends_with("index.html"),
             "should point to index.html"
         );
     }
@@ -444,11 +448,19 @@ mod tests {
 
         let hello = layer.resolve("/posts/hello");
         assert!(hello.is_some(), "/posts/hello should resolve");
-        assert!(hello.expect("test requirement failed").ends_with("posts/hello/index.html"));
+        assert!(
+            hello
+                .expect("test requirement failed")
+                .ends_with("posts/hello/index.html")
+        );
 
         let world = layer.resolve("/posts/world");
         assert!(world.is_some(), "/posts/world should resolve");
-        assert!(world.expect("test requirement failed").ends_with("posts/world/index.html"));
+        assert!(
+            world
+                .expect("test requirement failed")
+                .ends_with("posts/world/index.html")
+        );
     }
 
     #[test]

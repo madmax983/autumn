@@ -1645,7 +1645,8 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
-        let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml")).expect("test requirement failed");
+        let config = AutumnConfig::load_from(Path::new("this_file_does_not_exist.toml"))
+            .expect("test requirement failed");
         assert_eq!(config.server.port, 3000);
         assert!(config.database.url.is_none());
     }
@@ -2082,9 +2083,13 @@ path = "/healthz"
 
         // Load base
         let mut merged = toml::Value::Table(toml::map::Map::new());
-        let base = load_raw_toml(&base_path).expect("test requirement failed").expect("test requirement failed");
+        let base = load_raw_toml(&base_path)
+            .expect("test requirement failed")
+            .expect("test requirement failed");
         deep_merge(&mut merged, base);
-        let profile = load_raw_toml(&dev_path).expect("test requirement failed").expect("test requirement failed");
+        let profile = load_raw_toml(&dev_path)
+            .expect("test requirement failed")
+            .expect("test requirement failed");
         deep_merge(&mut merged, profile);
 
         let toml_str = toml::to_string(&merged).expect("test requirement failed");
@@ -2140,7 +2145,10 @@ path = "/healthz"
         let config_path = dir.path().join("autumn.toml");
         std::fs::write(&config_path, "").expect("test requirement failed");
 
-        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().expect("test requirement failed"));
+        let env = MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            dir.path().to_str().expect("test requirement failed"),
+        );
         let path = find_config_file_named("autumn.toml", &env);
         assert_eq!(path, config_path);
     }
@@ -2149,7 +2157,10 @@ path = "/healthz"
     fn find_config_file_falls_back_when_manifest_dir_missing_file() {
         let dir = tempfile::tempdir().expect("test requirement failed");
         // dir exists but the file doesn't
-        let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().expect("test requirement failed"));
+        let env = MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            dir.path().to_str().expect("test requirement failed"),
+        );
         let path = find_config_file_named("nonexistent.toml", &env);
         assert_eq!(path, PathBuf::from("nonexistent.toml"));
     }
@@ -2173,7 +2184,8 @@ path = "/healthz"
     fn deep_merge_non_table_overlay_replaces_base() {
         // When overlay is not a table, it should replace (not merge into) base.
         // This kills the `&& → ||` mutant on line 162.
-        let mut base: toml::Value = toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
+        let mut base: toml::Value =
+            toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
         let overlay = toml::Value::String("not_a_table".into());
 
         // When base is table and overlay is NOT table, base should be unchanged
@@ -2188,7 +2200,8 @@ path = "/healthz"
     fn deep_merge_when_base_not_table() {
         // When base is not a table, overlay should not merge
         let mut base = toml::Value::String("original".into());
-        let overlay: toml::Value = toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
+        let overlay: toml::Value =
+            toml::from_str("[server]\nport = 3000\n").expect("test requirement failed");
 
         deep_merge(&mut base, overlay);
         // base should be unchanged
@@ -2312,7 +2325,8 @@ path = "/healthz"
 
     #[test]
     fn load_raw_toml_missing_file_returns_none() {
-        let result = load_raw_toml(Path::new("this_file_does_not_exist_12345.toml")).expect("test requirement failed");
+        let result = load_raw_toml(Path::new("this_file_does_not_exist_12345.toml"))
+            .expect("test requirement failed");
         assert!(result.is_none());
     }
 

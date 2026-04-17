@@ -229,7 +229,10 @@ mod tests {
     #[test]
     fn static_params_macro() {
         let params = static_params! { "slug" => "hello-world" };
-        assert_eq!(params.get("slug").expect("test requirement failed"), "hello-world");
+        assert_eq!(
+            params.get("slug").expect("test requirement failed"),
+            "hello-world"
+        );
     }
 
     #[test]
@@ -242,7 +245,10 @@ mod tests {
         assert_eq!(params.len(), 3);
         assert_eq!(params.get("year").expect("test requirement failed"), "2026");
         assert_eq!(params.get("month").expect("test requirement failed"), "03");
-        assert_eq!(params.get("slug").expect("test requirement failed"), "hello");
+        assert_eq!(
+            params.get("slug").expect("test requirement failed"),
+            "hello"
+        );
     }
 
     #[test]
