@@ -51,8 +51,7 @@ pub fn init_with_telemetry(
 /// (case-insensitive).
 #[cfg(test)]
 fn is_production() -> bool {
-    std::env::var("AUTUMN_ENV")
-        .is_ok_and(|v| v.eq_ignore_ascii_case("production"))
+    std::env::var("AUTUMN_ENV").is_ok_and(|v| v.eq_ignore_ascii_case("production"))
 }
 
 #[cfg(test)]
