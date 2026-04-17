@@ -1118,7 +1118,7 @@ fn draw_routes_tab(frame: &mut ratatui::Frame, area: Rect, state: &DashboardStat
     .bottom_margin(1);
 
     let mut routes: Vec<_> = state.metrics.http.by_route.iter().collect();
-    routes.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    routes.sort_by_key(|b| std::cmp::Reverse(b.1.count));
 
     let max_count = routes.first().map_or(1, |r| r.1.count.max(1));
 
