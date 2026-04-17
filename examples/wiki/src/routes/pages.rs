@@ -7,7 +7,7 @@ use crate::models::{NewPage, Page, Revision};
 use crate::repositories::{PageRepository, PgPageRepository};
 use crate::schema::revisions;
 
-fn layout(title: &str, content: Markup) -> Markup {
+pub fn layout(title: &str, content: Markup) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html lang="en" {
@@ -34,7 +34,7 @@ fn layout(title: &str, content: Markup) -> Markup {
     }
 }
 
-fn status_badge(status: &str) -> Markup {
+pub fn status_badge(status: &str) -> Markup {
     let color = match status {
         "published" => "bg-green-100 text-green-700",
         "draft" => "bg-yellow-100 text-yellow-700",
@@ -46,7 +46,7 @@ fn status_badge(status: &str) -> Markup {
     }
 }
 
-fn redirect_to(url: &str) -> Markup {
+pub fn redirect_to(url: &str) -> Markup {
     html! {
         (PreEscaped("<!DOCTYPE html>"))
         html {
@@ -262,7 +262,7 @@ impl PageForm {
         }
     }
 
-    fn into_update(self) -> crate::models::UpdatePage {
+    pub fn into_update(self) -> crate::models::UpdatePage {
         crate::models::UpdatePage {
             title: Patch::Set(self.title),
             slug: Patch::Unchanged,
