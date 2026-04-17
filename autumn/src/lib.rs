@@ -110,8 +110,10 @@ pub mod security;
 pub mod session;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
-/// Static site generation support.
+/// Server-Sent Events (SSE) support.
 pub mod sse;
+
+/// Static site generation support.
 pub mod static_gen;
 pub mod task;
 pub(crate) mod telemetry;
@@ -475,10 +477,14 @@ pub use autumn_macros::static_routes;
 /// that registers the route for static HTML generation at build time
 /// (`autumn build`).
 ///
-/// Phase 1 restriction: path parameters (`{id}`) are **not** supported.
-/// Use [`get`] for parameterized routes.
+/// For routes with path parameters, you must provide a `params_fn`
+/// to dictate what parameter combinations should be pre-rendered.
+/// You can also supply a `revalidate` interval (in seconds) to enable
+/// Incremental Static Regeneration (ISR).
 ///
 /// # Examples
+///
+/// ## Simple Pre-rendered Route
 ///
 /// ```rust,no_run
 /// use autumn_web::prelude::*;
@@ -486,6 +492,26 @@ pub use autumn_macros::static_routes;
 /// #[static_get("/about")]
 /// async fn about() -> &'static str {
 ///     "About us"
+/// }
+/// ```
+///
+/// ## Parameterized Route with ISR
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::static_gen::StaticParams;
+/// use std::future::Future;
+/// use std::pin::Pin;
+///
+/// fn blog_params(_router: axum::Router) -> Pin<Box<dyn Future<Output = Vec<StaticParams>> + Send>> {
+///     Box::pin(async {
+///         vec![autumn_web::static_params! { "slug" => "hello-world" }]
+///     })
+/// }
+///
+/// #[static_get(path = "/posts/{slug}", revalidate = 3600, params_fn = blog_params)]
+/// async fn show_post(Path(slug): Path<String>) -> String {
+///     format!("Post: {slug}")
 /// }
 /// ```
 pub use autumn_macros::static_get;
