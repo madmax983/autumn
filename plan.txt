@@ -1,0 +1,19 @@
+The CI failed in `autumn-cli/src/monitor.rs:1121:5` due to `clippy::unnecessary_sort_by`.
+
+Memory explicitly notes:
+"When resolving `clippy::unnecessary_sort_by` warnings, replace `.sort_by(|a, b| b.key.cmp(&a.key))` with `.sort_by_key(|x| std::cmp::Reverse(x.key))`."
+
+The warning:
+```rust
+routes.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+```
+Should be:
+```rust
+routes.sort_by_key(|b| std::cmp::Reverse(b.1.count));
+```
+
+Plan:
+1. Update `autumn-cli/src/monitor.rs` at line 1121 to use `sort_by_key(|b| std::cmp::Reverse(b.1.count))`.
+2. Run `cargo clippy -p autumn-cli --all-targets --all-features -- -D warnings` to verify.
+3. Pre-commit check.
+4. Submit.
