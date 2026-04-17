@@ -1,13 +1,17 @@
-🔒 Warden: [security fix] Add harvest_api_with_auth for management API protection
+🤖 Sentinel: [fix chaos channels panic test]
 
-🦠 Threat
-The `autumn-harvest` management API (`/api/harvest`) was previously only mountable via `.harvest_api("/api/harvest")` which did not provide any native way to apply authentication middleware. By default, this exposed endpoints for enumerating DAGs, starting workflows, and triggering DAG runs, which could allow an unauthenticated attacker to manipulate background tasks and internal state (CWE-306).
+🦠 **Mutants Found:**
+The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
 
-🛡️ Defense
-Introduced a new method `harvest_api_with_auth<M>` to the `HarvestExt` trait. This allows developers to mount the management API protected by a custom `tower::Layer` (such as `autumn_web::auth::RequireAuth`), enforcing authentication before requests reach the internal API router.
+🎯 **Tests Added/Strengthened:**
+* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
+* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
 
-💥 Severity
-High. Unauthenticated access to a workflow management API allows arbitrary triggering of tasks, potentially leading to unauthorized data modification, business logic bypass, or Denial of Service (DoS).
+⚠️ **Suspected Bugs:**
+Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
 
-🧪 Verification
-Created `eris_authenticated_harvest_api_start_workflow` PoC test in `autumn-web-harvest/tests/security.rs` to verify that when the API is mounted using `harvest_api_with_auth` and a `RequireAuth` middleware, unauthenticated requests are appropriately blocked with a `401 Unauthorized` status code.
+📊 **Kill Rate:**
+High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
+
+🔗 **Havoc Interaction:**
+These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
