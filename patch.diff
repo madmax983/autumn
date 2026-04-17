@@ -1,0 +1,29 @@
+--- autumn/src/flash.rs
++++ autumn/src/flash.rs
+@@ -107,6 +107,26 @@
+         }
+         messages
+     }
++
++    /// Injects pending flash messages into an HTMX response as `HX-Trigger` events.
++    ///
++    /// Consumes the messages from the session and sets the `HX-Trigger` header
++    /// with a JSON payload representing the messages. This allows the frontend
++    /// to display flash messages without a full page reload.
++    #[cfg(feature = "htmx")]
++    pub async fn inject_hx_trigger<T: axum::response::IntoResponse>(&self, response: T) -> axum::response::Response {
++        let messages = self.consume().await;
++        let mut res = response.into_response();
++        if !messages.is_empty() {
++            let payload = serde_json::json!({
++                "flash": messages
++            });
++            if let Ok(v) = http::header::HeaderValue::from_str(&payload.to_string()) {
++                res.headers_mut().insert(http::header::HeaderName::from_static("hx-trigger"), v);
++            }
++        }
++        res
++    }
+ }
+
+ impl<S> FromRequestParts<S> for Flash

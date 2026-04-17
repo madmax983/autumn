@@ -1,0 +1,12 @@
+--- autumn/src/flash.rs
++++ autumn/src/flash.rs
+@@ -9,7 +9,8 @@
+ //! ```rust,no_run
+ //! use autumn_web::prelude::*;
++//! use axum::response::{IntoResponse, Redirect};
+ //!
+ //! #[post("/items")]
+ //! async fn create_item(flash: Flash) -> impl IntoResponse {
+ //!     // ... create item ...
+ //!     flash.success("Item created successfully!").await;
+ //!     Redirect::to("/items")

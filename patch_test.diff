@@ -1,0 +1,27 @@
+--- autumn/src/flash.rs
++++ autumn/src/flash.rs
+@@ -193,4 +193,24 @@
+         assert_eq!(messages[3].level, FlashLevel::Error);
+         assert_eq!(messages[3].message, "Error msg");
+     }
++
++    #[tokio::test]
++    #[cfg(feature = "htmx")]
++    async fn should_inject_hx_trigger() {
++        use axum::response::IntoResponse;
++        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
++        let flash = Flash::new(session.clone());
++
++        flash.success("Item saved").await;
++
++        let response = flash.inject_hx_trigger("OK").await;
++        let header = response.headers().get("hx-trigger");
++        assert!(header.is_some());
++
++        let json_str = header.unwrap().to_str().unwrap();
++        let payload: serde_json::Value = serde_json::from_str(json_str).unwrap();
++
++        assert_eq!(payload["flash"][0]["level"], "success");
++        assert_eq!(payload["flash"][0]["message"], "Item saved");
++    }
+ }
