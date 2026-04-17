@@ -408,4 +408,81 @@ mod tests {
         let err = DagBuildError::CycleDetected;
         assert_eq!(err.to_string(), "dag contains a dependency cycle");
     }
+
+    #[test]
+    fn should_ignore_duplicate_upstream_dependencies() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a).upstream(&a);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        assert_eq!(tasks[1].upstreams, vec![0]);
+    }
+
+    #[test]
+    fn should_detect_cycle_when_task_depends_on_itself() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _a = a.clone().upstream(&a);
+
+        let res = builder.build();
+        assert_eq!(res.unwrap_err(), DagBuildError::CycleDetected);
+    }
+
+    #[test]
+    fn should_build_execution_levels_for_multiple_disconnected_components() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+
+        let c = builder.activity(dummy_activity3);
+        let _d = builder.activity(dummy_activity).upstream(&c);
+
+        let dag = builder.build().unwrap();
+        let levels = dag.execution_levels();
+
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0], vec![0, 2]); // a and c run first
+        assert_eq!(levels[1], vec![1, 3]); // b and d run second
+    }
+
+    #[test]
+    fn should_handle_long_linear_dependency_chain() {
+        let mut builder = DagBuilder::new();
+        let mut current = builder.activity(dummy_activity);
+
+        for _ in 1..100 {
+            current = builder.activity(dummy_activity).upstream(&current);
+        }
+
+        let dag = builder.build().unwrap();
+        let levels = dag.execution_levels();
+
+        assert_eq!(levels.len(), 100);
+        for (i, level) in levels.iter().enumerate() {
+            assert_eq!(*level, vec![i]);
+        }
+    }
+
+    #[test]
+    fn should_return_correct_task_index() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        let b = builder.activity(dummy_activity2);
+
+        assert_eq!(a.index(), 0);
+        assert_eq!(b.index(), 1);
+    }
+
+    #[test]
+    fn should_handle_malformed_type_names_gracefully() {
+        assert_eq!(short_activity_name(""), "");
+        assert_eq!(short_activity_name("::"), "");
+        assert_eq!(
+            short_activity_name("only_one_colon:name"),
+            "only_one_colon:name"
+        );
+    }
 }
