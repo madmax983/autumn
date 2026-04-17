@@ -417,6 +417,25 @@ mod tests {
         let invalid_result = inject_snippet(&invalid_utf8);
         // String::from_utf8_lossy Replaces invalid bytes with U+FFFD.
         assert!(String::from_utf8_lossy(&invalid_result).contains("</script></body></html>"));
+
+        // Empty body.
+        let empty = inject_snippet(b"");
+        assert!(empty.is_empty());
+
+        // Exact </body> tag.
+        let exact_body = inject_snippet(b"</body>");
+        let exact_body_str = std::str::from_utf8(&exact_body).expect("utf-8");
+        assert!(exact_body_str.ends_with("</script></body>"));
+
+        // Case sensitivity behavior (currently case-sensitive, so these skip insertion).
+        let uppercase = inject_snippet(b"<HTML><BODY>ok</BODY></HTML>");
+        let uppercase_str = std::str::from_utf8(&uppercase).expect("utf-8");
+        assert_eq!(uppercase_str, "<HTML><BODY>ok</BODY></HTML>");
+
+        // Malformed/spaced tags (currently exact match only, so this skips insertion).
+        let spaced_body = inject_snippet(b"<html><body >ok</body ></html>");
+        let spaced_body_str = std::str::from_utf8(&spaced_body).expect("utf-8");
+        assert!(spaced_body_str.ends_with("</script>")); // Falls back to <html match, which appends to end
     }
 
     #[test]
