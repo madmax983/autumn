@@ -135,10 +135,7 @@ async fn eris_unauthenticated_query_workflow_is_accessible() {
 #[tokio::test]
 async fn eris_unauthenticated_list_dag_runs_is_accessible() {
     let app = unauthenticated_app();
-    let res = app
-        .oneshot(get("/dags/my-dag/runs"))
-        .await
-        .unwrap();
+    let res = app.oneshot(get("/dags/my-dag/runs")).await.unwrap();
     assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
     assert_ne!(res.status(), StatusCode::FORBIDDEN);
 }
@@ -239,10 +236,7 @@ async fn eris_require_auth_blocks_list_dags() {
 #[tokio::test]
 async fn eris_require_auth_blocks_list_dag_runs() {
     let app = authenticated_app();
-    let res = app
-        .oneshot(get("/dags/my-dag/runs"))
-        .await
-        .unwrap();
+    let res = app.oneshot(get("/dags/my-dag/runs")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
