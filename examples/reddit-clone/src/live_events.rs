@@ -602,6 +602,42 @@ async fn connect_postgres_live_event_listener(
     }
 }
 
+async fn subscribe_redis_pubsub(
+    mut pubsub: redis::aio::PubSub,
+    channel: &str,
+) -> Option<redis::aio::PubSub> {
+    match pubsub.subscribe(channel).await {
+        Ok(()) => {
+            debug!(
+                channel = %channel,
+                "reddit-clone live-feed Redis listener connected"
+            );
+            Some(pubsub)
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                channel = %channel,
+                "failed to subscribe reddit-clone live-feed Redis listener; falling back to polling"
+            );
+            None
+        }
+    }
+}
+
+async fn setup_redis_pubsub(client: redis::Client, channel: &str) -> Option<redis::aio::PubSub> {
+    match client.get_async_pubsub().await {
+        Ok(pubsub) => subscribe_redis_pubsub(pubsub, channel).await,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "failed to connect reddit-clone live-feed Redis pubsub listener; falling back to polling"
+            );
+            None
+        }
+    }
+}
+
 async fn connect_redis_live_event_listener(
     redis_url: Option<&str>,
     channel: &str,
@@ -611,32 +647,7 @@ async fn connect_redis_live_event_listener(
         return None;
     };
     match redis::Client::open(redis_url) {
-        Ok(client) => match client.get_async_pubsub().await {
-            Ok(mut pubsub) => match pubsub.subscribe(channel).await {
-                Ok(()) => {
-                    debug!(
-                        channel = %channel,
-                        "reddit-clone live-feed Redis listener connected"
-                    );
-                    Some(pubsub)
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        channel = %channel,
-                        "failed to subscribe reddit-clone live-feed Redis listener; falling back to polling"
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to connect reddit-clone live-feed Redis pubsub listener; falling back to polling"
-                );
-                None
-            }
-        },
+        Ok(client) => setup_redis_pubsub(client, channel).await,
         Err(error) => {
             warn!(
                 error = %error,

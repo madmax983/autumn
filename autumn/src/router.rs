@@ -385,13 +385,10 @@ fn mount_raw_routers(
     router
 }
 
-fn apply_middleware(
+fn apply_cors_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
-    state: &AppState,
-    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    error_page_renderer: Option<SharedRenderer>,
-) -> Result<axum::Router<AppState>, RouterBuildError> {
+) -> axum::Router<AppState> {
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -402,13 +399,31 @@ fn apply_middleware(
         );
         router = router.layer(cors);
     }
+    router
+}
 
+fn apply_csrf_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+) -> axum::Router<AppState> {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
+    router
+}
+
+fn apply_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+    state: &AppState,
+    exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    error_page_renderer: Option<SharedRenderer>,
+) -> Result<axum::Router<AppState>, RouterBuildError> {
+    router = apply_cors_middleware(router, config);
+    router = apply_csrf_middleware(router, config);
 
     // Security headers layer (always applied)
     let security_headers =
@@ -873,6 +888,118 @@ mod tests {
         assert!(
             result.unwrap().is_err(),
             "route overlap should be reported as a checked router build error"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_cors_middleware_skipped_when_no_origins() {
+        let config = AutumnConfig::default();
+        assert!(config.cors.allowed_origins.is_empty());
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "CORS header must be absent when no origins are configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_cors_middleware_present_when_origins_configured() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://example.com".to_owned()];
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .header("Origin", "https://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_some(),
+            "CORS header must be present when origins are configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_csrf_middleware_skipped_when_disabled() {
+        let config = AutumnConfig::default();
+        assert!(!config.security.csrf.enabled);
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
+        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+
+        // Without CSRF the POST should pass through with no CSRF-specific response
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/form")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn apply_csrf_middleware_blocks_without_token_when_enabled() {
+        let mut config = AutumnConfig::default();
+        config.security.csrf.enabled = true;
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
+        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+
+        // POST without CSRF token should be rejected
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/form")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "POST without CSRF token should be rejected when CSRF is enabled"
         );
     }
 }
