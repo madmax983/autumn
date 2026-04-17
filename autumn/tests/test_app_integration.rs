@@ -4,7 +4,7 @@
 //! that bring Autumn's testing story to parity with Spring Boot / Django.
 
 use autumn_web::prelude::*;
-use autumn_web::test::TestApp;
+use autumn_web::test::{TestApp, TestClient};
 use axum::http::StatusCode;
 
 // ── Sample handlers (simulate a real application) ──────────────
@@ -66,7 +66,7 @@ async fn validate_input(
 
 // ── Helper to build a client with all routes ───────────────────
 
-fn app() -> autumn_web::test::TestClient {
+fn app() -> TestClient {
     TestApp::new()
         .routes(routes![
             index,

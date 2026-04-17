@@ -1,6 +1,6 @@
 use autumn_harvest::HarvestBuilder;
 use autumn_harvest::prelude::WorkerConfig;
-use autumn_web::app::AppBuilder;
+use autumn_web::AppBuilder;
 use autumn_web_harvest::HarvestExt;
 
 use crate::workflows;

@@ -1,6 +1,6 @@
 use autumn_web::AppState;
 use autumn_web::config::{AutumnConfig, DatabaseConfig};
-use autumn_web::db;
+use autumn_web::create_pool;
 use autumn_web_harvest::{
     HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
 };
@@ -82,7 +82,7 @@ fn build_pool(
     database_url: &str,
     pool_size: usize,
 ) -> Result<autumn_harvest::worker::DbPool, RunnerMainError> {
-    db::create_pool(&DatabaseConfig {
+    create_pool(&DatabaseConfig {
         url: Some(database_url.to_owned()),
         pool_size,
         ..DatabaseConfig::default()

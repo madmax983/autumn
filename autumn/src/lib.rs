@@ -66,14 +66,14 @@
 extern crate self as autumn_web;
 
 pub mod actuator;
-pub mod app;
+pub(crate) mod app;
 pub mod auth;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
 pub mod config;
 #[cfg(feature = "db")]
-pub mod db;
+pub(crate) mod db;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
@@ -139,13 +139,15 @@ pub mod ws;
 ///         .await;
 /// }
 /// ```
-pub use app::app;
+pub use app::{AppBuilder, app};
 /// Async database connection extractor.
 ///
 /// Declare `db: Db` in a handler signature to get a pooled Postgres
 /// connection. See [`db::Db`] for full documentation and examples.
 #[cfg(feature = "db")]
 pub use db::Db;
+#[cfg(feature = "db")]
+pub use db::create_pool;
 
 /// Framework error type and result alias.
 ///
@@ -619,7 +621,14 @@ pub use crate::extract::Query;
 /// | `diesel` | `autumn_web::reexports::diesel` | Raw Diesel queries, schema types |
 /// | `http` | `autumn_web::reexports::http` | HTTP types (`StatusCode`, `Method`, headers) |
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
+pub mod test {
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    pub use crate::testing::TestDb;
+    pub use crate::testing::{TestApp, TestClient};
+}
+
 pub mod reexports {
+
     pub use axum;
     pub use chrono;
     #[cfg(feature = "db")]
@@ -640,7 +649,7 @@ pub(crate) mod state;
     clippy::must_use_candidate,
     clippy::field_reassign_with_default
 )]
-pub mod test;
+pub(crate) mod testing;
 pub use state::AppState;
 
 #[cfg(test)]

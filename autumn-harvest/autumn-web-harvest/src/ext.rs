@@ -3,11 +3,11 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
+use autumn_web::AppBuilder;
 use autumn_web::AppState;
-use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
 use autumn_web::config::DatabaseConfig;
-use autumn_web::db;
+use autumn_web::create_pool;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use tokio::task::JoinHandle;
@@ -271,7 +271,7 @@ fn resolve_harvest_pool(
                 url: config.database.url.clone(),
                 ..DatabaseConfig::default()
             };
-            db::create_pool(&database)
+            create_pool(&database)
                 .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
                 .ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
@@ -434,7 +434,7 @@ mod tests {
     }
 
     fn test_pool(database_url: &str, pool_size: usize) -> DbPool {
-        autumn_web::db::create_pool(&DatabaseConfig {
+        autumn_web::create_pool(&DatabaseConfig {
             url: Some(database_url.to_owned()),
             pool_size,
             ..DatabaseConfig::default()

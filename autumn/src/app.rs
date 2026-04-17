@@ -134,7 +134,7 @@ pub struct AppBuilder {
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
+pub struct ScopedGroup {
     pub(crate) prefix: String,
     pub(crate) routes: Vec<Route>,
     /// Closure that applies the layer to a sub-router.
@@ -775,7 +775,7 @@ impl AppBuilder {
     }
 }
 
-pub(crate) fn is_static_build_mode() -> bool {
+pub fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
 }
 
@@ -1280,7 +1280,7 @@ fn format_config_summary(config: &AutumnConfig) -> String {
 
 /// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
 /// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
-pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
+pub fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
     env.var("AUTUMN_MANIFEST_DIR").map_or_else(
         |_| std::path::PathBuf::from(subdir),
         |d| std::path::PathBuf::from(d).join(subdir),

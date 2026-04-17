@@ -10,7 +10,7 @@
 #[cfg(feature = "db")]
 mod db_tests {
     use autumn_web::prelude::*;
-    use autumn_web::test::TestApp;
+    use autumn_web::test::{TestApp, TestClient};
     use diesel::prelude::*;
     use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::pooled_connection::deadpool::Pool;
@@ -140,7 +140,7 @@ mod db_tests {
         Ok(Json(item))
     }
 
-    fn build_client(pool: Pool<AsyncPgConnection>) -> autumn_web::test::TestClient {
+    fn build_client(pool: Pool<AsyncPgConnection>) -> TestClient {
         TestApp::new()
             .routes(routes![list_items, create_item, get_item])
             .with_db(pool)

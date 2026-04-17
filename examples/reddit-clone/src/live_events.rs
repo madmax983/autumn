@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::notify::{QueueListener, QueueWaitOutcome, queue_channel};
+use autumn_web::AppBuilder;
 use autumn_web::AppState;
-use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
 use autumn_web::error::AutumnError;
 use chrono::{NaiveDateTime, Utc};
@@ -1047,7 +1047,7 @@ mod tests {
 
     use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
     use autumn_web::config::DatabaseConfig;
-    use autumn_web::db;
+    use autumn_web::create_pool;
     use diesel::QueryableByName;
     use diesel_async::SimpleAsyncConnection;
     use testcontainers::ContainerAsync;
@@ -1552,14 +1552,14 @@ mod tests {
             .expect("failed to get container port");
         let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
-        let web_pool = db::create_pool(&DatabaseConfig {
+        let web_pool = create_pool(&DatabaseConfig {
             url: Some(database_url.clone()),
             pool_size: 4,
             ..DatabaseConfig::default()
         })
         .expect("web pool config should build")
         .expect("web pool should exist");
-        let runner_pool = db::create_pool(&DatabaseConfig {
+        let runner_pool = create_pool(&DatabaseConfig {
             url: Some(database_url.clone()),
             pool_size: 4,
             ..DatabaseConfig::default()
@@ -1593,7 +1593,7 @@ mod tests {
             .await
             .expect("failed to get container port");
         let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-        let pool = db::create_pool(&DatabaseConfig {
+        let pool = create_pool(&DatabaseConfig {
             url: Some(database_url),
             pool_size: 1,
             ..DatabaseConfig::default()

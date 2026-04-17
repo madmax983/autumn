@@ -136,7 +136,7 @@ async fn scoped_middleware_applies_only_to_group() {
 
 #[test]
 fn app_builder_scoped_compiles() {
-    let _builder = autumn_web::app::app().routes(routes![ok_handler]).scoped(
+    let _builder = autumn_web::app().routes(routes![ok_handler]).scoped(
         "/api",
         AddHeaderLayer,
         routes![list_users],
@@ -152,7 +152,7 @@ fn app_builder_exception_filter_compiles() {
         }
     }
 
-    let _builder = autumn_web::app::app()
+    let _builder = autumn_web::app()
         .exception_filter(NoopFilter)
         .routes(routes![ok_handler]);
 }
