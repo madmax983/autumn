@@ -238,7 +238,10 @@ impl WorkerConfig {
     /// Replace the queue list.
     #[must_use]
     pub fn with_queues<'a>(mut self, queues: impl IntoIterator<Item = &'a str>) -> Self {
-        self.queues = queues.into_iter().map(str::to_owned).collect();
+        let new_queues: Vec<String> = queues.into_iter().filter(|q| !q.trim().is_empty()).map(str::to_owned).collect();
+        if !new_queues.is_empty() {
+            self.queues = new_queues;
+        }
         self
     }
 
@@ -299,9 +302,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_config_with_empty_queues_clears_list() {
+    fn worker_config_with_empty_queues_ignores_update() {
         let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
-        assert!(config.queues.is_empty());
+        assert_eq!(config.queues, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn worker_config_with_whitespace_queues_ignores_update() {
+        let config = WorkerConfig::default().with_queues(vec!["   ", ""]);
+        assert_eq!(config.queues, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn worker_config_with_mixed_queues_filters_empty() {
+        let config = WorkerConfig::default().with_queues(vec!["etl", "  ", "email"]);
+        assert_eq!(config.queues, vec!["etl".to_string(), "email".to_string()]);
     }
 
     #[test]

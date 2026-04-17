@@ -1,17 +1,17 @@
-🤖 Sentinel: [fix chaos channels panic test]
+# 🧪 [testing improvement description]
 
-🦠 **Mutants Found:**
-The `test_channels_zero_capacity_regression` previously did not send or receive any messages. This allowed bugs where channel operations could panic or fail under a 0-capacity setup to easily go undetected since only channel creation was exercised.
+## 🎯 Target
+The `Builder` queue configuration API (`WorkerConfig::with_queues`) lacked boundary edge case tests and enforcement to prevent misconfiguring the worker queue listener. Previously, it allowed injecting empty queue sets or invalid string vectors containing only empty strings, which could result in a configuration bug.
 
-🎯 **Tests Added/Strengthened:**
-* Updated `test_channels_zero_capacity_regression` to fully test sending and receiving messages.
-* Updated `test_channels_capacity_fuzzing` to assert that message sending successfully works and does not panic on any fuzzed capacity.
+## 💣 Risk
+Worker processes misconfigured with empty `queues` will not subscribe to anything and remain effectively broken and idle. This can be problematic if a configuration management tool or dynamic service sets it to an empty or whitespace string array, resulting in silent failures without any error or warning.
 
-⚠️ **Suspected Bugs:**
-Operations on 0-capacity (or other unexpected capacities) could panic at runtime because the tests were only validating channel initialization and not the actual send/receive operations.
+## 🧪 Strategy
+1. **Implementation Upgrade:** Enforce robustness directly in the `WorkerConfig::with_queues` function. Using `.filter(|q| !q.trim().is_empty())` protects against whitespace-only configurations. Furthermore, checking if the resulting `new_queues` slice is empty ensures that if an empty array or purely empty string sequence is passed in, the `WorkerConfig` simply ignores the invalid update and maintains its fallback default `["default"]` configuration.
+2. **Test Assertions:** Added three new edge-case tests validating this behavior:
+   - `worker_config_with_empty_queues_ignores_update`
+   - `worker_config_with_whitespace_queues_ignores_update`
+   - `worker_config_with_mixed_queues_filters_empty`
 
-📊 **Kill Rate:**
-High. The tests now verify the entire flow of `Channels` logic on edge capacities rather than just initialization.
-
-🔗 **Havoc Interaction:**
-These changes were needed to secure regression tests against edge cases exposed during concurrency/chaos evaluations.
+## 🔭 Verification
+Locally confirmed via test suite execution with `cargo check` and `cargo test builder`. Tests correctly demonstrate the robust rejection of empty configuration states.
