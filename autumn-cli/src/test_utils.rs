@@ -19,7 +19,10 @@ mod tests {
                 temp_env::with_vars([("AUTUMN_ISOLATION_TEST", Some(&value))], || {
                     let actual = std::env::var("AUTUMN_ISOLATION_TEST").unwrap_or_default();
                     if actual != expected {
-                        errors_clone.lock().unwrap().push(format!("Thread {} expected {} but got {}", i, expected, actual));
+                        errors_clone.lock().unwrap().push(format!(
+                            "Thread {} expected {} but got {}",
+                            i, expected, actual
+                        ));
                     }
 
                     // Add a small delay to increase chance of interleaving
@@ -27,7 +30,10 @@ mod tests {
 
                     let actual_after = std::env::var("AUTUMN_ISOLATION_TEST").unwrap_or_default();
                     if actual_after != expected {
-                        errors_clone.lock().unwrap().push(format!("Thread {} expected {} but got {} after sleep", i, expected, actual_after));
+                        errors_clone.lock().unwrap().push(format!(
+                            "Thread {} expected {} but got {} after sleep",
+                            i, expected, actual_after
+                        ));
                     }
                 });
             }));
@@ -38,6 +44,10 @@ mod tests {
         }
 
         let final_errors = errors.lock().unwrap();
-        assert!(final_errors.is_empty(), "Data races detected: {:?}", *final_errors);
+        assert!(
+            final_errors.is_empty(),
+            "Data races detected: {:?}",
+            *final_errors
+        );
     }
 }

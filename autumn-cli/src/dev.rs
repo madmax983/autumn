@@ -767,7 +767,6 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 mod tests {
     use super::*;
 
-
     // ── is_relevant_change tests ───────────────────────────────────
 
     #[test]
@@ -1535,13 +1534,10 @@ mod tests {
         std::fs::write(&binary, "echo tailwind").expect("write binary");
         let path = std::env::join_paths([dir.path()]).expect("join path");
 
-        temp_env::with_vars(
-            [("PATH", Some(path.as_os_str()))],
-            || {
-                let found = which("mocktailwind").expect("binary on PATH");
-                assert_eq!(found, binary);
-            }
-        );
+        temp_env::with_vars([("PATH", Some(path.as_os_str()))], || {
+            let found = which("mocktailwind").expect("binary on PATH");
+            assert_eq!(found, binary);
+        });
     }
 
     #[test]
@@ -1549,11 +1545,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = std::env::join_paths([dir.path()]).expect("join path");
 
-        temp_env::with_vars(
-            [("PATH", Some(path.as_os_str()))],
-            || {
-                assert!(which("definitely-missing-binary").is_none());
-            }
-        );
+        temp_env::with_vars([("PATH", Some(path.as_os_str()))], || {
+            assert!(which("definitely-missing-binary").is_none());
+        });
     }
 }

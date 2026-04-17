@@ -1841,41 +1841,39 @@ mod tests {
 
     #[tokio::test]
     async fn build_mode_static_rendering_bypasses_startup_barrier() {
-        temp_env::async_with_vars(
-            [("AUTUMN_BUILD_STATIC", Some("1"))],
-            async {
-                let config = AutumnConfig::default();
-                let state = AppState::for_test().with_startup_complete(false);
-                let router = crate::router::build_router(
-                    vec![Route {
-                        method: http::Method::GET,
-                        path: "/about",
-                        handler: axum::routing::get(|| async { "About Page Content" }),
-                        name: "about",
-                    }],
-                    &config,
-                    state,
-                );
-                let tmp = tempfile::tempdir().unwrap();
-                let dist = tmp.path().join("dist");
+        temp_env::async_with_vars([("AUTUMN_BUILD_STATIC", Some("1"))], async {
+            let config = AutumnConfig::default();
+            let state = AppState::for_test().with_startup_complete(false);
+            let router = crate::router::build_router(
+                vec![Route {
+                    method: http::Method::GET,
+                    path: "/about",
+                    handler: axum::routing::get(|| async { "About Page Content" }),
+                    name: "about",
+                }],
+                &config,
+                state,
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            let dist = tmp.path().join("dist");
 
-                let result = crate::static_gen::render_static_routes(
-                    router,
-                    &[crate::static_gen::StaticRouteMeta {
-                        path: "/about",
-                        name: "about",
-                        revalidate: None,
-                        params_fn: None,
-                    }],
-                    &dist,
-                )
-                .await;
+            let result = crate::static_gen::render_static_routes(
+                router,
+                &[crate::static_gen::StaticRouteMeta {
+                    path: "/about",
+                    name: "about",
+                    revalidate: None,
+                    params_fn: None,
+                }],
+                &dist,
+            )
+            .await;
 
-                assert!(result.is_ok(), "build failed: {:?}", result.err());
-                let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
-                assert_eq!(html, "About Page Content");
-            }
-        ).await;
+            assert!(result.is_ok(), "build failed: {:?}", result.err());
+            let html = std::fs::read_to_string(dist.join("about/index.html")).unwrap();
+            assert_eq!(html, "About Page Content");
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1909,8 +1907,9 @@ mod tests {
                     .unwrap();
                 let html = std::str::from_utf8(&body).expect("utf-8");
                 assert!(html.contains("/__autumn/live-reload"));
-            }
-        ).await;
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1946,8 +1945,9 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(&body[..], br#"{"version":7,"kind":"css"}"#);
-            }
-        ).await;
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -1985,8 +1985,9 @@ mod tests {
                     response.headers().get("cache-control").unwrap(),
                     "no-store, no-cache, must-revalidate"
                 );
-            }
-        ).await;
+            },
+        )
+        .await;
     }
 
     #[test]
