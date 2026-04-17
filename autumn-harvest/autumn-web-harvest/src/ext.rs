@@ -511,6 +511,52 @@ mod tests {
     }
 
     #[test]
+    fn test_harvest_api_with_auth_configures_middleware() {
+        use crate::HarvestExt;
+        let builder = autumn_web::app()
+            .harvest_api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        let integration = builder.extension::<HarvestIntegration>().unwrap();
+        assert_eq!(
+            integration
+                .shared
+                .lock()
+                .unwrap()
+                .registration
+                .api_path
+                .as_deref(),
+            Some("/api")
+        );
+    }
+
+    #[test]
+    fn test_harvest_api_with_auth_after_hooks_configures_middleware() {
+        use crate::HarvestExt;
+        let builder = autumn_web::app()
+            .workflows(vec![])
+            .harvest_api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+        let integration = builder.extension::<HarvestIntegration>().unwrap();
+        assert_eq!(
+            integration
+                .shared
+                .lock()
+                .unwrap()
+                .registration
+                .api_path
+                .as_deref(),
+            Some("/api")
+        );
+        assert!(
+            integration
+                .shared
+                .lock()
+                .unwrap()
+                .registration
+                .api_middleware
+                .is_none()
+        );
+    }
+
+    #[test]
     fn harvest_ext_accumulates_registration_on_app_builder() {
         let builder = autumn_web::app()
             .workflows(vec![fake_workflow_info()])
