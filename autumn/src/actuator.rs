@@ -799,26 +799,29 @@ pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static
 // ── Metrics ────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
-#[allow(unused_variables, unused_mut)]
 pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let snapshot = state.metrics().snapshot();
-    let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
+    let result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool() {
-        let status = pool.status();
-        let db_stats = serde_json::json!({
-            "pool_size": status.max_size,
-            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
-            "idle_connections": status.available,
-        });
-        if let serde_json::Value::Object(ref mut map) = result {
-            map.insert("database".to_string(), db_stats);
+    let result = {
+        let mut result = result;
+        if let Some(pool) = state.pool() {
+            let status = pool.status();
+            let db_stats = serde_json::json!({
+                "pool_size": status.max_size,
+                "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+                "idle_connections": status.available,
+            });
+            if let serde_json::Value::Object(ref mut map) = result {
+                map.insert("database".to_string(), db_stats);
+            }
         }
-    }
+        result
+    };
 
     Json(result)
 }
@@ -1402,6 +1405,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn actuator_metrics_returns_db_stats_when_pool_present() {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+
+        let mut state = test_state();
+
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://postgres:postgres@localhost:5432/postgres",
+        );
+        let pool = Pool::builder(manager).build().unwrap();
+
+        state.pool = Some(pool);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(json.get("database").is_some());
     }
 
     // ── Config properties endpoint tests ───────────────────────
