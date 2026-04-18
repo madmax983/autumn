@@ -236,6 +236,10 @@ impl Default for WorkerConfig {
 
 impl WorkerConfig {
     /// Replace the queue list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the provided queue names are empty strings.
     #[must_use]
     pub fn with_queues<'a>(mut self, queues: impl IntoIterator<Item = &'a str>) -> Self {
         self.queues = queues
