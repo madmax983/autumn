@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
-ws = []
+ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
@@ -54,6 +54,7 @@ serde.workspace = true
 serde_json = "1"
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream = { workspace = true, optional = true }
 tokio-util.workspace = true
 toml.workspace = true
 tower.workspace = true
