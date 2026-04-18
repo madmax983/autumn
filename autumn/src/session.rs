@@ -310,7 +310,7 @@ pub struct SessionConfig {
     pub max_age_secs: u64,
 
     /// Whether the cookie should only be sent over HTTPS.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub secure: bool,
 
     /// `SameSite` attribute for the cookie.
@@ -433,7 +433,7 @@ impl Default for SessionConfig {
             backend: SessionBackend::default(),
             cookie_name: default_cookie_name(),
             max_age_secs: default_max_age_secs(),
-            secure: false,
+            secure: true,
             same_site: default_same_site(),
             http_only: default_true(),
             path: default_path(),
