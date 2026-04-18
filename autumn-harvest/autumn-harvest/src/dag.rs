@@ -408,4 +408,76 @@ mod tests {
         let err = DagBuildError::CycleDetected;
         assert_eq!(err.to_string(), "dag contains a dependency cycle");
     }
+
+    #[test]
+    fn should_deduplicate_identical_upstream_dependencies() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        // Upstream added twice
+        let _b = builder.activity(dummy_activity2).upstream(&a).upstream(&a);
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        // b's upstreams should only contain a once
+        assert_eq!(tasks[1].upstreams, vec![0]);
+    }
+
+    #[test]
+    fn should_process_disjoint_subgraphs() {
+        let mut builder = DagBuilder::new();
+
+        // Subgraph 1
+        let a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).upstream(&a);
+
+        // Subgraph 2
+        let c = builder.activity(dummy_activity3);
+        let _d = builder.activity(dummy_activity).upstream(&c);
+
+        let dag = builder.build().unwrap();
+        let levels = dag.execution_levels();
+
+        // Level 0: [a, c]
+        // Level 1: [b, d]
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0], vec![0, 2]); // a, c
+        assert_eq!(levels[1], vec![1, 3]); // b, d
+    }
+
+    #[test]
+    fn should_override_default_queue() {
+        let mut builder = DagBuilder::with_default_queue("default-queue");
+
+        let _a = builder.activity(dummy_activity);
+        let _b = builder.activity(dummy_activity2).queue("custom-queue");
+
+        let dag = builder.build().unwrap();
+        let tasks = dag.tasks();
+
+        assert_eq!(tasks[0].queue.as_deref(), Some("default-queue"));
+        assert_eq!(tasks[1].queue.as_deref(), Some("custom-queue"));
+    }
+
+    #[test]
+    fn should_detect_self_referential_dependency_cycles() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+
+        // Self-reference cycle
+        let a_clone = a.clone();
+        let _ = a.upstream(&a_clone);
+
+        let res = builder.build();
+        assert_eq!(res.unwrap_err(), DagBuildError::CycleDetected);
+    }
+
+    #[test]
+    fn should_return_task_index() {
+        let mut builder = DagBuilder::new();
+        let a = builder.activity(dummy_activity);
+        assert_eq!(a.index(), 0);
+        let b = builder.activity(dummy_activity);
+        assert_eq!(b.index(), 1);
+    }
 }
