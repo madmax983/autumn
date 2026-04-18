@@ -91,8 +91,6 @@ pub mod probe;
 /// that will handle incoming HTTP requests.
 pub(crate) mod router;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
 #[cfg(feature = "db")]
 pub use hooks::{
     DraftField, FieldDiff, MutationContext, MutationHooks, MutationOp, NoHooks, Patch, UpdateDraft,

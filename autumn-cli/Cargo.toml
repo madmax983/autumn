@@ -34,6 +34,7 @@ nix = { version = "0.31.2", features = ["signal"] }
 tempfile = "3"
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
 proptest = "1.4"
+temp-env = { version = "0.3.6", features = ["async_closure"] }
 
 [lints]
 workspace = true

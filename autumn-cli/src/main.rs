@@ -7,9 +7,6 @@ mod migrate;
 mod monitor;
 mod new;
 mod setup;
-#[cfg(test)]
-pub(crate) mod test_utils;
-
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
