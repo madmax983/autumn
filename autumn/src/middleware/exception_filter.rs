@@ -195,6 +195,18 @@ where
                     for filter in filters.iter() {
                         response = filter.filter(&error_info, response);
                     }
+
+                    if axum::body::HttpBody::size_hint(response.body()).exact() == Some(0) {
+                        let mut default_resp = error_info.into_default_response();
+                        if let Some(wants_html) = response.extensions().get::<crate::middleware::error_page_filter::WantsHtml>().cloned() {
+                            default_resp.extensions_mut().insert(wants_html);
+                        }
+                        if let Some(req_ctx) = response.extensions().get::<crate::middleware::error_page_filter::ErrorPageRequestContext>().cloned() {
+                            default_resp.extensions_mut().insert(req_ctx);
+                        }
+                        response = default_resp;
+                    }
+
                     Poll::Ready(Ok(response))
                 } else {
                     Poll::Ready(Ok(response))
