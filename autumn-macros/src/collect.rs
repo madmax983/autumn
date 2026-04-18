@@ -35,7 +35,8 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
             // `cannot find value nonexistent_handler`. Trybuild tests fail without it.
             // Therefore, we MUST retain the dummy binding to ensure the primary error is helpful.
             if let Some(last) = companion.segments.last_mut() {
-                last.ident.set_span(path.segments.last().unwrap().ident.span());
+                last.ident
+                    .set_span(path.segments.last().unwrap().ident.span());
             }
 
             quote! {
