@@ -1410,13 +1410,15 @@ mod tests {
     #[tokio::test]
     #[cfg(feature = "db")]
     async fn actuator_metrics_returns_db_stats_when_pool_present() {
+        use diesel_async::AsyncPgConnection;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
         use diesel_async::pooled_connection::deadpool::Pool;
-        use diesel_async::AsyncPgConnection;
 
         let mut state = test_state();
 
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new("postgres://postgres:postgres@localhost:5432/postgres");
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://postgres:postgres@localhost:5432/postgres",
+        );
         let pool = Pool::builder(manager).build().unwrap();
 
         state.pool = Some(pool);
@@ -1440,7 +1442,6 @@ mod tests {
 
         assert!(json.get("database").is_some());
     }
-
 
     // ── Config properties endpoint tests ───────────────────────
 
