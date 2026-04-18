@@ -143,7 +143,6 @@ pub(crate) struct ScopedGroup {
 }
 
 impl AppBuilder {
-
     async fn start_server(
         router: axum::Router,
         config: &AutumnConfig,
@@ -588,7 +587,7 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     #[allow(clippy::too_many_lines)]
-        #[allow(clippy::cognitive_complexity)]
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
@@ -725,8 +724,6 @@ impl AppBuilder {
         tracing::info!("Server shut down cleanly");
     }
 
-
-
     /// Render all registered static routes to `dist/` and exit.
     ///
     /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
@@ -837,7 +834,7 @@ fn start_task_scheduler(
         let handler = task_info.handler;
 
         match task_info.schedule {
-                        crate::task::Schedule::FixedDelay(delay) => {
+            crate::task::Schedule::FixedDelay(delay) => {
                 // Register with the task registry for /actuator/tasks
                 let schedule_desc = format!("every {}s", delay.as_secs());
                 state.task_registry.register(&name, &schedule_desc);
@@ -917,7 +914,11 @@ async fn execute_task_result(
 
 /// Handle the execution of a single cron task.
 /// Handle the execution of a single fixed delay task.
-async fn execute_fixed_delay_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
+async fn execute_fixed_delay_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+) {
     tracing::debug!(task = %name, "Running scheduled task");
     state.task_registry.record_start(&name);
 
