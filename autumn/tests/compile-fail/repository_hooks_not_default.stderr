@@ -1,8 +1,8 @@
-error[E0277]: the trait bound `BadHooks: std::default::Default` is not satisfied
+error[E0277]: the trait bound `BadHooks: Default` is not satisfied
   --> tests/compile-fail/repository_hooks_not_default.rs:29:40
    |
 29 | #[autumn_web::repository(Item, hooks = BadHooks)]
-   |                                        ^^^^^^^^ the trait `std::default::Default` is not implemented for `BadHooks`
+   |                                        ^^^^^^^^ the trait `Default` is not implemented for `BadHooks`
    |
 help: consider annotating `BadHooks` with `#[derive(Default)]`
    |

@@ -75,3 +75,26 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Modifying the macro span does NOT remove the second error because rustc will eagerly resolve both. A dummy binding ensures the original user identifier error is surfaced so that developers have clear guidance on what went wrong. We must accept the second macro-level error as unavoidable cost for ergonomic macros.
+
+
+# DX Audit Report: Application Builder Ergonomics
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Read the documentation for `autumn_web::app()`.
+- Wrote a basic test application using `.routes()`, `.merge()`, and `.nest()`.
+- Intentionally introduced a typo in a route handler name.
+- Ran the application using `cargo check`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check 1**: Requesting a non-existent route returns an empty HTTP 404 response body (`content-length: 0`).
+- **Error Check 2**: Putting a non-existent function inside the `routes!` macro (e.g. `routes![index, missing_route]`) produces a secondary compiler error `cannot find function __autumn_route_info_missing_route in this scope` alongside the primary typo error.
+- **Import Scan**: The prelude `use autumn_web::prelude::*;` covers the vast majority of use cases effectively, avoiding "import spam".
+- **Slang Check**: Terminology like "routes", "nest", "merge" is standard web framework jargon and easily understandable.
+
+## 3. 📢 REPORT - The Complaint
+- "Why does a 404 give me a completely blank page instead of a default error payload?"
+- "The macro error `__autumn_route_info_missing_route` exposes internal generation details that I shouldn't have to care about. Just tell me 'Route not found'."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that standard `curl` requests to missing paths receive `content-length: 0`.
+- Verified that the secondary `__autumn_route_info_...` error is unavoidable due to eager macro resolution, meaning we must accept it as an ergonomic trade-off, but it could be explicitly documented.
