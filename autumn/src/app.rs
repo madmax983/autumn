@@ -143,6 +143,71 @@ pub(crate) struct ScopedGroup {
 }
 
 impl AppBuilder {
+
+    async fn start_server(
+        router: axum::Router,
+        config: &AutumnConfig,
+    ) -> (
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        let addr = format!("{}:{}", config.server.host, config.server.port);
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(addr = %addr, "Failed to bind: {e}");
+                std::process::exit(1);
+            });
+        tracing::info!(addr = %addr, "Listening");
+
+        let server_shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown_wait = server_shutdown.clone();
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    server_shutdown_wait.cancelled().await;
+                })
+                .await
+        });
+
+        (server_task, server_shutdown)
+    }
+
+    fn spawn_shutdown_task(
+        state: AppState,
+        config: &AutumnConfig,
+        shutdown_hooks: Vec<ShutdownHook>,
+        server_shutdown: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let shutdown_timeout = config.server.shutdown_timeout_secs;
+        #[cfg(feature = "ws")]
+        let websocket_shutdown = state.shutdown.clone();
+
+        tokio::spawn(async move {
+            shutdown_signal().await;
+            state.begin_shutdown();
+
+            #[cfg(feature = "ws")]
+            websocket_shutdown.cancel();
+
+            if shutdown_timeout > 5 {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        shutdown_timeout.saturating_sub(5),
+                    ))
+                    .await;
+                    tracing::warn!(
+                        timeout_secs = shutdown_timeout,
+                        "Shutdown draining near timeout, force-kill may be imminent"
+                    );
+                });
+            }
+
+            run_shutdown_hooks(&shutdown_hooks).await;
+            server_shutdown.cancel();
+        })
+    }
+
     /// Register a collection of routes with the application.
     ///
     /// Can be called multiple times -- routes are combined additively.
@@ -523,7 +588,7 @@ impl AppBuilder {
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::cognitive_complexity)]
+        #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) {
         // ── Build mode ─────────────────────────────────────────────────
         // When AUTUMN_BUILD_STATIC=1, render static routes to dist/ and exit
@@ -624,54 +689,14 @@ impl AppBuilder {
 
         // 7. Bind and serve. We start listening before startup hooks finish so
         // `/startup` can honestly report startup progress.
-        let addr = format!("{}:{}", config.server.host, config.server.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(addr = %addr, "Failed to bind: {e}");
-                std::process::exit(1);
-            });
-        tracing::info!(addr = %addr, "Listening");
+        let (server_task, server_shutdown) = Self::start_server(router, &config).await;
 
-        let shutdown_timeout = config.server.shutdown_timeout_secs;
-        let server_shutdown = tokio_util::sync::CancellationToken::new();
-        let server_shutdown_wait = server_shutdown.clone();
-        let server_task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    server_shutdown_wait.cancelled().await;
-                })
-                .await
-        });
-
-        let shutdown_state = state.clone();
-        let shutdown_signal_token = server_shutdown.clone();
-        #[cfg(feature = "ws")]
-        let websocket_shutdown = state.shutdown.clone();
-
-        let shutdown_task = tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown_state.begin_shutdown();
-
-            #[cfg(feature = "ws")]
-            websocket_shutdown.cancel();
-
-            if shutdown_timeout > 5 {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        shutdown_timeout.saturating_sub(5),
-                    ))
-                    .await;
-                    tracing::warn!(
-                        timeout_secs = shutdown_timeout,
-                        "Shutdown draining near timeout, force-kill may be imminent"
-                    );
-                });
-            }
-
-            run_shutdown_hooks(&shutdown_hooks).await;
-            shutdown_signal_token.cancel();
-        });
+        let shutdown_task = Self::spawn_shutdown_task(
+            state.clone(),
+            &config,
+            shutdown_hooks,
+            server_shutdown.clone(),
+        );
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
@@ -699,6 +724,8 @@ impl AppBuilder {
 
         tracing::info!("Server shut down cleanly");
     }
+
+
 
     /// Render all registered static routes to `dist/` and exit.
     ///
@@ -810,7 +837,7 @@ fn start_task_scheduler(
         let handler = task_info.handler;
 
         match task_info.schedule {
-            crate::task::Schedule::FixedDelay(delay) => {
+                        crate::task::Schedule::FixedDelay(delay) => {
                 // Register with the task registry for /actuator/tasks
                 let schedule_desc = format!("every {}s", delay.as_secs());
                 state.task_registry.register(&name, &schedule_desc);
@@ -818,61 +845,7 @@ fn start_task_scheduler(
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(delay).await;
-                        tracing::debug!(task = %name, "Running scheduled task");
-                        state.task_registry.record_start(&name);
-                        #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "started",
-                                "task": name,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
-
-                        let start = std::time::Instant::now();
-                        match (handler)(state.clone()).await {
-                            Ok(()) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                state.task_registry.record_success(&name, duration_ms);
-                                tracing::debug!(task = %name, "Task completed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "success",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                            Err(e) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                let error_str = e.to_string();
-                                state
-                                    .task_registry
-                                    .record_failure(&name, duration_ms, &error_str);
-                                tracing::warn!(task = %name, error = %e, "Task failed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "failure",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "error": error_str,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                        }
+                        execute_fixed_delay_task(name.clone(), state.clone(), handler).await;
                     }
                 });
             }
@@ -925,7 +898,7 @@ fn send_ws_sys_task_msg(
     }
 }
 
-async fn execute_cron_task_result(
+async fn execute_task_result(
     state: &AppState,
     handler: crate::task::TaskHandler,
     start: std::time::Instant,
@@ -943,6 +916,41 @@ async fn execute_cron_task_result(
 }
 
 /// Handle the execution of a single cron task.
+/// Handle the execution of a single fixed delay task.
+async fn execute_fixed_delay_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
+    tracing::debug!(task = %name, "Running scheduled task");
+    state.task_registry.record_start(&name);
+
+    send_ws_sys_task_msg(&state, "started", &name, None);
+
+    let start = std::time::Instant::now();
+    match execute_task_result(&state, handler, start).await {
+        Ok(duration_ms) => {
+            state.task_registry.record_success(&name, duration_ms);
+            tracing::debug!(task = %name, "Task completed");
+            send_ws_sys_task_msg(
+                &state,
+                "success",
+                &name,
+                Some(("duration_ms", serde_json::json!(duration_ms))),
+            );
+        }
+        Err((duration_ms, error_str)) => {
+            state
+                .task_registry
+                .record_failure(&name, duration_ms, &error_str);
+            tracing::warn!(task = %name, error = %error_str, "Task failed");
+            send_ws_sys_task_msg(
+                &state,
+                "failure",
+                &name,
+                Some(("error", serde_json::json!(error_str))),
+            );
+        }
+    }
+}
+
+/// Handle the execution of a single cron task.
 async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
@@ -950,7 +958,7 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
     send_ws_sys_task_msg(&state, "started", &name, None);
 
     let start = std::time::Instant::now();
-    match execute_cron_task_result(&state, handler, start).await {
+    match execute_task_result(&state, handler, start).await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -2580,7 +2588,7 @@ mod tests {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result = super::execute_task_result(&state, handler, start).await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
@@ -2592,7 +2600,7 @@ mod tests {
         let handler: crate::task::TaskHandler =
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result = super::execute_task_result(&state, handler, start).await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);

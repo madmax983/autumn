@@ -27,19 +27,8 @@ pub struct ErrorPageFilter {
     pub is_dev: bool,
 }
 
-impl ExceptionFilter for ErrorPageFilter {
-    fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
-        // Check if the original request wanted HTML (stored in extensions
-        // by the error page middleware layer).
-        let wants_html = response
-            .extensions()
-            .get::<WantsHtml>()
-            .is_some_and(|w| w.0);
-
-        if !wants_html {
-            return response;
-        }
-
+impl ErrorPageFilter {
+    fn build_error_context(&self, error: &AutumnErrorInfo, response: &Response) -> ErrorContext {
         let request_id = response
             .extensions()
             .get::<ErrorPageRequestContext>()
@@ -55,41 +44,38 @@ impl ExceptionFilter for ErrorPageFilter {
             .map(|ctx| ctx.uri.path().to_string())
             .unwrap_or_default();
 
-        let ctx = ErrorContext {
+        ErrorContext {
             status: error.status,
             message: error.message.clone(),
             path,
-            request_id: request_id.clone(),
+            request_id,
             details: error.details.clone(),
             is_dev: self.is_dev,
-        };
-
-        let mut html_body =
-            error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
-                .into_string();
-
-        // In dev mode, inject the error badge before </body>
-        if self.is_dev {
-            let badge_ctx = DevBadgeContext {
-                status_code: error.status.as_u16(),
-                status_reason: error
-                    .status
-                    .canonical_reason()
-                    .unwrap_or("Error")
-                    .to_string(),
-                message: error.message.clone(),
-                path: ctx.path,
-                request_id,
-                source_location: None,
-            };
-            let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
-            if let Some(pos) = html_body.rfind("</body>") {
-                html_body.insert_str(pos, &badge);
-            } else {
-                html_body.push_str(&badge);
-            }
         }
+    }
 
+    fn inject_dev_badge(html_body: &mut String, error: &AutumnErrorInfo, ctx: &ErrorContext) {
+        let badge_ctx = DevBadgeContext {
+            status_code: error.status.as_u16(),
+            status_reason: error
+                .status
+                .canonical_reason()
+                .unwrap_or("Error")
+                .to_string(),
+            message: error.message.clone(),
+            path: ctx.path.clone(),
+            request_id: ctx.request_id.clone(),
+            source_location: None,
+        };
+        let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
+        if let Some(pos) = html_body.rfind("</body>") {
+            html_body.insert_str(pos, &badge);
+        } else {
+            html_body.push_str(&badge);
+        }
+    }
+
+    fn build_html_response(error: &AutumnErrorInfo, html_body: String) -> Response {
         let content_length = html_body.len();
 
         let mut resp = (
@@ -110,6 +96,34 @@ impl ExceptionFilter for ErrorPageFilter {
         );
 
         resp
+    }
+}
+
+impl ExceptionFilter for ErrorPageFilter {
+    fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
+        // Check if the original request wanted HTML (stored in extensions
+        // by the error page middleware layer).
+        let wants_html = response
+            .extensions()
+            .get::<WantsHtml>()
+            .is_some_and(|w| w.0);
+
+        if !wants_html {
+            return response;
+        }
+
+        let ctx = self.build_error_context(error, &response);
+
+        let mut html_body =
+            error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
+                .into_string();
+
+        // In dev mode, inject the error badge before </body>
+        if self.is_dev {
+            Self::inject_dev_badge(&mut html_body, error, &ctx);
+        }
+
+        Self::build_html_response(error, html_body)
     }
 }
 
