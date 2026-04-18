@@ -2,6 +2,7 @@
 
 use autumn_web::channels::Channels;
 use proptest::prelude::*;
+use std::sync::Arc;
 
 proptest! {
     #[test]
@@ -10,23 +11,50 @@ proptest! {
 
         // This should never panic on any capacity (see explicit zero test)
         let tx = channels.sender("test_channel");
-        let _rx = channels.subscribe("test_channel");
-        prop_assert!(tx.send("test").is_ok());
+
+        // Edge case: Sending with no subscribers should cleanly error, not panic
+        let res = tx.send("test");
+        prop_assert!(res.is_err());
     }
 }
 
 #[tokio::test]
-async fn test_channels_zero_capacity_regression() -> Result<(), Box<dyn std::error::Error>> {
-    let channels = Channels::new(0);
+async fn test_channels_zero_capacity_regression() {
+    let channels = Arc::new(Channels::new(0));
+    let mut tasks = vec![];
 
-    // This should never panic even if capacity is 0 (which was the bug)
-    let tx = channels.sender("test_channel");
-    let mut rx = channels.subscribe("test_channel");
+    // 10 concurrent writers overfilling the 1-capacity buffer
+    for i in 0..10 {
+        let channels = Arc::clone(&channels);
+        tasks.push(tokio::spawn(async move {
+            let tx = channels.sender("chaos_channel");
+            for j in 0..100 {
+                let _ = tx.send(format!("msg_{i}_{j}"));
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
 
-    // We shouldn't use expect/unwrap in tests
-    tx.send("test_message")?;
-    let msg = rx.recv().await?;
-    assert_eq!(msg.as_str(), "test_message");
+    // 10 concurrent readers experiencing lagged errors
+    for _ in 0..10 {
+        let channels = Arc::clone(&channels);
+        tasks.push(tokio::spawn(async move {
+            let mut rx = channels.subscribe("chaos_channel");
+            let mut lagged = 0;
 
-    Ok(())
+            for _ in 0..100 {
+                if let Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                    lagged += 1;
+                }
+            }
+
+            // Buffer size is 1, writers send 1000 messages total.
+            // Readers will definitely fall behind and experience Lagged errors.
+            assert!(lagged > 0);
+        }));
+    }
+
+    for task in tasks {
+        task.await.expect("Task panicked");
+    }
 }
