@@ -1456,7 +1456,53 @@ impl Default for HealthConfig {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn database_config_validate_none() {
+        let config = DatabaseConfig {
+            url: None,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_config_validate_valid_postgres() {
+        let config = DatabaseConfig {
+            url: Some("postgres://user:pass@localhost:5432/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_config_validate_valid_postgresql() {
+        let config = DatabaseConfig {
+            url: Some("postgresql://user:pass@localhost:5432/db".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn database_config_validate_invalid_scheme() {
+        let config = DatabaseConfig {
+            url: Some("mysql://user:pass@localhost:3306/db".to_string()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                // Ensure we just match the underlying variant correctly
+                // as requested in the review.
+                assert!(msg.contains("must start with postgres:// or postgresql://"));
+            }
+            _ => panic!("Expected ConfigError::Validation"),
+        }
+    }
 
     #[test]
     fn server_defaults() {
