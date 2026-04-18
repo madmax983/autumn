@@ -1,0 +1,23 @@
+error[E0277]: the trait bound `BadHooks: Default` is not satisfied
+  --> tests/compile-fail/repository_hooks_not_default_1_95.rs:29:40
+   |
+29 | #[autumn_web::repository(Item, hooks = BadHooks)]
+   |                                        ^^^^^^^^ the trait `Default` is not implemented for `BadHooks`
+   |
+help: consider annotating `BadHooks` with `#[derive(Default)]`
+   |
+21 + #[derive(Default)]
+22 | pub struct BadHooks;
+   |
+
+error[E0277]: the trait bound `BadHooks: Clone` is not satisfied
+  --> tests/compile-fail/repository_hooks_not_default_1_95.rs:29:1
+   |
+29 | #[autumn_web::repository(Item, hooks = BadHooks)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `Clone` is not implemented for `BadHooks`
+   |
+help: consider annotating `BadHooks` with `#[derive(Clone)]`
+   |
+21 + #[derive(Clone)]
+22 | pub struct BadHooks;
+   |
