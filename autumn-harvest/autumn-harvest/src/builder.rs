@@ -238,10 +238,13 @@ impl WorkerConfig {
     /// Replace the queue list.
     #[must_use]
     pub fn with_queues<'a>(mut self, queues: impl IntoIterator<Item = &'a str>) -> Self {
-        self.queues = queues.into_iter().map(|q| {
-            assert!(!q.is_empty(), "queue name cannot be empty");
-            q.to_owned()
-        }).collect();
+        self.queues = queues
+            .into_iter()
+            .map(|q| {
+                assert!(!q.is_empty(), "queue name cannot be empty");
+                q.to_owned()
+            })
+            .collect();
         self
     }
 
