@@ -97,8 +97,8 @@ mod tests {
     use super::*;
     use crate::session::SessionRedisConfig;
 
-    #[test]
-    fn redis_store_from_config_missing_url() {
+    #[tokio::test]
+    async fn redis_store_from_config_missing_url() {
         let config = SessionConfig {
             redis: SessionRedisConfig {
                 url: None,
@@ -113,8 +113,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn redis_store_from_config_empty_url() {
+    #[tokio::test]
+    async fn redis_store_from_config_empty_url() {
         let config = SessionConfig {
             redis: SessionRedisConfig {
                 url: Some("   ".to_string()),
@@ -129,8 +129,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn redis_store_from_config_invalid_url() {
+    #[tokio::test]
+    async fn redis_store_from_config_invalid_url() {
         let config = SessionConfig {
             redis: SessionRedisConfig {
                 url: Some("not a redis url".to_string()),
@@ -145,8 +145,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn redis_store_key_for() {
+    #[tokio::test]
+    async fn redis_store_key_for() {
         let store = RedisStore {
             connection: ConnectionManager::new_lazy_with_config(
                 redis::Client::open("redis://127.0.0.1/").unwrap(),
