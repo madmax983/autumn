@@ -371,4 +371,39 @@ mod tests {
         let response = info.into_default_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn fallback_404_produces_empty_body_and_is_formatted() {
+
+        struct JsonFilter;
+        impl ExceptionFilter for JsonFilter {
+            fn filter(&self, _error: &AutumnErrorInfo, response: Response) -> Response {
+                response
+            }
+        }
+
+        let app = Router::new()
+            .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(ExceptionFilterLayer::new(vec![Arc::new(JsonFilter)]));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("error"));
+        assert!(body_str.contains("404"));
+    }
 }
