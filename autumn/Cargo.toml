@@ -90,6 +90,7 @@ redis.workspace = true
 proptest = "1.4"
 tokio-tungstenite = "0.29.0"
 loom = "0.7.2"
+temp-env = { version = "0.3.6", features = ["async_closure"] }
 
 [lints]
 workspace = true
