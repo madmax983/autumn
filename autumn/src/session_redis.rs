@@ -91,3 +91,71 @@ impl SessionStore for RedisStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::SessionRedisConfig;
+
+    #[tokio::test]
+    async fn redis_store_from_config_missing_url() {
+        let config = SessionConfig {
+            redis: SessionRedisConfig {
+                url: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = RedisStore::from_config(&config);
+        assert!(matches!(
+            result,
+            Err(SessionBackendConfigError::MissingRedisUrl)
+        ));
+    }
+
+    #[tokio::test]
+    async fn redis_store_from_config_empty_url() {
+        let config = SessionConfig {
+            redis: SessionRedisConfig {
+                url: Some("   ".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = RedisStore::from_config(&config);
+        assert!(matches!(
+            result,
+            Err(SessionBackendConfigError::MissingRedisUrl)
+        ));
+    }
+
+    #[tokio::test]
+    async fn redis_store_from_config_invalid_url() {
+        let config = SessionConfig {
+            redis: SessionRedisConfig {
+                url: Some("not a redis url".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = RedisStore::from_config(&config);
+        assert!(matches!(
+            result,
+            Err(SessionBackendConfigError::InvalidRedisUrl(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn redis_store_key_for() {
+        let store = RedisStore {
+            connection: ConnectionManager::new_lazy_with_config(
+                redis::Client::open("redis://127.0.0.1/").unwrap(),
+                ConnectionManagerConfig::new(),
+            )
+            .unwrap(),
+            key_prefix: "autumn:session".to_string(),
+            ttl_secs: 3600,
+        };
+        assert_eq!(store.key_for("12345"), "autumn:session:12345");
+    }
+}
