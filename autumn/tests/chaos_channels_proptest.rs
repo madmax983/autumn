@@ -15,6 +15,11 @@ proptest! {
         // Edge case: Sending with no subscribers should cleanly error, not panic
         let res = tx.send("test");
         prop_assert!(res.is_err());
+
+        // Exercise capacity: Adding a subscriber should make the send successful
+        // and actually rely on the generated capacity.
+        let _rx = channels.subscribe("test_channel");
+        prop_assert!(tx.send("test_with_subscriber").is_ok());
     }
 }
 
