@@ -418,4 +418,94 @@ mod tests {
                 .is_some()
         );
     }
+
+    #[tokio::test]
+    async fn fallback_404_produces_empty_body_and_preserves_only_one_extension() {
+
+        use crate::middleware::error_page_filter::WantsHtml;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        struct InjectExtensionFilter;
+        impl ExceptionFilter for InjectExtensionFilter {
+            fn filter(&self, _error: &AutumnErrorInfo, mut response: Response) -> Response {
+                response.extensions_mut().insert(WantsHtml(true));
+                response
+            }
+        }
+
+        let app = Router::new()
+            .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(ExceptionFilterLayer::new(vec![Arc::new(
+                InjectExtensionFilter,
+            )]));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.extensions().get::<WantsHtml>().is_some());
+        assert!(
+            response
+                .extensions()
+                .get::<crate::middleware::error_page_filter::ErrorPageRequestContext>()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_404_produces_empty_body_and_preserves_the_other_extension() {
+
+        use crate::middleware::error_page_filter::ErrorPageRequestContext;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        struct InjectExtensionFilter;
+        impl ExceptionFilter for InjectExtensionFilter {
+            fn filter(&self, _error: &AutumnErrorInfo, mut response: Response) -> Response {
+                response.extensions_mut().insert(ErrorPageRequestContext {
+                    uri: "/missing".parse().unwrap(),
+                    request_id: None,
+                });
+                response
+            }
+        }
+
+        let app = Router::new()
+            .fallback(crate::middleware::error_page_filter::fallback_404_handler)
+            .layer(ExceptionFilterLayer::new(vec![Arc::new(
+                InjectExtensionFilter,
+            )]));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response
+                .extensions()
+                .get::<crate::middleware::error_page_filter::WantsHtml>()
+                .is_none()
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<ErrorPageRequestContext>()
+                .is_some()
+        );
+    }
 }
