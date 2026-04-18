@@ -431,7 +431,8 @@ impl std::fmt::Debug for AppState {
             &self
                 .extensions
                 .lock()
-                .map_or(0, |extensions| extensions.len()),
+                .map_or(0, |extensions| extensions.len())
+                ,
         );
         s.field("profile", &self.profile)
             .field("started_at", &self.started_at)

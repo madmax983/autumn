@@ -465,12 +465,15 @@ fn find_pending_scheduled_activity(
         })
         .collect::<HashSet<_>>();
 
-    let mut pending = history.iter().filter_map(|event| match event {
-        WorkflowEvent::ActivityScheduled {
-            activity_id, name, ..
-        } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
-        _ => None,
-    });
+    let mut pending = history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id, name, ..
+            } if name == activity_name && !terminal_ids.contains(activity_id) => Some(*activity_id),
+            _ => None,
+        })
+        ;
 
     match (pending.next(), pending.next()) {
         (Some(activity_id), None) => Ok(activity_id),
