@@ -183,7 +183,7 @@ impl Channels {
     /// # Panics
     ///
     /// Panics if the internal mutex is poisoned (indicates a prior panic
-    /// while holding the lock).
+    /// while holding the lock — a bug).
     ///
     /// # Examples
     ///
@@ -223,7 +223,8 @@ impl Channels {
     ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned.
+    /// Panics if the internal mutex is poisoned (indicates a prior panic
+    /// while holding the lock — a bug).
     ///
     /// # Examples
     ///
@@ -261,7 +262,8 @@ impl Channels {
     ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned.
+    /// Panics if the internal mutex is poisoned (indicates a prior panic
+    /// while holding the lock — a bug).
     #[must_use]
     pub fn channel_count(&self) -> usize {
         let registry = self.inner.registry.lock().expect("channels lock poisoned");
@@ -275,7 +277,8 @@ impl Channels {
     ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned.
+    /// Panics if the internal mutex is poisoned (indicates a prior panic
+    /// while holding the lock — a bug).
     pub fn gc(&self) {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
         registry.retain(|_, tx| tx.receiver_count() > 0 || Arc::strong_count(tx) > 1);
@@ -287,7 +290,8 @@ impl Channels {
     ///
     /// # Panics
     ///
-    /// Panics if the internal mutex is poisoned.
+    /// Panics if the internal mutex is poisoned (indicates a prior panic
+    /// while holding the lock — a bug).
     #[must_use]
     pub fn snapshot(&self) -> HashMap<String, usize> {
         let registry = self.inner.registry.lock().expect("channels lock poisoned");
