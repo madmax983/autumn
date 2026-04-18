@@ -655,7 +655,6 @@ struct DatabaseCheck {
 }
 
 /// `GET <actuator-prefix>/health`
-#[allow(unused_variables)]
 pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
