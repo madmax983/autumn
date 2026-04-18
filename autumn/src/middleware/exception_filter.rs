@@ -372,13 +372,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-
-
-
-
     #[tokio::test]
     async fn fallback_404_produces_empty_body_and_preserves_extensions() {
-        use crate::middleware::error_page_filter::{WantsHtml, ErrorPageRequestContext};
+        use crate::middleware::error_page_filter::{ErrorPageRequestContext, WantsHtml};
         use axum::http::Request;
         use tower::ServiceExt;
 
@@ -399,7 +395,9 @@ mod tests {
         // across the default JSON body fallback.
         let app = Router::new()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
-            .layer(ExceptionFilterLayer::new(vec![Arc::new(InjectExtensionFilter)]));
+            .layer(ExceptionFilterLayer::new(vec![Arc::new(
+                InjectExtensionFilter,
+            )]));
 
         let response = app
             .oneshot(
@@ -413,6 +411,11 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(response.extensions().get::<WantsHtml>().is_some());
-        assert!(response.extensions().get::<ErrorPageRequestContext>().is_some());
+        assert!(
+            response
+                .extensions()
+                .get::<ErrorPageRequestContext>()
+                .is_some()
+        );
     }
 }
