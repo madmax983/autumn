@@ -577,4 +577,22 @@ mod tests {
         assert_eq!(error.status(), StatusCode::NOT_FOUND);
         assert_eq!(error.to_string(), "No route matches /some/unknown/path");
     }
+
+    #[tokio::test]
+    async fn fallback_404_handler_ignores_query_params() {
+        let uri = axum::http::Uri::from_static("/search?q=rust&sort=desc");
+        let error = fallback_404_handler(uri).await;
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.to_string(), "No route matches /search");
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_with_root_path() {
+        let uri = axum::http::Uri::from_static("/");
+        let error = fallback_404_handler(uri).await;
+
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(error.to_string(), "No route matches /");
+    }
 }
