@@ -799,26 +799,29 @@ pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static
 // ── Metrics ────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
-#[allow(unused_variables, unused_mut)]
 pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
     let snapshot = state.metrics().snapshot();
-    let mut result = serde_json::to_value(&snapshot).unwrap_or_default();
+    let result = serde_json::to_value(&snapshot).unwrap_or_default();
 
     // Include DB pool stats if available
     #[cfg(feature = "db")]
-    if let Some(pool) = state.pool() {
-        let status = pool.status();
-        let db_stats = serde_json::json!({
-            "pool_size": status.max_size,
-            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
-            "idle_connections": status.available,
-        });
-        if let serde_json::Value::Object(ref mut map) = result {
-            map.insert("database".to_string(), db_stats);
+    let result = {
+        let mut result = result;
+        if let Some(pool) = state.pool() {
+            let status = pool.status();
+            let db_stats = serde_json::json!({
+                "pool_size": status.max_size,
+                "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+                "idle_connections": status.available,
+            });
+            if let serde_json::Value::Object(ref mut map) = result {
+                map.insert("database".to_string(), db_stats);
+            }
         }
-    }
+        result
+    };
 
     Json(result)
 }
