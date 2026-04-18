@@ -236,9 +236,19 @@ impl Default for WorkerConfig {
 
 impl WorkerConfig {
     /// Replace the queue list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the provided queue names are empty strings.
     #[must_use]
     pub fn with_queues<'a>(mut self, queues: impl IntoIterator<Item = &'a str>) -> Self {
-        self.queues = queues.into_iter().map(str::to_owned).collect();
+        self.queues = queues
+            .into_iter()
+            .map(|q| {
+                assert!(!q.is_empty(), "queue name cannot be empty");
+                q.to_owned()
+            })
+            .collect();
         self
     }
 
@@ -353,5 +363,17 @@ mod tests {
 
         assert_eq!(registry.state::<String>(), Some(&String::from("haunted")));
         assert!(worker_config.queues.contains(&"default".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "queue name cannot be empty")]
+    fn worker_config_with_empty_queue_name_panics() {
+        let _config = WorkerConfig::default().with_queues(["", "default"]);
+    }
+
+    #[test]
+    fn worker_config_with_empty_iterator_clears_queues() {
+        let config = WorkerConfig::default().with_queues(Vec::<&str>::new());
+        assert!(config.queues.is_empty());
     }
 }
