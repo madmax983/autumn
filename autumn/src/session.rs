@@ -885,7 +885,7 @@ mod tests {
         assert_eq!(config.backend, SessionBackend::Memory);
         assert_eq!(config.cookie_name, "autumn.sid");
         assert_eq!(config.max_age_secs, 86400);
-        assert!(!config.secure);
+        assert!(config.secure);
         assert_eq!(config.same_site, "Lax");
         assert!(config.http_only);
         assert_eq!(config.path, "/");
