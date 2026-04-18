@@ -1,3 +1,10 @@
+//! Types and metadata for static site generation.
+//!
+//! This module defines the data structures used throughout the static generation process:
+//! - Metadata emitted by route macros ([`StaticRouteMeta`]).
+//! - The persistent JSON manifest format ([`StaticManifest`]).
+//! - Types for handling parameterized static routes ([`StaticParams`], [`ParamsFn`]).
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;

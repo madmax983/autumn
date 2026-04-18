@@ -1,3 +1,14 @@
+//! Development server auto-reload middleware.
+//!
+//! Provides the automatic page refresh functionality for `autumn dev`.
+//!
+//! When enabled, it performs two main tasks:
+//! 1. Disables caching for static assets (CSS, JS, etc.).
+//! 2. Injects a tiny JavaScript polling snippet just before the closing `</body>`
+//!    tag of outgoing HTML responses. The script polls a framework endpoint to
+//!    detect when source files have changed and triggers a page reload or CSS
+//!    swap automatically.
+
 use axum::body::Body;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPIRES, PRAGMA,
