@@ -438,7 +438,7 @@ mod tests {
         // If a user has upper case tags, we shouldn't fail or panic, we just won't inject.
         let upper_body = inject_snippet(b"<HTML><BODY>ok</BODY></HTML>");
         let upper_result = std::str::from_utf8(&upper_body).expect("utf-8");
-        assert_eq!(&upper_result[..], "<HTML><BODY>ok</BODY></HTML>");
+        assert_eq!(upper_result, "<HTML><BODY>ok</BODY></HTML>");
     }
 
     #[test]
