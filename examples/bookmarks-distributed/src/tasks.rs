@@ -85,6 +85,26 @@ async fn process_shard(
     Ok((shard_checked_count, dead_count))
 }
 
+fn process_shard_result(
+    result: std::thread::Result<AutumnResult<(u32, u32)>>,
+    release_result: AutumnResult<()>,
+) -> AutumnResult<(u32, u32)> {
+    match (result, release_result) {
+        (Ok(Ok(counts)), Ok(())) => Ok(counts),
+        (Ok(Err(err)), Ok(())) => Err(err),
+        (Ok(Ok(_)), Err(err)) => Err(err),
+        (Ok(Err(err)), Err(release_err)) => {
+            tracing::warn!(release_error = %release_err, "link-checker shard release failed after shard error");
+            Err(err)
+        }
+        (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
+        (Err(panic), Err(release_err)) => {
+            tracing::error!(release_error = %release_err, "link-checker shard release failed after panic");
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
 #[scheduled(every = "1h", name = "link-checker")]
 pub async fn check_links(_state: AppState) -> AutumnResult<()> {
     let repo = BookmarkRepository;
@@ -108,24 +128,10 @@ pub async fn check_links(_state: AppState) -> AutumnResult<()> {
             .await;
         let release_result = BookmarkRepository::release_shard_lease(lease).await;
 
-        match (result, release_result) {
-            (Ok(Ok((shard_checked_count, shard_dead_count))), Ok(())) => {
-                owned_shards += 1;
-                dead_count += shard_dead_count;
-                checked_count += shard_checked_count;
-            }
-            (Ok(Err(err)), Ok(())) => return Err(err),
-            (Ok(Ok(_)), Err(err)) => return Err(err),
-            (Ok(Err(err)), Err(release_err)) => {
-                tracing::warn!(release_error = %release_err, "link-checker shard release failed after shard error");
-                return Err(err);
-            }
-            (Err(panic), Ok(())) => std::panic::resume_unwind(panic),
-            (Err(panic), Err(release_err)) => {
-                tracing::error!(release_error = %release_err, "link-checker shard release failed after panic");
-                std::panic::resume_unwind(panic);
-            }
-        }
+        let (shard_checked_count, shard_dead_count) = process_shard_result(result, release_result)?;
+        owned_shards += 1;
+        dead_count += shard_dead_count;
+        checked_count += shard_checked_count;
     }
 
     tracing::info!(
@@ -139,7 +145,10 @@ pub async fn check_links(_state: AppState) -> AutumnResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{head_requires_get_fallback, probe_outcome, response_is_reachable};
+    use super::{
+        head_requires_get_fallback, probe_outcome, process_shard_result, response_is_reachable,
+    };
+    use autumn_web::error::AutumnError;
     use reqwest::StatusCode;
 
     #[test]
@@ -178,5 +187,57 @@ mod tests {
     fn hard_head_failures_do_not_trigger_fallback() {
         assert!(!probe_outcome(Ok(StatusCode::NOT_FOUND), None));
         assert!(!probe_outcome(Err(()), None));
+    }
+
+    #[test]
+    fn process_shard_result_both_ok_returns_counts() {
+        let result = process_shard_result(Ok(Ok((5, 2))), Ok(()));
+        assert_eq!(result.unwrap(), (5, 2));
+    }
+
+    #[test]
+    fn process_shard_result_shard_err_release_ok_returns_shard_error() {
+        let err = AutumnError::bad_request_msg("shard failure");
+        let result = process_shard_result(Ok(Err(err)), Ok(()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shard failure"));
+    }
+
+    #[test]
+    fn process_shard_result_shard_ok_release_err_returns_release_error() {
+        let release_err = AutumnError::bad_request_msg("release failure");
+        let result = process_shard_result(Ok(Ok((3, 1))), Err(release_err));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("release failure"));
+    }
+
+    #[test]
+    fn process_shard_result_both_err_returns_shard_error() {
+        let shard_err = AutumnError::bad_request_msg("shard error");
+        let release_err = AutumnError::bad_request_msg("release error");
+        let result = process_shard_result(Ok(Err(shard_err)), Err(release_err));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("shard error"));
+    }
+
+    #[test]
+    fn process_shard_result_panic_with_ok_release_resumes_panic() {
+        let panic_payload =
+            std::panic::catch_unwind(|| panic!("test panic for process_shard_result")).unwrap_err();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = process_shard_result(Err(panic_payload), Ok(()));
+        }));
+        assert!(caught.is_err(), "panic should have been re-raised");
+    }
+
+    #[test]
+    fn process_shard_result_panic_with_release_err_resumes_panic() {
+        let panic_payload =
+            std::panic::catch_unwind(|| panic!("test panic for process_shard_result")).unwrap_err();
+        let release_err = AutumnError::bad_request_msg("release error");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = process_shard_result(Err(panic_payload), Err(release_err));
+        }));
+        assert!(caught.is_err(), "panic should have been re-raised");
     }
 }
