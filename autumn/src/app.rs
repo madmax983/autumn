@@ -125,7 +125,7 @@ pub struct AppBuilder {
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
     /// Plugin names that have already been applied, for duplicate detection.
-    registered_plugins: HashSet<&'static str>,
+    registered_plugins: HashSet<String>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
@@ -490,14 +490,14 @@ impl AppBuilder {
         P: crate::plugin::Plugin,
     {
         let name = plugin.name();
-        if self.registered_plugins.contains(name) {
+        if self.registered_plugins.contains(name.as_ref()) {
             tracing::warn!(
-                plugin = name,
+                plugin = name.as_ref(),
                 "plugin already registered; skipping duplicate"
             );
             return self;
         }
-        self.registered_plugins.insert(name);
+        self.registered_plugins.insert(name.into_owned());
         plugin.build(self)
     }
 

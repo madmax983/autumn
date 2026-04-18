@@ -95,15 +95,21 @@ so a second instance of the same plugin type is skipped with a
 designed to be registered more than once (rare — most plugins should
 accept a `Vec`-shaped input instead).
 
+`name` returns [`Cow<'static, str>`], so plugins can compute a unique
+label from runtime configuration without leaking memory:
+
 ```rust
+use std::borrow::Cow;
+
 impl Plugin for ShardedPlugin {
-    fn name(&self) -> &'static str {
-        // Safe because shard labels are static &'static str literals:
-        self.shard_label
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Owned(format!("sharded-plugin:{}", self.shard))
     }
     // ...
 }
 ```
+
+[`Cow<'static, str>`]: https://doc.rust-lang.org/std/borrow/enum.Cow.html
 
 ## Object safety
 

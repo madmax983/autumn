@@ -60,6 +60,8 @@
 //! default -- override [`Plugin::name`] if a plugin is genuinely designed to
 //! be registered more than once.
 
+use std::borrow::Cow;
+
 use crate::app::AppBuilder;
 
 /// A reusable Autumn integration that wires itself into an [`AppBuilder`].
@@ -68,10 +70,13 @@ use crate::app::AppBuilder;
 pub trait Plugin: Sized + Send + 'static {
     /// Stable identifier used for duplicate-registration detection.
     ///
-    /// Defaults to [`std::any::type_name`] of the concrete plugin struct.
-    /// Override to allow multiple instances of the same type to coexist.
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
+    /// Defaults to [`std::any::type_name`] of the concrete plugin struct, so
+    /// two instances of the same type collide by default. Override to allow
+    /// multiple instances of the same type to coexist; the return type is
+    /// [`Cow<'static, str>`](std::borrow::Cow) so plugins can compute a
+    /// unique label from runtime configuration without leaking memory.
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(std::any::type_name::<Self>())
     }
 
     /// Apply this plugin's configuration to the builder.
@@ -157,8 +162,8 @@ mod tests {
     }
 
     impl Plugin for RecordingPlugin {
-        fn name(&self) -> &'static str {
-            self.label
+        fn name(&self) -> Cow<'static, str> {
+            Cow::Borrowed(self.label)
         }
 
         fn build(self, app: AppBuilder) -> AppBuilder {
