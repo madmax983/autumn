@@ -70,7 +70,7 @@ async fn eris_auth_dos_poc() {
 
     assert!(ping_success, "Ping request failed");
 
-    // To prove the fix, we assert that ping returns in a reasonable time.
+    // To prove the fix, we assert that ping returns fast.
     // A true DoS (blocking workers) would make this take 30+ seconds,
     // while the non-blocking implementation allows the ping to respond immediately.
     assert!(
