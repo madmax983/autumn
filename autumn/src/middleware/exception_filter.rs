@@ -374,7 +374,6 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_404_produces_empty_body_and_is_formatted() {
-
         struct JsonFilter;
         impl ExceptionFilter for JsonFilter {
             fn filter(&self, _error: &AutumnErrorInfo, response: Response) -> Response {
