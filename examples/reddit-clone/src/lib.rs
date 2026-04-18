@@ -16,8 +16,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
+    use autumn_harvest_plugin::{HarvestMode, HarvestRuntimeConfig};
     use autumn_web::config::{AutumnConfig, MockEnv};
-    use autumn_web_harvest::{HarvestMode, HarvestRuntimeConfig};
 
     use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
 
@@ -63,7 +63,7 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let app_migrations = collect_migration_versions(&manifest_dir.join("migrations"));
         let harvest_adapter_migrations = collect_migration_versions(
-            &manifest_dir.join("../../autumn-harvest/autumn-web-harvest/migrations"),
+            &manifest_dir.join("../../autumn-harvest/autumn-harvest-plugin/migrations"),
         );
         let harvest_migrations = collect_migration_versions(
             &manifest_dir.join("../../autumn-harvest/autumn-harvest/migrations"),
@@ -76,7 +76,7 @@ mod tests {
 
         assert!(
             collisions.is_empty(),
-            "reddit-clone and autumn-web-harvest migrations must not share Diesel version prefixes: {collisions:?}",
+            "reddit-clone and autumn-harvest-plugin migrations must not share Diesel version prefixes: {collisions:?}",
         );
 
         let collisions: Vec<_> = app_migrations

@@ -10,7 +10,7 @@ path = "src/bin/harvest-runner.rs"
 
 [dependencies]
 autumn-harvest = { path = "../../autumn-harvest/autumn-harvest" }
-autumn-web-harvest = { path = "../../autumn-harvest/autumn-web-harvest" }
+autumn-harvest-plugin = { path = "../../autumn-harvest/autumn-harvest-plugin" }
 autumn-web = { path = "../../autumn", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }

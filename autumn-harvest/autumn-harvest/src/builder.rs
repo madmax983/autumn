@@ -8,8 +8,8 @@ use crate::info::{ActivityInfo, DagInfo, WorkflowInfo};
 
 /// Fluent builder for configuring the autumn-harvest engine.
 ///
-/// In a full Autumn app, this is consumed by the `HarvestExt` trait from the
-/// `autumn-web-harvest` adapter crate. In tests or standalone use, call
+/// In a full Autumn app, this is consumed by `HarvestPlugin` from the
+/// `autumn-harvest-plugin` crate. In tests or standalone use, call
 /// `.build()` directly.
 #[derive(Default)]
 pub struct HarvestBuilder {

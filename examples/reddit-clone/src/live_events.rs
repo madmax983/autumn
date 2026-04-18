@@ -18,6 +18,7 @@ use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
 use autumn_web::error::AutumnError;
+use autumn_web::plugin::Plugin;
 use chrono::{NaiveDateTime, Utc};
 use diesel::ExpressionMethods;
 use diesel::QueryDsl;
@@ -466,9 +467,24 @@ fn ensure_live_feed_relay_health(
     }
 }
 
-#[must_use]
-pub fn configure_live_feed(builder: AppBuilder) -> AppBuilder {
-    builder.on_startup(start_live_event_relay)
+/// Plugin that spawns the durable live-feed relay during app startup.
+///
+/// Serves as a second in-tree example of the [`Plugin`] trait, alongside the
+/// first-party `HarvestPlugin`, to validate that the contract generalises.
+#[derive(Default)]
+pub struct LiveFeedPlugin;
+
+impl LiveFeedPlugin {
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Plugin for LiveFeedPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        app.on_startup(start_live_event_relay)
+    }
 }
 
 pub async fn install_live_event_bus(state: &AppState) -> AutumnResult<()> {

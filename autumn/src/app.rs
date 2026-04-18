@@ -25,7 +25,7 @@
 //! ```
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -73,6 +73,7 @@ pub fn app() -> AppBuilder {
         startup_hooks: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
+        registered_plugins: HashSet::new(),
         error_page_renderer: None,
         #[cfg(feature = "db")]
         migrations: Vec::new(),
@@ -123,6 +124,8 @@ pub struct AppBuilder {
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
+    /// Plugin names that have already been applied, for duplicate detection.
+    registered_plugins: HashSet<&'static str>,
     /// Custom error page renderer (overrides built-in pages).
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
@@ -473,6 +476,48 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
+    ///
+    /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
+    /// per [`AppBuilder`]. Registering two plugins that share a
+    /// [`name`](crate::plugin::Plugin::name) is a no-op after the first: the
+    /// duplicate emits a `tracing::warn!` and the builder is returned
+    /// unchanged.
+    #[must_use]
+    #[track_caller]
+    pub fn plugin<P>(mut self, plugin: P) -> Self
+    where
+        P: crate::plugin::Plugin,
+    {
+        let name = plugin.name();
+        if self.registered_plugins.contains(name) {
+            tracing::warn!(
+                plugin = name,
+                "plugin already registered; skipping duplicate"
+            );
+            return self;
+        }
+        self.registered_plugins.insert(name);
+        plugin.build(self)
+    }
+
+    /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
+    /// of plugins) to the builder, in declaration order.
+    #[must_use]
+    pub fn plugins<P>(self, plugins: P) -> Self
+    where
+        P: crate::plugin::Plugins,
+    {
+        plugins.apply(self)
+    }
+
+    /// Return `true` if a plugin with the given [`Plugin::name`](crate::plugin::Plugin::name)
+    /// has already been applied to this builder.
+    #[must_use]
+    pub fn has_plugin(&self, name: &str) -> bool {
+        self.registered_plugins.contains(name)
+    }
+
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
@@ -544,6 +589,7 @@ impl AppBuilder {
             startup_hooks,
             shutdown_hooks,
             extensions: _,
+            registered_plugins: _,
             error_page_renderer,
             #[cfg(feature = "db")]
             migrations,
@@ -717,6 +763,7 @@ impl AppBuilder {
             startup_hooks: _,
             shutdown_hooks: _,
             extensions: _,
+            registered_plugins: _,
             error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,

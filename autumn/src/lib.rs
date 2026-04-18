@@ -82,7 +82,9 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "db")]
 pub mod migrate;
+pub mod plugin;
 pub mod probe;
+pub use plugin::{Plugin, Plugins};
 
 /// Router construction and integration with Axum.
 ///

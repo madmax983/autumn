@@ -5,6 +5,45 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Plugin` trait and `AppBuilder::plugin` / `plugins` / `has_plugin` for
+  composable, Bevy-style integrations. `Plugin::build(self, app)` runs
+  exactly once per builder; duplicate names warn and are skipped. See
+  `docs/plugins.md` for authoring conventions.
+- `HarvestPlugin` in `autumn-harvest-plugin` replaces the old extension-trait
+  API with a plugin-style authoring contract.
+
+### Changed
+
+- **Breaking:** Renamed `autumn-web-harvest` crate to `autumn-harvest-plugin`.
+  Update `Cargo.toml` path dependencies and `use autumn_web_harvest::...`
+  imports to `use autumn_harvest_plugin::...`.
+- **Breaking:** Removed `HarvestExt` and its fluent methods on `AppBuilder`
+  (`.workflows`, `.activities`, `.dags`, `.state`, `.worker`, `.harvest_api`,
+  `.harvest_api_with_auth`). Build a `HarvestPlugin` with the equivalent
+  fluent methods and register it with `.plugin(...)` or `.plugins((...))`.
+  Before:
+  ```rust
+  autumn_web::app()
+      .workflows(workflows![...])
+      .activities(activities![...])
+      .worker(WorkerConfig::default())
+      .harvest_api("/api/harvest")
+  ```
+  After:
+  ```rust
+  autumn_web::app().plugin(
+      HarvestPlugin::new()
+          .workflows(workflows![...])
+          .activities(activities![...])
+          .worker(WorkerConfig::default())
+          .api("/api/harvest"),
+  )
+  ```
+
 ## [0.1.0] - 2026-03-26
 
 ### Added
