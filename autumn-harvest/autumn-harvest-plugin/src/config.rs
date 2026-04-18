@@ -514,7 +514,7 @@ mode = "embedded"
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "autumn-web-harvest-{label}-{}",
+            "autumn-harvest-plugin-{label}-{}",
             uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).expect("temp dir should be created");

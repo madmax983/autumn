@@ -30,9 +30,9 @@ jobs:
       - name: Harvest clippy
         working-directory: autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
-      - name: Harvest Autumn adapter clippy
+      - name: Harvest Autumn plugin clippy
         working-directory: autumn-harvest
-        run: cargo clippy -p autumn-web-harvest --all-targets -- -D warnings
+        run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Harvest macros clippy
         working-directory: autumn-harvest
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
@@ -60,15 +60,15 @@ jobs:
       - name: Run harvest all-features lib tests
         working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --all-features --lib
-      - name: Run harvest Autumn adapter lib tests
+      - name: Run harvest Autumn plugin lib tests
         working-directory: autumn-harvest
-        run: cargo test -p autumn-web-harvest --lib
+        run: cargo test -p autumn-harvest-plugin --lib
       - name: Run harvest macros tests
         working-directory: autumn-harvest
         run: cargo test -p autumn-harvest-macros
-      - name: Compile harvest Autumn adapter integration tests
+      - name: Compile harvest Autumn plugin integration tests
         working-directory: autumn-harvest
-        run: cargo test -p autumn-web-harvest --test api_scheduler_integration --no-run
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --no-run
       - name: Run framework Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
@@ -76,10 +76,10 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --test integration_e2e -- --test-threads=1
-      - name: Run harvest Autumn adapter API and scheduler integration tests
+      - name: Run harvest Autumn plugin API and scheduler integration tests
         if: runner.os == 'Linux'
         working-directory: autumn-harvest
-        run: cargo test -p autumn-web-harvest --test api_scheduler_integration -- --test-threads=1
+        run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
 
   coverage:
     name: Coverage

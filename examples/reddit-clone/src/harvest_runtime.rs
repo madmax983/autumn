@@ -1,7 +1,6 @@
 use autumn_harvest::HarvestBuilder;
 use autumn_harvest::prelude::WorkerConfig;
-use autumn_web::app::AppBuilder;
-use autumn_web_harvest::HarvestExt;
+use autumn_harvest_plugin::HarvestPlugin;
 
 use crate::workflows;
 
@@ -25,14 +24,12 @@ pub fn harvest_builder() -> HarvestBuilder {
 }
 
 #[must_use]
-pub fn configure_embedded_harvest(builder: AppBuilder) -> AppBuilder {
-    let worker_config = configured_worker_config();
-
-    builder
+pub fn harvest_plugin() -> HarvestPlugin {
+    HarvestPlugin::new()
         .workflows(workflows::registered_workflows())
         .activities(workflows::registered_activities())
-        .worker(worker_config)
-        .harvest_api(HARVEST_API_PATH)
+        .worker(configured_worker_config())
+        .api(HARVEST_API_PATH)
 }
 
 #[cfg(test)]

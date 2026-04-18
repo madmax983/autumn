@@ -1,6 +1,6 @@
 [package]
-name = "autumn-web-harvest"
-description = "Autumn web-framework adapter for autumn-harvest"
+name = "autumn-harvest-plugin"
+description = "Autumn plugin for autumn-harvest durable workflows"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

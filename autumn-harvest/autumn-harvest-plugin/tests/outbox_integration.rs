@@ -1,9 +1,9 @@
-use autumn_web::AppState;
-use autumn_web::config::DatabaseConfig;
-use autumn_web_harvest::{
+use autumn_harvest_plugin::{
     HarvestDbPool, HarvestOutboxConfig, WorkflowStartRequest, drain_workflow_start_outbox_once,
     enqueue_workflow_start_outbox, flush_workflow_start_outbox,
 };
+use autumn_web::AppState;
+use autumn_web::config::DatabaseConfig;
 use diesel::QueryableByName;
 use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;

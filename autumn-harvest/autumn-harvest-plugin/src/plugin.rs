@@ -1,16 +1,16 @@
-//! Autumn `AppBuilder` integration for Harvest worker lifecycle.
+//! `HarvestPlugin` — the [`Plugin`](autumn_web::Plugin) implementation that wires
+//! the Harvest workflow engine into an Autumn [`AppBuilder`].
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use autumn_web::AppState;
-
 use autumn_web::app::AppBuilder;
-use autumn_web::config::AutumnConfig;
-use autumn_web::config::DatabaseConfig;
+use autumn_web::config::{AutumnConfig, DatabaseConfig};
 use autumn_web::db;
 use autumn_web::error::AutumnError;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::plugin::Plugin;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -35,6 +35,15 @@ struct HarvestRuntime {
     outbox: Option<OutboxRuntime>,
 }
 
+/// Plugin-local shared slot: holds the pre-built `HarvestBuilder` until the
+/// first `on_startup` call consumes it, then holds the running `HarvestRuntime`
+/// until `on_shutdown` stops it.
+#[derive(Default)]
+struct HarvestRuntimeSlot {
+    builder: Option<HarvestBuilder>,
+    runtime: Option<HarvestRuntime>,
+}
+
 type ApiMiddlewareFn = Box<
     dyn FnOnce(
             autumn_web::reexports::axum::Router<autumn_web::AppState>,
@@ -43,128 +52,95 @@ type ApiMiddlewareFn = Box<
         + Sync,
 >;
 
-#[derive(Default)]
-struct HarvestRegistration {
+/// Autumn plugin that embeds the Harvest workflow engine in an application.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_harvest_plugin::HarvestPlugin;
+/// use autumn_harvest::prelude::*;
+///
+/// # #[autumn_web::main]
+/// # async fn main() {
+/// autumn_web::app()
+///     .plugin(
+///         HarvestPlugin::new()
+///             .worker(WorkerConfig::default())
+///             .api("/api/harvest"),
+///     )
+///     .run()
+///     .await;
+/// # }
+/// ```
+pub struct HarvestPlugin {
     builder: HarvestBuilder,
     api_path: Option<String>,
     api_middleware: Option<ApiMiddlewareFn>,
 }
 
-#[derive(Default)]
-struct HarvestIntegrationShared {
-    registration: HarvestRegistration,
-    runtime: Option<HarvestRuntime>,
-}
-
-struct HarvestIntegration {
-    shared: Arc<Mutex<HarvestIntegrationShared>>,
-    api_state: HarvestApiState,
-    hooks_registered: bool,
-    api_route_registered: bool,
-}
-
-impl Default for HarvestIntegration {
+impl Default for HarvestPlugin {
     fn default() -> Self {
-        Self {
-            shared: Arc::new(Mutex::new(HarvestIntegrationShared::default())),
-            api_state: HarvestApiState::new(),
-            hooks_registered: false,
-            api_route_registered: false,
-        }
+        Self::new()
     }
 }
 
-/// Extension trait embedding Harvest into Autumn's application lifecycle.
-///
-/// The registered Harvest worker starts after [`AppState`] is constructed and
-/// stops during graceful shutdown. Harvest migrations are appended to the
-/// app's migration set the first time one of these methods is used.
-pub trait HarvestExt {
+impl HarvestPlugin {
+    /// Create a plugin with no workflows, activities, dags, or API mount.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            builder: HarvestBuilder::default(),
+            api_path: None,
+            api_middleware: None,
+        }
+    }
+
     /// Register workflow definitions produced by `autumn_harvest::workflows!`.
     #[must_use]
-    fn workflows(self, workflows: Vec<WorkflowInfo>) -> Self;
+    pub fn workflows(mut self, workflows: Vec<WorkflowInfo>) -> Self {
+        self.builder = self.builder.workflows(workflows);
+        self
+    }
 
     /// Register activity definitions produced by `autumn_harvest::activities!`.
     #[must_use]
-    fn activities(self, activities: Vec<ActivityInfo>) -> Self;
+    pub fn activities(mut self, activities: Vec<ActivityInfo>) -> Self {
+        self.builder = self.builder.activities(activities);
+        self
+    }
 
     /// Register DAG definitions produced by `autumn_harvest::dags!`.
     #[must_use]
-    fn dags(self, dags: Vec<DagInfo>) -> Self;
+    pub fn dags(mut self, dags: Vec<DagInfo>) -> Self {
+        self.builder = self.builder.dags(dags);
+        self
+    }
 
     /// Register typed shared state visible to workflow and activity handlers.
     #[must_use]
-    fn state<T: Any + Send + Sync>(self, value: T) -> Self;
+    pub fn state<T: Any + Send + Sync>(mut self, value: T) -> Self {
+        self.builder = self.builder.state(value);
+        self
+    }
 
     /// Configure the worker runtime.
     #[must_use]
-    fn worker(self, config: WorkerConfig) -> Self;
+    pub fn worker(mut self, config: WorkerConfig) -> Self {
+        self.builder = self.builder.worker(config);
+        self
+    }
 
     /// Mount the Harvest management API under `path`.
     #[must_use]
-    fn harvest_api(self, path: &str) -> Self;
+    pub fn api(mut self, path: impl Into<String>) -> Self {
+        self.api_path = Some(path.into());
+        self
+    }
 
-    /// Mount the Harvest management API under `path`, protected by the given middleware layer.
+    /// Mount the Harvest management API under `path`, protected by the given
+    /// tower middleware layer.
     #[must_use]
-    fn harvest_api_with_auth<M>(self, path: &str, middleware: M) -> Self
-    where
-        M: tower::Layer<autumn_web::reexports::axum::routing::Route>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        M::Service: tower::Service<autumn_web::reexports::axum::extract::Request>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Response:
-            autumn_web::reexports::axum::response::IntoResponse + 'static,
-        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Error:
-            Into<std::convert::Infallible> + 'static,
-        <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Future:
-            Send + 'static;
-}
-
-impl HarvestExt for AppBuilder {
-    fn workflows(self, workflows: Vec<WorkflowInfo>) -> Self {
-        configure_harvest(self, move |registration| {
-            registration.builder = std::mem::take(&mut registration.builder).workflows(workflows);
-        })
-    }
-
-    fn activities(self, activities: Vec<ActivityInfo>) -> Self {
-        configure_harvest(self, move |registration| {
-            registration.builder = std::mem::take(&mut registration.builder).activities(activities);
-        })
-    }
-
-    fn dags(self, dags: Vec<DagInfo>) -> Self {
-        configure_harvest(self, move |registration| {
-            registration.builder = std::mem::take(&mut registration.builder).dags(dags);
-        })
-    }
-
-    fn state<T: Any + Send + Sync>(self, value: T) -> Self {
-        configure_harvest(self, move |registration| {
-            registration.builder = std::mem::take(&mut registration.builder).state(value);
-        })
-    }
-
-    fn worker(self, config: WorkerConfig) -> Self {
-        configure_harvest(self, move |registration| {
-            registration.builder = std::mem::take(&mut registration.builder).worker(config);
-        })
-    }
-
-    fn harvest_api(self, path: &str) -> Self {
-        let path = path.to_owned();
-        configure_harvest(self, move |registration| {
-            registration.api_path = Some(path);
-        })
-    }
-
-    fn harvest_api_with_auth<M>(self, path: &str, middleware: M) -> Self
+    pub fn api_with_auth<M>(mut self, path: impl Into<String>, middleware: M) -> Self
     where
         M: tower::Layer<autumn_web::reexports::axum::routing::Route>
             + Clone
@@ -183,93 +159,60 @@ impl HarvestExt for AppBuilder {
         <M::Service as tower::Service<autumn_web::reexports::axum::extract::Request>>::Future:
             Send + 'static,
     {
-        let path = path.to_owned();
-        configure_harvest(self, move |registration| {
-            registration.api_path = Some(path);
-            registration.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
-        })
+        self.api_path = Some(path.into());
+        self.api_middleware = Some(Box::new(move |router| router.layer(middleware)));
+        self
     }
 }
 
-fn configure_harvest<F>(builder: AppBuilder, update: F) -> AppBuilder
-where
-    F: FnOnce(&mut HarvestRegistration),
-{
-    let mut register_hooks = false;
-    let mut api_mount = None;
-    let mut api_middleware = None;
-    let builder = builder.update_extension::<HarvestIntegration, _, _>(
-        HarvestIntegration::default,
-        |integration| {
-            {
-                let mut shared = integration.shared.lock().expect("harvest lock poisoned");
-                update(&mut shared.registration);
-                if !integration.api_route_registered {
-                    if let Some(path) = shared.registration.api_path.clone() {
-                        integration.api_route_registered = true;
-                        api_mount = Some((path, integration.api_state.clone()));
-                        api_middleware = shared.registration.api_middleware.take();
-                    }
+impl Plugin for HarvestPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        let Self {
+            builder,
+            api_path,
+            api_middleware,
+        } = self;
+
+        let slot = Arc::new(Mutex::new(HarvestRuntimeSlot {
+            builder: Some(builder),
+            runtime: None,
+        }));
+        let api_state = HarvestApiState::new();
+
+        let startup_slot = Arc::clone(&slot);
+        let shutdown_slot = Arc::clone(&slot);
+        let startup_api_state = api_state.clone();
+        let shutdown_api_state = api_state.clone();
+
+        let app = app
+            .on_startup(move |state| {
+                let slot = Arc::clone(&startup_slot);
+                let api_state = startup_api_state.clone();
+                async move { start_harvest_runtime(&state, &slot, &api_state) }
+            })
+            .on_shutdown(move || {
+                let slot = Arc::clone(&shutdown_slot);
+                let api_state = shutdown_api_state.clone();
+                async move {
+                    stop_harvest_runtime(slot, api_state).await;
                 }
-            }
+            });
 
-            if !integration.hooks_registered {
-                integration.hooks_registered = true;
-                register_hooks = true;
-            }
-        },
-    );
-
-    if !register_hooks {
-        return if let Some((path, api_state)) = api_mount {
+        if let Some(path) = api_path {
             let mut router = harvest_api_router(api_state);
             if let Some(mw) = api_middleware {
                 router = mw(router);
             }
-            builder.nest(&path, router)
+            app.nest(&path, router)
         } else {
-            builder
-        };
-    }
-
-    let integration = builder
-        .extension::<HarvestIntegration>()
-        .expect("harvest integration should be present");
-    let shared = integration.shared.clone();
-    let api_state = integration.api_state.clone();
-    let startup_shared = Arc::clone(&shared);
-    let shutdown_shared = Arc::clone(&shared);
-    let startup_api_state = api_state.clone();
-    let shutdown_api_state = api_state;
-
-    let builder = builder
-        .on_startup(move |state| {
-            let shared = Arc::clone(&startup_shared);
-            let api_state = startup_api_state.clone();
-            async move { start_harvest_runtime(&state, &shared, &api_state) }
-        })
-        .on_shutdown(move || {
-            let shared = Arc::clone(&shutdown_shared);
-            let api_state = shutdown_api_state.clone();
-            async move {
-                stop_harvest_runtime(shared, api_state).await;
-            }
-        });
-
-    if let Some((path, api_state)) = api_mount {
-        let mut router = harvest_api_router(api_state);
-        if let Some(mw) = api_middleware {
-            router = mw(router);
+            app
         }
-        builder.nest(&path, router)
-    } else {
-        builder
     }
 }
 
 fn start_harvest_runtime(
     state: &AppState,
-    shared: &Arc<Mutex<HarvestIntegrationShared>>,
+    slot: &Arc<Mutex<HarvestRuntimeSlot>>,
     api_state: &HarvestApiState,
 ) -> autumn_web::AutumnResult<()> {
     let app_config = AutumnConfig::load()
@@ -282,12 +225,9 @@ fn start_harvest_runtime(
     let app_pool = state.pool().cloned();
     let harvest_pool = resolve_harvest_pool(state, &harvest_config)?;
 
-    let (registration, runtime_already_started) = {
-        let mut guard = shared.lock().expect("harvest lock poisoned");
-        (
-            std::mem::take(&mut guard.registration),
-            guard.runtime.is_some(),
-        )
+    let (builder, runtime_already_started) = {
+        let mut guard = slot.lock().expect("harvest lock poisoned");
+        (guard.builder.take(), guard.runtime.is_some())
     };
 
     if runtime_already_started {
@@ -295,7 +235,13 @@ fn start_harvest_runtime(
         return Ok(());
     }
 
-    let built = registration.builder.build();
+    let Some(builder) = builder else {
+        return Err(AutumnError::service_unavailable_msg(
+            "harvest plugin builder was already consumed",
+        ));
+    };
+
+    let built = builder.build();
     state.insert_extension(harvest_config.outbox.clone());
     let mut runner_resources =
         HarvestRunnerResources::new(harvest_pool).with_app_state(runtime_state.clone());
@@ -319,7 +265,7 @@ fn start_harvest_runtime(
     api_state.install(runner.api_runtime());
 
     {
-        let mut guard = shared.lock().expect("harvest lock poisoned");
+        let mut guard = slot.lock().expect("harvest lock poisoned");
         guard.runtime = Some(HarvestRuntime { runner, outbox });
     }
     Ok(())
@@ -349,11 +295,8 @@ fn resolve_harvest_pool(
     }
 }
 
-async fn stop_harvest_runtime(
-    shared: Arc<Mutex<HarvestIntegrationShared>>,
-    api_state: HarvestApiState,
-) {
-    let runtime = { shared.lock().expect("harvest lock poisoned").runtime.take() };
+async fn stop_harvest_runtime(slot: Arc<Mutex<HarvestRuntimeSlot>>, api_state: HarvestApiState) {
+    let runtime = { slot.lock().expect("harvest lock poisoned").runtime.take() };
 
     let Some(runtime) = runtime else {
         api_state.clear();
@@ -455,12 +398,15 @@ mod tests {
     use super::*;
     use std::any::TypeId;
 
-    use crate::config::{HarvestDatabaseConfig, HarvestMode, HarvestRuntimeConfig};
+    use crate::config::{
+        HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig,
+    };
     use crate::runner::injected_runtime_state;
     use crate::{AppDbPool, HarvestDbPool};
     use autumn_harvest::dag::DagBuilder;
     use autumn_harvest::policy::Schedule;
     use autumn_web::config::DatabaseConfig;
+
     fn fake_workflow_info() -> WorkflowInfo {
         WorkflowInfo {
             name: "echo",
@@ -496,10 +442,6 @@ mod tests {
         }
     }
 
-    fn test_app_state() -> AppState {
-        AppState::for_test()
-    }
-
     fn test_pool(database_url: &str, pool_size: usize) -> DbPool {
         autumn_web::db::create_pool(&DatabaseConfig {
             url: Some(database_url.to_owned()),
@@ -511,77 +453,21 @@ mod tests {
     }
 
     #[test]
-    fn test_harvest_api_with_auth_configures_middleware() {
-        use crate::HarvestExt;
-        let builder = autumn_web::app()
-            .harvest_api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
-        let integration = builder.extension::<HarvestIntegration>().unwrap();
-        assert_eq!(
-            integration
-                .shared
-                .lock()
-                .unwrap()
-                .registration
-                .api_path
-                .as_deref(),
-            Some("/api")
-        );
-    }
-
-    #[test]
-    fn test_harvest_api_with_auth_after_hooks_configures_middleware() {
-        use crate::HarvestExt;
-        let builder = autumn_web::app()
-            .workflows(vec![])
-            .harvest_api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
-        let integration = builder.extension::<HarvestIntegration>().unwrap();
-        assert_eq!(
-            integration
-                .shared
-                .lock()
-                .unwrap()
-                .registration
-                .api_path
-                .as_deref(),
-            Some("/api")
-        );
-        assert!(
-            integration
-                .shared
-                .lock()
-                .unwrap()
-                .registration
-                .api_middleware
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn harvest_ext_accumulates_registration_on_app_builder() {
-        let builder = autumn_web::app()
+    fn harvest_plugin_accumulates_registrations_fluently() {
+        let plugin = HarvestPlugin::new()
             .workflows(vec![fake_workflow_info()])
             .activities(vec![fake_activity_info()])
             .dags(vec![fake_dag_info()])
             .state(String::from("haunted"))
             .worker(WorkerConfig::default().with_queues(["harvest"]))
-            .harvest_api("/api/harvest");
+            .api("/api/harvest");
 
-        let integration = builder
-            .extension::<HarvestIntegration>()
-            .expect("harvest integration should be attached");
-        assert!(integration.hooks_registered);
+        assert_eq!(plugin.builder.workflow_count(), 1);
+        assert_eq!(plugin.builder.activity_count(), 1);
+        assert_eq!(plugin.builder.dag_count(), 1);
+        assert_eq!(plugin.api_path.as_deref(), Some("/api/harvest"));
 
-        let mut shared = integration.shared.lock().expect("harvest lock poisoned");
-        assert_eq!(shared.registration.builder.workflow_count(), 1);
-        assert_eq!(shared.registration.builder.activity_count(), 1);
-        assert_eq!(shared.registration.builder.dag_count(), 1);
-        assert_eq!(
-            shared.registration.api_path.as_deref(),
-            Some("/api/harvest")
-        );
-
-        let built = std::mem::take(&mut shared.registration.builder).build();
-        drop(shared);
+        let built = plugin.builder.build();
         assert_eq!(
             built.worker_config().queues.first().map(String::as_str),
             Some("harvest")
@@ -590,8 +476,29 @@ mod tests {
     }
 
     #[test]
+    fn harvest_plugin_api_with_auth_sets_path_and_middleware() {
+        let plugin =
+            HarvestPlugin::new().api_with_auth("/api", autumn_web::auth::RequireAuth::new("test"));
+
+        assert_eq!(plugin.api_path.as_deref(), Some("/api"));
+        assert!(plugin.api_middleware.is_some());
+    }
+
+    #[test]
+    fn harvest_plugin_build_registers_startup_and_shutdown_hooks() {
+        let app = autumn_web::app().plugin(
+            HarvestPlugin::new()
+                .workflows(vec![fake_workflow_info()])
+                .worker(WorkerConfig::default())
+                .api("/api/harvest"),
+        );
+
+        assert!(app.has_plugin(std::any::type_name::<HarvestPlugin>()));
+    }
+
+    #[test]
     fn injected_runtime_state_contains_app_state() {
-        let state = test_app_state();
+        let state = AppState::for_test();
         let harvest_pool = test_pool("postgres://harvest:harvest@localhost:5432/harvest", 4);
         let injected = injected_runtime_state(Some(state.clone()), None, harvest_pool);
         let stored = injected
@@ -603,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn harvest_ext_embedded_mode_reuses_app_pool() {
+    fn harvest_plugin_embedded_mode_reuses_app_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
         let state = AppState::for_test().with_pool(app_pool);
         let config = HarvestRuntimeConfig::default();
@@ -615,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn harvest_ext_split_mode_builds_dedicated_harvest_pool() {
+    fn harvest_plugin_split_mode_builds_dedicated_harvest_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
         let state = AppState::for_test().with_pool(app_pool.clone());
         let config = HarvestRuntimeConfig {
@@ -659,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn harvest_ext_external_mode_builds_dedicated_harvest_pool() {
+    fn harvest_plugin_external_mode_builds_dedicated_harvest_pool() {
         let app_pool = test_pool("postgres://app:app@localhost:5432/app", 3);
         let state = AppState::for_test().with_pool(app_pool);
         let config = HarvestRuntimeConfig {
@@ -669,7 +576,7 @@ mod tests {
             database: HarvestDatabaseConfig {
                 url: Some("postgres://harvest:harvest@localhost:5432/harvest".to_owned()),
             },
-            outbox: crate::config::HarvestOutboxConfig::default(),
+            outbox: HarvestOutboxConfig::default(),
         };
 
         let harvest_pool = resolve_harvest_pool(&state, &config)

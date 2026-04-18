@@ -1,9 +1,9 @@
+use autumn_harvest_plugin::{
+    HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
+};
 use autumn_web::AppState;
 use autumn_web::config::{AutumnConfig, DatabaseConfig};
 use autumn_web::db;
-use autumn_web_harvest::{
-    HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
-};
 use reddit_clone::harvest_runtime::harvest_builder;
 use reddit_clone::live_events;
 use thiserror::Error;
@@ -125,10 +125,10 @@ fn detached_runner_state(profile: &str) -> AppState {
 
 #[cfg(test)]
 mod tests {
-    use autumn_web::config::AutumnConfig;
-    use autumn_web_harvest::{
+    use autumn_harvest_plugin::{
         HarvestDatabaseConfig, HarvestMode, HarvestOutboxConfig, HarvestRuntimeConfig,
     };
+    use autumn_web::config::AutumnConfig;
 
     use super::{
         detached_runner_state, resolve_app_database_url, resolve_harvest_database_url,

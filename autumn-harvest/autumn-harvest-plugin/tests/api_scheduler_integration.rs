@@ -16,13 +16,13 @@ use autumn_harvest::schema::{
 };
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ActivityContext, WorkflowContext};
-use autumn_web::AppState;
-use autumn_web::reexports::axum;
-use autumn_web_harvest::HarvestDbPool;
-use autumn_web_harvest::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
-use autumn_web_harvest::{
+use autumn_harvest_plugin::HarvestDbPool;
+use autumn_harvest_plugin::api::{HarvestApiRuntime, HarvestApiState, harvest_api_router};
+use autumn_harvest_plugin::{
     HarvestMode, HarvestRunner, HarvestRunnerResources, HarvestRuntimeConfig,
 };
+use autumn_web::AppState;
+use autumn_web::reexports::axum;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use diesel::ExpressionMethods;
@@ -603,10 +603,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             mode: HarvestMode::External,
             worker_enabled: false,
             scheduler_enabled: false,
-            database: autumn_web_harvest::HarvestDatabaseConfig {
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(database_url.clone()),
             },
-            outbox: autumn_web_harvest::HarvestOutboxConfig::default(),
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )
@@ -624,10 +624,10 @@ async fn external_runner_processes_workflows_started_via_management_api() {
             mode: HarvestMode::External,
             worker_enabled: true,
             scheduler_enabled: false,
-            database: autumn_web_harvest::HarvestDatabaseConfig {
+            database: autumn_harvest_plugin::HarvestDatabaseConfig {
                 url: Some(database_url.clone()),
             },
-            outbox: autumn_web_harvest::HarvestOutboxConfig::default(),
+            outbox: autumn_harvest_plugin::HarvestOutboxConfig::default(),
         },
         HarvestRunnerResources::new(pool.clone()),
     )

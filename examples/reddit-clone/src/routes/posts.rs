@@ -4,10 +4,10 @@
 //! #[secured] for write operations, htmx for voting and deletion,
 //! Maud templates with Tailwind CSS.
 
+use autumn_harvest_plugin::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use autumn_web::extract::Path;
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::State;
-use autumn_web_harvest::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;

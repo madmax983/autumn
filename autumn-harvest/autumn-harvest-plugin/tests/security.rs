@@ -1,8 +1,8 @@
+use autumn_harvest_plugin::api::{HarvestApiState, harvest_api_router};
 use autumn_web::AppState;
 use autumn_web::auth::RequireAuth;
 use autumn_web::reexports::axum::body::Body;
 use autumn_web::reexports::http::{Method, Request, StatusCode};
-use autumn_web_harvest::api::{HarvestApiState, harvest_api_router};
 use tower::ServiceExt;
 
 /// Build an unauthenticated test app (no middleware applied).
