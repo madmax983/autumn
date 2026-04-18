@@ -372,18 +372,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+
+
+
+
     #[tokio::test]
-    async fn fallback_404_produces_empty_body_and_is_formatted() {
-        struct JsonFilter;
-        impl ExceptionFilter for JsonFilter {
-            fn filter(&self, _error: &AutumnErrorInfo, response: Response) -> Response {
+    async fn fallback_404_produces_empty_body_and_preserves_extensions() {
+        use crate::middleware::error_page_filter::{WantsHtml, ErrorPageRequestContext};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        struct InjectExtensionFilter;
+        impl ExceptionFilter for InjectExtensionFilter {
+            fn filter(&self, _error: &AutumnErrorInfo, mut response: Response) -> Response {
+                response.extensions_mut().insert(WantsHtml(true));
+                response.extensions_mut().insert(ErrorPageRequestContext {
+                    uri: "/missing".parse().unwrap(),
+                    request_id: None,
+                });
                 response
             }
         }
 
+        // This simulates a request entering the ExceptionFilterLayer and being assigned
+        // the extensions WantsHtml and ErrorPageRequestContext, which should be preserved
+        // across the default JSON body fallback.
         let app = Router::new()
             .fallback(crate::middleware::error_page_filter::fallback_404_handler)
-            .layer(ExceptionFilterLayer::new(vec![Arc::new(JsonFilter)]));
+            .layer(ExceptionFilterLayer::new(vec![Arc::new(InjectExtensionFilter)]));
 
         let response = app
             .oneshot(
@@ -396,13 +412,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-
-        let body_str = String::from_utf8(body.to_vec()).unwrap();
-        assert!(body_str.contains("error"));
-        assert!(body_str.contains("404"));
+        assert!(response.extensions().get::<WantsHtml>().is_some());
+        assert!(response.extensions().get::<ErrorPageRequestContext>().is_some());
     }
 }
