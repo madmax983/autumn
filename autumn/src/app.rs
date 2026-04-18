@@ -1332,8 +1332,12 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
             let _ = parsed_url.set_password(Some("****"));
             return format!("{parsed_url} (pool_size={pool_size})");
         }
+        format!("{parsed_url} (pool_size={pool_size})")
+    } else {
+        // Fallback: If URL parsing fails, mask the entire URL string to prevent any
+        // potential data exposure (e.g. if the malformed string still contained a password)
+        format!("**** (pool_size={pool_size})")
     }
-    format!("{url} (pool_size={pool_size})")
 }
 
 /// Build the configuration summary string.
@@ -2449,6 +2453,14 @@ mod tests {
         assert!(!masked3.contains("secret"));
         assert!(masked3.contains("postgres://:****@localhost:5432/mydb"));
     }
+    #[test]
+    fn mask_database_url_invalid_url_fallback() {
+        let masked = mask_database_url("this is completely invalid as a URL with supersecret", 10);
+        assert!(masked.contains("****"));
+        assert!(!masked.contains("supersecret"));
+        assert!(masked.contains("pool_size=10"));
+    }
+
     #[test]
     fn format_config_summary_defaults() {
         let config = AutumnConfig::default();
