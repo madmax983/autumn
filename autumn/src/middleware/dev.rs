@@ -425,4 +425,26 @@ mod tests {
         assert!(is_static_path("/static/css/autumn.css"));
         assert!(!is_static_path("/assets/autumn.css"));
     }
+
+    #[test]
+    fn inject_snippet_edge_cases_empty_body() {
+        let empty = inject_snippet(b"");
+        assert_eq!(empty, b"");
+    }
+
+    #[test]
+    fn inject_snippet_edge_cases_case_insensitivity() {
+        // Our current implementation is case sensitive.
+        // If a user has upper case tags, we shouldn't fail or panic, we just won't inject.
+        let upper_body = inject_snippet(b"<HTML><BODY>ok</BODY></HTML>");
+        let upper_result = std::str::from_utf8(&upper_body).expect("utf-8");
+        assert_eq!(upper_result, "<HTML><BODY>ok</BODY></HTML>");
+    }
+
+    #[test]
+    fn inject_snippet_edge_cases_malformed_but_matching() {
+        let malformed = inject_snippet(b"<html<body>");
+        let result = std::str::from_utf8(&malformed).expect("utf-8");
+        assert!(result.ends_with("</script>"));
+    }
 }
