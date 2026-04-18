@@ -421,7 +421,6 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_404_produces_empty_body_and_preserves_only_one_extension() {
-
         use crate::middleware::error_page_filter::WantsHtml;
         use axum::http::Request;
         use tower::ServiceExt;
@@ -462,7 +461,6 @@ mod tests {
 
     #[tokio::test]
     async fn fallback_404_produces_empty_body_and_preserves_the_other_extension() {
-
         use crate::middleware::error_page_filter::ErrorPageRequestContext;
         use axum::http::Request;
         use tower::ServiceExt;
