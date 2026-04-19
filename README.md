@@ -12,11 +12,6 @@ stack with proc-macro ergonomics, framework defaults, and customization options 
 you need them. If Spring Boot, Rails, or Laravel feels familiar, Autumn aims
 for that same "ship the app, not the plumbing" shape in Rust.
 
-> **Status:** the latest tagged release is `v0.1.0` (2026-03-26), but `trunk`
-> already contains substantial post-`v0.1.0` work. This README documents the
-> current `trunk` branch, not just the `v0.1.0` tag. The framework is still
-> experimental and not recommended for production use yet.
-
 ## Features
 
 - **Route and app macros** - `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
