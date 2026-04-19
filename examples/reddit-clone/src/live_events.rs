@@ -1082,7 +1082,7 @@ mod tests {
     use testcontainers_modules::redis::{REDIS_PORT, Redis};
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-    const REDDIT_INIT_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
+    const REDDIT_INIT_SQL: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
 
     #[derive(Debug, QueryableByName)]
     struct CountRow {

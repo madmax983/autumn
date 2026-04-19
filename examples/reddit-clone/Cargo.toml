@@ -3,6 +3,7 @@ name = "reddit-clone"
 edition.workspace = true
 version.workspace = true
 publish = false
+default-run = "reddit-clone"
 
 [[bin]]
 name = "reddit-clone-harvest-runner"

@@ -13,17 +13,20 @@ pub mod workflows;
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::fs;
-    use std::path::Path;
 
     use autumn_harvest_plugin::{HarvestMode, HarvestRuntimeConfig};
     use autumn_web::config::{AutumnConfig, MockEnv};
+    use diesel::migration::MigrationSource;
+    use diesel::pg::Pg;
+    use diesel_migrations::{EmbeddedMigrations, embed_migrations};
 
     use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
 
-    const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_reddit/up.sql");
+    const REDDIT_MIGRATIONS: EmbeddedMigrations = embed_migrations!();
+
+    const MIGRATION_SQL: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
     const MIGRATION_DOWN_SQL: &str =
-        include_str!("../migrations/00000000000000_create_reddit/down.sql");
+        include_str!("../migrations/20260419000000_create_reddit/down.sql");
 
     #[test]
     fn migration_uses_bigserial_ids() {
@@ -60,30 +63,17 @@ mod tests {
 
     #[test]
     fn app_and_harvest_migration_versions_do_not_collide() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let app_migrations = collect_migration_versions(&manifest_dir.join("migrations"));
-        let harvest_adapter_migrations = collect_migration_versions(
-            &manifest_dir.join("../../autumn-harvest/autumn-harvest-plugin/migrations"),
-        );
-        let harvest_migrations = collect_migration_versions(
-            &manifest_dir.join("../../autumn-harvest/autumn-harvest/migrations"),
-        );
+        // Pulls migration version prefixes from the actual EmbeddedMigrations
+        // that get applied at runtime — no filesystem reads into sibling
+        // crates (which broke when autumn-harvest moved to its own repo).
+        //
+        // TODO: also check autumn-harvest-plugin's outbox migrations once the
+        // plugin exposes them as a `pub const`. They're currently private to
+        // the plugin crate, so a downstream consumer can't see them.
+        let app = migration_versions(&REDDIT_MIGRATIONS);
+        let harvest = migration_versions(&autumn_harvest::MIGRATIONS);
 
-        let collisions: Vec<_> = app_migrations
-            .intersection(&harvest_adapter_migrations)
-            .cloned()
-            .collect();
-
-        assert!(
-            collisions.is_empty(),
-            "reddit-clone and autumn-harvest-plugin migrations must not share Diesel version prefixes: {collisions:?}",
-        );
-
-        let collisions: Vec<_> = app_migrations
-            .intersection(&harvest_migrations)
-            .cloned()
-            .collect();
-
+        let collisions: Vec<_> = app.intersection(&harvest).cloned().collect();
         assert!(
             collisions.is_empty(),
             "reddit-clone and Harvest migrations must not share Diesel version prefixes: {collisions:?}",
@@ -184,26 +174,17 @@ mod tests {
         assert_eq!(config.channel, "reddit_live_feed");
     }
 
-    fn collect_migration_versions(dir: &Path) -> BTreeSet<String> {
-        fs::read_dir(dir)
-            .unwrap_or_else(|error| {
-                panic!("failed to read migrations at {}: {error}", dir.display())
-            })
-            .map(|entry| entry.expect("migration directory entry should be readable"))
-            .filter_map(|entry| {
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(|kind| kind.is_dir())
-                    .map(|_| entry)
-            })
-            .map(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
+    fn migration_versions(source: &EmbeddedMigrations) -> BTreeSet<String> {
+        MigrationSource::<Pg>::migrations(source)
+            .expect("EmbeddedMigrations should yield its migrations")
+            .iter()
+            .map(|migration| {
+                migration
+                    .name()
+                    .to_string()
                     .split('_')
                     .next()
-                    .expect("migration directory should have a version prefix")
+                    .expect("migration name should have a version prefix")
                     .to_owned()
             })
             .collect()
