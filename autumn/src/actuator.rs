@@ -1144,6 +1144,10 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(env_endpoint::<S>),
             )
             .route(
+                &actuator_route_path(prefix, "/prometheus"),
+                axum::routing::get(prometheus_endpoint::<S>),
+            )
+            .route(
                 &actuator_route_path(prefix, "/configprops"),
                 axum::routing::get(configprops_endpoint::<S>),
             )
@@ -1160,25 +1164,25 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(tasks_endpoint::<S>),
             )
             .route(
-                &actuator_route_path(prefix, "/prometheus"),
-                axum::routing::get(prometheus_endpoint::<S>),
+                &actuator_route_path(prefix, "/ui/tasks"),
+                axum::routing::get(ui_tasks::<S>),
             );
 
         #[cfg(feature = "ws")]
         {
             router = router
                 .route(
-                    &actuator_route_path(prefix, "/tasks/stream"),
-                    axum::routing::get(tasks_stream_endpoint::<S>),
-                )
-                .route(
                     &actuator_route_path(prefix, "/channels"),
                     axum::routing::get(channels_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/tasks/stream"),
+                    axum::routing::get(tasks_stream_endpoint::<S>),
                 );
         }
     }
 
-    // Nova: Add HTMX UI endpoints
+    // Nova: Add HTMX UI endpoints available unconditionally like metrics
     router
         .route(
             &actuator_route_path(prefix, "/ui"),
@@ -1187,10 +1191,6 @@ pub(crate) fn actuator_router_with_prefix<
         .route(
             &actuator_route_path(prefix, "/ui/metrics"),
             axum::routing::get(ui_metrics::<S>),
-        )
-        .route(
-            &actuator_route_path(prefix, "/ui/tasks"),
-            axum::routing::get(ui_tasks::<S>),
         )
 }
 
@@ -1954,7 +1954,7 @@ mod havoc_proptest {
 
 // ── Nova: Actuator HTMX Dashboard UI ──────────────────────────
 
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "maud", feature = "htmx"))]
 async fn ui_dashboard() -> impl IntoResponse {
     let html = maud::html! {
         (maud::DOCTYPE)
@@ -2001,7 +2001,7 @@ async fn ui_dashboard() -> impl IntoResponse {
     )
 }
 
-#[cfg(not(feature = "maud"))]
+#[cfg(not(all(feature = "maud", feature = "htmx")))]
 async fn ui_dashboard() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -2009,7 +2009,7 @@ async fn ui_dashboard() -> impl IntoResponse {
     )
 }
 
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "maud", feature = "htmx"))]
 async fn ui_metrics<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoResponse {
     let metrics = state.metrics().snapshot();
     let uptime = state.uptime_display();
@@ -2043,7 +2043,7 @@ async fn ui_metrics<S: ProvideActuatorState>(State(state): State<S>) -> impl Int
     )
 }
 
-#[cfg(not(feature = "maud"))]
+#[cfg(not(all(feature = "maud", feature = "htmx")))]
 async fn ui_metrics<S: ProvideActuatorState>() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
@@ -2051,7 +2051,7 @@ async fn ui_metrics<S: ProvideActuatorState>() -> impl IntoResponse {
     )
 }
 
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "maud", feature = "htmx"))]
 async fn ui_tasks<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoResponse {
     let tasks = state.task_registry().snapshot();
 
@@ -2085,7 +2085,7 @@ async fn ui_tasks<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoR
     )
 }
 
-#[cfg(not(feature = "maud"))]
+#[cfg(not(all(feature = "maud", feature = "htmx")))]
 async fn ui_tasks<S: ProvideActuatorState>() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
