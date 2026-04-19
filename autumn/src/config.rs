@@ -456,7 +456,7 @@ pub enum ConfigError {
 /// assert_eq!(config.log.level, "info");
 /// assert_eq!(config.health.path, "/health");
 /// ```
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
     /// Resolved at load time, not deserialized from TOML.
@@ -932,7 +932,7 @@ impl AutumnConfig {
 /// assert_eq!(server.port, 3000);
 /// assert_eq!(server.host, "127.0.0.1");
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
     #[serde(default = "default_port")]
@@ -979,7 +979,7 @@ pub struct ServerConfig {
 /// assert!(db.url.is_none());
 /// assert_eq!(db.pool_size, 10);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     /// Postgres connection URL. `None` means no database is configured.
     ///
@@ -1030,7 +1030,7 @@ impl DatabaseConfig {
 /// assert_eq!(log.level, "info");
 /// assert_eq!(log.format, LogFormat::Auto);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     /// Tracing filter directive. Default: `"info"`.
     ///
@@ -1062,7 +1062,7 @@ pub struct LogConfig {
 ///
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
-#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
     #[default]
@@ -1077,7 +1077,7 @@ pub enum LogFormat {
 ///
 /// Controls whether Autumn enables OTLP trace export and how the process
 /// identifies itself in resource metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     /// Enable framework-managed telemetry. Default: `false`.
     #[serde(default)]
@@ -1156,7 +1156,7 @@ impl TelemetryProtocol {
 /// assert_eq!(health.startup_path, "/startup");
 /// assert!(!health.detailed);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
     /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
@@ -1188,7 +1188,7 @@ pub struct HealthConfig {
 /// Controls which operational endpoints are exposed. The `sensitive` flag
 /// determines whether sensitive endpoints (env, configprops, loggers,
 /// tasks) are available. Defaults to `true` for `dev`, `false` for `prod`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ActuatorConfig {
     /// URL prefix for actuator endpoints. Default: `"/actuator"`.
     #[serde(default = "default_actuator_prefix")]
@@ -1249,7 +1249,7 @@ fn default_actuator_prefix() -> String {
 /// assert!(cors.allowed_origins.is_empty());
 /// assert!(!cors.allow_credentials);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CorsConfig {
     /// Origins allowed to make cross-origin requests.
     ///
@@ -1454,10 +1454,109 @@ impl Default for HealthConfig {
     }
 }
 
+// ----------------------------------------------------------------------------
+// ConfigLoader — tier-1 boot-time replaceable config loading
+// ----------------------------------------------------------------------------
+
+/// Pluggable boot-time configuration loader.
+///
+/// Replace the default TOML + env loader with a custom strategy (e.g. AWS
+/// Secrets Manager, Consul, a JSON file, an HTTP fetch) by implementing this
+/// trait and installing it on the [`AppBuilder`](crate::app::AppBuilder) via
+/// [`with_config_loader`](crate::app::AppBuilder::with_config_loader).
+///
+/// The trait's return type uses `impl Future + Send` so implementations can
+/// freely use `async fn` in their bodies while the framework can still spawn
+/// the load on any executor.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::config::{AutumnConfig, ConfigError, ConfigLoader};
+///
+/// pub struct JsonFileConfigLoader { path: std::path::PathBuf }
+///
+/// impl ConfigLoader for JsonFileConfigLoader {
+///     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+///         let bytes = std::fs::read(&self.path).map_err(ConfigError::Io)?;
+///         serde_json::from_slice(&bytes)
+///             .map_err(|e| ConfigError::Validation(e.to_string()))
+///     }
+/// }
+/// ```
+pub trait ConfigLoader: Send + Sync + 'static {
+    /// Load and return a fully-resolved [`AutumnConfig`].
+    ///
+    /// Implementations are responsible for any layering, profile resolution,
+    /// and validation they care to apply. The default implementation
+    /// ([`TomlEnvConfigLoader`]) preserves Autumn's five-layer load
+    /// (framework defaults → profile defaults → `autumn.toml` →
+    /// `autumn-{profile}.toml` → `AUTUMN_*` env vars).
+    fn load(&self) -> impl std::future::Future<Output = Result<AutumnConfig, ConfigError>> + Send;
+}
+
+/// Default [`ConfigLoader`] — Autumn's five-layer TOML + env load strategy.
+///
+/// Delegates to [`AutumnConfig::load_with_env`] using [`OsEnv`] for environment
+/// variable reads. This is the loader used when no override is installed via
+/// [`with_config_loader`](crate::app::AppBuilder::with_config_loader).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TomlEnvConfigLoader;
+
+impl TomlEnvConfigLoader {
+    /// Construct a new default loader.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl ConfigLoader for TomlEnvConfigLoader {
+    async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+        AutumnConfig::load_with_env(&OsEnv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
+
+    /// Mock loader for tests — returns a hand-built config without touching disk.
+    struct MockConfigLoader {
+        config: AutumnConfig,
+    }
+
+    impl ConfigLoader for MockConfigLoader {
+        async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+            Ok(self.config.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn config_loader_trait_returns_supplied_config() {
+        let mut custom = AutumnConfig::default();
+        custom.server.port = 9999;
+        custom.profile = Some("integration-test".to_owned());
+
+        let loader = MockConfigLoader {
+            config: custom.clone(),
+        };
+        let resolved = loader.load().await.expect("mock loader should succeed");
+
+        assert_eq!(resolved.server.port, 9999);
+        assert_eq!(resolved.profile.as_deref(), Some("integration-test"));
+    }
+
+    #[tokio::test]
+    async fn default_toml_env_loader_succeeds_without_files() {
+        // No autumn.toml in the test runner's pwd; loader should fall back to
+        // framework defaults rather than failing.
+        let loader = TomlEnvConfigLoader::new();
+        let resolved = loader.load().await.expect("default loader should succeed");
+        // Default port is 3000 per ServerConfig::default — sanity check.
+        assert_eq!(resolved.server.port, 3000);
+    }
 
     #[test]
     fn database_config_validate_none() {

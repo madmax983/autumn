@@ -280,6 +280,64 @@ impl SessionStore for MemoryStore {
     }
 }
 
+// ── Erasure bridge for runtime-installed custom stores ─────────
+//
+// `SessionStore` uses RPIT (`-> impl Future + Send`) and is therefore not
+// dyn-compatible. To let `AppBuilder::with_session_store(impl SessionStore)`
+// erase the concrete type into something `AppBuilder` can store and
+// `apply_session_layer` can wrap into a `SessionLayer`, we keep a
+// pub(crate) dyn-compatible `BoxedSessionStore` shadow trait with a blanket
+// impl over any `SessionStore`, plus an `ArcSessionStore` newtype that
+// satisfies `SessionStore` by delegating through the trait object. Users
+// only see `SessionStore`; the bridge stays an implementation detail.
+
+pub(crate) type BoxedLoadFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Option<HashMap<String, String>>, SessionStoreError>> + Send + 'a,
+    >,
+>;
+pub(crate) type BoxedUnitFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), SessionStoreError>> + Send + 'a>>;
+
+pub(crate) trait BoxedSessionStore: Send + Sync + 'static {
+    fn boxed_load<'a>(&'a self, id: &'a str) -> BoxedLoadFuture<'a>;
+
+    fn boxed_save<'a>(&'a self, id: &'a str, data: HashMap<String, String>) -> BoxedUnitFuture<'a>;
+
+    fn boxed_destroy<'a>(&'a self, id: &'a str) -> BoxedUnitFuture<'a>;
+}
+
+impl<S: SessionStore> BoxedSessionStore for S {
+    fn boxed_load<'a>(&'a self, id: &'a str) -> BoxedLoadFuture<'a> {
+        Box::pin(SessionStore::load(self, id))
+    }
+
+    fn boxed_save<'a>(&'a self, id: &'a str, data: HashMap<String, String>) -> BoxedUnitFuture<'a> {
+        Box::pin(SessionStore::save(self, id, data))
+    }
+
+    fn boxed_destroy<'a>(&'a self, id: &'a str) -> BoxedUnitFuture<'a> {
+        Box::pin(SessionStore::destroy(self, id))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ArcSessionStore(pub(crate) Arc<dyn BoxedSessionStore>);
+
+impl SessionStore for ArcSessionStore {
+    async fn load(&self, id: &str) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+        self.0.boxed_load(id).await
+    }
+
+    async fn save(&self, id: &str, data: HashMap<String, String>) -> Result<(), SessionStoreError> {
+        self.0.boxed_save(id, data).await
+    }
+
+    async fn destroy(&self, id: &str) -> Result<(), SessionStoreError> {
+        self.0.boxed_destroy(id).await
+    }
+}
+
 // ── Session configuration ───────────────────────────────────────
 
 /// Configuration for session management.
@@ -682,7 +740,15 @@ pub(crate) fn apply_session_layer(
     router: axum::Router<crate::state::AppState>,
     config: &SessionConfig,
     profile: Option<&str>,
+    custom_store: Option<Arc<dyn BoxedSessionStore>>,
 ) -> Result<axum::Router<crate::state::AppState>, SessionBackendConfigError> {
+    if let Some(store) = custom_store {
+        tracing::debug!(
+            "Custom session store installed via with_session_store(); skipping config-driven backend selection"
+        );
+        return Ok(router.layer(SessionLayer::new(ArcSessionStore(store), config.clone())));
+    }
+
     match config.backend_plan(profile)? {
         SessionBackendPlan::Memory { warn_in_production } => {
             if warn_in_production {
@@ -717,6 +783,72 @@ mod tests {
     use axum::routing::get;
     use http::Request as HttpRequest;
     use tower::ServiceExt;
+
+    /// Sentinel store for verifying that the type-erased `BoxedSessionStore`
+    /// bridge actually delegates back to the user's `SessionStore` impl
+    /// instead of silently picking up the default memory store.
+    #[derive(Clone, Default)]
+    struct SentinelStore {
+        load_calls: Arc<RwLock<u32>>,
+    }
+
+    impl SessionStore for SentinelStore {
+        async fn load(
+            &self,
+            _id: &str,
+        ) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+            *self.load_calls.write().await += 1;
+            // Return a recognisable session payload so the test can prove the
+            // wrapper actually went through this impl.
+            let mut data = HashMap::new();
+            data.insert("from".to_owned(), "sentinel".to_owned());
+            Ok(Some(data))
+        }
+
+        async fn save(
+            &self,
+            _id: &str,
+            _data: HashMap<String, String>,
+        ) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+
+        async fn destroy(&self, _id: &str) -> Result<(), SessionStoreError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_session_store_wrapper_delegates_to_inner_session_store() {
+        let inner = SentinelStore::default();
+        let load_counter = inner.load_calls.clone();
+        let arc: Arc<dyn BoxedSessionStore> = Arc::new(inner);
+        let wrapper = ArcSessionStore(arc);
+
+        let result = wrapper
+            .load("session-id")
+            .await
+            .expect("wrapped store should succeed");
+
+        assert_eq!(*load_counter.read().await, 1);
+        assert_eq!(
+            result
+                .as_ref()
+                .and_then(|m| m.get("from"))
+                .map(String::as_str),
+            Some("sentinel"),
+            "wrapper must return data from the wrapped impl, not a default"
+        );
+    }
+
+    #[tokio::test]
+    async fn boxed_session_store_blanket_impl_works_for_any_session_store() {
+        // Any SessionStore type erases via the BoxedSessionStore blanket impl.
+        let store = SentinelStore::default();
+        let boxed: Arc<dyn BoxedSessionStore> = Arc::new(store);
+        let result = boxed.boxed_load("session-id").await.unwrap();
+        assert!(result.is_some());
+    }
 
     #[derive(Clone)]
     struct FailingStore {
