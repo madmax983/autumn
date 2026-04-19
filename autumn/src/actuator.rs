@@ -1178,7 +1178,20 @@ pub(crate) fn actuator_router_with_prefix<
         }
     }
 
+    // Nova: Add HTMX UI endpoints
     router
+        .route(
+            &actuator_route_path(prefix, "/ui"),
+            axum::routing::get(ui_dashboard),
+        )
+        .route(
+            &actuator_route_path(prefix, "/ui/metrics"),
+            axum::routing::get(ui_metrics::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/ui/tasks"),
+            axum::routing::get(ui_tasks::<S>),
+        )
 }
 
 #[cfg(test)]
@@ -1844,6 +1857,81 @@ mod tests {
         ConfigProperties::track_property(&mut props, "log.level", "info", "info", "dev");
         assert_eq!(props["log.level"].source, "default");
     }
+
+    #[tokio::test]
+    async fn actuator_ui_dashboard_returns_html_or_unimplemented() {
+        let app = actuator_router(true).with_state(test_state());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if cfg!(feature = "maud") {
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+        } else {
+            assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_ui_metrics_returns_html_or_unimplemented() {
+        let app = actuator_router(true).with_state(test_state());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/ui/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if cfg!(feature = "maud") {
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+        } else {
+            assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_ui_tasks_returns_html_or_unimplemented() {
+        let app = actuator_router(true).with_state(test_state());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/ui/tasks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if cfg!(feature = "maud") {
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+        } else {
+            assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1862,4 +1950,145 @@ mod havoc_proptest {
             assert!(levels.logger_overrides().len() <= 1000, "Memory leak: unbounded loggers inserted");
         }
     }
+}
+
+// ── Nova: Actuator HTMX Dashboard UI ──────────────────────────
+
+#[cfg(feature = "maud")]
+async fn ui_dashboard() -> impl IntoResponse {
+    let html = maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { "Autumn Actuator Dashboard" }
+                script src="/static/js/htmx.min.js" {}
+                style {
+                    "body { font-family: system-ui, sans-serif; background: #f9fafb; color: #111827; margin: 0; padding: 2rem; }"
+                    "h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 1.5rem; }"
+                    ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }"
+                    ".card { background: white; padding: 1.5rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
+                    ".card h2 { font-size: 1.125rem; font-weight: 500; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.5rem; }"
+                    ".stat { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }"
+                    ".stat-label { color: #6b7280; }"
+                    ".stat-value { font-weight: 500; }"
+                    ".task-item { border: 1px solid #e5e7eb; padding: 0.75rem; border-radius: 0.375rem; margin-bottom: 0.75rem; }"
+                    ".task-name { font-weight: 600; display: block; margin-bottom: 0.25rem; }"
+                    ".task-meta { font-size: 0.875rem; color: #6b7280; }"
+                    ".badge { display: inline-block; padding: 0.125rem 0.375rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }"
+                    ".badge-green { background: #dcfce7; color: #166534; }"
+                    ".badge-gray { background: #f3f4f6; color: #374151; }"
+                    ".badge-red { background: #fee2e2; color: #991b1b; }"
+                }
+            }
+            body {
+                h1 { "🍂 Autumn Actuator Dashboard" }
+                div class="grid" {
+                    div class="card" hx-get="ui/metrics" hx-trigger="load, every 2s" {
+                        "Loading metrics..."
+                    }
+                    div class="card" hx-get="ui/tasks" hx-trigger="load, every 2s" {
+                        "Loading tasks..."
+                    }
+                }
+            }
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html.into_string(),
+    )
+}
+
+#[cfg(not(feature = "maud"))]
+async fn ui_dashboard() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Maud feature is required for the UI dashboard",
+    )
+}
+
+#[cfg(feature = "maud")]
+async fn ui_metrics<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoResponse {
+    let metrics = state.metrics().snapshot();
+    let uptime = state.uptime_display();
+
+    let html = maud::html! {
+        h2 { "System Metrics" }
+        div class="stat" {
+            span class="stat-label" { "Uptime" }
+            span class="stat-value" { (uptime) }
+        }
+        div class="stat" {
+            span class="stat-label" { "Total Requests" }
+            span class="stat-value" { (metrics.http.requests_total) }
+        }
+        div class="stat" {
+            span class="stat-label" { "Active Requests" }
+            span class="stat-value" { (metrics.http.requests_active) }
+        }
+        div class="stat" {
+            span class="stat-label" { "P95 Latency" }
+            span class="stat-value" { (metrics.http.latency_ms.p95) " ms" }
+        }
+        div class="stat" {
+            span class="stat-label" { "P99 Latency" }
+            span class="stat-value" { (metrics.http.latency_ms.p99) " ms" }
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html.into_string(),
+    )
+}
+
+#[cfg(not(feature = "maud"))]
+async fn ui_metrics<S: ProvideActuatorState>() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Maud feature is required for the UI dashboard",
+    )
+}
+
+#[cfg(feature = "maud")]
+async fn ui_tasks<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoResponse {
+    let tasks = state.task_registry().snapshot();
+
+    let html = maud::html! {
+        h2 { "Background Tasks" }
+        @if tasks.is_empty() {
+            p class="stat-label" { "No tasks registered." }
+        } @else {
+            @for (name, task) in tasks.iter() {
+                div class="task-item" {
+                    span class="task-name" { (name) }
+                    div class="task-meta" {
+                        @if task.status == "running" {
+                            span class="badge badge-green" { "Running" }
+                        } @else {
+                            span class="badge badge-gray" { "Idle" }
+                        }
+                        " "
+                        "Runs: " (task.total_runs)
+                        @if task.total_failures > 0 {
+                            " " span class="badge badge-red" { "Failures: " (task.total_failures) }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html.into_string(),
+    )
+}
+
+#[cfg(not(feature = "maud"))]
+async fn ui_tasks<S: ProvideActuatorState>() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Maud feature is required for the UI dashboard",
+    )
 }
