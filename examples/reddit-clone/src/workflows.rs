@@ -332,19 +332,18 @@ fn parse_string_field(input: &Value, field: &str, context: &str) -> HarvestResul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::Connection;
     use diesel::ExpressionMethods;
+    use diesel::PgConnection;
     use diesel::QueryDsl;
     use diesel::SelectableHelper;
     use diesel_async::AsyncConnection;
     use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
+    use diesel_migrations::MigrationHarness;
     use testcontainers::ContainerAsync;
     use testcontainers_modules::postgres::Postgres;
     use testcontainers_modules::testcontainers::runners::AsyncRunner;
-
-    const HARVEST_INIT_SQL: &str = include_str!(
-        "../../../autumn-harvest/autumn-harvest/migrations/20260409000000_harvest_initial/up.sql"
-    );
 
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
@@ -483,7 +482,6 @@ mod tests {
 
     async fn setup_test_db() -> (AsyncPgConnection, ContainerAsync<Postgres>) {
         let container = Postgres::default()
-            .with_init_sql(HARVEST_INIT_SQL.to_string().into_bytes())
             .start()
             .await
             .expect("failed to start Postgres container");
@@ -497,6 +495,21 @@ mod tests {
             .await
             .expect("failed to get container port");
         let database_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        // diesel_migrations works with sync diesel; spawn_blocking keeps it
+        // off the test runtime. Sources autumn_harvest::MIGRATIONS so the
+        // example's test schema tracks whatever harvest publishes — no SQL
+        // vendoring, no cross-crate paths.
+        let migration_url = database_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut sync_conn = PgConnection::establish(&migration_url)
+                .expect("failed to connect for harvest migrations");
+            sync_conn
+                .run_pending_migrations(autumn_harvest::MIGRATIONS)
+                .expect("failed to apply harvest migrations");
+        })
+        .await
+        .expect("harvest migration task panicked");
 
         let conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
             .await
