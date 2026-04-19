@@ -679,7 +679,9 @@ impl AutumnConfig {
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
-        parse_env_option_string(env, "AUTUMN_DATABASE__URL", &mut self.database.url);
+        if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
+            self.database.url = Some(val);
+        }
         parse_env(
             env,
             "AUTUMN_DATABASE__POOL_SIZE",
