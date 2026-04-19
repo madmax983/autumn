@@ -1223,7 +1223,7 @@ fn build_state(
     >,
 ) -> AppState {
     AppState {
-        extensions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
         pool,
         profile: config.profile.clone(),
@@ -1429,9 +1429,9 @@ mod tests {
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -1593,9 +1593,9 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.health.path = "/healthz".to_owned();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -1679,9 +1679,9 @@ mod tests {
         }];
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -1731,9 +1731,9 @@ mod tests {
         ];
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -1895,9 +1895,9 @@ mod tests {
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -2120,9 +2120,9 @@ mod tests {
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -2259,9 +2259,9 @@ mod tests {
 
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -2296,9 +2296,9 @@ mod tests {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -2540,9 +2540,9 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -2600,9 +2600,9 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,

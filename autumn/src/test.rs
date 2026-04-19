@@ -194,9 +194,9 @@ impl TestApp {
     #[must_use]
     pub fn build(self) -> TestClient {
         let state = AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: self.pool,
             profile: self.config.profile.clone(),
