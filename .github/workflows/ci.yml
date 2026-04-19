@@ -23,18 +23,14 @@ jobs:
       - name: Check framework formatting
         run: cargo fmt --all -- --check
       - name: Check harvest formatting
-        working-directory: autumn-harvest
         run: cargo fmt --all -- --check
       - name: Framework clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Harvest clippy
-        working-directory: autumn-harvest
         run: cargo clippy -p autumn-harvest --all-features --tests -- -D warnings
       - name: Harvest Autumn plugin clippy
-        working-directory: autumn-harvest
         run: cargo clippy -p autumn-harvest-plugin --all-targets -- -D warnings
       - name: Harvest macros clippy
-        working-directory: autumn-harvest
         run: cargo clippy -p autumn-harvest-macros -- -D warnings
 
   test:
@@ -52,33 +48,25 @@ jobs:
       - name: Run framework tests
         run: cargo test --workspace
       - name: Run harvest no-db tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --no-default-features
       - name: Compile harvest db-backed tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       - name: Run harvest all-features lib tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --all-features --lib
       - name: Run harvest Autumn plugin lib tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest-plugin --lib
       - name: Run harvest macros tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest-macros
       - name: Compile harvest Autumn plugin integration tests
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration --no-run
       - name: Run framework Docker-dependent tests
         if: runner.os == 'Linux'
         run: cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
       - name: Run harvest Docker-backed integration tests
         if: runner.os == 'Linux'
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest --test integration_e2e -- --test-threads=1
       - name: Run harvest Autumn plugin API and scheduler integration tests
         if: runner.os == 'Linux'
-        working-directory: autumn-harvest
         run: cargo test -p autumn-harvest-plugin --test api_scheduler_integration -- --test-threads=1
 
   coverage:
@@ -112,5 +100,4 @@ jobs:
       - name: Check framework MSRV compiles
         run: cargo check --workspace
       - name: Check harvest MSRV compiles
-        working-directory: autumn-harvest
         run: cargo check --workspace
