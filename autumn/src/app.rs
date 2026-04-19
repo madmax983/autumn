@@ -942,7 +942,7 @@ fn start_task_scheduler(
     }
 }
 
-#[allow(unused_variables)]
+#[allow(unused_variables, clippy::needless_pass_by_value)]
 fn send_ws_sys_task_msg(
     state: &AppState,
     event: &str,

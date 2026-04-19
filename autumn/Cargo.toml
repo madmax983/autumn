@@ -5,6 +5,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage = "https://github.com/madmax983/autumn"
+readme = "../README.md"
+keywords = ["web", "composable", "axum", "htmx", "fullstack"]
+categories = ["web-programming", "web-programming::http-server"]
 
 [features]
 default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
@@ -33,7 +37,7 @@ telemetry-otlp = [
 redis = ["dep:redis"]
 
 [dependencies]
-autumn-macros = { version = "0.1.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.2.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"
