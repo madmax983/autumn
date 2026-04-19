@@ -1,3 +1,12 @@
+//! Live-reload and development middleware.
+//!
+//! When you run `autumn dev`, you don't want to manually refresh your browser every time
+//! you tweak some CSS or HTML. This module provides the magical "live reload" functionality
+//! that automatically injects a tiny JavaScript snippet into your HTML responses.
+//!
+//! It also explicitly disables caching for static files during development so you never
+//! get stuck looking at yesterday's CSS.
+
 use axum::body::Body;
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, EXPIRES, PRAGMA,

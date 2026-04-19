@@ -1,3 +1,17 @@
+//! Static Site Generation (SSG) and Incremental Static Regeneration (ISR).
+//!
+//! Sometimes, rendering a page on every request is just too slow. For pages where the
+//! data changes rarely (like a blog post or a marketing landing page), it is much faster
+//! to generate the HTML once at build time.
+//!
+//! This module provides the engine to pre-render routes annotated with `#[static_get]`
+//! and serve them lightning-fast via the [`crate::static_gen::StaticFileLayer`].
+//!
+//! ## How it works
+//!
+//! 1. **Build phase:** `autumn build` discovers your `#[static_get]` routes and runs them, saving the HTML to `dist/`.
+//! 2. **Runtime phase:** The `StaticFileLayer` intercepts requests. If a pre-rendered file exists, it serves it directly!
+
 pub mod build;
 mod middleware;
 mod types;

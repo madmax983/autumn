@@ -110,9 +110,10 @@ pub mod security;
 pub mod session;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
-/// Static site generation support.
 pub mod sse;
+/// Static site generation support.
 pub mod static_gen;
+
 pub mod task;
 pub(crate) mod telemetry;
 pub mod validation;

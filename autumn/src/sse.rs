@@ -2,7 +2,7 @@
 //!
 //! This module provides ergonomic SSE handling, integrating with Autumn's
 //! ecosystem to easily yield real-time updates to the client. SSE is a lightweight
-//! alternative to WebSockets for one-way server-to-client event streams.
+//! alternative to `WebSockets` for one-way server-to-client event streams.
 //!
 //! # Examples
 //!
