@@ -322,3 +322,62 @@ async fn form_submission() {
         .assert_body_contains("Alice")
         .assert_body_contains("30");
 }
+
+#[derive(serde::Serialize, serde::Deserialize, validator::Validate)]
+struct SentinelInput {
+    #[validate(length(min = 1, max = 5, message = "Custom validation failed"))]
+    field1: String,
+    #[validate(length(min = 10, message = "Another validation failed"))]
+    field2: String,
+}
+
+#[autumn_web::post("/test-validation")]
+async fn test_route_sentinel(
+    autumn_web::Valid(autumn_web::prelude::Json(_payload)): autumn_web::Valid<
+        autumn_web::prelude::Json<SentinelInput>,
+    >,
+) -> &'static str {
+    "ok"
+}
+
+#[tokio::test]
+async fn validation_error_structured_details() {
+    let client = autumn_web::test::TestApp::new()
+        .routes(autumn_web::routes![test_route_sentinel])
+        .build();
+
+    let payload = serde_json::json!({
+        "field1": "too long string",
+        "field2": "short"
+    });
+
+    let response = client.post("/test-validation").json(&payload).send().await;
+
+    response.assert_status(422);
+
+    let json: serde_json::Value = response.json::<serde_json::Value>();
+
+    let details = &json["error"]["details"];
+    assert!(
+        details.is_object(),
+        "Details should be an object mapping fields to errors"
+    );
+
+    let field1_errors = details["field1"]
+        .as_array()
+        .expect("field1 should have an array of errors");
+    assert!(!field1_errors.is_empty(), "field1 should have errors");
+    assert_eq!(
+        field1_errors[0].as_str().unwrap(),
+        "Custom validation failed"
+    );
+
+    let field2_errors = details["field2"]
+        .as_array()
+        .expect("field2 should have an array of errors");
+    assert!(!field2_errors.is_empty(), "field2 should have errors");
+    assert_eq!(
+        field2_errors[0].as_str().unwrap(),
+        "Another validation failed"
+    );
+}

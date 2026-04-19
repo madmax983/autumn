@@ -233,7 +233,8 @@ mod tests {
         let map = validation_errors_to_map(&errors);
 
         assert!(map.contains_key("name"));
-        assert!(!map["name"].is_empty());
+        assert_eq!(map["name"].len(), 1);
+        assert_eq!(map["name"][0], "validation failed: length");
     }
 
     #[test]
