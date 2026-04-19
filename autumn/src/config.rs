@@ -679,9 +679,7 @@ impl AutumnConfig {
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
-            self.database.url = Some(val);
-        }
+        parse_env_option_string(env, "AUTUMN_DATABASE__URL", &mut self.database.url);
         parse_env(
             env,
             "AUTUMN_DATABASE__POOL_SIZE",
@@ -721,9 +719,11 @@ impl AutumnConfig {
             "AUTUMN_TELEMETRY__SERVICE_NAME",
             &mut self.telemetry.service_name,
         );
-        if let Ok(val) = env.var("AUTUMN_TELEMETRY__SERVICE_NAMESPACE") {
-            self.telemetry.service_namespace = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_TELEMETRY__SERVICE_NAMESPACE",
+            &mut self.telemetry.service_namespace,
+        );
         parse_env_string(
             env,
             "AUTUMN_TELEMETRY__SERVICE_VERSION",
@@ -734,9 +734,11 @@ impl AutumnConfig {
             "AUTUMN_TELEMETRY__ENVIRONMENT",
             &mut self.telemetry.environment,
         );
-        if let Ok(val) = env.var("AUTUMN_TELEMETRY__OTLP_ENDPOINT") {
-            self.telemetry.otlp_endpoint = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_TELEMETRY__OTLP_ENDPOINT",
+            &mut self.telemetry.otlp_endpoint,
+        );
         if let Ok(val) = env.var("AUTUMN_TELEMETRY__PROTOCOL") {
             match TelemetryProtocol::from_env_value(&val) {
                 Some(protocol) => self.telemetry.protocol = protocol,
@@ -830,9 +832,11 @@ impl AutumnConfig {
             "AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION",
             &mut self.session.allow_memory_in_production,
         );
-        if let Ok(val) = env.var("AUTUMN_SESSION__REDIS__URL") {
-            self.session.redis.url = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_SESSION__REDIS__URL",
+            &mut self.session.redis.url,
+        );
         parse_env_string(
             env,
             "AUTUMN_SESSION__REDIS__KEY_PREFIX",
@@ -1315,6 +1319,12 @@ fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
             Ok(v) => *target = v,
             Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
         }
+    }
+}
+
+fn parse_env_option_string(env: &dyn Env, key: &str, target: &mut Option<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = if val.is_empty() { None } else { Some(val) };
     }
 }
 
