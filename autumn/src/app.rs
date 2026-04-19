@@ -30,7 +30,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::config::AutumnConfig;
+use crate::config::{AutumnConfig, ConfigLoader};
+#[cfg(feature = "db")]
+use crate::db::DatabasePoolProvider;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -77,6 +79,11 @@ pub fn app() -> AppBuilder {
         error_page_renderer: None,
         #[cfg(feature = "db")]
         migrations: Vec::new(),
+        config_loader_factory: None,
+        #[cfg(feature = "db")]
+        pool_provider_factory: None,
+        telemetry_provider: None,
+        session_store: None,
     }
 }
 
@@ -84,6 +91,38 @@ type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + 
 type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
 type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
+
+// ── Tier-1 subsystem factories ────────────────────────────────
+//
+// `ConfigLoader` and `DatabasePoolProvider` use RPIT (`-> impl Future + Send`)
+// in their trait methods, so `Box<dyn Trait>` is not dyn-compatible. We store
+// boxed factory closures that capture the concrete impl at the call site and
+// erase its future type via `Pin<Box<dyn Future>>`. `TelemetryProvider`'s
+// `init` is sync, so it's stored as a normal `Box<dyn>`.
+type ConfigLoaderFactory = Box<
+    dyn FnOnce() -> Pin<
+            Box<dyn Future<Output = Result<AutumnConfig, crate::config::ConfigError>> + Send>,
+        > + Send,
+>;
+#[cfg(feature = "db")]
+type PoolProviderFactory = Box<
+    dyn FnOnce(
+            crate::config::DatabaseConfig,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<
+                                diesel_async::pooled_connection::deadpool::Pool<
+                                    diesel_async::AsyncPgConnection,
+                                >,
+                            >,
+                            crate::db::PoolError,
+                        >,
+                    > + Send,
+            >,
+        > + Send,
+>;
 
 /// Builder for configuring and launching an Autumn application.
 ///
@@ -131,6 +170,20 @@ pub struct AppBuilder {
     /// Embedded Diesel migrations, registered via `.migrations()`.
     #[cfg(feature = "db")]
     migrations: Vec<migrate::EmbeddedMigrations>,
+    /// Custom config loader (tier-1 subsystem replacement). When `None`, the
+    /// default [`TomlEnvConfigLoader`](crate::config::TomlEnvConfigLoader) runs.
+    config_loader_factory: Option<ConfigLoaderFactory>,
+    /// Custom DB pool provider (tier-1 subsystem replacement). When `None`,
+    /// the default [`DieselDeadpoolPoolProvider`](crate::db::DieselDeadpoolPoolProvider) runs.
+    #[cfg(feature = "db")]
+    pool_provider_factory: Option<PoolProviderFactory>,
+    /// Custom telemetry provider (tier-1 subsystem replacement). When `None`,
+    /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
+    telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
+    /// Custom session store (tier-1 subsystem replacement). When `Some`,
+    /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
+    /// and uses this store directly.
+    session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -476,6 +529,102 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    // ── Tier-1 subsystem replacement hooks ─────────────────────
+    //
+    // Each `with_*` method swaps a framework-default subsystem for a
+    // user-provided trait impl. The defaults preserve current behaviour, so
+    // applications that don't customize see no change. Plugins typically chain
+    // these in their `build()` body to ship a subsystem (e.g. an
+    // `AwsSecretsConfigPlugin` that calls `app.with_config_loader(...)`).
+    // See `docs/guides/extensibility.md`.
+
+    /// Install a custom [`ConfigLoader`](crate::config::ConfigLoader),
+    /// replacing the default TOML + env loader.
+    ///
+    /// Useful when your config lives somewhere other than `autumn.toml` —
+    /// AWS Secrets Manager, Vault, a JSON file, an HTTP fetch, etc. Emits a
+    /// `tracing::warn!` if a loader was already installed.
+    #[must_use]
+    pub fn with_config_loader<L>(mut self, loader: L) -> Self
+    where
+        L: crate::config::ConfigLoader,
+    {
+        if self.config_loader_factory.is_some() {
+            tracing::warn!(
+                "config loader replaced; the previously-installed loader was overwritten"
+            );
+        }
+        self.config_loader_factory = Some(Box::new(move || {
+            Box::pin(async move { loader.load().await })
+        }));
+        self
+    }
+
+    /// Install a custom [`DatabasePoolProvider`](crate::db::DatabasePoolProvider),
+    /// replacing the default `deadpool + diesel-async` pool factory.
+    ///
+    /// Useful for adding metrics/circuit-breaker wrappers, switching to a
+    /// per-shard pool, or driving a non-default backend at the same
+    /// `Pool<AsyncPgConnection>` interface. Emits a `tracing::warn!` if a
+    /// provider was already installed.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_pool_provider<P>(mut self, provider: P) -> Self
+    where
+        P: crate::db::DatabasePoolProvider,
+    {
+        if self.pool_provider_factory.is_some() {
+            tracing::warn!(
+                "database pool provider replaced; the previously-installed provider was overwritten"
+            );
+        }
+        self.pool_provider_factory =
+            Some(Box::new(move |config: crate::config::DatabaseConfig| {
+                Box::pin(async move { provider.create_pool(&config).await })
+            }));
+        self
+    }
+
+    /// Install a custom [`TelemetryProvider`](crate::telemetry::TelemetryProvider),
+    /// replacing the default `tracing-subscriber + OTLP` initializer.
+    ///
+    /// Useful for shipping a Datadog tracer, Honeycomb beeline, Sentry
+    /// integration, or any other observability backend. Emits a
+    /// `tracing::warn!` if a provider was already installed.
+    #[must_use]
+    pub fn with_telemetry_provider<T>(mut self, provider: T) -> Self
+    where
+        T: crate::telemetry::TelemetryProvider,
+    {
+        if self.telemetry_provider.is_some() {
+            tracing::warn!(
+                "telemetry provider replaced; the previously-installed provider was overwritten"
+            );
+        }
+        self.telemetry_provider = Some(Box::new(provider));
+        self
+    }
+
+    /// Install a custom [`SessionStore`](crate::session::SessionStore),
+    /// bypassing the config-driven `memory`/`redis` backend selection.
+    ///
+    /// Useful for backing sessions with a database, encrypted cookie store,
+    /// or enterprise SSO bridge. Emits a `tracing::warn!` if a store was
+    /// already installed.
+    #[must_use]
+    pub fn with_session_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::session::SessionStore,
+    {
+        if self.session_store.is_some() {
+            tracing::warn!(
+                "session store replaced; the previously-installed store was overwritten"
+            );
+        }
+        self.session_store = Some(Arc::new(store));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -593,12 +742,18 @@ impl AppBuilder {
             error_page_renderer,
             #[cfg(feature = "db")]
             migrations,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store,
         } = self;
 
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (config, _telemetry_guard) = load_config_and_telemetry();
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // 3. Validate routes
         assert!(
@@ -622,10 +777,12 @@ impl AppBuilder {
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
-            tracing::error!("{e}");
-            std::process::exit(1);
-        });
+        let pool = setup_database(&config, migrations, pool_provider_factory)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -661,6 +818,7 @@ impl AppBuilder {
                 merge_routers,
                 nest_routers,
                 error_page_renderer,
+                session_store,
             },
         )
         .unwrap_or_else(|error| {
@@ -767,12 +925,18 @@ impl AppBuilder {
             error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store: _,
         } = self;
 
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (config, _telemetry_guard) = load_config_and_telemetry();
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -782,10 +946,12 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        let pool = setup_database(&config, vec![], pool_provider_factory)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
 
         let mut state = build_state(
             &config,
@@ -1175,37 +1341,53 @@ fn log_startup_transparency(
     tracing::info!("Configuration:{}", format_config_summary(config));
 }
 
-fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
-    // 1. Load configuration (profile-aware)
-    let config = AutumnConfig::load().unwrap_or_else(|e| {
+async fn load_config_and_telemetry(
+    config_loader: Option<ConfigLoaderFactory>,
+    telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
+) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    // 1. Load configuration via the installed loader, falling back to the
+    //    five-layer TOML + env default.
+    let config = match config_loader {
+        Some(factory) => factory().await,
+        None => crate::config::TomlEnvConfigLoader::new().load().await,
+    }
+    .unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {e}");
         std::process::exit(1);
     });
 
-    // 2. Initialize logging/telemetry immediately after config.
-    let telemetry_guard = crate::logging::init_with_telemetry(
-        &config.log,
-        &config.telemetry,
-        config.profile.as_deref(),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("Failed to initialize telemetry: {error}");
-        std::process::exit(1);
-    });
+    // 2. Initialize logging/telemetry via the installed provider, falling
+    //    back to the default `tracing-subscriber + OTLP` initializer.
+    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
+        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
+    let telemetry_guard = provider
+        .init(&config.log, &config.telemetry, config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
 
     (config, telemetry_guard)
 }
 
 #[cfg(feature = "db")]
-fn setup_database(
+async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    pool_provider: Option<PoolProviderFactory>,
 ) -> Result<
     Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
     String,
 > {
-    let pool = crate::db::create_pool(&config.database)
-        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+    let pool = match pool_provider {
+        Some(factory) => factory(config.database.clone()).await,
+        None => {
+            crate::db::DieselDeadpoolPoolProvider::new()
+                .create_pool(&config.database)
+                .await
+        }
+    }
+    .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
     if let Some(url) = &config.database.url {
         for mig in migrations {

@@ -74,6 +74,11 @@ pub struct RouterContext {
     pub merge_routers: Vec<axum::Router<AppState>>,
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
     pub error_page_renderer: Option<SharedRenderer>,
+    /// Custom session store installed via
+    /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
+    /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
+    /// uses it directly and skips the config-driven backend selection.
+    pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 }
 
 /// Checked variant of [`build_router`] that returns configuration errors
@@ -99,6 +104,7 @@ pub fn try_build_router(
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             error_page_renderer: None,
+            session_store: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -156,6 +162,7 @@ pub fn try_build_router_merged(
             merge_routers,
             nest_routers,
             error_page_renderer: None,
+            session_store: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -197,6 +204,7 @@ pub fn try_build_router_inner(
         &state,
         ctx.exception_filters,
         ctx.error_page_renderer,
+        ctx.session_store,
     )?;
 
     if dev_reload_enabled {
@@ -421,6 +429,7 @@ fn apply_middleware(
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     error_page_renderer: Option<SharedRenderer>,
+    session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config);
@@ -436,8 +445,12 @@ fn apply_middleware(
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
     let router = router.layer(RequestIdLayer).layer(security_headers);
-    let router =
-        crate::session::apply_session_layer(router, &config.session, config.profile.as_deref())?;
+    let router = crate::session::apply_session_layer(
+        router,
+        &config.session,
+        config.profile.as_deref(),
+        session_store,
+    )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
     // Error page filter: renders HTML error pages for browser requests.
@@ -529,6 +542,7 @@ pub fn try_build_router_with_static(
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             error_page_renderer: None,
+            session_store: None,
         },
     )
 }

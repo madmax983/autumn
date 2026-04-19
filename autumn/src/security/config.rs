@@ -46,7 +46,7 @@ use serde::Deserialize;
 /// assert!(config.headers.x_content_type_options);
 /// assert!(!config.csrf.enabled);
 /// ```
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConfig {
     /// HTTP security headers applied to all responses.
     #[serde(default)]
@@ -84,7 +84,7 @@ pub struct SecurityConfig {
 /// content_security_policy = "default-src 'self'; script-src 'self'"
 /// strict_transport_security = true
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct HeadersConfig {
     /// `X-Frame-Options` header value. Default: `"DENY"`.
@@ -188,7 +188,7 @@ impl Default for HeadersConfig {
 /// token_header = "X-XSRF-Token"
 /// cookie_name = "XSRF-TOKEN"
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CsrfConfig {
     /// Enable CSRF protection. Default: `false`.
     ///

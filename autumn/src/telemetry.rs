@@ -410,3 +410,120 @@ fn build_resource_attributes(resource: &TelemetryResource) -> [KeyValue; 3] {
         KeyValue::new("deployment.environment", resource.environment.clone()),
     ]
 }
+
+// ----------------------------------------------------------------------------
+// TelemetryProvider — tier-1 boot-time replaceable telemetry init
+// ----------------------------------------------------------------------------
+
+/// Pluggable boot-time telemetry initializer.
+///
+/// Replace the default `tracing-subscriber + OTLP` initializer with a custom
+/// strategy (Datadog tracer, Honeycomb beeline, Sentry breadcrumbs, custom
+/// log aggregator) by implementing this trait and installing it on the
+/// [`AppBuilder`](crate::app::AppBuilder) via
+/// [`with_telemetry_provider`](crate::app::AppBuilder::with_telemetry_provider).
+///
+/// Initialization is synchronous — the trait mirrors the shape of the
+/// underlying [`init`] free function. Custom providers that need async setup
+/// can spin up a runtime internally or, more commonly, do their async work
+/// from within the returned [`TelemetryGuard`]'s lifecycle hooks.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::config::{LogConfig, TelemetryConfig};
+/// use autumn_web::telemetry::{TelemetryGuard, TelemetryInitError, TelemetryProvider};
+///
+/// pub struct DatadogTelemetryProvider;
+///
+/// impl TelemetryProvider for DatadogTelemetryProvider {
+///     fn init(
+///         &self,
+///         _log: &LogConfig,
+///         _telemetry: &TelemetryConfig,
+///         _profile: Option<&str>,
+///     ) -> Result<TelemetryGuard, TelemetryInitError> {
+///         // configure datadog-tracing here, then return a guard whose Drop
+///         // cleanly flushes the exporter.
+///         Ok(TelemetryGuard::disabled())
+///     }
+/// }
+/// ```
+pub trait TelemetryProvider: Send + Sync + 'static {
+    /// Initialize tracing/log subscribers and any exporters.
+    ///
+    /// Returns a [`TelemetryGuard`] whose `Drop` impl is responsible for
+    /// flushing exporters and tearing down any background tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryInitError`] if subscriber registration or exporter
+    /// setup fails. Propagates to bootstrap and aborts the app.
+    fn init(
+        &self,
+        log: &LogConfig,
+        telemetry: &TelemetryConfig,
+        profile: Option<&str>,
+    ) -> Result<TelemetryGuard, TelemetryInitError>;
+}
+
+/// Default [`TelemetryProvider`] — `tracing-subscriber` with optional OTLP export.
+///
+/// Delegates to the free function [`init`]. This is the provider used when no
+/// override is installed via
+/// [`with_telemetry_provider`](crate::app::AppBuilder::with_telemetry_provider).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TracingOtlpTelemetryProvider;
+
+impl TracingOtlpTelemetryProvider {
+    /// Construct a new default telemetry provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl TelemetryProvider for TracingOtlpTelemetryProvider {
+    fn init(
+        &self,
+        log: &LogConfig,
+        telemetry: &TelemetryConfig,
+        profile: Option<&str>,
+    ) -> Result<TelemetryGuard, TelemetryInitError> {
+        init(log, telemetry, profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No-op provider for tests — returns a disabled guard without touching the
+    /// global tracing subscriber. Verifies the trait actually overrides the
+    /// default `tracing-subscriber + OTLP` initializer.
+    struct NoOpTelemetryProvider;
+
+    impl TelemetryProvider for NoOpTelemetryProvider {
+        fn init(
+            &self,
+            _log: &LogConfig,
+            _telemetry: &TelemetryConfig,
+            _profile: Option<&str>,
+        ) -> Result<TelemetryGuard, TelemetryInitError> {
+            Ok(TelemetryGuard::disabled())
+        }
+    }
+
+    #[test]
+    fn telemetry_provider_trait_returns_supplied_guard() {
+        let provider = NoOpTelemetryProvider;
+        let log = LogConfig::default();
+        let telemetry = TelemetryConfig::default();
+        // Should succeed and not touch the global subscriber.
+        let guard = provider
+            .init(&log, &telemetry, Some("test"))
+            .expect("no-op provider should succeed");
+        // Sanity: the disabled guard must be droppable without panic.
+        drop(guard);
+    }
+}
