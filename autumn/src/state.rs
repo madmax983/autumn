@@ -11,7 +11,7 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::actuator;
 #[cfg(feature = "ws")]
@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 pub struct AppState {
     /// Runtime-managed typed extensions installed by integrations after the app
     /// state has been constructed.
-    pub(crate) extensions: Arc<Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+    pub(crate) extensions: Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
 
     /// Database connection pool, or `None` when no `database.url` is configured.
     #[cfg(feature = "db")]
@@ -108,7 +108,7 @@ impl AppState {
         T: Any + Send + Sync + 'static,
     {
         self.extensions
-            .lock()
+            .write()
             .expect("app state extension lock poisoned")
             .insert(TypeId::of::<T>(), Arc::new(value));
     }
@@ -127,7 +127,7 @@ impl AppState {
         T: Any + Send + Sync + 'static,
     {
         self.extensions
-            .lock()
+            .read()
             .expect("app state extension lock poisoned")
             .get(&TypeId::of::<T>())
             .cloned()
@@ -308,7 +308,7 @@ impl AppState {
     #[must_use]
     pub fn detached() -> Self {
         Self {
-            extensions: Arc::new(Mutex::new(HashMap::new())),
+            extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,
@@ -430,7 +430,7 @@ impl std::fmt::Debug for AppState {
             "extensions",
             &self
                 .extensions
-                .lock()
+                .read()
                 .map_or(0, |extensions| extensions.len()),
         );
         s.field("profile", &self.profile)

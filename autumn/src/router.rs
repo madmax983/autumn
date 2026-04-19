@@ -791,9 +791,9 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
-            extensions: std::sync::Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             #[cfg(feature = "db")]
             pool: None,
             profile: Some("test".to_owned()),
