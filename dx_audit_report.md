@@ -98,3 +98,25 @@ To make the developer experience more robust ("idiot-proofing"):
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that standard `curl` requests to missing paths receive `content-length: 0`.
 - Verified that the secondary `__autumn_route_info_...` error is unavoidable due to eager macro resolution, meaning we must accept it as an ergonomic trade-off, but it could be explicitly documented.
+
+# DX Audit Report: Database Ergonomics & `Db` Extractor
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Read the documentation for `Db` extractor in `docs/guide/tutorial/04-models.md` and `autumn/src/db.rs`.
+- Created a new test application without configuring a database in `autumn.toml`.
+- Added a route that uses the `Db` extractor (e.g., `async fn db_test(mut db: Db) -> AutumnResult<&'static str>`).
+- Attempted to access the route via a browser (`Accept: text/html`) and via an API client (`Accept: application/json`).
+
+## 2. 🚧 STUMBLE - The Friction Points
+- The behavior is exactly as documented: handlers that request `Db` return `503 Service Unavailable` if the database is not configured.
+- The `503 Service Unavailable` HTML page and JSON response display the message "Database not configured". This is very clear.
+- **Import Scan**: The `Db` type is easily accessible via `autumn_web::prelude::*`, avoiding import spam.
+- **Slang Check**: Terminology is standard. The term `Db` extractor makes sense within the context of Axum.
+
+## 3. 📢 REPORT - The Complaint
+- The developer experience here is surprisingly good. The framework avoids panicking at startup if you forget to configure a database, and instead clearly explains the issue when a database-dependent route is hit.
+- "I actually don't have a complaint here. The error message 'Database not configured' is extremely helpful and tells me exactly what I forgot to do."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that hitting a `Db`-requiring route without a configured database returns a `503 Service Unavailable` status with a clear "Database not configured" message in both HTML and JSON formats.
+- The application starts up gracefully even when `Db` is required in routes but `database.url` is missing from the config, allowing non-DB routes to continue functioning perfectly.
