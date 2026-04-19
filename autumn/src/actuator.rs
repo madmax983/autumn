@@ -1083,21 +1083,21 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
         actuator_route_path(prefix, "/metrics"),
+        actuator_route_path(prefix, "/ui"),
+        actuator_route_path(prefix, "/ui/metrics"),
     ];
 
     if sensitive {
-        paths.extend([
-            actuator_route_path(prefix, "/env"),
-            actuator_route_path(prefix, "/configprops"),
-            actuator_route_path(prefix, "/loggers"),
-            actuator_route_path(prefix, "/tasks"),
-            actuator_route_path(prefix, "/prometheus"),
-        ]);
-
+        paths.push(actuator_route_path(prefix, "/env"));
+        paths.push(actuator_route_path(prefix, "/configprops"));
+        paths.push(actuator_route_path(prefix, "/loggers"));
+        paths.push(actuator_route_path(prefix, "/tasks"));
+        paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
         {
-            paths.push(actuator_route_path(prefix, "/tasks/stream"));
             paths.push(actuator_route_path(prefix, "/channels"));
+            paths.push(actuator_route_path(prefix, "/tasks/stream"));
         }
     }
 
