@@ -150,6 +150,16 @@ impl Subscriber {
     pub async fn recv(&mut self) -> Result<ChannelMessage, broadcast::error::RecvError> {
         self.inner.recv().await
     }
+
+    /// Convert this subscriber into a `Stream` of channel messages.
+    ///
+    /// Lagged errors are silently ignored, ensuring the stream continues
+    /// with the freshest messages.
+    #[cfg(feature = "ws")]
+    pub fn into_stream(self) -> impl tokio_stream::Stream<Item = ChannelMessage> {
+        use tokio_stream::StreamExt;
+        tokio_stream::wrappers::BroadcastStream::new(self.inner).filter_map(std::result::Result::ok)
+    }
 }
 
 impl Channels {
@@ -300,6 +310,29 @@ impl Channels {
             .map(|(name, tx)| (name.clone(), tx.receiver_count()))
             .collect()
     }
+
+    /// Creates an SSE (Server-Sent Events) response stream for a channel.
+    ///
+    /// This bridges the pub-sub system directly to an HTTP response,
+    /// which pairs perfectly with `htmx`'s `sse` extension.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[cfg(feature = "ws")]
+    pub fn sse_stream(
+        &self,
+        name: &str,
+    ) -> axum::response::sse::Sse<
+        impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    > {
+        use tokio_stream::StreamExt;
+        let rx = self.subscribe(name);
+        let stream = rx
+            .into_stream()
+            .map(|msg| Ok(axum::response::sse::Event::default().data(msg.into_string())));
+        axum::response::sse::Sse::new(stream).keep_alive(crate::sse::keep_alive())
+    }
 }
 
 #[cfg(test)]
@@ -416,5 +449,38 @@ mod tests {
         // "alive" has an active sender (_tx), so it is kept (count = 1).
         // "dead" has 0 receivers and 0 active senders (dropped), so it gets cleaned.
         assert_eq!(channels.channel_count(), 1);
+    }
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn subscriber_into_stream() {
+        use tokio_stream::StreamExt;
+        let channels = Channels::new(16);
+        let tx = channels.sender("test_stream");
+        let rx = channels.subscribe("test_stream");
+
+        tx.send("message 1").unwrap();
+        tx.send("message 2").unwrap();
+
+        let mut stream = rx.into_stream();
+        let msg1 = stream.next().await.unwrap();
+        assert_eq!(msg1.as_str(), "message 1");
+
+        let msg2 = stream.next().await.unwrap();
+        assert_eq!(msg2.as_str(), "message 2");
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn channels_sse_stream() {
+        let channels = Channels::new(16);
+        let tx = channels.sender("test_sse");
+
+        let sse = channels.sse_stream("test_sse");
+
+        tx.send("sse message").unwrap();
+
+        // Sse implements IntoResponse, we can pull from the stream.
+        // We will just verify it compiles and creates the struct.
+        let _stream = sse;
     }
 }
