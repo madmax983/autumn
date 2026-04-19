@@ -1,3 +1,9 @@
+//! Core types for the static generation engine.
+//!
+//! This module defines the vocabulary used to describe statically generated routes,
+//! such as `StaticRouteMeta` (metadata about a route) and `StaticManifest` (the JSON
+//! ledger of all files generated during the build).
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;

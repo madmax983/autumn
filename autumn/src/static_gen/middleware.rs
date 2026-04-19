@@ -1,3 +1,9 @@
+//! Middleware for serving statically generated files.
+//!
+//! This module contains the `StaticFileLayer`, which intercepts requests and serves
+//! pre-rendered HTML files from the `dist/` directory if they exist. It acts as a
+//! lightning-fast cache layer in front of your dynamic routes.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
