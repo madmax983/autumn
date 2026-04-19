@@ -308,4 +308,14 @@ mod tests {
         assert!(s.contains("<html"));
         assert!(s.contains("</html>"));
     }
+
+    #[test]
+    fn test_canonical_reason_fallback() {
+        let pages = DefaultErrorPages;
+        let ctx = make_ctx(StatusCode::from_u16(599).unwrap());
+        let html = pages.render_error(&ctx);
+        let s = html.into_string();
+        assert!(s.contains("599"));
+        assert!(s.contains("Error"));
+    }
 }
