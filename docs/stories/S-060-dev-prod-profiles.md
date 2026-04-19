@@ -36,7 +36,7 @@ Look at the market:
 
 ✅ **Acceptance Criteria:**
 - Must allow `[profile.dev]` and `[profile.prod]` sections within the standard `autumn.toml` configuration file.
-- Must determine the active profile via the `AUTUMN_ENV` environment variable, defaulting to `development` if unset.
+- Must determine the active profile via the `AUTUMN_ENV` environment variable, defaulting to `dev` if unset, with values mapping directly to the profile keys (`dev` -> `[profile.dev]`, `prod` -> `[profile.prod]`).
 - Must ensure that settings in `[profile.dev]` or `[profile.prod]` override base settings when their respective profile is active.
 - Must automatically switch framework-level defaults based on the active profile (e.g., structured JSON logging in production vs. pretty logging in development).
 - Must ensure that explicit environment variables (e.g., `AUTUMN_DATABASE__URL`) continue to take precedence over both base and profile-specific settings.
