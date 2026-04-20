@@ -18,6 +18,12 @@
 //! headers — the limiter consults `X-Forwarded-For` (first entry) and
 //! `X-Real-IP` first, falling back to the peer address.
 //!
+//! Requests with no identifiable client (no trusted forwarding header
+//! AND no `ConnectInfo`) bypass rate limiting entirely. In-process
+//! callers such as the static site generator and test harnesses that
+//! invoke the router via [`tower::ServiceExt::oneshot`] fall into this
+//! bucket and must not be throttled.
+//!
 //! # Configuration
 //!
 //! See [`RateLimitConfig`] for available settings.
@@ -175,18 +181,23 @@ impl Limiter {
     /// Extract the originating client IP from a request, honoring this
     /// limiter's trusted-proxy policy.
     ///
-    /// When `trust_forwarded_headers` is `false` (the default), the peer
-    /// address from [`ConnectInfo<SocketAddr>`] is the sole key source.
-    /// Otherwise the first entry of `X-Forwarded-For`, then `X-Real-IP`,
-    /// is consulted before falling back to the peer address.
-    fn client_ip<B>(&self, req: &Request<B>) -> String {
+    /// Returns `None` when no identifiable client is present, signalling
+    /// the middleware to bypass throttling. In-process callers such as
+    /// the static site generator and `Router::oneshot`-style test
+    /// harnesses fall into this path.
+    ///
+    /// When `trust_forwarded_headers` is `true`, the first entry of
+    /// `X-Forwarded-For` and then `X-Real-IP` are consulted before
+    /// [`ConnectInfo<SocketAddr>`]. Otherwise only the peer address is
+    /// used.
+    fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers {
             if let Some(value) = req.headers().get("x-forwarded-for") {
                 if let Ok(s) = value.to_str() {
                     if let Some(first) = s.split(',').next() {
                         let trimmed = first.trim();
                         if !trimmed.is_empty() {
-                            return trimmed.to_owned();
+                            return Some(trimmed.to_owned());
                         }
                     }
                 }
@@ -196,17 +207,15 @@ impl Limiter {
                 if let Ok(s) = value.to_str() {
                     let trimmed = s.trim();
                     if !trimmed.is_empty() {
-                        return trimmed.to_owned();
+                        return Some(trimmed.to_owned());
                     }
                 }
             }
         }
 
-        if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-            return addr.ip().to_string();
-        }
-
-        "unknown".to_owned()
+        req.extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip().to_string())
     }
 }
 
@@ -264,9 +273,17 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let now = Instant::now();
-        let key = self.limiter.client_ip(&req);
-        let decision = self.limiter.decide(&key, now);
-        self.limiter.maybe_sweep(now);
+        // When no identifiable client is present (no trusted forwarding
+        // header, no ConnectInfo), bypass rate limiting. This covers
+        // in-process callers like the static site generator and test
+        // harnesses that invoke the router via `oneshot`.
+        let decision = self
+            .limiter
+            .client_ip(&req)
+            .map(|key| self.limiter.decide(&key, now));
+        if decision.is_some() {
+            self.limiter.maybe_sweep(now);
+        }
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
@@ -275,7 +292,7 @@ where
 
         Box::pin(async move {
             match decision {
-                Decision::Denied { retry_after_secs } => {
+                Some(Decision::Denied { retry_after_secs }) => {
                     let mut response = Response::new(ResBody::default());
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
                     let headers = response.headers_mut();
@@ -286,7 +303,7 @@ where
                     headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
                     Ok(response)
                 }
-                Decision::Allowed { remaining } => {
+                Some(Decision::Allowed { remaining }) => {
                     let mut response = inner.call(req).await?;
                     let headers = response.headers_mut();
                     headers.insert(X_RATELIMIT_LIMIT, limiter.burst_header.clone());
@@ -295,6 +312,7 @@ where
                     }
                     Ok(response)
                 }
+                None => inner.call(req).await,
             }
         })
     }
@@ -424,7 +442,7 @@ mod tests {
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .unwrap();
-        assert_eq!(limiter(true).client_ip(&req), "1.2.3.4");
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
@@ -433,7 +451,7 @@ mod tests {
             .header("X-Forwarded-For", "  9.9.9.9  ")
             .body(())
             .unwrap();
-        assert_eq!(limiter(true).client_ip(&req), "9.9.9.9");
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("9.9.9.9"));
     }
 
     #[test]
@@ -442,7 +460,7 @@ mod tests {
             .header("X-Real-IP", "7.7.7.7")
             .body(())
             .unwrap();
-        assert_eq!(limiter(true).client_ip(&req), "7.7.7.7");
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("7.7.7.7"));
     }
 
     #[test]
@@ -450,16 +468,18 @@ mod tests {
         let mut req: Request<()> = Request::builder().body(()).unwrap();
         let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
-        assert_eq!(limiter(true).client_ip(&req), "127.0.0.1");
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("127.0.0.1"));
         // Untrusted limiter also falls back, since headers are ignored.
-        assert_eq!(limiter(false).client_ip(&req), "127.0.0.1");
+        assert_eq!(limiter(false).client_ip(&req).as_deref(), Some("127.0.0.1"));
     }
 
     #[test]
-    fn client_ip_unknown_when_no_source() {
+    fn client_ip_none_when_no_source() {
+        // In-process callers without ConnectInfo (SSG, tests) must be
+        // bypassed, not collapsed onto a shared fallback bucket.
         let req: Request<()> = Request::builder().body(()).unwrap();
-        assert_eq!(limiter(true).client_ip(&req), "unknown");
-        assert_eq!(limiter(false).client_ip(&req), "unknown");
+        assert!(limiter(true).client_ip(&req).is_none());
+        assert!(limiter(false).client_ip(&req).is_none());
     }
 
     #[test]
@@ -470,7 +490,7 @@ mod tests {
             .body(())
             .unwrap();
         // First XFF entry is empty after trim, so we fall back to X-Real-IP.
-        assert_eq!(limiter(true).client_ip(&req), "8.8.8.8");
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("8.8.8.8"));
     }
 
     #[test]
@@ -485,14 +505,15 @@ mod tests {
             .unwrap();
         let addr: SocketAddr = "10.0.0.42:1111".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
-        assert_eq!(limiter(false).client_ip(&req), "10.0.0.42");
+        assert_eq!(limiter(false).client_ip(&req).as_deref(), Some("10.0.0.42"));
     }
 
     #[tokio::test]
     async fn forwarded_headers_cannot_bypass_throttling_when_untrusted() {
-        // `trust_forwarded_headers = false` (default). All requests share the
-        // same fallback key because no ConnectInfo is set, so rotating XFF
-        // does NOT create independent buckets.
+        // `trust_forwarded_headers = false` (default). When ConnectInfo is
+        // set (the production configuration), rotating XFF values must
+        // NOT shard the throttle into separate buckets — the peer IP is
+        // the sole key source.
         let config = RateLimitConfig {
             enabled: true,
             requests_per_second: 0.1,
@@ -500,12 +521,57 @@ mod tests {
             trust_forwarded_headers: false,
         };
         let app = app(&config);
+        let peer: SocketAddr = "198.51.100.1:2000".parse().unwrap();
 
-        let first = app.clone().oneshot(req_with_ip("1.1.1.1")).await.unwrap();
+        let make_req = |xff: &str| {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("X-Forwarded-For", xff)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let first = app.clone().oneshot(make_req("1.1.1.1")).await.unwrap();
         assert_eq!(first.status(), StatusCode::OK);
-        // Different XFF value, but same fallback key → still throttled.
-        let blocked = app.clone().oneshot(req_with_ip("2.2.2.2")).await.unwrap();
+        // Different XFF value, but same peer → still throttled.
+        let blocked = app.clone().oneshot(make_req("2.2.2.2")).await.unwrap();
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn requests_without_connect_info_bypass_rate_limit() {
+        // Static site generation and `Router::oneshot`-style callers
+        // don't set ConnectInfo. The limiter must pass them through so
+        // build-time rendering isn't throttled onto a shared bucket.
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.001,
+            burst: 1,
+            trust_forwarded_headers: false,
+        };
+        let app = app(&config);
+
+        for _ in 0..10 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers().get("x-ratelimit-limit").is_none(),
+                "bypassed requests should not carry rate-limit headers"
+            );
+        }
     }
 
     #[test]
