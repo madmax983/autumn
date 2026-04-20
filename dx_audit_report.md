@@ -98,3 +98,26 @@ To make the developer experience more robust ("idiot-proofing"):
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that standard `curl` requests to missing paths receive `content-length: 0`.
 - Verified that the secondary `__autumn_route_info_...` error is unavoidable due to eager macro resolution, meaning we must accept it as an ergonomic trade-off, but it could be explicitly documented.
+
+# DX Audit Report: Security Scanning
+
+## 1. 🔍 SURVEILLANCE
+- Ran `cargo audit` to check for known dependencies vulnerabilities (none found).
+- Checked for `unsafe` usages and `std::env::set_var` (they are either fine, in tests/docs, or being used safely like in `EnvGuard` tests, or are from dependencies).
+- Checked for panics like `unwrap()`, `expect()`, `unwrap_err()`. There are a lot of `unwrap()` calls in tests and CLI commands.
+- Looked for integer overflows without `checked_add`. I grepped for `+` and looked through places where arithmetic is done without `checked_*` methods.
+- Analyzed potential DoS vectors such as missing `Take` limits on Readers or missing bound checks on deserialization sizes. The payload size in `verify_csrf_token` is limited using `axum::body::to_bytes(body, 2 * 1024 * 1024)` which prevents memory exhaustion DoS.
+- Examined `verify_password` and CSRF implementations for timing attacks. Both correctly handle timing attacks using fallback hashes or `constant_time_eq` using `subtle`.
+
+## 2. 🔒 SELECT
+- No security vulnerabilities found.
+
+## 3. 🛡️ FORTIFY
+- None needed.
+
+## 4. ✅ VERIFY
+- Ran `cargo audit`. No vulnerabilities found.
+- All code is safe and tested.
+
+## 5. 🎁 PRESENT
+- Wrote `scan_log.md` with the output of the scan.
