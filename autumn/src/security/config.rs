@@ -343,7 +343,10 @@ mod tests {
         // Mozilla Observatory and similar automated scanners.
         let csp = default_content_security_policy();
         assert!(!csp.contains("'unsafe-eval'"), "csp = {csp}");
-        assert!(!csp.contains("'unsafe-inline' 'unsafe-eval'"), "csp = {csp}");
+        assert!(
+            !csp.contains("'unsafe-inline' 'unsafe-eval'"),
+            "csp = {csp}"
+        );
     }
 
     #[test]
