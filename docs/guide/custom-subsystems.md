@@ -194,8 +194,12 @@ that doesn't fit the built-in memory/Redis split.
 
 ```rust,no_run
 # use autumn_web::error_pages::ErrorPageRenderer;
+# use autumn_web::error_pages::ErrorContext;
+# use maud::Markup;
 # struct MyRenderer;
-# impl ErrorPageRenderer for MyRenderer {}
+# impl ErrorPageRenderer for MyRenderer {
+#     fn render_error(&self, _ctx: &ErrorContext) -> Markup { maud::html! { h1 { "error" } } }
+# }
 # use autumn_web::prelude::*;
 #[autumn_web::main]
 async fn main() {

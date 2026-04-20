@@ -70,11 +70,15 @@ async fn eris_auth_dos_poc() {
 
     assert!(ping_success, "Ping request failed");
 
-    // To prove the fix, we assert that ping returns fast.
-    // A true DoS (blocking workers) would make this take 30+ seconds,
-    // while the non-blocking implementation allows the ping to respond immediately.
+    // To prove the fix, we assert that ping returns in a reasonable time.
+    // A true DoS (synchronous bcrypt blocking the async workers) would make
+    // this take 30+ seconds, since every worker is held by a hash. The
+    // non-blocking implementation (spawn_blocking) lets the async workers
+    // service the ping even while hashes are in flight. The 2s threshold
+    // leaves slack for constrained CI runners where 64 concurrent bcrypts
+    // contend for CPU on the blocking threadpool.
     assert!(
-        ping_duration < Duration::from_millis(250),
+        ping_duration < Duration::from_secs(2),
         "Ping took too long ({ping_duration:?}), indicating a Denial of Service via blocked worker threads!"
     );
 

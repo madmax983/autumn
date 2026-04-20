@@ -549,6 +549,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_renderer_is_ignored_for_json_requests() {
+        use crate::error_pages::{ErrorContext, ErrorPageRenderer};
+        use maud::{Markup, html};
+
+        struct LoudCustomPages;
+        impl ErrorPageRenderer for LoudCustomPages {
+            fn render_error(&self, ctx: &ErrorContext) -> Markup {
+                html! {
+                    h1 { "LOUD CUSTOM " (ctx.status.as_u16()) }
+                }
+            }
+        }
+
+        let renderer: crate::error_pages::SharedRenderer = Arc::new(LoudCustomPages);
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+        };
+        let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
+            vec![Arc::new(error_page_filter)];
+
+        let app = Router::new()
+            .route(
+                "/err",
+                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
+            )
+            .layer(ErrorPageContextLayer)
+            .layer(ExceptionFilterLayer::new(filters));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/err")
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type should be present")
+            .to_str()
+            .expect("content-type should be valid UTF-8");
+        assert!(
+            ct.contains("application/json"),
+            "JSON requests should still get JSON, got: {ct}"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("LOUD CUSTOM 404"),
+            "custom HTML renderer should not run for JSON requests, got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
     async fn success_responses_not_affected() {
         let app = test_router_with_error_pages(false);
         let resp = app
