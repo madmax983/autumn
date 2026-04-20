@@ -402,7 +402,19 @@ impl AppBuilder {
     ///
     /// When `.layer()` is called multiple times, the **first** call becomes
     /// the outermost user layer on ingress (matching `tower::ServiceBuilder`
-    /// semantics).
+    /// semantics): the layer from the first `.layer(...)` call sees the
+    /// request first on the way in and the response last on the way out.
+    ///
+    /// # Scope
+    ///
+    /// This layer applies **globally** to every route in the app, including
+    /// routes added later by plugins, routes mounted via `.merge` / `.nest`,
+    /// and the built-in `404` fallback. Use [`AppBuilder::scoped`] when you
+    /// need middleware scoped to a group of routes.
+    ///
+    /// Shared state (pools, metrics registries, rate-limit stores, etc.)
+    /// should be wrapped in `Arc` so the layer can satisfy the
+    /// `Clone + Send + Sync + 'static` bounds without moving the state.
     ///
     /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
     /// for ready-made recipes.
@@ -419,7 +431,7 @@ impl AppBuilder {
     /// use axum::{error_handling::HandleErrorLayer, http::StatusCode};
     /// use tower::{ServiceBuilder, timeout::TimeoutLayer};
     ///
-    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
     /// # #[autumn_web::main]
     /// # async fn main() {
     /// autumn_web::app()
@@ -440,16 +452,21 @@ impl AppBuilder {
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<
-                axum::http::Request<axum::body::Body>,
-                Response = axum::http::Response<axum::body::Body>,
+                axum::extract::Request,
+                Response = axum::response::Response,
                 Error = std::convert::Infallible,
             > + Clone
             + Send
             + Sync
             + 'static,
-        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
-            Send + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
+        // TODO(0.x): consider retaining a TypeId alongside the closure so
+        // plugins can introspect which layers are already registered
+        // (e.g. warn when auth is installed after rate-limiting). Requires
+        // replacing CustomLayerApplier with a small trait that carries type
+        // metadata. Deliberately deferred — pure closures keep the public
+        // surface minimal until a concrete introspection use case appears.
         self.custom_layers
             .push(Box::new(move |router| router.layer(layer)));
         self
@@ -1009,7 +1026,7 @@ impl AppBuilder {
             scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
-            custom_layers: _,
+            custom_layers,
             startup_hooks: _,
             shutdown_hooks: _,
             extensions: _,
@@ -1063,6 +1080,8 @@ impl AppBuilder {
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
+        // Custom Tower layers registered via .layer(...) are likewise
+        // applied so static output matches the production response pipeline.
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -1072,7 +1091,7 @@ impl AppBuilder {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
-                custom_layers: Vec::new(),
+                custom_layers,
                 error_page_renderer: None,
                 session_store,
             },

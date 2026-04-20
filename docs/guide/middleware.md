@@ -81,6 +81,27 @@ user layer, so `A` sees the request first and the response last.
 
 ---
 
+## Wrap shared state in `Arc`
+
+Because `AppBuilder::layer()` requires the layer to be `Clone + Send + Sync +
+'static`, any state your middleware needs to share across requests — HTTP
+client pools, metrics registries, rate-limit stores, caches — should live
+behind an [`Arc`]. Clone the layer; the `Arc` cheaply bumps a refcount.
+
+```rust,ignore
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct MetricsLayer {
+    registry: Arc<prometheus::Registry>, // shared, cheaply clonable
+}
+```
+
+Trying to store the raw `prometheus::Registry` directly would force every
+request-handling clone to deep-copy the registry (if it were `Clone` at all)
+and would fail the `Sync` bound outright for types like `RefCell`. `Arc`
+sidesteps both issues.
+
 ## Reading the request ID from a custom layer
 
 ```rust,ignore
