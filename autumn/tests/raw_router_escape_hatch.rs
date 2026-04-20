@@ -131,6 +131,17 @@ async fn raw_routes_can_extract_app_state() {
 }
 
 #[tokio::test]
+async fn merged_routes_get_request_id_header() {
+    let raw = axum::Router::<AppState>::new().route("/raw", axum::routing::get(|| async { "raw" }));
+    let app = TestApp::new().merge(raw).build();
+    app.get("/raw")
+        .send()
+        .await
+        .assert_status(200)
+        .assert_header_contains("x-request-id", "-");
+}
+
+#[tokio::test]
 async fn nested_routes_can_extract_app_state() {
     let raw = axum::Router::<AppState>::new().route(
         "/state",

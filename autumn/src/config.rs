@@ -41,6 +41,7 @@
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__POOL_SIZE` | `database.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -71,6 +72,10 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -605,6 +610,7 @@ impl AutumnConfig {
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
+        self.cors.validate()?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -631,6 +637,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
@@ -692,6 +699,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
+            &mut self.database.auto_migrate_in_production,
         );
     }
 
@@ -906,6 +918,28 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
             &mut self.security.csrf.cookie_name,
         );
+
+        // Rate limiting
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__ENABLED",
+            &mut self.security.rate_limit.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND",
+            &mut self.security.rate_limit.requests_per_second,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__BURST",
+            &mut self.security.rate_limit.burst,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
+            &mut self.security.rate_limit.trust_forwarded_headers,
+        );
     }
 
     /// Returns the active profile name, if any.
@@ -974,6 +1008,7 @@ pub struct ServerConfig {
 /// | `url` | `None` |
 /// | `pool_size` | `10` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate_in_production` | `false` |
 ///
 /// # Examples
 ///
@@ -1001,6 +1036,14 @@ pub struct DatabaseConfig {
     /// Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+
+    /// When true, permits automatic migration application while running with
+    /// `prod`/`production` profile. Default: `false`.
+    ///
+    /// Keep this disabled for multi-replica production fleets and use an
+    /// explicit migration job (`autumn migrate`) instead.
+    #[serde(default)]
+    pub auto_migrate_in_production: bool,
 }
 
 impl DatabaseConfig {
@@ -1296,6 +1339,27 @@ impl Default for CorsConfig {
     }
 }
 
+impl CorsConfig {
+    /// Validate CORS configuration for combinations rejected by browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `allow_credentials = true` is combined
+    /// with a wildcard `"*"` origin. Browsers refuse this combination per the
+    /// Fetch spec, and `tower-http`'s `CorsLayer` panics when asked to build
+    /// it, so we fail fast at config load with an actionable message.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.allow_credentials && self.allowed_origins.iter().any(|o| o == "*") {
+            return Err(ConfigError::Validation(
+                "CORS: allow_credentials=true is incompatible with allowed_origins=[\"*\"]; \
+                 list explicit origins instead (browsers reject the wildcard+credentials combo)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn default_cors_methods() -> Vec<String> {
     vec![
         "GET".to_owned(),
@@ -1425,6 +1489,7 @@ impl Default for DatabaseConfig {
             url: None,
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout(),
+            auto_migrate_in_production: false,
         }
     }
 }
@@ -1796,6 +1861,7 @@ mod tests {
         assert!(config.database.url.is_none());
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.database.connect_timeout_secs, 5);
+        assert!(!config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Auto);
         assert_eq!(config.health.path, "/health");
@@ -1846,6 +1912,7 @@ shutdown_timeout_secs = 60
 url = "postgres://user:pass@db:5432/myapp"
 pool_size = 20
 connect_timeout_secs = 10
+auto_migrate_in_production = true
 
 [log]
 level = "debug"
@@ -1867,6 +1934,7 @@ path = "/healthz"
         );
         assert_eq!(config.database.pool_size, 20);
         assert_eq!(config.database.connect_timeout_secs, 10);
+        assert!(config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.health.path, "/healthz");
@@ -1942,6 +2010,14 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    #[test]
+    fn env_override_database_auto_migrate_in_production() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.database.auto_migrate_in_production);
     }
 
     // ── Server env override tests ────────────────────────────────
@@ -2462,6 +2538,40 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.cors.max_age_secs, 3600);
+    }
+
+    #[test]
+    fn cors_validate_rejects_wildcard_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = true;
+
+        let result = config.validate();
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(
+                    msg.contains("allow_credentials") && msg.contains('*'),
+                    "message should mention credentials and wildcard, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cors_validate_accepts_wildcard_without_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_validate_accepts_explicit_origins_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+        config.cors.allow_credentials = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

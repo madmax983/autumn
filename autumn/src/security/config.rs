@@ -18,6 +18,11 @@
 //!
 //! [security.csrf]
 //! enabled = true
+//!
+//! [security.rate_limit]
+//! enabled = true
+//! requests_per_second = 10.0
+//! burst = 20
 //! ```
 //!
 //! # Environment variable reference
@@ -28,6 +33,10 @@
 //! | `AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS` | `security.headers.hsts_max_age_secs` | `u64` |
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //!
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
@@ -48,6 +57,7 @@ use serde::Deserialize;
 /// assert_eq!(config.headers.x_frame_options, "DENY");
 /// assert!(config.headers.x_content_type_options);
 /// assert!(!config.csrf.enabled);
+/// assert!(!config.rate_limit.enabled);
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SecurityConfig {
@@ -58,6 +68,10 @@ pub struct SecurityConfig {
     /// CSRF (Cross-Site Request Forgery) protection.
     #[serde(default)]
     pub csrf: CsrfConfig,
+
+    /// Rate limiting (per-client-IP token bucket).
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 /// Security response headers configuration.
@@ -187,6 +201,7 @@ impl Default for HeadersConfig {
 /// | `form_field` | `"_csrf"` |
 /// | `cookie_name` | `"autumn-csrf"` |
 /// | `safe_methods` | `["GET", "HEAD", "OPTIONS", "TRACE"]` |
+/// | `exempt_paths` | `[]` |
 ///
 /// # Examples
 ///
@@ -195,6 +210,7 @@ impl Default for HeadersConfig {
 /// enabled = true
 /// token_header = "X-XSRF-Token"
 /// cookie_name = "XSRF-TOKEN"
+/// exempt_paths = ["/api/"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct CsrfConfig {
@@ -220,6 +236,16 @@ pub struct CsrfConfig {
     /// Default: `["GET", "HEAD", "OPTIONS", "TRACE"]`.
     #[serde(default = "default_safe_methods")]
     pub safe_methods: Vec<String>,
+
+    /// Request path prefixes that are exempt from CSRF validation.
+    /// Default: `[]`.
+    ///
+    /// Use this to opt JSON API routes out of CSRF when they authenticate
+    /// with bearer tokens or other non-cookie credentials. Matches are by
+    /// prefix on the request path, e.g. `"/api/"` exempts all routes
+    /// under `/api/`.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
 }
 
 impl Default for CsrfConfig {
@@ -230,6 +256,75 @@ impl Default for CsrfConfig {
             form_field: default_csrf_field(),
             cookie_name: default_csrf_cookie(),
             safe_methods: default_safe_methods(),
+            exempt_paths: Vec::new(),
+        }
+    }
+}
+
+/// Rate limiting configuration.
+///
+/// Applies a per-client-IP token bucket to every request. When a client
+/// exceeds their bucket, the middleware returns `429 Too Many Requests`
+/// with a `Retry-After` header indicating when to retry.
+///
+/// # Defaults
+///
+/// | Field | Default |
+/// |-------|---------|
+/// | `enabled` | `false` |
+/// | `requests_per_second` | `10.0` |
+/// | `burst` | `20` |
+/// | `trust_forwarded_headers` | `false` |
+///
+/// # Client IP resolution
+///
+/// By default the limiter keys on the **connection peer address**. This
+/// prevents clients from bypassing throttling by rotating `X-Forwarded-For`
+/// values. Set `trust_forwarded_headers = true` only when the server
+/// sits behind a trusted reverse proxy that strips and rewrites
+/// forwarding headers on every request.
+///
+/// # Examples
+///
+/// ```toml
+/// [security.rate_limit]
+/// enabled = true
+/// requests_per_second = 5.0
+/// burst = 10
+/// trust_forwarded_headers = false
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    /// Enable rate limiting. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Steady-state refill rate in requests per second. Default: `10.0`.
+    #[serde(default = "default_rps")]
+    pub requests_per_second: f64,
+
+    /// Maximum burst capacity (number of tokens the bucket can hold).
+    /// Default: `20`.
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+
+    /// Consult `X-Forwarded-For` / `X-Real-IP` before the connection peer
+    /// when identifying the client. Default: `false`.
+    ///
+    /// Enable ONLY when the server is behind a trusted reverse proxy that
+    /// fully overrides these headers on every request. Otherwise a client
+    /// can rotate header values to bypass throttling.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            requests_per_second: default_rps(),
+            burst: default_burst(),
+            trust_forwarded_headers: false,
         }
     }
 }
@@ -302,6 +397,14 @@ fn default_safe_methods() -> Vec<String> {
         "OPTIONS".to_owned(),
         "TRACE".to_owned(),
     ]
+}
+
+const fn default_rps() -> f64 {
+    10.0
+}
+
+const fn default_burst() -> u32 {
+    20
 }
 
 #[cfg(test)]
@@ -406,6 +509,40 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_config_defaults() {
+        let config = RateLimitConfig::default();
+        assert!(!config.enabled);
+        assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.burst, 20);
+        assert!(!config.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn rate_limit_config_deserialize() {
+        let toml_str = r"
+            enabled = true
+            requests_per_second = 5.0
+            burst = 100
+            trust_forwarded_headers = true
+        ";
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!((config.requests_per_second - 5.0).abs() < f64::EPSILON);
+        assert_eq!(config.burst, 100);
+        assert!(config.trust_forwarded_headers);
+    }
+
+    #[test]
+    fn rate_limit_config_partial_deserialize_uses_defaults() {
+        let toml_str = "enabled = true";
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.enabled);
+        assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.burst, 20);
+        assert!(!config.trust_forwarded_headers);
+    }
+
+    #[test]
     fn full_security_config_deserialize() {
         let toml_str = r#"
             [headers]
@@ -414,10 +551,18 @@ mod tests {
 
             [csrf]
             enabled = true
+
+            [rate_limit]
+            enabled = true
+            requests_per_second = 50.0
+            burst = 100
         "#;
         let config: SecurityConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.headers.x_frame_options, "DENY");
         assert!(config.headers.strict_transport_security);
         assert!(config.csrf.enabled);
+        assert!(config.rate_limit.enabled);
+        assert!((config.rate_limit.requests_per_second - 50.0).abs() < f64::EPSILON);
+        assert_eq!(config.rate_limit.burst, 100);
     }
 }

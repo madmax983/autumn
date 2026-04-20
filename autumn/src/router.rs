@@ -436,6 +436,23 @@ fn apply_csrf_middleware(
     router
 }
 
+fn apply_rate_limit_middleware(
+    mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
+) -> axum::Router<AppState> {
+    // Rate limiting middleware (only applied when enabled)
+    if config.security.rate_limit.enabled {
+        let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
+        tracing::info!(
+            rps = config.security.rate_limit.requests_per_second,
+            burst = config.security.rate_limit.burst,
+            "Rate limiting enabled"
+        );
+        router = router.layer(layer);
+    }
+    router
+}
+
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -447,6 +464,7 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config);
+    router = apply_rate_limit_middleware(router, config);
 
     // Security headers layer (always applied)
     let security_headers =
@@ -505,8 +523,8 @@ fn apply_middleware(
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers] -> CSRF -> CORS ->
-    //   handler
+    //   SecurityHeaders -> RequestId -> [user layers] -> RateLimit ->
+    //   CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -787,7 +805,13 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         let origins: Vec<http::HeaderValue> = cors
             .allowed_origins
             .iter()
-            .filter_map(|o| o.parse().ok())
+            .filter_map(|o| match o.parse() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(origin = %o, error = %e, "CORS: ignoring malformed allowed_origin");
+                    None
+                }
+            })
             .collect();
         CorsLayer::new().allow_origin(origins)
     };
@@ -795,13 +819,25 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
     let methods: Vec<http::Method> = cors
         .allowed_methods
         .iter()
-        .filter_map(|m| m.parse().ok())
+        .filter_map(|m| match m.parse() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(method = %m, error = %e, "CORS: ignoring malformed allowed_method");
+                None
+            }
+        })
         .collect();
 
     let headers: Vec<HeaderName> = cors
         .allowed_headers
         .iter()
-        .filter_map(|h| h.parse().ok())
+        .filter_map(|h| match h.parse() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(header = %h, error = %e, "CORS: ignoring malformed allowed_header");
+                None
+            }
+        })
         .collect();
 
     layer
@@ -997,6 +1033,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_cors_middleware_handles_preflight_request() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://example.com".to_owned()];
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/api/widgets", axum::routing::post(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/widgets")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header("Access-Control-Request-Headers", "Content-Type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://example.com"),
+            "preflight must echo the allowed origin"
+        );
+        assert!(
+            headers.get("access-control-allow-methods").is_some(),
+            "preflight must advertise allowed methods"
+        );
+        assert!(
+            headers.get("access-control-allow-headers").is_some(),
+            "preflight must advertise allowed headers"
+        );
+        assert!(
+            headers.get("access-control-max-age").is_some(),
+            "preflight must advertise max-age so browsers can cache it"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_csrf_middleware_skipped_when_disabled() {
         let config = AutumnConfig::default();
         assert!(!config.security.csrf.enabled);
@@ -1018,6 +1099,65 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn apply_rate_limit_middleware_skipped_when_disabled() {
+        let config = AutumnConfig::default();
+        assert!(!config.security.rate_limit.enabled);
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+
+        // Fire several rapid requests; none should be throttled.
+        for _ in 0..5 {
+            let response = router
+                .clone()
+                .oneshot(Request::builder().uri("/ping").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_rate_limit_middleware_returns_429_when_exhausted() {
+        let mut config = AutumnConfig::default();
+        config.security.rate_limit.enabled = true;
+        config.security.rate_limit.requests_per_second = 0.1;
+        config.security.rate_limit.burst = 1;
+        config.security.rate_limit.trust_forwarded_headers = true;
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
+        let router = apply_rate_limit_middleware(base, &config).with_state(test_state());
+
+        let ok = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/ping")
+                    .header("X-Forwarded-For", "203.0.113.9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let blocked = router
+            .oneshot(
+                Request::builder()
+                    .uri("/ping")
+                    .header("X-Forwarded-For", "203.0.113.9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(blocked.headers().get("retry-after").is_some());
     }
 
     #[tokio::test]
