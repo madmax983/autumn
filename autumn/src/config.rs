@@ -604,17 +604,15 @@ impl AutumnConfig {
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
-        match self.session.backend_plan(self.profile.as_deref()) {
-            Ok(crate::session::SessionBackendPlan::Memory {
-                warn_in_production: true,
-            }) => eprintln!(
-                "Warning: prod profile is using in-memory sessions. Configure \
-                 `session.backend = \"redis\"` or set \
-                 `session.allow_memory_in_production = true` to acknowledge the risk."
-            ),
-            Ok(_) => {}
-            Err(error) => return Err(ConfigError::Validation(error.to_string())),
-        }
+        // Session backend validation deliberately lives in
+        // `crate::session::apply_session_layer`, not here. That function
+        // short-circuits when a custom `SessionStore` was installed via
+        // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
+        // `session.backend = "redis"` config without a redis URL doesn't
+        // need to fail the boot. Validating the same thing here would
+        // defeat the override and exit the app before the custom store
+        // ever gets a chance to apply. The "prod profile + memory backend"
+        // warning lives in `apply_session_layer` for the same reason.
         Ok(())
     }
 
@@ -1548,6 +1546,25 @@ mod tests {
         assert_eq!(resolved.profile.as_deref(), Some("integration-test"));
     }
 
+    #[test]
+    fn validate_does_not_error_on_redis_backend_without_url() {
+        // Regression: previously `validate()` called
+        // `session.backend_plan(profile)` which returned an error for
+        // `backend = "redis"` without `redis.url`, exiting the boot before
+        // a `with_session_store(...)` override could apply. Session
+        // backend validation now lives in `apply_session_layer`, which
+        // short-circuits when a custom store is installed. `validate()`
+        // is config-shape-only and must accept this combination.
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = None;
+
+        config.validate().expect(
+            "validate() must accept redis-backend-without-url so custom \
+             session store overrides aren't blocked at boot",
+        );
+    }
+
     #[tokio::test]
     async fn default_toml_env_loader_succeeds_without_files() {
         // No autumn.toml in the test runner's pwd; loader should fall back to
@@ -1692,18 +1709,23 @@ mod tests {
     }
 
     #[test]
-    fn autumn_config_validate_session_err() {
+    fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
+        // Session backend validation moved to `apply_session_layer` so a
+        // custom store installed via `AppBuilder::with_session_store(...)`
+        // can override an otherwise-invalid backend config without the boot
+        // exiting first. `validate()` is config-shape-only now; runtime
+        // session selection (and the backend error) lives in
+        // `apply_session_layer`, which short-circuits when a custom store
+        // is installed. `crate::session::tests::session_backend_plan_*`
+        // still cover the underlying error cases directly on
+        // `SessionConfig::backend_plan`.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;
 
-        let result = config.validate();
-        assert!(result.is_err());
-        if let Err(ConfigError::Validation(msg)) = result {
-            assert!(msg.contains("session.backend=redis requires session.redis.url"));
-        } else {
-            panic!("Expected ConfigError::Validation");
-        }
+        config
+            .validate()
+            .expect("validate() must accept invalid session backend so custom store can override");
     }
 
     #[test]
