@@ -836,6 +836,42 @@ without a database pool. Handlers that use `Db` will return 503 Service
 Unavailable. This is useful for static sites, APIs that do not need a
 database, or during early development.
 
+### Escape hatch: mounting raw Axum routers
+
+When route macros are enough, prefer them -- you keep Autumn's discovery
+conventions and the codebase stays more uniform.
+
+When you need Axum-native composition (for example, mounting a third-party
+router like GraphQL), use `.merge()` or `.nest()`:
+
+```rust,no_run
+use autumn_web::prelude::*;
+use autumn_web::AppState;
+
+#[get("/")]
+async fn index() -> &'static str { "ok" }
+
+#[autumn_web::main]
+async fn main() {
+    let graphql = axum::Router::<AppState>::new()
+        .route("/graphql", axum::routing::get(|| async { "graphql endpoint" }));
+
+    autumn_web::app()
+        .routes(routes![index]) // Autumn-managed routes
+        .merge(graphql) // Raw Axum routes on the same app
+        .run()
+        .await;
+}
+```
+
+Use `.merge()` for direct mounting and `.nest("/prefix", router)` when you want
+all routes under a prefix (for example `/api/v2`).
+
+Merged/nested routers share the same `AppState` and still pass through Autumn's
+global middleware (including `X-Request-Id` response headers). Avoid defining
+the same method+path in both managed and raw routers -- Axum treats overlaps as
+an error during router construction.
+
 ---
 
 ## What's Next?

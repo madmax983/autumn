@@ -538,8 +538,9 @@ impl AppBuilder {
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
     ///
-    /// Merged routes are added **after** Autumn's annotated routes, so
-    /// if both define the same path, the annotated route takes precedence.
+    /// Merged routes are added **after** Autumn's annotated routes.
+    /// If both define the same method+path pair, Axum treats that as an
+    /// overlap and router construction will fail.
     ///
     /// Can be called multiple times -- routers are accumulated.
     ///
@@ -1607,7 +1608,12 @@ async fn setup_database(
     if pool.is_some() {
         if let Some(url) = &config.database.url {
             for mig in migrations {
-                crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+                crate::migrate::auto_migrate(
+                    url,
+                    config.profile.as_deref(),
+                    config.database.auto_migrate_in_production,
+                    mig,
+                );
             }
         }
     }
