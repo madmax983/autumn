@@ -36,7 +36,7 @@
 //! xss_protection = true                # X-XSS-Protection: 1; mode=block
 //! strict_transport_security = true     # HSTS (auto-enabled in prod)
 //! hsts_max_age_secs = 31536000         # 1 year
-//! content_security_policy = ""         # set to enable CSP
+//! content_security_policy = "default-src 'self'; ..."  # htmx-compatible default; "" to disable
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
 //!
