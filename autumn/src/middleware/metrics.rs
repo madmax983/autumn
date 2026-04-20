@@ -140,6 +140,10 @@ impl MetricsCollector {
         let key = format!("{method} {route}");
         {
             if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+                // Prevent unbounded memory growth from arbitrary routes
+                if shard.by_route.len() >= 10_000 && !shard.by_route.contains_key(&key) {
+                    return;
+                }
                 let entry = shard.by_route.entry(key).or_default();
                 entry.count += 1;
                 if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
