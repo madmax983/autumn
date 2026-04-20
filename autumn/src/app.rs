@@ -538,8 +538,9 @@ impl AppBuilder {
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
     ///
-    /// Merged routes are added **after** Autumn's annotated routes, so
-    /// if both define the same path, the annotated route takes precedence.
+    /// Merged routes are added **after** Autumn's annotated routes.
+    /// If both define the same method+path pair, Axum treats that as an
+    /// overlap and router construction will fail.
     ///
     /// Can be called multiple times -- routers are accumulated.
     ///
