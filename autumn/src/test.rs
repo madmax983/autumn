@@ -155,21 +155,9 @@ impl TestApp {
     /// Mirrors [`crate::app::AppBuilder::layer`] so tests can exercise the
     /// exact middleware wiring that `AppBuilder::run()` produces.
     #[must_use]
-    pub fn layer<L>(mut self, layer: L) -> Self
-    where
-        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
-        L::Service: tower::Service<
-                axum::extract::Request,
-                Response = axum::response::Response,
-                Error = std::convert::Infallible,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
-    {
+    pub fn layer<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
         self.custom_layers
-            .push(Box::new(move |router| router.layer(layer)));
+            .push(Box::new(move |router| layer.apply_to(router)));
         self
     }
 
