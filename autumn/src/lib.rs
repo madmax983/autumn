@@ -115,7 +115,7 @@ pub mod sse;
 pub mod static_gen;
 
 pub mod task;
-pub(crate) mod telemetry;
+pub mod telemetry;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;
