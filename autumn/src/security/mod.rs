@@ -79,7 +79,9 @@ pub mod headers;
 pub mod rate_limit;
 
 // Re-export commonly used types at the module level.
-pub use config::{CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy};
+pub use config::{
+    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy,
+};
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;
