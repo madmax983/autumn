@@ -48,6 +48,8 @@ pub use crate::extract::Json;
 pub use crate::extract::Path;
 /// Query extractor.
 pub use crate::extract::Query;
+/// State extractor.
+pub use axum::extract::State;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
