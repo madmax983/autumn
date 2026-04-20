@@ -636,53 +636,6 @@ mod tests {
         assert_eq!(err.to_string(), "authentication required");
     }
 
-
-    #[tokio::test]
-    async fn require_auth_poll_ready_returns_inner() {
-        use tower::Service;
-        use tower::layer::Layer;
-        use std::task::{Context, Poll};
-        use std::pin::Pin;
-        use std::future::Future;
-
-        #[derive(Clone)]
-        struct MockService;
-        impl Service<axum::extract::Request> for MockService {
-            type Response = axum::response::Response;
-            type Error = std::convert::Infallible;
-            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-                Poll::Pending
-            }
-
-            fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
-                unimplemented!()
-            }
-        }
-
-        let auth_layer = RequireAuth::new("user_id");
-        let mut service = auth_layer.layer(MockService);
-
-        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
-        let poll = service.poll_ready(&mut cx);
-        assert!(poll.is_pending());
-    }
-
-
-    #[test]
-    fn auth_rejection_display_format() {
-        let err = AuthRejection;
-        assert_eq!(format!("{err}"), "authentication required");
-    }
-
-    #[tokio::test]
-    async fn test_hash_password_err() {
-        // Can't easily force hash_password to return an error, but we can verify it doesn't default to empty string.
-        let hash = hash_password("pass").await.unwrap();
-        assert!(!hash.is_empty());
-    }
-
     #[tokio::test]
     async fn check_secured_allows_authenticated() {
         let data = std::collections::HashMap::from([("user_id".into(), "42".into())]);

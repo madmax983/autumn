@@ -72,6 +72,7 @@ pub fn app() -> AppBuilder {
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
+        custom_layers: Vec::new(),
         startup_hooks: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
@@ -160,6 +161,9 @@ pub struct AppBuilder {
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Custom Tower layers registered via [`AppBuilder::layer`], applied
+    /// inside `RequestIdLayer` on ingress so they observe the request ID.
+    custom_layers: Vec<CustomLayerApplier>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -196,6 +200,75 @@ pub(crate) struct ScopedGroup {
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+}
+
+/// A deferred router mutator that applies a user-registered
+/// [`tower::Layer`] to the app-wide router.
+///
+/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
+/// `apply_middleware` where the final layer stack is assembled.
+pub(crate) type CustomLayerApplier =
+    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Marker trait for types that can be registered with
+/// [`AppBuilder::layer`] as an app-wide Tower middleware.
+///
+/// Any [`tower::Layer`] whose produced service is a compatible axum
+/// service (i.e. `Service<Request, Response = Response, Error = Infallible>`,
+/// plus the usual `Clone + Send + Sync + 'static` bounds and a `Send`
+/// future) implements this trait automatically via a blanket impl.
+///
+/// The trait is **sealed**: it exists only to surface a clean
+/// `IntoAppLayer is not implemented for YourType` error message when a
+/// candidate layer fails to meet axum's service bounds, instead of a
+/// 40-line associated-type wall. You cannot implement it manually, and
+/// you should not need to — just bring your own `tower::Layer`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a usable Autumn app-wide Tower layer",
+    label = "this type does not implement `tower::Layer<axum::routing::Route>` with the required service bounds",
+    note = "`AppBuilder::layer(..)` requires:\n    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
+)]
+pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
+    /// Apply this layer to the given router. Not intended for direct use.
+    #[doc(hidden)]
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState>;
+}
+
+impl<L> sealed::Sealed for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+}
+
+impl<L> IntoAppLayer for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState> {
+        router.layer(self)
+    }
 }
 
 impl AppBuilder {
@@ -368,6 +441,90 @@ impl AppBuilder {
             routes,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
+        self
+    }
+
+    /// Apply a custom [`tower::Layer`] to the entire application.
+    ///
+    /// This is the escape hatch for integrating any middleware from the
+    /// Tower / Tower-HTTP ecosystem (timeouts, rate limiting, bespoke
+    /// tracing, request signing, etc.) without forking the framework.
+    ///
+    /// The generic bound is [`IntoAppLayer`], a sealed trait with a blanket
+    /// impl for every `tower::Layer` that meets axum's service requirements
+    /// — in practice this means any standard Tower layer whose service
+    /// produces `Infallible` errors. If your layer produces real errors
+    /// (like `TimeoutLayer`'s `BoxError`), wrap it with
+    /// [`axum::error_handling::HandleErrorLayer`] before passing it here.
+    ///
+    /// # Ordering
+    ///
+    /// User layers are applied **inside** Autumn's request-ID layer on the
+    /// ingress path, which means your middleware always sees the generated
+    /// `RequestId` in the request extensions. The full stack (outermost to
+    /// innermost on ingress) is:
+    ///
+    /// `Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->`
+    /// `SecurityHeaders -> RequestId -> [user layers, registration order]`
+    /// `-> CSRF -> CORS -> route handler`
+    ///
+    /// When `.layer()` is called multiple times, the **first** call becomes
+    /// the outermost user layer on ingress (matching `tower::ServiceBuilder`
+    /// semantics): the layer from the first `.layer(...)` call sees the
+    /// request first on the way in and the response last on the way out.
+    ///
+    /// # Scope
+    ///
+    /// This layer applies **globally** to every route in the app, including
+    /// routes added later by plugins, routes mounted via `.merge` / `.nest`,
+    /// and the built-in `404` fallback. Use [`AppBuilder::scoped`] when you
+    /// need middleware scoped to a group of routes.
+    ///
+    /// Shared state (pools, metrics registries, rate-limit stores, etc.)
+    /// should be wrapped in `Arc` so the layer can satisfy the
+    /// `Clone + Send + Sync + 'static` bounds without moving the state.
+    ///
+    /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
+    /// for ready-made recipes.
+    ///
+    /// # Examples
+    ///
+    /// Adding a Tower timeout layer in one line (Tower's `TimeoutLayer`
+    /// returns `BoxError`, so it must be paired with `HandleErrorLayer` to
+    /// satisfy axum's `Infallible` error requirement):
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use autumn_web::prelude::*;
+    /// use axum::{error_handling::HandleErrorLayer, http::StatusCode};
+    /// use tower::{ServiceBuilder, timeout::TimeoutLayer};
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(HandleErrorLayer::new(|_| async {
+    ///                 StatusCode::REQUEST_TIMEOUT
+    ///             }))
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(5))),
+    ///     )
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
+        // TODO(0.x): consider retaining a TypeId alongside the closure so
+        // plugins can introspect which layers are already registered
+        // (e.g. warn when auth is installed after rate-limiting). Requires
+        // replacing CustomLayerApplier with a small trait that carries type
+        // metadata. Deliberately deferred — pure closures keep the public
+        // surface minimal until a concrete introspection use case appears.
+        self.custom_layers
+            .push(Box::new(move |router| layer.apply_to(router)));
         self
     }
 
@@ -735,6 +892,7 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            custom_layers,
             startup_hooks,
             shutdown_hooks,
             extensions: _,
@@ -822,6 +980,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
+                custom_layers,
                 error_page_renderer,
                 session_store,
             },
@@ -923,6 +1082,7 @@ impl AppBuilder {
             scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
+            custom_layers,
             startup_hooks: _,
             shutdown_hooks: _,
             extensions: _,
@@ -976,6 +1136,8 @@ impl AppBuilder {
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
+        // Custom Tower layers registered via .layer(...) are likewise
+        // applied so static output matches the production response pipeline.
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -985,6 +1147,7 @@ impl AppBuilder {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                custom_layers,
                 error_page_renderer: None,
                 session_store,
             },

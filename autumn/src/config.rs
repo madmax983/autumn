@@ -345,8 +345,9 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
             overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
 
         if is_recursive_merge {
-            let base_val = base_table.get_mut(&key).unwrap();
-            deep_merge_with_depth(base_val, overlay_val, depth + 1);
+            if let Some(base_val) = base_table.get_mut(&key) {
+                deep_merge_with_depth(base_val, overlay_val, depth + 1);
+            }
         } else {
             base_table.insert(key, overlay_val);
         }

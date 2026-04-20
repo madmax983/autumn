@@ -10,12 +10,12 @@ use std::sync::Arc;
 use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
+use crate::extract::State;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 use crate::state::AppState;
-use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use http::StatusCode;
@@ -73,6 +73,11 @@ pub struct RouterContext {
     pub scoped_groups: Vec<ScopedGroup>,
     pub merge_routers: Vec<axum::Router<AppState>>,
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Custom Tower layers registered via
+    /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
+    /// [`RequestIdLayer`](crate::middleware::RequestIdLayer) on the ingress
+    /// path so user middleware observes the generated request ID.
+    pub custom_layers: Vec<crate::app::CustomLayerApplier>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -103,6 +108,7 @@ pub fn try_build_router(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
         },
@@ -161,6 +167,7 @@ pub fn try_build_router_merged(
             scoped_groups: Vec::new(),
             merge_routers,
             nest_routers,
+            custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
         },
@@ -203,6 +210,7 @@ pub fn try_build_router_inner(
         config,
         &state,
         ctx.exception_filters,
+        ctx.custom_layers,
         ctx.error_page_renderer,
         ctx.session_store,
     )?;
@@ -428,6 +436,7 @@ fn apply_middleware(
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
+    custom_layers: Vec<crate::app::CustomLayerApplier>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -441,6 +450,19 @@ fn apply_middleware(
 
     // 404 fallback handler for unmatched routes
     router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+
+    // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
+    // RequestIdLayer wraps the router, so user middleware sits INNER to
+    // RequestId on ingress and can read the generated request ID from the
+    // request extensions. Iterate in reverse so the first registered layer
+    // ends up outermost among user layers — matching tower::ServiceBuilder.
+    let custom_layer_count = custom_layers.len();
+    for applier in custom_layers.into_iter().rev() {
+        router = applier(router);
+    }
+    if custom_layer_count > 0 {
+        tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");
+    }
 
     // Apply framework middleware. Exception filters wrap outermost so they
     // see all error responses regardless of scoping or interceptors.
@@ -476,7 +498,10 @@ fn apply_middleware(
 
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
-    // Layer order: Metrics -> ExceptionFilter -> ErrorPageContext -> router
+    // Full ingress layer order (outermost -> innermost):
+    //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
+    //   SecurityHeaders -> RequestId -> [user layers] -> CSRF -> CORS ->
+    //   handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -541,6 +566,7 @@ pub fn try_build_router_with_static(
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
         },

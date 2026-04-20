@@ -59,6 +59,8 @@ pub use crate::htmx::HxRequest;
 pub use crate::htmx::HxResponseExt;
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
+/// State extractor.
+pub use axum::extract::State;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Framework error and result types.
