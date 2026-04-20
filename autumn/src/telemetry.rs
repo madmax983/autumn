@@ -14,7 +14,7 @@ use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -399,6 +399,12 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
     }
     .map_err(|error| TelemetryInitError::ExporterInit(error.to_string()))?;
 
+    // Install a W3C Trace Context propagator so the `TraceContextLayer`
+    // middleware can extract incoming `traceparent` headers and inject
+    // the current context into outgoing responses. Uses the global
+    // text-map propagator slot maintained by `opentelemetry::global`.
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(exporter)
@@ -541,5 +547,102 @@ mod tests {
 
         let filter = build_filter(&log);
         assert_eq!(filter.to_string(), "info");
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn build_resource_attributes_populates_otel_semantic_keys() {
+        let resource = TelemetryResource {
+            service_name: "svc".into(),
+            service_namespace: Some("team".into()),
+            service_version: "1.2.3".into(),
+            environment: "staging".into(),
+        };
+        let attrs = build_resource_attributes(&resource);
+        let pairs: std::collections::HashMap<_, _> = attrs
+            .iter()
+            .map(|kv| (kv.key.as_str().to_owned(), kv.value.to_string()))
+            .collect();
+        assert_eq!(
+            pairs.get("service.namespace").map(String::as_str),
+            Some("team")
+        );
+        assert_eq!(
+            pairs.get("service.version").map(String::as_str),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            pairs.get("deployment.environment").map(String::as_str),
+            Some("staging")
+        );
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    struct MapExtractor<'a>(&'a std::collections::HashMap<&'static str, &'static str>);
+
+    #[cfg(feature = "telemetry-otlp")]
+    impl opentelemetry::propagation::Extractor for MapExtractor<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).copied()
+        }
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().copied().collect()
+        }
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[tokio::test]
+    async fn build_tracer_provider_installs_w3c_propagator_and_returns_provider() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        // Exercises the full provider-construction path: resource building,
+        // tonic exporter setup, global propagator install, and batch
+        // provider assembly. Uses a bogus endpoint — exporter construction
+        // is lazy, so no network IO happens here.
+        let otlp = OtlpTraceRuntime {
+            endpoint: "http://127.0.0.1:65530".into(),
+            protocol: TelemetryProtocol::Grpc,
+            resource: TelemetryResource {
+                service_name: "unit-test".into(),
+                service_namespace: None,
+                service_version: "0.0.0".into(),
+                environment: "test".into(),
+            },
+        };
+        let provider = build_tracer_provider(&otlp)
+            .expect("tonic exporter + provider build should succeed lazily");
+
+        // Confirm the propagator global now round-trips a W3C traceparent —
+        // i.e., the install line ran.
+        let headers = std::collections::HashMap::from([(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )]);
+        let cx =
+            opentelemetry::global::get_text_map_propagator(|p| p.extract(&MapExtractor(&headers)));
+        assert!(
+            cx.span().span_context().is_valid(),
+            "global propagator should have been installed"
+        );
+
+        let _ = provider.shutdown();
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[tokio::test]
+    async fn build_tracer_provider_supports_http_protobuf_protocol() {
+        let otlp = OtlpTraceRuntime {
+            endpoint: "http://127.0.0.1:65531".into(),
+            protocol: TelemetryProtocol::HttpProtobuf,
+            resource: TelemetryResource {
+                service_name: "unit-test".into(),
+                service_namespace: None,
+                service_version: "0.0.0".into(),
+                environment: "test".into(),
+            },
+        };
+        let provider =
+            build_tracer_provider(&otlp).expect("http-protobuf exporter should build lazily");
+        let _ = provider.shutdown();
     }
 }

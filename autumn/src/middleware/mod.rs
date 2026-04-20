@@ -21,7 +21,11 @@ pub(crate) mod error_page_filter;
 pub mod exception_filter;
 pub mod metrics;
 pub mod request_id;
+#[cfg(feature = "telemetry-otlp")]
+pub mod trace_context;
 
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
+#[cfg(feature = "telemetry-otlp")]
+pub use trace_context::{TraceContextLayer, TraceContextService};

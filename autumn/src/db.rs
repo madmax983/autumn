@@ -30,6 +30,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
@@ -105,18 +106,52 @@ type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncP
 ///     Ok("database is reachable")
 /// }
 /// ```
-pub struct Db(PooledConnection);
+pub struct Db {
+    conn: PooledConnection,
+    /// Span covering the full checkout-to-release window. Dropped when
+    /// `Db` is dropped at the end of the request, so span duration
+    /// reflects real connection hold time rather than just `pool.get()`
+    /// latency. Exposed via [`Db::span`] so handlers can attach
+    /// per-query spans as children with
+    /// [`tracing::Instrument::instrument`].
+    span: tracing::Span,
+}
+
+impl Db {
+    /// Connection-scoped span. Instrument a query future with this to
+    /// emit a child span tagged under the connection checkout window.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use tracing::Instrument as _;
+    ///
+    /// # async fn example(mut db: Db) -> AutumnResult<()> {
+    /// let span = db.span().clone();
+    /// // run a Diesel query here, e.g. users::table.load(&mut *db)
+    /// async {
+    ///     // ... diesel_async query ...
+    ///     Ok::<_, AutumnError>(())
+    /// }
+    /// .instrument(span)
+    /// .await
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+}
 
 impl std::ops::Deref for Db {
     type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.conn
     }
 }
 
 impl std::ops::DerefMut for Db {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.conn
     }
 }
 
@@ -134,12 +169,27 @@ where
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
-        let conn = pool.get().await.map_err(|e| {
-            tracing::error!("Failed to acquire database connection: {e}");
-            AutumnError::service_unavailable_msg(e.to_string())
-        })?;
+        // Span covers the full time the connection is held — from
+        // checkout through the end of the request — rather than just
+        // `pool.get()`. Dropping `Db` closes the span, so span duration
+        // reflects real connection hold time and `db.system=postgresql`
+        // propagates to any query futures handlers instrument with
+        // `db.span()`.
+        let span = tracing::info_span!(
+            "db.connection",
+            otel.kind = "client",
+            db.system = "postgresql",
+        );
+        let conn = async {
+            pool.get().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {e}");
+                AutumnError::service_unavailable_msg(e.to_string())
+            })
+        }
+        .instrument(span.clone())
+        .await?;
 
-        Ok(Self(conn))
+        Ok(Self { conn, span })
     }
 }
 

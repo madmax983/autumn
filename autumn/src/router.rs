@@ -522,9 +522,11 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
+    //   TraceContext (applied outside the startup barrier / static-first
+    //   middleware so short-circuit responses still carry traceparent) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers] -> RateLimit ->
-    //   CSRF -> CORS -> handler
+    //   SecurityHeaders -> RequestId -> [user layers] ->
+    //   RateLimit -> CSRF -> CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -760,10 +762,20 @@ fn apply_startup_barrier(
     state: &AppState,
 ) -> axum::Router {
     let barrier_state = StartupBarrierState::from_config(config, state);
-    router.layer(axum::middleware::from_fn_with_state(
+    let router = router.layer(axum::middleware::from_fn_with_state(
         barrier_state,
         startup_barrier,
-    ))
+    ));
+    // W3C Trace Context propagation wraps the startup barrier (and the
+    // static-first middleware above it) so short-circuit responses —
+    // startup 503s and pre-built static file hits — still extract the
+    // incoming `traceparent` and inject the current context into the
+    // outgoing response. Applied here rather than inside `apply_middleware`
+    // because those outer wrappers can return without ever invoking the
+    // inner router.
+    #[cfg(feature = "telemetry-otlp")]
+    let router = router.layer(crate::middleware::TraceContextLayer);
+    router
 }
 
 async fn startup_barrier(
