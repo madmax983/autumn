@@ -15,7 +15,7 @@ use crate::middleware::dev;
 use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 use crate::state::AppState;
-use axum::extract::State;
+use crate::extract::State;
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 use http::StatusCode;

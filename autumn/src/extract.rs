@@ -86,3 +86,5 @@ pub use axum::extract::Path;
 /// }
 /// ```
 pub use axum::extract::Query;
+
+pub use axum::extract::State;

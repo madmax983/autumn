@@ -7,7 +7,7 @@
 //! Handlers typically don't extract `AppState` directly. Instead, they use
 //! specialized extractors like [`Db`](crate::Db) which pull what they need
 //! from the state. However, custom extractors can access the state via
-//! `axum::extract::State<AppState>`.
+//! `crate::extract::State<AppState>`.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
