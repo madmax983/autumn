@@ -2413,6 +2413,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_router_mounts_dev_reload_script_endpoint_when_enabled() {
+        // The injected <script src="/__autumn/live-reload.js"> tag only works
+        // under the default CSP (`script-src 'self'`) if the framework
+        // actually serves the JS at that path. This guards against the
+        // regression where the script endpoint is forgotten.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
+        std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                (
+                    "AUTUMN_DEV_RELOAD_STATE",
+                    Some(reload_file.path().to_str().expect("utf-8 path")),
+                ),
+            ],
+            async {
+                let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/__autumn/live-reload.js")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("application/javascript; charset=utf-8")
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let js = std::str::from_utf8(&body).expect("utf-8");
+                assert!(js.contains("fetch("), "js body: {js}");
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn build_router_mounts_dev_reload_endpoint_when_enabled() {
         let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
         std::fs::write(reload_file.path(), r#"{"version":7,"kind":"css"}"#).expect("write");
