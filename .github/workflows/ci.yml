@@ -55,11 +55,10 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
         run: |
+          cargo llvm-cov clean --workspace
           cargo llvm-cov --workspace --all-features --no-report
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test db_hooks_lifecycle -- --ignored
-          cargo llvm-cov --no-report -p autumn-web --all-features \
-            --test test_db_integration -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6

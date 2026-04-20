@@ -70,9 +70,16 @@ where
 
         let method = req.method().clone();
         let uri = req.uri().clone();
+        // OTel HTTP server semantic conventions want `{method} {http.route}`
+        // for span names, falling back to the method alone when the matched
+        // route template is unknown. Axum resolves the template inside the
+        // inner service so we can't see it here — using the raw URI path
+        // would explode cardinality (every `/users/123` hits a distinct
+        // span name). Stick to the method and keep the path as a searchable
+        // attribute.
         let span = tracing::info_span!(
             "http.server.request",
-            otel.name = %format!("{} {}", method, uri.path()),
+            otel.name = %method,
             otel.kind = "server",
             http.request.method = %method,
             url.path = %uri.path(),
