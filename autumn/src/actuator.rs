@@ -288,7 +288,8 @@ impl ConfigProperties {
         let profile = config.profile.as_deref().unwrap_or("default");
         let defaults = crate::config::AutumnConfig::default();
 
-        let mut props = HashMap::new();
+        // Avoids dynamic reallocation since we know roughly how many config properties are tracked.
+        let mut props = HashMap::with_capacity(32);
         let profile_str = profile.to_string();
 
         Self::track_server_props(&mut props, config, &defaults, &profile_str);
