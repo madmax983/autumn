@@ -532,4 +532,14 @@ mod tests {
         // Sanity: the disabled guard must be droppable without panic.
         drop(guard);
     }
+    #[test]
+    fn build_filter_falls_back_to_info_on_invalid_level() {
+        let log = LogConfig {
+            level: "this_is_not_a_valid_directive_it_lacks_an_equal_sign_and_is_not_a_level,foo=bar=baz=invalid".to_owned(),
+            ..Default::default()
+        };
+
+        let filter = build_filter(&log);
+        assert_eq!(filter.to_string(), "info");
+    }
 }
