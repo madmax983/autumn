@@ -231,17 +231,57 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
         return false;
     }
 
-    // Simple heuristic: if text/html appears before application/json,
-    // or if text/html is present and application/json is not, prefer HTML.
-    let html_pos = accept.find("text/html");
-    let json_pos = accept.find("application/json");
+    let mut html: Option<(f32, usize)> = None;
+    let mut json: Option<(f32, usize)> = None;
+    let mut wildcard: Option<(f32, usize)> = None;
 
-    match (html_pos, json_pos) {
-        (Some(_), None) => true,
-        (Some(h), Some(j)) => h < j,
-        (None, Some(_)) => false,
-        // `*/*` without specific types -- default to HTML for browsers
-        (None, None) => accept.contains("*/*"),
+    for (index, raw_part) in accept.split(',').enumerate() {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let mut mime = "";
+        let mut q = 1.0_f32;
+
+        for (i, segment) in part.split(';').enumerate() {
+            let segment = segment.trim();
+            if i == 0 {
+                mime = segment;
+                continue;
+            }
+
+            if let Some(value) = segment.strip_prefix("q=") {
+                if let Ok(parsed) = value.trim().parse::<f32>() {
+                    q = parsed.clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        match mime {
+            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
+                html = Some((q, index));
+            }
+            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+                json = Some((q, index));
+            }
+            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
+                wildcard = Some((q, index));
+            }
+            _ => {}
+        }
+    }
+
+    match (html, json, wildcard) {
+        (Some((hq, hidx)), Some((jq, jidx)), _) => {
+            if (hq - jq).abs() < f32::EPSILON {
+                hidx < jidx
+            } else {
+                hq > jq
+            }
+        }
+        (Some(_), None, _) | (None, None, Some(_)) => true,
+        (None, Some(_), _) | (None, None, None) => false,
     }
 }
 
@@ -305,6 +345,24 @@ mod tests {
     fn prefers_html_when_html_first() {
         let req = Request::builder()
             .header("accept", "text/html, application/json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_json_when_json_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "text/html;q=0.4, application/json;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_html_when_html_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "application/json;q=0.3, text/html;q=0.8")
             .body(Body::empty())
             .unwrap();
         assert!(accepts_html(&req));

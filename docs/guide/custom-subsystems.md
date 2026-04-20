@@ -193,18 +193,41 @@ that doesn't fit the built-in memory/Redis split.
 ## `ErrorPageRenderer` — replace the built-in HTML error pages
 
 ```rust,no_run
-# use autumn_web::error_pages::ErrorPageRenderer;
-# use autumn_web::error_pages::ErrorContext;
-# use maud::Markup;
+# use autumn_web::error_pages::{ErrorContext, ErrorPageRenderer};
+# use maud::{html, Markup};
 # struct MyRenderer;
+#
 # impl ErrorPageRenderer for MyRenderer {
-#     fn render_error(&self, _ctx: &ErrorContext) -> Markup { maud::html! { h1 { "error" } } }
+#     fn render_404(&self, ctx: &ErrorContext) -> Markup {
+#         html! { h1 { "Custom 404 for " (ctx.path) } }
+#     }
+#
+#     fn render_500(&self, ctx: &ErrorContext) -> Markup {
+#         html! {
+#             h1 { "Something went wrong." }
+#             @if let Some(id) = &ctx.request_id {
+#                 p { "Request ID: " (id) }
+#             }
+#         }
+#     }
+#
+#     fn render_422(&self, ctx: &ErrorContext) -> Markup {
+#         html! {
+#             h1 { "Validation failed" }
+#             p { (ctx.message) }
+#         }
+#     }
+#
+#     fn render_error(&self, ctx: &ErrorContext) -> Markup {
+#         html! { h1 { (ctx.status.as_u16()) " " (ctx.message) } }
+#     }
 # }
 # use autumn_web::prelude::*;
 #[autumn_web::main]
 async fn main() {
     autumn_web::app()
         .error_pages(MyRenderer)
+        .routes(routes![/* ... */])
         .run()
         .await;
 }
@@ -214,6 +237,11 @@ async fn main() {
 shape the others were modelled on. See its
 [trait docs](../../autumn/src/error_pages/renderer.rs) for the full method
 surface.
+
+`ErrorContext` gives you the status code, request path, request ID, and
+validation details (for `422`). Autumn only uses this renderer for requests
+that prefer HTML (`Accept: text/html`). JSON handlers continue to receive the
+standard structured JSON error shape.
 
 ---
 
