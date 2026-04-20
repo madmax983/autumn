@@ -259,20 +259,14 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
         }
 
         match mime {
-            "text/html" => {
-                if html.is_none_or(|(existing_q, _)| q > existing_q) {
-                    html = Some((q, index));
-                }
+            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
+                html = Some((q, index));
             }
-            "application/json" => {
-                if json.is_none_or(|(existing_q, _)| q > existing_q) {
-                    json = Some((q, index));
-                }
+            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+                json = Some((q, index));
             }
-            "*/*" => {
-                if wildcard.is_none_or(|(existing_q, _)| q > existing_q) {
-                    wildcard = Some((q, index));
-                }
+            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
+                wildcard = Some((q, index));
             }
             _ => {}
         }
@@ -286,10 +280,8 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
                 hq > jq
             }
         }
-        (Some(_), None, _) => true,
-        (None, Some(_), _) => false,
-        (None, None, Some(_)) => true,
-        (None, None, None) => false,
+        (Some(_), None, _) | (None, None, Some(_)) => true,
+        (None, Some(_), _) | (None, None, None) => false,
     }
 }
 
