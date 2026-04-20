@@ -56,6 +56,9 @@ use uuid::Uuid;
 
 use super::config::CsrfConfig;
 
+/// Error body returned with a `403 Forbidden` when CSRF validation fails.
+const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
@@ -119,6 +122,7 @@ struct CsrfSettings {
     token_header: HeaderName,
     form_field: String,
     safe_methods: Vec<http::Method>,
+    exempt_paths: Vec<String>,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -150,6 +154,7 @@ impl CsrfLayer {
                 token_header,
                 form_field: config.form_field.clone(),
                 safe_methods,
+                exempt_paths: config.exempt_paths.clone(),
             }),
         }
     }
@@ -234,7 +239,7 @@ where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    ResBody: Default + Send + 'static,
+    ResBody: From<&'static str> + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -245,7 +250,13 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        let is_safe = self.settings.safe_methods.contains(req.method());
+        let path = req.uri().path();
+        let is_exempt = self
+            .settings
+            .exempt_paths
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()));
+        let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
         let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
         // For safe methods, generate a new token if none exists
@@ -274,8 +285,13 @@ where
 
         Box::pin(async move {
             if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
-                let mut response = Response::new(ResBody::default());
+                let mut response =
+                    Response::new(ResBody::from(CSRF_FORBIDDEN_MESSAGE));
                 *response.status_mut() = StatusCode::FORBIDDEN;
+                response.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                );
                 return Ok(response);
             }
 
@@ -435,6 +451,81 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn forbidden_response_has_clear_error_body() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("text/plain; charset=utf-8")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(
+            text.contains("CSRF"),
+            "expected CSRF error message, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exempt_path_skips_csrf_validation() {
+        let config = CsrfConfig {
+            enabled: true,
+            exempt_paths: vec!["/api/".to_string()],
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/api/items", post(|| async { "created" }))
+            .route("/form/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&config));
+
+        // Exempt API path: POST with no token should succeed.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Non-exempt form path: POST with no token should still be blocked.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/form/submit")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
