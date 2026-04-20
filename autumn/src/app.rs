@@ -929,7 +929,7 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool_provider_factory,
             telemetry_provider,
-            session_store: _,
+            session_store,
         } = self;
 
         let all_routes = routes;
@@ -961,12 +961,28 @@ impl AppBuilder {
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
-        // Build the full router (same as production)
-        let router =
-            crate::router::try_build_router(all_routes, &config, state).unwrap_or_else(|error| {
-                eprintln!("Failed to build router: {error}");
-                std::process::exit(1);
-            });
+        // Build the full router (same as production). Use the inner builder
+        // so the custom session store installed via with_session_store(...)
+        // is honored during static generation — apps that swap in a custom
+        // store specifically to avoid Redis/external backends at build time
+        // would otherwise silently fall back to the config-driven backend.
+        let router = crate::router::try_build_router_inner(
+            all_routes,
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                error_page_renderer: None,
+                session_store,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to build router: {error}");
+            std::process::exit(1);
+        });
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -1389,9 +1405,15 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    if let Some(url) = &config.database.url {
-        for mig in migrations {
-            crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+    // Skip migrations when the provider opted out of a database (returned
+    // `Ok(None)`) — even if `database.url` is configured. Custom providers
+    // signal "this app runs without a DB" by returning None; running
+    // migrations against the URL anyway would defeat the opt-out.
+    if pool.is_some() {
+        if let Some(url) = &config.database.url {
+            for mig in migrations {
+                crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+            }
         }
     }
 
