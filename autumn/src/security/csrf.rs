@@ -485,6 +485,46 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn csrf_token_display_format() {
+        let token = CsrfToken("test_token_123".to_string());
+        assert_eq!(format!("{token}"), "test_token_123");
+    }
+
+
+    #[tokio::test]
+    async fn poll_ready_returns_inner() {
+        use tower::Service;
+        use tower::layer::Layer;
+        use std::task::{Context, Poll};
+        use std::pin::Pin;
+        use std::future::Future;
+
+        #[derive(Clone)]
+        struct MockService;
+        impl Service<Request<Body>> for MockService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Pending
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                unimplemented!()
+            }
+        }
+
+        let layer = CsrfLayer::from_config(&default_csrf_config());
+        let mut service = layer.layer(MockService);
+
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let poll = service.poll_ready(&mut cx);
+        assert!(poll.is_pending());
+    }
+
+
     #[tokio::test]
     async fn csrf_token_extractor_works() {
         async fn handler(csrf: CsrfToken) -> String {
