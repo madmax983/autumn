@@ -179,6 +179,7 @@ impl Default for HeadersConfig {
 /// | `form_field` | `"_csrf"` |
 /// | `cookie_name` | `"autumn-csrf"` |
 /// | `safe_methods` | `["GET", "HEAD", "OPTIONS", "TRACE"]` |
+/// | `exempt_paths` | `[]` |
 ///
 /// # Examples
 ///
@@ -187,6 +188,7 @@ impl Default for HeadersConfig {
 /// enabled = true
 /// token_header = "X-XSRF-Token"
 /// cookie_name = "XSRF-TOKEN"
+/// exempt_paths = ["/api/"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct CsrfConfig {
@@ -212,6 +214,16 @@ pub struct CsrfConfig {
     /// Default: `["GET", "HEAD", "OPTIONS", "TRACE"]`.
     #[serde(default = "default_safe_methods")]
     pub safe_methods: Vec<String>,
+
+    /// Request path prefixes that are exempt from CSRF validation.
+    /// Default: `[]`.
+    ///
+    /// Use this to opt JSON API routes out of CSRF when they authenticate
+    /// with bearer tokens or other non-cookie credentials. Matches are by
+    /// prefix on the request path, e.g. `"/api/"` exempts all routes
+    /// under `/api/`.
+    #[serde(default)]
+    pub exempt_paths: Vec<String>,
 }
 
 impl Default for CsrfConfig {
@@ -222,6 +234,7 @@ impl Default for CsrfConfig {
             form_field: default_csrf_field(),
             cookie_name: default_csrf_cookie(),
             safe_methods: default_safe_methods(),
+            exempt_paths: Vec::new(),
         }
     }
 }
