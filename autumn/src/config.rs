@@ -72,6 +72,9 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -913,6 +916,23 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
             &mut self.security.csrf.cookie_name,
+        );
+
+        // Rate limiting
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__ENABLED",
+            &mut self.security.rate_limit.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND",
+            &mut self.security.rate_limit.requests_per_second,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__BURST",
+            &mut self.security.rate_limit.burst,
         );
     }
 
