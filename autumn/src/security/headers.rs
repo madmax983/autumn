@@ -12,7 +12,7 @@
 //! | `X-Content-Type-Options` | `x_content_type_options` is `true` | `nosniff` |
 //! | `X-XSS-Protection` | `xss_protection` is `true` | `1; mode=block` |
 //! | `Strict-Transport-Security` | `strict_transport_security` is `true` | `max-age=31536000; includeSubDomains` |
-//! | `Content-Security-Policy` | `content_security_policy` is non-empty | not sent |
+//! | `Content-Security-Policy` | `content_security_policy` is non-empty | htmx-compatible same-origin policy |
 //! | `Referrer-Policy` | `referrer_policy` is non-empty | `strict-origin-when-cross-origin` |
 //! | `Permissions-Policy` | `permissions_policy` is non-empty | not sent |
 //!
@@ -241,8 +241,56 @@ mod tests {
                 .get("strict-transport-security")
                 .is_none()
         );
-        // CSP not present by default
-        assert!(response.headers().get("content-security-policy").is_none());
+        // CSP present by default with htmx-compatible policy
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("default CSP should be emitted");
+        let csp = csp.to_str().unwrap();
+        assert!(csp.contains("default-src 'self'"), "csp = {csp}");
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
+        assert!(csp.contains("img-src 'self' data:"), "csp = {csp}");
+        assert!(!csp.contains("'unsafe-eval'"), "csp = {csp}");
+    }
+
+    #[tokio::test]
+    async fn default_csp_allows_htmx_to_function() {
+        // htmx is served from /static/js/htmx.min.js (same origin), operates
+        // via addEventListener (no eval), and issues hx-* requests to the
+        // same origin. The default CSP must allow all of that.
+        let config = HeadersConfig::default();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("default CSP missing")
+            .to_str()
+            .unwrap()
+            .to_owned();
+
+        // htmx script loads from same origin
+        assert!(
+            csp.contains("script-src 'self'"),
+            "csp must allow same-origin scripts for htmx: {csp}"
+        );
+        // htmx XHR/fetch requests go to same origin
+        assert!(
+            csp.contains("connect-src 'self'"),
+            "csp must allow same-origin connects for htmx swaps: {csp}"
+        );
+        // No eval required for htmx standard operation
+        assert!(
+            !csp.contains("'unsafe-eval'"),
+            "default csp should not weaken script-src with unsafe-eval: {csp}"
+        );
     }
 
     #[tokio::test]

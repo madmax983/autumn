@@ -28,6 +28,9 @@
 //! | `AUTUMN_SECURITY__HEADERS__HSTS_MAX_AGE_SECS` | `security.headers.hsts_max_age_secs` | `u64` |
 //! | `AUTUMN_SECURITY__HEADERS__CONTENT_SECURITY_POLICY` | `security.headers.content_security_policy` | `String` |
 //! | `AUTUMN_SECURITY__CSRF__ENABLED` | `security.csrf.enabled` | `bool` |
+//!
+//! Setting any header value to an empty string disables it (the header is
+//! not emitted). This is the escape hatch for opting out of a default.
 
 use serde::Deserialize;
 
@@ -72,7 +75,7 @@ pub struct SecurityConfig {
 /// | `strict_transport_security` | `false` |
 /// | `hsts_max_age_secs` | `31_536_000` (1 year) |
 /// | `hsts_include_subdomains` | `true` |
-/// | `content_security_policy` | `""` (disabled) |
+/// | `content_security_policy` | htmx-compatible policy (see [`default_content_security_policy`]) |
 /// | `referrer_policy` | `"strict-origin-when-cross-origin"` |
 /// | `permissions_policy` | `""` (disabled) |
 ///
@@ -125,11 +128,16 @@ pub struct HeadersConfig {
     #[serde(default = "default_true")]
     pub hsts_include_subdomains: bool,
 
-    /// `Content-Security-Policy` header value. Default: `""` (not sent).
+    /// `Content-Security-Policy` header value.
     ///
-    /// When non-empty, the CSP header restricts which resources the browser
-    /// is allowed to load. Example: `"default-src 'self'; script-src 'self'"`.
-    #[serde(default)]
+    /// Defaults to an htmx-compatible, same-origin policy (see
+    /// [`default_content_security_policy`]). When set to an empty string,
+    /// the header is not emitted (explicit opt-out).
+    ///
+    /// The default allows htmx to function normally because htmx is served
+    /// from the same origin at `/static/js/htmx.min.js` and operates via
+    /// `addEventListener` rather than inline `eval`.
+    #[serde(default = "default_content_security_policy")]
     pub content_security_policy: String,
 
     /// `Referrer-Policy` header value. Default: `"strict-origin-when-cross-origin"`.
@@ -153,7 +161,7 @@ impl Default for HeadersConfig {
             strict_transport_security: false,
             hsts_max_age_secs: default_hsts_max_age(),
             hsts_include_subdomains: true,
-            content_security_policy: String::new(),
+            content_security_policy: default_content_security_policy(),
             referrer_policy: default_referrer_policy(),
             permissions_policy: String::new(),
         }
@@ -244,6 +252,37 @@ fn default_referrer_policy() -> String {
     "strict-origin-when-cross-origin".to_owned()
 }
 
+/// Default `Content-Security-Policy` value.
+///
+/// Designed to be "sensible by default" while allowing htmx to function
+/// normally when served from the same origin (as Autumn does at
+/// `/static/js/htmx.min.js`).
+///
+/// Directives:
+/// - `default-src 'self'` -- everything defaults to same-origin
+/// - `img-src 'self' data:` -- images from self and inline data URIs
+/// - `style-src 'self' 'unsafe-inline'` -- same-origin stylesheets plus
+///   inline `style` attributes (required by many UI libraries and
+///   template engines)
+/// - `script-src 'self'` -- only same-origin scripts; htmx works here
+///   because it is served from `/static/js/htmx.min.js`
+/// - `connect-src 'self'` -- `fetch`/`XHR`/htmx requests go to same origin
+/// - `form-action 'self'` -- forms can only POST to same origin
+/// - `frame-ancestors 'none'` -- matches the default `X-Frame-Options: DENY`
+/// - `base-uri 'self'` -- prevents `<base>` hijacking
+#[must_use]
+pub fn default_content_security_policy() -> String {
+    "default-src 'self'; \
+     img-src 'self' data:; \
+     style-src 'self' 'unsafe-inline'; \
+     script-src 'self'; \
+     connect-src 'self'; \
+     form-action 'self'; \
+     frame-ancestors 'none'; \
+     base-uri 'self'"
+        .to_owned()
+}
+
 fn default_csrf_header() -> String {
     "X-CSRF-Token".to_owned()
 }
@@ -277,11 +316,52 @@ mod tests {
         assert!(config.headers.xss_protection);
         assert!(!config.headers.strict_transport_security);
         assert_eq!(config.headers.hsts_max_age_secs, 31_536_000);
-        assert!(config.headers.content_security_policy.is_empty());
+        // Default CSP is non-empty and htmx-compatible.
+        assert!(!config.headers.content_security_policy.is_empty());
+        assert!(
+            config
+                .headers
+                .content_security_policy
+                .contains("default-src 'self'")
+        );
+        assert!(
+            config
+                .headers
+                .content_security_policy
+                .contains("script-src 'self'")
+        );
         assert_eq!(
             config.headers.referrer_policy,
             "strict-origin-when-cross-origin"
         );
+    }
+
+    #[test]
+    fn default_csp_does_not_allow_unsafe_eval() {
+        // htmx works without unsafe-eval; only `hx-on` opts into it.
+        // Keep the default tight so that the baseline policy passes
+        // Mozilla Observatory and similar automated scanners.
+        let csp = default_content_security_policy();
+        assert!(!csp.contains("'unsafe-eval'"), "csp = {csp}");
+        assert!(!csp.contains("'unsafe-inline' 'unsafe-eval'"), "csp = {csp}");
+    }
+
+    #[test]
+    fn csp_can_be_disabled_via_toml_empty_string() {
+        let toml_str = r#"
+            content_security_policy = ""
+        "#;
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.content_security_policy.is_empty());
+    }
+
+    #[test]
+    fn csp_can_be_overridden_via_toml() {
+        let toml_str = r#"
+            content_security_policy = "default-src 'none'"
+        "#;
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.content_security_policy, "default-src 'none'");
     }
 
     #[test]
