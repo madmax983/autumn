@@ -111,7 +111,13 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    const fn disabled() -> Self {
+    /// Construct a no-op telemetry guard.
+    ///
+    /// Useful for [`TelemetryProvider`] implementations that decide at runtime
+    /// not to register a global tracing subscriber — e.g. a Datadog provider
+    /// reading a feature flag, or any custom impl that wants to opt out of
+    /// telemetry without panicking.
+    pub const fn disabled() -> Self {
         Self {
             #[cfg(feature = "telemetry-otlp")]
             provider: None,
