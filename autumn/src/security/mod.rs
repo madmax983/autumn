@@ -10,6 +10,7 @@
 //! |-----------|--------|-------------|
 //! | Security headers | [`headers`] | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
 //! | CSRF protection | [`csrf`] | Token-based CSRF validation for mutating requests |
+//! | Rate limiting | [`rate_limit`] | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
 //! | Configuration | [`config`] | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
@@ -44,6 +45,11 @@
 //! enabled = true                       # auto-enabled in prod
 //! token_header = "X-CSRF-Token"
 //! cookie_name = "autumn-csrf"
+//!
+//! [security.rate_limit]
+//! enabled = true                       # per-IP token bucket
+//! requests_per_second = 10.0
+//! burst = 20
 //! ```
 //!
 //! ## Quick start
@@ -70,8 +76,10 @@
 pub mod config;
 pub mod csrf;
 pub mod headers;
+pub mod rate_limit;
 
 // Re-export commonly used types at the module level.
-pub use config::{CsrfConfig, HeadersConfig, SecurityConfig};
+pub use config::{CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig};
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
+pub use rate_limit::RateLimitLayer;

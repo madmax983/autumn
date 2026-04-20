@@ -1005,11 +1005,14 @@ impl AppBuilder {
         let server_shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    server_shutdown_wait.cancelled().await;
-                })
-                .await
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                server_shutdown_wait.cancelled().await;
+            })
+            .await
         });
 
         let shutdown_state = state.clone();
