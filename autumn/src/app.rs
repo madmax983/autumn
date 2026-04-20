@@ -1340,7 +1340,10 @@ async fn execute_fixed_delay_task(
                 &state,
                 "failure",
                 &name,
-                vec![("duration_ms", serde_json::json!(duration_ms)), ("error", serde_json::json!(error_str))],
+                vec![
+                    ("duration_ms", serde_json::json!(duration_ms)),
+                    ("error", serde_json::json!(error_str)),
+                ],
             );
         }
     }
@@ -1374,7 +1377,10 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
                 &state,
                 "failure",
                 &name,
-                vec![("duration_ms", serde_json::json!(duration_ms)), ("error", serde_json::json!(error_str))],
+                vec![
+                    ("duration_ms", serde_json::json!(duration_ms)),
+                    ("error", serde_json::json!(error_str)),
+                ],
             );
         }
     }
