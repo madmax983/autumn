@@ -276,9 +276,14 @@ fn mount_framework_routes(
             dev::LIVE_RELOAD_PATH,
             axum::routing::get(dev::live_reload_state_handler),
         );
+        router = router.route(
+            dev::LIVE_RELOAD_SCRIPT_PATH,
+            axum::routing::get(dev::live_reload_script_handler),
+        );
         tracing::debug!(
-            path = dev::LIVE_RELOAD_PATH,
-            "Mounted dev live reload endpoint"
+            state_path = dev::LIVE_RELOAD_PATH,
+            script_path = dev::LIVE_RELOAD_SCRIPT_PATH,
+            "Mounted dev live reload endpoints"
         );
     }
 

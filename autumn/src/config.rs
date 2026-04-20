@@ -2261,6 +2261,27 @@ path = "/healthz"
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
+        // AC: HSTS auto-enabled in the production profile.
+        assert!(
+            config.security.headers.strict_transport_security,
+            "prod profile must auto-enable Strict-Transport-Security"
+        );
+        // Defaults should still be secure-by-default in prod.
+        assert_eq!(config.security.headers.x_frame_options, "DENY");
+        assert!(config.security.headers.x_content_type_options);
+        assert!(!config.security.headers.content_security_policy.is_empty());
+    }
+
+    #[test]
+    fn dev_profile_does_not_auto_enable_hsts() {
+        let defaults = profile_defaults_as_toml("dev");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+
+        assert!(
+            !config.security.headers.strict_transport_security,
+            "dev profile must not force HSTS on (local http development)"
+        );
     }
 
     #[test]

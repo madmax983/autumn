@@ -37,7 +37,7 @@
 //! xss_protection = true                # X-XSS-Protection: 1; mode=block
 //! strict_transport_security = true     # HSTS (auto-enabled in prod)
 //! hsts_max_age_secs = 31536000         # 1 year
-//! content_security_policy = ""         # set to enable CSP
+//! content_security_policy = "default-src 'self'; ..."  # htmx-friendly default; "" disables
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
 //!
@@ -79,7 +79,9 @@ pub mod headers;
 pub mod rate_limit;
 
 // Re-export commonly used types at the module level.
-pub use config::{CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig};
+pub use config::{
+    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy,
+};
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;
