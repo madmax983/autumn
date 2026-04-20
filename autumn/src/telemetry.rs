@@ -14,9 +14,7 @@ use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
-use opentelemetry_sdk::{
-    Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider,
-};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

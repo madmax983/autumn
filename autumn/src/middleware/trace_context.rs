@@ -83,7 +83,11 @@ where
         // Nothing to recover from at ingress time.
         let _ = span.set_parent(parent_cx);
 
-        let future = self.inner.call(req);
+        // Enter the span before building the inner future so any tracing
+        // performed synchronously inside downstream `Service::call`
+        // implementations is parented on the extracted context, not just
+        // the work that runs during `poll`.
+        let future = span.in_scope(|| self.inner.call(req));
         TraceContextFuture {
             inner: future.instrument(span.clone()),
             span,
@@ -116,8 +120,7 @@ where
 
                 let cx = this.span.context();
                 opentelemetry::global::get_text_map_propagator(|propagator| {
-                    propagator
-                        .inject_context(&cx, &mut HeaderMapInjector(response.headers_mut()));
+                    propagator.inject_context(&cx, &mut HeaderMapInjector(response.headers_mut()));
                 });
                 Poll::Ready(Ok(response))
             }
