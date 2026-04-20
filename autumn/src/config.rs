@@ -74,6 +74,7 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -925,6 +926,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__RATE_LIMIT__BURST",
             &mut self.security.rate_limit.burst,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
+            &mut self.security.rate_limit.trust_forwarded_headers,
         );
     }
 

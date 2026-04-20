@@ -19,6 +19,8 @@ fn configured(rps: f64, burst: u32) -> AutumnConfig {
     config.security.rate_limit.enabled = true;
     config.security.rate_limit.requests_per_second = rps;
     config.security.rate_limit.burst = burst;
+    // Tests exercise the XFF-key path without a real TCP listener.
+    config.security.rate_limit.trust_forwarded_headers = true;
     config
 }
 

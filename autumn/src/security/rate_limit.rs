@@ -11,11 +11,12 @@
 //! token. When the bucket is empty the middleware rejects the request
 //! without invoking the handler.
 //!
-//! Client IP is extracted (in order) from:
-//!
-//! 1. The first entry of the `X-Forwarded-For` header.
-//! 2. The `X-Real-IP` header.
-//! 3. The connection peer address (via `ConnectInfo<SocketAddr>`).
+//! Client IP is extracted from the connection peer address
+//! ([`ConnectInfo<SocketAddr>`]) by default. When
+//! [`RateLimitConfig::trust_forwarded_headers`] is `true` — which should
+//! only be set behind a reverse proxy that strips and rewrites these
+//! headers — the limiter consults `X-Forwarded-For` (first entry) and
+//! `X-Real-IP` first, falling back to the peer address.
 //!
 //! # Configuration
 //!
@@ -53,6 +54,7 @@ struct Limiter {
     refill_per_sec: f64,
     burst: f64,
     burst_header: HeaderValue,
+    trust_forwarded_headers: bool,
     buckets: Mutex<HashMap<String, Bucket>>,
     calls: AtomicU64,
 }
@@ -80,6 +82,7 @@ impl Limiter {
             refill_per_sec,
             burst,
             burst_header,
+            trust_forwarded_headers: config.trust_forwarded_headers,
             buckets: Mutex::new(HashMap::new()),
             calls: AtomicU64::new(0),
         }
@@ -132,53 +135,79 @@ impl Limiter {
     }
 
     /// Probabilistic eviction of long-idle buckets to bound memory usage.
+    ///
+    /// A bucket is evicted when it has been idle past `idle_cutoff` AND the
+    /// refill would have topped it back up to `burst` (i.e. the bucket is
+    /// effectively full and stores no information a fresh entry wouldn't).
     fn maybe_sweep(&self, now: Instant) {
         // Sweep roughly once per 1024 calls. Cheap, branchless, no background task.
         let n = self.calls.fetch_add(1, Ordering::Relaxed);
         if n & 0x3FF != 0 {
             return;
         }
+        self.sweep(now);
+    }
+
+    fn sweep(&self, now: Instant) {
         let Ok(mut buckets) = self.buckets.lock() else {
             return;
         };
+        buckets.retain(|_, bucket| self.should_retain(bucket, now));
+    }
+
+    fn should_retain(&self, bucket: &Bucket, now: Instant) -> bool {
         let idle_cutoff = Duration::from_secs(300);
-        buckets.retain(|_, b| {
-            now.saturating_duration_since(b.last_refill) < idle_cutoff || b.tokens < self.burst
-        });
+        let elapsed = now.saturating_duration_since(bucket.last_refill);
+        if elapsed < idle_cutoff {
+            return true;
+        }
+        let effective_tokens = elapsed
+            .as_secs_f64()
+            .mul_add(self.refill_per_sec, bucket.tokens)
+            .min(self.burst);
+        // Only drop buckets that are idle AND effectively full — i.e.
+        // a fresh bucket would have the same state.
+        effective_tokens < self.burst
     }
 }
 
-/// Extract the originating client IP from a request.
-///
-/// Consults (in order) `X-Forwarded-For`, `X-Real-IP`, and the socket
-/// peer address recorded via [`ConnectInfo`]. Returns the literal
-/// string `"unknown"` when no source is available.
-pub fn client_ip<B>(req: &Request<B>) -> String {
-    if let Some(value) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = value.to_str() {
-            if let Some(first) = s.split(',').next() {
-                let trimmed = first.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
+impl Limiter {
+    /// Extract the originating client IP from a request, honoring this
+    /// limiter's trusted-proxy policy.
+    ///
+    /// When `trust_forwarded_headers` is `false` (the default), the peer
+    /// address from [`ConnectInfo<SocketAddr>`] is the sole key source.
+    /// Otherwise the first entry of `X-Forwarded-For`, then `X-Real-IP`,
+    /// is consulted before falling back to the peer address.
+    fn client_ip<B>(&self, req: &Request<B>) -> String {
+        if self.trust_forwarded_headers {
+            if let Some(value) = req.headers().get("x-forwarded-for") {
+                if let Ok(s) = value.to_str() {
+                    if let Some(first) = s.split(',').next() {
+                        let trimmed = first.trim();
+                        if !trimmed.is_empty() {
+                            return trimmed.to_owned();
+                        }
+                    }
+                }
+            }
+
+            if let Some(value) = req.headers().get("x-real-ip") {
+                if let Ok(s) = value.to_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_owned();
+                    }
                 }
             }
         }
-    }
 
-    if let Some(value) = req.headers().get("x-real-ip") {
-        if let Ok(s) = value.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_owned();
-            }
+        if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
+            return addr.ip().to_string();
         }
-    }
 
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.ip().to_string();
+        "unknown".to_owned()
     }
-
-    "unknown".to_owned()
 }
 
 /// Tower [`Layer`] that applies rate limiting.
@@ -235,7 +264,7 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let now = Instant::now();
-        let key = client_ip(&req);
+        let key = self.limiter.client_ip(&req);
         let decision = self.limiter.decide(&key, now);
         self.limiter.maybe_sweep(now);
 
@@ -284,6 +313,9 @@ mod tests {
             enabled,
             requests_per_second: rps,
             burst,
+            // Tests exercise the key-by-IP path via X-Forwarded-For so
+            // they don't need a real TCP listener.
+            trust_forwarded_headers: true,
         }
     }
 
@@ -300,6 +332,15 @@ mod tests {
             .header("X-Forwarded-For", ip)
             .body(Body::empty())
             .unwrap()
+    }
+
+    fn limiter(trust: bool) -> Limiter {
+        Limiter::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: trust,
+        })
     }
 
     #[tokio::test]
@@ -378,30 +419,30 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_x_forwarded_for_first_entry() {
+    fn client_ip_prefers_x_forwarded_for_first_entry_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .unwrap();
-        assert_eq!(client_ip(&req), "1.2.3.4");
+        assert_eq!(limiter(true).client_ip(&req), "1.2.3.4");
     }
 
     #[test]
-    fn client_ip_trims_whitespace() {
+    fn client_ip_trims_whitespace_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "  9.9.9.9  ")
             .body(())
             .unwrap();
-        assert_eq!(client_ip(&req), "9.9.9.9");
+        assert_eq!(limiter(true).client_ip(&req), "9.9.9.9");
     }
 
     #[test]
-    fn client_ip_falls_back_to_x_real_ip() {
+    fn client_ip_falls_back_to_x_real_ip_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Real-IP", "7.7.7.7")
             .body(())
             .unwrap();
-        assert_eq!(client_ip(&req), "7.7.7.7");
+        assert_eq!(limiter(true).client_ip(&req), "7.7.7.7");
     }
 
     #[test]
@@ -409,23 +450,138 @@ mod tests {
         let mut req: Request<()> = Request::builder().body(()).unwrap();
         let addr: SocketAddr = "127.0.0.1:4242".parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(addr));
-        assert_eq!(client_ip(&req), "127.0.0.1");
+        assert_eq!(limiter(true).client_ip(&req), "127.0.0.1");
+        // Untrusted limiter also falls back, since headers are ignored.
+        assert_eq!(limiter(false).client_ip(&req), "127.0.0.1");
     }
 
     #[test]
     fn client_ip_unknown_when_no_source() {
         let req: Request<()> = Request::builder().body(()).unwrap();
-        assert_eq!(client_ip(&req), "unknown");
+        assert_eq!(limiter(true).client_ip(&req), "unknown");
+        assert_eq!(limiter(false).client_ip(&req), "unknown");
     }
 
     #[test]
-    fn client_ip_empty_xff_falls_through() {
+    fn client_ip_empty_xff_falls_through_to_x_real_ip_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", " , 5.5.5.5")
             .header("X-Real-IP", "8.8.8.8")
             .body(())
             .unwrap();
         // First XFF entry is empty after trim, so we fall back to X-Real-IP.
-        assert_eq!(client_ip(&req), "8.8.8.8");
+        assert_eq!(limiter(true).client_ip(&req), "8.8.8.8");
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_by_default() {
+        // Attacker-supplied forwarding headers must not be trusted when
+        // `trust_forwarded_headers = false`; the limiter keys on the
+        // real peer address instead.
+        let mut req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "1.2.3.4")
+            .header("X-Real-IP", "5.6.7.8")
+            .body(())
+            .unwrap();
+        let addr: SocketAddr = "10.0.0.42:1111".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(addr));
+        assert_eq!(limiter(false).client_ip(&req), "10.0.0.42");
+    }
+
+    #[tokio::test]
+    async fn forwarded_headers_cannot_bypass_throttling_when_untrusted() {
+        // `trust_forwarded_headers = false` (default). All requests share the
+        // same fallback key because no ConnectInfo is set, so rotating XFF
+        // does NOT create independent buckets.
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            trust_forwarded_headers: false,
+        };
+        let app = app(&config);
+
+        let first = app.clone().oneshot(req_with_ip("1.1.1.1")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        // Different XFF value, but same fallback key → still throttled.
+        let blocked = app.clone().oneshot(req_with_ip("2.2.2.2")).await.unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn sweep_evicts_idle_full_buckets() {
+        let lim = Limiter::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 2,
+            trust_forwarded_headers: true,
+        });
+
+        let t0 = Instant::now();
+        // Seed a bucket and consume one token so tokens < burst at t0.
+        match lim.decide("1.2.3.4", t0) {
+            Decision::Allowed { .. } => {}
+            Decision::Denied { .. } => panic!("first request should be allowed"),
+        }
+        assert_eq!(lim.buckets.lock().unwrap().len(), 1);
+
+        // Jump far enough ahead that the bucket has refilled completely
+        // AND crossed the idle cutoff.
+        let later = t0 + Duration::from_secs(3600);
+        lim.sweep(later);
+
+        assert!(
+            lim.buckets.lock().unwrap().is_empty(),
+            "idle full bucket should be evicted"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_recently_used_buckets() {
+        let lim = Limiter::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 2,
+            trust_forwarded_headers: true,
+        });
+
+        let t0 = Instant::now();
+        lim.decide("recent", t0);
+        // Only 1s later — well under the 300s idle cutoff.
+        lim.sweep(t0 + Duration::from_secs(1));
+
+        assert_eq!(
+            lim.buckets.lock().unwrap().len(),
+            1,
+            "recently used bucket must survive sweep"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_idle_but_partially_drained_buckets() {
+        // Edge case: a bucket that's been idle past the cutoff but whose
+        // refill rate is slow enough that it's still not full. The sweep
+        // must keep it so the client's pending debit is preserved.
+        let lim = Limiter::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.001, // 1 token every 1000s
+            burst: 5,
+            trust_forwarded_headers: true,
+        });
+
+        let t0 = Instant::now();
+        // Consume 3 tokens -> tokens = 2.
+        for _ in 0..3 {
+            lim.decide("slow", t0);
+        }
+
+        // 400s later: still idle past cutoff, but only ~0.4 tokens refilled.
+        lim.sweep(t0 + Duration::from_secs(400));
+
+        assert_eq!(
+            lim.buckets.lock().unwrap().len(),
+            1,
+            "partially-drained bucket must survive sweep to preserve debit"
+        );
     }
 }

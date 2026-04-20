@@ -36,6 +36,7 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 
 use serde::Deserialize;
 
@@ -252,6 +253,15 @@ impl Default for CsrfConfig {
 /// | `enabled` | `false` |
 /// | `requests_per_second` | `10.0` |
 /// | `burst` | `20` |
+/// | `trust_forwarded_headers` | `false` |
+///
+/// # Client IP resolution
+///
+/// By default the limiter keys on the **connection peer address**. This
+/// prevents clients from bypassing throttling by rotating `X-Forwarded-For`
+/// values. Set `trust_forwarded_headers = true` only when the server
+/// sits behind a trusted reverse proxy that strips and rewrites
+/// forwarding headers on every request.
 ///
 /// # Examples
 ///
@@ -260,6 +270,7 @@ impl Default for CsrfConfig {
 /// enabled = true
 /// requests_per_second = 5.0
 /// burst = 10
+/// trust_forwarded_headers = false
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
@@ -275,6 +286,15 @@ pub struct RateLimitConfig {
     /// Default: `20`.
     #[serde(default = "default_burst")]
     pub burst: u32,
+
+    /// Consult `X-Forwarded-For` / `X-Real-IP` before the connection peer
+    /// when identifying the client. Default: `false`.
+    ///
+    /// Enable ONLY when the server is behind a trusted reverse proxy that
+    /// fully overrides these headers on every request. Otherwise a client
+    /// can rotate header values to bypass throttling.
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 impl Default for RateLimitConfig {
@@ -283,6 +303,7 @@ impl Default for RateLimitConfig {
             enabled: false,
             requests_per_second: default_rps(),
             burst: default_burst(),
+            trust_forwarded_headers: false,
         }
     }
 }
@@ -397,6 +418,7 @@ mod tests {
         assert!(!config.enabled);
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
+        assert!(!config.trust_forwarded_headers);
     }
 
     #[test]
@@ -405,11 +427,13 @@ mod tests {
             enabled = true
             requests_per_second = 5.0
             burst = 100
+            trust_forwarded_headers = true
         ";
         let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert!((config.requests_per_second - 5.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 100);
+        assert!(config.trust_forwarded_headers);
     }
 
     #[test]
@@ -419,6 +443,7 @@ mod tests {
         assert!(config.enabled);
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
+        assert!(!config.trust_forwarded_headers);
     }
 
     #[test]

@@ -1059,6 +1059,7 @@ mod tests {
         config.security.rate_limit.enabled = true;
         config.security.rate_limit.requests_per_second = 0.1;
         config.security.rate_limit.burst = 1;
+        config.security.rate_limit.trust_forwarded_headers = true;
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" }));
