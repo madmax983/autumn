@@ -1607,7 +1607,12 @@ async fn setup_database(
     if pool.is_some() {
         if let Some(url) = &config.database.url {
             for mig in migrations {
-                crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+                crate::migrate::auto_migrate(
+                    url,
+                    config.profile.as_deref(),
+                    config.database.auto_migrate_in_production,
+                    mig,
+                );
             }
         }
     }

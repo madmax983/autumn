@@ -41,6 +41,7 @@
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__POOL_SIZE` | `database.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -631,6 +632,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
@@ -692,6 +694,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
+            &mut self.database.auto_migrate_in_production,
         );
     }
 
@@ -974,6 +981,7 @@ pub struct ServerConfig {
 /// | `url` | `None` |
 /// | `pool_size` | `10` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate_in_production` | `false` |
 ///
 /// # Examples
 ///
@@ -1001,6 +1009,14 @@ pub struct DatabaseConfig {
     /// Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+
+    /// When true, permits automatic migration application while running with
+    /// `prod`/`production` profile. Default: `false`.
+    ///
+    /// Keep this disabled for multi-replica production fleets and use an
+    /// explicit migration job (`autumn migrate`) instead.
+    #[serde(default)]
+    pub auto_migrate_in_production: bool,
 }
 
 impl DatabaseConfig {
@@ -1425,6 +1441,7 @@ impl Default for DatabaseConfig {
             url: None,
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout(),
+            auto_migrate_in_production: false,
         }
     }
 }
@@ -1796,6 +1813,7 @@ mod tests {
         assert!(config.database.url.is_none());
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.database.connect_timeout_secs, 5);
+        assert!(!config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Auto);
         assert_eq!(config.health.path, "/health");
@@ -1846,6 +1864,7 @@ shutdown_timeout_secs = 60
 url = "postgres://user:pass@db:5432/myapp"
 pool_size = 20
 connect_timeout_secs = 10
+auto_migrate_in_production = true
 
 [log]
 level = "debug"
@@ -1867,6 +1886,7 @@ path = "/healthz"
         );
         assert_eq!(config.database.pool_size, 20);
         assert_eq!(config.database.connect_timeout_secs, 10);
+        assert!(config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.health.path, "/healthz");
@@ -1942,6 +1962,14 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    #[test]
+    fn env_override_database_auto_migrate_in_production() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.database.auto_migrate_in_production);
     }
 
     // ── Server env override tests ────────────────────────────────
