@@ -23,6 +23,7 @@
 - Confirmed that the `curl -v http://localhost:3000/missing` request responds with HTTP 404 and `content-length: 0` despite having framework error page middleware.
 - Confirmed the macro compiler error by intentionally misspelling a route in `routes![]`.
 - The `README Run` works as intended, provided you don't make any errors.
+
 # DX Audit Report: `autumn dev` Hot Reloading
 
 ## 1. EXPERIENCE
@@ -98,3 +99,20 @@ To make the developer experience more robust ("idiot-proofing"):
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that standard `curl` requests to missing paths receive `content-length: 0`.
 - Verified that the secondary `__autumn_route_info_...` error is unavoidable due to eager macro resolution, meaning we must accept it as an ergonomic trade-off, but it could be explicitly documented.
+
+# DX Audit Report: Missing Extractor Re-exports
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Read the Axum documentation and wanted to use the `State` extractor for passing around database connections or application state.
+- Wrote a route `async fn db_route(db: autumn_web::extract::State<DatabaseConnection>) -> &'static str`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: Ran into `error[E0425]: cannot find type State in module autumn_web::extract`.
+- **Import Scan**: Realized I need to import `axum` directly to get `State` even though `autumn_web::extract` provides `Form`, `Json`, `Path`, and `Query`.
+
+## 3. 📢 REPORT - The Complaint
+- "Why do I have to import Axum myself just to use State? The framework says 'underlying axum implementation details should be hidden from users' and gives me `Path` and `Json`, but forgot `State`. This makes me add `axum` to my `Cargo.toml` which breaks the encapsulation."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that `autumn/src/extract.rs` only re-exports `Form`, `Json`, `Path`, and `Query`.
+- Confirmed that adding `pub use axum::extract::State;` in `autumn/src/extract.rs` would solve this without adding extra dependencies to the user's project.
