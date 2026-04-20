@@ -1226,71 +1226,7 @@ fn start_task_scheduler(
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(delay).await;
-                        tracing::debug!(task = %name, "Running scheduled task");
-                        state.task_registry.record_start(&name);
-                        #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "started",
-                                "task": name,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
-
-                        let start = std::time::Instant::now();
-                        // A fresh span per run so OTLP-enabled deployments
-                        // see each invocation as its own trace and request-
-                        // triggered tasks don't leak context across runs.
-                        let task_span = tracing::info_span!(
-                            parent: None,
-                            "scheduled_task",
-                            otel.kind = "internal",
-                            task = %name,
-                            schedule = "fixed_delay",
-                        );
-                        match (handler)(state.clone()).instrument(task_span).await {
-                            Ok(()) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                state.task_registry.record_success(&name, duration_ms);
-                                tracing::debug!(task = %name, "Task completed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "success",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                            Err(e) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                let error_str = e.to_string();
-                                state
-                                    .task_registry
-                                    .record_failure(&name, duration_ms, &error_str);
-                                tracing::warn!(task = %name, error = %e, "Task failed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "failure",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "error": error_str,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                        }
+                        execute_fixed_delay_task(name.clone(), state.clone(), handler).await;
                     }
                 });
             }
@@ -1318,7 +1254,7 @@ fn send_ws_sys_task_msg(
     state: &AppState,
     event: &str,
     name: &str,
-    extra: Option<(&str, serde_json::Value)>,
+    extra: Vec<(&str, serde_json::Value)>,
 ) {
     #[cfg(feature = "ws")]
     {
@@ -1335,7 +1271,7 @@ fn send_ws_sys_task_msg(
             "timestamp".to_string(),
             serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
         );
-        if let Some((k, v)) = extra {
+        for (k, v) in extra {
             map.insert(k.to_string(), v);
         }
         let msg = serde_json::Value::Object(map);
@@ -1343,11 +1279,12 @@ fn send_ws_sys_task_msg(
     }
 }
 
-async fn execute_cron_task_result(
+async fn execute_task_result(
     state: &AppState,
     handler: crate::task::TaskHandler,
     start: std::time::Instant,
     name: &str,
+    schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
     // A fresh span per run so OTLP-enabled deployments see each invocation
     // as its own trace rather than inheriting whatever was current on the
@@ -1357,7 +1294,7 @@ async fn execute_cron_task_result(
         "scheduled_task",
         otel.kind = "internal",
         task = %name,
-        schedule = "cron",
+        schedule = schedule,
     );
     match (handler)(state.clone()).instrument(task_span).await {
         Ok(()) => {
@@ -1371,15 +1308,53 @@ async fn execute_cron_task_result(
     }
 }
 
+/// Handle the execution of a single fixed-delay task.
+async fn execute_fixed_delay_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+) {
+    tracing::debug!(task = %name, "Running scheduled task");
+    state.task_registry.record_start(&name);
+
+    send_ws_sys_task_msg(&state, "started", &name, vec![]);
+
+    let start = std::time::Instant::now();
+    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
+        Ok(duration_ms) => {
+            state.task_registry.record_success(&name, duration_ms);
+            tracing::debug!(task = %name, "Task completed");
+            send_ws_sys_task_msg(
+                &state,
+                "success",
+                &name,
+                vec![("duration_ms", serde_json::json!(duration_ms))],
+            );
+        }
+        Err((duration_ms, error_str)) => {
+            state
+                .task_registry
+                .record_failure(&name, duration_ms, &error_str);
+            tracing::warn!(task = %name, error = %error_str, "Task failed");
+            send_ws_sys_task_msg(
+                &state,
+                "failure",
+                &name,
+                vec![("duration_ms", serde_json::json!(duration_ms)), ("error", serde_json::json!(error_str))],
+            );
+        }
+    }
+}
+
 /// Handle the execution of a single cron task.
 async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
-    send_ws_sys_task_msg(&state, "started", &name, None);
+    send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_cron_task_result(&state, handler, start, &name).await {
+    match execute_task_result(&state, handler, start, &name, "cron").await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -1387,7 +1362,7 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
                 &state,
                 "success",
                 &name,
-                Some(("duration_ms", serde_json::json!(duration_ms))),
+                vec![("duration_ms", serde_json::json!(duration_ms))],
             );
         }
         Err((duration_ms, error_str)) => {
@@ -1399,7 +1374,7 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
                 &state,
                 "failure",
                 &name,
-                Some(("error", serde_json::json!(error_str))),
+                vec![("duration_ms", serde_json::json!(duration_ms)), ("error", serde_json::json!(error_str))],
             );
         }
     }
@@ -3129,23 +3104,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_cron_task_result_ok_returns_duration() {
+    async fn execute_task_result_ok_returns_duration() {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start, "test_task").await;
+        let result =
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
     }
 
     #[tokio::test]
-    async fn execute_cron_task_result_err_returns_duration_and_message() {
+    async fn execute_task_result_err_returns_duration_and_message() {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler =
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start, "test_task").await;
+        let result =
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
