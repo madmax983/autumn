@@ -108,11 +108,18 @@ pub fn pending_migrations(
         .collect())
 }
 
-/// Run migrations according to the active profile.
+fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
+    let profile_name = profile.unwrap_or("none");
+    matches!(profile_name, "dev" | "development")
+        || (matches!(profile_name, "prod" | "production") && allow_auto_migrate_in_production)
+}
+
+/// Run migrations according to the active profile and migration policy.
 ///
-/// - **dev**: runs all pending migrations automatically and logs each one.
-/// - **prod** / other: logs a warning if pending migrations exist but does
-///   not apply them.
+/// - **dev/development**: runs all pending migrations automatically and logs each one.
+/// - **prod/production**: logs pending migrations unless
+///   `allow_auto_migrate_in_production` is enabled.
+/// - **other profiles**: logs pending migrations without auto-applying.
 ///
 /// Called internally by [`AppBuilder::run`](crate::app::AppBuilder::run)
 /// when migrations are registered via `.migrations()`.
@@ -120,12 +127,23 @@ pub fn pending_migrations(
 pub(crate) fn auto_migrate(
     database_url: &str,
     profile: Option<&str>,
+    allow_auto_migrate_in_production: bool,
     migrations: EmbeddedMigrations,
 ) {
-    let is_dev = profile == Some("dev");
+    let profile_name = profile.unwrap_or("none");
+    let is_dev = matches!(profile_name, "dev" | "development");
+    let is_prod = matches!(profile_name, "prod" | "production");
+    let should_auto_apply = should_auto_apply(profile, allow_auto_migrate_in_production);
 
-    if is_dev {
-        tracing::info!("Dev mode: running pending database migrations...");
+    if should_auto_apply {
+        if is_dev {
+            tracing::info!("Development profile: running pending database migrations...");
+        } else {
+            tracing::warn!(
+                profile = profile_name,
+                "Production auto-migration is enabled; running pending database migrations"
+            );
+        }
         match run_pending(database_url, migrations) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!("No pending migrations");
@@ -151,6 +169,12 @@ pub(crate) fn auto_migrate(
                 tracing::info!("Database migrations are up to date");
             }
             Ok(pending) => {
+                if is_prod {
+                    tracing::warn!(
+                        "Production profile detected: automatic migrations are disabled by default. \
+                         Set database.auto_migrate_in_production=true to opt in."
+                    );
+                }
                 tracing::warn!(
                     count = pending.len(),
                     "Pending migrations detected. Run `autumn migrate` to apply them."
@@ -193,5 +217,16 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("migration failed"));
         assert!(msg.contains("syntax error"));
+    }
+
+    #[test]
+    fn profile_aliases_are_recognized() {
+        assert!(should_auto_apply(Some("dev"), false));
+        assert!(should_auto_apply(Some("development"), false));
+        assert!(!should_auto_apply(Some("prod"), false));
+        assert!(!should_auto_apply(Some("production"), false));
+        assert!(should_auto_apply(Some("prod"), true));
+        assert!(should_auto_apply(Some("production"), true));
+        assert!(!should_auto_apply(Some("staging"), true));
     }
 }
