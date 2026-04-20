@@ -72,7 +72,7 @@ pub struct SecurityConfig {
 /// | `strict_transport_security` | `false` |
 /// | `hsts_max_age_secs` | `31_536_000` (1 year) |
 /// | `hsts_include_subdomains` | `true` |
-/// | `content_security_policy` | `""` (disabled) |
+/// | `content_security_policy` | htmx-compatible policy (see [`default_content_security_policy`]) |
 /// | `referrer_policy` | `"strict-origin-when-cross-origin"` |
 /// | `permissions_policy` | `""` (disabled) |
 ///
@@ -125,11 +125,15 @@ pub struct HeadersConfig {
     #[serde(default = "default_true")]
     pub hsts_include_subdomains: bool,
 
-    /// `Content-Security-Policy` header value. Default: `""` (not sent).
+    /// `Content-Security-Policy` header value.
     ///
-    /// When non-empty, the CSP header restricts which resources the browser
-    /// is allowed to load. Example: `"default-src 'self'; script-src 'self'"`.
-    #[serde(default)]
+    /// Default is an htmx-compatible policy that restricts resources to the
+    /// same origin while permitting inline styles (common for htmx-driven
+    /// UIs) and data-URI images. Set to `""` to disable the header entirely
+    /// or override with a custom policy via `autumn.toml`.
+    ///
+    /// See [`default_content_security_policy`] for the exact default value.
+    #[serde(default = "default_content_security_policy")]
     pub content_security_policy: String,
 
     /// `Referrer-Policy` header value. Default: `"strict-origin-when-cross-origin"`.
@@ -153,7 +157,7 @@ impl Default for HeadersConfig {
             strict_transport_security: false,
             hsts_max_age_secs: default_hsts_max_age(),
             hsts_include_subdomains: true,
-            content_security_policy: String::new(),
+            content_security_policy: default_content_security_policy(),
             referrer_policy: default_referrer_policy(),
             permissions_policy: String::new(),
         }
@@ -244,6 +248,36 @@ fn default_referrer_policy() -> String {
     "strict-origin-when-cross-origin".to_owned()
 }
 
+/// Default Content-Security-Policy used when no override is provided.
+///
+/// Designed to be strict enough to pass common security scanners while
+/// still allowing htmx to function normally:
+///
+/// - `default-src 'self'` restricts all fetches to the same origin, covering
+///   htmx's AJAX/SSE/WebSocket requests out of the box.
+/// - `img-src 'self' data:` permits same-origin images and inline
+///   `data:` images (common in htmx demos and dynamic content).
+/// - `style-src 'self' 'unsafe-inline'` permits inline `style=""`
+///   attributes, which are frequently used in htmx-rendered partials.
+/// - `script-src 'self'` permits same-origin scripts only (htmx's
+///   `hx-*` attributes are not affected by CSP because they are not
+///   inline event handlers).
+/// - `frame-ancestors 'none'` provides clickjacking protection even if
+///   `X-Frame-Options` is absent.
+/// - `base-uri 'self'` prevents `<base>` tag injection attacks.
+/// - `form-action 'self'` restricts form submissions to the same origin.
+#[must_use]
+pub fn default_content_security_policy() -> String {
+    "default-src 'self'; \
+     img-src 'self' data:; \
+     style-src 'self' 'unsafe-inline'; \
+     script-src 'self'; \
+     frame-ancestors 'none'; \
+     base-uri 'self'; \
+     form-action 'self'"
+        .to_owned()
+}
+
 fn default_csrf_header() -> String {
     "X-CSRF-Token".to_owned()
 }
@@ -277,11 +311,48 @@ mod tests {
         assert!(config.headers.xss_protection);
         assert!(!config.headers.strict_transport_security);
         assert_eq!(config.headers.hsts_max_age_secs, 31_536_000);
-        assert!(config.headers.content_security_policy.is_empty());
+        // Default CSP is htmx-compatible (see S-049): same-origin default
+        // with inline styles permitted so htmx-rendered partials work.
+        let csp = &config.headers.content_security_policy;
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
         assert_eq!(
             config.headers.referrer_policy,
             "strict-origin-when-cross-origin"
         );
+    }
+
+    #[test]
+    fn default_csp_allows_htmx() {
+        // htmx relies on same-origin fetches (AJAX/SSE) and frequently
+        // renders partials with inline style attributes. The default CSP
+        // must permit both without requiring developer configuration.
+        let csp = default_content_security_policy();
+        assert!(
+            csp.contains("default-src 'self'"),
+            "default-src 'self' must cover htmx fetch/SSE/WebSocket requests"
+        );
+        assert!(
+            csp.contains("style-src 'self' 'unsafe-inline'"),
+            "inline styles must be permitted for htmx-rendered partials"
+        );
+        // unsafe-eval must NOT be present: htmx 2+ does not need it and
+        // enabling it would weaken the default posture.
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "default CSP must not include 'unsafe-eval'"
+        );
+    }
+
+    #[test]
+    fn empty_csp_disables_header() {
+        // Developers can disable the CSP entirely via autumn.toml.
+        let toml_str = r#"
+            content_security_policy = ""
+        "#;
+        let config: HeadersConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.content_security_policy.is_empty());
     }
 
     #[test]

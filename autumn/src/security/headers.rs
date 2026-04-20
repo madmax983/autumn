@@ -12,7 +12,7 @@
 //! | `X-Content-Type-Options` | `x_content_type_options` is `true` | `nosniff` |
 //! | `X-XSS-Protection` | `xss_protection` is `true` | `1; mode=block` |
 //! | `Strict-Transport-Security` | `strict_transport_security` is `true` | `max-age=31536000; includeSubDomains` |
-//! | `Content-Security-Policy` | `content_security_policy` is non-empty | not sent |
+//! | `Content-Security-Policy` | `content_security_policy` is non-empty | htmx-compatible same-origin policy |
 //! | `Referrer-Policy` | `referrer_policy` is non-empty | `strict-origin-when-cross-origin` |
 //! | `Permissions-Policy` | `permissions_policy` is non-empty | not sent |
 //!
@@ -234,14 +234,40 @@ mod tests {
             response.headers().get("referrer-policy").unwrap(),
             "strict-origin-when-cross-origin"
         );
-        // HSTS not present by default
+        // HSTS not present by default (auto-enabled in prod via profile defaults)
         assert!(
             response
                 .headers()
                 .get("strict-transport-security")
                 .is_none()
         );
-        // CSP not present by default
+        // Default CSP is htmx-compatible (S-049): same-origin with inline
+        // styles permitted for htmx-rendered partials.
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("default CSP should be sent")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+    }
+
+    #[tokio::test]
+    async fn csp_header_disabled_when_empty() {
+        let config = HeadersConfig {
+            content_security_policy: String::new(),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SecurityHeadersLayer::from_config(&config));
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
         assert!(response.headers().get("content-security-policy").is_none());
     }
 
