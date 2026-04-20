@@ -159,15 +159,14 @@ impl TestApp {
     where
         L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
         L::Service: tower::Service<
-                axum::http::Request<axum::body::Body>,
-                Response = axum::http::Response<axum::body::Body>,
+                axum::extract::Request,
+                Response = axum::response::Response,
                 Error = std::convert::Infallible,
             > + Clone
             + Send
             + Sync
             + 'static,
-        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
-            Send + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
         self.custom_layers
             .push(Box::new(move |router| router.layer(layer)));
