@@ -5,6 +5,16 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Custom Tower middleware** — new `AppBuilder::layer()` accepts any
+  `tower::Layer`, allowing one-line integration of `TimeoutLayer`, rate
+  limiters, and other third-party Tower middleware. User layers execute
+  inside `RequestIdLayer` on ingress so they observe the generated request
+  ID. See `docs/guide/middleware.md`. (S-049)
+
 ## [0.2.0] - 2026-04-19
 
 ### Added

@@ -105,6 +105,7 @@ pub struct TestApp {
     routes: Vec<Route>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    custom_layers: Vec<crate::app::CustomLayerApplier>,
     config: AutumnConfig,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
@@ -123,6 +124,7 @@ impl TestApp {
             routes: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
             config,
             #[cfg(feature = "db")]
             pool: None,
@@ -145,6 +147,30 @@ impl TestApp {
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    /// Apply a custom [`tower::Layer`] to the entire test application.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::layer`] so tests can exercise the
+    /// exact middleware wiring that `AppBuilder::run()` produces.
+    #[must_use]
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.custom_layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
@@ -213,12 +239,19 @@ impl TestApp {
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
-        let router = crate::router::try_build_router_merged(
+        let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
             state,
-            self.merge_routers,
-            self.nest_routers,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: self.merge_routers,
+                nest_routers: self.nest_routers,
+                custom_layers: self.custom_layers,
+                error_page_renderer: None,
+                session_store: None,
+            },
         )
         .unwrap();
         TestClient { router }

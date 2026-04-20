@@ -1,0 +1,169 @@
+# Middleware in Autumn
+
+Autumn ships a curated stack of built-in middleware — request IDs, security
+headers, CSRF, CORS, sessions, metrics, exception filters. That covers the
+boring-but-critical concerns most applications share. When you need something
+off the beaten path (a timeout, a rate limiter, a custom tracing span, a
+legacy header injector), reach for [`AppBuilder::layer`] and drop in any
+standard [`tower::Layer`].
+
+This guide explains where user layers sit in the stack, how to register them,
+and the common recipes.
+
+---
+
+## Quick start
+
+Apply a Tower timeout layer to every route in the app:
+
+```rust,no_run
+use std::time::Duration;
+use autumn_web::prelude::*;
+use axum::{error_handling::HandleErrorLayer, http::StatusCode};
+use tower::{ServiceBuilder, timeout::TimeoutLayer};
+
+#[get("/slow")]
+async fn slow() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    "done"
+}
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .routes(routes![slow])
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(|_| async {
+                    StatusCode::REQUEST_TIMEOUT
+                }))
+                .layer(TimeoutLayer::new(Duration::from_secs(5))),
+        )
+        .run()
+        .await;
+}
+```
+
+Tower's `TimeoutLayer` surfaces its own `BoxError` on timeout, while axum
+requires every layer to produce `Infallible`. `HandleErrorLayer` bridges the
+two — it converts any error from the inner layer into an HTTP response.
+
+---
+
+## Middleware ordering
+
+On a request's **ingress** path (outermost → innermost), layers run in this
+order:
+
+```
+  Metrics
+    └─ ExceptionFilter
+         └─ ErrorPageContext
+              └─ Session
+                   └─ SecurityHeaders
+                        └─ RequestId
+                             └─ [your .layer() calls, first = outermost]
+                                  └─ CSRF
+                                       └─ CORS
+                                            └─ route handler
+```
+
+The ordering guarantee that matters most: **user layers run inside
+`RequestIdLayer` on ingress**, so every `.layer()` you register can read the
+generated `RequestId` from the request extensions. Exception filters,
+metrics, and error-page rendering all sit *outside* your layers, which means
+errors you produce (and errors you let bubble up from handlers) are still
+caught by Autumn's error pipeline.
+
+Multiple `.layer()` calls stack in registration order, mirroring
+[`tower::ServiceBuilder`]: the first `.layer(A)` call becomes the outermost
+user layer, so `A` sees the request first and the response last.
+
+---
+
+## Reading the request ID from a custom layer
+
+```rust,ignore
+use autumn_web::middleware::RequestId;
+use axum::http::Request;
+
+fn log_with_id<B>(req: &Request<B>) {
+    if let Some(id) = req.extensions().get::<RequestId>() {
+        tracing::info!(request_id = %id, "custom layer fired");
+    }
+}
+```
+
+Because user layers sit inside `RequestIdLayer`, the extension is always
+present in `call(..)` — there's no race condition to worry about.
+
+---
+
+## Limitations (for now)
+
+- **No per-route layers.** `.layer()` wraps the whole app. If you need a
+  middleware scoped to a group of routes, use
+  [`AppBuilder::scoped`] — it accepts the same `tower::Layer` bounds and
+  applies the layer only to the routes in that group. Per-route layering
+  (equivalent to axum's `route_layer`) is tracked as a follow-up.
+- **`Service::Error = Infallible`.** Any layer you register must produce
+  `Infallible` on its service's `Error` associated type. For layers that
+  surface real errors (timeouts, rate limits, circuit breakers), wrap them
+  with [`axum::error_handling::HandleErrorLayer`] as shown above.
+
+---
+
+## Recipes
+
+### Rate limiting with `tower-governor`
+
+```rust,ignore
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+
+let governor_conf = GovernorConfigBuilder::default()
+    .per_second(10)
+    .burst_size(20)
+    .finish()
+    .unwrap();
+
+autumn_web::app()
+    .routes(routes![index])
+    .layer(GovernorLayer::new(governor_conf))
+    .run()
+    .await;
+```
+
+### Extra tracing span per request
+
+```rust,ignore
+use tower_http::trace::TraceLayer;
+
+autumn_web::app()
+    .routes(routes![index])
+    .layer(TraceLayer::new_for_http())
+    .run()
+    .await;
+```
+
+### Custom header injection (legacy system integration)
+
+Write a small `Layer`/`Service` pair (see the pattern in
+`autumn/tests/custom_layer.rs`) that rewrites or inserts request/response
+headers, then register it with `.layer(MyLayer)`. Because the layer sits
+inside `RequestIdLayer`, you can stamp the request ID onto any outgoing
+header for downstream services.
+
+---
+
+## See also
+
+- [`AppBuilder::layer`] — method reference and trait bounds.
+- [`AppBuilder::scoped`] — the group-scoped variant.
+- [Extensibility guide](./extensibility.md) — picks the right tier for your
+  extension point.
+
+[`AppBuilder::layer`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.layer
+[`AppBuilder::scoped`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.scoped
+[`tower::Layer`]: https://docs.rs/tower/latest/tower/trait.Layer.html
+[`tower::ServiceBuilder`]: https://docs.rs/tower/latest/tower/struct.ServiceBuilder.html
+[`axum::error_handling::HandleErrorLayer`]: https://docs.rs/axum/latest/axum/error_handling/struct.HandleErrorLayer.html
