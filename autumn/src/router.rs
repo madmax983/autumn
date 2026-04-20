@@ -1034,7 +1034,9 @@ mod tests {
 
         let headers = response.headers();
         assert_eq!(
-            headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
             Some("https://example.com"),
             "preflight must echo the allowed origin"
         );
