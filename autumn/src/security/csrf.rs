@@ -285,8 +285,7 @@ where
 
         Box::pin(async move {
             if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
-                let mut response =
-                    Response::new(ResBody::from(CSRF_FORBIDDEN_MESSAGE));
+                let mut response = Response::new(ResBody::from(CSRF_FORBIDDEN_MESSAGE));
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 response.headers_mut().insert(
                     http::header::CONTENT_TYPE,
