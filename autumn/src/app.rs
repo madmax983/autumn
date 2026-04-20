@@ -210,6 +210,67 @@ pub(crate) struct ScopedGroup {
 pub(crate) type CustomLayerApplier =
     Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
 
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Marker trait for types that can be registered with
+/// [`AppBuilder::layer`] as an app-wide Tower middleware.
+///
+/// Any [`tower::Layer`] whose produced service is a compatible axum
+/// service (i.e. `Service<Request, Response = Response, Error = Infallible>`,
+/// plus the usual `Clone + Send + Sync + 'static` bounds and a `Send`
+/// future) implements this trait automatically via a blanket impl.
+///
+/// The trait is **sealed**: it exists only to surface a clean
+/// `IntoAppLayer is not implemented for YourType` error message when a
+/// candidate layer fails to meet axum's service bounds, instead of a
+/// 40-line associated-type wall. You cannot implement it manually, and
+/// you should not need to — just bring your own `tower::Layer`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a usable Autumn app-wide Tower layer",
+    label = "this type does not implement `tower::Layer<axum::routing::Route>` with the required service bounds",
+    note = "`AppBuilder::layer(..)` requires:\n    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
+)]
+pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
+    /// Apply this layer to the given router. Not intended for direct use.
+    #[doc(hidden)]
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState>;
+}
+
+impl<L> sealed::Sealed for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+}
+
+impl<L> IntoAppLayer for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState> {
+        router.layer(self)
+    }
+}
+
 impl AppBuilder {
     /// Register a collection of routes with the application.
     ///
@@ -389,6 +450,13 @@ impl AppBuilder {
     /// Tower / Tower-HTTP ecosystem (timeouts, rate limiting, bespoke
     /// tracing, request signing, etc.) without forking the framework.
     ///
+    /// The generic bound is [`IntoAppLayer`], a sealed trait with a blanket
+    /// impl for every `tower::Layer` that meets axum's service requirements
+    /// — in practice this means any standard Tower layer whose service
+    /// produces `Infallible` errors. If your layer produces real errors
+    /// (like `TimeoutLayer`'s `BoxError`), wrap it with
+    /// [`axum::error_handling::HandleErrorLayer`] before passing it here.
+    ///
     /// # Ordering
     ///
     /// User layers are applied **inside** Autumn's request-ID layer on the
@@ -448,19 +516,7 @@ impl AppBuilder {
     /// # }
     /// ```
     #[must_use]
-    pub fn layer<L>(mut self, layer: L) -> Self
-    where
-        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
-        L::Service: tower::Service<
-                axum::extract::Request,
-                Response = axum::response::Response,
-                Error = std::convert::Infallible,
-            > + Clone
-            + Send
-            + Sync
-            + 'static,
-        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
-    {
+    pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
         // TODO(0.x): consider retaining a TypeId alongside the closure so
         // plugins can introspect which layers are already registered
         // (e.g. warn when auth is installed after rate-limiting). Requires
@@ -468,7 +524,7 @@ impl AppBuilder {
         // metadata. Deliberately deferred — pure closures keep the public
         // surface minimal until a concrete introspection use case appears.
         self.custom_layers
-            .push(Box::new(move |router| router.layer(layer)));
+            .push(Box::new(move |router| layer.apply_to(router)));
         self
     }
 
