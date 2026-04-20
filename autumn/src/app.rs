@@ -775,6 +775,11 @@ impl AppBuilder {
             log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
+        // 4c. Fail-fast on invalid session config — but only when no custom
+        // SessionStore was installed via with_session_store(...). Done before
+        // setup_database so a doomed boot doesn't run migrations first.
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
+
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
         let pool = setup_database(&config, migrations, pool_provider_factory)
@@ -943,6 +948,11 @@ impl AppBuilder {
             eprintln!("Hint: use .static_routes(static_routes![...]) on your AppBuilder.");
             std::process::exit(1);
         }
+
+        // Fail-fast on invalid session config — only when no custom store
+        // was installed. Symmetrical to the same check in run() so static
+        // builds don't run migrations against a doomed boot either.
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
@@ -1355,6 +1365,28 @@ fn log_startup_transparency(
     tracing::info!("Active middleware: {}", format_middleware_list(config));
 
     tracing::info!("Configuration:{}", format_config_summary(config));
+}
+
+/// Fail the boot fast (before any DB side effects) when the default
+/// session backend is misconfigured.
+///
+/// `AutumnConfig::validate()` is intentionally session-agnostic so that a
+/// custom [`SessionStore`](crate::session::SessionStore) installed via
+/// [`AppBuilder::with_session_store`] can override an otherwise-invalid
+/// `session.backend = "redis"`-without-`redis.url` config. But when no
+/// custom store is installed, the config-driven path will fail later in
+/// `apply_session_layer` — and by then, `setup_database` has already run
+/// migrations, leaving DB side effects from a doomed boot. This helper
+/// runs the same `backend_plan` check `apply_session_layer` does, but
+/// before any side effects, and only when the override path is inactive.
+fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session_store: bool) {
+    if has_custom_session_store {
+        return;
+    }
+    if let Err(error) = config.session.backend_plan(config.profile.as_deref()) {
+        eprintln!("Invalid session backend config: {error}");
+        std::process::exit(1);
+    }
 }
 
 async fn load_config_and_telemetry(
