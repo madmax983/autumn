@@ -30,6 +30,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
@@ -134,10 +135,25 @@ where
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
-        let conn = pool.get().await.map_err(|e| {
-            tracing::error!("Failed to acquire database connection: {e}");
-            AutumnError::service_unavailable_msg(e.to_string())
-        })?;
+        // OpenTelemetry semantic conventions for DB client spans. The
+        // acquired connection's `Deref` target is used by every query made
+        // via this `Db`, so query-level spans automatically descend from
+        // this span under the standard tracing scope rules — giving us
+        // automatic instrumentation of `diesel-async` queries without
+        // wrapping the connection type.
+        let acquire_span = tracing::info_span!(
+            "db.connection.acquire",
+            otel.kind = "client",
+            db.system = "postgresql",
+        );
+        let conn = async {
+            pool.get().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {e}");
+                AutumnError::service_unavailable_msg(e.to_string())
+            })
+        }
+        .instrument(acquire_span)
+        .await?;
 
         Ok(Self(conn))
     }

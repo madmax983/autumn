@@ -30,6 +30,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tracing::Instrument as _;
+
 use crate::config::{AutumnConfig, ConfigLoader};
 #[cfg(feature = "db")]
 use crate::db::DatabasePoolProvider;
@@ -1233,7 +1235,17 @@ fn start_task_scheduler(
                         }
 
                         let start = std::time::Instant::now();
-                        match (handler)(state.clone()).await {
+                        // A fresh span per run so OTLP-enabled deployments
+                        // see each invocation as its own trace and request-
+                        // triggered tasks don't leak context across runs.
+                        let task_span = tracing::info_span!(
+                            parent: None,
+                            "scheduled_task",
+                            otel.kind = "internal",
+                            task = %name,
+                            schedule = "fixed_delay",
+                        );
+                        match (handler)(state.clone()).instrument(task_span).await {
                             Ok(()) => {
                                 let duration_ms =
                                     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1331,8 +1343,19 @@ async fn execute_cron_task_result(
     state: &AppState,
     handler: crate::task::TaskHandler,
     start: std::time::Instant,
+    name: &str,
 ) -> Result<u64, (u64, String)> {
-    match (handler)(state.clone()).await {
+    // A fresh span per run so OTLP-enabled deployments see each invocation
+    // as its own trace rather than inheriting whatever was current on the
+    // scheduler thread.
+    let task_span = tracing::info_span!(
+        parent: None,
+        "scheduled_task",
+        otel.kind = "internal",
+        task = %name,
+        schedule = "cron",
+    );
+    match (handler)(state.clone()).instrument(task_span).await {
         Ok(()) => {
             let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
             Ok(duration_ms)
@@ -1352,7 +1375,7 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
     send_ws_sys_task_msg(&state, "started", &name, None);
 
     let start = std::time::Instant::now();
-    match execute_cron_task_result(&state, handler, start).await {
+    match execute_cron_task_result(&state, handler, start, &name).await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -3054,7 +3077,7 @@ mod tests {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result = super::execute_cron_task_result(&state, handler, start, "test_task").await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
@@ -3066,7 +3089,7 @@ mod tests {
         let handler: crate::task::TaskHandler =
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result = super::execute_cron_task_result(&state, handler, start, "test_task").await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);

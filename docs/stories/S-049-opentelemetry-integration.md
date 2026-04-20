@@ -3,7 +3,7 @@
 **Epic:** EPIC-012 (v1.1 Observability)
 **Priority:** Must Have
 **Story Points:** 8
-**Status:** Not Started
+**Status:** Done
 **Assigned To:** markm
 **Created:** 2026-04-02
 **Sprint:** Backlog

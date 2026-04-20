@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limiters, and other third-party Tower middleware. User layers execute
   inside `RequestIdLayer` on ingress so they observe the generated request
   ID. See `docs/guide/middleware.md`. (S-049)
+- **W3C Trace Context propagation** — when the `telemetry-otlp` feature is
+  enabled, Autumn now extracts `traceparent` / `tracestate` from incoming
+  HTTP requests and injects the current span context back into outgoing
+  responses. Scheduled tasks (`#[scheduled]`) run inside a fresh server
+  span so each invocation appears as its own trace, and the `Db` extractor
+  opens a `db.connection.acquire` span tagged with `db.system=postgresql`
+  so database activity shows up as a child of the request span in APM
+  tooling. (S-049)
 
 ## [0.2.0] - 2026-04-19
 

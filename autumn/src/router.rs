@@ -499,13 +499,19 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
-    //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers] -> CSRF -> CORS ->
-    //   handler
+    //   TraceContext -> Metrics -> ExceptionFilter -> ErrorPageContext ->
+    //   Session -> SecurityHeaders -> RequestId -> [user layers] -> CSRF ->
+    //   CORS -> handler
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
         .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+
+    // W3C Trace Context propagation sits outermost so the server span
+    // established from the incoming `traceparent` is the parent of every
+    // other layer's tracing activity — metrics, errors, handler spans.
+    #[cfg(feature = "telemetry-otlp")]
+    let router = router.layer(crate::middleware::TraceContextLayer);
 
     Ok(router)
 }

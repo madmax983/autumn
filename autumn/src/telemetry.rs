@@ -14,7 +14,9 @@ use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{
+    Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider,
+};
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,6 +400,12 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
             .build(),
     }
     .map_err(|error| TelemetryInitError::ExporterInit(error.to_string()))?;
+
+    // Install a W3C Trace Context propagator so the `TraceContextLayer`
+    // middleware can extract incoming `traceparent` headers and inject
+    // the current context into outgoing responses. Uses the global
+    // text-map propagator slot maintained by `opentelemetry::global`.
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
