@@ -72,6 +72,7 @@ pub fn app() -> AppBuilder {
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
+        custom_layers: Vec::new(),
         startup_hooks: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
@@ -160,6 +161,9 @@ pub struct AppBuilder {
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Custom Tower layers registered via [`AppBuilder::layer`], applied
+    /// inside `RequestIdLayer` on ingress so they observe the request ID.
+    custom_layers: Vec<CustomLayerApplier>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -197,6 +201,14 @@ pub(crate) struct ScopedGroup {
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
+
+/// A deferred router mutator that applies a user-registered
+/// [`tower::Layer`] to the app-wide router.
+///
+/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
+/// `apply_middleware` where the final layer stack is assembled.
+pub(crate) type CustomLayerApplier =
+    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
 
 impl AppBuilder {
     /// Register a collection of routes with the application.
@@ -368,6 +380,78 @@ impl AppBuilder {
             routes,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
+        self
+    }
+
+    /// Apply a custom [`tower::Layer`] to the entire application.
+    ///
+    /// This is the escape hatch for integrating any middleware from the
+    /// Tower / Tower-HTTP ecosystem (timeouts, rate limiting, bespoke
+    /// tracing, request signing, etc.) without forking the framework.
+    ///
+    /// # Ordering
+    ///
+    /// User layers are applied **inside** Autumn's request-ID layer on the
+    /// ingress path, which means your middleware always sees the generated
+    /// `RequestId` in the request extensions. The full stack (outermost to
+    /// innermost on ingress) is:
+    ///
+    /// `Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->`
+    /// `SecurityHeaders -> RequestId -> [user layers, registration order]`
+    /// `-> CSRF -> CORS -> route handler`
+    ///
+    /// When `.layer()` is called multiple times, the **first** call becomes
+    /// the outermost user layer on ingress (matching `tower::ServiceBuilder`
+    /// semantics).
+    ///
+    /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
+    /// for ready-made recipes.
+    ///
+    /// # Examples
+    ///
+    /// Adding a Tower timeout layer in one line (Tower's `TimeoutLayer`
+    /// returns `BoxError`, so it must be paired with `HandleErrorLayer` to
+    /// satisfy axum's `Infallible` error requirement):
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use autumn_web::prelude::*;
+    /// use axum::{error_handling::HandleErrorLayer, http::StatusCode};
+    /// use tower::{ServiceBuilder, timeout::TimeoutLayer};
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(HandleErrorLayer::new(|_| async {
+    ///                 StatusCode::REQUEST_TIMEOUT
+    ///             }))
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(5))),
+    ///     )
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                axum::http::Request<axum::body::Body>,
+                Response = axum::http::Response<axum::body::Body>,
+                Error = std::convert::Infallible,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
+            Send + 'static,
+    {
+        self.custom_layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
@@ -735,6 +819,7 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            custom_layers,
             startup_hooks,
             shutdown_hooks,
             extensions: _,
@@ -822,6 +907,7 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
+                custom_layers,
                 error_page_renderer,
                 session_store,
             },
@@ -923,6 +1009,7 @@ impl AppBuilder {
             scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
+            custom_layers: _,
             startup_hooks: _,
             shutdown_hooks: _,
             extensions: _,
@@ -985,6 +1072,7 @@ impl AppBuilder {
                 scoped_groups: Vec::new(),
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
+                custom_layers: Vec::new(),
                 error_page_renderer: None,
                 session_store,
             },
