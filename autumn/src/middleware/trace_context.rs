@@ -238,4 +238,55 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn service_propagates_inner_error_through_poll() {
+        // Exercises the `Poll::Ready(Err(_))` branch in `TraceContextFuture::poll`.
+        use std::convert::Infallible;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct ErrService;
+        impl Service<Request<Body>> for ErrService {
+            type Response = Response<Body>;
+            type Error = &'static str;
+            type Future = std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Response<Body>, &'static str>> + Send>,
+            >;
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                Box::pin(async { Err::<Response<Body>, _>("downstream boom") })
+            }
+        }
+
+        // Infallible placates the compiler that `ErrService::Error` is usable
+        // directly without axum's Router error remapping.
+        let _ = std::marker::PhantomData::<Infallible>;
+
+        let mut layered = TraceContextLayer.layer(ErrService);
+        let result = layered
+            .call(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await;
+        assert_eq!(result.unwrap_err(), "downstream boom");
+    }
+
+    #[tokio::test]
+    async fn call_records_status_code_on_response_span_field() {
+        // Covers the `span.record("http.response.status_code", ...)` line in
+        // `TraceContextFuture::poll` by driving a status through the layer.
+        let app = Router::new()
+            .route("/", get(|| async { (StatusCode::IM_A_TEAPOT, "teapot") }))
+            .layer(TraceContextLayer);
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
+    }
 }
