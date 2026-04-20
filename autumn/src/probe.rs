@@ -8,8 +8,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use axum::Json;
 use crate::extract::State;
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Serialize;

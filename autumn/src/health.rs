@@ -26,8 +26,8 @@
 //!
 //! Returns the same response as the readiness probe.
 
-use crate::state::AppState;
 use crate::extract::State;
+use crate::state::AppState;
 use axum::response::IntoResponse;
 
 /// Health check handler.

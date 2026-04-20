@@ -4,8 +4,8 @@
 //! for graceful shutdown, and the durable app-db relay that keeps separate
 //! web and worker processes on the same live-feed stream.
 
-use autumn_web::prelude::*;
 use autumn_web::extract::State;
+use autumn_web::prelude::*;
 use autumn_web::ws::{Message, WebSocket, WithShutdown, WsHandler};
 use tokio_util::sync::CancellationToken;
 
