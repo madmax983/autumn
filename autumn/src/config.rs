@@ -605,6 +605,7 @@ impl AutumnConfig {
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
+        self.cors.validate()?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -1293,6 +1294,27 @@ impl Default for CorsConfig {
             allow_credentials: false,
             max_age_secs: default_cors_max_age(),
         }
+    }
+}
+
+impl CorsConfig {
+    /// Validate CORS configuration for combinations rejected by browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `allow_credentials = true` is combined
+    /// with a wildcard `"*"` origin. Browsers refuse this combination per the
+    /// Fetch spec, and `tower-http`'s `CorsLayer` panics when asked to build
+    /// it, so we fail fast at config load with an actionable message.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.allow_credentials && self.allowed_origins.iter().any(|o| o == "*") {
+            return Err(ConfigError::Validation(
+                "CORS: allow_credentials=true is incompatible with allowed_origins=[\"*\"]; \
+                 list explicit origins instead (browsers reject the wildcard+credentials combo)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2441,6 +2463,40 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.cors.max_age_secs, 3600);
+    }
+
+    #[test]
+    fn cors_validate_rejects_wildcard_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = true;
+
+        let result = config.validate();
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(
+                    msg.contains("allow_credentials") && msg.contains('*'),
+                    "message should mention credentials and wildcard, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cors_validate_accepts_wildcard_without_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_validate_accepts_explicit_origins_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+        config.cors.allow_credentials = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

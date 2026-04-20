@@ -782,7 +782,13 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         let origins: Vec<http::HeaderValue> = cors
             .allowed_origins
             .iter()
-            .filter_map(|o| o.parse().ok())
+            .filter_map(|o| match o.parse() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(origin = %o, error = %e, "CORS: ignoring malformed allowed_origin");
+                    None
+                }
+            })
             .collect();
         CorsLayer::new().allow_origin(origins)
     };
@@ -790,13 +796,25 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
     let methods: Vec<http::Method> = cors
         .allowed_methods
         .iter()
-        .filter_map(|m| m.parse().ok())
+        .filter_map(|m| match m.parse() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(method = %m, error = %e, "CORS: ignoring malformed allowed_method");
+                None
+            }
+        })
         .collect();
 
     let headers: Vec<HeaderName> = cors
         .allowed_headers
         .iter()
-        .filter_map(|h| h.parse().ok())
+        .filter_map(|h| match h.parse() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(header = %h, error = %e, "CORS: ignoring malformed allowed_header");
+                None
+            }
+        })
         .collect();
 
     layer
@@ -988,6 +1006,49 @@ mod tests {
                 .get("access-control-allow-origin")
                 .is_some(),
             "CORS header must be present when origins are configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_cors_middleware_handles_preflight_request() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://example.com".to_owned()];
+
+        let base: axum::Router<AppState> =
+            axum::Router::new().route("/api/widgets", axum::routing::post(|| async { "ok" }));
+        let router = apply_cors_middleware(base, &config).with_state(test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/widgets")
+                    .header("Origin", "https://example.com")
+                    .header("Access-Control-Request-Method", "POST")
+                    .header("Access-Control-Request-Headers", "Content-Type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("access-control-allow-origin").and_then(|v| v.to_str().ok()),
+            Some("https://example.com"),
+            "preflight must echo the allowed origin"
+        );
+        assert!(
+            headers.get("access-control-allow-methods").is_some(),
+            "preflight must advertise allowed methods"
+        );
+        assert!(
+            headers.get("access-control-allow-headers").is_some(),
+            "preflight must advertise allowed headers"
+        );
+        assert!(
+            headers.get("access-control-max-age").is_some(),
+            "preflight must advertise max-age so browsers can cache it"
         );
     }
 
