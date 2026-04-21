@@ -95,6 +95,11 @@ where
 ///
 /// See <https://htmx.org/reference/#response_headers> for more details.
 pub trait HxResponseExt: IntoResponse + Sized {
+    /// Allows you to do a client-side redirect that does not do a full page reload (`HX-Location`).
+    fn hx_location(self, url: &str) -> Response {
+        append_hx_header(self, "hx-location", url)
+    }
+
     /// Pushes a new URL into the history stack (`HX-Push-Url`).
     fn hx_push_url(self, url: &str) -> Response {
         append_hx_header(self, "hx-push-url", url)
@@ -209,6 +214,7 @@ mod tests {
     async fn hx_response_ext_adds_headers() {
         use axum::response::IntoResponse;
         let response = "hello"
+            .hx_location("/some-location")
             .hx_push_url("/new-url")
             .hx_redirect("/login")
             .hx_refresh()
@@ -221,6 +227,7 @@ mod tests {
             .into_response();
 
         let headers = response.headers();
+        assert_eq!(headers.get("hx-location").unwrap(), "/some-location");
         assert_eq!(headers.get("hx-push-url").unwrap(), "/new-url");
         assert_eq!(headers.get("hx-redirect").unwrap(), "/login");
         assert_eq!(headers.get("hx-refresh").unwrap(), "true");
@@ -247,6 +254,7 @@ mod tests {
         let invalid_header_value = "invalid\nvalue";
 
         let response = "hello"
+            .hx_location(invalid_header_value)
             .hx_push_url(invalid_header_value)
             .hx_redirect(invalid_header_value)
             .hx_refresh() // valid by default
@@ -259,6 +267,7 @@ mod tests {
             .into_response();
 
         let headers = response.headers();
+        assert!(headers.get("hx-location").is_none());
         assert!(headers.get("hx-push-url").is_none());
         assert!(headers.get("hx-redirect").is_none());
         // hx_refresh is always set to "true" internally, so it will be present
