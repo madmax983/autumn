@@ -1202,10 +1202,7 @@ fn start_task_scheduler(
 ) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
-        let schedule_desc = match &task_info.schedule {
-            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-            crate::task::Schedule::Cron { expression, .. } => format!("cron {expression}"),
-        };
+        let schedule_desc = task_info.schedule.to_string();
         tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
     }
 
@@ -1216,11 +1213,11 @@ fn start_task_scheduler(
         let state = state.clone();
         let name = task_info.name.clone();
         let handler = task_info.handler;
+        let schedule_desc = task_info.schedule.to_string();
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
                 // Register with the task registry for /actuator/tasks
-                let schedule_desc = format!("every {}s", delay.as_secs());
                 state.task_registry.register(&name, &schedule_desc);
 
                 tokio::spawn(async move {
@@ -1234,7 +1231,6 @@ fn start_task_scheduler(
                 expression,
                 timezone,
             } => {
-                let schedule_desc = format!("cron {expression}");
                 state.task_registry.register(&name, &schedule_desc);
                 cron_tasks.push((name, expression, timezone, handler));
             }
@@ -1710,10 +1706,7 @@ fn format_task_lines(tasks: &[crate::task::TaskInfo]) -> Option<String> {
 
     let mut out = String::new();
     for task in tasks {
-        let schedule = match &task.schedule {
-            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-            crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
-        };
+        let schedule = task.schedule.to_string();
         let _ = write!(out, "\n    {} ({schedule})", task.name);
     }
     Some(out)
@@ -2839,7 +2832,7 @@ mod tests {
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
-        assert!(output.contains("nightly (cron \"0 0 * * *\")"));
+        assert!(output.contains("nightly (cron 0 0 * * *)"));
     }
 
     #[test]
