@@ -1,7 +1,7 @@
-use axum::{body::Body, http::Request, Router, routing::post};
-use tower::ServiceExt;
 use autumn_web::security::config::CsrfConfig;
 use autumn_web::security::csrf::CsrfLayer;
+use axum::{Router, body::Body, http::Request, routing::post};
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn csrf_cookie_has_secure_attribute() {
@@ -25,5 +25,8 @@ async fn csrf_cookie_has_secure_attribute() {
     let set_cookie = res.headers().get("set-cookie").unwrap().to_str().unwrap();
 
     // Cookie should contain "Secure"
-    assert!(set_cookie.contains("Secure"), "Cookie should contain Secure flag after fix");
+    assert!(
+        set_cookie.contains("Secure"),
+        "Cookie should contain Secure flag after fix"
+    );
 }

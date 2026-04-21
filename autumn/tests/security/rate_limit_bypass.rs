@@ -1,9 +1,9 @@
-use axum::{body::Body, http::Request, Router, routing::get};
-use tower::ServiceExt;
-use std::net::SocketAddr;
 use autumn_web::security::config::RateLimitConfig;
 use autumn_web::security::rate_limit::RateLimitLayer;
 use axum::extract::ConnectInfo;
+use axum::{Router, body::Body, http::Request, routing::get};
+use std::net::SocketAddr;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn xff_spoofing_bypasses_rate_limit() {
@@ -22,7 +22,8 @@ async fn xff_spoofing_bypasses_rate_limit() {
         .header("X-Forwarded-For", "10.0.0.1, 192.168.1.100") // attacker spoofs 10.0.0.1, proxy appends 192.168.1.100
         .body(Body::empty())
         .unwrap();
-    req1.extensions_mut().insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
+    req1.extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
     let res1 = app.clone().oneshot(req1).await.unwrap();
     assert_eq!(res1.status(), 200);
@@ -33,7 +34,8 @@ async fn xff_spoofing_bypasses_rate_limit() {
         .header("X-Forwarded-For", "10.0.0.2, 192.168.1.100")
         .body(Body::empty())
         .unwrap();
-    req2.extensions_mut().insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
+    req2.extensions_mut()
+        .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
     let res2 = app.clone().oneshot(req2).await.unwrap();
 
