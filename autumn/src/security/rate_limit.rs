@@ -82,8 +82,7 @@ impl Limiter {
     fn from_config(config: &RateLimitConfig) -> Self {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
-        let burst_header = HeaderValue::from_str(&config.burst.max(1).to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("0"));
+        let burst_header = HeaderValue::from(config.burst.max(1));
         Self {
             refill_per_sec,
             burst,
@@ -296,9 +295,7 @@ where
                     let mut response = Response::new(ResBody::default());
                     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
                     let headers = response.headers_mut();
-                    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                        headers.insert(RETRY_AFTER, v);
-                    }
+                    headers.insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
                     headers.insert(X_RATELIMIT_LIMIT, limiter.burst_header.clone());
                     headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from_static("0"));
                     Ok(response)
@@ -307,9 +304,7 @@ where
                     let mut response = inner.call(req).await?;
                     let headers = response.headers_mut();
                     headers.insert(X_RATELIMIT_LIMIT, limiter.burst_header.clone());
-                    if let Ok(v) = HeaderValue::from_str(&remaining.to_string()) {
-                        headers.insert(X_RATELIMIT_REMAINING, v);
-                    }
+                    headers.insert(X_RATELIMIT_REMAINING, HeaderValue::from(remaining));
                     Ok(response)
                 }
                 None => inner.call(req).await,
