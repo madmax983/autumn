@@ -537,4 +537,30 @@ mod tests {
         let result = std::str::from_utf8(&malformed).expect("utf-8");
         assert!(result.ends_with("</script>"));
     }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_returns_json_and_headers() {
+        let response = super::live_reload_state_handler().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+        // Assert valid JSON string containing expected structure
+        assert!(body_str.contains(r#""version""#));
+        assert!(body_str.contains(r#""kind""#));
+    }
 }
