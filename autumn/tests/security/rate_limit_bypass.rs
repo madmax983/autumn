@@ -22,7 +22,8 @@ async fn xff_spoofing_bypasses_rate_limit() {
         .header("X-Forwarded-For", "10.0.0.1, 192.168.1.100") // attacker spoofs 10.0.0.1, proxy appends 192.168.1.100
         .body(Body::empty())
         .unwrap();
-    request_one.extensions_mut()
+    request_one
+        .extensions_mut()
         .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
     let response_one = app.clone().oneshot(request_one).await.unwrap();
@@ -34,7 +35,8 @@ async fn xff_spoofing_bypasses_rate_limit() {
         .header("X-Forwarded-For", "10.0.0.2, 192.168.1.100")
         .body(Body::empty())
         .unwrap();
-    request_two.extensions_mut()
+    request_two
+        .extensions_mut()
         .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
     let response_two = app.clone().oneshot(request_two).await.unwrap();
