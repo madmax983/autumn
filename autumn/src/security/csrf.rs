@@ -123,6 +123,7 @@ struct CsrfSettings {
     form_field: String,
     safe_methods: Vec<http::Method>,
     exempt_paths: Vec<String>,
+    secure: bool,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -155,6 +156,7 @@ impl CsrfLayer {
                 form_field: config.form_field.clone(),
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
+                secure: config.secure,
             }),
         }
     }
@@ -269,10 +271,14 @@ where
 
         // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {
-            Some(format!(
+            let mut cookie = format!(
                 "{}={}; Path=/; SameSite=Lax; HttpOnly",
                 self.settings.cookie_name, token
-            ))
+            );
+            if self.settings.secure {
+                cookie.push_str("; Secure");
+            }
+            Some(cookie)
         } else {
             None
         };
@@ -291,6 +297,11 @@ where
                     http::header::CONTENT_TYPE,
                     http::HeaderValue::from_static("text/plain; charset=utf-8"),
                 );
+                if let Some(cookie) = set_cookie {
+                    if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
+                        response.headers_mut().append(http::header::SET_COOKIE, val);
+                    }
+                }
                 return Ok(response);
             }
 

@@ -246,6 +246,10 @@ pub struct CsrfConfig {
     /// under `/api/`.
     #[serde(default)]
     pub exempt_paths: Vec<String>,
+
+    /// Whether to set the Secure attribute on the CSRF cookie. Default: `true`.
+    #[serde(default = "default_true")]
+    pub secure: bool,
 }
 
 impl Default for CsrfConfig {
@@ -257,6 +261,7 @@ impl Default for CsrfConfig {
             cookie_name: default_csrf_cookie(),
             safe_methods: default_safe_methods(),
             exempt_paths: Vec::new(),
+            secure: default_true(),
         }
     }
 }
