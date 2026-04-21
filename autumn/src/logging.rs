@@ -57,24 +57,41 @@ fn is_production() -> bool {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    #[should_panic(expected = "failed to initialize logging")]
-    fn init_panics_on_second_call() {
-        let config = LogConfig {
-            level: "debug".to_owned(),
-            format: LogFormat::Pretty,
-        };
-        // We can't easily test the first call without breaking the global state for other tests,
-        // but we can test that calling it when the state is already set (or mock it) panics.
-        // Tracing subscriber actually catches this and returns an error, which our code unwraps into a panic.
+// We cannot call `init()` in standard unit tests because the global subscriber
+    // can only be set once per process and other tests may have already set it.
+    // Instead, we use `rusty_fork_test` to run tests that call `init()` in a separate process.
+    use rusty_fork::rusty_fork_test;
 
-        // Actually, let's just make sure we have a test for `init` that invokes it.
-        // It's tricky to test because of global state. Let's just create a dummy test to satisfy the coverage/mutation tool if possible.
-        // Wait, the mutant is replacing `init` body with `()`.
-        // A test that calls `init` will catch this.
-        init(&config); // Should set it or panic
-        init(&config); // Should definitely panic
+    rusty_fork_test! {
+        #[test]
+        fn init_succeeds_first_time() {
+            let config = LogConfig {
+                level: "debug".to_owned(),
+                format: LogFormat::Pretty,
+            };
+            init(&config);
+        }
+
+        #[test]
+        fn init_panics_on_second_call() {
+            let config = LogConfig {
+                level: "debug".to_owned(),
+                format: LogFormat::Pretty,
+            };
+            init(&config); // Sets it successfully
+
+            let result = std::panic::catch_unwind(|| {
+                init(&config); // Should definitely panic
+            });
+
+            assert!(result.is_err(), "init did not panic on second call");
+
+            let err = result.unwrap_err();
+            let msg = err.downcast_ref::<&str>().map_or_else(|| err.downcast_ref::<String>().map_or("unknown", |s| s.as_str()), |s| *s);
+            assert!(msg.contains("failed to initialize logging"), "Unexpected panic message: {msg}");
+        }
     }
+
 
     use super::*;
     use crate::config::{LogConfig, LogFormat};
