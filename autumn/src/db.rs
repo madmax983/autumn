@@ -321,6 +321,23 @@ mod tests {
 
     // ── Pool creation tests ──────────────────────────────────────
 
+    #[tokio::test]
+    async fn default_pool_provider_respects_url_config() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            ..Default::default()
+        };
+        let provider = DieselDeadpoolPoolProvider::new();
+        let pool = provider
+            .create_pool(&config)
+            .await
+            .expect("default provider should succeed");
+        assert!(
+            pool.is_some(),
+            "default provider should return Some when url is provided"
+        );
+    }
+
     #[test]
     fn create_pool_with_no_url_returns_none() {
         let config = DatabaseConfig::default();
