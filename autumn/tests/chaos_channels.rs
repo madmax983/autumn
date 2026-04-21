@@ -1,3 +1,6 @@
+//!
+//! Chaos tests for channels.
+//!
 #![cfg(feature = "ws")]
 
 use autumn_web::channels::Channels;

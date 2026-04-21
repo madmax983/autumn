@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the route macros.
+//!
 use autumn_web::{get, routes};
 
 #[get("/one")]

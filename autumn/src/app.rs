@@ -698,7 +698,7 @@ impl AppBuilder {
     // `AwsSecretsConfigPlugin` that calls `app.with_config_loader(...)`).
     // See `docs/guides/extensibility.md`.
 
-    /// Install a custom [`ConfigLoader`](crate::config::ConfigLoader),
+    /// Install a custom [`ConfigLoader`],
     /// replacing the default TOML + env loader.
     ///
     /// Useful when your config lives somewhere other than `autumn.toml` —
@@ -720,7 +720,7 @@ impl AppBuilder {
         self
     }
 
-    /// Install a custom [`DatabasePoolProvider`](crate::db::DatabasePoolProvider),
+    /// Install a custom [`DatabasePoolProvider`],
     /// replacing the default `deadpool + diesel-async` pool factory.
     ///
     /// Useful for adding metrics/circuit-breaker wrappers, switching to a

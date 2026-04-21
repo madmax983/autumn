@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the raw router escape hatch.
+//!
 use autumn_web::test::TestApp;
 use autumn_web::{AppState, get, routes};
 

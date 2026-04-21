@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the `AppBuilder`.
+//!
 use autumn_web::{get, routes};
 
 #[get("/test")]

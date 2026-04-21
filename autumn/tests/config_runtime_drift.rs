@@ -1,3 +1,6 @@
+//!
+//! Integration tests for config runtime drift.
+//!
 use autumn_web::config::AutumnConfig;
 use autumn_web::test::TestApp;
 
