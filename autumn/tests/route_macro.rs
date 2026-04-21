@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the single route macro.
+//!
 use autumn_web::extract::Path;
 use autumn_web::{delete, get, post, put};
 

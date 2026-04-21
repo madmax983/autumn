@@ -1,3 +1,6 @@
+//!
+//! Tests for compile failures using trybuild.
+//!
 #[test]
 fn compile_fail_tests() {
     let t = trybuild::TestCases::new();

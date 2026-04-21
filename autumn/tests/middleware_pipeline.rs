@@ -1,3 +1,6 @@
+//!
+//! Integration tests for middleware pipeline.
+//!
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
