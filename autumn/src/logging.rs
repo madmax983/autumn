@@ -57,7 +57,7 @@ fn is_production() -> bool {
 #[cfg(test)]
 mod tests {
 
-// We cannot call `init()` in standard unit tests because the global subscriber
+    // We cannot call `init()` in standard unit tests because the global subscriber
     // can only be set once per process and other tests may have already set it.
     // Instead, we use `rusty_fork_test` to run tests that call `init()` in a separate process.
     use rusty_fork::rusty_fork_test;
@@ -91,7 +91,6 @@ mod tests {
             assert!(msg.contains("failed to initialize logging"), "Unexpected panic message: {msg}");
         }
     }
-
 
     use super::*;
     use crate::config::{LogConfig, LogFormat};
