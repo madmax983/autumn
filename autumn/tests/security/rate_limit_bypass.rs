@@ -16,30 +16,30 @@ async fn xff_spoofing_bypasses_rate_limit() {
             trust_forwarded_headers: true,
         }));
 
-    // Attacker sends request 1 with spoofed XFF
-    let mut req1 = Request::builder()
+    // Attacker sends first request with spoofed XFF
+    let mut request_one = Request::builder()
         .uri("/")
         .header("X-Forwarded-For", "10.0.0.1, 192.168.1.100") // attacker spoofs 10.0.0.1, proxy appends 192.168.1.100
         .body(Body::empty())
         .unwrap();
-    req1.extensions_mut()
+    request_one.extensions_mut()
         .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
-    let res1 = app.clone().oneshot(req1).await.unwrap();
-    assert_eq!(res1.status(), 200);
+    let response_one = app.clone().oneshot(request_one).await.unwrap();
+    assert_eq!(response_one.status(), 200);
 
-    // Attacker sends request 2 with different spoofed XFF, bypassing rate limit
-    let mut req2 = Request::builder()
+    // Attacker sends second request with different spoofed XFF, bypassing rate limit
+    let mut request_two = Request::builder()
         .uri("/")
         .header("X-Forwarded-For", "10.0.0.2, 192.168.1.100")
         .body(Body::empty())
         .unwrap();
-    req2.extensions_mut()
+    request_two.extensions_mut()
         .insert(ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap()));
 
-    let res2 = app.clone().oneshot(req2).await.unwrap();
+    let response_two = app.clone().oneshot(request_two).await.unwrap();
 
     // In a secure implementation, this should be 429 because the real IP is 192.168.1.100
     // The rate limiter now correctly keys on the appended IP from the proxy, completely preventing XFF spoofing bypass.
-    assert_eq!(res2.status(), 429); // 429 proves the fix works
+    assert_eq!(response_two.status(), 429); // 429 proves the fix works
 }
