@@ -1292,15 +1292,12 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    match (handler)(state.clone()).instrument(task_span).await {
-        Ok(()) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Ok(duration_ms)
-        }
-        Err(e) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Err((duration_ms, e.to_string()))
-        }
+    let result = (handler)(state.clone()).instrument(task_span).await;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    match result {
+        Ok(()) => Ok(duration_ms),
+        Err(e) => Err((duration_ms, e.to_string())),
     }
 }
 
