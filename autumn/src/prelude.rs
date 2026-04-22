@@ -51,12 +51,12 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
-/// htmx request extractor.
-#[cfg(feature = "htmx")]
-pub use crate::htmx::HxRequest;
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
+/// htmx request extractor.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// State extractor.

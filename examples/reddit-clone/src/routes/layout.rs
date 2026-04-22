@@ -2,7 +2,7 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
-use autumn_web::{Markup, PreEscaped, html};
+use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, Markup, PreEscaped, html};
 
 /// Render a meta-refresh redirect page (for regular form submissions).
 pub fn redirect_to(url: &str) -> Markup {
@@ -53,16 +53,8 @@ pub fn layout(
                     meta name="csrf-token" content=(token);
                 }
                 link rel="stylesheet" href="/static/css/autumn.css";
-                script src="/static/js/htmx.min.js" {}
-                // Configure htmx to send CSRF token from meta tag on every request
-                script {
-                    (PreEscaped(r#"
-                    document.addEventListener('htmx:configRequest', function(evt) {
-                        var meta = document.querySelector('meta[name="csrf-token"]');
-                        if (meta) evt.detail.headers['X-CSRF-Token'] = meta.content;
-                    });
-                    "#))
-                }
+                script src=(HTMX_JS_PATH) {}
+                script src=(HTMX_CSRF_JS_PATH) {}
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {
                 // Navigation bar
@@ -117,6 +109,25 @@ pub fn layout(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_web::html;
+
+    use super::layout;
+
+    #[test]
+    fn layout_loads_framework_csrf_script_from_same_origin() {
+        let rendered = layout("Test", None, Some("token"), html! {}).into_string();
+
+        assert!(rendered.contains(r#"<script src="/static/js/htmx.min.js"></script>"#));
+        assert!(rendered.contains(r#"<script src="/static/js/autumn-htmx-csrf.js"></script>"#));
+        assert!(
+            !rendered.contains("htmx:configRequest"),
+            "CSRF htmx listener must not be rendered inline under script-src 'self'",
+        );
     }
 }
 

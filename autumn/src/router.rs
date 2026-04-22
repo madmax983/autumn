@@ -21,6 +21,8 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
+pub(crate) const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
+
 /// Errors that can occur during the router build process.
 ///
 /// These errors are typically fatal and represent configuration or routing
@@ -185,11 +187,21 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
+    let user_declared_favicon = route_list
+        .iter()
+        .any(|route| route.path == DEFAULT_FAVICON_PATH && route.method == http::Method::GET)
+        || ctx.scoped_groups.iter().any(|group| {
+            group.routes.iter().any(|route| {
+                route.method == http::Method::GET
+                    && format!("{}{}", group.prefix, route.path) == DEFAULT_FAVICON_PATH
+            })
+        });
+    let mount_default_favicon = !user_declared_favicon;
     let mut router = group_and_mount_routes(route_list);
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
-    router = mount_framework_routes(router, dev_reload_enabled);
+    router = mount_framework_routes(router, dev_reload_enabled, mount_default_favicon);
 
     let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
     router = router_with_probes;
@@ -258,15 +270,39 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     dev_reload_enabled: bool,
+    mount_default_favicon: bool,
 ) -> axum::Router<AppState> {
+    if mount_default_favicon {
+        router = router.route(
+            DEFAULT_FAVICON_PATH,
+            axum::routing::get(default_favicon_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = DEFAULT_FAVICON_PATH,
+            name = "default favicon",
+            "Mounted route"
+        );
+    }
+
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
-        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+        router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+        router = router.route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(htmx_csrf_handler),
+        );
         tracing::debug!(
             method = "GET",
-            path = "/static/js/htmx.min.js",
+            path = crate::htmx::HTMX_JS_PATH,
             name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_CSRF_JS_PATH,
+            name = "htmx csrf helper",
             "Mounted route"
         );
     }
@@ -699,6 +735,9 @@ pub fn try_build_router_with_static_inner(
             }
         },
     ));
+    let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
+        &config.security.headers,
+    ));
 
     Ok(apply_startup_barrier(
         router,
@@ -873,6 +912,26 @@ pub async fn htmx_handler() -> axum::response::Response {
         crate::htmx::HTMX_JS,
     )
         .into_response()
+}
+
+#[cfg(feature = "htmx")]
+pub async fn htmx_csrf_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/javascript"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::htmx::HTMX_CSRF_JS,
+    )
+        .into_response()
+}
+
+pub async fn default_favicon_handler() -> impl IntoResponse {
+    StatusCode::NO_CONTENT
 }
 
 #[cfg(test)]
