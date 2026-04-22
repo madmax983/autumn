@@ -85,3 +85,4 @@ pub use config::{
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;
+#[cfg(test)] mod rate_limit_fuzz;

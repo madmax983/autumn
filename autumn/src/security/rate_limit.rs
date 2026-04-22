@@ -56,7 +56,7 @@ const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-r
 
 /// Shared rate limiter state.
 #[derive(Debug)]
-struct Limiter {
+pub struct Limiter {
     refill_per_sec: f64,
     burst: f64,
     burst_header: HeaderValue,
@@ -73,13 +73,13 @@ struct Bucket {
 
 /// Outcome of consuming one token from a bucket.
 #[derive(Debug, Clone, Copy)]
-enum Decision {
+pub enum Decision {
     Allowed { remaining: u32 },
     Denied { retry_after_secs: u64 },
 }
 
 impl Limiter {
-    fn from_config(config: &RateLimitConfig) -> Self {
+    pub fn from_config(config: &RateLimitConfig) -> Self {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
@@ -94,7 +94,7 @@ impl Limiter {
     }
 
     #[allow(clippy::significant_drop_tightening)] // lock protects the bucket mutation
-    fn decide(&self, key: &str, now: Instant) -> Decision {
+    pub fn decide(&self, key: &str, now: Instant) -> Decision {
         // Scope the lock guard so it's released before we produce the final
         // `Decision`. Keeps the critical section tight.
         let tokens_after = {
