@@ -39,6 +39,15 @@ pub enum Schedule {
     },
 }
 
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FixedDelay(d) => write!(f, "every {}s", d.as_secs()),
+            Self::Cron { expression, .. } => write!(f, "cron {expression}"),
+        }
+    }
+}
+
 /// Parse a human-readable duration string like `"5m"`, `"1h 30m"`.
 ///
 /// Supported units: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
