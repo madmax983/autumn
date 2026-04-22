@@ -155,4 +155,34 @@ mod tests {
         let filter = tracing_subscriber::EnvFilter::try_new("not_a_valid_[directive");
         assert!(filter.is_err());
     }
+
+    #[test]
+    fn test_init_with_telemetry_forwards_to_telemetry_init() {
+        use crate::config::{TelemetryConfig, TelemetryProtocol};
+
+        // We know that if we pass an invalid strict telemetry config without an endpoint,
+        // it will return an error without touching global subscriber state.
+        // Let's use this to verify `init_with_telemetry` forwards correctly.
+        let log_config = LogConfig {
+            level: "debug".to_owned(),
+            format: LogFormat::Pretty,
+        };
+        let telemetry_config = TelemetryConfig {
+            enabled: true,
+            strict: true, // strict mode to ensure we get an error
+            service_name: "test".to_owned(),
+            service_namespace: None,
+            service_version: "1.0.0".to_owned(),
+            environment: "test".to_owned(),
+            otlp_endpoint: None,
+            protocol: TelemetryProtocol::Grpc,
+        };
+
+        // This should return an error because it's enabled but no endpoint is provided (assuming OTLP feature).
+        // If OTLP feature is not enabled, it returns `FeatureDisabled`.
+        // If OTLP feature is enabled, it returns `MissingEndpoint`.
+        // In either case, it's an error.
+        let result = init_with_telemetry(&log_config, &telemetry_config, None);
+        assert!(result.is_err());
+    }
 }
