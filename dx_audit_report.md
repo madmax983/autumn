@@ -98,3 +98,21 @@ To make the developer experience more robust ("idiot-proofing"):
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that standard `curl` requests to missing paths receive `content-length: 0`.
 - Verified that the secondary `__autumn_route_info_...` error is unavoidable due to eager macro resolution, meaning we must accept it as an ergonomic trade-off, but it could be explicitly documented.
+
+# 🗣️ Echo: DX Audit for README Run and Route Handlers
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Did the "README Run": Copied the exact example code from `README.md` into a new project's `main.rs`.
+- Specifically, the example defines `async fn index() -> &'static str { "Welcome to Autumn!" }` and `async fn hello_name(name: autumn_web::extract::Path<String>) -> String`.
+- Tested writing a simpler custom route: `async fn foo() -> i32 { 42 }`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: The `foo` route handler returning `i32` completely fails to compile with a massive, unintelligible error: `the trait bound fn() -> ... {foo}: Handler<_, _> is not satisfied`. The error output references internal Axum routing boundaries: `required by a bound in autumn_web::reexports::axum::routing::get`.
+- This tells me that returning plain primitive types like `i32` doesn't work, even though returning strings works.
+- **Slang Check**: "Handler trait bound not satisfied" is deep Rust/Axum jargon that breaks the illusion of a simple web framework.
+
+## 3. 📢 REPORT - The Complaint
+- "Why can I return a String but not an integer? If I return `42`, the compiler dumps 20 lines of trait bound errors about Axum internals. Simple is better than powerful, and right now simple numbers crash the compiler!"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
