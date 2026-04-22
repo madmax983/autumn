@@ -49,7 +49,7 @@
 //! backend = "memory"
 //! cookie_name = "autumn.sid"
 //! max_age_secs = 86400       # 24 hours
-//! secure = false              # true in prod profile
+//! secure = true               # true by default
 //! same_site = "Lax"
 //!
 //! [session.redis]
@@ -349,7 +349,7 @@ impl SessionStore for ArcSessionStore {
 /// | `cookie_name` | `"autumn.sid"` |
 /// | `max_age_secs` | `86400` (24 hours) |
 /// | `backend` | `memory` |
-/// | `secure` | `false` |
+/// | `secure` | `true` |
 /// | `same_site` | `"Lax"` |
 /// | `http_only` | `true` |
 /// | `path` | `"/"` |
