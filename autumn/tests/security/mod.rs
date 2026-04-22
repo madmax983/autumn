@@ -8,5 +8,4 @@ pub mod csrf_form_bypass;
 pub mod csrf_length_timing;
 pub mod csrf_timing;
 pub mod ctf;
-pub mod rate_limit_bypass;
 pub mod session_fixation;

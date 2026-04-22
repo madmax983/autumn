@@ -193,8 +193,8 @@ impl Limiter {
         if self.trust_forwarded_headers {
             if let Some(value) = req.headers().get("x-forwarded-for") {
                 if let Ok(s) = value.to_str() {
-                    if let Some(last) = s.split(',').next_back() {
-                        let trimmed = last.trim();
+                    if let Some(first) = s.split(',').next() {
+                        let trimmed = first.trim();
                         if !trimmed.is_empty() {
                             return Some(trimmed.to_owned());
                         }
@@ -432,12 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_x_forwarded_for_last_entry_when_trusted() {
+    fn client_ip_prefers_x_forwarded_for_first_entry_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .unwrap();
-        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("5.6.7.8"));
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("1.2.3.4"));
     }
 
     #[test]
@@ -480,11 +480,11 @@ mod tests {
     #[test]
     fn client_ip_empty_xff_falls_through_to_x_real_ip_when_trusted() {
         let req: Request<()> = Request::builder()
-            .header("X-Forwarded-For", "5.5.5.5,  ")
+            .header("X-Forwarded-For", " , 5.5.5.5")
             .header("X-Real-IP", "8.8.8.8")
             .body(())
             .unwrap();
-        // Last XFF entry is empty after trim, so we fall back to X-Real-IP.
+        // First XFF entry is empty after trim, so we fall back to X-Real-IP.
         assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("8.8.8.8"));
     }
 
