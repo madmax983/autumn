@@ -21,7 +21,7 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
-pub(crate) const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
+pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
 
 /// Errors that can occur during the router build process.
 ///

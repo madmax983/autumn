@@ -112,25 +112,6 @@ pub fn layout(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use autumn_web::html;
-
-    use super::layout;
-
-    #[test]
-    fn layout_loads_framework_csrf_script_from_same_origin() {
-        let rendered = layout("Test", None, Some("token"), html! {}).into_string();
-
-        assert!(rendered.contains(r#"<script src="/static/js/htmx.min.js"></script>"#));
-        assert!(rendered.contains(r#"<script src="/static/js/autumn-htmx-csrf.js"></script>"#));
-        assert!(
-            !rendered.contains("htmx:configRequest"),
-            "CSRF htmx listener must not be rendered inline under script-src 'self'",
-        );
-    }
-}
-
 /// Score display with upvote/downvote buttons (htmx-powered).
 pub fn vote_controls(post_id: i64, score: i64) -> Markup {
     html! {
@@ -172,5 +153,24 @@ pub fn time_ago(dt: &chrono::NaiveDateTime) -> String {
         format!("{}m ago", diff.num_minutes())
     } else {
         "just now".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use autumn_web::html;
+
+    use super::layout;
+
+    #[test]
+    fn layout_loads_framework_csrf_script_from_same_origin() {
+        let rendered = layout("Test", None, Some("token"), html! {}).into_string();
+
+        assert!(rendered.contains(r#"<script src="/static/js/htmx.min.js"></script>"#));
+        assert!(rendered.contains(r#"<script src="/static/js/autumn-htmx-csrf.js"></script>"#));
+        assert!(
+            !rendered.contains("htmx:configRequest"),
+            "CSRF htmx listener must not be rendered inline under script-src 'self'",
+        );
     }
 }
