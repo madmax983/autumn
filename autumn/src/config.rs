@@ -2031,6 +2031,70 @@ path = "/healthz"
     }
 
     #[test]
+    fn parse_env_works() {
+        let env = MockEnv::new().with("SOME_NUM", "123");
+        let mut target: u32 = 0;
+        parse_env(&env, "SOME_NUM", &mut target);
+        assert_eq!(target, 123);
+
+        let env_err = MockEnv::new().with("SOME_NUM", "abc");
+        let mut target_err: u32 = 0;
+        parse_env(&env_err, "SOME_NUM", &mut target_err);
+        assert_eq!(target_err, 0); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_option_string_works() {
+        let env = MockEnv::new().with("SOME_OPT", "val");
+        let mut target = None;
+        parse_env_option_string(&env, "SOME_OPT", &mut target);
+        assert_eq!(target, Some("val".to_string()));
+
+        let env_empty = MockEnv::new().with("SOME_OPT", "");
+        let mut target_empty = Some("old".to_string());
+        parse_env_option_string(&env_empty, "SOME_OPT", &mut target_empty);
+        assert_eq!(target_empty, None);
+    }
+
+    #[test]
+    fn parse_env_string_works() {
+        let env = MockEnv::new().with("SOME_STR", "val");
+        let mut target = "old".to_string();
+        parse_env_string(&env, "SOME_STR", &mut target);
+        assert_eq!(target, "val");
+    }
+
+    #[test]
+    fn parse_env_bool_works() {
+        let env = MockEnv::new().with("SOME_BOOL", "true");
+        let mut target = false;
+        parse_env_bool(&env, "SOME_BOOL", &mut target);
+        assert!(target);
+
+        let env2 = MockEnv::new().with("SOME_BOOL", "1");
+        let mut target2 = false;
+        parse_env_bool(&env2, "SOME_BOOL", &mut target2);
+        assert!(target2);
+
+        let env3 = MockEnv::new().with("SOME_BOOL", "0");
+        let mut target3 = true;
+        parse_env_bool(&env3, "SOME_BOOL", &mut target3);
+        assert!(!target3);
+
+        let env_err = MockEnv::new().with("SOME_BOOL", "invalid");
+        let mut target_err = true;
+        parse_env_bool(&env_err, "SOME_BOOL", &mut target_err);
+        assert!(target_err); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_csv_works() {
+        let env = MockEnv::new().with("SOME_CSV", "a, b,c");
+        let mut target = vec![];
+        parse_env_csv(&env, "SOME_CSV", &mut target);
+        assert_eq!(target, vec!["a", "b", "c"]);
+    }
+    #[test]
     fn env_override_server_host() {
         let env = MockEnv::new().with("AUTUMN_SERVER__HOST", "0.0.0.0");
         let mut config = AutumnConfig::default();
