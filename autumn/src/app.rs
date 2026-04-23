@@ -1254,23 +1254,19 @@ fn send_ws_sys_task_msg(
 ) {
     #[cfg(feature = "ws")]
     {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "event".to_string(),
-            serde_json::Value::String(event.to_string()),
-        );
-        map.insert(
-            "task".to_string(),
-            serde_json::Value::String(name.to_string()),
-        );
-        map.insert(
-            "timestamp".to_string(),
-            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-        );
-        for (k, v) in extra {
-            map.insert(k.to_string(), v);
+        // ⚡ Bolt Optimization:
+        // Use serde_json::json! to avoid multiple String allocations (`.to_string()`)
+        // and repetitive `Map::insert` calls for `sys:tasks` websocket messages.
+        let mut msg = serde_json::json!({
+            "event": event,
+            "task": name,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Some(map) = msg.as_object_mut() {
+            for (k, v) in extra {
+                map.insert(k.to_string(), v);
+            }
         }
-        let msg = serde_json::Value::Object(map);
         let _ = state.channels().sender("sys:tasks").send(msg.to_string());
     }
 }
