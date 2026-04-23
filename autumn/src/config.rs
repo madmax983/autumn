@@ -1688,12 +1688,14 @@ mod tests {
         };
         let result = config.validate();
         assert!(result.is_err());
-        let Err(ConfigError::Validation(msg)) = result else {
-            panic!("Expected ConfigError::Validation");
-        };
-        // Ensure we just match the underlying variant correctly
-        // as requested in the review.
-        assert!(msg.contains("must start with postgres:// or postgresql://"));
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                // Ensure we just match the underlying variant correctly
+                // as requested in the review.
+                assert!(msg.contains("must start with postgres:// or postgresql://"));
+            }
+            _ => panic!("Expected ConfigError::Validation"),
+        }
     }
 
     #[test]
@@ -2545,13 +2547,15 @@ path = "/healthz"
         config.cors.allow_credentials = true;
 
         let result = config.validate();
-        let Err(ConfigError::Validation(msg)) = result else {
-            panic!("expected ConfigError::Validation, got {result:?}");
-        };
-        assert!(
-            msg.contains("allow_credentials") && msg.contains('*'),
-            "message should mention credentials and wildcard, got: {msg}"
-        );
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(
+                    msg.contains("allow_credentials") && msg.contains('*'),
+                    "message should mention credentials and wildcard, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
     }
 
     #[test]
