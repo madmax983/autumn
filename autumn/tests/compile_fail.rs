@@ -8,6 +8,7 @@ fn compile_fail_tests() {
     // Route macro failures (always available)
     t.compile_fail("tests/compile-fail/empty_path.rs");
     t.compile_fail("tests/compile-fail/missing_leading_slash.rs");
+    t.compile_fail("tests/compile-fail/path_traversal.rs");
     t.compile_fail("tests/compile-fail/non_async.rs");
     t.compile_fail("tests/compile-fail/non_async_main.rs");
     t.compile_fail("tests/compile-fail/non_function.rs");

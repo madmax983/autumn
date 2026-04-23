@@ -1,0 +1,5 @@
+error: Route path must not contain directory traversal sequences (..)
+ --> tests/compile-fail/path_traversal.rs:3:7
+  |
+3 | #[get("/../../../etc/passwd")]
+  |       ^^^^^^^^^^^^^^^^^^^^^^

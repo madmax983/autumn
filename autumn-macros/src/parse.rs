@@ -23,6 +23,12 @@ pub fn parse_route_path(attr: TokenStream) -> Result<LitStr, TokenStream> {
         .to_compile_error());
     }
 
+    if path.value().contains("..") {
+        return Err(
+            syn::Error::new(path.span(), "Route path must not contain directory traversal sequences (..)").to_compile_error(),
+        );
+    }
+
     Ok(path)
 }
 
