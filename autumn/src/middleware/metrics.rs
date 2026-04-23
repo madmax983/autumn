@@ -137,8 +137,37 @@ impl MetricsCollector {
         #[allow(clippy::cast_possible_truncation)]
         let shard_idx = (std::hash::Hasher::finish(&hasher) % (SHARD_COUNT as u64)) as usize;
 
-        let key = format!("{method} {route}");
-        {
+        // ⚡ Bolt Optimization:
+        // Format the key into a stack-allocated buffer to avoid a heap allocation
+        // on every request. Fall back to allocating a String only if the route
+        // is exceptionally long (which is rare) or if it's a new route missing
+        // from the metrics map.
+        let mut buf = [0u8; 256];
+        let key_str = {
+            let mut cursor = &mut buf[..];
+            if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
+                let len = 256 - cursor.len();
+                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+            } else {
+                ""
+            }
+        };
+
+        let mut is_new = false;
+        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+            if let Some(entry) = shard.by_route.get_mut(key_str) {
+                entry.count += 1;
+                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+                    entry.latencies_ms.pop_front();
+                }
+                entry.latencies_ms.push_back(latency_ms);
+            } else {
+                is_new = true;
+            }
+        }
+
+        if is_new {
+            let key = format!("{method} {route}");
             if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
                 let entry = shard.by_route.entry(key).or_default();
                 entry.count += 1;
