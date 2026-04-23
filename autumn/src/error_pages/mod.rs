@@ -1,3 +1,4 @@
+#![allow(clippy::redundant_pub_crate)]
 //! Styled error pages and dev-mode error badge overlay.
 //!
 //! Autumn provides default HTML error pages for common HTTP error codes

@@ -1,5 +1,5 @@
 use autumn_web::security::CsrfLayer;
-use autumn_web::security::config::CsrfConfig;
+use autumn_web::security::CsrfConfig;
 use axum::http::Request;
 use axum::{Router, body::Body, routing::post};
 use tower::ServiceExt;

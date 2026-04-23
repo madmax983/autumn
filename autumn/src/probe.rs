@@ -1,3 +1,4 @@
+#![allow(clippy::redundant_pub_crate)]
 //! Liveness, readiness, and startup probes.
 //!
 //! Autumn exposes explicit cloud-native probe contracts:
