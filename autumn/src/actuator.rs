@@ -1110,7 +1110,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
 ///
 /// In dev mode (or when `actuator.sensitive = true`), all endpoints are
 /// exposed. In prod mode, only health, info, and metrics are available.
-    pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
+pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
     sensitive: bool,
 ) -> axum::Router<S> {
     actuator_router_with_prefix("/actuator", sensitive)
