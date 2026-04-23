@@ -66,6 +66,10 @@ pub use axum::extract::State;
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
 
+// ── Pagination ──────────────────────────────────────────────────
+/// Pagination primitives — extractor and response wrapper.
+pub use crate::pagination::{Page, PageRequest};
+
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
