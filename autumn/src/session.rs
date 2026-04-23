@@ -395,6 +395,7 @@ pub struct SessionConfig {
 /// Supported session storage backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SessionBackend {
     /// In-memory storage. Resets on application restart.
     #[default]
@@ -457,6 +458,7 @@ pub enum SessionBackendPlan {
 
 /// Errors that can occur when resolving the session backend configuration.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionBackendConfigError {
     /// Redis was selected, but no URL was provided.
     #[error("session.backend=redis requires session.redis.url")]

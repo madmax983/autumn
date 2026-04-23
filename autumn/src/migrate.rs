@@ -45,6 +45,7 @@ pub struct MigrationResult {
 
 /// Error type for migration operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum MigrationError {
     /// Failed to connect to the database.
     #[error("failed to connect to database: {0}")]
