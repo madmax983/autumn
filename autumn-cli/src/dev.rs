@@ -1052,6 +1052,26 @@ fn find_binary(package: Option<&str>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn with_cwd<R>(cwd: &Path, f: impl FnOnce() -> R) -> R {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("cwd mutex poisoned");
+
+        let previous = std::env::current_dir().expect("current cwd");
+        std::env::set_current_dir(cwd).expect("set cwd");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
 
     // ── is_relevant_change tests ───────────────────────────────────
 
@@ -1798,10 +1818,7 @@ watch_dirs = ["./views", "locales", "src"]
         )
         .expect("write config");
 
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(dir.path()).expect("set cwd");
-        let dirs = resolve_watch_dirs();
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        let dirs = with_cwd(dir.path(), resolve_watch_dirs);
 
         for default in WATCH_DIRS {
             assert!(
@@ -1932,16 +1949,13 @@ watch_dirs = ["./views", "locales", "src"]
         std::fs::create_dir_all(&repo).expect("create repo dir");
         std::fs::create_dir_all(shared.join("nested")).expect("create shared dir");
 
-        let cwd = std::env::current_dir().expect("cwd");
-        std::env::set_current_dir(&repo).expect("set cwd");
-
-        let file = shared.join("nested").join("data.json");
-        assert!(
-            path_contains_dir(&file, "../shared"),
-            "absolute event path under ../shared should match custom watch dir"
-        );
-
-        std::env::set_current_dir(cwd).expect("restore cwd");
+        with_cwd(&repo, || {
+            let file = shared.join("nested").join("data.json");
+            assert!(
+                path_contains_dir(&file, "../shared"),
+                "absolute event path under ../shared should match custom watch dir"
+            );
+        });
     }
 
     #[test]
