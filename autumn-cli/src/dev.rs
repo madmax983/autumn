@@ -689,6 +689,22 @@ fn path_contains_dir(path: &Path, dir: &str) -> bool {
         return true;
     }
 
+    if dir.is_absolute() {
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+
+        if path_starts_with_watch_dir(path, &canonical_dir) {
+            return true;
+        }
+
+        if path.is_absolute() {
+            if let Ok(canonical_path) = std::fs::canonicalize(path) {
+                if path_starts_with_watch_dir(&canonical_path, &canonical_dir) {
+                    return true;
+                }
+            }
+        }
+    }
+
     // notify can emit absolute paths on some backends/platforms. Anchor custom
     // matching to the workspace-relative watched prefix when possible.
     if path.is_absolute() {
@@ -1901,6 +1917,23 @@ watch_dirs = ["./views", "locales", "src"]
         );
 
         std::env::set_current_dir(cwd).expect("restore cwd");
+    }
+
+    #[test]
+    fn path_contains_dir_matches_canonical_event_for_noncanonical_absolute_watch_dir() {
+        let root = tempfile::tempdir().expect("temp root");
+        let watch_root = root.path().join("shared");
+        std::fs::create_dir_all(watch_root.join("nested")).expect("create shared dir");
+
+        let noncanonical_watch_dir = watch_root.join("..").join("shared");
+        let file = watch_root.join("nested").join("data.json");
+        std::fs::write(&file, "{}").expect("write file");
+        let canonical_file = std::fs::canonicalize(&file).expect("canonicalize file");
+
+        assert!(path_contains_dir(
+            &canonical_file,
+            &noncanonical_watch_dir.to_string_lossy()
+        ));
     }
 
     #[test]
