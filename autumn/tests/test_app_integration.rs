@@ -52,11 +52,13 @@ async fn delete_user(axum::extract::Path(_id): axum::extract::Path<i64>) -> Stat
 }
 
 #[get("/primitive/int")]
+#[allow(clippy::unused_async)]
 async fn primitive_int() -> i32 {
     42
 }
 
 #[get("/primitive/bool")]
+#[allow(clippy::unused_async)]
 async fn primitive_bool() -> bool {
     true
 }
