@@ -60,6 +60,17 @@ pub enum RouterBuildError {
         /// The path that both fields pointed at.
         path: String,
     },
+    /// An `OpenAPI` mount path overlaps with an existing `GET` handler,
+    /// which would panic at `axum::Router::merge` time.
+    #[error(
+        "OpenAPI {field} path {path:?} collides with an existing GET route; choose a different `OpenApiConfig::{field}`"
+    )]
+    OpenApiPathCollision {
+        /// Which config field carried the colliding path.
+        field: &'static str,
+        /// The colliding path.
+        path: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -211,6 +222,16 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
+    // Fail-fast if an OpenAPI mount path collides with a user or
+    // framework GET route — axum panics on overlapping method routes,
+    // so surface this as a recoverable error before we start merging.
+    reject_openapi_path_collisions(
+        ctx.openapi.as_ref(),
+        &route_list,
+        &ctx.scoped_groups,
+        config,
+    )?;
+
     // Build the OpenAPI spec BEFORE moving the routes into axum, because
     // group_and_mount_routes consumes the Route list.
     let openapi_router =
@@ -413,6 +434,72 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
             field,
             value: value.to_owned(),
         });
+    }
+    Ok(())
+}
+
+/// Reject `OpenAPI` mount paths that overlap with an existing `GET`
+/// handler.
+///
+/// `axum::Router::merge` panics when the merged routers have method
+/// handlers on the same path (e.g. two `GET` handlers on
+/// `/v3/api-docs`). We surface that as a recoverable
+/// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
+/// produces an actionable error instead of a crash on startup.
+///
+/// We check against user routes (both top-level and scoped groups)
+/// plus the framework's probe/actuator/htmx endpoints that will be
+/// mounted before the `OpenAPI` sub-router merges in.
+fn reject_openapi_path_collisions(
+    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) -> Result<(), RouterBuildError> {
+    let Some(openapi) = openapi_config else {
+        return Ok(());
+    };
+
+    // Gather every path a GET will already own by the time we merge.
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for route in route_list {
+        if route.method == http::Method::GET {
+            claimed.insert(route.path.to_owned());
+        }
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            if route.method == http::Method::GET {
+                claimed.insert(format!("{}{}", group.prefix, route.path));
+            }
+        }
+    }
+    // Framework-mounted GETs.
+    claimed.insert(config.health.path.clone());
+    claimed.insert(config.health.live_path.clone());
+    claimed.insert(config.health.ready_path.clone());
+    claimed.insert(config.health.startup_path.clone());
+    for path in
+        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, config.actuator.sensitive)
+    {
+        claimed.insert(path);
+    }
+    #[cfg(feature = "htmx")]
+    claimed.insert("/static/js/htmx.min.js".to_owned());
+
+    if claimed.contains(&openapi.openapi_json_path) {
+        return Err(RouterBuildError::OpenApiPathCollision {
+            field: "openapi_json_path",
+            path: openapi.openapi_json_path.clone(),
+        });
+    }
+    if let Some(path) = &openapi.swagger_ui_path {
+        if claimed.contains(path) {
+            return Err(RouterBuildError::OpenApiPathCollision {
+                field: "swagger_ui_path",
+                path: path.clone(),
+            });
+        }
     }
     Ok(())
 }
@@ -1528,6 +1615,75 @@ mod tests {
         assert!(matches!(
             err,
             RouterBuildError::DuplicateOpenApiPath { ref path } if path == "/docs"
+        ));
+    }
+
+    async fn collision_test_handler() -> &'static str {
+        "user"
+    }
+
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_colliding_with_user_route() {
+        let mut config = AutumnConfig::default();
+        config.actuator.prefix = "/ops".to_owned();
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/my-api-docs");
+
+        let user_route = Route {
+            method: http::Method::GET,
+            path: "/my-api-docs",
+            handler: axum::routing::get(collision_test_handler),
+            name: "collides",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/my-api-docs",
+                operation_id: "collides",
+                success_status: 200,
+                ..Default::default()
+            },
+        };
+
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+        };
+        let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
+            .expect_err("user-owned path should prevent OpenAPI mount");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision { field: "openapi_json_path", ref path } if path == "/my-api-docs"
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_colliding_with_framework_route() {
+        let config = AutumnConfig::default(); // /actuator/health is a GET by default
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/actuator/health");
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("framework-owned path should prevent OpenAPI mount");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ..
+            }
         ));
     }
 }

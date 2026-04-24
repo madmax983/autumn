@@ -539,12 +539,17 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
             "items": schema_value_for(items),
         }),
         SchemaKind::Nullable(inner) => {
-            // OpenAPI 3.0: apply the `nullable: true` keyword alongside
-            // the inner schema body. For `$ref` we have to wrap in an
-            // `anyOf` since a bare `$ref` can't carry siblings.
+            // OpenAPI 3.0 has no `type: "null"` (that's a 3.1 feature),
+            // so we use the 3.0-compatible patterns:
+            //   * For a `$ref`, wrap in `allOf` alongside
+            //     `nullable: true` — bare `$ref`s can't carry siblings,
+            //     and `allOf` is the standard workaround.
+            //   * For every other schema body, inject `nullable: true`
+            //     directly onto the existing object.
             if inner.kind == SchemaKind::Ref {
                 serde_json::json!({
-                    "anyOf": [schema_value_for(inner), { "type": "null" }],
+                    "nullable": true,
+                    "allOf": [schema_value_for(inner)],
                 })
             } else {
                 let mut v = schema_value_for(inner);
@@ -742,6 +747,49 @@ mod tests {
         let op = spec.paths["/users/{id}"].get.as_ref().unwrap();
         let media = op.responses["200"].content.get("application/json").unwrap();
         assert_eq!(media.schema, serde_json::json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn nullable_ref_uses_openapi_3_0_shape() {
+        // OpenAPI 3.0 has no `type: "null"`, so nullable refs must use
+        // `nullable: true` + `allOf` instead. Wrapping in `anyOf` with
+        // a `type: "null"` member produces a spec that Swagger and
+        // OpenAPI validators reject.
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "User",
+            kind: SchemaKind::Ref,
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert_eq!(value["nullable"], true);
+        assert_eq!(
+            value["allOf"][0]["$ref"], "#/components/schemas/User",
+            "nullable refs must wrap in allOf so `$ref` can carry siblings"
+        );
+        assert!(value.get("anyOf").is_none(), "must not emit anyOf/null");
+        assert!(
+            value.get("type").is_none()
+                || value.get("type").unwrap() != &serde_json::Value::String("null".into()),
+            "must not emit type: null"
+        );
+    }
+
+    #[test]
+    fn nullable_primitive_inlines_nullable_flag() {
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "integer",
+            kind: SchemaKind::Primitive("integer"),
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert_eq!(value["type"], "integer");
+        assert_eq!(value["nullable"], true);
     }
 
     #[test]

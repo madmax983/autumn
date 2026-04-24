@@ -491,6 +491,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         path: #api_path,
                         operation_id: ::core::stringify!(#list_fn),
                         success_status: 200,
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: "array",
+                                kind: ::autumn_web::openapi::SchemaKind::Array(
+                                    &::autumn_web::openapi::SchemaEntry {
+                                        name: ::core::stringify!(#model_name),
+                                        kind: ::autumn_web::openapi::SchemaKind::Ref,
+                                    }
+                                ),
+                            }
+                        ),
                         ..::core::default::Default::default()
                     },
                 }
@@ -518,6 +529,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         operation_id: ::core::stringify!(#get_fn),
                         path_params: &["id"],
                         success_status: 200,
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: ::core::stringify!(#model_name),
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
                         ..::core::default::Default::default()
                     },
                 }
@@ -543,6 +560,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         path: #api_path,
                         operation_id: ::core::stringify!(#create_fn),
                         success_status: 201,
+                        request_body: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: ::core::stringify!(#new_name),
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: ::core::stringify!(#model_name),
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
                         ..::core::default::Default::default()
                     },
                 }
@@ -570,6 +599,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         operation_id: ::core::stringify!(#update_fn),
                         path_params: &["id"],
                         success_status: 200,
+                        request_body: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: ::core::stringify!(#update_name),
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
+                        response: ::core::option::Option::Some(
+                            ::autumn_web::openapi::SchemaEntry {
+                                name: ::core::stringify!(#model_name),
+                                kind: ::autumn_web::openapi::SchemaKind::Ref,
+                            }
+                        ),
                         ..::core::default::Default::default()
                     },
                 }
