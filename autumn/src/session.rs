@@ -49,7 +49,7 @@
 //! backend = "memory"
 //! cookie_name = "autumn.sid"
 //! max_age_secs = 86400       # 24 hours
-//! secure = false              # true in prod profile
+//! secure = true               # true by default
 //! same_site = "Lax"
 //!
 //! [session.redis]
@@ -349,7 +349,7 @@ impl SessionStore for ArcSessionStore {
 /// | `cookie_name` | `"autumn.sid"` |
 /// | `max_age_secs` | `86400` (24 hours) |
 /// | `backend` | `memory` |
-/// | `secure` | `false` |
+/// | `secure` | `true` |
 /// | `same_site` | `"Lax"` |
 /// | `http_only` | `true` |
 /// | `path` | `"/"` |
@@ -395,6 +395,7 @@ pub struct SessionConfig {
 /// Supported session storage backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum SessionBackend {
     /// In-memory storage. Resets on application restart.
     #[default]
@@ -457,6 +458,7 @@ pub enum SessionBackendPlan {
 
 /// Errors that can occur when resolving the session backend configuration.
 #[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionBackendConfigError {
     /// Redis was selected, but no URL was provided.
     #[error("session.backend=redis requires session.redis.url")]

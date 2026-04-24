@@ -27,7 +27,7 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
+    api_doc, cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
     static_routes, tasks,
 };
 
@@ -63,8 +63,14 @@ pub use crate::sse::{Event, Sse};
 pub use axum::extract::State;
 
 // ── Error handling ───────────────────────────────────────────────
+/// Structured audit event types.
+pub use crate::audit::{AuditEvent, AuditStatus};
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
+
+// ── Pagination ──────────────────────────────────────────────────
+/// Pagination primitives — extractor and response wrapper.
+pub use crate::pagination::{Page, PageRequest};
 
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.

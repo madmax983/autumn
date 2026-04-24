@@ -46,6 +46,7 @@
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 
 //! - [`middleware`] -- Built-in middleware (request IDs).
+//! - [`pagination`] -- Standardized `page`/`size` extractor and response wrapper.
 //! - [`prelude`] -- Glob import for the most common types.
 
 //!
@@ -67,6 +68,7 @@ extern crate self as autumn_web;
 
 pub mod actuator;
 pub mod app;
+pub mod audit;
 pub mod auth;
 pub mod cache;
 #[cfg(feature = "ws")]
@@ -103,6 +105,8 @@ pub mod flash;
 pub(crate) mod htmx;
 pub(crate) mod logging;
 pub mod middleware;
+pub mod openapi;
+pub mod pagination;
 pub mod prelude;
 pub(crate) mod route;
 pub use route::Route;
@@ -156,6 +160,18 @@ pub use db::Db;
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
 
+/// Paginated list response wrapper with navigation metadata.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::Page;
+
+/// Pagination parameters extracted from the query string.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::PageRequest;
+
 /// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
 /// and validates via `validator::Validate` before the handler runs.
 /// Returns 422 with structured error details on validation failure.
@@ -193,6 +209,24 @@ pub use validation::ValidateExt;
 /// }
 /// ```
 pub use autumn_macros::delete;
+
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
+///
+/// See the [`openapi`] module and the [`autumn_macros::api_doc`]
+/// attribute docs for details on the supported keys.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// #[api_doc(summary = "Fetch a user by id", tag = "users")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+/// ```
+pub use autumn_macros::api_doc;
 
 /// Annotate an async function as a `GET` route handler.
 ///

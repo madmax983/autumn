@@ -386,20 +386,20 @@ fn warn_profile_typo(profile: &str) {
 /// Levenshtein edit distance between two strings.
 ///
 /// ⚡ Bolt Optimization:
-/// Avoids allocating two `Vec<char>` buffers by iterating directly over `Chars`.
-/// While this re-evaluates UTF-8 boundaries in the inner loop, avoiding the heap
-/// allocations is typically faster for the short strings compared here (e.g., config profile typos).
+/// Reduces memory allocations by using a single `Vec` instead of two and
+/// iterating directly over `Chars` to avoid `Vec<char>` allocations.
 fn levenshtein(a: &str, b: &str) -> usize {
     let n = b.chars().count();
-    let mut prev = (0..=n).collect::<Vec<_>>();
-    let mut curr = vec![0; n + 1];
+    let mut prev: Vec<usize> = (0..=n).collect();
     for (i, a_ch) in a.chars().enumerate() {
-        curr[0] = i + 1;
+        let mut prev_diag = prev[0];
+        prev[0] = i + 1;
         for (j, b_ch) in b.chars().enumerate() {
+            let old_prev = prev[j + 1];
             let cost = usize::from(a_ch != b_ch);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            prev[j + 1] = (prev[j + 1] + 1).min(prev[j] + 1).min(prev_diag + cost);
+            prev_diag = old_prev;
         }
-        std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
 }
@@ -420,6 +420,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// assert!(result.is_ok());
 /// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The config file exists but could not be read.
     #[error("failed to read autumn.toml: {0}")]
@@ -1111,6 +1112,7 @@ pub struct LogConfig {
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
     #[default]
@@ -1162,6 +1164,7 @@ pub struct TelemetryConfig {
 
 /// OTLP transport protocol selection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TelemetryProtocol {
     /// OTLP over gRPC.
     #[serde(alias = "grpc", alias = "GRPC")]
@@ -2030,6 +2033,70 @@ path = "/healthz"
         assert_eq!(config.server.port, 8080);
     }
 
+    #[test]
+    fn parse_env_works() {
+        let env = MockEnv::new().with("SOME_NUM", "123");
+        let mut target: u32 = 0;
+        parse_env(&env, "SOME_NUM", &mut target);
+        assert_eq!(target, 123);
+
+        let env_err = MockEnv::new().with("SOME_NUM", "abc");
+        let mut target_err: u32 = 0;
+        parse_env(&env_err, "SOME_NUM", &mut target_err);
+        assert_eq!(target_err, 0); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_option_string_works() {
+        let env = MockEnv::new().with("SOME_OPT", "val");
+        let mut target = None;
+        parse_env_option_string(&env, "SOME_OPT", &mut target);
+        assert_eq!(target, Some("val".to_string()));
+
+        let env_empty = MockEnv::new().with("SOME_OPT", "");
+        let mut target_empty = Some("old".to_string());
+        parse_env_option_string(&env_empty, "SOME_OPT", &mut target_empty);
+        assert_eq!(target_empty, None);
+    }
+
+    #[test]
+    fn parse_env_string_works() {
+        let env = MockEnv::new().with("SOME_STR", "val");
+        let mut target = "old".to_string();
+        parse_env_string(&env, "SOME_STR", &mut target);
+        assert_eq!(target, "val");
+    }
+
+    #[test]
+    fn parse_env_bool_works() {
+        let env = MockEnv::new().with("SOME_BOOL", "true");
+        let mut target = false;
+        parse_env_bool(&env, "SOME_BOOL", &mut target);
+        assert!(target);
+
+        let env2 = MockEnv::new().with("SOME_BOOL", "1");
+        let mut target2 = false;
+        parse_env_bool(&env2, "SOME_BOOL", &mut target2);
+        assert!(target2);
+
+        let env3 = MockEnv::new().with("SOME_BOOL", "0");
+        let mut target3 = true;
+        parse_env_bool(&env3, "SOME_BOOL", &mut target3);
+        assert!(!target3);
+
+        let env_err = MockEnv::new().with("SOME_BOOL", "invalid");
+        let mut target_err = true;
+        parse_env_bool(&env_err, "SOME_BOOL", &mut target_err);
+        assert!(target_err); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_csv_works() {
+        let env = MockEnv::new().with("SOME_CSV", "a, b,c");
+        let mut target = vec![];
+        parse_env_csv(&env, "SOME_CSV", &mut target);
+        assert_eq!(target, vec!["a", "b", "c"]);
+    }
     #[test]
     fn env_override_server_host() {
         let env = MockEnv::new().with("AUTUMN_SERVER__HOST", "0.0.0.0");

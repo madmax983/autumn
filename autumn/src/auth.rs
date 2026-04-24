@@ -1082,4 +1082,27 @@ mod tests {
         assert_eq!(config.bcrypt_cost, DEFAULT_BCRYPT_COST);
         assert_eq!(config.session_key, "user_id");
     }
+
+    #[tokio::test]
+    async fn test_hash_password() {
+        let password = "my_super_secret_password";
+
+        // Test hashing
+        let hash = super::hash_password(password)
+            .await
+            .expect("Failed to hash password");
+        assert!(hash.starts_with("$2b$"));
+
+        // Test verification with correct password
+        let is_valid = super::verify_password(password, &hash)
+            .await
+            .expect("Failed to verify password");
+        assert!(is_valid, "Password should be verified successfully");
+
+        // Test verification with incorrect password
+        let is_invalid = super::verify_password("wrong_password", &hash)
+            .await
+            .expect("Failed to verify wrong password");
+        assert!(!is_invalid, "Wrong password should not be verified");
+    }
 }
