@@ -45,6 +45,18 @@ autumn dev
 # cargo run
 ```
 
+`autumn dev` watches these directories by default: `src/`, `static/`,
+`templates/`, and `migrations/`.
+
+You can add extra watch paths in `autumn.toml`:
+
+```toml
+[dev]
+watch_dirs = ["views", "locales"]
+```
+
+Custom entries are additive: the four default directories are still watched.
+
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
@@ -128,4 +140,3 @@ Autumn can still run without a database if you omit the `[database]` section.
 ## License
 
 MIT OR Apache-2.0
-

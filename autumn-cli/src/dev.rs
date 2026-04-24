@@ -38,7 +38,7 @@ const WATCH_FILES: &[&str] = &[
     "tailwind.config.js",
 ];
 
-/// Directories to watch recursively.
+/// Default directories watched recursively by `autumn dev`.
 const WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
 
 const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
@@ -174,6 +174,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
+    let watch_dirs = resolve_watch_dirs();
     // Initial build
     if !cargo_build(package) {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
@@ -194,7 +195,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
     let watcher = debouncer.watcher();
 
     // Watch relevant directories
-    for dir in WATCH_DIRS {
+    for dir in &watch_dirs {
         let path = Path::new(dir);
         if path.exists() {
             if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
@@ -219,7 +220,14 @@ pub fn run(package: Option<&str>, show_config: bool) {
             break;
         }
 
-        if !process_events(&rx, package, &mut child, reload_state.as_mut(), show_config) {
+        if !process_events(
+            &rx,
+            package,
+            &mut child,
+            reload_state.as_mut(),
+            show_config,
+            &watch_dirs,
+        ) {
             break;
         }
     }
@@ -235,15 +243,16 @@ fn process_events(
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
     show_config: bool,
+    watch_dirs: &[String],
 ) -> bool {
     match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
         Ok(Ok(events)) => {
-            let plan = plan_changes(&events);
+            let plan = plan_changes_with_watch_dirs(&events, watch_dirs);
             if plan.is_empty() {
                 return true;
             }
 
-            let changed = collect_relevant_changes(&events);
+            let changed = collect_relevant_changes_with_watch_dirs(&events, watch_dirs);
             if changed.is_empty() {
                 return true;
             }
@@ -322,18 +331,40 @@ fn execute_plan(
 /// Collect display paths for all relevant file changes from a debounced batch.
 ///
 /// Returns an empty vec if no changes are relevant.
+#[cfg(test)]
 fn collect_relevant_changes(events: &[notify_debouncer_mini::DebouncedEvent]) -> Vec<String> {
+    let watch_dirs = default_watch_dirs();
+    collect_relevant_changes_with_watch_dirs(events, &watch_dirs)
+}
+
+fn collect_relevant_changes_with_watch_dirs(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    watch_dirs: &[String],
+) -> Vec<String> {
     events
         .iter()
-        .filter(|e| is_relevant_change(&e.path, e.kind))
+        .filter(|e| is_relevant_change_with_watch_dirs(&e.path, e.kind, watch_dirs))
         .map(|e| e.path.display().to_string())
         .collect()
 }
 
+#[cfg(test)]
 fn plan_changes(events: &[notify_debouncer_mini::DebouncedEvent]) -> ChangePlan {
+    let watch_dirs = default_watch_dirs();
+    plan_changes_with_watch_dirs(events, &watch_dirs)
+}
+
+fn plan_changes_with_watch_dirs(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    watch_dirs: &[String],
+) -> ChangePlan {
     let mut plan = ChangePlan::default();
     for event in events {
-        plan.register(classify_change(&event.path, event.kind));
+        plan.register(classify_change_with_watch_dirs(
+            &event.path,
+            event.kind,
+            watch_dirs,
+        ));
     }
     plan.finalize()
 }
@@ -449,11 +480,31 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
+#[cfg(test)]
 fn is_relevant_change(path: &Path, kind: DebouncedEventKind) -> bool {
-    classify_change(path, kind) != ChangeEffect::Ignore
+    let watch_dirs = default_watch_dirs();
+    is_relevant_change_with_watch_dirs(path, kind, &watch_dirs)
 }
 
+#[cfg(test)]
 fn classify_change(path: &Path, kind: DebouncedEventKind) -> ChangeEffect {
+    let watch_dirs = default_watch_dirs();
+    classify_change_with_watch_dirs(path, kind, &watch_dirs)
+}
+
+fn is_relevant_change_with_watch_dirs(
+    path: &Path,
+    kind: DebouncedEventKind,
+    watch_dirs: &[String],
+) -> bool {
+    classify_change_with_watch_dirs(path, kind, watch_dirs) != ChangeEffect::Ignore
+}
+
+fn classify_change_with_watch_dirs(
+    path: &Path,
+    kind: DebouncedEventKind,
+    watch_dirs: &[String],
+) -> ChangeEffect {
     if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
         return ChangeEffect::Ignore;
     }
@@ -500,6 +551,15 @@ fn classify_change(path: &Path, kind: DebouncedEventKind) -> ChangeEffect {
         return ChangeEffect::BrowserReloadOnly;
     }
 
+    for dir in watch_dirs {
+        if WATCH_DIRS.contains(&dir.as_str()) {
+            continue;
+        }
+        if path_contains_dir(path, dir) {
+            return ChangeEffect::BuildRestart;
+        }
+    }
+
     ChangeEffect::Ignore
 }
 
@@ -535,6 +595,71 @@ fn has_component(path: &Path, target: &str) -> bool {
             std::path::Component::Normal(name) if name == std::ffi::OsStr::new(target)
         )
     })
+}
+
+fn path_contains_dir(path: &Path, dir: &str) -> bool {
+    let dir = Path::new(dir);
+    if dir.components().count() == 1 {
+        return has_component(path, dir.as_os_str().to_str().unwrap_or_default());
+    }
+
+    let path_components: Vec<_> = path.components().collect();
+    let dir_components: Vec<_> = dir.components().collect();
+    if dir_components.is_empty() || path_components.len() < dir_components.len() {
+        return false;
+    }
+
+    path_components
+        .windows(dir_components.len())
+        .any(|window| window == dir_components.as_slice())
+}
+
+fn default_watch_dirs() -> Vec<String> {
+    WATCH_DIRS.iter().map(|dir| (*dir).to_owned()).collect()
+}
+
+fn resolve_watch_dirs() -> Vec<String> {
+    let mut dirs = default_watch_dirs();
+    let custom = load_custom_watch_dirs(Path::new("autumn.toml"));
+    for dir in custom {
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+fn load_custom_watch_dirs(config_path: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+
+    let parsed: toml::Value = match toml::from_str(&contents) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "  Warning: could not parse {} for [dev].watch_dirs: {error}",
+                config_path.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let Some(watch_dirs) = parsed
+        .get("dev")
+        .and_then(|dev| dev.get("watch_dirs"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    watch_dirs
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn is_profile_config_file(file_name: &str) -> bool {
@@ -962,6 +1087,25 @@ mod tests {
     }
 
     #[test]
+    fn custom_watch_dir_change_triggers_build_restart() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            "views".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new("views/home/index.html"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::BuildRestart
+        );
+    }
+
+    #[test]
     fn ignores_target_directory() {
         assert!(!is_relevant_change(
             Path::new("target/debug/build/main.rs"),
@@ -1378,6 +1522,37 @@ mod tests {
     }
 
     #[test]
+    fn resolve_watch_dirs_keeps_defaults_and_adds_custom() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            r#"[dev]
+watch_dirs = ["views", "locales", "src"]
+"#,
+        )
+        .expect("write config");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(dir.path()).expect("set cwd");
+        let dirs = resolve_watch_dirs();
+        std::env::set_current_dir(cwd).expect("restore cwd");
+
+        for default in WATCH_DIRS {
+            assert!(
+                dirs.contains(&default.to_string()),
+                "missing default watch dir: {default}"
+            );
+        }
+        assert!(dirs.contains(&"views".to_string()));
+        assert!(dirs.contains(&"locales".to_string()));
+        assert_eq!(
+            dirs.iter().filter(|d| d.as_str() == "src").count(),
+            1,
+            "default dirs should not be duplicated"
+        );
+    }
+
+    #[test]
     fn watch_files_are_non_empty() {
         for f in WATCH_FILES {
             assert!(!f.is_empty());
@@ -1450,6 +1625,18 @@ mod tests {
         assert!(!has_component(
             Path::new("template/index.html"),
             "templates"
+        ));
+    }
+
+    #[test]
+    fn path_contains_dir_supports_nested_dirs() {
+        assert!(path_contains_dir(
+            Path::new("frontend/views/home/index.html"),
+            "frontend/views"
+        ));
+        assert!(!path_contains_dir(
+            Path::new("frontend/view/home/index.html"),
+            "frontend/views"
         ));
     }
 
