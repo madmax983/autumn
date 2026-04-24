@@ -214,6 +214,18 @@ fn primitive_bool_return_type_compiles_with_route_macro() {
     assert_eq!(route.name, "returns_primitive_bool");
 }
 
+#[tokio::test]
+async fn primitive_int_handler_keeps_declared_return_type_for_direct_calls() {
+    let value: i32 = returns_primitive_int().await;
+    assert_eq!(value, 42);
+}
+
+#[tokio::test]
+async fn primitive_bool_handler_keeps_declared_return_type_for_direct_calls() {
+    let value: bool = returns_primitive_bool().await;
+    assert!(value);
+}
+
 // ── Path parameter tests (S-006) ────────────────────────────────────
 
 #[test]
