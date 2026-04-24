@@ -26,7 +26,7 @@ use crate::config::{LogConfig, TelemetryConfig};
 #[allow(dead_code)]
 pub fn init(config: &LogConfig) {
     let profile = crate::config::resolve_profile(&crate::config::OsEnv);
-    let _ = init_with_telemetry(config, &TelemetryConfig::default(), profile.as_deref())
+    let _ = init_with_telemetry(config, &TelemetryConfig::default(), Some(profile.as_str()))
         .unwrap_or_else(|error| panic!("failed to initialize logging: {error}"));
 }
 
