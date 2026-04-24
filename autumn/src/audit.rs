@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
 use crate::state::AppState;
 
@@ -81,6 +82,10 @@ impl AuditError {
             message: message.into(),
         }
     }
+
+    fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 type AuditWriteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>>;
@@ -114,10 +119,25 @@ impl AuditLogger {
 
     /// Append an event to all configured sinks.
     pub async fn write(&self, event: AuditEvent) -> Result<(), AuditError> {
+        let mut errors = Vec::new();
         for sink in &self.sinks {
-            sink.write(event.clone()).await?;
+            if let Err(error) = sink.write(event.clone()).await {
+                errors.push(error);
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            let details = errors
+                .iter()
+                .map(|error| error.message().to_owned())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            Err(AuditError::new(format!(
+                "{} audit sink(s) failed: {details}",
+                errors.len()
+            )))
+        }
     }
 
     /// Returns true when at least one sink is configured.
@@ -153,6 +173,7 @@ impl AuditSink for TracingAuditSink {
 #[derive(Debug)]
 pub struct JsonlFileAuditSink {
     path: PathBuf,
+    write_lock: Mutex<()>,
 }
 
 impl JsonlFileAuditSink {
@@ -161,6 +182,7 @@ impl JsonlFileAuditSink {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            write_lock: Mutex::new(()),
         }
     }
 }
@@ -168,9 +190,11 @@ impl JsonlFileAuditSink {
 impl AuditSink for JsonlFileAuditSink {
     fn write<'a>(&'a self, event: AuditEvent) -> AuditWriteFuture<'a> {
         Box::pin(async move {
-            let encoded = serde_json::to_vec(&event).map_err(|error| {
+            let mut encoded = serde_json::to_vec(&event).map_err(|error| {
                 AuditError::new(format!("failed to encode audit event: {error}"))
             })?;
+            encoded.push(b'\n');
+            let _guard = self.write_lock.lock().await;
             let mut file = tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -181,9 +205,6 @@ impl AuditSink for JsonlFileAuditSink {
                 })?;
             file.write_all(&encoded).await.map_err(|error| {
                 AuditError::new(format!("failed to write audit event: {error}"))
-            })?;
-            file.write_all(b"\n").await.map_err(|error| {
-                AuditError::new(format!("failed to flush audit newline: {error}"))
             })?;
             Ok(())
         })
@@ -202,6 +223,30 @@ pub async fn write_from_state(state: &AppState, event: AuditEvent) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FailingSink;
+
+    impl AuditSink for FailingSink {
+        fn write<'a>(&'a self, _event: AuditEvent) -> AuditWriteFuture<'a> {
+            Box::pin(async { Err(AuditError::new("boom")) })
+        }
+    }
+
+    struct CountingSink {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl AuditSink for CountingSink {
+        fn write<'a>(&'a self, _event: AuditEvent) -> AuditWriteFuture<'a> {
+            let writes = self.writes.clone();
+            Box::pin(async move {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
 
     #[tokio::test]
     async fn jsonl_sink_appends_events() {
@@ -244,5 +289,36 @@ mod tests {
         )
         .await
         .expect("no-op write should succeed");
+    }
+
+    #[tokio::test]
+    async fn audit_logger_continues_fan_out_after_sink_failure() {
+        let writes = Arc::new(AtomicUsize::new(0));
+        let logger = AuditLogger::new()
+            .with_sink(Arc::new(FailingSink))
+            .with_sink(Arc::new(CountingSink {
+                writes: writes.clone(),
+            }));
+
+        let error = logger
+            .write(AuditEvent::new(
+                "u1",
+                "auth.login",
+                "session-1",
+                None,
+                AuditStatus::Failure,
+            ))
+            .await
+            .expect_err("first sink should fail");
+
+        assert!(
+            error.to_string().contains("1 audit sink(s) failed"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "second sink should still receive event"
+        );
     }
 }
