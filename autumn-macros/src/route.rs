@@ -6,6 +6,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::{ReturnType, Type};
 
 use crate::parse;
 
@@ -59,6 +60,14 @@ pub fn route_macro(
     // That macro generates code with `::axum::` paths, which don't resolve
     // when the user only depends on `autumn-web` (axum is a transitive dep).
     // Custom compile_error! diagnostics (S-007) provide error guidance instead.
+    if should_stringify_primitive_output(&input_fn.sig.output) {
+        let original_block = input_fn.block.clone();
+        input_fn.sig.output = syn::parse_quote!(-> ::std::string::String);
+        input_fn.block = syn::parse_quote!({
+            let __autumn_primitive_response = (async move #original_block).await;
+            __autumn_primitive_response.to_string()
+        });
+    }
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -76,4 +85,38 @@ pub fn route_macro(
             }
         }
     }
+}
+
+fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    let Type::Path(path) = ty.as_ref() else {
+        return false;
+    };
+
+    if path.qself.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+
+    let ident = path.path.segments[0].ident.to_string();
+    matches!(
+        ident.as_str(),
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
 }

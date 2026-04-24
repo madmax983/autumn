@@ -51,6 +51,16 @@ async fn delete_user(axum::extract::Path(_id): axum::extract::Path<i64>) -> Stat
     StatusCode::NO_CONTENT
 }
 
+#[get("/primitive/int")]
+async fn primitive_int() -> i32 {
+    42
+}
+
+#[get("/primitive/bool")]
+async fn primitive_bool() -> bool {
+    true
+}
+
 #[post("/validate")]
 async fn validate_input(
     Json(body): Json<serde_json::Value>,
@@ -76,7 +86,9 @@ fn app() -> autumn_web::test::TestClient {
             get_user,
             update_user,
             delete_user,
-            validate_input
+            validate_input,
+            primitive_int,
+            primitive_bool
         ])
         .build()
 }
@@ -213,6 +225,30 @@ async fn validation_success() {
             assert_eq!(v["valid"], true);
             assert_eq!(v["name"], "Alice");
         });
+}
+
+#[tokio::test]
+async fn primitive_integer_return_is_plain_text() {
+    let client = app();
+
+    client
+        .get("/primitive/int")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("42");
+}
+
+#[tokio::test]
+async fn primitive_bool_return_is_plain_text() {
+    let client = app();
+
+    client
+        .get("/primitive/bool")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_eq("true");
 }
 
 // ── Full CRUD lifecycle test ───────────────────────────────────

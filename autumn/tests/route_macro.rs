@@ -55,6 +55,16 @@ async fn returns_status() -> http::StatusCode {
     http::StatusCode::NO_CONTENT
 }
 
+#[get("/primitive-int")]
+async fn returns_primitive_int() -> i32 {
+    42
+}
+
+#[get("/primitive-bool")]
+async fn returns_primitive_bool() -> bool {
+    true
+}
+
 // ── GET tests ────────────────────────────────────────────────────────
 
 #[test]
@@ -186,6 +196,22 @@ fn status_code_return_type_compiles_with_debug_handler() {
     assert_eq!(route.method, http::Method::GET);
     assert_eq!(route.path, "/status");
     assert_eq!(route.name, "returns_status");
+}
+
+#[test]
+fn primitive_int_return_type_compiles_with_route_macro() {
+    let route = __autumn_route_info_returns_primitive_int();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/primitive-int");
+    assert_eq!(route.name, "returns_primitive_int");
+}
+
+#[test]
+fn primitive_bool_return_type_compiles_with_route_macro() {
+    let route = __autumn_route_info_returns_primitive_bool();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/primitive-bool");
+    assert_eq!(route.name, "returns_primitive_bool");
 }
 
 // ── Path parameter tests (S-006) ────────────────────────────────────
