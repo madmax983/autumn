@@ -11,21 +11,8 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
 use crate::registry::AdminRegistry;
+use crate::routes::ADMIN_JS_PATH;
 use crate::traits::{AdminField, AdminFieldKind, ListResult, SortDirection, record_id};
-
-/// Tiny inline script that strips empty password inputs from any form before
-/// submission, so "Leave blank to keep current" doesn't overwrite stored
-/// hashes with an empty string. Works without any framework dependency and
-/// is CSP-compatible under `script-src 'self' 'unsafe-inline'` (the default
-/// Autumn profile allows inline scripts).
-const ADMIN_INLINE_JS: &str = "\
-document.addEventListener('submit', function (e) {
-  var form = e.target;
-  if (!form || !form.matches || !form.matches('form')) return;
-  form.querySelectorAll('input[type=\"password\"]').forEach(function (i) {
-    if (i.value === '') i.removeAttribute('name');
-  });
-}, true);";
 
 // ── CSS ─────────────────────────────────────────────────────────────
 
@@ -341,7 +328,8 @@ pub fn admin_layout(
                 title { (title) " — Autumn Admin" }
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
-                script { (PreEscaped(ADMIN_INLINE_JS)) }
+                // External so it runs under the default CSP `script-src 'self'`.
+                script src={ (prefix) (ADMIN_JS_PATH) } {}
                 style {
                     (PreEscaped(TOKENS_CSS))
                     (PreEscaped(FLASH_CSS))
@@ -497,8 +485,8 @@ pub fn model_list_page(
                     thead {
                         tr {
                             th class="checkbox-cell" {
-                                input type="checkbox" id="select-all"
-                                    onclick="document.querySelectorAll('.row-check').forEach(c => c.checked = this.checked)";
+                                // Wired up by admin.js via event delegation on #select-all.
+                                input type="checkbox" id="select-all";
                             }
                             @for field in &list_fields {
                                 @let is_sorted = sort_by == Some(field.name);
@@ -1138,16 +1126,35 @@ mod tests {
     }
 
     #[test]
-    fn layout_inline_script_strips_empty_passwords() {
-        // The layout ships a submit-time listener that removes `name` from
-        // blank password inputs. We just assert the guard is there.
+    fn layout_loads_external_admin_js_not_inline() {
+        // The layout must NOT ship an inline <script>{js}</script> block —
+        // that would be blocked by the default CSP (`script-src 'self'`).
+        // Instead it must load the plugin-owned asset at /{prefix}/static/admin.js.
+        let r = dummy_registry();
+        let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator").into_string();
         assert!(
-            ADMIN_INLINE_JS.contains("input[type=\"password\"]"),
-            "password-strip script should target password inputs"
+            html.contains(r#"src="/admin/static/admin.js""#),
+            "admin.js must be referenced as an external script: {html}"
+        );
+        // No inline onclick on the select-all checkbox either — it's
+        // wired via event delegation in admin.js now.
+        assert!(
+            !html.contains("onclick=\""),
+            "no inline event handlers allowed under default CSP: {html}"
+        );
+    }
+
+    #[test]
+    fn admin_js_does_not_contain_inline_event_handlers() {
+        // Sanity-check the shipped JS: has the two behaviours we expect.
+        let js = include_str!("admin.js");
+        assert!(
+            js.contains("select-all"),
+            "admin.js should wire the select-all checkbox"
         );
         assert!(
-            ADMIN_INLINE_JS.contains("removeAttribute('name')"),
-            "should remove name attribute on blank password inputs"
+            js.contains("removeAttribute(\"name\")"),
+            "admin.js should strip blank password input names"
         );
     }
 }

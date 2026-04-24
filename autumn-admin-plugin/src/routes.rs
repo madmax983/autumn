@@ -11,7 +11,7 @@ use autumn_web::prelude::HxResponseExt;
 use autumn_web::security::CsrfToken;
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware::from_fn;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing;
@@ -24,7 +24,14 @@ use serde_json::Value;
 use crate::auth::check_role;
 use crate::registry::AdminRegistry;
 use crate::templates;
-use crate::traits::{AdminModel, ListParams, SortDirection, record_id};
+use crate::traits::{AdminField, AdminFieldKind, AdminModel, ListParams, SortDirection, record_id};
+
+/// Plugin-owned JS served at `{prefix}/static/admin.js`. External file
+/// (not inline) so it works under the default CSP `script-src 'self'`.
+const ADMIN_JS: &str = include_str!("admin.js");
+
+/// Route (relative to the plugin prefix) where [`ADMIN_JS`] is served.
+pub const ADMIN_JS_PATH: &str = "/static/admin.js";
 
 // ── Router construction ─────────────────────────────────────────────
 
@@ -47,6 +54,7 @@ pub fn admin_router(
                 .delete(model_delete),
         )
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
+        .route(ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
         .layer(axum::Extension(ActuatorPrefix(actuator_prefix)))
         .layer(axum::Extension(registry));
@@ -67,6 +75,18 @@ struct AdminPrefix(String);
 /// `config.actuator.prefix`), used for dashboard links and HTMX polling.
 #[derive(Clone)]
 struct ActuatorPrefix(String);
+
+/// Serve the plugin's static JS with long-cache headers.
+async fn serve_admin_js() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        ADMIN_JS,
+    )
+        .into_response()
+}
 
 // ── Query params ────────────────────────────────────────────────────
 
@@ -241,8 +261,9 @@ async fn model_create(
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
+    let fields = model.fields();
     let record = model
-        .create(&pool, strip_meta_fields(form_data))
+        .create(&pool, strip_meta_fields(form_data, &fields))
         .await
         .map_err(|e| AutumnError::bad_request_msg(format!("Create failed: {e}")))?;
     flash
@@ -336,8 +357,9 @@ async fn model_update(
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
+    let fields = model.fields();
     model
-        .update(&pool, id, strip_meta_fields(form_data))
+        .update(&pool, id, strip_meta_fields(form_data, &fields))
         .await
         .map_err(|e| AutumnError::bad_request_msg(format!("Update failed: {e}")))?;
     flash
@@ -376,26 +398,25 @@ async fn model_delete(
 /// Remove form-internal fields (`_csrf`, anything else starting with `_`) and
 /// any password field whose value is blank (so "leave blank to keep current"
 /// works on edit forms without wiping the existing hash).
-fn strip_meta_fields(mut data: Value) -> Value {
+///
+/// Uses [`AdminFieldKind::Password`] from the model's declared field metadata
+/// — not a name heuristic — so custom password fields (`secret`, `api_key`,
+/// whatever the admin chose) are all handled correctly.
+fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
     if let Some(obj) = data.as_object_mut() {
         obj.retain(|k, v| {
             if k.starts_with('_') {
                 return false;
             }
-            // Discard blank password fields so they don't overwrite stored hashes.
-            // We can't know from the raw form data which fields are passwords, so
-            // the template strips empty password inputs client-side before submit.
-            // This retain runs anyway as a server-side safety net for string-typed
-            // values that arrive empty.
-            !matches!(v, Value::String(s) if s.is_empty() && is_likely_password(k))
+            // Drop blank string values for fields the model declared as passwords,
+            // so admins editing unrelated fields don't overwrite stored hashes.
+            let is_declared_password = fields
+                .iter()
+                .any(|f| f.name == k && matches!(f.kind, AdminFieldKind::Password));
+            !matches!(v, Value::String(s) if s.is_empty() && is_declared_password)
         });
     }
     data
-}
-
-fn is_likely_password(field: &str) -> bool {
-    let lower = field.to_ascii_lowercase();
-    lower.contains("password") || lower.contains("passwd") || lower == "pwd"
 }
 
 #[cfg(test)]
@@ -403,39 +424,60 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn fields(specs: &[(&'static str, AdminFieldKind)]) -> Vec<AdminField> {
+        specs
+            .iter()
+            .cloned()
+            .map(|(name, kind)| AdminField::new(name, kind))
+            .collect()
+    }
+
     #[test]
     fn strip_meta_removes_csrf_and_underscore_fields() {
         let input = json!({"name": "x", "_csrf": "t", "_foo": 1});
-        let out = strip_meta_fields(input);
+        let out = strip_meta_fields(input, &fields(&[("name", AdminFieldKind::Text)]));
         assert_eq!(out, json!({"name": "x"}));
     }
 
     #[test]
-    fn strip_meta_drops_blank_password_but_keeps_filled() {
-        let input = json!({"password": "", "other": "y"});
-        assert_eq!(strip_meta_fields(input), json!({"other": "y"}));
+    fn strip_meta_drops_blank_password_by_declared_kind() {
+        let fields = fields(&[
+            ("password", AdminFieldKind::Password),
+            ("other", AdminFieldKind::Text),
+        ]);
+        let out = strip_meta_fields(json!({"password": "", "other": "y"}), &fields);
+        assert_eq!(out, json!({"other": "y"}));
 
-        let input = json!({"password": "hunter2", "other": "y"});
-        assert_eq!(
-            strip_meta_fields(input),
-            json!({"password": "hunter2", "other": "y"})
-        );
+        let out = strip_meta_fields(json!({"password": "hunter2", "other": "y"}), &fields);
+        assert_eq!(out, json!({"password": "hunter2", "other": "y"}));
+    }
+
+    #[test]
+    fn strip_meta_drops_blank_custom_named_password() {
+        // Regression: the old name-heuristic version missed this.
+        // A field called "secret" declared as Password must still be stripped.
+        let fields = fields(&[("secret", AdminFieldKind::Password)]);
+        let out = strip_meta_fields(json!({"secret": ""}), &fields);
+        assert_eq!(out, json!({}));
     }
 
     #[test]
     fn strip_meta_preserves_blank_non_password_fields() {
-        let input = json!({"name": "", "bio": ""});
-        assert_eq!(strip_meta_fields(input), json!({"name": "", "bio": ""}));
+        let fields = fields(&[
+            ("name", AdminFieldKind::Text),
+            ("bio", AdminFieldKind::TextArea),
+        ]);
+        let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
+        assert_eq!(out, json!({"name": "", "bio": ""}));
     }
 
     #[test]
-    fn is_likely_password_detects_variants() {
-        assert!(is_likely_password("password"));
-        assert!(is_likely_password("Password"));
-        assert!(is_likely_password("new_password"));
-        assert!(is_likely_password("passwd"));
-        assert!(is_likely_password("pwd"));
-        assert!(!is_likely_password("name"));
-        assert!(!is_likely_password("email"));
+    fn strip_meta_keeps_field_named_password_if_not_declared_as_such() {
+        // If the model exposes a Text field literally named "password" (weird
+        // but legal), we should NOT drop the empty string — the model gets to
+        // decide. Only `AdminFieldKind::Password` triggers the strip.
+        let fields = fields(&[("password", AdminFieldKind::Text)]);
+        let out = strip_meta_fields(json!({"password": ""}), &fields);
+        assert_eq!(out, json!({"password": ""}));
     }
 }
