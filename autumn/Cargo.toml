@@ -80,6 +80,7 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 subtle = "2.6.1"
 url = "2.5.8"
+lru = "0.17.0"
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }
