@@ -145,6 +145,20 @@ async fn merged_routes_get_request_id_header() {
 }
 
 #[tokio::test]
+async fn merged_router_favicon_route_wins_without_startup_conflict() {
+    let raw = axum::Router::<AppState>::new().route(
+        "/favicon.ico",
+        axum::routing::get(|| async { "raw favicon" }),
+    );
+    let app = TestApp::new().merge(raw).build();
+    app.get("/favicon.ico")
+        .send()
+        .await
+        .assert_status(200)
+        .assert_body_eq("raw favicon");
+}
+
+#[tokio::test]
 async fn nested_routes_can_extract_app_state() {
     let raw = axum::Router::<AppState>::new().route(
         "/state",

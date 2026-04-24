@@ -1695,22 +1695,6 @@ fn format_route_lines(
         crate::actuator::actuator_route_glob(&config.actuator.prefix),
         "GET"
     );
-    let user_declared_favicon = routes.iter().any(|route| {
-        route.path == crate::router::DEFAULT_FAVICON_PATH && route.method == http::Method::GET
-    }) || scoped_groups.iter().any(|group| {
-        group.routes.iter().any(|route| {
-            route.method == http::Method::GET
-                && format!("{}{}", group.prefix, route.path) == crate::router::DEFAULT_FAVICON_PATH
-        })
-    });
-    if !user_declared_favicon {
-        let _ = write!(
-            out,
-            "\n    {} {:<8} -> default favicon",
-            crate::router::DEFAULT_FAVICON_PATH,
-            "GET"
-        );
-    }
     #[cfg(feature = "htmx")]
     {
         out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
