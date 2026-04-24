@@ -30,7 +30,7 @@ pub enum AuditStatus {
 }
 
 /// A structured audit log entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEvent {
     /// UTC timestamp recorded when the event was created.
     pub timestamp: DateTime<Utc>,
@@ -94,7 +94,7 @@ type AuditWriteFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditError>> 
 pub trait AuditSink: Send + Sync + 'static {
     /// Persist one audit event. Implementations must treat events as immutable,
     /// append-only records.
-    fn write<'a>(&'a self, event: AuditEvent) -> AuditWriteFuture<'a>;
+    fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_>;
 }
 
 /// Shared audit writer that fans out to multiple sinks.
@@ -118,6 +118,11 @@ impl AuditLogger {
     }
 
     /// Append an event to all configured sinks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuditError`] when one or more configured sinks fail. All
+    /// sinks are still attempted; failures are aggregated into one error.
     pub async fn write(&self, event: AuditEvent) -> Result<(), AuditError> {
         let mut errors = Vec::new();
         for sink in &self.sinks {
@@ -152,7 +157,7 @@ impl AuditLogger {
 pub struct TracingAuditSink;
 
 impl AuditSink for TracingAuditSink {
-    fn write<'a>(&'a self, event: AuditEvent) -> AuditWriteFuture<'a> {
+    fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
             tracing::info!(
                 target: "autumn.audit",
@@ -188,7 +193,7 @@ impl JsonlFileAuditSink {
 }
 
 impl AuditSink for JsonlFileAuditSink {
-    fn write<'a>(&'a self, event: AuditEvent) -> AuditWriteFuture<'a> {
+    fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
         Box::pin(async move {
             let mut encoded = serde_json::to_vec(&event).map_err(|error| {
                 AuditError::new(format!("failed to encode audit event: {error}"))
@@ -212,6 +217,12 @@ impl AuditSink for JsonlFileAuditSink {
 }
 
 /// Helper to write an audit event using the logger stored in [`AppState`].
+///
+/// # Errors
+///
+/// Returns [`AuditError`] when the installed logger fails to persist to one or
+/// more sinks. If no logger is installed in state, this is a no-op and returns
+/// `Ok(())`.
 pub async fn write_from_state(state: &AppState, event: AuditEvent) -> Result<(), AuditError> {
     if let Some(logger) = state.extension::<AuditLogger>() {
         logger.write(event).await
@@ -229,7 +240,7 @@ mod tests {
     struct FailingSink;
 
     impl AuditSink for FailingSink {
-        fn write<'a>(&'a self, _event: AuditEvent) -> AuditWriteFuture<'a> {
+        fn write(&self, _event: AuditEvent) -> AuditWriteFuture<'_> {
             Box::pin(async { Err(AuditError::new("boom")) })
         }
     }
@@ -239,7 +250,7 @@ mod tests {
     }
 
     impl AuditSink for CountingSink {
-        fn write<'a>(&'a self, _event: AuditEvent) -> AuditWriteFuture<'a> {
+        fn write(&self, _event: AuditEvent) -> AuditWriteFuture<'_> {
             let writes = self.writes.clone();
             Box::pin(async move {
                 writes.fetch_add(1, Ordering::SeqCst);
