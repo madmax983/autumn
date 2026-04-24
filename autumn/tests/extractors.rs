@@ -156,3 +156,62 @@ async fn multipart_extraction_works() {
         .unwrap();
     assert_eq!(&body[..], b"hello.txt:11");
 }
+
+#[tokio::test]
+async fn multipart_mime_allow_list_skips_non_file_fields() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+        let mut text_seen = false;
+        let mut file_seen = false;
+
+        while let Some(field) = multipart.next_field().await? {
+            if field.file_name().is_some() {
+                file_seen = true;
+                let _ = field.bytes_limited().await?;
+            } else {
+                text_seen = true;
+                let _ = field.bytes_limited().await?;
+            }
+        }
+
+        Ok(format!("text={text_seen},file={file_seen}"))
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nreport\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new()
+        .route("/", axum::routing::post(handler))
+        .layer(axum::middleware::from_fn(
+            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(autumn_web::security::config::UploadConfig {
+                        allowed_mime_types: vec!["text/plain".to_owned()],
+                        ..autumn_web::security::config::UploadConfig::default()
+                    });
+                next.run(req).await
+            },
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"text=true,file=true");
+}

@@ -95,7 +95,7 @@ pub use axum::extract::Query;
 /// - MIME allow-list checks (`allowed_mime_types`)
 /// - Per-file size caps when consuming field bytes or streaming to disk
 ///
-/// Global request size limits are enforced by router middleware via
+/// Request size limits are enforced per request in this extractor via
 /// `security.upload.max_request_size_bytes`.
 pub struct Multipart {
     inner: axum::extract::Multipart,
@@ -119,7 +119,9 @@ impl Multipart {
             return Ok(None);
         };
 
-        if !self.config.allowed_mime_types.is_empty() {
+        // Only enforce MIME allow-lists for file parts. Regular form
+        // fields often omit `Content-Type`.
+        if field.file_name().is_some() && !self.config.allowed_mime_types.is_empty() {
             let Some(content_type) = field.content_type().map(str::to_owned) else {
                 return Err(crate::AutumnError::bad_request_msg(
                     "missing content type on uploaded file",
@@ -147,19 +149,21 @@ impl Multipart {
 impl<S> axum::extract::FromRequest<S> for Multipart
 where
     S: Send + Sync,
-    axum::extract::Multipart: axum::extract::FromRequest<
-        S,
-        Rejection = axum::extract::multipart::MultipartRejection,
-    >,
+    axum::extract::Multipart:
+        axum::extract::FromRequest<S, Rejection = axum::extract::multipart::MultipartRejection>,
 {
     type Rejection = crate::AutumnError;
 
-    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(
+        mut req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
         let config = req
             .extensions()
             .get::<crate::security::config::UploadConfig>()
             .cloned()
             .unwrap_or_default();
+        axum::extract::DefaultBodyLimit::max(config.max_request_size_bytes).apply(&mut req);
         let inner = axum::extract::Multipart::from_request(req, state)
             .await
             .map_err(multipart_rejection_to_error)?;
@@ -235,6 +239,7 @@ impl<'a> MultipartField<'a> {
         while let Some(chunk) = self.inner.chunk().await.map_err(multipart_error_to_error)? {
             written += chunk.len();
             if written > self.max_file_size_bytes {
+                drop(file);
                 let _ = tokio::fs::remove_file(path).await;
                 return Err(crate::AutumnError::bad_request_msg(format!(
                     "uploaded file exceeds limit of {} bytes",

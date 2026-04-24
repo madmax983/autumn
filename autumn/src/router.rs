@@ -454,7 +454,7 @@ fn apply_rate_limit_middleware(
 }
 
 fn apply_upload_middleware(
-    mut router: axum::Router<AppState>,
+    router: axum::Router<AppState>,
     config: &AutumnConfig,
 ) -> axum::Router<AppState> {
     let upload_config = config.security.upload.clone();
@@ -465,17 +465,13 @@ fn apply_upload_middleware(
         "Multipart upload safeguards enabled"
     );
 
-    router = router.layer(axum::extract::DefaultBodyLimit::max(
-        upload_config.max_request_size_bytes,
-    ));
-
     router.layer(axum::middleware::from_fn(
         move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-        let upload_config = upload_config.clone();
-        async move {
-            req.extensions_mut().insert(upload_config);
-            next.run(req).await
-        }
+            let upload_config = upload_config.clone();
+            async move {
+                req.extensions_mut().insert(upload_config);
+                next.run(req).await
+            }
         },
     ))
 }
