@@ -599,19 +599,27 @@ fn has_component(path: &Path, target: &str) -> bool {
 
 fn path_contains_dir(path: &Path, dir: &str) -> bool {
     let dir = Path::new(dir);
-    if dir.components().count() == 1 {
-        return has_component(path, dir.as_os_str().to_str().unwrap_or_default());
+    if path_starts_with_watch_dir(path, dir) {
+        return true;
     }
 
-    let path_components: Vec<_> = path.components().collect();
-    let dir_components: Vec<_> = dir.components().collect();
-    if dir_components.is_empty() || path_components.len() < dir_components.len() {
-        return false;
+    // notify can emit absolute paths on some backends/platforms. Anchor custom
+    // matching to the workspace-relative watched prefix when possible.
+    if path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = path.strip_prefix(&cwd)
+    {
+        return path_starts_with_watch_dir(relative, dir);
     }
 
-    path_components
-        .windows(dir_components.len())
-        .any(|window| window == dir_components.as_slice())
+    false
+}
+
+fn path_starts_with_watch_dir(path: &Path, watch_dir: &Path) -> bool {
+    path.starts_with(watch_dir)
+        || path
+            .strip_prefix(Path::new("."))
+            .is_ok_and(|relative| relative.starts_with(watch_dir))
 }
 
 fn default_watch_dirs() -> Vec<String> {
@@ -1102,6 +1110,25 @@ mod tests {
                 &watch_dirs
             ),
             ChangeEffect::BuildRestart
+        );
+    }
+
+    #[test]
+    fn custom_watch_dir_does_not_match_nested_component_name() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            "views".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new("src/views/readme.txt"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::Ignore
         );
     }
 
@@ -1630,6 +1657,14 @@ watch_dirs = ["views", "locales", "src"]
 
     #[test]
     fn path_contains_dir_supports_nested_dirs() {
+        assert!(path_contains_dir(
+            Path::new("views/home/index.html"),
+            "views"
+        ));
+        assert!(!path_contains_dir(
+            Path::new("src/views/home/index.html"),
+            "views"
+        ));
         assert!(path_contains_dir(
             Path::new("frontend/views/home/index.html"),
             "frontend/views"
