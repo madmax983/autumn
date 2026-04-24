@@ -350,9 +350,9 @@ impl AppBuilder {
     /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
     /// time from the route path, HTTP method, extractor types, and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
-    /// `OpenAPI` 3.0 JSON document at [`OpenApiConfig::openapi_json_path`]
+    /// `OpenAPI` 3.0 JSON document at `OpenApiConfig::openapi_json_path`
     /// (default `/v3/api-docs`). If
-    /// [`OpenApiConfig::swagger_ui_path`] is set (default `/swagger-ui`),
+    /// `OpenApiConfig::swagger_ui_path` is set (default `/swagger-ui`),
     /// a Swagger UI HTML page is served there too.
     ///
     /// Routes marked `#[api_doc(hidden)]` are excluded.

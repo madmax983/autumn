@@ -1,6 +1,6 @@
 //! Demonstrates replacing autumn-web's default TOML + env config loader with a
 //! custom JSON-file loader via the [`ConfigLoader`] trait and the
-//! [`AppBuilder::with_config_loader`] hook (S-053 success metric).
+//! [`AppBuilder::with_config_loader`](autumn_web::app::AppBuilder::with_config_loader) hook (S-053 success metric).
 //!
 //! Run with:
 //!

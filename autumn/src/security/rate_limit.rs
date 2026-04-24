@@ -35,14 +35,15 @@
 //! burst = 20
 //! ```
 
-use std::collections::HashMap;
+use lru::LruCache;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Request, Response, StatusCode};
@@ -61,8 +62,7 @@ struct Limiter {
     burst: f64,
     burst_header: HeaderValue,
     trust_forwarded_headers: bool,
-    buckets: Mutex<HashMap<String, Bucket>>,
-    calls: AtomicU64,
+    buckets: Mutex<LruCache<String, Bucket>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,8 +88,7 @@ impl Limiter {
             burst,
             burst_header,
             trust_forwarded_headers: config.trust_forwarded_headers,
-            buckets: Mutex::new(HashMap::new()),
-            calls: AtomicU64::new(0),
+            buckets: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
         }
     }
 
@@ -102,7 +101,8 @@ impl Limiter {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let bucket = buckets.entry(key.to_owned()).or_insert(Bucket {
+
+            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
                 tokens: self.burst,
                 last_refill: now,
             });
@@ -115,12 +115,15 @@ impl Limiter {
                 .min(self.burst);
             bucket.last_refill = now;
 
-            if bucket.tokens >= 1.0 {
+            let result = if bucket.tokens >= 1.0 {
                 bucket.tokens -= 1.0;
                 Ok(bucket.tokens)
             } else {
                 Err(bucket.tokens)
-            }
+            };
+
+            buckets.put(key.to_owned(), bucket);
+            result
         };
 
         match tokens_after {
@@ -137,42 +140,6 @@ impl Limiter {
                 Decision::Denied { retry_after_secs }
             }
         }
-    }
-
-    /// Probabilistic eviction of long-idle buckets to bound memory usage.
-    ///
-    /// A bucket is evicted when it has been idle past `idle_cutoff` AND the
-    /// refill would have topped it back up to `burst` (i.e. the bucket is
-    /// effectively full and stores no information a fresh entry wouldn't).
-    fn maybe_sweep(&self, now: Instant) {
-        // Sweep roughly once per 1024 calls. Cheap, branchless, no background task.
-        let n = self.calls.fetch_add(1, Ordering::Relaxed);
-        if n & 0x3FF != 0 {
-            return;
-        }
-        self.sweep(now);
-    }
-
-    fn sweep(&self, now: Instant) {
-        let Ok(mut buckets) = self.buckets.lock() else {
-            return;
-        };
-        buckets.retain(|_, bucket| self.should_retain(bucket, now));
-    }
-
-    fn should_retain(&self, bucket: &Bucket, now: Instant) -> bool {
-        let idle_cutoff = Duration::from_secs(300);
-        let elapsed = now.saturating_duration_since(bucket.last_refill);
-        if elapsed < idle_cutoff {
-            return true;
-        }
-        let effective_tokens = elapsed
-            .as_secs_f64()
-            .mul_add(self.refill_per_sec, bucket.tokens)
-            .min(self.burst);
-        // Only drop buckets that are idle AND effectively full — i.e.
-        // a fresh bucket would have the same state.
-        effective_tokens < self.burst
     }
 }
 
@@ -280,9 +247,6 @@ where
             .limiter
             .client_ip(&req)
             .map(|key| self.limiter.decide(&key, now));
-        if decision.is_some() {
-            self.limiter.maybe_sweep(now);
-        }
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
@@ -319,6 +283,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
+    use std::time::Duration;
     use tower::ServiceExt;
 
     fn cfg(enabled: bool, rps: f64, burst: u32) -> RateLimitConfig {
@@ -567,82 +532,5 @@ mod tests {
                 "bypassed requests should not carry rate-limit headers"
             );
         }
-    }
-
-    #[test]
-    fn sweep_evicts_idle_full_buckets() {
-        let lim = Limiter::from_config(&RateLimitConfig {
-            enabled: true,
-            requests_per_second: 10.0,
-            burst: 2,
-            trust_forwarded_headers: true,
-        });
-
-        let t0 = Instant::now();
-        // Seed a bucket and consume one token so tokens < burst at t0.
-        match lim.decide("1.2.3.4", t0) {
-            Decision::Allowed { .. } => {}
-            Decision::Denied { .. } => panic!("first request should be allowed"),
-        }
-        assert_eq!(lim.buckets.lock().unwrap().len(), 1);
-
-        // Jump far enough ahead that the bucket has refilled completely
-        // AND crossed the idle cutoff.
-        let later = t0 + Duration::from_secs(3600);
-        lim.sweep(later);
-
-        assert!(
-            lim.buckets.lock().unwrap().is_empty(),
-            "idle full bucket should be evicted"
-        );
-    }
-
-    #[test]
-    fn sweep_keeps_recently_used_buckets() {
-        let lim = Limiter::from_config(&RateLimitConfig {
-            enabled: true,
-            requests_per_second: 10.0,
-            burst: 2,
-            trust_forwarded_headers: true,
-        });
-
-        let t0 = Instant::now();
-        lim.decide("recent", t0);
-        // Only 1s later — well under the 300s idle cutoff.
-        lim.sweep(t0 + Duration::from_secs(1));
-
-        assert_eq!(
-            lim.buckets.lock().unwrap().len(),
-            1,
-            "recently used bucket must survive sweep"
-        );
-    }
-
-    #[test]
-    fn sweep_keeps_idle_but_partially_drained_buckets() {
-        // Edge case: a bucket that's been idle past the cutoff but whose
-        // refill rate is slow enough that it's still not full. The sweep
-        // must keep it so the client's pending debit is preserved.
-        let lim = Limiter::from_config(&RateLimitConfig {
-            enabled: true,
-            requests_per_second: 0.001, // 1 token every 1000s
-            burst: 5,
-            trust_forwarded_headers: true,
-        });
-
-        let t0 = Instant::now();
-        // Consume 3 tokens -> tokens = 2.
-        for _ in 0..3 {
-            lim.decide("slow", t0);
-        }
-
-        // 400s later: still idle past cutoff, but only ~0.4 tokens refilled.
-        lim.sweep(t0 + Duration::from_secs(400));
-
-        assert_eq!(
-            lim.buckets.lock().unwrap().len(),
-            1,
-            "partially-drained bucket must survive sweep to preserve debit"
-        );
     }
 }
