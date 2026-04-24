@@ -448,25 +448,39 @@ async fn model_delete(
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Remove form-internal fields (`_csrf`, anything else starting with `_`) and
-/// any password field whose value is blank (so "leave blank to keep current"
-/// works on edit forms without wiping the existing hash).
+/// Filter incoming form data down to fields the model declared as editable.
 ///
-/// Uses [`AdminFieldKind::Password`] from the model's declared field metadata
-/// — not a name heuristic — so custom password fields (`secret`, `api_key`,
-/// whatever the admin chose) are all handled correctly.
+/// Enforcement (all three are necessary):
+///
+/// 1. **Drop underscore-prefixed keys** (`_csrf` and similar form internals).
+/// 2. **Drop keys not declared in `fields`** so a crafted POST can't inject
+///    arbitrary columns (e.g. `is_admin=true`) into an `AdminModel::create`.
+/// 3. **Drop keys whose `AdminField::editable = false`** so read-only columns
+///    (`id`, `created_at`, computed fields, privilege flags) can't be
+///    overwritten by admins submitting tampered forms.
+/// 4. **Drop blank string values on declared `Password` fields** so "leave
+///    blank to keep current" doesn't wipe stored hashes.
+///
+/// The UI's readonly contract is the source of truth: if the admin didn't
+/// declare a field as editable, model code never sees it.
 fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
     if let Some(obj) = data.as_object_mut() {
         obj.retain(|k, v| {
             if k.starts_with('_') {
                 return false;
             }
-            // Drop blank string values for fields the model declared as passwords,
-            // so admins editing unrelated fields don't overwrite stored hashes.
-            let is_declared_password = fields
-                .iter()
-                .any(|f| f.name == k && matches!(f.kind, AdminFieldKind::Password));
-            !matches!(v, Value::String(s) if s.is_empty() && is_declared_password)
+            let Some(field) = fields.iter().find(|f| f.name == k) else {
+                // Key not in the schema — drop it. Prevents arbitrary columns
+                // from being injected past the declared editable surface.
+                return false;
+            };
+            if !field.editable {
+                // Readonly field — drop it regardless of submitted value.
+                return false;
+            }
+            // Drop blank string values on Password fields so admins editing
+            // unrelated fields don't overwrite stored hashes.
+            !matches!(v, Value::String(s) if s.is_empty() && matches!(field.kind, AdminFieldKind::Password))
         });
     }
     data
@@ -594,5 +608,36 @@ mod tests {
         let fields = fields(&[("password", AdminFieldKind::Text)]);
         let out = strip_meta_fields(json!({"password": ""}), &fields);
         assert_eq!(out, json!({"password": ""}));
+    }
+
+    #[test]
+    fn strip_meta_drops_fields_not_in_schema() {
+        // Prevents a crafted POST from injecting arbitrary columns past the
+        // declared editable surface (e.g. `is_admin=true` on a users model
+        // that doesn't expose it).
+        let fields = fields(&[("name", AdminFieldKind::Text)]);
+        let input = json!({"name": "x", "is_admin": true, "raw_column": "y"});
+        let out = strip_meta_fields(input, &fields);
+        assert_eq!(out, json!({"name": "x"}));
+    }
+
+    #[test]
+    fn strip_meta_drops_readonly_fields() {
+        // `editable = false` fields (id, created_at, computed, privilege
+        // flags) must not be forwarded to model code even if submitted.
+        let mut id = AdminField::new("id", AdminFieldKind::Integer);
+        id.editable = false;
+        let mut created_at = AdminField::new("created_at", AdminFieldKind::DateTime);
+        created_at.editable = false;
+        let name = AdminField::new("name", AdminFieldKind::Text);
+        let schema = vec![id, created_at, name];
+
+        let input = json!({
+            "id": 999,
+            "created_at": "2026-01-01T00:00:00Z",
+            "name": "legit",
+        });
+        let out = strip_meta_fields(input, &schema);
+        assert_eq!(out, json!({"name": "legit"}));
     }
 }

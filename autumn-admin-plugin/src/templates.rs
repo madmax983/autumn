@@ -444,7 +444,13 @@ pub fn model_list_page(
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
-    let list_fields: Vec<_> = fields.iter().filter(|f| f.list_display).collect();
+    // Password fields are documented as write-only — never surface their
+    // values (raw or hashed) in the index view, even if the model set
+    // `list_display = true`.
+    let list_fields: Vec<_> = fields
+        .iter()
+        .filter(|f| f.list_display && !matches!(f.kind, AdminFieldKind::Password))
+        .collect();
     let search_enc = url_encode(search_query);
 
     let content = html! {
@@ -717,6 +723,12 @@ pub fn model_form_page(
 
 /// Render a cell value in the list table.
 fn render_cell_value(record: &Value, field: &AdminField) -> Markup {
+    // Defense in depth: the list-view field filter already excludes
+    // `AdminFieldKind::Password`, but mask here too so we can never leak
+    // a hash if a caller slips one through.
+    if matches!(field.kind, AdminFieldKind::Password) {
+        return html! { "••••••••" };
+    }
     let val = record.get(field.name);
     match val {
         None | Some(Value::Null) => html! {
@@ -1145,6 +1157,51 @@ mod tests {
         assert!(
             !html.contains("onclick=\""),
             "no inline event handlers allowed under default CSP: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_hides_password_fields_even_if_list_display_true() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        // A model that (incorrectly) marks a password field list_display=true.
+        // The admin plugin must drop it from the index table anyway.
+        let fields = vec![
+            AdminField::new("name", AdminFieldKind::Text),
+            AdminField::new("password_hash", AdminFieldKind::Password),
+        ];
+        let result = ListResult {
+            records: vec![serde_json::json!({
+                "id": 1,
+                "name": "alice",
+                "password_hash": "$argon2id$leaked",
+            })],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "users",
+            "Users",
+            &fields,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            !html.contains("$argon2id$leaked"),
+            "raw password hash must not appear in list view: {html}"
+        );
+        assert!(
+            !html.contains("password_hash"),
+            "password column must not have a header in list view: {html}"
         );
     }
 
