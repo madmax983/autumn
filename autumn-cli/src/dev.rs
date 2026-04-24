@@ -438,10 +438,18 @@ fn sync_watch_dirs<W: notify::Watcher + ?Sized>(
         if let Err(e) = watcher.unwatch(Path::new(&dir)) {
             eprintln!("  Warning: could not unwatch {dir}/: {e}");
         }
-        watched_dirs.remove(&dir);
+        invalidate_watch_cache_for_removed_dir(watched_dirs, &dir);
     }
 
     ensure_watch_dirs_registered(watcher, watch_dirs, watched_dirs);
+}
+
+fn invalidate_watch_cache_for_removed_dir(watched_dirs: &mut HashSet<String>, removed_dir: &str) {
+    let removed_path = Path::new(removed_dir);
+    watched_dirs.retain(|cached| {
+        let cached_path = Path::new(cached);
+        !(cached_path == removed_path || cached_path.starts_with(removed_path))
+    });
 }
 
 fn removed_watch_dirs(
@@ -1438,6 +1446,23 @@ mod tests {
 
         let removed = removed_watch_dirs(&watched, &desired);
         assert_eq!(removed, vec!["views".to_string()]);
+    }
+
+    #[test]
+    fn invalidate_watch_cache_for_removed_parent_clears_nested_entries() {
+        let mut watched = HashSet::from([
+            "frontend".to_string(),
+            "frontend/assets".to_string(),
+            "frontend/assets/images".to_string(),
+            "src".to_string(),
+        ]);
+
+        invalidate_watch_cache_for_removed_dir(&mut watched, "frontend");
+
+        assert!(!watched.contains("frontend"));
+        assert!(!watched.contains("frontend/assets"));
+        assert!(!watched.contains("frontend/assets/images"));
+        assert!(watched.contains("src"));
     }
 
     #[test]
