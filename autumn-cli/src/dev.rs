@@ -607,9 +607,20 @@ fn path_contains_dir(path: &Path, dir: &str) -> bool {
     // matching to the workspace-relative watched prefix when possible.
     if path.is_absolute()
         && let Ok(cwd) = std::env::current_dir()
-        && let Ok(relative) = path.strip_prefix(&cwd)
     {
-        return path_starts_with_watch_dir(relative, dir);
+        if let Ok(relative) = path.strip_prefix(&cwd)
+            && path_starts_with_watch_dir(relative, dir)
+        {
+            return true;
+        }
+
+        if dir.is_relative() {
+            let absolute_dir = cwd.join(dir);
+            let absolute_dir = std::fs::canonicalize(&absolute_dir).unwrap_or(absolute_dir);
+            if path_starts_with_watch_dir(path, &absolute_dir) {
+                return true;
+            }
+        }
     }
 
     false
@@ -1705,6 +1716,27 @@ watch_dirs = ["./views", "locales", "src"]
             Path::new("frontend/view/home/index.html"),
             "frontend/views"
         ));
+    }
+
+    #[test]
+    fn path_contains_dir_matches_parent_relative_watch_dir_for_absolute_paths() {
+        let root = tempfile::tempdir().expect("temp root");
+        let workspace = root.path().join("workspace");
+        let repo = workspace.join("autumn");
+        let shared = workspace.join("shared");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        std::fs::create_dir_all(shared.join("nested")).expect("create shared dir");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("set cwd");
+
+        let file = shared.join("nested").join("data.json");
+        assert!(
+            path_contains_dir(&file, "../shared"),
+            "absolute event path under ../shared should match custom watch dir"
+        );
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
     }
 
     #[test]
