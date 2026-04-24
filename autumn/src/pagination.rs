@@ -35,9 +35,9 @@
 //! | `page` | 1-based page index | `1` | `>= 1` |
 //! | `size` | Items per page | [`DEFAULT_PAGE_SIZE`] | <code>1..=[`MAX_PAGE_SIZE`]</code> |
 //!
-//! Requests like `?size=0`, `?size=9999`, or `?page=0` are silently coerced
-//! to the valid range rather than rejected — bad pagination parameters
-//! should not 400.
+//! Requests like `?size=0`, `?size=9999`, `?page=0`, or even `?page=abc`
+//! are silently coerced to the valid range rather than rejected — bad
+//! pagination parameters should not 400.
 //!
 //! # Response shape
 //!
@@ -55,7 +55,7 @@
 //! }
 //! ```
 
-use axum::extract::{FromRequestParts, Query};
+use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use serde::{Deserialize, Serialize};
 
@@ -72,8 +72,11 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 ///
 /// Use as a handler extractor to receive `?page=N&size=M`. Both fields
 /// are optional; missing values fall back to [`DEFAULT_PAGE_SIZE`] and
-/// page `1`. Out-of-range values are clamped rather than rejected:
-/// `page < 1` becomes `1`, `size` is clamped to <code>1..=[`MAX_PAGE_SIZE`]</code>.
+/// page `1`. Out-of-range *and unparseable* values are clamped rather
+/// than rejected: `page < 1` becomes `1`, `size` is clamped to
+/// <code>1..=[`MAX_PAGE_SIZE`]</code>, and inputs like `?page=abc` are
+/// silently ignored. A list endpoint should never 400 because of a
+/// malformed pager.
 ///
 /// # Examples
 ///
@@ -141,18 +144,81 @@ impl<S> FromRequestParts<S> for PageRequest
 where
     S: Send + Sync,
 {
-    type Rejection = <Query<Self> as FromRequestParts<S>>::Rejection;
+    type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        // Missing query string (`/items` with no `?…`) is a valid request
-        // for a PageRequest — fall back to defaults rather than rejecting.
-        if parts.uri.query().is_none() {
-            return Ok(Self::default());
-        }
-        Query::<Self>::from_request_parts(parts, state)
-            .await
-            .map(|Query(p)| p)
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Manual parse rather than `Query::<Self>::from_request_parts` so
+        // that unparseable values (`?page=abc`, `?size=`, duplicate keys,
+        // percent-encoding errors) fall back to defaults instead of
+        // rejecting the whole request with a 400.
+        Ok(parts.uri.query().map_or_else(Self::default, parse_query))
     }
+}
+
+/// Best-effort parse of a URL-encoded query string into a [`PageRequest`].
+/// Unknown keys, malformed values, and percent-decoding failures are
+/// silently ignored. Later occurrences of `page`/`size` win, matching the
+/// behaviour of `serde_urlencoded`.
+fn parse_query(query: &str) -> PageRequest {
+    let mut req = PageRequest::default();
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Ok(key) = percent_decode(raw_key) else {
+            continue;
+        };
+        let Ok(value) = percent_decode(raw_value) else {
+            continue;
+        };
+        match key.as_str() {
+            "page" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    req.page = Some(n);
+                }
+            }
+            "size" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    req.size = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    req
+}
+
+/// Decode a single URL-encoded segment. `+` is treated as a space (the
+/// `application/x-www-form-urlencoded` convention used by
+/// `serde_urlencoded` and browsers).
+fn percent_decode(input: &str) -> Result<String, std::str::Utf8Error> {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    // h and l are both `0..=15` from `to_digit(16)`, so
+                    // `(h << 4) | l` fits in a u8 by construction.
+                    out.push(u8::try_from((h << 4) | l).unwrap_or(0));
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    std::str::from_utf8(&out).map(ToOwned::to_owned)
 }
 
 // ── Page<T> ─────────────────────────────────────────────────────────
@@ -411,6 +477,56 @@ mod tests {
     #[tokio::test]
     async fn extractor_coerces_page_zero_to_one() {
         let (status, body) = fetch("/items?page=0&size=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "1:10:0");
+    }
+
+    // ── Malformed input handling ───────────────────────────────
+    //
+    // A list endpoint should never 400 because of a malformed pager.
+    // These cases used to reject through `Query::from_request_parts` —
+    // they now fall back to defaults.
+
+    #[tokio::test]
+    async fn extractor_ignores_non_numeric_page() {
+        let (status, body) = fetch("/items?page=abc&size=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "1:10:0");
+    }
+
+    #[tokio::test]
+    async fn extractor_ignores_empty_size() {
+        let (status, body) = fetch("/items?page=2&size=").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("2:{DEFAULT_PAGE_SIZE}:{DEFAULT_PAGE_SIZE}"));
+    }
+
+    #[tokio::test]
+    async fn extractor_uses_last_value_on_duplicate_keys() {
+        let (status, body) = fetch("/items?page=1&page=4&size=5").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "4:5:15");
+    }
+
+    #[tokio::test]
+    async fn extractor_ignores_unknown_keys() {
+        let (status, body) = fetch("/items?sort=name&page=2&size=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2:10:10");
+    }
+
+    #[tokio::test]
+    async fn extractor_handles_percent_encoded_values() {
+        // `%32` decodes to `2`
+        let (status, body) = fetch("/items?page=%32&size=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2:10:10");
+    }
+
+    #[tokio::test]
+    async fn extractor_handles_negative_page_value() {
+        // `-1` is not a valid u32 — fall back to the default page.
+        let (status, body) = fetch("/items?page=-1&size=10").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "1:10:0");
     }

@@ -127,3 +127,13 @@ async fn size_zero_falls_back_to_default() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["size"], DEFAULT_PAGE_SIZE);
 }
+
+#[tokio::test]
+async fn malformed_page_value_does_not_400() {
+    // The contract is that a bad pager never breaks the endpoint —
+    // unparseable values fall back to defaults.
+    let (status, body) = fetch_json("/items?page=abc&size=xyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"], 1);
+    assert_eq!(body["size"], DEFAULT_PAGE_SIZE);
+}
