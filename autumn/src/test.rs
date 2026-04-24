@@ -105,7 +105,7 @@ pub struct TestApp {
     routes: Vec<Route>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
-    custom_layers: Vec<crate::app::CustomLayerApplier>,
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
@@ -157,7 +157,10 @@ impl TestApp {
     #[must_use]
     pub fn layer<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
         self.custom_layers
-            .push(Box::new(move |router| layer.apply_to(router)));
+            .push(crate::app::CustomLayerRegistration {
+                type_id: std::any::TypeId::of::<L>(),
+                apply: Box::new(move |router| layer.apply_to(router)),
+            });
         self
     }
 

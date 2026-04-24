@@ -165,7 +165,7 @@ pub struct AppBuilder {
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerApplier>,
+    custom_layers: Vec<CustomLayerRegistration>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -211,6 +211,14 @@ pub(crate) struct ScopedGroup {
 /// `apply_middleware` where the final layer stack is assembled.
 pub(crate) type CustomLayerApplier =
     Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
+/// Metadata and deferred application closure for a user-registered layer.
+pub(crate) struct CustomLayerRegistration {
+    /// Concrete type for the registered layer.
+    pub(crate) type_id: TypeId,
+    /// Deferred router mutation that applies the layer.
+    pub(crate) apply: CustomLayerApplier,
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -519,15 +527,35 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
-        // TODO(0.x): consider retaining a TypeId alongside the closure so
-        // plugins can introspect which layers are already registered
-        // (e.g. warn when auth is installed after rate-limiting). Requires
-        // replacing CustomLayerApplier with a small trait that carries type
-        // metadata. Deliberately deferred — pure closures keep the public
-        // surface minimal until a concrete introspection use case appears.
-        self.custom_layers
-            .push(Box::new(move |router| layer.apply_to(router)));
+        self.custom_layers.push(CustomLayerRegistration {
+            type_id: TypeId::of::<L>(),
+            apply: Box::new(move |router| layer.apply_to(router)),
+        });
         self
+    }
+
+    /// Returns `true` when a custom layer of type `L` has already been
+    /// registered via [`AppBuilder::layer`].
+    ///
+    /// Intended for plugin pre-flight validation before the app is started.
+    #[must_use]
+    pub fn has_layer<L: 'static>(&self) -> bool {
+        let layer_type = TypeId::of::<L>();
+        self.custom_layers
+            .iter()
+            .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Returns the registered custom layer types in registration order.
+    ///
+    /// This includes only user-installed layers from
+    /// [`AppBuilder::layer`], not framework-managed middleware.
+    #[must_use]
+    pub fn get_layer_types(&self) -> Vec<TypeId> {
+        self.custom_layers
+            .iter()
+            .map(|registered| registered.type_id)
+            .collect()
     }
 
     /// Merge a raw Axum router into the application.
