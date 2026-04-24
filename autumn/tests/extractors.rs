@@ -166,11 +166,10 @@ async fn multipart_mime_allow_list_skips_non_file_fields() {
         while let Some(field) = multipart.next_field().await? {
             if field.file_name().is_some() {
                 file_seen = true;
-                let _ = field.bytes_limited().await?;
             } else {
                 text_seen = true;
-                let _ = field.bytes_limited().await?;
             }
+            let _ = field.bytes_limited().await?;
         }
 
         Ok(format!("text={text_seen},file={file_seen}"))
