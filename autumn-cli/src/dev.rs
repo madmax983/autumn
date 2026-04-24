@@ -599,7 +599,12 @@ fn classify_change_with_watch_dirs(
     kind: DebouncedEventKind,
     watch_dirs: &[String],
 ) -> ChangeEffect {
-    if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
+    if !matches!(kind, DebouncedEventKind::Any) {
+        return ChangeEffect::Ignore;
+    }
+
+    let custom_watch_match = matches_custom_watch_dir(path, watch_dirs);
+    if should_ignore_path(path) && !custom_watch_match {
         return ChangeEffect::Ignore;
     }
 
@@ -623,13 +628,8 @@ fn classify_change_with_watch_dirs(
         return ChangeEffect::RestartOnly;
     }
 
-    for dir in watch_dirs {
-        if WATCH_DIRS.contains(&dir.as_str()) {
-            continue;
-        }
-        if path_contains_dir(path, dir) {
-            return ChangeEffect::BuildRestart;
-        }
+    if custom_watch_match {
+        return ChangeEffect::BuildRestart;
     }
 
     if has_component(path, "src") && path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
@@ -655,6 +655,15 @@ fn classify_change_with_watch_dirs(
     }
 
     ChangeEffect::Ignore
+}
+
+fn matches_custom_watch_dir(path: &Path, watch_dirs: &[String]) -> bool {
+    watch_dirs.iter().any(|dir| {
+        if is_default_watch_dir_or_alias(dir) {
+            return false;
+        }
+        path_contains_dir(path, dir)
+    })
 }
 
 fn should_ignore_path(path: &Path) -> bool {
@@ -751,11 +760,49 @@ fn resolve_watch_dirs() -> Vec<String> {
     let mut dirs = default_watch_dirs();
     let custom = load_custom_watch_dirs(Path::new("autumn.toml"));
     for dir in custom {
-        if !dirs.iter().any(|existing| existing == &dir) {
+        if !dirs
+            .iter()
+            .any(|existing| watch_dirs_equivalent(existing, &dir))
+        {
             dirs.push(dir);
         }
     }
     dirs
+}
+
+fn is_default_watch_dir_or_alias(dir: &str) -> bool {
+    WATCH_DIRS
+        .iter()
+        .any(|default| watch_dirs_equivalent(default, dir))
+}
+
+fn watch_dirs_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+
+    let a = Path::new(a);
+    let b = Path::new(b);
+    if a == b {
+        return true;
+    }
+
+    let Some(a) = canonicalize_watch_dir(a) else {
+        return false;
+    };
+    let Some(b) = canonicalize_watch_dir(b) else {
+        return false;
+    };
+
+    a == b
+}
+
+fn canonicalize_watch_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return std::fs::canonicalize(path).ok();
+    }
+    let cwd = std::env::current_dir().ok()?;
+    std::fs::canonicalize(cwd.join(path)).ok()
 }
 
 fn load_custom_watch_dirs(config_path: &Path) -> Vec<String> {
@@ -1059,7 +1106,7 @@ mod tests {
         let _guard = LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .expect("cwd mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let previous = std::env::current_dir().expect("current cwd");
         std::env::set_current_dir(cwd).expect("set cwd");
@@ -1313,6 +1360,50 @@ mod tests {
             ),
             ChangeEffect::BuildRestart
         );
+    }
+
+    #[test]
+    fn explicit_hidden_custom_watch_dir_is_not_ignored() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            ".storybook".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new(".storybook/main.js"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::BuildRestart
+        );
+    }
+
+    #[test]
+    fn default_dir_absolute_alias_is_not_treated_as_custom_watch_dir() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::create_dir_all(root.path().join("static").join("js")).expect("create static");
+        let static_alias = root.path().join("static").display().to_string();
+
+        with_cwd(root.path(), || {
+            let watch_dirs = vec![
+                "src".to_owned(),
+                "static".to_owned(),
+                "templates".to_owned(),
+                "migrations".to_owned(),
+                static_alias.clone(),
+            ];
+            assert_eq!(
+                classify_change_with_watch_dirs(
+                    Path::new("static/js/app.js"),
+                    DebouncedEventKind::Any,
+                    &watch_dirs
+                ),
+                ChangeEffect::BrowserReloadOnly
+            );
+        });
     }
 
     #[test]
@@ -1842,6 +1933,22 @@ watch_dirs = ["./views", "locales", "src"]
             normalize_watch_dir("./frontend/views/"),
             Some("frontend/views".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_watch_dirs_deduplicates_default_aliases() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("static")).expect("create static");
+        let static_alias = dir.path().join("static").display().to_string();
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            format!("[dev]\nwatch_dirs = [\"{static_alias}\"]\n"),
+        )
+        .expect("write config");
+
+        let dirs = with_cwd(dir.path(), resolve_watch_dirs);
+        assert_eq!(dirs.iter().filter(|d| d.as_str() == "static").count(), 1);
+        assert_eq!(dirs.len(), WATCH_DIRS.len());
     }
 
     #[test]
