@@ -11,13 +11,14 @@ keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "oauth2"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
 tailwind = []
+oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -79,8 +80,8 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 subtle = "2.6.1"
 url = "2.5.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-jsonwebtoken = "10.1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+jsonwebtoken = { version = "10.1.0", optional = true }
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }

@@ -53,19 +53,24 @@
 //! `401 Unauthorized` before they reach the handler. It checks for the
 //! presence of a session key (default: `"user_id"`).
 
+#[cfg(feature = "oauth2")]
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+#[cfg(feature = "oauth2")]
 use std::time::Duration;
 
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
+#[cfg(feature = "oauth2")]
 use jsonwebtoken::jwk::JwkSet;
+#[cfg(feature = "oauth2")]
 use serde::Deserialize;
+#[cfg(feature = "oauth2")]
 use url::Url;
 
 // ── Password hashing ────────────────────────────────────────────
@@ -383,6 +388,7 @@ pub struct AuthConfig {
 
     /// OAuth2/OIDC provider configuration by provider key
     /// (for example: `github`, `google`, `okta`).
+    #[cfg(feature = "oauth2")]
     #[serde(default)]
     pub oauth2: OAuth2Config,
 }
@@ -395,12 +401,15 @@ fn default_session_key() -> String {
     "user_id".to_owned()
 }
 
+#[cfg(feature = "oauth2")]
 fn default_provider_scope() -> String {
     String::new()
 }
 
+#[cfg(feature = "oauth2")]
 const OAUTH_HTTP_TIMEOUT_SECS: u64 = 15;
 
+#[cfg(feature = "oauth2")]
 /// `OAuth2` provider map loaded from `autumn.toml`.
 ///
 /// Example:
@@ -422,6 +431,7 @@ pub struct OAuth2Config {
     pub providers: HashMap<String, OAuth2ProviderConfig>,
 }
 
+#[cfg(feature = "oauth2")]
 /// A single OAuth2/OIDC provider configuration entry.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OAuth2ProviderConfig {
@@ -442,6 +452,7 @@ pub struct OAuth2ProviderConfig {
     pub jwks_url: Option<String>,
 }
 
+#[cfg(feature = "oauth2")]
 /// Query extractor payload for `OAuth2` callback handlers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OAuth2Callback {
@@ -449,6 +460,7 @@ pub struct OAuth2Callback {
     pub state: String,
 }
 
+#[cfg(feature = "oauth2")]
 /// Identity information extracted from an OIDC ID token or userinfo endpoint.
 #[derive(Debug, Clone)]
 pub struct OidcIdentity {
@@ -459,6 +471,7 @@ pub struct OidcIdentity {
     pub raw_claims: serde_json::Value,
 }
 
+#[cfg(feature = "oauth2")]
 #[derive(Debug, Deserialize)]
 struct OAuth2TokenResponse {
     access_token: String,
@@ -467,6 +480,7 @@ struct OAuth2TokenResponse {
     id_token: Option<String>,
 }
 
+#[cfg(feature = "oauth2")]
 /// Build an `OAuth2` authorization URL and persist anti-CSRF state + nonce in session.
 ///
 /// # Errors
@@ -502,6 +516,7 @@ pub async fn oauth2_authorize_url(
     Ok(url.into())
 }
 
+#[cfg(feature = "oauth2")]
 /// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
 ///
 /// On success this method rotates the session ID and writes:
@@ -527,6 +542,7 @@ pub async fn oauth2_finish_login(
     finalize_oauth2_session(session, session_key, provider_name, subject, claims).await
 }
 
+#[cfg(feature = "oauth2")]
 async fn validate_callback_state(
     session: &crate::session::Session,
     provider_name: &str,
@@ -547,6 +563,7 @@ async fn validate_callback_state(
     Ok(())
 }
 
+#[cfg(feature = "oauth2")]
 async fn exchange_oauth2_token(
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
@@ -580,6 +597,7 @@ async fn exchange_oauth2_token(
     parse_oauth2_token_response(token_content_type.as_deref(), &token_body)
 }
 
+#[cfg(feature = "oauth2")]
 async fn load_identity_claims(
     provider: &OAuth2ProviderConfig,
     token: &OAuth2TokenResponse,
@@ -613,6 +631,7 @@ async fn load_identity_claims(
     ))
 }
 
+#[cfg(feature = "oauth2")]
 async fn validate_oidc_nonce(
     session: &crate::session::Session,
     provider_name: &str,
@@ -637,6 +656,7 @@ async fn validate_oidc_nonce(
     Ok(())
 }
 
+#[cfg(feature = "oauth2")]
 async fn finalize_oauth2_session(
     session: &crate::session::Session,
     session_key: &str,
@@ -665,6 +685,7 @@ async fn finalize_oauth2_session(
     })
 }
 
+#[cfg(feature = "oauth2")]
 fn parse_oauth2_token_response(
     content_type: Option<&str>,
     body: &str,
@@ -690,12 +711,14 @@ fn parse_oauth2_token_response(
     })
 }
 
+#[cfg(feature = "oauth2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentitySource {
     IdToken,
     UserInfo,
 }
 
+#[cfg(feature = "oauth2")]
 fn extract_subject(
     claims: &serde_json::Value,
     source: IdentitySource,
@@ -719,6 +742,7 @@ fn extract_subject(
     Err(crate::AutumnError::bad_request_msg("missing sub claim"))
 }
 
+#[cfg(feature = "oauth2")]
 async fn validate_and_decode_id_token(
     token: &str,
     provider: &OAuth2ProviderConfig,
@@ -772,6 +796,7 @@ async fn validate_and_decode_id_token(
     Ok(claims.claims)
 }
 
+#[cfg(feature = "oauth2")]
 fn oauth_http_client() -> crate::AutumnResult<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
@@ -788,6 +813,7 @@ impl Default for AuthConfig {
         Self {
             bcrypt_cost: default_bcrypt_cost(),
             session_key: default_session_key(),
+            #[cfg(feature = "oauth2")]
             oauth2: OAuth2Config::default(),
         }
     }
@@ -837,9 +863,11 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(config.bcrypt_cost, 12);
         assert_eq!(config.session_key, "user_id");
+        #[cfg(feature = "oauth2")]
         assert!(config.oauth2.providers.is_empty());
     }
 
+    #[cfg(feature = "oauth2")]
     #[test]
     fn oauth2_config_deserializes_provider_tables() {
         let cfg: crate::config::AutumnConfig = toml::from_str(
@@ -860,6 +888,7 @@ mod tests {
         assert!(provider.jwks_url.is_none());
     }
 
+    #[cfg(feature = "oauth2")]
     #[tokio::test]
     async fn oauth2_authorize_url_sets_state_and_nonce() {
         let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
@@ -882,6 +911,7 @@ mod tests {
         assert!(session.get("oauth2:github:nonce").await.is_some());
     }
 
+    #[cfg(feature = "oauth2")]
     #[tokio::test]
     async fn oauth2_authorize_url_omits_scope_when_empty() {
         let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
@@ -902,6 +932,7 @@ mod tests {
         assert!(!url.contains("scope="));
     }
 
+    #[cfg(feature = "oauth2")]
     #[tokio::test]
     async fn validate_id_token_requires_oidc_metadata() {
         let provider = OAuth2ProviderConfig {
@@ -921,6 +952,7 @@ mod tests {
         assert_eq!(err.to_string(), "provider.issuer required for oidc");
     }
 
+    #[cfg(feature = "oauth2")]
     #[test]
     fn parse_oauth2_token_response_supports_form_encoded_payload() {
         let token = parse_oauth2_token_response(
@@ -932,6 +964,7 @@ mod tests {
         assert_eq!(token.token_type.as_deref(), Some("bearer"));
     }
 
+    #[cfg(feature = "oauth2")]
     #[test]
     fn extract_subject_allows_userinfo_id_fallback() {
         let claims = serde_json::json!({ "id": 42 });
@@ -939,6 +972,7 @@ mod tests {
         assert_eq!(subject, "42");
     }
 
+    #[cfg(feature = "oauth2")]
     #[test]
     fn extract_subject_requires_sub_for_id_token() {
         let claims = serde_json::json!({ "id": "abc" });
