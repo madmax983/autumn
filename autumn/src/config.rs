@@ -6,8 +6,9 @@
 //! 1. **Framework defaults** (this module) -- compiled into the binary.
 //! 2. **Profile smart defaults** -- per-profile values for `dev`/`prod`.
 //! 3. **`autumn.toml`** -- project-level overrides checked into source control.
-//! 4. **`autumn-{profile}.toml`** -- profile-specific overrides.
-//! 5. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
+//! 4. **`[profile.{name}]` in `autumn.toml`** -- profile-specific overrides.
+//! 5. **`autumn-{profile}.toml`** -- legacy profile-specific overrides.
+//! 6. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
 //!
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
@@ -15,9 +16,10 @@
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
-//! 1. `AUTUMN_PROFILE` environment variable
-//! 2. `--profile` CLI flag
-//! 3. Auto-detect from debug/release build mode
+//! 1. `AUTUMN_ENV` environment variable
+//! 2. `AUTUMN_PROFILE` environment variable (legacy alias)
+//! 3. `--profile` CLI flag
+//! 4. Auto-detect from debug/release build mode
 //!
 //! # Example
 //!
@@ -76,7 +78,8 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
-//! | `AUTUMN_PROFILE` | active profile | `String` |
+//! | `AUTUMN_ENV` | active profile | `String` |
+//! | `AUTUMN_PROFILE` | active profile (legacy alias) | `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -204,38 +207,89 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     }
 }
 
-/// Resolve the active profile using the three-mechanism precedence chain.
+/// Resolve the active profile using the precedence chain.
 ///
-/// 1. `AUTUMN_PROFILE` env var (highest priority)
-/// 2. `--profile <name>` CLI flag
-/// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
-pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
-    // 1. Env var
-    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        if !profile.is_empty() {
-            return Some(profile);
+/// 1. `AUTUMN_ENV` env var (highest priority)
+/// 2. `AUTUMN_PROFILE` env var (legacy alias)
+/// 3. `--profile <name>` CLI flag
+/// 4. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
+/// 5. Fallback to `dev`
+pub(crate) fn resolve_profile(env: &dyn Env) -> String {
+    // 1. Preferred env var
+    if let Ok(profile) = env.var("AUTUMN_ENV") {
+        if let Some(profile) = normalize_profile_name(&profile) {
+            return profile;
         }
     }
 
-    // 2. CLI flag
+    // 2. Legacy env var
+    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
+        if let Some(profile) = normalize_profile_name(&profile) {
+            return profile;
+        }
+    }
+
+    // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
         if arg == "--profile" {
             if let Some(profile) = args.get(i + 1) {
-                return Some(profile.clone());
+                if let Some(profile) = normalize_profile_name(profile) {
+                    return profile;
+                }
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
-            return Some(profile.to_owned());
+            if let Some(profile) = normalize_profile_name(profile) {
+                return profile;
+            }
         }
     }
 
-    // 3. Auto-detect from build mode
-    match env.var("AUTUMN_IS_DEBUG").ok().as_deref() {
-        Some("1") => Some("dev".to_owned()),
-        Some("0") => Some("prod".to_owned()),
-        _ => None,
+    // 4. Auto-detect from build mode
+    if env.var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
+        return "prod".to_owned();
     }
+    "dev".to_owned()
+}
+
+/// Normalize profile aliases and trim whitespace.
+///
+/// Supported aliases:
+/// - `production` -> `prod`
+/// - `development` -> `dev`
+/// - `prod`/`PROD` -> `prod`
+/// - `dev`/`DEV` -> `dev`
+fn normalize_profile_name(profile: &str) -> Option<String> {
+    let trimmed = profile.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.eq_ignore_ascii_case("production") {
+        return Some("prod".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("development") {
+        return Some("dev".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("prod") {
+        return Some("prod".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("dev") {
+        return Some("dev".to_owned());
+    }
+
+    // Preserve user-specified case for custom profile names.
+    Some(trimmed.to_owned())
+}
+
+/// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
 }
 
 /// Profile-specific smart defaults as a TOML table.
@@ -383,6 +437,10 @@ fn warn_profile_typo(profile: &str) {
     }
 }
 
+fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: bool) -> bool {
+    profile != "dev" && profile != "prod" && !has_inline_profile_section
+}
+
 /// Levenshtein edit distance between two strings.
 ///
 /// ⚡ Bolt Optimization:
@@ -513,12 +571,13 @@ pub struct AutumnConfig {
 impl AutumnConfig {
     /// Load configuration with profile-aware layering.
     ///
-    /// Applies the five-layer configuration system:
+    /// Applies the six-layer configuration system:
     /// 1. Framework defaults
     /// 2. Profile smart defaults (dev/prod)
     /// 3. `autumn.toml` (base config)
-    /// 4. `autumn-{profile}.toml` (profile overrides)
-    /// 5. `AUTUMN_*` environment variables
+    /// 4. `[profile.{name}]` section in `autumn.toml`
+    /// 5. `autumn-{profile}.toml` (legacy profile overrides)
+    /// 6. `AUTUMN_*` environment variables
     ///
     /// # Errors
     ///
@@ -546,35 +605,40 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
         let profile = resolve_profile(env);
+        let mut has_inline_profile_section = false;
 
-        // Build merged TOML: profile smart defaults ← autumn.toml ← autumn-{profile}.toml
-        let mut merged = profile.as_ref().map_or_else(
-            || toml::Value::Table(toml::map::Map::new()),
-            |p| profile_defaults_as_toml(p),
-        );
+        // Build merged TOML:
+        // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
+        let mut merged = profile_defaults_as_toml(&profile);
 
         // Layer 3: base autumn.toml
         if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
-            deep_merge(&mut merged, base);
+            deep_merge(&mut merged, base.clone());
+
+            // Layer 4: [profile.{name}] in autumn.toml
+            if let Some(inline_profile) = profile_section_from_base_toml(&base, &profile) {
+                deep_merge(&mut merged, inline_profile);
+                has_inline_profile_section = true;
+            }
         }
 
-        // Layer 4: autumn-{profile}.toml
-        if let Some(ref p) = profile {
-            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
-            match load_raw_toml(&profile_path)? {
-                Some(profile_toml) => deep_merge(&mut merged, profile_toml),
-                None if p != "dev" && p != "prod" => warn_profile_typo(p),
-                None => {}
+        // Layer 5: autumn-{profile}.toml (legacy compatibility)
+        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
+        match load_raw_toml(&profile_path)? {
+            Some(profile_toml) => deep_merge(&mut merged, profile_toml),
+            None if should_warn_missing_profile_file(&profile, has_inline_profile_section) => {
+                warn_profile_typo(&profile);
             }
+            None => {}
         }
 
         // Deserialize the merged TOML table into AutumnConfig
         let toml_str =
             toml::to_string(&merged).expect("internal error: failed to serialize merged config");
         let mut config: Self = toml::from_str(&toml_str)?;
-        config.profile = profile;
+        config.profile = Some(profile);
 
-        // Layer 5: env var overrides (highest priority)
+        // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
         config.validate()?;
@@ -2278,24 +2342,79 @@ path = "/healthz"
     // ── Profile tests ──────────────────────────────────────────
 
     #[test]
-    fn resolve_profile_from_env() {
+    fn resolve_profile_from_autumn_env() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_from_legacy_env() {
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(profile, "staging");
+    }
+
+    #[test]
+    fn resolve_profile_prefers_autumn_env_over_legacy_alias() {
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "dev")
+            .with("AUTUMN_PROFILE", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_production_alias() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "production");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_development_alias_with_whitespace() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "  development  ");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_uppercase_dev_and_prod() {
+        let prod_env = MockEnv::new().with("AUTUMN_ENV", "PROD");
+        let prod = resolve_profile(&prod_env);
+        assert_eq!(prod, "prod");
+
+        let dev_env = MockEnv::new().with("AUTUMN_ENV", "DEV");
+        let dev = resolve_profile(&dev_env);
+        assert_eq!(dev, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_preserves_case_for_custom_profiles() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "QA");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "QA");
     }
 
     #[test]
     fn resolve_profile_auto_detect_debug() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "1");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
     fn resolve_profile_auto_detect_release() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "0");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_defaults_to_dev_when_no_signal_present() {
+        let env = MockEnv::new();
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
     }
 
     #[test]
@@ -2440,6 +2559,33 @@ path = "/healthz"
     }
 
     #[test]
+    fn inline_profile_section_overrides_base_toml() {
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        let base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            port = 3000
+
+            [log]
+            level = "info"
+
+            [profile.dev.log]
+            level = "debug"
+            "#,
+        )
+        .unwrap();
+
+        deep_merge(&mut merged, base.clone());
+        let inline = profile_section_from_base_toml(&base, "dev").unwrap();
+        deep_merge(&mut merged, inline);
+
+        let toml_str = toml::to_string(&merged).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(config.log.level, "debug");
+    }
+
+    #[test]
     fn levenshtein_basic() {
         assert_eq!(levenshtein("dev", "dev"), 0);
         assert_eq!(levenshtein("dev", "dve"), 2); // swap = 2 edits (del + ins)
@@ -2568,6 +2714,22 @@ path = "/healthz"
     }
 
     #[test]
+    fn should_warn_missing_profile_file_custom_without_inline() {
+        assert!(should_warn_missing_profile_file("staging", false));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_custom_with_inline() {
+        assert!(!should_warn_missing_profile_file("staging", true));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_dev_or_prod() {
+        assert!(!should_warn_missing_profile_file("dev", false));
+        assert!(!should_warn_missing_profile_file("prod", false));
+    }
+
+    #[test]
     fn levenshtein_threshold_in_warn_profile_typo() {
         assert!(levenshtein("dve", "dev") <= 2);
         assert!(levenshtein("xyz", "dev") > 2);
@@ -2674,6 +2836,31 @@ path = "/healthz"
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn load_custom_profile_uses_inline_profile_without_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &base_path,
+            r"
+            [server]
+            port = 3000
+
+            [profile.staging.server]
+            port = 4100
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "staging")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("staging"));
+        assert_eq!(config.server.port, 4100);
     }
 
     #[test]
