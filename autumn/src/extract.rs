@@ -208,10 +208,7 @@ impl<'a> MultipartField<'a> {
         while let Some(chunk) = self.inner.chunk().await.map_err(multipart_error_to_error)? {
             read += chunk.len();
             if read > self.max_file_size_bytes {
-                return Err(crate::AutumnError::bad_request_msg(format!(
-                    "uploaded file exceeds limit of {} bytes",
-                    self.max_file_size_bytes
-                )));
+                return Err(file_too_large_error(self.max_file_size_bytes));
             }
             out.extend_from_slice(&chunk);
         }
@@ -241,10 +238,7 @@ impl<'a> MultipartField<'a> {
             if written > self.max_file_size_bytes {
                 drop(file);
                 let _ = tokio::fs::remove_file(path).await;
-                return Err(crate::AutumnError::bad_request_msg(format!(
-                    "uploaded file exceeds limit of {} bytes",
-                    self.max_file_size_bytes
-                )));
+                return Err(file_too_large_error(self.max_file_size_bytes));
             }
             file.write_all(&chunk)
                 .await
@@ -264,7 +258,14 @@ fn multipart_rejection_to_error(
 }
 
 fn multipart_error_to_error(err: axum::extract::multipart::MultipartError) -> crate::AutumnError {
-    crate::AutumnError::bad_request_msg(format!("multipart read error: {err}"))
+    crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
+}
+
+fn file_too_large_error(max_file_size_bytes: usize) -> crate::AutumnError {
+    crate::AutumnError::bad_request_msg(format!(
+        "uploaded file exceeds limit of {max_file_size_bytes} bytes",
+    ))
+    .with_status(http::StatusCode::PAYLOAD_TOO_LARGE)
 }
 
 pub use axum::extract::State;
