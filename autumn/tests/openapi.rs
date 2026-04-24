@@ -100,6 +100,22 @@ async fn post_widgets(axum::Json(_body): axum::Json<Vec<Widget>>) -> http::Statu
     http::StatusCode::OK
 }
 
+// `Valid<Json<T>>` is Autumn's documented validation pattern. The
+// generator must see straight through the wrapper so the resulting
+// spec still reports a request body.
+#[derive(serde::Deserialize, serde::Serialize, validator::Validate)]
+struct NewWidget {
+    #[validate(length(min = 1))]
+    name: String,
+}
+
+#[post("/validated-widgets")]
+async fn create_validated_widget(
+    _body: autumn_web::Valid<autumn_web::Json<NewWidget>>,
+) -> http::StatusCode {
+    http::StatusCode::CREATED
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -241,6 +257,18 @@ fn json_vec_request_body_is_emitted_as_array_schema() {
         .as_ref()
         .expect("Json<Vec<T>> request body must infer");
     assert!(matches!(body.kind, SchemaKind::Array(_)));
+}
+
+#[test]
+fn valid_json_request_body_is_inferred() {
+    let route = __autumn_route_info_create_validated_widget();
+    let body = route
+        .api_doc
+        .request_body
+        .as_ref()
+        .expect("Valid<Json<T>> request body should be inferred");
+    assert_eq!(body.name, "NewWidget");
+    assert_eq!(body.kind, SchemaKind::Ref);
 }
 
 // ── Spec generation pipeline ───────────────────────────────────────

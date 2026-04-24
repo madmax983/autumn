@@ -303,13 +303,37 @@ pub fn emit_path_param_slice(params: &[String]) -> TokenStream {
 ///
 /// Returns a `Some(tokens)` producing a `SchemaEntry` initializer for the
 /// first JSON extractor seen, or `None` if the handler has no JSON body.
+///
+/// Recognizes Autumn's validation wrapper as well: a parameter typed
+/// `Valid<Json<T>>` is treated the same as `Json<T>` so handlers using
+/// the documented validator pattern still get a `requestBody` in the
+/// generated spec.
 pub fn infer_request_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
     for arg in &input_fn.sig.inputs {
         let syn::FnArg::Typed(pat) = arg else {
             continue;
         };
-        if let Some(inner) = unwrap_single_generic(&pat.ty, "Json") {
+        if let Some(inner) = unwrap_json_body(&pat.ty) {
             return Some(schema_entry_for_type(&inner));
+        }
+    }
+    None
+}
+
+/// Peel one layer of `Valid<...>` so that
+/// `Valid<Json<NewPost>>` → `Json<NewPost>` → `NewPost`.
+///
+/// Matches either a bare `Json<T>` or `Valid<Json<T>>` and returns the
+/// inner `T`. Any deeper nesting returns `None` — we intentionally
+/// don't guess at unknown wrappers because mis-identifying them would
+/// produce wrong schemas.
+fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
+    if let Some(inner) = unwrap_single_generic(ty, "Json") {
+        return Some(inner);
+    }
+    if let Some(inner) = unwrap_single_generic(ty, "Valid") {
+        if let Some(payload) = unwrap_single_generic(&inner, "Json") {
+            return Some(payload);
         }
     }
     None
