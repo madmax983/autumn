@@ -664,10 +664,33 @@ fn load_custom_watch_dirs(config_path: &Path) -> Vec<String> {
     watch_dirs
         .iter()
         .filter_map(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty())
-        .map(ToOwned::to_owned)
+        .filter_map(normalize_watch_dir)
         .collect()
+}
+
+fn normalize_watch_dir(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => normalized.push(".."),
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized.to_string_lossy().to_string())
+    }
 }
 
 fn is_profile_config_file(file_name: &str) -> bool {
@@ -1554,7 +1577,7 @@ mod tests {
         std::fs::write(
             dir.path().join("autumn.toml"),
             r#"[dev]
-watch_dirs = ["views", "locales", "src"]
+watch_dirs = ["./views", "locales", "src"]
 "#,
         )
         .expect("write config");
@@ -1576,6 +1599,15 @@ watch_dirs = ["views", "locales", "src"]
             dirs.iter().filter(|d| d.as_str() == "src").count(),
             1,
             "default dirs should not be duplicated"
+        );
+    }
+
+    #[test]
+    fn normalize_watch_dir_strips_leading_dot_slash() {
+        assert_eq!(normalize_watch_dir("./views"), Some("views".to_string()));
+        assert_eq!(
+            normalize_watch_dir("./frontend/views/"),
+            Some("frontend/views".to_string())
         );
     }
 
