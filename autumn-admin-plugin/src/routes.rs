@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use std::convert::Infallible;
+use std::sync::LazyLock;
 
 use autumn_web::flash::Flash;
 use autumn_web::prelude::HxResponseExt;
@@ -63,12 +64,32 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
     }
 }
 
-/// Plugin-owned JS served at `{prefix}/static/admin.js`. External file
-/// (not inline) so it works under the default CSP `script-src 'self'`.
+/// Plugin-owned JS. Served as an external file (not inline) so it works
+/// under the default CSP `script-src 'self'`.
 const ADMIN_JS: &str = include_str!("admin.js");
 
-/// Route (relative to the plugin prefix) where [`ADMIN_JS`] is served.
-pub const ADMIN_JS_PATH: &str = "/static/admin.js";
+/// FNV-1a 64-bit hash of the shipped JS, computed at compile time. Used to
+/// fingerprint the asset path so the browser cache can be `immutable` for
+/// a year without risking a post-deploy mismatch between cached client JS
+/// and newer server templates — bumping the JS bumps the URL.
+const ADMIN_JS_HASH: u64 = fnv1a_64(ADMIN_JS.as_bytes());
+
+const fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
+}
+
+/// Route path (relative to the plugin prefix) where [`ADMIN_JS`] is served.
+/// Format: `/static/admin.<hash>.js`. Built at startup from the compile-time
+/// content hash; stable for the lifetime of the process.
+pub static ADMIN_JS_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("/static/admin.{ADMIN_JS_HASH:016x}.js"));
 
 // ── Router construction ─────────────────────────────────────────────
 
@@ -91,7 +112,7 @@ pub fn admin_router(
                 .delete(model_delete),
         )
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
-        .route(ADMIN_JS_PATH, routing::get(serve_admin_js))
+        .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
         .layer(axum::Extension(ActuatorPrefix(actuator_prefix)))
         .layer(axum::Extension(registry));

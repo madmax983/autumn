@@ -329,7 +329,7 @@ pub fn admin_layout(
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
                 // External so it runs under the default CSP `script-src 'self'`.
-                script src={ (prefix) (ADMIN_JS_PATH) } {}
+                script src={ (prefix) (&**ADMIN_JS_PATH) } {}
                 style {
                     (PreEscaped(TOKENS_CSS))
                     (PreEscaped(FLASH_CSS))
@@ -782,6 +782,56 @@ fn truncate_display(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Normalize a stored date string into `YYYY-MM-DD`, the only format the
+/// HTML `<input type="date">` control accepts. Leaves the input untouched
+/// if it can't be parsed — the user sees whatever the backend sent rather
+/// than a silently-empty field.
+fn normalize_date_input(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    // Fast path: already in the right shape.
+    if chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok() {
+        return s.to_owned();
+    }
+    // Fall back to full RFC 3339 (which includes the `T` + time).
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.format("%Y-%m-%d").to_string();
+    }
+    // Finally try a naive datetime.
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return ndt.format("%Y-%m-%d").to_string();
+    }
+    s.to_owned()
+}
+
+/// Normalize a stored datetime string into `YYYY-MM-DDTHH:MM`, the only
+/// format the HTML `<input type="datetime-local">` control accepts.
+/// Browsers silently reject RFC 3339 with `Z`/offset; this maps common
+/// backend representations onto the local-time shape the input expects.
+///
+/// Timezone-aware inputs are converted to UTC (same instant, different
+/// representation). If parsing fails, the original string is returned
+/// unchanged — better to show the server's value than silently blank the
+/// field on edit.
+fn normalize_datetime_local_input(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    // Already local-shaped.
+    if chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").is_ok() {
+        return s.to_owned();
+    }
+    if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return ndt.format("%Y-%m-%dT%H:%M").to_string();
+    }
+    // RFC 3339 with timezone — serialize as UTC, drop the offset.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.naive_utc().format("%Y-%m-%dT%H:%M").to_string();
+    }
+    s.to_owned()
+}
+
 /// Render a field value in the detail view.
 fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
     let val = record.get(field.name);
@@ -859,16 +909,22 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
                     style="width: auto;";
             }
         }
-        AdminFieldKind::Date => html! {
-            input type="date" class="form-input" name=(field.name) id=(field.name)
-                value=(str_val)
-                required[field.required];
-        },
-        AdminFieldKind::DateTime => html! {
-            input type="datetime-local" class="form-input" name=(field.name) id=(field.name)
-                value=(str_val)
-                required[field.required];
-        },
+        AdminFieldKind::Date => {
+            let v = normalize_date_input(&str_val);
+            html! {
+                input type="date" class="form-input" name=(field.name) id=(field.name)
+                    value=(v)
+                    required[field.required];
+            }
+        }
+        AdminFieldKind::DateTime => {
+            let v = normalize_datetime_local_input(&str_val);
+            html! {
+                input type="datetime-local" class="form-input" name=(field.name) id=(field.name)
+                    value=(v)
+                    required[field.required];
+            }
+        }
         AdminFieldKind::Select(options) => html! {
             select class="form-input" name=(field.name) id=(field.name)
                 required[field.required] {
@@ -1050,6 +1106,61 @@ mod tests {
         assert_eq!(url_encode("é"), "%C3%A9");
     }
 
+    #[test]
+    fn normalize_datetime_local_accepts_expected_shape() {
+        assert_eq!(
+            normalize_datetime_local_input("2026-04-24T12:34"),
+            "2026-04-24T12:34"
+        );
+    }
+
+    #[test]
+    fn normalize_datetime_local_strips_seconds() {
+        assert_eq!(
+            normalize_datetime_local_input("2026-04-24T12:34:56"),
+            "2026-04-24T12:34"
+        );
+    }
+
+    #[test]
+    fn normalize_datetime_local_strips_rfc3339_zulu() {
+        // The browser refuses the `Z` suffix; we emit UTC without offset.
+        assert_eq!(
+            normalize_datetime_local_input("2026-04-24T12:34:56Z"),
+            "2026-04-24T12:34"
+        );
+    }
+
+    #[test]
+    fn normalize_datetime_local_strips_rfc3339_offset() {
+        // +05:30 offset → converted to UTC (07:04), then rendered local-shaped.
+        assert_eq!(
+            normalize_datetime_local_input("2026-04-24T12:34:56+05:30"),
+            "2026-04-24T07:04"
+        );
+    }
+
+    #[test]
+    fn normalize_datetime_local_empty_stays_empty() {
+        assert_eq!(normalize_datetime_local_input(""), "");
+    }
+
+    #[test]
+    fn normalize_datetime_local_leaves_garbage_untouched() {
+        // Better to show the raw value than silently blank the field.
+        assert_eq!(normalize_datetime_local_input("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn normalize_date_accepts_expected_shape() {
+        assert_eq!(normalize_date_input("2026-04-24"), "2026-04-24");
+    }
+
+    #[test]
+    fn normalize_date_extracts_from_rfc3339() {
+        assert_eq!(normalize_date_input("2026-04-24T12:34:56Z"), "2026-04-24");
+    }
+
     // ── End-to-end render checks (CSRF / XSS / actuator prefix wiring) ──
 
     fn dummy_registry() -> AdminRegistry {
@@ -1109,6 +1220,36 @@ mod tests {
         assert!(
             html.contains(r#"<input type="hidden" name="_csrf" value="tok-xyz""#),
             "_csrf hidden field missing: {html}"
+        );
+    }
+
+    #[test]
+    fn form_page_normalizes_datetime_for_browser_input() {
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("created_at", AdminFieldKind::DateTime)];
+        // RFC 3339 with `Z` — would render as empty without normalization.
+        let record = serde_json::json!({"id": 1, "created_at": "2026-04-24T12:34:56Z"});
+        let html = model_form_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            Some(&record),
+            Some(1),
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"value="2026-04-24T12:34""#),
+            "datetime-local input should carry browser-friendly value: {html}"
+        );
+        assert!(
+            !html.contains(r#"value="2026-04-24T12:34:56Z""#),
+            "raw RFC3339 must not reach datetime-local input: {html}"
         );
     }
 
@@ -1216,12 +1357,23 @@ mod tests {
     fn layout_loads_external_admin_js_not_inline() {
         // The layout must NOT ship an inline <script>{js}</script> block —
         // that would be blocked by the default CSP (`script-src 'self'`).
-        // Instead it must load the plugin-owned asset at /{prefix}/static/admin.js.
+        // Instead it must load the plugin-owned asset at a fingerprinted
+        // `/{prefix}/static/admin.<hash>.js` URL.
         let r = dummy_registry();
         let html = dashboard_page(&r, &[], &[], "t", "/admin", "/actuator").into_string();
+        let expected = format!(r#"src="/admin{}""#, &**ADMIN_JS_PATH);
         assert!(
-            html.contains(r#"src="/admin/static/admin.js""#),
-            "admin.js must be referenced as an external script: {html}"
+            html.contains(&expected),
+            "admin.js must be referenced as an external script at {expected}: {html}"
+        );
+        // The URL must be content-fingerprinted so immutable caching is safe.
+        assert!(
+            html.contains("/admin/static/admin.") && html.contains(".js\""),
+            "admin.js URL should be fingerprinted (admin.<hash>.js): {html}"
+        );
+        assert!(
+            !html.contains(r#"src="/admin/static/admin.js""#),
+            "unfingerprinted URL would invalidate immutable caching: {html}"
         );
         // No inline onclick on the select-all checkbox either — it's
         // wired via event delegation in admin.js now.
