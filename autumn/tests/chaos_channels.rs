@@ -1,3 +1,4 @@
+#![cfg(feature = "ws")]
 //!
 //! Chaos tests for channels.
 //!
