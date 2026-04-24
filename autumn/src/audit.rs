@@ -289,7 +289,7 @@ mod tests {
             .await
             .expect("read audit file");
         let line_count = content.lines().filter(|l| !l.is_empty()).count();
-        assert_eq!(line_count, 2, "content:\n{}", content);
+        assert_eq!(line_count, 2, "content:\n{content}");
     }
 
     #[tokio::test]
