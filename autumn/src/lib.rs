@@ -68,6 +68,7 @@ extern crate self as autumn_web;
 
 pub mod actuator;
 pub mod app;
+pub mod audit;
 pub mod auth;
 pub mod cache;
 #[cfg(feature = "ws")]
