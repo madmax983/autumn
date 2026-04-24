@@ -605,20 +605,20 @@ fn path_contains_dir(path: &Path, dir: &str) -> bool {
 
     // notify can emit absolute paths on some backends/platforms. Anchor custom
     // matching to the workspace-relative watched prefix when possible.
-    if path.is_absolute()
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        if let Ok(relative) = path.strip_prefix(&cwd)
-            && path_starts_with_watch_dir(relative, dir)
-        {
-            return true;
-        }
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(relative) = path.strip_prefix(&cwd) {
+                if path_starts_with_watch_dir(relative, dir) {
+                    return true;
+                }
+            }
 
-        if dir.is_relative() {
-            let absolute_dir = cwd.join(dir);
-            let absolute_dir = std::fs::canonicalize(&absolute_dir).unwrap_or(absolute_dir);
-            if path_starts_with_watch_dir(path, &absolute_dir) {
-                return true;
+            if dir.is_relative() {
+                let absolute_dir = cwd.join(dir);
+                let absolute_dir = std::fs::canonicalize(&absolute_dir).unwrap_or(absolute_dir);
+                if path_starts_with_watch_dir(path, &absolute_dir) {
+                    return true;
+                }
             }
         }
     }
