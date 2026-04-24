@@ -84,6 +84,10 @@ pub struct RouterContext {
     /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
     /// uses it directly and skips the config-driven backend selection.
     pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// OpenAPI generation configuration. When `Some`, the router mounts
+    /// an `openapi.json` endpoint and (optionally) a Swagger UI page
+    /// describing the application's routes.
+    pub openapi: Option<crate::openapi::OpenApiConfig>,
 }
 
 /// Checked variant of [`build_router`] that returns configuration errors
@@ -111,6 +115,7 @@ pub fn try_build_router(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            openapi: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -170,6 +175,7 @@ pub fn try_build_router_merged(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            openapi: None,
         },
     )?;
     Ok(apply_startup_barrier(
@@ -185,6 +191,11 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
+    // Build the OpenAPI spec BEFORE moving the routes into axum, because
+    // group_and_mount_routes consumes the Route list.
+    let openapi_router =
+        build_openapi_router(&route_list, &ctx.scoped_groups, ctx.openapi.as_ref());
+
     let mut router = group_and_mount_routes(route_list);
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
@@ -195,6 +206,10 @@ pub fn try_build_router_inner(
     router = router_with_probes;
 
     router = mount_actuator_endpoints(router, config, &mounted_probe_paths)?;
+
+    if let Some(openapi_router) = openapi_router {
+        router = router.merge(openapi_router);
+    }
 
     // Static file serving from project's static/ directory.
     let env = crate::config::OsEnv;
@@ -222,6 +237,95 @@ pub fn try_build_router_inner(
     }
 
     Ok(router.with_state(state))
+}
+
+/// Build an Axum sub-router that serves the generated OpenAPI document
+/// and (optionally) a Swagger UI HTML page.
+///
+/// Returns `None` when OpenAPI generation is disabled, i.e. the user
+/// never called [`AppBuilder::openapi`](crate::app::AppBuilder::openapi).
+///
+/// The spec is rendered once at build time and stored in an `Arc<String>`
+/// so the `/v3/api-docs` handler performs no serialization per request.
+fn build_openapi_router(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+    openapi_config: Option<&crate::openapi::OpenApiConfig>,
+) -> Option<axum::Router<AppState>> {
+    let config = openapi_config?;
+
+    // Walk both top-level routes and scoped groups. For scoped groups the
+    // effective path is `prefix + route.path`; we materialize these into
+    // fresh `ApiDoc`s so the rendered spec reflects the actual URL the
+    // user will call.
+    let mut docs: Vec<crate::openapi::ApiDoc> = Vec::new();
+    for route in route_list {
+        docs.push(route.api_doc.clone());
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            let mut doc = route.api_doc.clone();
+            // Leak the combined path so it fits the `&'static str` shape of
+            // ApiDoc. The spec is built once per process; the leak is
+            // bounded by the route table size.
+            let full = format!("{}{}", group.prefix, route.api_doc.path);
+            doc.path = Box::leak(full.into_boxed_str());
+            docs.push(doc);
+        }
+    }
+
+    let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
+    let spec = crate::openapi::generate_spec(config, &refs);
+    let spec_json = serde_json::to_string_pretty(&spec)
+        .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
+
+    let spec_body = Arc::new(spec_json);
+    let json_path = config.openapi_json_path.clone();
+    let swagger_path = config.swagger_ui_path.clone();
+    let title = config.title.clone();
+
+    let spec_for_handler = spec_body.clone();
+    let mut router = axum::Router::<AppState>::new().route(
+        &json_path,
+        axum::routing::get(move || {
+            let spec = spec_for_handler.clone();
+            async move {
+                use axum::response::IntoResponse;
+                (
+                    [(http::header::CONTENT_TYPE, "application/json")],
+                    (*spec).clone(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    if let Some(path) = swagger_path {
+        let spec_url = json_path.clone();
+        let title_for_handler = title.clone();
+        router = router.route(
+            &path,
+            axum::routing::get(move || {
+                let html = crate::openapi::swagger_ui_html(&spec_url, &title_for_handler);
+                async move {
+                    use axum::response::IntoResponse;
+                    (
+                        [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        html,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+    }
+
+    tracing::debug!(
+        openapi_json = %json_path,
+        swagger_ui = ?config.swagger_ui_path,
+        "Mounted OpenAPI endpoints"
+    );
+
+    Some(router)
 }
 
 fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
@@ -594,6 +698,7 @@ pub fn try_build_router_with_static(
             custom_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
+            openapi: None,
         },
     )
 }

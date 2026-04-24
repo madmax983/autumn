@@ -107,6 +107,7 @@ pub struct TestApp {
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     custom_layers: Vec<crate::app::CustomLayerApplier>,
     config: AutumnConfig,
+    openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
 }
@@ -126,9 +127,20 @@ impl TestApp {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             config,
+            openapi: None,
             #[cfg(feature = "db")]
             pool: None,
         }
+    }
+
+    /// Enable OpenAPI spec generation for the test app.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::openapi`] so integration tests
+    /// can exercise the `/v3/api-docs` and `/swagger-ui` endpoints.
+    #[must_use]
+    pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
+        self.openapi = Some(config);
+        self
     }
 
     /// Merge a router into the internal application state.
@@ -238,6 +250,7 @@ impl TestApp {
                 custom_layers: self.custom_layers,
                 error_page_renderer: None,
                 session_store: None,
+                openapi: self.openapi,
             },
         )
         .unwrap();
@@ -733,18 +746,39 @@ mod tests {
                 path: "/hello",
                 handler: routing::get(hello),
                 name: "hello",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/hello",
+                    operation_id: "hello",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: Method::POST,
                 path: "/echo",
                 handler: routing::post(echo_json),
                 name: "echo",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/echo",
+                    operation_id: "echo",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: Method::POST,
                 path: "/create",
                 handler: routing::post(status_201),
                 name: "create",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/create",
+                    operation_id: "create",
+                    success_status: 201,
+                    ..Default::default()
+                },
             },
         ]
     }

@@ -11,6 +11,7 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod api_doc;
 mod cached;
 mod collect;
 mod main_macro;
@@ -397,6 +398,60 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
     cached::cached_macro(attr.into(), item.into()).into()
+}
+
+/// Enrich a route handler's auto-generated OpenAPI documentation.
+///
+/// Applied on top of a route macro (`#[get]`, `#[post]`, etc.), this
+/// attribute lets you override or add documentation fields that cannot
+/// be inferred from the handler signature (summaries, descriptions,
+/// tags, custom success status codes).
+///
+/// The route macro consumes this attribute and folds the metadata into
+/// the route's `ApiDoc`. When no route macro is applied, the attribute
+/// is a no-op.
+///
+/// # Supported keys
+///
+/// | Key | Type | Effect |
+/// |-----|------|--------|
+/// | `summary` | string | Short one-line description |
+/// | `description` | string | Longer multi-line description |
+/// | `tag` | string | Single OpenAPI tag for grouping |
+/// | `tags` | `[string, ...]` | Multiple OpenAPI tags |
+/// | `operation_id` | string | Override the default operation id |
+/// | `status` | integer | Success HTTP status code (defaults to `200`) |
+/// | `hidden` | flag / bool | Exclude the route from the generated spec |
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// #[api_doc(summary = "Fetch a user by id", tag = "users")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+///
+/// #[post("/users")]
+/// #[api_doc(description = "Create a new user", status = 201)]
+/// async fn create_user(Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+///     Json(req)
+/// }
+///
+/// #[get("/internal/metrics")]
+/// #[api_doc(hidden)]
+/// async fn metrics() -> &'static str { "" }
+/// ```
+#[proc_macro_attribute]
+pub fn api_doc(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Standalone form: no-op. Route macros parse and consume `#[api_doc]`
+    // directly from their input's attribute list (see api_doc::extract).
+    // When `#[api_doc]` appears without any route macro, it still needs to
+    // be a valid attribute so the item compiles — we simply pass the item
+    // through unchanged.
+    item
 }
 
 /// Annotate an async function as a WebSocket route handler.

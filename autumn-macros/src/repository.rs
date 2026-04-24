@@ -486,6 +486,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#list_fn),
                     name: ::core::stringify!(#list_fn),
+                    api_doc: ::autumn_web::openapi::ApiDoc {
+                        method: "GET",
+                        path: #api_path,
+                        operation_id: ::core::stringify!(#list_fn),
+                        success_status: 200,
+                        ..::core::default::Default::default()
+                    },
                 }
             }
 
@@ -505,6 +512,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::get(#get_fn),
                     name: ::core::stringify!(#get_fn),
+                    api_doc: ::autumn_web::openapi::ApiDoc {
+                        method: "GET",
+                        path: #id_path,
+                        operation_id: ::core::stringify!(#get_fn),
+                        path_params: &["id"],
+                        success_status: 200,
+                        ..::core::default::Default::default()
+                    },
                 }
             }
 
@@ -523,6 +538,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     path: #api_path,
                     handler: ::autumn_web::reexports::axum::routing::post(#create_fn),
                     name: ::core::stringify!(#create_fn),
+                    api_doc: ::autumn_web::openapi::ApiDoc {
+                        method: "POST",
+                        path: #api_path,
+                        operation_id: ::core::stringify!(#create_fn),
+                        success_status: 201,
+                        ..::core::default::Default::default()
+                    },
                 }
             }
 
@@ -542,6 +564,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::put(#update_fn),
                     name: ::core::stringify!(#update_fn),
+                    api_doc: ::autumn_web::openapi::ApiDoc {
+                        method: "PUT",
+                        path: #id_path,
+                        operation_id: ::core::stringify!(#update_fn),
+                        path_params: &["id"],
+                        success_status: 200,
+                        ..::core::default::Default::default()
+                    },
                 }
             }
 
@@ -560,6 +590,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     path: #id_path,
                     handler: ::autumn_web::reexports::axum::routing::delete(#delete_fn),
                     name: ::core::stringify!(#delete_fn),
+                    api_doc: ::autumn_web::openapi::ApiDoc {
+                        method: "DELETE",
+                        path: #id_path,
+                        operation_id: ::core::stringify!(#delete_fn),
+                        path_params: &["id"],
+                        success_status: 204,
+                        ..::core::default::Default::default()
+                    },
                 }
             }
         }

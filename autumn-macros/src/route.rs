@@ -2,11 +2,15 @@
 //!
 //! Generates a companion `__autumn_route_info_{name}()` function for each
 //! annotated handler, pairing the HTTP method and path with an Axum
-//! `MethodRouter`.
+//! `MethodRouter`. The companion also carries an [`ApiDoc`] describing
+//! the route for OpenAPI auto-generation.
+//!
+//! [`ApiDoc`]: ../../autumn_web/openapi/struct.ApiDoc.html
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use crate::api_doc;
 use crate::parse;
 
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
@@ -32,6 +36,14 @@ pub fn route_macro(
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
 
+    // Extract #[api_doc(...)] overrides before emitting the function, so
+    // the attribute doesn't leak onto the emitted fn definition and
+    // trigger an "unknown attribute" error.
+    let api_doc_attr = match api_doc::extract(&mut input_fn.attrs) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let vis = &input_fn.vis;
@@ -55,10 +67,13 @@ pub fn route_macro(
         };
     }
 
-    // Note: we intentionally do NOT apply #[axum::debug_handler] here.
-    // That macro generates code with `::axum::` paths, which don't resolve
-    // when the user only depends on `autumn-web` (axum is a transitive dep).
-    // Custom compile_error! diagnostics (S-007) provide error guidance instead.
+    // ── OpenAPI metadata ────────────────────────────────────────
+    let path_params = api_doc::extract_path_params(&path.value());
+    let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
+    let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
+    let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
+    let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
+    let http_method_lit = syn::LitStr::new(http_method, proc_macro2::Span::call_site());
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -73,6 +88,15 @@ pub fn route_macro(
                 path: #path,
                 handler: #handler_expr,
                 name: ::core::stringify!(#fn_name),
+                api_doc: ::autumn_web::openapi::ApiDoc {
+                    method: #http_method_lit,
+                    path: #path,
+                    path_params: #path_params_tokens,
+                    request_body: #request_body,
+                    response: #response_body,
+                    register_schemas: ::core::option::Option::None,
+                    #api_doc_fields
+                },
             }
         }
     }

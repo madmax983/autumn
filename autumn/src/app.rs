@@ -87,6 +87,7 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        openapi: None,
     }
 }
 
@@ -190,6 +191,10 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// OpenAPI generation configuration. When `Some`, the router mounts
+    /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
+    /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
+    openapi: Option<crate::openapi::OpenApiConfig>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -319,6 +324,54 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Enable OpenAPI (Swagger) spec auto-generation.
+    ///
+    /// When called, the framework inspects every registered route's
+    /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
+    /// time from the route path, HTTP method, extractor types, and any
+    /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
+    /// OpenAPI 3.0 JSON document at [`OpenApiConfig::openapi_json_path`]
+    /// (default `/v3/api-docs`). If
+    /// [`OpenApiConfig::swagger_ui_path`] is set (default `/swagger-ui`),
+    /// a Swagger UI HTML page is served there too.
+    ///
+    /// Routes marked `#[api_doc(hidden)]` are excluded.
+    ///
+    /// # Examples
+    ///
+    /// Zero-config:
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// # #[get("/hello")] async fn hello() -> &'static str { "hi" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![hello])
+    ///     .openapi(OpenApiConfig::new("My API", "1.0.0"))
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// With custom paths:
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// let config = OpenApiConfig::new("My API", "1.0.0")
+    ///     .description("Full product API")
+    ///     .openapi_json_path("/openapi.json")
+    ///     .swagger_ui_path(Some("/docs".to_owned()));
+    /// ```
+    #[must_use]
+    pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
+        self.openapi = Some(config);
         self
     }
 
@@ -908,6 +961,7 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            openapi,
         } = self;
 
         let all_routes = routes;
@@ -986,6 +1040,7 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                openapi,
             },
         )
         .unwrap_or_else(|error| {
@@ -1101,6 +1156,7 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            openapi: _,
         } = self;
 
         let all_routes = routes;
@@ -1156,6 +1212,7 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer: None,
                 session_store,
+                openapi: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -1855,6 +1912,13 @@ mod tests {
             path,
             handler: axum::routing::get(|| async { "ok" }),
             name,
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path,
+                operation_id: name,
+                success_status: 200,
+                ..Default::default()
+            },
         }
     }
 
@@ -2074,6 +2138,13 @@ mod tests {
             path: "/submit",
             handler: axum::routing::post(|| async { "posted" }),
             name: "submit",
+            api_doc: crate::openapi::ApiDoc {
+                method: "POST",
+                path: "/submit",
+                operation_id: "submit",
+                success_status: 200,
+                ..Default::default()
+            },
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -2119,12 +2190,26 @@ mod tests {
                 path: "/admin",
                 handler: axum::routing::get(|| async { "list" }),
                 name: "admin_list",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/admin",
+                    operation_id: "admin_list",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: http::Method::POST,
                 path: "/admin",
                 handler: axum::routing::post(|| async { "created" }),
                 name: "create",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/admin",
+                    operation_id: "create",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
         ];
         let config = AutumnConfig::default();
@@ -2348,6 +2433,13 @@ mod tests {
                     path: "/about",
                     handler: axum::routing::get(|| async { "About Page Content" }),
                     name: "about",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/about",
+                        operation_id: "about",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }],
                 &config,
                 state,
@@ -2394,6 +2486,13 @@ mod tests {
                         axum::response::Html("<html><body><main>ok</main></body></html>")
                     }),
                     name: "page",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/page",
+                        operation_id: "page",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }]);
 
                 let response = router
