@@ -58,8 +58,8 @@
 //! # Custom schemas
 //!
 //! Types that need rich schemas (beyond the generic "object" fallback)
-//! implement the [`OpenApiSchema`] trait and are registered with
-//! [`OpenApiConfig::register_schema`].
+//! implement the `OpenApiSchema` trait and are registered with
+//! `OpenApiConfig::register_schema`.
 
 use std::collections::BTreeMap;
 
@@ -199,7 +199,7 @@ impl OpenApiConfig {
     }
 
     /// Register a custom component schema. Useful when a handler's
-    /// payload type does not implement [`OpenApiSchema`].
+    /// payload type does not implement `OpenApiSchema`.
     #[must_use]
     pub fn register_schema(mut self, name: impl Into<String>, schema: serde_json::Value) -> Self {
         self.additional_schemas.insert(name.into(), schema);
@@ -280,7 +280,7 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    /// Register a type via its [`OpenApiSchema`] implementation. A
+    /// Register a type via its `OpenApiSchema` implementation. A
     /// duplicate insertion is a no-op (the existing entry wins).
     #[cfg(feature = "openapi")]
     pub fn register<T: OpenApiSchema>(&mut self) {
