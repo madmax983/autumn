@@ -105,6 +105,7 @@ pub mod flash;
 pub(crate) mod htmx;
 pub(crate) mod logging;
 pub mod middleware;
+pub mod openapi;
 pub mod pagination;
 pub mod prelude;
 pub(crate) mod route;
@@ -207,6 +208,24 @@ pub use validation::ValidateExt;
 /// }
 /// ```
 pub use autumn_macros::delete;
+
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
+///
+/// See the [`openapi`] module and the [`autumn_macros::api_doc`]
+/// attribute docs for details on the supported keys.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// #[api_doc(summary = "Fetch a user by id", tag = "users")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+/// ```
+pub use autumn_macros::api_doc;
 
 /// Annotate an async function as a `GET` route handler.
 ///

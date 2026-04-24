@@ -27,7 +27,7 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
+    api_doc, cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
     static_routes, tasks,
 };
 
