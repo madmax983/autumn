@@ -27,6 +27,7 @@ pub struct TaskInfo {
 }
 
 /// How a scheduled task is triggered.
+#[non_exhaustive]
 pub enum Schedule {
     /// Run after a fixed delay from the end of the previous run.
     FixedDelay(Duration),
