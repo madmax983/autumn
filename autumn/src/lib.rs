@@ -194,7 +194,7 @@ pub use validation::ValidateExt;
 /// ```
 pub use autumn_macros::delete;
 
-/// Enrich a route handler's auto-generated OpenAPI documentation.
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
 ///
 /// See the [`openapi`] module and the [`autumn_macros::api_doc`]
 /// attribute docs for details on the supported keys.

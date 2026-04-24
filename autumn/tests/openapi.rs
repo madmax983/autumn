@@ -1,4 +1,4 @@
-//! Integration tests for OpenAPI auto-generation (S-056).
+//! Integration tests for `OpenAPI` auto-generation (S-056).
 //!
 //! Covers:
 //! * Route macros emit the expected `ApiDoc` metadata.

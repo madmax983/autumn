@@ -47,7 +47,7 @@ pub struct Route {
     /// (e.g., `"hello"`, `"create_item"`).
     pub name: &'static str,
 
-    /// OpenAPI metadata inferred from the handler's signature and any
+    /// `OpenAPI` metadata inferred from the handler's signature and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides. Consumed by
     /// [`AppBuilder::openapi`](crate::app::AppBuilder::openapi) when
     /// generating `/v3/api-docs`.

@@ -265,7 +265,7 @@ impl SchemaRegistry {
 
     /// Peek at the collected schemas without consuming the registry.
     #[must_use]
-    pub fn schemas(&self) -> &BTreeMap<String, serde_json::Value> {
+    pub const fn schemas(&self) -> &BTreeMap<String, serde_json::Value> {
         &self.schemas
     }
 }
@@ -375,12 +375,31 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
         registry.insert(name.clone(), schema.clone());
     }
 
+    // Collect every named schema reference produced by any operation so
+    // we can back-fill component entries for types the user didn't
+    // explicitly register. Without this, auto-inferred `Json<MyDto>`
+    // payloads would emit `$ref`s pointing at nonexistent component
+    // schemas — an invalid OpenAPI document.
+    let mut referenced_names: std::collections::BTreeSet<&'static str> =
+        std::collections::BTreeSet::new();
+
     for api_doc in routes {
         if api_doc.hidden {
             continue;
         }
         if let Some(register) = api_doc.register_schemas {
             (register)(&mut registry);
+        }
+
+        if let Some(entry) = &api_doc.request_body
+            && entry.kind == SchemaKind::Ref
+        {
+            referenced_names.insert(entry.name);
+        }
+        if let Some(entry) = &api_doc.response
+            && entry.kind == SchemaKind::Ref
+        {
+            referenced_names.insert(entry.name);
         }
 
         let operation = operation_for(api_doc);
@@ -394,6 +413,22 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             // Unknown methods are silently skipped; Autumn's route macros
             // only emit the five verbs above today.
             _ => {}
+        }
+    }
+
+    // Back-fill a minimal `{"type": "object", "title": "X"}` schema for
+    // every referenced name the user didn't already register. Types that
+    // implement OpenApiSchema can be registered explicitly via
+    // OpenApiConfig::register_schema to replace the placeholder.
+    for name in referenced_names {
+        if !registry.schemas().contains_key(name) {
+            registry.insert(
+                name,
+                serde_json::json!({
+                    "type": "object",
+                    "title": name,
+                }),
+            );
         }
     }
 
@@ -503,7 +538,7 @@ fn default_tag(path: &str) -> Option<&str> {
         .find(|seg| !seg.is_empty() && !seg.starts_with('{'))
 }
 
-fn status_description(status: u16) -> &'static str {
+const fn status_description(status: u16) -> &'static str {
     match status {
         200 => "OK",
         201 => "Created",
@@ -679,6 +714,61 @@ mod tests {
         let spec = generate_spec(&config, &[&doc]);
         let components = spec.components.unwrap();
         assert!(components.schemas.contains_key("Foo"));
+    }
+
+    #[test]
+    fn generate_spec_back_fills_unregistered_ref_schemas() {
+        // A Json<CreateUser> handler emits a `$ref` with no component
+        // schema registered. The generator must back-fill a placeholder
+        // schema so the resulting OpenAPI document is valid.
+        let mut doc = make_doc();
+        doc.method = "POST";
+        doc.path = "/users";
+        doc.path_params = &[];
+        doc.request_body = Some(SchemaEntry {
+            name: "CreateUser",
+            kind: SchemaKind::Ref,
+        });
+        doc.response = Some(SchemaEntry {
+            name: "User",
+            kind: SchemaKind::Ref,
+        });
+
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let components = spec.components.expect("components must be emitted");
+        let create = components
+            .schemas
+            .get("CreateUser")
+            .expect("CreateUser should be back-filled");
+        let user = components
+            .schemas
+            .get("User")
+            .expect("User should be back-filled");
+        assert_eq!(create["type"], "object");
+        assert_eq!(create["title"], "CreateUser");
+        assert_eq!(user["type"], "object");
+        assert_eq!(user["title"], "User");
+    }
+
+    #[test]
+    fn generate_spec_preserves_user_registered_schemas_over_backfill() {
+        let mut doc = make_doc();
+        doc.response = Some(SchemaEntry {
+            name: "User",
+            kind: SchemaKind::Ref,
+        });
+
+        let user_schema = serde_json::json!({
+            "type": "object",
+            "properties": {"id": {"type": "integer"}},
+        });
+        let config =
+            OpenApiConfig::new("Demo", "1.0.0").register_schema("User", user_schema.clone());
+        let spec = generate_spec(&config, &[&doc]);
+        let components = spec.components.unwrap();
+        let stored = components.schemas.get("User").unwrap();
+        assert_eq!(stored, &user_schema, "user schema must not be overwritten");
     }
 
     #[test]

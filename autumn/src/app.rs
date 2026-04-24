@@ -191,7 +191,7 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
-    /// OpenAPI generation configuration. When `Some`, the router mounts
+    /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
     openapi: Option<crate::openapi::OpenApiConfig>,
@@ -327,13 +327,13 @@ impl AppBuilder {
         self
     }
 
-    /// Enable OpenAPI (Swagger) spec auto-generation.
+    /// Enable `OpenAPI` (Swagger) spec auto-generation.
     ///
     /// When called, the framework inspects every registered route's
     /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
     /// time from the route path, HTTP method, extractor types, and any
     /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
-    /// OpenAPI 3.0 JSON document at [`OpenApiConfig::openapi_json_path`]
+    /// `OpenAPI` 3.0 JSON document at [`OpenApiConfig::openapi_json_path`]
     /// (default `/v3/api-docs`). If
     /// [`OpenApiConfig::swagger_ui_path`] is set (default `/swagger-ui`),
     /// a Swagger UI HTML page is served there too.

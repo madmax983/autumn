@@ -400,7 +400,7 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
     cached::cached_macro(attr.into(), item.into()).into()
 }
 
-/// Enrich a route handler's auto-generated OpenAPI documentation.
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
 ///
 /// Applied on top of a route macro (`#[get]`, `#[post]`, etc.), this
 /// attribute lets you override or add documentation fields that cannot
@@ -417,8 +417,8 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// |-----|------|--------|
 /// | `summary` | string | Short one-line description |
 /// | `description` | string | Longer multi-line description |
-/// | `tag` | string | Single OpenAPI tag for grouping |
-/// | `tags` | `[string, ...]` | Multiple OpenAPI tags |
+/// | `tag` | string | Single `OpenAPI` tag for grouping |
+/// | `tags` | `[string, ...]` | Multiple `OpenAPI` tags |
 /// | `operation_id` | string | Override the default operation id |
 /// | `status` | integer | Success HTTP status code (defaults to `200`) |
 /// | `hidden` | flag / bool | Exclude the route from the generated spec |

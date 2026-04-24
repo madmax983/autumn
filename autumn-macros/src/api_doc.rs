@@ -1,6 +1,14 @@
 // OpenAPI appears many times in this module's docs as an acronym —
-// silence clippy::doc_markdown for it locally.
-#![allow(clippy::doc_markdown)]
+// silence clippy::doc_markdown for it locally. The other allows turn
+// off pedantic style nits (`KeyValue::Foo` vs `Foo` inside the enum's
+// own impl, `Option::map_or_else` vs `match`/`if let`) that would
+// trade clarity for less-readable chained closure calls.
+#![allow(
+    clippy::doc_markdown,
+    clippy::option_if_let_else,
+    clippy::single_match_else,
+    clippy::use_self
+)]
 
 //! `#[api_doc(...)]` attribute parsing for OpenAPI auto-generation.
 //!

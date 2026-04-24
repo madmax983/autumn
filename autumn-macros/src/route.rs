@@ -3,7 +3,7 @@
 //! Generates a companion `__autumn_route_info_{name}()` function for each
 //! annotated handler, pairing the HTTP method and path with an Axum
 //! `MethodRouter`. The companion also carries an [`ApiDoc`] describing
-//! the route for OpenAPI auto-generation.
+//! the route for `OpenAPI` auto-generation.
 //!
 //! [`ApiDoc`]: ../../autumn_web/openapi/struct.ApiDoc.html
 

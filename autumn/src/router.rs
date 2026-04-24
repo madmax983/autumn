@@ -84,7 +84,7 @@ pub struct RouterContext {
     /// When `Some`, [`apply_session_layer`](crate::session::apply_session_layer)
     /// uses it directly and skips the config-driven backend selection.
     pub session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
-    /// OpenAPI generation configuration. When `Some`, the router mounts
+    /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// an `openapi.json` endpoint and (optionally) a Swagger UI page
     /// describing the application's routes.
     pub openapi: Option<crate::openapi::OpenApiConfig>,
@@ -239,10 +239,36 @@ pub fn try_build_router_inner(
     Ok(router.with_state(state))
 }
 
-/// Build an Axum sub-router that serves the generated OpenAPI document
+/// Parse `{name}` captures from a route path.
+///
+/// Mirrors the compile-time extractor in `autumn_macros::api_doc` so
+/// runtime spec assembly (which sees scope prefixes that the macro
+/// never does) produces consistent parameter lists.
+fn extract_path_params(path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{'
+            && let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}')
+        {
+            let inner = &path[i + 1..i + 1 + end_rel];
+            let name = inner.split(':').next().unwrap_or(inner).trim();
+            if !name.is_empty() {
+                out.push(name.to_owned());
+            }
+            i += 1 + end_rel + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Build an Axum sub-router that serves the generated `OpenAPI` document
 /// and (optionally) a Swagger UI HTML page.
 ///
-/// Returns `None` when OpenAPI generation is disabled, i.e. the user
+/// Returns `None` when `OpenAPI` generation is disabled, i.e. the user
 /// never called [`AppBuilder::openapi`](crate::app::AppBuilder::openapi).
 ///
 /// The spec is rendered once at build time and stored in an `Arc<String>`
@@ -263,6 +289,10 @@ fn build_openapi_router(
         docs.push(route.api_doc.clone());
     }
     for group in scoped_groups {
+        // Extract `{name}` captures from the scope prefix so parameters
+        // declared in the prefix (e.g. `/orgs/{org_id}`) show up on the
+        // generated operation alongside the child route's own params.
+        let prefix_params = extract_path_params(&group.prefix);
         for route in &group.routes {
             let mut doc = route.api_doc.clone();
             // Leak the combined path so it fits the `&'static str` shape of
@@ -270,6 +300,20 @@ fn build_openapi_router(
             // bounded by the route table size.
             let full = format!("{}{}", group.prefix, route.api_doc.path);
             doc.path = Box::leak(full.into_boxed_str());
+
+            if !prefix_params.is_empty() {
+                let mut merged: Vec<&'static str> = prefix_params
+                    .iter()
+                    .map(|p| &*Box::leak(p.clone().into_boxed_str()))
+                    .collect();
+                for existing in route.api_doc.path_params {
+                    if !merged.iter().any(|n| n == existing) {
+                        merged.push(existing);
+                    }
+                }
+                doc.path_params = Box::leak(merged.into_boxed_slice());
+            }
+
             docs.push(doc);
         }
     }
@@ -284,11 +328,10 @@ fn build_openapi_router(
     let swagger_path = config.swagger_ui_path.clone();
     let title = config.title.clone();
 
-    let spec_for_handler = spec_body.clone();
     let mut router = axum::Router::<AppState>::new().route(
         &json_path,
         axum::routing::get(move || {
-            let spec = spec_for_handler.clone();
+            let spec = spec_body.clone();
             async move {
                 use axum::response::IntoResponse;
                 (
@@ -302,11 +345,10 @@ fn build_openapi_router(
 
     if let Some(path) = swagger_path {
         let spec_url = json_path.clone();
-        let title_for_handler = title.clone();
         router = router.route(
             &path,
             axum::routing::get(move || {
-                let html = crate::openapi::swagger_ui_html(&spec_url, &title_for_handler);
+                let html = crate::openapi::swagger_ui_html(&spec_url, &title);
                 async move {
                     use axum::response::IntoResponse;
                     (
@@ -1303,5 +1345,80 @@ mod tests {
             StatusCode::OK,
             "POST without CSRF token should be rejected when CSRF is enabled"
         );
+    }
+
+    #[test]
+    fn extract_path_params_matches_macro_behavior() {
+        assert_eq!(
+            super::extract_path_params("/orgs/{org_id}/users/{id}"),
+            vec!["org_id".to_owned(), "id".to_owned()]
+        );
+        assert!(super::extract_path_params("/static").is_empty());
+        assert_eq!(
+            super::extract_path_params("/users/{id:[0-9]+}"),
+            vec!["id".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn openapi_merges_scoped_prefix_path_params() {
+        use crate::openapi::{ApiDoc, OpenApiConfig};
+
+        // Scope prefix has `{org_id}`; the child route has `{id}`. The
+        // generated ApiDoc must declare BOTH parameters, or Swagger
+        // validators reject the document for referencing undeclared
+        // path params.
+        async fn handler() -> &'static str {
+            "ok"
+        }
+        let child = Route {
+            method: http::Method::GET,
+            path: "/users/{id}",
+            handler: axum::routing::get(handler),
+            name: "child",
+            api_doc: ApiDoc {
+                method: "GET",
+                path: "/users/{id}",
+                operation_id: "child",
+                path_params: &["id"],
+                success_status: 200,
+                ..Default::default()
+            },
+        };
+        let group = crate::app::ScopedGroup {
+            prefix: "/orgs/{org_id}".to_owned(),
+            routes: vec![child],
+            apply_layer: Box::new(|r| r),
+        };
+
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let router =
+            super::build_openapi_router(&[], &[group], Some(&config)).expect("openapi sub-router");
+        let state = test_state();
+        let router = router.with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v3/api-docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let params = &spec["paths"]["/orgs/{org_id}/users/{id}"]["get"]["parameters"];
+        let names: Vec<&str> = params
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"org_id"), "missing org_id: {names:?}");
+        assert!(names.contains(&"id"), "missing id: {names:?}");
     }
 }
