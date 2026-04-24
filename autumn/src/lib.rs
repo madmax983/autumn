@@ -32,7 +32,7 @@
 //! | HTTP server | [Axum] | Routing, extractors, middleware |
 //! | HTML templates | [Maud] | Type-safe, compiled HTML via `html!` macro |
 //! | Database | [Diesel] | Async Postgres via `diesel-async` + deadpool |
-//! | Client interactivity | htmx | Embedded JS served at `/static/js/htmx.min.js` |
+//! | Client interactivity | htmx | Embedded JS served from same-origin `/static/js/` routes |
 //! | Styling | Tailwind CSS | Downloaded + managed by `autumn-cli` |
 //!
 //! ## Modules
@@ -183,7 +183,7 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::HTMX_VERSION;
+pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
