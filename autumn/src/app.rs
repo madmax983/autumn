@@ -3403,7 +3403,6 @@ mod tests {
         assert!(result.unwrap() < u64::MAX);
     }
 
-
     #[tokio::test]
     async fn execute_fixed_delay_task_calls_lifecycle_and_succeeds() {
         let state = AppState::for_test();
