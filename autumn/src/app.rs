@@ -87,6 +87,9 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        #[cfg(feature = "openapi")]
+        openapi: None,
+        audit_logger: None,
     }
 }
 
@@ -165,7 +168,7 @@ pub struct AppBuilder {
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerApplier>,
+    custom_layers: Vec<CustomLayerRegistration>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -190,6 +193,17 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// `OpenAPI` generation configuration. When `Some`, the router mounts
+    /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
+    /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
+    ///
+    /// Gated behind the `openapi` feature: apps that don't need a
+    /// served `OpenAPI` document shouldn't pay for the spec types or the
+    /// runtime collision-check machinery.
+    #[cfg(feature = "openapi")]
+    openapi: Option<crate::openapi::OpenApiConfig>,
+    /// Shared audit logger used for append-only compliance events.
+    audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -211,6 +225,14 @@ pub(crate) struct ScopedGroup {
 /// `apply_middleware` where the final layer stack is assembled.
 pub(crate) type CustomLayerApplier =
     Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
+/// Metadata and deferred application closure for a user-registered layer.
+pub(crate) struct CustomLayerRegistration {
+    /// Concrete type for the registered layer.
+    pub(crate) type_id: TypeId,
+    /// Deferred router mutation that applies the layer.
+    pub(crate) apply: CustomLayerApplier,
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -319,6 +341,60 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Enable `OpenAPI` (Swagger) spec auto-generation.
+    ///
+    /// When called, the framework inspects every registered route's
+    /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
+    /// time from the route path, HTTP method, extractor types, and any
+    /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
+    /// `OpenAPI` 3.0 JSON document at [`OpenApiConfig::openapi_json_path`]
+    /// (default `/v3/api-docs`). If
+    /// [`OpenApiConfig::swagger_ui_path`] is set (default `/swagger-ui`),
+    /// a Swagger UI HTML page is served there too.
+    ///
+    /// Routes marked `#[api_doc(hidden)]` are excluded.
+    ///
+    /// **Gated behind the `openapi` Cargo feature.** Add
+    /// `features = ["openapi"]` to your `autumn-web` dependency to
+    /// enable it; the default build excludes the runtime spec types
+    /// and endpoints to keep the binary small.
+    ///
+    /// # Examples
+    ///
+    /// Zero-config:
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// # #[get("/hello")] async fn hello() -> &'static str { "hi" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![hello])
+    ///     .openapi(OpenApiConfig::new("My API", "1.0.0"))
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// With custom paths:
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// let config = OpenApiConfig::new("My API", "1.0.0")
+    ///     .description("Full product API")
+    ///     .openapi_json_path("/openapi.json")
+    ///     .swagger_ui_path(Some("/docs".to_owned()));
+    /// ```
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
+        self.openapi = Some(config);
         self
     }
 
@@ -519,15 +595,35 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
-        // TODO(0.x): consider retaining a TypeId alongside the closure so
-        // plugins can introspect which layers are already registered
-        // (e.g. warn when auth is installed after rate-limiting). Requires
-        // replacing CustomLayerApplier with a small trait that carries type
-        // metadata. Deliberately deferred — pure closures keep the public
-        // surface minimal until a concrete introspection use case appears.
-        self.custom_layers
-            .push(Box::new(move |router| layer.apply_to(router)));
+        self.custom_layers.push(CustomLayerRegistration {
+            type_id: TypeId::of::<L>(),
+            apply: Box::new(move |router| layer.apply_to(router)),
+        });
         self
+    }
+
+    /// Returns `true` when a custom layer of type `L` has already been
+    /// registered via [`AppBuilder::layer`].
+    ///
+    /// Intended for plugin pre-flight validation before the app is started.
+    #[must_use]
+    pub fn has_layer<L: 'static>(&self) -> bool {
+        let layer_type = TypeId::of::<L>();
+        self.custom_layers
+            .iter()
+            .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Returns the registered custom layer types in registration order.
+    ///
+    /// This includes only user-installed layers from
+    /// [`AppBuilder::layer`], not framework-managed middleware.
+    #[must_use]
+    pub fn get_layer_types(&self) -> Vec<TypeId> {
+        self.custom_layers
+            .iter()
+            .map(|registered| registered.type_id)
+            .collect()
     }
 
     /// Merge a raw Axum router into the application.
@@ -785,6 +881,24 @@ impl AppBuilder {
         self
     }
 
+    /// Register an additional audit sink for structured audit events.
+    ///
+    /// Multiple calls accumulate sinks. Logged events are fanned out to all
+    /// configured sinks.
+    #[must_use]
+    pub fn with_audit_sink<S>(mut self, sink: S) -> Self
+    where
+        S: crate::audit::AuditSink,
+    {
+        let logger = self
+            .audit_logger
+            .take()
+            .map_or_else(crate::audit::AuditLogger::new, |logger| (*logger).clone())
+            .with_sink(Arc::new(sink));
+        self.audit_logger = Some(Arc::new(logger));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -908,6 +1022,9 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "openapi")]
+            openapi,
+            audit_logger,
         } = self;
 
         let all_routes = routes;
@@ -966,6 +1083,9 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -986,6 +1106,8 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                #[cfg(feature = "openapi")]
+                openapi,
             },
         )
         .unwrap_or_else(|error| {
@@ -1101,6 +1223,9 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "openapi")]
+                openapi: _,
+            audit_logger: _,
         } = self;
 
         let all_routes = routes;
@@ -1156,6 +1281,8 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer: None,
                 session_store,
+                #[cfg(feature = "openapi")]
+                openapi: None,
             },
         )
         .unwrap_or_else(|error| {
@@ -1685,7 +1812,10 @@ fn format_route_lines(
         "GET"
     );
     #[cfg(feature = "htmx")]
-    out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+    {
+        out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+        out.push_str("\n    /static/js/autumn-htmx-csrf.js GET -> htmx csrf");
+    }
     out
 }
 
@@ -1855,6 +1985,13 @@ mod tests {
             path,
             handler: axum::routing::get(|| async { "ok" }),
             name,
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path,
+                operation_id: name,
+                success_status: 200,
+                ..Default::default()
+            },
         }
     }
 
@@ -2074,6 +2211,13 @@ mod tests {
             path: "/submit",
             handler: axum::routing::post(|| async { "posted" }),
             name: "submit",
+            api_doc: crate::openapi::ApiDoc {
+                method: "POST",
+                path: "/submit",
+                operation_id: "submit",
+                success_status: 200,
+                ..Default::default()
+            },
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -2119,12 +2263,26 @@ mod tests {
                 path: "/admin",
                 handler: axum::routing::get(|| async { "list" }),
                 name: "admin_list",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/admin",
+                    operation_id: "admin_list",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: http::Method::POST,
                 path: "/admin",
                 handler: axum::routing::post(|| async { "created" }),
                 name: "create",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/admin",
+                    operation_id: "create",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
         ];
         let config = AutumnConfig::default();
@@ -2188,14 +2346,14 @@ mod tests {
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
         let app = axum::Router::new().route(
-            "/static/js/htmx.min.js",
+            crate::htmx::HTMX_JS_PATH,
             axum::routing::get(crate::router::htmx_handler),
         );
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2243,13 +2401,50 @@ mod tests {
 
     #[cfg(feature = "htmx")]
     #[tokio::test]
+    async fn htmx_csrf_handler_returns_csp_compatible_javascript() {
+        let app = axum::Router::new().route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(crate::router::htmx_csrf_handler),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+        assert!(!js.contains("<script"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
     async fn build_router_serves_htmx_js() {
         let router = test_router(vec![test_get_route("/dummy", "dummy")]);
 
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2264,6 +2459,86 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("javascript"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
+    async fn build_router_serves_htmx_csrf_js() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("framework JS should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_default_favicon_without_404() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers().contains_key("content-security-policy"),
+            "framework fallback responses should still receive security headers"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_router_does_not_override_user_favicon_route() {
+        let router = test_router(vec![test_get_route(
+            crate::router::DEFAULT_FAVICON_PATH,
+            "favicon",
+        )]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     #[tokio::test]
@@ -2331,6 +2606,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("static-first HTML should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -2348,6 +2630,13 @@ mod tests {
                     path: "/about",
                     handler: axum::routing::get(|| async { "About Page Content" }),
                     name: "about",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/about",
+                        operation_id: "about",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }],
                 &config,
                 state,
@@ -2394,6 +2683,13 @@ mod tests {
                         axum::response::Html("<html><body><main>ok</main></body></html>")
                     }),
                     name: "page",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/page",
+                        operation_id: "page",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }]);
 
                 let response = router

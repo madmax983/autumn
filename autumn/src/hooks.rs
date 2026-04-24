@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 
 /// The kind of mutation being performed on a repository record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MutationOp {
     /// A new record is being created.
     Create,

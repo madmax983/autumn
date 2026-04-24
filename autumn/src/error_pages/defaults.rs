@@ -103,9 +103,9 @@ impl ErrorPageRenderer for DefaultErrorPages {
                         }
                     }
                     div class="mt-8" {
-                        a href="javascript:history.back()"
+                        a href="/"
                           class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go back"
+                            "Go to homepage"
                         }
                     }
                 }
@@ -307,6 +307,17 @@ mod tests {
         assert!(s.contains("<!DOCTYPE html>"));
         assert!(s.contains("<html"));
         assert!(s.contains("</html>"));
+    }
+
+    #[test]
+    fn default_pages_do_not_use_javascript_urls() {
+        let pages = DefaultErrorPages;
+        let html = pages.render_422(&make_ctx(StatusCode::UNPROCESSABLE_ENTITY));
+        let s = html.into_string();
+        assert!(
+            !s.contains("javascript:"),
+            "default error pages must work under script-src 'self'",
+        );
     }
 
     #[test]

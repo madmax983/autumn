@@ -1,8 +1,10 @@
 //! Embedded htmx JavaScript.
 //!
 //! htmx is embedded directly in the Autumn binary via [`include_bytes!`]
-//! and served at `/static/js/htmx.min.js`. No CDN, no npm, no build
-//! step required.
+//! and served at [`HTMX_JS_PATH`]. A small CSRF helper is also served at
+//! [`HTMX_CSRF_JS_PATH`] so htmx forms can work with Autumn's default
+//! `script-src 'self'` Content Security Policy. No CDN, no npm, no build step
+//! required.
 //!
 //! The framework automatically mounts a route handler that serves this
 //! file with immutable caching headers. Reference it in your HTML
@@ -10,6 +12,7 @@
 //!
 //! ```html
 //! <script src="/static/js/htmx.min.js"></script>
+//! <script src="/static/js/autumn-htmx-csrf.js"></script>
 //! ```
 
 use axum::extract::FromRequestParts;
@@ -24,6 +27,37 @@ use std::convert::Infallible;
 /// served automatically by the framework at `/static/js/htmx.min.js`
 /// with `Cache-Control: public, max-age=31536000, immutable`.
 pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
+
+/// Same-origin path where Autumn serves embedded htmx.
+pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
+
+/// Same-origin path where Autumn serves the htmx CSRF helper.
+///
+/// The helper reads a CSRF token from either:
+/// - `<meta name="csrf-token" content="...">`
+/// - `<meta name="autumn-csrf-token" content="...">`
+///
+/// The request header defaults to `X-CSRF-Token`; override it with
+/// `data-header="..."` on the meta tag when using a custom CSRF header name.
+pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
+
+/// CSP-compatible htmx CSRF helper JavaScript.
+///
+/// Served as an external same-origin script so applications do not need inline
+/// JavaScript under Autumn's default `script-src 'self'` policy.
+pub const HTMX_CSRF_JS: &str = r#"(function () {
+  document.addEventListener("htmx:configRequest", function (evt) {
+    var meta = document.querySelector('meta[name="csrf-token"], meta[name="autumn-csrf-token"]');
+
+    if (!meta || !evt.detail || !evt.detail.headers) {
+      return;
+    }
+
+    var header = meta.getAttribute("data-header") || "X-CSRF-Token";
+    evt.detail.headers[header] = meta.getAttribute("content") || "";
+  });
+})();
+"#;
 
 /// htmx version string for diagnostics and cache busting.
 ///
@@ -179,6 +213,20 @@ mod tests {
     #[test]
     fn htmx_version_matches_expected() {
         assert_eq!(HTMX_VERSION, "2.0.4");
+    }
+
+    #[test]
+    fn htmx_asset_paths_are_same_origin_static_paths() {
+        assert_eq!(HTMX_JS_PATH, "/static/js/htmx.min.js");
+        assert_eq!(HTMX_CSRF_JS_PATH, "/static/js/autumn-htmx-csrf.js");
+    }
+
+    #[test]
+    fn htmx_csrf_js_configures_request_header_without_inline_wrapper() {
+        assert!(HTMX_CSRF_JS.contains("htmx:configRequest"));
+        assert!(HTMX_CSRF_JS.contains("X-CSRF-Token"));
+        assert!(HTMX_CSRF_JS.contains("csrf-token"));
+        assert!(!HTMX_CSRF_JS.contains("<script"));
     }
 
     #[tokio::test]

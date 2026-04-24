@@ -11,6 +11,7 @@
 use axum::routing::MethodRouter;
 use http::Method;
 
+use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
 /// A single route binding an HTTP method + path to an Axum handler.
@@ -45,4 +46,10 @@ pub struct Route {
     /// Handler function name, used for startup logging
     /// (e.g., `"hello"`, `"create_item"`).
     pub name: &'static str,
+
+    /// `OpenAPI` metadata inferred from the handler's signature and any
+    /// [`#[api_doc(...)]`](crate::api_doc) overrides. Consumed by
+    /// [`AppBuilder::openapi`](crate::app::AppBuilder::openapi) when
+    /// generating `/v3/api-docs`.
+    pub api_doc: ApiDoc,
 }

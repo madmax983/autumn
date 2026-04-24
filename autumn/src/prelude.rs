@@ -27,7 +27,7 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
+    api_doc, cached, delete, get, main, post, put, routes, scheduled, secured, service, static_get,
     static_routes, tasks,
 };
 
@@ -51,20 +51,26 @@ pub use crate::extract::Query;
 /// Flash message extractor.
 #[cfg(feature = "flash")]
 pub use crate::flash::{Flash, FlashLevel, FlashMessage};
-/// htmx request extractor.
-#[cfg(feature = "htmx")]
-pub use crate::htmx::HxRequest;
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
+/// htmx request extractor.
+#[cfg(feature = "htmx")]
+pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// State extractor.
 pub use axum::extract::State;
 
 // ── Error handling ───────────────────────────────────────────────
+/// Structured audit event types.
+pub use crate::audit::{AuditEvent, AuditStatus};
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
+
+// ── Pagination ──────────────────────────────────────────────────
+/// Pagination primitives — extractor and response wrapper.
+pub use crate::pagination::{Page, PageRequest};
 
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.

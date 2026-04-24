@@ -289,8 +289,15 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
 /// error pages instead of Axum's default plain-text "Not Found".
-pub async fn fallback_404_handler(uri: axum::http::Uri) -> crate::error::AutumnError {
+pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && uri.path() == crate::router::DEFAULT_FAVICON_PATH
+    {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    }
+
     crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
+        .into_response()
 }
 
 #[cfg(test)]
@@ -693,27 +700,62 @@ mod tests {
     #[tokio::test]
     async fn fallback_404_handler_creates_correct_error() {
         let uri = axum::http::Uri::from_static("/some/unknown/path");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /some/unknown/path");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /some/unknown/path"));
     }
 
     #[tokio::test]
     async fn fallback_404_handler_ignores_query_params() {
         let uri = axum::http::Uri::from_static("/search?q=rust&sort=desc");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /search");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /search"));
     }
 
     #[tokio::test]
     async fn fallback_404_handler_with_root_path() {
         let uri = axum::http::Uri::from_static("/");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /"));
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_returns_empty_no_content_for_favicon_get() {
+        let response = fallback_404_handler(
+            axum::http::Method::GET,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {
+        let response = fallback_404_handler(
+            axum::http::Method::POST,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

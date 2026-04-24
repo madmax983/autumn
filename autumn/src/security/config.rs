@@ -148,9 +148,9 @@ pub struct HeadersConfig {
     /// [`default_content_security_policy`]). When set to an empty string,
     /// the header is not emitted (explicit opt-out).
     ///
-    /// The default allows htmx to function normally because htmx is served
-    /// from the same origin at `/static/js/htmx.min.js` and operates via
-    /// `addEventListener` rather than inline `eval`.
+    /// The default allows htmx to function normally because htmx and Autumn's
+    /// htmx CSRF helper are served from the same origin and operate via
+    /// `addEventListener` rather than inline scripts.
     #[serde(default = "default_content_security_policy")]
     pub content_security_policy: String,
 
@@ -350,8 +350,8 @@ fn default_referrer_policy() -> String {
 /// Default `Content-Security-Policy` value.
 ///
 /// Designed to be "sensible by default" while allowing htmx to function
-/// normally when served from the same origin (as Autumn does at
-/// `/static/js/htmx.min.js`).
+/// normally when served from the same origin (as Autumn does for htmx and its
+/// CSRF helper under `/static/js/`).
 ///
 /// Directives:
 /// - `default-src 'self'` -- everything defaults to same-origin
@@ -359,8 +359,8 @@ fn default_referrer_policy() -> String {
 /// - `style-src 'self' 'unsafe-inline'` -- same-origin stylesheets plus
 ///   inline `style` attributes (required by many UI libraries and
 ///   template engines)
-/// - `script-src 'self'` -- only same-origin scripts; htmx works here
-///   because it is served from `/static/js/htmx.min.js`
+/// - `script-src 'self'` -- only same-origin scripts; htmx and Autumn's htmx
+///   CSRF helper work here because they are served from `/static/js/`
 /// - `connect-src 'self'` -- `fetch`/`XHR`/htmx requests go to same origin
 /// - `form-action 'self'` -- forms can only POST to same origin
 /// - `frame-ancestors 'none'` -- matches the default `X-Frame-Options: DENY`
