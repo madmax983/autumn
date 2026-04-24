@@ -1,7 +1,9 @@
 //!
 //! Integration tests for extractors.
 //!
-use autumn_web::extract::{Form, Json, Multipart};
+#[cfg(feature = "multipart")]
+use autumn_web::extract::Multipart;
+use autumn_web::extract::{Form, Json};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -117,6 +119,7 @@ async fn form_extraction_works() {
     assert_eq!(&body[..], b"Alice is 30");
 }
 
+#[cfg(feature = "multipart")]
 #[tokio::test]
 async fn multipart_extraction_works() {
     async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
@@ -157,6 +160,7 @@ async fn multipart_extraction_works() {
     assert_eq!(&body[..], b"hello.txt:11");
 }
 
+#[cfg(feature = "multipart")]
 #[tokio::test]
 async fn multipart_mime_allow_list_skips_non_file_fields() {
     async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
@@ -215,6 +219,7 @@ async fn multipart_mime_allow_list_skips_non_file_fields() {
     assert_eq!(&body[..], b"text=true,file=true");
 }
 
+#[cfg(feature = "multipart")]
 #[tokio::test]
 async fn multipart_file_size_limit_returns_413() {
     async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<&'static str> {
@@ -259,6 +264,7 @@ async fn multipart_file_size_limit_returns_413() {
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+#[cfg(feature = "multipart")]
 #[tokio::test]
 async fn multipart_request_size_limit_returns_413() {
     async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<&'static str> {

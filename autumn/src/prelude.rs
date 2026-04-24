@@ -45,6 +45,7 @@ pub use crate::extract::Form;
 /// JSON request/response type.
 pub use crate::extract::Json;
 /// Multipart extractor with upload policy helpers.
+#[cfg(feature = "multipart")]
 pub use crate::extract::Multipart;
 /// Path extractor.
 pub use crate::extract::Path;

@@ -97,11 +97,13 @@ pub use axum::extract::Query;
 ///
 /// Request size limits are enforced per request in this extractor via
 /// `security.upload.max_request_size_bytes`.
+#[cfg(feature = "multipart")]
 pub struct Multipart {
     inner: axum::extract::Multipart,
     config: crate::security::config::UploadConfig,
 }
 
+#[cfg(feature = "multipart")]
 impl Multipart {
     /// Read the next multipart field, validating MIME type when configured.
     ///
@@ -146,6 +148,7 @@ impl Multipart {
     }
 }
 
+#[cfg(feature = "multipart")]
 impl<S> axum::extract::FromRequest<S> for Multipart
 where
     S: Send + Sync,
@@ -172,11 +175,13 @@ where
 }
 
 /// A multipart field wrapper that provides safe streaming helpers.
+#[cfg(feature = "multipart")]
 pub struct MultipartField<'a> {
     inner: axum::extract::multipart::Field<'a>,
     max_file_size_bytes: usize,
 }
 
+#[cfg(feature = "multipart")]
 impl MultipartField<'_> {
     /// Field name from the multipart form.
     #[must_use]
@@ -261,16 +266,19 @@ impl MultipartField<'_> {
     }
 }
 
+#[cfg(feature = "multipart")]
 fn multipart_rejection_to_error(
     err: &axum::extract::multipart::MultipartRejection,
 ) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(format!("multipart parse error: {err}"))
 }
 
+#[cfg(feature = "multipart")]
 fn multipart_error_to_error(err: &axum::extract::multipart::MultipartError) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
 }
 
+#[cfg(feature = "multipart")]
 fn file_too_large_error(max_file_size_bytes: usize) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(format!(
         "uploaded file exceeds limit of {max_file_size_bytes} bytes",
