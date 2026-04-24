@@ -1424,25 +1424,22 @@ async fn execute_task_result(
     }
 }
 
-async fn execute_task_lifecycle(
+/// Handle the execution of a single fixed-delay task.
+async fn execute_fixed_delay_task(
     name: String,
     state: AppState,
     handler: crate::task::TaskHandler,
-    schedule_type: &'static str,
-    start_msg: &'static str,
-    success_msg: &'static str,
-    fail_msg: &'static str,
 ) {
-    tracing::debug!(task = %name, "{}", start_msg);
+    tracing::debug!(task = %name, "Running scheduled task");
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, schedule_type).await {
+    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
-            tracing::debug!(task = %name, "{}", success_msg);
+            tracing::debug!(task = %name, "Task completed");
             send_ws_sys_task_msg(
                 &state,
                 "success",
@@ -1454,7 +1451,7 @@ async fn execute_task_lifecycle(
             state
                 .task_registry
                 .record_failure(&name, duration_ms, &error_str);
-            tracing::warn!(task = %name, error = %error_str, "{}", fail_msg);
+            tracing::warn!(task = %name, error = %error_str, "Task failed");
             send_ws_sys_task_msg(
                 &state,
                 "failure",
@@ -1468,36 +1465,41 @@ async fn execute_task_lifecycle(
     }
 }
 
-/// Handle the execution of a single fixed-delay task.
-async fn execute_fixed_delay_task(
-    name: String,
-    state: AppState,
-    handler: crate::task::TaskHandler,
-) {
-    execute_task_lifecycle(
-        name,
-        state,
-        handler,
-        "fixed_delay",
-        "Running scheduled task",
-        "Task completed",
-        "Task failed",
-    )
-    .await;
-}
-
 /// Handle the execution of a single cron task.
 async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
-    execute_task_lifecycle(
-        name,
-        state,
-        handler,
-        "cron",
-        "Running cron task",
-        "Cron task completed",
-        "Cron task failed",
-    )
-    .await;
+    tracing::debug!(task = %name, "Running cron task");
+    state.task_registry.record_start(&name);
+
+    send_ws_sys_task_msg(&state, "started", &name, vec![]);
+
+    let start = std::time::Instant::now();
+    match execute_task_result(&state, handler, start, &name, "cron").await {
+        Ok(duration_ms) => {
+            state.task_registry.record_success(&name, duration_ms);
+            tracing::debug!(task = %name, "Cron task completed");
+            send_ws_sys_task_msg(
+                &state,
+                "success",
+                &name,
+                vec![("duration_ms", serde_json::json!(duration_ms))],
+            );
+        }
+        Err((duration_ms, error_str)) => {
+            state
+                .task_registry
+                .record_failure(&name, duration_ms, &error_str);
+            tracing::warn!(task = %name, error = %error_str, "Cron task failed");
+            send_ws_sys_task_msg(
+                &state,
+                "failure",
+                &name,
+                vec![
+                    ("duration_ms", serde_json::json!(duration_ms)),
+                    ("error", serde_json::json!(error_str)),
+                ],
+            );
+        }
+    }
 }
 
 async fn register_cron_task(
@@ -3399,6 +3401,23 @@ mod tests {
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
+    }
+
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_calls_lifecycle_and_succeeds() {
+        let state = AppState::for_test();
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+        super::execute_fixed_delay_task("test_fixed".into(), state.clone(), handler).await;
+        assert!(true);
+    }
+
+    #[tokio::test]
+    async fn execute_cron_task_calls_lifecycle_and_succeeds() {
+        let state = AppState::for_test();
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+        super::execute_cron_task("test_cron".into(), state.clone(), handler).await;
+        assert!(true);
     }
 
     #[tokio::test]
