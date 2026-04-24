@@ -1,7 +1,12 @@
-1. Add Proptest fuzzing for Rate Limiting middleware `chaos_rate_limit_fuzz.rs` to break parsing of random strings in headers.
-2. Add loom testing for Channels concurrency `chaos_channels_loom.rs` `chaos_channels_concurrent_loom.rs` `chaos_channels_subscribe_loom.rs`
-3. Add loom testing for Metrics collection concurrency `chaos_metrics_loom.rs` `chaos_metrics_leak_loom.rs`
-4. Add loom testing for session storage mutation concurrency `chaos_session_loom.rs`
-5. Add loom testing for AppState concurrent modification `chaos_state_loom.rs`
-6. Complete pre commit steps.
-7. Submit the PR.
+1. **Refactor `Schedule` to implement `std::fmt::Display`**
+   - The formatting of `Schedule` is duplicated in several places in `autumn/src/app.rs`.
+   - Implement `std::fmt::Display` for `autumn/src/task.rs`'s `Schedule`.
+2. **Update usages in `autumn/src/app.rs`**
+   - Update `app.rs` to use `Schedule`'s `Display` implementation instead of repeating `match` logic.
+3. **Verify Tests**
+   - Run `cargo test -p autumn-web` to ensure no behavior change.
+   - Run `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`.
+4. **Pre-commit Checks**
+   - Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.
+5. **Submit PR**
+   - Create PR with '⚒️ Forge: [refactor name]' format.
