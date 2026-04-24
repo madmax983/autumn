@@ -1424,22 +1424,25 @@ async fn execute_task_result(
     }
 }
 
-/// Handle the execution of a single fixed-delay task.
-async fn execute_fixed_delay_task(
+async fn execute_task_lifecycle(
     name: String,
     state: AppState,
     handler: crate::task::TaskHandler,
+    schedule_type: &'static str,
+    start_msg: &'static str,
+    success_msg: &'static str,
+    fail_msg: &'static str,
 ) {
-    tracing::debug!(task = %name, "Running scheduled task");
+    tracing::debug!(task = %name, "{}", start_msg);
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
+    match execute_task_result(&state, handler, start, &name, schedule_type).await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
-            tracing::debug!(task = %name, "Task completed");
+            tracing::debug!(task = %name, "{}", success_msg);
             send_ws_sys_task_msg(
                 &state,
                 "success",
@@ -1451,7 +1454,7 @@ async fn execute_fixed_delay_task(
             state
                 .task_registry
                 .record_failure(&name, duration_ms, &error_str);
-            tracing::warn!(task = %name, error = %error_str, "Task failed");
+            tracing::warn!(task = %name, error = %error_str, "{}", fail_msg);
             send_ws_sys_task_msg(
                 &state,
                 "failure",
@@ -1465,41 +1468,36 @@ async fn execute_fixed_delay_task(
     }
 }
 
+/// Handle the execution of a single fixed-delay task.
+async fn execute_fixed_delay_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+) {
+    execute_task_lifecycle(
+        name,
+        state,
+        handler,
+        "fixed_delay",
+        "Running scheduled task",
+        "Task completed",
+        "Task failed",
+    )
+    .await;
+}
+
 /// Handle the execution of a single cron task.
 async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
-    tracing::debug!(task = %name, "Running cron task");
-    state.task_registry.record_start(&name);
-
-    send_ws_sys_task_msg(&state, "started", &name, vec![]);
-
-    let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "cron").await {
-        Ok(duration_ms) => {
-            state.task_registry.record_success(&name, duration_ms);
-            tracing::debug!(task = %name, "Cron task completed");
-            send_ws_sys_task_msg(
-                &state,
-                "success",
-                &name,
-                vec![("duration_ms", serde_json::json!(duration_ms))],
-            );
-        }
-        Err((duration_ms, error_str)) => {
-            state
-                .task_registry
-                .record_failure(&name, duration_ms, &error_str);
-            tracing::warn!(task = %name, error = %error_str, "Cron task failed");
-            send_ws_sys_task_msg(
-                &state,
-                "failure",
-                &name,
-                vec![
-                    ("duration_ms", serde_json::json!(duration_ms)),
-                    ("error", serde_json::json!(error_str)),
-                ],
-            );
-        }
-    }
+    execute_task_lifecycle(
+        name,
+        state,
+        handler,
+        "cron",
+        "Running cron task",
+        "Cron task completed",
+        "Cron task failed",
+    )
+    .await;
 }
 
 async fn register_cron_task(
