@@ -109,12 +109,12 @@ impl Multipart {
     ///
     /// Returns [`crate::AutumnError`] when multipart parsing fails or the
     /// field MIME type is not allowed by config.
-    pub async fn next_field<'a>(&'a mut self) -> crate::AutumnResult<Option<MultipartField<'a>>> {
+    pub async fn next_field(&mut self) -> crate::AutumnResult<Option<MultipartField<'_>>> {
         let Some(field) = self
             .inner
             .next_field()
             .await
-            .map_err(multipart_error_to_error)?
+            .map_err(|err| multipart_error_to_error(&err))?
         else {
             return Ok(None);
         };
@@ -166,7 +166,7 @@ where
         axum::extract::DefaultBodyLimit::max(config.max_request_size_bytes).apply(&mut req);
         let inner = axum::extract::Multipart::from_request(req, state)
             .await
-            .map_err(multipart_rejection_to_error)?;
+            .map_err(|err| multipart_rejection_to_error(&err))?;
         Ok(Self { inner, config })
     }
 }
@@ -177,7 +177,7 @@ pub struct MultipartField<'a> {
     max_file_size_bytes: usize,
 }
 
-impl<'a> MultipartField<'a> {
+impl MultipartField<'_> {
     /// Field name from the multipart form.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -205,7 +205,12 @@ impl<'a> MultipartField<'a> {
     pub async fn bytes_limited(mut self) -> crate::AutumnResult<Vec<u8>> {
         let mut out = Vec::new();
         let mut read = 0usize;
-        while let Some(chunk) = self.inner.chunk().await.map_err(multipart_error_to_error)? {
+        while let Some(chunk) = self
+            .inner
+            .chunk()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        {
             read += chunk.len();
             if read > self.max_file_size_bytes {
                 return Err(file_too_large_error(self.max_file_size_bytes));
@@ -233,7 +238,12 @@ impl<'a> MultipartField<'a> {
             .map_err(crate::AutumnError::internal_server_error)?;
 
         let mut written = 0usize;
-        while let Some(chunk) = self.inner.chunk().await.map_err(multipart_error_to_error)? {
+        while let Some(chunk) = self
+            .inner
+            .chunk()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        {
             written += chunk.len();
             if written > self.max_file_size_bytes {
                 drop(file);
@@ -252,12 +262,12 @@ impl<'a> MultipartField<'a> {
 }
 
 fn multipart_rejection_to_error(
-    err: axum::extract::multipart::MultipartRejection,
+    err: &axum::extract::multipart::MultipartRejection,
 ) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(format!("multipart parse error: {err}"))
 }
 
-fn multipart_error_to_error(err: axum::extract::multipart::MultipartError) -> crate::AutumnError {
+fn multipart_error_to_error(err: &axum::extract::multipart::MultipartError) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
 }
 
