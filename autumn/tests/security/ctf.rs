@@ -30,7 +30,7 @@
 use autumn_web::auth::{hash_password, verify_password};
 use autumn_web::security::CsrfLayer;
 use autumn_web::security::SecurityHeadersLayer;
-use autumn_web::security::config::{CsrfConfig, HeadersConfig};
+use autumn_web::security::{CsrfConfig, HeadersConfig};
 use autumn_web::session::{MemoryStore, Session, SessionConfig, SessionLayer, SessionStore};
 use axum::{
     Router,

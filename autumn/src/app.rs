@@ -36,7 +36,7 @@ use crate::config::{AutumnConfig, ConfigLoader};
 #[cfg(feature = "db")]
 use crate::db::DatabasePoolProvider;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
-use crate::middleware::exception_filter::ExceptionFilter;
+use crate::middleware::ExceptionFilter;
 #[cfg(feature = "db")]
 use crate::migrate;
 use crate::route::Route;
@@ -3144,12 +3144,12 @@ mod tests {
                 allowed_origins: vec!["https://example.com".into()],
                 ..crate::config::CorsConfig::default()
             },
-            security: crate::security::config::SecurityConfig {
-                csrf: crate::security::config::CsrfConfig {
+            security: crate::security::SecurityConfig {
+                csrf: crate::security::CsrfConfig {
                     enabled: true,
-                    ..crate::security::config::CsrfConfig::default()
+                    ..crate::security::CsrfConfig::default()
                 },
-                ..crate::security::config::SecurityConfig::default()
+                ..crate::security::SecurityConfig::default()
             },
             ..AutumnConfig::default()
         };

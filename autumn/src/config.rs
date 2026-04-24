@@ -508,7 +508,7 @@ pub struct AutumnConfig {
 
     /// Security settings (headers, CSRF).
     #[serde(default)]
-    pub security: crate::security::config::SecurityConfig,
+    pub security: crate::security::SecurityConfig,
 }
 
 impl AutumnConfig {

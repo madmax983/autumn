@@ -13,7 +13,7 @@ use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
-use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
+use crate::middleware::{ExceptionFilter, ExceptionFilterLayer};
 use crate::route::Route;
 use crate::state::AppState;
 use axum::middleware::Next;

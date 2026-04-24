@@ -51,7 +51,7 @@ use serde::Deserialize;
 /// # Examples
 ///
 /// ```rust
-/// use autumn_web::security::config::SecurityConfig;
+/// use autumn_web::security::SecurityConfig;
 ///
 /// let config = SecurityConfig::default();
 /// assert_eq!(config.headers.x_frame_options, "DENY");

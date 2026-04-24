@@ -18,11 +18,11 @@
 
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
-pub mod exception_filter;
-pub mod metrics;
-pub mod request_id;
+pub(crate) mod exception_filter;
+pub(crate) mod metrics;
+pub(crate) mod request_id;
 #[cfg(feature = "telemetry-otlp")]
-pub mod trace_context;
+pub(crate) mod trace_context;
 
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
 pub use metrics::{MetricsCollector, MetricsLayer};

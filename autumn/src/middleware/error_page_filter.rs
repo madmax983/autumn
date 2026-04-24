@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use crate::error_pages::dev_badge::{self, DevBadgeContext};
 use crate::error_pages::renderer::ErrorContext;
 use crate::error_pages::{self, SharedRenderer};
-use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
+use crate::middleware::{AutumnErrorInfo, ExceptionFilter};
 
 /// Exception filter that renders HTML error pages for browser requests.
 ///
@@ -386,7 +386,7 @@ mod tests {
 
     use crate::error::AutumnError;
     use crate::error_pages;
-    use crate::middleware::exception_filter::ExceptionFilterLayer;
+    use crate::middleware::ExceptionFilterLayer;
 
     /// Helper: build a router with the error page filter and context layer.
     fn test_router_with_error_pages(is_dev: bool) -> Router {

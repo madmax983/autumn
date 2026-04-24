@@ -23,7 +23,7 @@
 //!
 //! ```rust,no_run
 //! use autumn_web::security::headers::SecurityHeadersLayer;
-//! use autumn_web::security::config::HeadersConfig;
+//! use autumn_web::security::HeadersConfig;
 //!
 //! let config = HeadersConfig::default();
 //! let app = axum::Router::<()>::new()
