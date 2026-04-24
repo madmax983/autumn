@@ -18,6 +18,7 @@ cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
 tailwind = []
+openapi = []
 db = [
     "dep:deadpool",
     "dep:diesel",

@@ -420,6 +420,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// assert!(result.is_ok());
 /// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The config file exists but could not be read.
     #[error("failed to read autumn.toml: {0}")]
@@ -1111,6 +1112,7 @@ pub struct LogConfig {
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
     #[default]
@@ -1162,6 +1164,7 @@ pub struct TelemetryConfig {
 
 /// OTLP transport protocol selection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TelemetryProtocol {
     /// OTLP over gRPC.
     #[serde(alias = "grpc", alias = "GRPC")]

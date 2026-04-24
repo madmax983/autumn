@@ -150,6 +150,10 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         },
     );
 
+    let path_value = path.value();
+    let path_params = crate::api_doc::extract_path_params(&path_value);
+    let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
+
     quote! {
         #input_fn
 
@@ -160,6 +164,20 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 path: #path,
                 handler: ::autumn_web::reexports::axum::routing::get(#fn_name),
                 name: ::core::stringify!(#fn_name),
+                api_doc: ::autumn_web::openapi::ApiDoc {
+                    method: "GET",
+                    path: #path,
+                    operation_id: ::core::stringify!(#fn_name),
+                    summary: ::core::option::Option::None,
+                    description: ::core::option::Option::None,
+                    tags: &[],
+                    path_params: #path_params_tokens,
+                    request_body: ::core::option::Option::None,
+                    response: ::core::option::Option::None,
+                    success_status: 200,
+                    hidden: false,
+                    register_schemas: ::core::option::Option::None,
+                },
             }
         }
 
