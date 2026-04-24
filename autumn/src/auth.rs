@@ -549,7 +549,10 @@ async fn validate_callback_state(
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<()> {
     let state_key = format!("oauth2:{provider_name}:state");
-    let expected_state = session.remove(&state_key).await.ok_or_else(|| {
+    // Read without removing so a stray/attacker-controlled callback with a
+    // wrong state value cannot consume the real state and break the pending
+    // legitimate redirect.
+    let expected_state = session.get(&state_key).await.ok_or_else(|| {
         crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
     })?;
     if subtle::ConstantTimeEq::ct_eq(expected_state.as_bytes(), callback.state.as_bytes())
@@ -560,6 +563,8 @@ async fn validate_callback_state(
             "oauth2 state mismatch",
         ));
     }
+    // Remove the state only after a successful constant-time match.
+    session.remove(&state_key).await;
     Ok(())
 }
 
@@ -643,9 +648,14 @@ async fn validate_oidc_nonce(
     source: IdentitySource,
 ) -> crate::AutumnResult<()> {
     let nonce_key = format!("oauth2:{provider_name}:nonce");
-    if let Some(expected_nonce) = session.remove(&nonce_key).await
-        && source == IdentitySource::IdToken
-    {
+    let stored_nonce = session.remove(&nonce_key).await;
+    if source == IdentitySource::IdToken {
+        // The nonce MUST be present in the session for ID-token logins.
+        // A missing nonce (e.g. session was partially cleared) must be
+        // treated as an error to prevent replay/mix-up attacks.
+        let expected_nonce = stored_nonce.ok_or_else(|| {
+            crate::AutumnError::unauthorized_msg("oauth2 nonce missing from session")
+        })?;
         let actual_nonce = claims
             .get("nonce")
             .and_then(serde_json::Value::as_str)
@@ -978,6 +988,48 @@ mod tests {
         let claims = serde_json::json!({ "id": 42 });
         let subject = extract_subject(&claims, IdentitySource::UserInfo).unwrap();
         assert_eq!(subject, "42");
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_callback_state_preserves_state_on_mismatch() {
+        // An attacker hitting the callback with a wrong state must NOT
+        // consume the real state stored in the session; the legitimate
+        // provider redirect must still succeed.
+        let session =
+            crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        session
+            .insert("oauth2:github:state".to_owned(), "real-state".to_owned())
+            .await;
+        let bad_callback = OAuth2Callback {
+            code: "c".into(),
+            state: "wrong-state".into(),
+        };
+        let err = validate_callback_state(&session, "github", &bad_callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"));
+        // Real state must still be present after the failed attempt.
+        assert_eq!(
+            session.get("oauth2:github:state").await.as_deref(),
+            Some("real-state")
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_oidc_nonce_rejects_missing_nonce_for_id_token() {
+        // ID-token logins must fail when there is no stored nonce (e.g.,
+        // session was partially cleared or forged).
+        let session =
+            crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        // No nonce key inserted — simulates a cleared / missing session.
+        let claims = serde_json::json!({ "nonce": "any" });
+        let err =
+            validate_oidc_nonce(&session, "github", &claims, IdentitySource::IdToken)
+                .await
+                .unwrap_err();
+        assert!(err.to_string().contains("nonce missing from session"));
     }
 
     #[cfg(feature = "oauth2")]
