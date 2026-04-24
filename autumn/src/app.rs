@@ -3408,7 +3408,6 @@ mod tests {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         super::execute_fixed_delay_task("test_fixed".into(), state.clone(), handler).await;
-
     }
 
     #[tokio::test]
@@ -3416,7 +3415,6 @@ mod tests {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         super::execute_cron_task("test_cron".into(), state.clone(), handler).await;
-
     }
 
     #[tokio::test]
