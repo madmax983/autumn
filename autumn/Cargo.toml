@@ -17,8 +17,10 @@ flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
+multipart = ["axum/multipart"]
 tailwind = []
 oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
+openapi = []
 db = [
     "dep:deadpool",
     "dep:diesel",
