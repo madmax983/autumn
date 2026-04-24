@@ -76,6 +76,9 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
 //! | `AUTUMN_PROFILE` | active profile | `String` |
 
 use std::path::{Path, PathBuf};
@@ -940,6 +943,23 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
             &mut self.security.rate_limit.trust_forwarded_headers,
+        );
+
+        // Multipart uploads
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES",
+            &mut self.security.upload.max_request_size_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES",
+            &mut self.security.upload.max_file_size_bytes,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
+            &mut self.security.upload.allowed_mime_types,
         );
     }
 
