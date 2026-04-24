@@ -9,6 +9,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::{FnArg, ReturnType, Type};
 
 use crate::api_doc;
 use crate::parse;
@@ -51,11 +52,49 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
+    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+        let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
+        let mut wrapper_inputs = Vec::new();
+        let mut call_args = Vec::new();
+
+        for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
+            match arg {
+                FnArg::Typed(pat_type) => {
+                    let arg_name = format_ident!("__autumn_arg_{idx}");
+                    let ty = &pat_type.ty;
+                    wrapper_inputs.push(quote! { #arg_name: #ty });
+                    call_args.push(quote! { #arg_name });
+                }
+                FnArg::Receiver(receiver) => {
+                    return syn::Error::new_spanned(
+                        receiver,
+                        "Autumn route handlers cannot take a self receiver",
+                    )
+                    .to_compile_error();
+                }
+            }
+        }
+
+        Some(quote! {
+            #[doc(hidden)]
+            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
+                #fn_name(#(#call_args),*).await.to_string()
+            }
+        })
+    } else {
+        None
+    };
+
+    let handler_name = primitive_wrapper.as_ref().map_or_else(
+        || fn_name.clone(),
+        |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
+    );
+
     // Build the handler expression, chaining .layer() for each interceptor.
     // Interceptors are applied in reverse attribute order so that the first
     // #[intercept(...)] listed is the outermost layer (runs first).
     let mut handler_expr: TokenStream =
-        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#fn_name) };
+        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
 
     for interceptor in interceptors.iter().rev() {
         // Explicit error type annotation avoids inference ambiguity when
@@ -80,6 +119,7 @@ pub fn route_macro(
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
         #input_fn
+        #primitive_wrapper
 
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {
@@ -100,4 +140,38 @@ pub fn route_macro(
             }
         }
     }
+}
+
+fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    let Type::Path(path) = ty.as_ref() else {
+        return false;
+    };
+
+    if path.qself.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+
+    let ident = path.path.segments[0].ident.to_string();
+    matches!(
+        ident.as_str(),
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
 }
