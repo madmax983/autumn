@@ -11,7 +11,7 @@ keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "oauth2"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka"]
 ws = ["dep:tokio-stream"]
 flash = []
 cache-moka = ["dep:moka"]
