@@ -1,0 +1,30 @@
+[package]
+name = "autumn-admin-plugin"
+description = "Out-of-the-box admin panel plugin for autumn-web applications"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-web = { path = "../autumn", features = ["maud", "htmx", "db", "flash"] }
+axum = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+maud = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
