@@ -34,6 +34,7 @@ Look at the market: Relay/GraphQL standardizes on cursor pagination. Offset pagi
 ✅ **Acceptance Criteria:**
 - Must provide a `CursorPage` extraction type that accepts a cursor string and limit.
 - Must integrate with the existing database ORM layer to filter properly.
+- Must enforce a stable, deterministic sort order with a unique tie-breaker (e.g., `created_at` + `id`) to guarantee zero duplicate items during concurrent inserts.
 - Must return a `next_cursor` token in the response.
 
 ---
