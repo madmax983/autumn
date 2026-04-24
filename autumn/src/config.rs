@@ -214,18 +214,18 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
 /// 3. `--profile <name>` CLI flag
 /// 4. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
 /// 5. Fallback to `dev`
-pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
+pub(crate) fn resolve_profile(env: &dyn Env) -> String {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
         if let Some(profile) = normalize_profile_name(&profile) {
-            return Some(profile);
+            return profile;
         }
     }
 
     // 2. Legacy env var
     if let Ok(profile) = env.var("AUTUMN_PROFILE") {
         if let Some(profile) = normalize_profile_name(&profile) {
-            return Some(profile);
+            return profile;
         }
     }
 
@@ -235,23 +235,22 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
         if arg == "--profile" {
             if let Some(profile) = args.get(i + 1) {
                 if let Some(profile) = normalize_profile_name(profile) {
-                    return Some(profile);
+                    return profile;
                 }
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
             if let Some(profile) = normalize_profile_name(profile) {
-                return Some(profile);
+                return profile;
             }
         }
     }
 
     // 4. Auto-detect from build mode
-    match env.var("AUTUMN_IS_DEBUG").ok().as_deref() {
-        Some("1") => Some("dev".to_owned()),
-        Some("0") => Some("prod".to_owned()),
-        _ => Some("dev".to_owned()),
+    if env.var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
+        return "prod".to_owned();
     }
+    "dev".to_owned()
 }
 
 /// Normalize profile aliases and trim whitespace.
@@ -602,41 +601,34 @@ impl AutumnConfig {
 
         // Build merged TOML:
         // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
-        let mut merged = profile.as_ref().map_or_else(
-            || toml::Value::Table(toml::map::Map::new()),
-            |p| profile_defaults_as_toml(p),
-        );
+        let mut merged = profile_defaults_as_toml(&profile);
 
         // Layer 3: base autumn.toml
         if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
             deep_merge(&mut merged, base.clone());
 
             // Layer 4: [profile.{name}] in autumn.toml
-            if let Some(ref p) = profile {
-                if let Some(inline_profile) = profile_section_from_base_toml(&base, p) {
-                    deep_merge(&mut merged, inline_profile);
-                    has_inline_profile_section = true;
-                }
+            if let Some(inline_profile) = profile_section_from_base_toml(&base, &profile) {
+                deep_merge(&mut merged, inline_profile);
+                has_inline_profile_section = true;
             }
         }
 
         // Layer 5: autumn-{profile}.toml (legacy compatibility)
-        if let Some(ref p) = profile {
-            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
-            match load_raw_toml(&profile_path)? {
-                Some(profile_toml) => deep_merge(&mut merged, profile_toml),
-                None if should_warn_missing_profile_file(p, has_inline_profile_section) => {
-                    warn_profile_typo(p)
-                }
-                None => {}
+        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
+        match load_raw_toml(&profile_path)? {
+            Some(profile_toml) => deep_merge(&mut merged, profile_toml),
+            None if should_warn_missing_profile_file(&profile, has_inline_profile_section) => {
+                warn_profile_typo(&profile);
             }
+            None => {}
         }
 
         // Deserialize the merged TOML table into AutumnConfig
         let toml_str =
             toml::to_string(&merged).expect("internal error: failed to serialize merged config");
         let mut config: Self = toml::from_str(&toml_str)?;
-        config.profile = profile;
+        config.profile = Some(profile);
 
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
@@ -2345,14 +2337,14 @@ path = "/healthz"
     fn resolve_profile_from_autumn_env() {
         let env = MockEnv::new().with("AUTUMN_ENV", "prod");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(profile, "prod");
     }
 
     #[test]
     fn resolve_profile_from_legacy_env() {
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(profile, "staging");
     }
 
     #[test]
@@ -2361,49 +2353,49 @@ path = "/healthz"
             .with("AUTUMN_ENV", "dev")
             .with("AUTUMN_PROFILE", "prod");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
     fn resolve_profile_normalizes_production_alias() {
         let env = MockEnv::new().with("AUTUMN_ENV", "production");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(profile, "prod");
     }
 
     #[test]
     fn resolve_profile_normalizes_development_alias_with_whitespace() {
         let env = MockEnv::new().with("AUTUMN_ENV", "  development  ");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
     fn resolve_profile_preserves_case_for_custom_profiles() {
         let env = MockEnv::new().with("AUTUMN_ENV", "QA");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("QA"));
+        assert_eq!(profile, "QA");
     }
 
     #[test]
     fn resolve_profile_auto_detect_debug() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "1");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
     fn resolve_profile_auto_detect_release() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "0");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(profile, "prod");
     }
 
     #[test]
     fn resolve_profile_defaults_to_dev_when_no_signal_present() {
         let env = MockEnv::new();
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
@@ -2833,13 +2825,13 @@ path = "/healthz"
         let base_path = dir.path().join("autumn.toml");
         std::fs::write(
             &base_path,
-            r#"
+            r"
             [server]
             port = 3000
 
             [profile.staging.server]
             port = 4100
-            "#,
+            ",
         )
         .unwrap();
 
