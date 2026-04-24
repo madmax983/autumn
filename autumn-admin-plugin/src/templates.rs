@@ -153,10 +153,10 @@ const ADMIN_CSS: &str = "
         letter-spacing: 0.05em;
         border-bottom: 2px solid var(--border);
         white-space: nowrap;
-        cursor: pointer;
         user-select: none;
     }
-    th:hover { color: var(--text); }
+    th a { cursor: pointer; }
+    th a:hover { color: var(--text); }
     th .sort-icon { font-size: 0.625rem; margin-left: 0.25rem; }
     td {
         padding: 0.75rem;
@@ -492,16 +492,20 @@ pub fn model_list_page(
                                 @let is_sorted = sort_by == Some(field.name);
                                 @let next_dir = if is_sorted { sort_dir.flipped() } else { SortDirection::Asc };
                                 th {
-                                    a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
-                                        @if !search_enc.is_empty() { "&q=" (search_enc) }
-                                    }
-                                    style="color: inherit; text-decoration: none;" {
-                                        (field.label)
-                                        @if is_sorted {
-                                            span class="sort-icon" {
-                                                @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
+                                    @if field.sortable {
+                                        a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
+                                            @if !search_enc.is_empty() { "&q=" (search_enc) }
+                                        }
+                                        style="color: inherit; text-decoration: none;" {
+                                            (field.label)
+                                            @if is_sorted {
+                                                span class="sort-icon" {
+                                                    @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
+                                                }
                                             }
                                         }
+                                    } @else {
+                                        (field.label)
                                     }
                                 }
                             }
@@ -1141,6 +1145,52 @@ mod tests {
         assert!(
             !html.contains("onclick=\""),
             "no inline event handlers allowed under default CSP: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_omits_sort_link_for_unsortable_fields() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        // One sortable, one non-sortable.
+        let mut computed = AdminField::new("computed", AdminFieldKind::Text).label("Computed");
+        computed.sortable = false;
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text), computed];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "tok",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        // Sortable field gets a sort link.
+        assert!(
+            html.contains(r#"href="/admin/widgets?sort=name"#),
+            "sortable field should have a sort link: {html}"
+        );
+        // Non-sortable field must NOT get a sort link.
+        assert!(
+            !html.contains("sort=computed"),
+            "non-sortable field must not emit a sort link: {html}"
+        );
+        // But its label is still rendered.
+        assert!(
+            html.contains("Computed"),
+            "label should still render: {html}"
         );
     }
 
