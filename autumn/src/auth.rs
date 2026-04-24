@@ -996,8 +996,7 @@ mod tests {
         // An attacker hitting the callback with a wrong state must NOT
         // consume the real state stored in the session; the legitimate
         // provider redirect must still succeed.
-        let session =
-            crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
         session
             .insert("oauth2:github:state".to_owned(), "real-state".to_owned())
             .await;
@@ -1021,14 +1020,12 @@ mod tests {
     async fn validate_oidc_nonce_rejects_missing_nonce_for_id_token() {
         // ID-token logins must fail when there is no stored nonce (e.g.,
         // session was partially cleared or forged).
-        let session =
-            crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
         // No nonce key inserted — simulates a cleared / missing session.
         let claims = serde_json::json!({ "nonce": "any" });
-        let err =
-            validate_oidc_nonce(&session, "github", &claims, IdentitySource::IdToken)
-                .await
-                .unwrap_err();
+        let err = validate_oidc_nonce(&session, "github", &claims, IdentitySource::IdToken)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("nonce missing from session"));
     }
 
