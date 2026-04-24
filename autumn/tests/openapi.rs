@@ -50,6 +50,28 @@ async fn tagged() -> &'static str {
     "tagged"
 }
 
+// Exercise the *reversed* attribute order: `#[api_doc]` above `#[get]`.
+// Rust expands `#[api_doc]` first; the standalone macro must reorder
+// so the route macro still sees the overrides.
+#[api_doc(summary = "Top-first api_doc", tag = "top")]
+#[get("/top-first")]
+async fn top_first() -> &'static str {
+    "top"
+}
+
+#[api_doc(hidden)]
+#[post("/top-hidden")]
+async fn top_hidden() -> &'static str {
+    "hidden"
+}
+
+// Responses wrapped in `(StatusCode, Json<T>)` — common for 201 Created
+// handlers — should still be inferred.
+#[post("/things")]
+async fn create_thing() -> (http::StatusCode, axum::Json<serde_json::Value>) {
+    (http::StatusCode::CREATED, axum::Json(serde_json::json!({})))
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -115,6 +137,35 @@ fn api_doc_attribute_accepts_tag_list() {
     let route = __autumn_route_info_tagged();
     assert_eq!(route.api_doc.tags, &["users", "auth"]);
     assert_eq!(route.api_doc.description, Some("Multi-tagged route"));
+}
+
+#[test]
+fn api_doc_survives_when_placed_above_route_attribute() {
+    let route = __autumn_route_info_top_first();
+    assert_eq!(
+        route.api_doc.summary,
+        Some("Top-first api_doc"),
+        "`#[api_doc]` above `#[get]` must not be dropped"
+    );
+    assert_eq!(route.api_doc.tags, &["top"]);
+}
+
+#[test]
+fn api_doc_hidden_survives_when_placed_above_route_attribute() {
+    let route = __autumn_route_info_top_hidden();
+    assert!(route.api_doc.hidden);
+}
+
+#[test]
+fn status_tuple_response_is_inferred_as_json() {
+    let route = __autumn_route_info_create_thing();
+    let resp = route
+        .api_doc
+        .response
+        .as_ref()
+        .expect("(StatusCode, Json<T>) should be inferred");
+    assert_eq!(resp.name, "Value");
+    assert_eq!(resp.kind, SchemaKind::Ref);
 }
 
 // ── Spec generation pipeline ───────────────────────────────────────

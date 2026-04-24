@@ -445,13 +445,60 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// async fn metrics() -> &'static str { "" }
 /// ```
 #[proc_macro_attribute]
-pub fn api_doc(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Standalone form: no-op. Route macros parse and consume `#[api_doc]`
-    // directly from their input's attribute list (see api_doc::extract).
-    // When `#[api_doc]` appears without any route macro, it still needs to
-    // be a valid attribute so the item compiles — we simply pass the item
-    // through unchanged.
-    item
+pub fn api_doc(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Rust expands attribute macros top-down (outermost first), so if the
+    // user writes
+    //
+    //   #[api_doc(summary = "...")]
+    //   #[get("/x")]
+    //   async fn handler() { ... }
+    //
+    // this macro fires BEFORE `#[get]` and would strip `#[api_doc]` from
+    // the item — the route macro would then never see the overrides.
+    //
+    // To support both orderings, we detect any pending route attribute
+    // (`get`, `post`, etc.) sitting below us and reorder: we remove the
+    // route attribute and emit it as the NEW outermost attribute, and
+    // we re-attach `#[api_doc(...)]` to the function body. Rust then
+    // expands the route macro next, which finds and consumes the
+    // preserved `#[api_doc]` via the usual attribute-list walk.
+    api_doc_standalone(attr, item)
+}
+
+const ROUTE_ATTR_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "static_get", "ws"];
+
+fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr_ts: proc_macro2::TokenStream = attr.into();
+    let mut input_fn: syn::ItemFn = match syn::parse(item.clone()) {
+        Ok(f) => f,
+        // Not a function (e.g. applied to a struct) — leave it alone so
+        // the user sees the usual "expected function" error from rustc.
+        Err(_) => return item,
+    };
+
+    let route_idx = input_fn.attrs.iter().position(|a| {
+        a.path()
+            .get_ident()
+            .is_some_and(|ident| ROUTE_ATTR_NAMES.contains(&ident.to_string().as_str()))
+    });
+
+    let Some(idx) = route_idx else {
+        // Standalone `#[api_doc]` with no paired route macro is a no-op;
+        // route metadata is only emitted through route macros.
+        return quote::quote! { #input_fn }.into();
+    };
+
+    let route_attr = input_fn.attrs.remove(idx);
+    let preserved: syn::Attribute = syn::parse_quote! {
+        #[api_doc(#attr_ts)]
+    };
+    input_fn.attrs.insert(0, preserved);
+
+    quote::quote! {
+        #route_attr
+        #input_fn
+    }
+    .into()
 }
 
 /// Annotate an async function as a WebSocket route handler.

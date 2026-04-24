@@ -40,6 +40,16 @@ pub enum RouterBuildError {
         /// The name of the incoming user route.
         incoming: &'static str,
     },
+    /// An `OpenApiConfig` path (e.g. `openapi_json_path` or
+    /// `swagger_ui_path`) is not a valid route path (must start with `/`
+    /// and be non-empty).
+    #[error("invalid OpenAPI {field} path: {value:?} (must start with '/' and be non-empty)")]
+    InvalidOpenApiPath {
+        /// Which config field carried the invalid path.
+        field: &'static str,
+        /// The offending value from the user's config.
+        value: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -194,7 +204,7 @@ pub fn try_build_router_inner(
     // Build the OpenAPI spec BEFORE moving the routes into axum, because
     // group_and_mount_routes consumes the Route list.
     let openapi_router =
-        build_openapi_router(&route_list, &ctx.scoped_groups, ctx.openapi.as_ref());
+        build_openapi_router(&route_list, &ctx.scoped_groups, ctx.openapi.as_ref())?;
 
     let mut router = group_and_mount_routes(route_list);
 
@@ -277,8 +287,18 @@ fn build_openapi_router(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
-) -> Option<axum::Router<AppState>> {
-    let config = openapi_config?;
+) -> Result<Option<axum::Router<AppState>>, RouterBuildError> {
+    let Some(config) = openapi_config else {
+        return Ok(None);
+    };
+
+    // Validate user-provided paths up front so a typo like
+    // `"openapi.json"` surfaces as a recoverable RouterBuildError
+    // rather than an axum panic (`Paths must start with a '/'`).
+    validate_route_path("openapi_json_path", &config.openapi_json_path)?;
+    if let Some(path) = &config.swagger_ui_path {
+        validate_route_path("swagger_ui_path", path)?;
+    }
 
     // Walk both top-level routes and scoped groups. For scoped groups the
     // effective path is `prefix + route.path`; we materialize these into
@@ -367,7 +387,18 @@ fn build_openapi_router(
         "Mounted OpenAPI endpoints"
     );
 
-    Some(router)
+    Ok(Some(router))
+}
+
+/// Shared validator for user-supplied route paths.
+fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBuildError> {
+    if value.is_empty() || !value.starts_with('/') {
+        return Err(RouterBuildError::InvalidOpenApiPath {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
@@ -1392,8 +1423,9 @@ mod tests {
         };
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
-        let router =
-            super::build_openapi_router(&[], &[group], Some(&config)).expect("openapi sub-router");
+        let router = super::build_openapi_router(&[], &[group], Some(&config))
+            .expect("openapi sub-router builds")
+            .expect("openapi sub-router present when config is Some");
         let state = test_state();
         let router = router.with_state(state);
 
@@ -1420,5 +1452,53 @@ mod tests {
             .collect();
         assert!(names.contains(&"org_id"), "missing org_id: {names:?}");
         assert!(names.contains(&"id"), "missing id: {names:?}");
+    }
+
+    #[test]
+    fn openapi_rejects_json_path_without_leading_slash() {
+        let config =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("openapi.json");
+        let err = super::build_openapi_router(&[], &[], Some(&config))
+            .expect_err("non-slash path should be rejected");
+        assert!(matches!(
+            err,
+            RouterBuildError::InvalidOpenApiPath {
+                field: "openapi_json_path",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn openapi_rejects_swagger_ui_path_without_leading_slash() {
+        let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .swagger_ui_path(Some("docs".to_owned()));
+        let err = super::build_openapi_router(&[], &[], Some(&config))
+            .expect_err("non-slash path should be rejected");
+        assert!(matches!(
+            err,
+            RouterBuildError::InvalidOpenApiPath {
+                field: "swagger_ui_path",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn openapi_rejects_empty_json_path() {
+        let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("");
+        let err = super::build_openapi_router(&[], &[], Some(&config))
+            .expect_err("empty path should be rejected");
+        assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
+    }
+
+    #[test]
+    fn openapi_accepts_valid_paths() {
+        let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/api-docs")
+            .swagger_ui_path(Some("/ui".to_owned()));
+        let out = super::build_openapi_router(&[], &[], Some(&config))
+            .expect("valid paths must not error");
+        assert!(out.is_some());
     }
 }

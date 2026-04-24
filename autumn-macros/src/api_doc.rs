@@ -315,15 +315,39 @@ pub fn infer_request_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
     None
 }
 
-/// Inspect the handler's return type for `Json<T>` (including
-/// `Result<Json<T>, _>` and `AutumnResult<Json<T>>`) to infer the
-/// success response body.
+/// Inspect the handler's return type for `Json<T>` to infer the success
+/// response body. Handles several common Axum return-type patterns:
+///
+/// * `Json<T>` — plain JSON body
+/// * `Result<Json<T>, _>` / `AutumnResult<Json<T>>` — fallible JSON
+/// * `(StatusCode, Json<T>)` — JSON with a custom status code
+/// * `Result<(StatusCode, Json<T>), _>` — the two combined
 pub fn infer_response_body(input_fn: &syn::ItemFn) -> Option<TokenStream> {
     let syn::ReturnType::Type(_, ty) = &input_fn.sig.output else {
         return None;
     };
     let ty = unwrap_result_ok(ty).unwrap_or_else(|| (**ty).clone());
-    unwrap_single_generic(&ty, "Json").map(|inner| schema_entry_for_type(&inner))
+    find_json_in_type(&ty).map(|inner| schema_entry_for_type(&inner))
+}
+
+/// Look for `Json<T>` either directly or inside a tuple element.
+///
+/// Axum handlers often return tuples like `(StatusCode, Json<T>)` or
+/// `([(HeaderName, _); N], Json<T>)` to attach status codes or
+/// headers. We scan each tuple element so the generated schema still
+/// reflects the JSON body.
+fn find_json_in_type(ty: &syn::Type) -> Option<syn::Type> {
+    if let Some(inner) = unwrap_single_generic(ty, "Json") {
+        return Some(inner);
+    }
+    if let syn::Type::Tuple(tup) = ty {
+        for elem in &tup.elems {
+            if let Some(inner) = unwrap_single_generic(elem, "Json") {
+                return Some(inner);
+            }
+        }
+    }
+    None
 }
 
 /// Peel a single layer of `Result<T, _>` / `AutumnResult<T>` so we can
