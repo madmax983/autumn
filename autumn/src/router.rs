@@ -229,6 +229,8 @@ pub fn try_build_router_inner(
         ctx.openapi.as_ref(),
         &route_list,
         &ctx.scoped_groups,
+        &ctx.merge_routers,
+        &ctx.nest_routers,
         config,
     )?;
 
@@ -447,13 +449,24 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
 /// [`RouterBuildError::OpenApiPathCollision`] so misconfiguration
 /// produces an actionable error instead of a crash on startup.
 ///
-/// We check against user routes (both top-level and scoped groups)
-/// plus the framework's probe/actuator/htmx endpoints that will be
-/// mounted before the `OpenAPI` sub-router merges in.
+/// We check against:
+/// * user routes (top-level + scoped groups) that will be mounted
+///   before the `OpenAPI` sub-router merges in,
+/// * framework `GET`s: probes, actuator, htmx asset, and dev
+///   live-reload when enabled,
+/// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
+///   when the `OpenAPI` path falls under one.
+///
+/// Raw routers passed to [`AppBuilder::merge`](crate::app::AppBuilder::merge)
+/// cannot be introspected — axum does not expose their route table.
+/// We emit a `tracing::warn!` so operators know the check is
+/// incomplete in that case.
 fn reject_openapi_path_collisions(
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
+    merge_routers: &[axum::Router<AppState>],
+    nest_routers: &[(String, axum::Router<AppState>)],
     config: &AutumnConfig,
 ) -> Result<(), RouterBuildError> {
     let Some(openapi) = openapi_config else {
@@ -486,18 +499,68 @@ fn reject_openapi_path_collisions(
     }
     #[cfg(feature = "htmx")]
     claimed.insert("/static/js/htmx.min.js".to_owned());
+    // Dev live-reload endpoints are only mounted when the env vars
+    // that enable them are set, but reserving the paths regardless
+    // makes the error message deterministic across dev/prod.
+    if dev::is_enabled_with_env(&crate::config::OsEnv) {
+        claimed.insert(dev::LIVE_RELOAD_PATH.to_owned());
+        claimed.insert(dev::LIVE_RELOAD_SCRIPT_PATH.to_owned());
+    }
 
-    if claimed.contains(&openapi.openapi_json_path) {
+    check_openapi_path_against(
+        "openapi_json_path",
+        &openapi.openapi_json_path,
+        &claimed,
+        nest_routers,
+    )?;
+    if let Some(path) = &openapi.swagger_ui_path {
+        check_openapi_path_against("swagger_ui_path", path, &claimed, nest_routers)?;
+    }
+
+    // Raw merged routers are opaque — we can't inspect their route
+    // tables through the axum API. Warn instead of failing so users
+    // know the check doesn't cover this code path.
+    if !merge_routers.is_empty() {
+        tracing::warn!(
+            openapi_json_path = %openapi.openapi_json_path,
+            swagger_ui_path = ?openapi.swagger_ui_path,
+            merged_routers = merge_routers.len(),
+            "OpenAPI mount collision check skipped for AppBuilder::merge routers: \
+             axum does not expose their route table, so overlapping GET handlers \
+             will still panic at startup. Choose OpenAPI paths that don't overlap \
+             with any merged router's handlers."
+        );
+    }
+
+    Ok(())
+}
+
+/// Evaluate a single `OpenAPI` path against the claimed-path set plus
+/// any nest prefixes. Returns an `OpenApiPathCollision` error on
+/// collision.
+fn check_openapi_path_against(
+    field: &'static str,
+    path: &str,
+    claimed: &std::collections::HashSet<String>,
+    nest_routers: &[(String, axum::Router<AppState>)],
+) -> Result<(), RouterBuildError> {
+    if claimed.contains(path) {
         return Err(RouterBuildError::OpenApiPathCollision {
-            field: "openapi_json_path",
-            path: openapi.openapi_json_path.clone(),
+            field,
+            path: path.to_owned(),
         });
     }
-    if let Some(path) = &openapi.swagger_ui_path {
-        if claimed.contains(path) {
+    // A nest prefix P owns every route under P (`/P/...`), so any
+    // OpenAPI path that equals P or starts with `P/` will either
+    // panic on merge (exact match) or nest inside the user's router
+    // (where axum routing semantics decide which handler wins).
+    // Reject both cases so the spec endpoint can't silently vanish.
+    for (prefix, _) in nest_routers {
+        let prefix_slash = format!("{prefix}/");
+        if path == prefix || path.starts_with(&prefix_slash) {
             return Err(RouterBuildError::OpenApiPathCollision {
-                field: "swagger_ui_path",
-                path: path.clone(),
+                field,
+                path: path.to_owned(),
             });
         }
     }
@@ -1685,5 +1748,71 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_under_nest_prefix() {
+        // Nesting `/api` means that router owns everything under
+        // `/api/...`. Mounting OpenAPI at `/api/docs` would either
+        // panic on merge or silently lose one of the routes, so the
+        // collision check rejects it.
+        let config = AutumnConfig::default();
+        let openapi =
+            crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/api/docs");
+        let nested = axum::Router::<AppState>::new()
+            .route("/inner", axum::routing::get(|| async { "inner" }));
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: vec![("/api".to_owned(), nested)],
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("OpenAPI path under a nest prefix should collide");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == "/api/docs"
+        ));
+    }
+
+    #[test]
+    fn try_build_router_rejects_openapi_path_on_dev_live_reload() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                ("AUTUMN_DEV_RELOAD_STATE", Some("/tmp/autumn-reload-test")),
+            ],
+            || {
+                let config = AutumnConfig::default();
+                let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+                    .openapi_json_path("/__autumn/live-reload");
+                let ctx = RouterContext {
+                    exception_filters: Vec::new(),
+                    scoped_groups: Vec::new(),
+                    merge_routers: Vec::new(),
+                    nest_routers: Vec::new(),
+                    custom_layers: Vec::new(),
+                    error_page_renderer: None,
+                    session_store: None,
+                    openapi: Some(openapi),
+                };
+                let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+                    .expect_err("dev reload path should be reserved");
+                assert!(matches!(
+                    err,
+                    RouterBuildError::OpenApiPathCollision {
+                        field: "openapi_json_path",
+                        ..
+                    }
+                ));
+            },
+        );
     }
 }
