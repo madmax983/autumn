@@ -108,7 +108,7 @@ pub struct RouterContext {
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`](crate::middleware::RequestIdLayer) on the ingress
     /// path so user middleware observes the generated request ID.
-    pub custom_layers: Vec<crate::app::CustomLayerApplier>,
+    pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -801,7 +801,7 @@ fn apply_middleware(
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    custom_layers: Vec<crate::app::CustomLayerApplier>,
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -823,8 +823,8 @@ fn apply_middleware(
     // request extensions. Iterate in reverse so the first registered layer
     // ends up outermost among user layers — matching tower::ServiceBuilder.
     let custom_layer_count = custom_layers.len();
-    for applier in custom_layers.into_iter().rev() {
-        router = applier(router);
+    for registered in custom_layers.into_iter().rev() {
+        router = (registered.apply)(router);
     }
     if custom_layer_count > 0 {
         tracing::debug!(count = custom_layer_count, "Custom Tower layers applied");

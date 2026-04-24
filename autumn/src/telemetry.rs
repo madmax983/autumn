@@ -18,6 +18,7 @@ use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::Sd
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResolvedLogFormat {
     /// Human-readable developer logs.
     Pretty,
@@ -71,6 +72,7 @@ pub struct TelemetryResource {
 
 /// Errors that can occur while planning or initializing telemetry.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TelemetryInitError {
     /// Telemetry was enabled without an OTLP endpoint.
     #[error("telemetry is enabled but no OTLP endpoint was configured")]

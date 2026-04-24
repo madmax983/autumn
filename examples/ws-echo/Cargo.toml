@@ -1,0 +1,10 @@
+[package]
+name = "ws-echo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn", features = ["ws"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

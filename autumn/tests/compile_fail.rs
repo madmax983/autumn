@@ -73,6 +73,10 @@ fn compile_pass_tests() {
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
     t.pass("tests/compile-pass/cached_result.rs");
+
+    // WebSocket macro (requires ws feature)
+    #[cfg(feature = "ws")]
+    t.pass("tests/compile-pass/ws_basic.rs");
 }
 
 #[cfg(feature = "db")]

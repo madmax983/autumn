@@ -40,6 +40,7 @@ const FLASH_SESSION_KEY: &str = "__autumn_flash";
 /// The severity level of a flash message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FlashLevel {
     /// Success messages (e.g., "Item created").
     Success,

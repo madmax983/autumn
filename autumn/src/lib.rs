@@ -46,6 +46,7 @@
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 
 //! - [`middleware`] -- Built-in middleware (request IDs).
+//! - [`pagination`] -- Standardized `page`/`size` extractor and response wrapper.
 //! - [`prelude`] -- Glob import for the most common types.
 
 //!
@@ -104,6 +105,7 @@ pub(crate) mod htmx;
 pub(crate) mod logging;
 pub mod middleware;
 pub mod openapi;
+pub mod pagination;
 pub mod prelude;
 pub(crate) mod route;
 pub use route::Route;
@@ -155,6 +157,18 @@ pub use db::Db;
 /// [`AutumnResult<T>`] is `Result<T, AutumnError>`.
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
+
+/// Paginated list response wrapper with navigation metadata.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::Page;
+
+/// Pagination parameters extracted from the query string.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::PageRequest;
 
 /// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
 /// and validates via `validator::Validate` before the handler runs.
