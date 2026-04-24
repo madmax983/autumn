@@ -255,9 +255,10 @@ mod tests {
 
     #[tokio::test]
     async fn default_csp_allows_htmx_to_function() {
-        // htmx is served from /static/js/htmx.min.js (same origin), operates
-        // via addEventListener (no eval), and issues hx-* requests to the
-        // same origin. The default CSP must allow all of that.
+        // htmx and Autumn's htmx CSRF helper are served from /static/js/
+        // (same origin), operate via addEventListener, and issue hx-* requests
+        // to the same origin. The default CSP must allow all of that without
+        // requiring inline scripts.
         let config = HeadersConfig::default();
         let app = Router::new()
             .route("/", get(|| async { "ok" }))

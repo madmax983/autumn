@@ -21,6 +21,8 @@ use axum::response::IntoResponse;
 use http::StatusCode;
 use thiserror::Error;
 
+pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
+
 /// Errors that can occur during the router build process.
 ///
 /// These errors are typically fatal and represent configuration or routing
@@ -697,11 +699,21 @@ fn mount_framework_routes(
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
-        router = router.route("/static/js/htmx.min.js", axum::routing::get(htmx_handler));
+        router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+        router = router.route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(htmx_csrf_handler),
+        );
         tracing::debug!(
             method = "GET",
-            path = "/static/js/htmx.min.js",
+            path = crate::htmx::HTMX_JS_PATH,
             name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_CSRF_JS_PATH,
+            name = "htmx csrf helper",
             "Mounted route"
         );
     }
@@ -1136,6 +1148,9 @@ pub fn try_build_router_with_static_inner(
             }
         },
     ));
+    let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
+        &config.security.headers,
+    ));
 
     Ok(apply_startup_barrier(
         router,
@@ -1308,6 +1323,22 @@ pub async fn htmx_handler() -> axum::response::Response {
             ),
         ],
         crate::htmx::HTMX_JS,
+    )
+        .into_response()
+}
+
+#[cfg(feature = "htmx")]
+pub async fn htmx_csrf_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/javascript"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::htmx::HTMX_CSRF_JS,
     )
         .into_response()
 }

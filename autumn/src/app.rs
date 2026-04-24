@@ -89,6 +89,7 @@ pub fn app() -> AppBuilder {
         session_store: None,
         #[cfg(feature = "openapi")]
         openapi: None,
+        audit_logger: None,
     }
 }
 
@@ -201,6 +202,8 @@ pub struct AppBuilder {
     /// runtime collision-check machinery.
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
+    /// Shared audit logger used for append-only compliance events.
+    audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -878,6 +881,24 @@ impl AppBuilder {
         self
     }
 
+    /// Register an additional audit sink for structured audit events.
+    ///
+    /// Multiple calls accumulate sinks. Logged events are fanned out to all
+    /// configured sinks.
+    #[must_use]
+    pub fn with_audit_sink<S>(mut self, sink: S) -> Self
+    where
+        S: crate::audit::AuditSink,
+    {
+        let logger = self
+            .audit_logger
+            .take()
+            .map_or_else(crate::audit::AuditLogger::new, |logger| (*logger).clone())
+            .with_sink(Arc::new(sink));
+        self.audit_logger = Some(Arc::new(logger));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -1003,6 +1024,7 @@ impl AppBuilder {
             session_store,
             #[cfg(feature = "openapi")]
             openapi,
+            audit_logger,
         } = self;
 
         let all_routes = routes;
@@ -1061,6 +1083,9 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1200,6 +1225,7 @@ impl AppBuilder {
             session_store,
             #[cfg(feature = "openapi")]
                 openapi: _,
+            audit_logger: _,
         } = self;
 
         let all_routes = routes;
@@ -1786,7 +1812,10 @@ fn format_route_lines(
         "GET"
     );
     #[cfg(feature = "htmx")]
-    out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+    {
+        out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+        out.push_str("\n    /static/js/autumn-htmx-csrf.js GET -> htmx csrf");
+    }
     out
 }
 
@@ -2317,14 +2346,14 @@ mod tests {
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
         let app = axum::Router::new().route(
-            "/static/js/htmx.min.js",
+            crate::htmx::HTMX_JS_PATH,
             axum::routing::get(crate::router::htmx_handler),
         );
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2372,13 +2401,50 @@ mod tests {
 
     #[cfg(feature = "htmx")]
     #[tokio::test]
+    async fn htmx_csrf_handler_returns_csp_compatible_javascript() {
+        let app = axum::Router::new().route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(crate::router::htmx_csrf_handler),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+        assert!(!js.contains("<script"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
     async fn build_router_serves_htmx_js() {
         let router = test_router(vec![test_get_route("/dummy", "dummy")]);
 
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2393,6 +2459,86 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("javascript"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
+    async fn build_router_serves_htmx_csrf_js() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("framework JS should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_default_favicon_without_404() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers().contains_key("content-security-policy"),
+            "framework fallback responses should still receive security headers"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_router_does_not_override_user_favicon_route() {
+        let router = test_router(vec![test_get_route(
+            crate::router::DEFAULT_FAVICON_PATH,
+            "favicon",
+        )]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     #[tokio::test]
@@ -2460,6 +2606,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("static-first HTML should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();

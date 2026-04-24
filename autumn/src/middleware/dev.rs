@@ -91,11 +91,10 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
         return Response::from_parts(parts, Body::from(body));
     }
 
-    if let Ok(value) = HeaderValue::from_str(&updated.len().to_string()) {
-        parts.headers.insert(CONTENT_LENGTH, value);
-    } else {
-        parts.headers.remove(CONTENT_LENGTH);
-    }
+    // Avoids heap allocation by using zero-cost numeric conversion
+    parts
+        .headers
+        .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
 
     Response::from_parts(parts, Body::from(updated))
 }
