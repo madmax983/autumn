@@ -611,6 +611,10 @@ async fn load_identity_claims(
     if let Some(userinfo_url) = &provider.userinfo_url {
         let claims = oauth_http_client()?
             .get(userinfo_url)
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!("autumn-web/", env!("CARGO_PKG_VERSION")),
+            )
             .bearer_auth(&token.access_token)
             .send()
             .await
@@ -788,6 +792,10 @@ async fn validate_and_decode_id_token(
     let mut validation = jsonwebtoken::Validation::new(alg);
     validation.set_issuer(&[issuer]);
     validation.set_audience(std::slice::from_ref(&provider.client_id));
+    validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
     validation.validate_exp = true;
     validation.validate_nbf = true;
 
