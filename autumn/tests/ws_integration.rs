@@ -26,14 +26,13 @@ use tokio_util::sync::CancellationToken;
 async fn echo() -> impl WsHandler {
     |mut socket: WebSocket| async move {
         while let Some(Ok(msg)) = socket.recv().await {
-            match msg {
-                Message::Text(t) => {
-                    if socket.send(Message::Text(t)).await.is_err() {
-                        break;
-                    }
-                }
+            let send_result = match msg {
+                Message::Text(t) => socket.send(Message::Text(t)).await,
                 Message::Close(_) => break,
-                _ => {}
+                _ => Ok(()),
+            };
+            if send_result.is_err() {
+                break;
             }
         }
     }
@@ -75,14 +74,13 @@ async fn shutdown_aware() -> impl WsHandler {
             loop {
                 tokio::select! {
                     incoming = socket.recv() => {
-                        match incoming {
-                            Some(Ok(Message::Text(t))) => {
-                                if socket.send(Message::Text(t)).await.is_err() {
-                                    break;
-                                }
-                            }
+                        let send_result = match incoming {
+                            Some(Ok(Message::Text(t))) => socket.send(Message::Text(t)).await,
                             Some(Ok(Message::Close(_))) | None => break,
-                            _ => {}
+                            _ => Ok(()),
+                        };
+                        if send_result.is_err() {
+                            break;
                         }
                     }
                     () = shutdown.cancelled() => {
