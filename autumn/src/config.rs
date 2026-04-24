@@ -6,8 +6,9 @@
 //! 1. **Framework defaults** (this module) -- compiled into the binary.
 //! 2. **Profile smart defaults** -- per-profile values for `dev`/`prod`.
 //! 3. **`autumn.toml`** -- project-level overrides checked into source control.
-//! 4. **`autumn-{profile}.toml`** -- profile-specific overrides.
-//! 5. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
+//! 4. **`[profile.{name}]` in `autumn.toml`** -- profile-specific overrides.
+//! 5. **`autumn-{profile}.toml`** -- legacy profile-specific overrides.
+//! 6. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
 //!
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
@@ -15,9 +16,10 @@
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
-//! 1. `AUTUMN_PROFILE` environment variable
-//! 2. `--profile` CLI flag
-//! 3. Auto-detect from debug/release build mode
+//! 1. `AUTUMN_ENV` environment variable
+//! 2. `AUTUMN_PROFILE` environment variable (legacy alias)
+//! 3. `--profile` CLI flag
+//! 4. Auto-detect from debug/release build mode
 //!
 //! # Example
 //!
@@ -76,7 +78,8 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
-//! | `AUTUMN_PROFILE` | active profile | `String` |
+//! | `AUTUMN_ENV` | active profile | `String` |
+//! | `AUTUMN_PROFILE` | active profile (legacy alias) | `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -204,20 +207,29 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     }
 }
 
-/// Resolve the active profile using the three-mechanism precedence chain.
+/// Resolve the active profile using the precedence chain.
 ///
-/// 1. `AUTUMN_PROFILE` env var (highest priority)
-/// 2. `--profile <name>` CLI flag
-/// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
+/// 1. `AUTUMN_ENV` env var (highest priority)
+/// 2. `AUTUMN_PROFILE` env var (legacy alias)
+/// 3. `--profile <name>` CLI flag
+/// 4. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
+/// 5. Fallback to `dev`
 pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
-    // 1. Env var
+    // 1. Preferred env var
+    if let Ok(profile) = env.var("AUTUMN_ENV") {
+        if !profile.is_empty() {
+            return Some(profile);
+        }
+    }
+
+    // 2. Legacy env var
     if let Ok(profile) = env.var("AUTUMN_PROFILE") {
         if !profile.is_empty() {
             return Some(profile);
         }
     }
 
-    // 2. CLI flag
+    // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
         if arg == "--profile" {
@@ -230,12 +242,21 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
         }
     }
 
-    // 3. Auto-detect from build mode
+    // 4. Auto-detect from build mode
     match env.var("AUTUMN_IS_DEBUG").ok().as_deref() {
         Some("1") => Some("dev".to_owned()),
         Some("0") => Some("prod".to_owned()),
-        _ => None,
+        _ => Some("dev".to_owned()),
     }
+}
+
+/// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
 }
 
 /// Profile-specific smart defaults as a TOML table.
@@ -513,12 +534,13 @@ pub struct AutumnConfig {
 impl AutumnConfig {
     /// Load configuration with profile-aware layering.
     ///
-    /// Applies the five-layer configuration system:
+    /// Applies the six-layer configuration system:
     /// 1. Framework defaults
     /// 2. Profile smart defaults (dev/prod)
     /// 3. `autumn.toml` (base config)
-    /// 4. `autumn-{profile}.toml` (profile overrides)
-    /// 5. `AUTUMN_*` environment variables
+    /// 4. `[profile.{name}]` section in `autumn.toml`
+    /// 5. `autumn-{profile}.toml` (legacy profile overrides)
+    /// 6. `AUTUMN_*` environment variables
     ///
     /// # Errors
     ///
@@ -547,7 +569,8 @@ impl AutumnConfig {
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
         let profile = resolve_profile(env);
 
-        // Build merged TOML: profile smart defaults ← autumn.toml ← autumn-{profile}.toml
+        // Build merged TOML:
+        // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
         let mut merged = profile.as_ref().map_or_else(
             || toml::Value::Table(toml::map::Map::new()),
             |p| profile_defaults_as_toml(p),
@@ -555,10 +578,17 @@ impl AutumnConfig {
 
         // Layer 3: base autumn.toml
         if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
-            deep_merge(&mut merged, base);
+            deep_merge(&mut merged, base.clone());
+
+            // Layer 4: [profile.{name}] in autumn.toml
+            if let Some(ref p) = profile {
+                if let Some(inline_profile) = profile_section_from_base_toml(&base, p) {
+                    deep_merge(&mut merged, inline_profile);
+                }
+            }
         }
 
-        // Layer 4: autumn-{profile}.toml
+        // Layer 5: autumn-{profile}.toml (legacy compatibility)
         if let Some(ref p) = profile {
             let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
             match load_raw_toml(&profile_path)? {
@@ -574,7 +604,7 @@ impl AutumnConfig {
         let mut config: Self = toml::from_str(&toml_str)?;
         config.profile = profile;
 
-        // Layer 5: env var overrides (highest priority)
+        // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
         config.validate()?;
@@ -2278,10 +2308,26 @@ path = "/healthz"
     // ── Profile tests ──────────────────────────────────────────
 
     #[test]
-    fn resolve_profile_from_env() {
+    fn resolve_profile_from_autumn_env() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_profile_from_legacy_env() {
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
         let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn resolve_profile_prefers_autumn_env_over_legacy_alias() {
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "dev")
+            .with("AUTUMN_PROFILE", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("dev"));
     }
 
     #[test]
@@ -2296,6 +2342,13 @@ path = "/healthz"
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "0");
         let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_profile_defaults_to_dev_when_no_signal_present() {
+        let env = MockEnv::new();
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("dev"));
     }
 
     #[test]
@@ -2437,6 +2490,33 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://localhost/myapp_dev")
         ); // from profile
+    }
+
+    #[test]
+    fn inline_profile_section_overrides_base_toml() {
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        let base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            port = 3000
+
+            [log]
+            level = "info"
+
+            [profile.dev.log]
+            level = "debug"
+            "#,
+        )
+        .unwrap();
+
+        deep_merge(&mut merged, base.clone());
+        let inline = profile_section_from_base_toml(&base, "dev").unwrap();
+        deep_merge(&mut merged, inline);
+
+        let toml_str = toml::to_string(&merged).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(config.log.level, "debug");
     }
 
     #[test]
