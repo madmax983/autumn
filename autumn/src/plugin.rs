@@ -156,11 +156,17 @@ mod tests {
         }
 
         fn events(&self) -> Vec<&'static str> {
-            self.events.lock().unwrap().clone()
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .clone()
         }
 
         fn push(&self, label: &'static str) {
-            self.events.lock().unwrap().push(label);
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .push(label);
         }
     }
 
