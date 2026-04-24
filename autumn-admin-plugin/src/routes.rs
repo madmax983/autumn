@@ -296,6 +296,7 @@ async fn model_new_form(
         model.display_name_plural(),
         &fields,
         None,
+        None,
         &messages,
         csrf.token(),
         &prefix,
@@ -356,6 +357,7 @@ async fn model_detail(
         &fields,
         &record,
         &display,
+        id,
         &messages,
         csrf.token(),
         &prefix,
@@ -392,6 +394,7 @@ async fn model_edit_form(
         model.display_name_plural(),
         &fields,
         Some(&record),
+        Some(id),
         &messages,
         csrf.token(),
         &prefix,
@@ -474,6 +477,13 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
                 // from being injected past the declared editable surface.
                 return false;
             };
+            if matches!(field.kind, AdminFieldKind::Hidden) {
+                // Hidden fields are read-only by contract, regardless of
+                // whether `editable` was flipped back to true — the form
+                // never exposes an input for them, so any submitted value
+                // is necessarily tampered.
+                return false;
+            }
             if !field.editable {
                 // Readonly field — drop it regardless of submitted value.
                 return false;
@@ -619,6 +629,19 @@ mod tests {
         let input = json!({"name": "x", "is_admin": true, "raw_column": "y"});
         let out = strip_meta_fields(input, &fields);
         assert_eq!(out, json!({"name": "x"}));
+    }
+
+    #[test]
+    fn strip_meta_drops_hidden_fields_even_if_editable_true() {
+        // Defense in depth: even if a caller flipped `editable` back to true
+        // on a Hidden field (which `AdminField::new` defaults to `false`),
+        // the server must still reject it — the form never exposes an input
+        // so any submitted value is tampered.
+        let mut hidden = AdminField::new("owner_id", AdminFieldKind::Hidden);
+        hidden.editable = true; // deliberately wrong
+        let schema = vec![hidden];
+        let out = strip_meta_fields(json!({"owner_id": 999}), &schema);
+        assert_eq!(out, json!({}));
     }
 
     #[test]

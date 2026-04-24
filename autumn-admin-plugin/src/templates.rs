@@ -580,13 +580,15 @@ pub fn model_detail_page(
     fields: &[AdminField],
     record: &Value,
     record_display: &str,
+    // Path-based ID from the handler. Authoritative — edit/delete links
+    // must route to the same record the URL addressed, not whatever ID
+    // happens to appear in the JSON payload.
+    id: i64,
     messages: &[FlashMessage],
     csrf_token: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
-    let id = record_id(record);
-
     let content = html! {
         div class="breadcrumbs" {
             a href=(prefix) { "Admin" }
@@ -645,18 +647,20 @@ pub fn model_form_page(
     model_name_plural: &str,
     fields: &[AdminField],
     record: Option<&Value>,
+    // Path-based ID from the handler on edit pages (`None` when rendering
+    // the "new" form). Never trust the JSON payload for mutation routing.
+    id: Option<i64>,
     messages: &[FlashMessage],
     csrf_token: &str,
     prefix: &str,
     actuator_prefix: &str,
 ) -> Markup {
-    let is_edit = record.is_some();
+    let is_edit = id.is_some();
     let title = if is_edit {
         format!("Edit {model_name}")
     } else {
         format!("New {model_name}")
     };
-    let id = record.map_or(0, record_id);
 
     let editable_fields: Vec<_> = fields.iter().filter(|f| f.editable).collect();
 
@@ -676,7 +680,7 @@ pub fn model_form_page(
 
             form method="post"
                 action={
-                    @if is_edit {
+                    @if let Some(id) = id {
                         (prefix) "/" (model_slug) "/" (id)
                     } @else {
                         (prefix) "/" (model_slug)
@@ -1095,6 +1099,7 @@ mod tests {
             "Widgets",
             &fields,
             None,
+            None,
             &[],
             "tok-xyz",
             "/admin",
@@ -1104,6 +1109,71 @@ mod tests {
         assert!(
             html.contains(r#"<input type="hidden" name="_csrf" value="tok-xyz""#),
             "_csrf hidden field missing: {html}"
+        );
+    }
+
+    #[test]
+    fn form_page_action_uses_path_id_not_payload_id() {
+        // Regression: mutation target must come from the URL path, not the
+        // record payload. Payload says id=99, path says 42 — form posts to 42.
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 99, "name": "x"});
+        let html = model_form_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            Some(&record),
+            Some(42),
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"action="/admin/widgets/42""#),
+            "form action should use path-based id 42, not payload id 99: {html}"
+        );
+        assert!(
+            !html.contains(r#"action="/admin/widgets/99""#),
+            "payload-derived id must not appear in form action: {html}"
+        );
+    }
+
+    #[test]
+    fn detail_page_edit_delete_links_use_path_id() {
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let record = serde_json::json!({"id": 99, "name": "x"});
+        let html = model_detail_page(
+            &r,
+            "widgets",
+            "Widget",
+            "Widgets",
+            &fields,
+            &record,
+            "#42",
+            42,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"href="/admin/widgets/42/edit""#),
+            "Edit link must use path id 42: {html}"
+        );
+        assert!(
+            html.contains(r#"hx-delete="/admin/widgets/42""#),
+            "Delete must target path id 42: {html}"
+        );
+        assert!(
+            !html.contains("widgets/99"),
+            "payload id 99 must not route mutations: {html}"
         );
     }
 
@@ -1125,6 +1195,7 @@ mod tests {
             &fields,
             &record,
             "#1",
+            1,
             &[],
             "t",
             "/admin",

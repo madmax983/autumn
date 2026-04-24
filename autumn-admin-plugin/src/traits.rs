@@ -70,9 +70,13 @@ impl AdminField {
     /// Create a new field with sensible defaults.
     ///
     /// By default: displayed in list, not searchable, not filterable,
-    /// required, editable, and sortable.
+    /// required, and sortable. Editable defaults to `true` except for
+    /// [`AdminFieldKind::Hidden`], which is read-only by contract
+    /// (and is therefore excluded from `strip_meta_fields` acceptance
+    /// even if a caller later flips `editable` back to `true`).
     #[must_use]
     pub fn new(name: &'static str, kind: AdminFieldKind) -> Self {
+        let editable = !matches!(kind, AdminFieldKind::Hidden);
         Self {
             name,
             label: humanize_field_name(name),
@@ -81,7 +85,7 @@ impl AdminField {
             searchable: false,
             filterable: false,
             required: true,
-            editable: true,
+            editable,
             sortable: true,
         }
     }
@@ -444,5 +448,21 @@ mod tests {
         assert!(field.filterable);
         assert!(!field.required);
         assert!(field.editable);
+    }
+
+    #[test]
+    fn hidden_fields_default_to_not_editable() {
+        // AdminFieldKind::Hidden is documented as "not editable". Ensure the
+        // default matches the contract so admins who skip `.readonly()` still
+        // get safe behaviour.
+        let hidden = AdminField::new("owner_id", AdminFieldKind::Hidden);
+        assert!(
+            !hidden.editable,
+            "Hidden fields must default to editable=false"
+        );
+
+        // Other kinds remain editable by default.
+        let text = AdminField::new("name", AdminFieldKind::Text);
+        assert!(text.editable);
     }
 }
