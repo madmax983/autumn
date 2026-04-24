@@ -73,10 +73,10 @@ pub fn route_macro(
         None
     };
 
-    let handler_name = primitive_wrapper
-        .as_ref()
-        .map(|_| format_ident!("__autumn_primitive_handler_{}", fn_name))
-        .unwrap_or_else(|| fn_name.clone());
+    let handler_name = primitive_wrapper.as_ref().map_or_else(
+        || fn_name.clone(),
+        |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
+    );
 
     // Build the handler expression, chaining .layer() for each interceptor.
     // Interceptors are applied in reverse attribute order so that the first
