@@ -14,6 +14,7 @@
 //! unnecessary rebuilds.
 
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,7 +39,7 @@ const WATCH_FILES: &[&str] = &[
     "tailwind.config.js",
 ];
 
-/// Directories to watch recursively.
+/// Default directories watched recursively by `autumn dev`.
 const WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
 
 const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
@@ -174,6 +175,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
             None
         }
     };
+    let mut watch_dirs = resolve_watch_dirs();
     // Initial build
     if !cargo_build(package) {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
@@ -192,16 +194,8 @@ pub fn run(package: Option<&str>, show_config: bool) {
         .expect("failed to create file watcher");
 
     let watcher = debouncer.watcher();
-
-    // Watch relevant directories
-    for dir in WATCH_DIRS {
-        let path = Path::new(dir);
-        if path.exists() {
-            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
-                eprintln!("  Warning: could not watch {dir}/: {e}");
-            }
-        }
-    }
+    let mut watched_dirs = HashSet::new();
+    ensure_watch_dirs_registered(watcher, &watch_dirs, &mut watched_dirs);
 
     // Watch the project root for config and build script changes.
     if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::NonRecursive) {
@@ -219,7 +213,22 @@ pub fn run(package: Option<&str>, show_config: bool) {
             break;
         }
 
-        if !process_events(&rx, package, &mut child, reload_state.as_mut(), show_config) {
+        let result = process_events(
+            &rx,
+            package,
+            &mut child,
+            reload_state.as_mut(),
+            show_config,
+            &watch_dirs,
+        );
+
+        if result.refresh_watch_dirs {
+            watch_dirs = resolve_watch_dirs();
+            let watcher = debouncer.watcher();
+            ensure_watch_dirs_registered(watcher, &watch_dirs, &mut watched_dirs);
+        }
+
+        if !result.keep_running {
             break;
         }
     }
@@ -229,39 +238,63 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
 /// Process a single batch of events from the debouncer channel.
 /// Returns false if the channel was closed and the loop should exit.
+struct ProcessEventsResult {
+    keep_running: bool,
+    refresh_watch_dirs: bool,
+}
+
 fn process_events(
     rx: &mpsc::Receiver<Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>>,
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
     show_config: bool,
-) -> bool {
+    watch_dirs: &[String],
+) -> ProcessEventsResult {
     match rx.recv_timeout(Duration::from_millis(SHUTDOWN_CHECK_INTERVAL_MS)) {
         Ok(Ok(events)) => {
-            let plan = plan_changes(&events);
+            let plan = plan_changes_with_watch_dirs(&events, watch_dirs);
             if plan.is_empty() {
-                return true;
+                return ProcessEventsResult {
+                    keep_running: true,
+                    refresh_watch_dirs: false,
+                };
             }
 
-            let changed = collect_relevant_changes(&events);
+            let changed = collect_relevant_changes_with_watch_dirs(&events, watch_dirs);
             if changed.is_empty() {
-                return true;
+                return ProcessEventsResult {
+                    keep_running: true,
+                    refresh_watch_dirs: false,
+                };
             }
 
             eprintln!("\n  Changed: {}", changed.join(", "));
             eprintln!("  Action: {}", describe_plan(plan));
 
             execute_plan(plan, package, child, reload_state, show_config);
-            true
+            ProcessEventsResult {
+                keep_running: true,
+                refresh_watch_dirs: includes_autumn_toml_change(&events),
+            }
         }
         Ok(Err(error)) => {
             eprintln!("  Watch error: {error:?}");
-            true
+            ProcessEventsResult {
+                keep_running: true,
+                refresh_watch_dirs: false,
+            }
         }
-        Err(mpsc::RecvTimeoutError::Timeout) => true,
+        Err(mpsc::RecvTimeoutError::Timeout) => ProcessEventsResult {
+            keep_running: true,
+            refresh_watch_dirs: false,
+        },
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             eprintln!("  Watch channel error: channel disconnected");
-            false
+            ProcessEventsResult {
+                keep_running: false,
+                refresh_watch_dirs: false,
+            }
         }
     }
 }
@@ -322,20 +355,69 @@ fn execute_plan(
 /// Collect display paths for all relevant file changes from a debounced batch.
 ///
 /// Returns an empty vec if no changes are relevant.
+#[cfg(test)]
 fn collect_relevant_changes(events: &[notify_debouncer_mini::DebouncedEvent]) -> Vec<String> {
+    let watch_dirs = default_watch_dirs();
+    collect_relevant_changes_with_watch_dirs(events, &watch_dirs)
+}
+
+fn collect_relevant_changes_with_watch_dirs(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    watch_dirs: &[String],
+) -> Vec<String> {
     events
         .iter()
-        .filter(|e| is_relevant_change(&e.path, e.kind))
+        .filter(|e| is_relevant_change_with_watch_dirs(&e.path, e.kind, watch_dirs))
         .map(|e| e.path.display().to_string())
         .collect()
 }
 
+#[cfg(test)]
 fn plan_changes(events: &[notify_debouncer_mini::DebouncedEvent]) -> ChangePlan {
+    let watch_dirs = default_watch_dirs();
+    plan_changes_with_watch_dirs(events, &watch_dirs)
+}
+
+fn plan_changes_with_watch_dirs(
+    events: &[notify_debouncer_mini::DebouncedEvent],
+    watch_dirs: &[String],
+) -> ChangePlan {
     let mut plan = ChangePlan::default();
     for event in events {
-        plan.register(classify_change(&event.path, event.kind));
+        plan.register(classify_change_with_watch_dirs(
+            &event.path,
+            event.kind,
+            watch_dirs,
+        ));
     }
     plan.finalize()
+}
+
+fn includes_autumn_toml_change(events: &[notify_debouncer_mini::DebouncedEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event.kind, DebouncedEventKind::Any)
+            && event.path.file_name().and_then(|name| name.to_str()) == Some("autumn.toml")
+    })
+}
+
+fn ensure_watch_dirs_registered<W: notify::Watcher + ?Sized>(
+    watcher: &mut W,
+    watch_dirs: &[String],
+    watched_dirs: &mut HashSet<String>,
+) {
+    for dir in watch_dirs {
+        if watched_dirs.contains(dir) {
+            continue;
+        }
+        let path = Path::new(dir);
+        if path.exists() {
+            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
+                eprintln!("  Warning: could not watch {dir}/: {e}");
+            } else {
+                watched_dirs.insert(dir.clone());
+            }
+        }
+    }
 }
 
 /// Build a `cargo build` command for the given package.
@@ -449,11 +531,31 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
+#[cfg(test)]
 fn is_relevant_change(path: &Path, kind: DebouncedEventKind) -> bool {
-    classify_change(path, kind) != ChangeEffect::Ignore
+    let watch_dirs = default_watch_dirs();
+    is_relevant_change_with_watch_dirs(path, kind, &watch_dirs)
 }
 
+#[cfg(test)]
 fn classify_change(path: &Path, kind: DebouncedEventKind) -> ChangeEffect {
+    let watch_dirs = default_watch_dirs();
+    classify_change_with_watch_dirs(path, kind, &watch_dirs)
+}
+
+fn is_relevant_change_with_watch_dirs(
+    path: &Path,
+    kind: DebouncedEventKind,
+    watch_dirs: &[String],
+) -> bool {
+    classify_change_with_watch_dirs(path, kind, watch_dirs) != ChangeEffect::Ignore
+}
+
+fn classify_change_with_watch_dirs(
+    path: &Path,
+    kind: DebouncedEventKind,
+    watch_dirs: &[String],
+) -> ChangeEffect {
     if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
         return ChangeEffect::Ignore;
     }
@@ -476,6 +578,15 @@ fn classify_change(path: &Path, kind: DebouncedEventKind) -> ChangeEffect {
         || is_profile_config_file(file_name)
     {
         return ChangeEffect::RestartOnly;
+    }
+
+    for dir in watch_dirs {
+        if WATCH_DIRS.contains(&dir.as_str()) {
+            continue;
+        }
+        if path_contains_dir(path, dir) {
+            return ChangeEffect::BuildRestart;
+        }
     }
 
     if has_component(path, "src") && path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
@@ -535,6 +646,113 @@ fn has_component(path: &Path, target: &str) -> bool {
             std::path::Component::Normal(name) if name == std::ffi::OsStr::new(target)
         )
     })
+}
+
+fn path_contains_dir(path: &Path, dir: &str) -> bool {
+    let dir = Path::new(dir);
+    if path_starts_with_watch_dir(path, dir) {
+        return true;
+    }
+
+    // notify can emit absolute paths on some backends/platforms. Anchor custom
+    // matching to the workspace-relative watched prefix when possible.
+    if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(relative) = path.strip_prefix(&cwd) {
+                if path_starts_with_watch_dir(relative, dir) {
+                    return true;
+                }
+            }
+
+            if dir.is_relative() {
+                let absolute_dir = cwd.join(dir);
+                let absolute_dir = std::fs::canonicalize(&absolute_dir).unwrap_or(absolute_dir);
+                if path_starts_with_watch_dir(path, &absolute_dir) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn path_starts_with_watch_dir(path: &Path, watch_dir: &Path) -> bool {
+    path.starts_with(watch_dir)
+        || path
+            .strip_prefix(Path::new("."))
+            .is_ok_and(|relative| relative.starts_with(watch_dir))
+}
+
+fn default_watch_dirs() -> Vec<String> {
+    WATCH_DIRS.iter().map(|dir| (*dir).to_owned()).collect()
+}
+
+fn resolve_watch_dirs() -> Vec<String> {
+    let mut dirs = default_watch_dirs();
+    let custom = load_custom_watch_dirs(Path::new("autumn.toml"));
+    for dir in custom {
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+fn load_custom_watch_dirs(config_path: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(config_path) else {
+        return Vec::new();
+    };
+
+    let parsed: toml::Value = match toml::from_str(&contents) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "  Warning: could not parse {} for [dev].watch_dirs: {error}",
+                config_path.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let Some(watch_dirs) = parsed
+        .get("dev")
+        .and_then(|dev| dev.get("watch_dirs"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    watch_dirs
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter_map(normalize_watch_dir)
+        .collect()
+}
+
+fn normalize_watch_dir(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => normalized.push(".."),
+            std::path::Component::Normal(name) => normalized.push(name),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized.to_string_lossy().to_string())
+    }
 }
 
 fn is_profile_config_file(file_name: &str) -> bool {
@@ -962,6 +1180,63 @@ mod tests {
     }
 
     #[test]
+    fn custom_watch_dir_change_triggers_build_restart() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            "views".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new("views/home/index.html"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::BuildRestart
+        );
+    }
+
+    #[test]
+    fn custom_watch_dir_does_not_match_nested_component_name() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            "views".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new("src/views/readme.txt"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn custom_watch_dir_takes_priority_over_default_static_routing() {
+        let watch_dirs = vec![
+            "src".to_owned(),
+            "static".to_owned(),
+            "templates".to_owned(),
+            "migrations".to_owned(),
+            "frontend".to_owned(),
+        ];
+        assert_eq!(
+            classify_change_with_watch_dirs(
+                Path::new("frontend/static/logo.png"),
+                DebouncedEventKind::Any,
+                &watch_dirs
+            ),
+            ChangeEffect::BuildRestart
+        );
+    }
+
+    #[test]
     fn ignores_target_directory() {
         assert!(!is_relevant_change(
             Path::new("target/debug/build/main.rs"),
@@ -1077,6 +1352,21 @@ mod tests {
     fn collect_changes_handles_empty_events() {
         let changed = collect_relevant_changes(&[]);
         assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn includes_autumn_toml_change_detects_config_updates() {
+        let events = vec![notify_debouncer_mini::DebouncedEvent {
+            path: PathBuf::from("autumn.toml"),
+            kind: DebouncedEventKind::Any,
+        }];
+        assert!(includes_autumn_toml_change(&events));
+
+        let events = vec![notify_debouncer_mini::DebouncedEvent {
+            path: PathBuf::from("autumn.toml"),
+            kind: DebouncedEventKind::AnyContinuous,
+        }];
+        assert!(!includes_autumn_toml_change(&events));
     }
 
     // ── build_cargo_command tests ──────────────────────────────────
@@ -1378,6 +1668,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_watch_dirs_keeps_defaults_and_adds_custom() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            r#"[dev]
+watch_dirs = ["./views", "locales", "src"]
+"#,
+        )
+        .expect("write config");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(dir.path()).expect("set cwd");
+        let dirs = resolve_watch_dirs();
+        std::env::set_current_dir(cwd).expect("restore cwd");
+
+        for default in WATCH_DIRS {
+            assert!(
+                dirs.contains(&default.to_string()),
+                "missing default watch dir: {default}"
+            );
+        }
+        assert!(dirs.contains(&"views".to_string()));
+        assert!(dirs.contains(&"locales".to_string()));
+        assert_eq!(
+            dirs.iter().filter(|d| d.as_str() == "src").count(),
+            1,
+            "default dirs should not be duplicated"
+        );
+    }
+
+    #[test]
+    fn normalize_watch_dir_strips_leading_dot_slash() {
+        assert_eq!(normalize_watch_dir("./views"), Some("views".to_string()));
+        assert_eq!(
+            normalize_watch_dir("./frontend/views/"),
+            Some("frontend/views".to_string())
+        );
+    }
+
+    #[test]
     fn watch_files_are_non_empty() {
         for f in WATCH_FILES {
             assert!(!f.is_empty());
@@ -1451,6 +1781,47 @@ mod tests {
             Path::new("template/index.html"),
             "templates"
         ));
+    }
+
+    #[test]
+    fn path_contains_dir_supports_nested_dirs() {
+        assert!(path_contains_dir(
+            Path::new("views/home/index.html"),
+            "views"
+        ));
+        assert!(!path_contains_dir(
+            Path::new("src/views/home/index.html"),
+            "views"
+        ));
+        assert!(path_contains_dir(
+            Path::new("frontend/views/home/index.html"),
+            "frontend/views"
+        ));
+        assert!(!path_contains_dir(
+            Path::new("frontend/view/home/index.html"),
+            "frontend/views"
+        ));
+    }
+
+    #[test]
+    fn path_contains_dir_matches_parent_relative_watch_dir_for_absolute_paths() {
+        let root = tempfile::tempdir().expect("temp root");
+        let workspace = root.path().join("workspace");
+        let repo = workspace.join("autumn");
+        let shared = workspace.join("shared");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+        std::fs::create_dir_all(shared.join("nested")).expect("create shared dir");
+
+        let cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&repo).expect("set cwd");
+
+        let file = shared.join("nested").join("data.json");
+        assert!(
+            path_contains_dir(&file, "../shared"),
+            "absolute event path under ../shared should match custom watch dir"
+        );
+
+        std::env::set_current_dir(cwd).expect("restore cwd");
     }
 
     #[test]
