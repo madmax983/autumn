@@ -61,9 +61,9 @@ use std::task::{Context, Poll};
 
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
-use base64::Engine as _;
 use http::StatusCode;
 use http::request::Parts;
+use jsonwebtoken::jwk::JwkSet;
 use serde::Deserialize;
 use url::Url;
 
@@ -431,6 +431,12 @@ pub struct OAuth2ProviderConfig {
     pub redirect_uri: String,
     #[serde(default = "default_provider_scope")]
     pub scope: String,
+    /// Expected OIDC issuer (`iss`) used for ID token validation.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// JWKS endpoint URL used to verify ID token signatures.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
 }
 
 /// Query extractor payload for OAuth2 callback handlers.
@@ -494,6 +500,7 @@ pub async fn oauth2_authorize_url(
 /// - `auth_provider` (provider key, like `github`)
 pub async fn oauth2_finish_login(
     session: &crate::session::Session,
+    session_key: &str,
     provider_name: &str,
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
@@ -539,7 +546,10 @@ pub async fn oauth2_finish_login(
     let token = parse_oauth2_token_response(token_content_type.as_deref(), &token_body)?;
 
     let (claims, source) = if let Some(id_token) = token.id_token.as_deref() {
-        (decode_jwt_claims(id_token)?, IdentitySource::IdToken)
+        (
+            validate_and_decode_id_token(id_token, provider).await?,
+            IdentitySource::IdToken,
+        )
     } else if let Some(userinfo_url) = &provider.userinfo_url {
         (
             reqwest::Client::new()
@@ -585,7 +595,7 @@ pub async fn oauth2_finish_login(
 
     let subject = extract_subject(&claims, source)?;
 
-    session.insert("user_id", subject.clone()).await;
+    session.insert(session_key, subject.clone()).await;
     session.insert("auth_provider", provider_name).await;
     session.rotate_id().await;
 
@@ -661,19 +671,57 @@ fn extract_subject(
     Err(crate::AutumnError::bad_request_msg("missing sub claim"))
 }
 
-fn decode_jwt_claims(token: &str) -> crate::AutumnResult<serde_json::Value> {
-    let mut parts = token.split('.');
-    let _header = parts.next();
-    let payload = parts
-        .next()
-        .ok_or_else(|| crate::AutumnError::bad_request_msg("invalid id_token format"))?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
+async fn validate_and_decode_id_token(
+    token: &str,
+    provider: &OAuth2ProviderConfig,
+) -> crate::AutumnResult<serde_json::Value> {
+    let issuer = provider
+        .issuer
+        .as_deref()
+        .ok_or_else(|| crate::AutumnError::bad_request_msg("provider.issuer required for oidc"))?;
+    let jwks_url = provider.jwks_url.as_deref().ok_or_else(|| {
+        crate::AutumnError::bad_request_msg("provider.jwks_url required for oidc")
+    })?;
+
+    let header = jsonwebtoken::decode_header(token).map_err(|e| {
+        crate::AutumnError::unauthorized_msg(format!("invalid id_token header: {e}"))
+    })?;
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| crate::AutumnError::unauthorized_msg("id_token header missing kid"))?;
+    let alg = header.alg;
+
+    let jwks: JwkSet = reqwest::Client::new()
+        .get(jwks_url)
+        .send()
+        .await
         .map_err(|e| {
-            crate::AutumnError::bad_request_msg(format!("invalid id_token payload: {e}"))
-        })?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid id_token claims: {e}")))
+            crate::AutumnError::service_unavailable_msg(format!("jwks request failed: {e}"))
+        })?
+        .error_for_status()
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("jwks fetch failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid jwks response: {e}")))?;
+
+    let jwk = jwks
+        .keys
+        .iter()
+        .find(|k| k.common.key_id.as_deref() == Some(kid))
+        .ok_or_else(|| crate::AutumnError::unauthorized_msg("no jwk matched id_token kid"))?;
+    let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
+
+    let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[provider.client_id.clone()]);
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+
+    let claims = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid id_token: {e}")))?;
+    Ok(claims.claims)
 }
 
 impl Default for AuthConfig {
@@ -749,6 +797,8 @@ mod tests {
         let provider = cfg.auth.oauth2.providers.get("github").unwrap();
         assert_eq!(provider.client_id, "cid");
         assert_eq!(provider.scope, "openid profile email");
+        assert!(provider.issuer.is_none());
+        assert!(provider.jwks_url.is_none());
     }
 
     #[tokio::test]
@@ -762,6 +812,8 @@ mod tests {
             userinfo_url: None,
             redirect_uri: "http://localhost:3000/callback".into(),
             scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
@@ -771,17 +823,23 @@ mod tests {
         assert!(session.get("oauth2:github:nonce").await.is_some());
     }
 
-    #[test]
-    fn decode_jwt_claims_extracts_json_payload() {
-        let payload = serde_json::json!({
-            "sub": "abc-123",
-            "email": "u@example.com"
-        });
-        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(&payload).unwrap());
-        let token = format!("header.{payload_b64}.sig");
-        let claims = decode_jwt_claims(&token).unwrap();
-        assert_eq!(claims["sub"], "abc-123");
+    #[tokio::test]
+    async fn validate_id_token_requires_oidc_metadata() {
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+        };
+        let err = validate_and_decode_id_token("bad.token.value", &provider)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "provider.issuer required for oidc");
     }
 
     #[test]
