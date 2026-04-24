@@ -63,6 +63,8 @@ pub use crate::sse::{Event, Sse};
 pub use axum::extract::State;
 
 // ── Error handling ───────────────────────────────────────────────
+/// Structured audit event types.
+pub use crate::audit::{AuditEvent, AuditStatus};
 /// Framework error and result types.
 pub use crate::error::{AutumnError, AutumnResult};
 

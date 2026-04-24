@@ -87,6 +87,7 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        audit_logger: None,
     }
 }
 
@@ -190,6 +191,8 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Shared audit logger used for append-only compliance events.
+    audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -785,6 +788,24 @@ impl AppBuilder {
         self
     }
 
+    /// Register an additional audit sink for structured audit events.
+    ///
+    /// Multiple calls accumulate sinks. Logged events are fanned out to all
+    /// configured sinks.
+    #[must_use]
+    pub fn with_audit_sink<S>(mut self, sink: S) -> Self
+    where
+        S: crate::audit::AuditSink,
+    {
+        let logger = self
+            .audit_logger
+            .take()
+            .map_or_else(crate::audit::AuditLogger::new, |logger| (*logger).clone())
+            .with_sink(Arc::new(sink));
+        self.audit_logger = Some(Arc::new(logger));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -908,6 +929,7 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            audit_logger,
         } = self;
 
         let all_routes = routes;
@@ -966,6 +988,9 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1101,6 +1126,7 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            audit_logger: _,
         } = self;
 
         let all_routes = routes;
