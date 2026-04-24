@@ -398,7 +398,7 @@ fn default_provider_scope() -> String {
     "openid profile email".to_owned()
 }
 
-/// OAuth2 provider map loaded from `autumn.toml`.
+/// `OAuth2` provider map loaded from `autumn.toml`.
 ///
 /// Example:
 ///
@@ -439,7 +439,7 @@ pub struct OAuth2ProviderConfig {
     pub jwks_url: Option<String>,
 }
 
-/// Query extractor payload for OAuth2 callback handlers.
+/// Query extractor payload for `OAuth2` callback handlers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OAuth2Callback {
     pub code: String,
@@ -464,7 +464,11 @@ struct OAuth2TokenResponse {
     id_token: Option<String>,
 }
 
-/// Build an OAuth2 authorization URL and persist anti-CSRF state + nonce in session.
+/// Build an `OAuth2` authorization URL and persist anti-CSRF state + nonce in session.
+///
+/// # Errors
+///
+/// Returns an error if `authorize_url` is not a valid URL.
 pub async fn oauth2_authorize_url(
     session: &crate::session::Session,
     provider_name: &str,
@@ -496,8 +500,13 @@ pub async fn oauth2_authorize_url(
 /// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
 ///
 /// On success this method rotates the session ID and writes:
-/// - `user_id` (OIDC `sub`)
+/// - `session_key` (OIDC `sub`)
 /// - `auth_provider` (provider key, like `github`)
+///
+/// # Errors
+///
+/// Returns an error when callback state/nonce validation fails, token exchange
+/// fails, ID token/userinfo payloads are invalid, or identity extraction fails.
 pub async fn oauth2_finish_login(
     session: &crate::session::Session,
     session_key: &str,
@@ -505,6 +514,19 @@ pub async fn oauth2_finish_login(
     provider: &OAuth2ProviderConfig,
     callback: &OAuth2Callback,
 ) -> crate::AutumnResult<OidcIdentity> {
+    validate_callback_state(session, provider_name, callback).await?;
+    let token = exchange_oauth2_token(provider, callback).await?;
+    let (claims, source) = load_identity_claims(provider, &token).await?;
+    validate_oidc_nonce(session, provider_name, &claims, source).await?;
+    let subject = extract_subject(&claims, source)?;
+    finalize_oauth2_session(session, session_key, provider_name, subject, claims).await
+}
+
+async fn validate_callback_state(
+    session: &crate::session::Session,
+    provider_name: &str,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<()> {
     let state_key = format!("oauth2:{provider_name}:state");
     let expected_state = session.remove(&state_key).await.ok_or_else(|| {
         crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
@@ -517,7 +539,13 @@ pub async fn oauth2_finish_login(
             "oauth2 state mismatch",
         ));
     }
+    Ok(())
+}
 
+async fn exchange_oauth2_token(
+    provider: &OAuth2ProviderConfig,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<OAuth2TokenResponse> {
     let token_response = reqwest::Client::new()
         .post(&provider.token_url)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -535,6 +563,7 @@ pub async fn oauth2_finish_login(
         })?
         .error_for_status()
         .map_err(|e| crate::AutumnError::unauthorized_msg(format!("token exchange failed: {e}")))?;
+
     let token_content_type = token_response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -543,40 +572,48 @@ pub async fn oauth2_finish_login(
     let token_body = token_response.text().await.map_err(|e| {
         crate::AutumnError::bad_request_msg(format!("invalid token response body: {e}"))
     })?;
-    let token = parse_oauth2_token_response(token_content_type.as_deref(), &token_body)?;
+    parse_oauth2_token_response(token_content_type.as_deref(), &token_body)
+}
 
-    let (claims, source) = if let Some(id_token) = token.id_token.as_deref() {
-        (
+async fn load_identity_claims(
+    provider: &OAuth2ProviderConfig,
+    token: &OAuth2TokenResponse,
+) -> crate::AutumnResult<(serde_json::Value, IdentitySource)> {
+    if let Some(id_token) = token.id_token.as_deref() {
+        return Ok((
             validate_and_decode_id_token(id_token, provider).await?,
             IdentitySource::IdToken,
-        )
-    } else if let Some(userinfo_url) = &provider.userinfo_url {
-        (
-            reqwest::Client::new()
-                .get(userinfo_url)
-                .bearer_auth(&token.access_token)
-                .send()
-                .await
-                .map_err(|e| {
-                    crate::AutumnError::service_unavailable_msg(format!(
-                        "userinfo request failed: {e}"
-                    ))
-                })?
-                .error_for_status()
-                .map_err(|e| crate::AutumnError::unauthorized_msg(format!("userinfo failed: {e}")))?
-                .json()
-                .await
-                .map_err(|e| {
-                    crate::AutumnError::bad_request_msg(format!("invalid userinfo payload: {e}"))
-                })?,
-            IdentitySource::UserInfo,
-        )
-    } else {
-        return Err(crate::AutumnError::bad_request_msg(
-            "provider must return id_token or configure userinfo_url",
         ));
-    };
+    }
+    if let Some(userinfo_url) = &provider.userinfo_url {
+        let claims = reqwest::Client::new()
+            .get(userinfo_url)
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::service_unavailable_msg(format!("userinfo request failed: {e}"))
+            })?
+            .error_for_status()
+            .map_err(|e| crate::AutumnError::unauthorized_msg(format!("userinfo failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::bad_request_msg(format!("invalid userinfo payload: {e}"))
+            })?;
+        return Ok((claims, IdentitySource::UserInfo));
+    }
+    Err(crate::AutumnError::bad_request_msg(
+        "provider must return id_token or configure userinfo_url",
+    ))
+}
 
+async fn validate_oidc_nonce(
+    session: &crate::session::Session,
+    provider_name: &str,
+    claims: &serde_json::Value,
+    source: IdentitySource,
+) -> crate::AutumnResult<()> {
     let nonce_key = format!("oauth2:{provider_name}:nonce");
     if let Some(expected_nonce) = session.remove(&nonce_key).await
         && source == IdentitySource::IdToken
@@ -592,13 +629,19 @@ pub async fn oauth2_finish_login(
             return Err(crate::AutumnError::unauthorized_msg("oidc nonce mismatch"));
         }
     }
+    Ok(())
+}
 
-    let subject = extract_subject(&claims, source)?;
-
+async fn finalize_oauth2_session(
+    session: &crate::session::Session,
+    session_key: &str,
+    provider_name: &str,
+    subject: String,
+    claims: serde_json::Value,
+) -> crate::AutumnResult<OidcIdentity> {
     session.insert(session_key, subject.clone()).await;
     session.insert("auth_provider", provider_name).await;
     session.rotate_id().await;
-
     Ok(OidcIdentity {
         subject,
         email: claims
@@ -715,7 +758,7 @@ async fn validate_and_decode_id_token(
 
     let mut validation = jsonwebtoken::Validation::new(alg);
     validation.set_issuer(&[issuer]);
-    validation.set_audience(&[provider.client_id.clone()]);
+    validation.set_audience(std::slice::from_ref(&provider.client_id));
     validation.validate_exp = true;
     validation.validate_nbf = true;
 
