@@ -213,6 +213,12 @@ pub fn run(package: Option<&str>, show_config: bool) {
             break;
         }
 
+        // Re-attempt registration for configured dirs that may have been
+        // missing earlier (e.g. custom watch dir added to config before
+        // creating the directory on disk).
+        let watcher = debouncer.watcher();
+        ensure_watch_dirs_registered(watcher, &watch_dirs, &mut watched_dirs);
+
         let result = process_events(
             &rx,
             package,
@@ -1416,6 +1422,30 @@ mod tests {
 
         let removed = removed_watch_dirs(&watched, &desired);
         assert_eq!(removed, vec!["views".to_string()]);
+    }
+
+    #[test]
+    fn ensure_watch_dirs_registered_retries_dirs_once_created() {
+        let root = tempfile::tempdir().expect("temp root");
+        let watch_dir = root.path().join("future-dir");
+        let dir = watch_dir.display().to_string();
+        let watch_dirs = vec![dir.clone()];
+        let mut watched_dirs = HashSet::new();
+
+        let mut watcher = notify::recommended_watcher(|_| {}).expect("watcher");
+
+        ensure_watch_dirs_registered(&mut watcher, &watch_dirs, &mut watched_dirs);
+        assert!(
+            !watched_dirs.contains(&dir),
+            "missing dir should not be marked watched"
+        );
+
+        std::fs::create_dir_all(&watch_dir).expect("create watch dir");
+        ensure_watch_dirs_registered(&mut watcher, &watch_dirs, &mut watched_dirs);
+        assert!(
+            watched_dirs.contains(&dir),
+            "dir should be registered once it exists"
+        );
     }
 
     // ── build_cargo_command tests ──────────────────────────────────
