@@ -430,6 +430,10 @@ fn warn_profile_typo(profile: &str) {
     }
 }
 
+fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: bool) -> bool {
+    profile != "dev" && profile != "prod" && !has_inline_profile_section
+}
+
 /// Levenshtein edit distance between two strings.
 ///
 /// ⚡ Bolt Optimization:
@@ -594,6 +598,7 @@ impl AutumnConfig {
     /// Panics if the internally-built TOML table fails to re-serialize.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
         let profile = resolve_profile(env);
+        let mut has_inline_profile_section = false;
 
         // Build merged TOML:
         // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
@@ -610,6 +615,7 @@ impl AutumnConfig {
             if let Some(ref p) = profile {
                 if let Some(inline_profile) = profile_section_from_base_toml(&base, p) {
                     deep_merge(&mut merged, inline_profile);
+                    has_inline_profile_section = true;
                 }
             }
         }
@@ -619,7 +625,9 @@ impl AutumnConfig {
             let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
             match load_raw_toml(&profile_path)? {
                 Some(profile_toml) => deep_merge(&mut merged, profile_toml),
-                None if p != "dev" && p != "prod" => warn_profile_typo(p),
+                None if should_warn_missing_profile_file(p, has_inline_profile_section) => {
+                    warn_profile_typo(p)
+                }
                 None => {}
             }
         }
@@ -2695,6 +2703,22 @@ path = "/healthz"
     }
 
     #[test]
+    fn should_warn_missing_profile_file_custom_without_inline() {
+        assert!(should_warn_missing_profile_file("staging", false));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_custom_with_inline() {
+        assert!(!should_warn_missing_profile_file("staging", true));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_dev_or_prod() {
+        assert!(!should_warn_missing_profile_file("dev", false));
+        assert!(!should_warn_missing_profile_file("prod", false));
+    }
+
+    #[test]
     fn levenshtein_threshold_in_warn_profile_typo() {
         assert!(levenshtein("dve", "dev") <= 2);
         assert!(levenshtein("xyz", "dev") > 2);
@@ -2801,6 +2825,31 @@ path = "/healthz"
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn load_custom_profile_uses_inline_profile_without_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &base_path,
+            r#"
+            [server]
+            port = 3000
+
+            [profile.staging.server]
+            port = 4100
+            "#,
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "staging")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("staging"));
+        assert_eq!(config.server.port, 4100);
     }
 
     #[test]
