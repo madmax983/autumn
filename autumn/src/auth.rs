@@ -53,6 +53,7 @@
 //! `401 Unauthorized` before they reach the handler. It checks for the
 //! presence of a session key (default: `"user_id"`).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,8 +61,11 @@ use std::task::{Context, Poll};
 
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use http::StatusCode;
 use http::request::Parts;
+use serde::Deserialize;
+use url::Url;
 
 // ── Password hashing ────────────────────────────────────────────
 
@@ -375,6 +379,11 @@ pub struct AuthConfig {
     /// Session key used to identify authenticated users.
     #[serde(default = "default_session_key")]
     pub session_key: String,
+
+    /// OAuth2/OIDC provider configuration by provider key
+    /// (for example: `github`, `google`, `okta`).
+    #[serde(default)]
+    pub oauth2: OAuth2Config,
 }
 
 const fn default_bcrypt_cost() -> u32 {
@@ -385,11 +394,228 @@ fn default_session_key() -> String {
     "user_id".to_owned()
 }
 
+fn default_provider_scope() -> String {
+    "openid profile email".to_owned()
+}
+
+/// OAuth2 provider map loaded from `autumn.toml`.
+///
+/// Example:
+///
+/// ```toml
+/// [auth.oauth2.github]
+/// client_id = "..."
+/// client_secret = "..."
+/// authorize_url = "https://github.com/login/oauth/authorize"
+/// token_url = "https://github.com/login/oauth/access_token"
+/// userinfo_url = "https://api.github.com/user"
+/// redirect_uri = "http://localhost:3000/auth/github/callback"
+/// scope = "openid profile email"
+/// ```
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OAuth2Config {
+    /// Dynamic provider table keyed by provider name.
+    #[serde(flatten)]
+    pub providers: HashMap<String, OAuth2ProviderConfig>,
+}
+
+/// A single OAuth2/OIDC provider configuration entry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OAuth2ProviderConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    #[serde(default)]
+    pub userinfo_url: Option<String>,
+    pub redirect_uri: String,
+    #[serde(default = "default_provider_scope")]
+    pub scope: String,
+}
+
+/// Query extractor payload for OAuth2 callback handlers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuth2Callback {
+    pub code: String,
+    pub state: String,
+}
+
+/// Identity information extracted from an OIDC ID token or userinfo endpoint.
+#[derive(Debug, Clone)]
+pub struct OidcIdentity {
+    pub subject: String,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub preferred_username: Option<String>,
+    pub raw_claims: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuth2TokenResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type: Option<String>,
+    id_token: Option<String>,
+}
+
+/// Build an OAuth2 authorization URL and persist anti-CSRF state + nonce in session.
+pub async fn oauth2_authorize_url(
+    session: &crate::session::Session,
+    provider_name: &str,
+    provider: &OAuth2ProviderConfig,
+) -> crate::AutumnResult<String> {
+    let state = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    session
+        .insert(format!("oauth2:{provider_name}:state"), state.clone())
+        .await;
+    session
+        .insert(format!("oauth2:{provider_name}:nonce"), nonce.clone())
+        .await;
+
+    let mut url = Url::parse(&provider.authorize_url)
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid authorize_url: {e}")))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code");
+        q.append_pair("client_id", &provider.client_id);
+        q.append_pair("redirect_uri", &provider.redirect_uri);
+        q.append_pair("scope", &provider.scope);
+        q.append_pair("state", &state);
+        q.append_pair("nonce", &nonce);
+    }
+    Ok(url.into())
+}
+
+/// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
+///
+/// On success this method rotates the session ID and writes:
+/// - `user_id` (OIDC `sub`)
+/// - `auth_provider` (provider key, like `github`)
+pub async fn oauth2_finish_login(
+    session: &crate::session::Session,
+    provider_name: &str,
+    provider: &OAuth2ProviderConfig,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<OidcIdentity> {
+    let state_key = format!("oauth2:{provider_name}:state");
+    let expected_state = session.remove(&state_key).await.ok_or_else(|| {
+        crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
+    })?;
+    if subtle::ConstantTimeEq::ct_eq(expected_state.as_bytes(), callback.state.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(crate::AutumnError::unauthorized_msg(
+            "oauth2 state mismatch",
+        ));
+    }
+
+    let token: OAuth2TokenResponse = reqwest::Client::new()
+        .post(&provider.token_url)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", callback.code.as_str()),
+            ("redirect_uri", provider.redirect_uri.as_str()),
+            ("client_id", provider.client_id.as_str()),
+            ("client_secret", provider.client_secret.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            crate::AutumnError::service_unavailable_msg(format!("token request failed: {e}"))
+        })?
+        .error_for_status()
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("token exchange failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid token response: {e}")))?;
+
+    let claims = if let Some(id_token) = token.id_token.as_deref() {
+        decode_jwt_claims(id_token)?
+    } else if let Some(userinfo_url) = &provider.userinfo_url {
+        reqwest::Client::new()
+            .get(userinfo_url)
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::service_unavailable_msg(format!("userinfo request failed: {e}"))
+            })?
+            .error_for_status()
+            .map_err(|e| crate::AutumnError::unauthorized_msg(format!("userinfo failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::bad_request_msg(format!("invalid userinfo payload: {e}"))
+            })?
+    } else {
+        return Err(crate::AutumnError::bad_request_msg(
+            "provider must return id_token or configure userinfo_url",
+        ));
+    };
+
+    let nonce_key = format!("oauth2:{provider_name}:nonce");
+    if let Some(expected_nonce) = session.remove(&nonce_key).await {
+        if let Some(actual_nonce) = claims.get("nonce").and_then(serde_json::Value::as_str) {
+            if subtle::ConstantTimeEq::ct_eq(expected_nonce.as_bytes(), actual_nonce.as_bytes())
+                .unwrap_u8()
+                != 1
+            {
+                return Err(crate::AutumnError::unauthorized_msg("oidc nonce mismatch"));
+            }
+        }
+    }
+
+    let subject = claims
+        .get("sub")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| crate::AutumnError::bad_request_msg("missing sub claim"))?
+        .to_owned();
+
+    session.insert("user_id", subject.clone()).await;
+    session.insert("auth_provider", provider_name).await;
+    session.rotate_id().await;
+
+    Ok(OidcIdentity {
+        subject,
+        email: claims
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        name: claims
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        preferred_username: claims
+            .get("preferred_username")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        raw_claims: claims,
+    })
+}
+
+fn decode_jwt_claims(token: &str) -> crate::AutumnResult<serde_json::Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next();
+    let payload = parts
+        .next()
+        .ok_or_else(|| crate::AutumnError::bad_request_msg("invalid id_token format"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .map_err(|e| {
+            crate::AutumnError::bad_request_msg(format!("invalid id_token payload: {e}"))
+        })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid id_token claims: {e}")))
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             bcrypt_cost: default_bcrypt_cost(),
             session_key: default_session_key(),
+            oauth2: OAuth2Config::default(),
         }
     }
 }
@@ -438,6 +664,58 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(config.bcrypt_cost, 12);
         assert_eq!(config.session_key, "user_id");
+        assert!(config.oauth2.providers.is_empty());
+    }
+
+    #[test]
+    fn oauth2_config_deserializes_provider_tables() {
+        let cfg: crate::config::AutumnConfig = toml::from_str(
+            r#"
+            [auth.oauth2.github]
+            client_id = "cid"
+            client_secret = "secret"
+            authorize_url = "https://github.com/login/oauth/authorize"
+            token_url = "https://github.com/login/oauth/access_token"
+            redirect_uri = "http://localhost:3000/auth/github/callback"
+            "#,
+        )
+        .unwrap();
+        let provider = cfg.auth.oauth2.providers.get("github").unwrap();
+        assert_eq!(provider.client_id, "cid");
+        assert_eq!(provider.scope, "openid profile email");
+    }
+
+    #[tokio::test]
+    async fn oauth2_authorize_url_sets_state_and_nonce() {
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+        };
+        let url = oauth2_authorize_url(&session, "github", &provider)
+            .await
+            .unwrap();
+        assert!(url.contains("response_type=code"));
+        assert!(session.get("oauth2:github:state").await.is_some());
+        assert!(session.get("oauth2:github:nonce").await.is_some());
+    }
+
+    #[test]
+    fn decode_jwt_claims_extracts_json_payload() {
+        let payload = serde_json::json!({
+            "sub": "abc-123",
+            "email": "u@example.com"
+        });
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let token = format!("header.{payload_b64}.sig");
+        let claims = decode_jwt_claims(&token).unwrap();
+        assert_eq!(claims["sub"], "abc-123");
     }
 
     #[test]

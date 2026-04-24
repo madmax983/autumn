@@ -15,6 +15,7 @@ mod cached;
 mod collect;
 mod main_macro;
 mod model;
+mod oauth2_callback;
 mod parse;
 mod repository;
 mod route;
@@ -119,6 +120,15 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("DELETE", "delete", attr.into(), item.into()).into()
+}
+
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// This is a convenience alias for `#[get(\"...\")]`, intended for OAuth
+/// callback endpoints such as `/auth/github/callback`.
+#[proc_macro_attribute]
+pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
+    oauth2_callback::oauth2_callback_macro(attr.into(), item.into()).into()
 }
 
 /// Collect annotated route handlers into a `Vec<Route>`.
