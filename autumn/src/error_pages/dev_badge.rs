@@ -28,7 +28,8 @@ pub struct DevBadgeContext {
 
 /// Generate the dev error badge HTML snippet.
 ///
-/// This returns a self-contained HTML fragment with inline CSS and JS.
+/// This returns a self-contained HTML fragment with inline CSS and no
+/// JavaScript, so it works under Autumn's default `script-src 'self'` CSP.
 /// It should be injected just before `</body>` in HTML error responses.
 ///
 /// Uses inline CSS (not Tailwind) so it works even if the CSS build fails.
@@ -44,9 +45,12 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
     html! {
         (PreEscaped(DEV_BADGE_STYLES))
         div #autumn-dev-error-badge {
+            input #autumn-dev-badge-toggle type="checkbox" class="autumn-dev-toggle";
+
             // Collapsed badge (always visible)
-            div #autumn-dev-badge-collapsed
-                onclick="document.getElementById('autumn-dev-badge-expanded').style.display='flex';document.getElementById('autumn-dev-badge-collapsed').style.display='none';"
+            label #autumn-dev-badge-collapsed
+                for="autumn-dev-badge-toggle"
+                tabindex="0"
             {
                 span class="autumn-dev-badge-dot" {}
                 span class="autumn-dev-badge-code" { (status) }
@@ -60,8 +64,10 @@ pub fn dev_error_badge_html(ctx: &DevBadgeContext) -> Markup {
                         span class="autumn-dev-badge-dot" {}
                         (status) " " (reason)
                     }
-                    button class="autumn-dev-overlay-close"
-                        onclick="document.getElementById('autumn-dev-badge-expanded').style.display='none';document.getElementById('autumn-dev-badge-collapsed').style.display='flex';"
+                    label class="autumn-dev-overlay-close"
+                        for="autumn-dev-badge-toggle"
+                        role="button"
+                        aria-label="Close error details"
                     {
                         "\u{00d7}"
                     }
@@ -102,6 +108,17 @@ const DEV_BADGE_STYLES: &str = r#"<style>
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     font-size: 13px;
     line-height: 1.5;
+}
+.autumn-dev-toggle {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+#autumn-dev-badge-toggle:not(:checked) ~ #autumn-dev-badge-expanded {
+    display: none;
+}
+#autumn-dev-badge-toggle:checked ~ #autumn-dev-badge-collapsed {
+    display: none;
 }
 #autumn-dev-badge-collapsed {
     display: flex;
@@ -252,6 +269,15 @@ mod tests {
             s.contains("#autumn-dev-error-badge"),
             "badge uses namespaced CSS selectors"
         );
+    }
+
+    #[test]
+    fn badge_does_not_use_inline_javascript_handlers() {
+        let html = dev_error_badge_html(&test_ctx());
+        let s = html.into_string();
+        assert!(!s.contains("onclick="));
+        assert!(!s.contains("<script"));
+        assert!(s.contains("autumn-dev-badge-toggle"));
     }
 
     #[test]

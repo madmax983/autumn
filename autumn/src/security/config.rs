@@ -37,6 +37,9 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
 //!
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
@@ -72,6 +75,10 @@ pub struct SecurityConfig {
     /// Rate limiting (per-client-IP token bucket).
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    /// Multipart upload safeguards and validation policy.
+    #[serde(default)]
+    pub upload: UploadConfig,
 }
 
 /// Security response headers configuration.
@@ -148,9 +155,9 @@ pub struct HeadersConfig {
     /// [`default_content_security_policy`]). When set to an empty string,
     /// the header is not emitted (explicit opt-out).
     ///
-    /// The default allows htmx to function normally because htmx is served
-    /// from the same origin at `/static/js/htmx.min.js` and operates via
-    /// `addEventListener` rather than inline `eval`.
+    /// The default allows htmx to function normally because htmx and Autumn's
+    /// htmx CSRF helper are served from the same origin and operate via
+    /// `addEventListener` rather than inline scripts.
     #[serde(default = "default_content_security_policy")]
     pub content_security_policy: String,
 
@@ -329,6 +336,38 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Multipart upload configuration.
+///
+/// Applies framework-level guardrails for `multipart/form-data` requests:
+///
+/// - `max_request_size_bytes`: global request body cap (enforced by middleware)
+/// - `max_file_size_bytes`: per-file cap for [`crate::extract::MultipartField`] helpers
+/// - `allowed_mime_types`: optional MIME-type allow list for uploaded parts
+///
+/// Leave `allowed_mime_types` empty to allow any content type.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UploadConfig {
+    /// Maximum total multipart request body size in bytes.
+    #[serde(default = "default_max_request_size_bytes")]
+    pub max_request_size_bytes: usize,
+    /// Maximum individual uploaded file size in bytes.
+    #[serde(default = "default_max_file_size_bytes")]
+    pub max_file_size_bytes: usize,
+    /// Optional allowed MIME types (e.g. `["image/png", "image/jpeg"]`).
+    #[serde(default)]
+    pub allowed_mime_types: Vec<String>,
+}
+
+impl Default for UploadConfig {
+    fn default() -> Self {
+        Self {
+            max_request_size_bytes: default_max_request_size_bytes(),
+            max_file_size_bytes: default_max_file_size_bytes(),
+            allowed_mime_types: Vec::new(),
+        }
+    }
+}
+
 // ── Default value functions ────────────────────────────────────────
 
 const fn default_true() -> bool {
@@ -350,8 +389,8 @@ fn default_referrer_policy() -> String {
 /// Default `Content-Security-Policy` value.
 ///
 /// Designed to be "sensible by default" while allowing htmx to function
-/// normally when served from the same origin (as Autumn does at
-/// `/static/js/htmx.min.js`).
+/// normally when served from the same origin (as Autumn does for htmx and its
+/// CSRF helper under `/static/js/`).
 ///
 /// Directives:
 /// - `default-src 'self'` -- everything defaults to same-origin
@@ -359,8 +398,8 @@ fn default_referrer_policy() -> String {
 /// - `style-src 'self' 'unsafe-inline'` -- same-origin stylesheets plus
 ///   inline `style` attributes (required by many UI libraries and
 ///   template engines)
-/// - `script-src 'self'` -- only same-origin scripts; htmx works here
-///   because it is served from `/static/js/htmx.min.js`
+/// - `script-src 'self'` -- only same-origin scripts; htmx and Autumn's htmx
+///   CSRF helper work here because they are served from `/static/js/`
 /// - `connect-src 'self'` -- `fetch`/`XHR`/htmx requests go to same origin
 /// - `form-action 'self'` -- forms can only POST to same origin
 /// - `frame-ancestors 'none'` -- matches the default `X-Frame-Options: DENY`
@@ -405,6 +444,14 @@ const fn default_rps() -> f64 {
 
 const fn default_burst() -> u32 {
     20
+}
+
+const fn default_max_request_size_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+const fn default_max_file_size_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 #[cfg(test)]
@@ -543,6 +590,27 @@ mod tests {
     }
 
     #[test]
+    fn upload_config_defaults() {
+        let config = UploadConfig::default();
+        assert_eq!(config.max_request_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.max_file_size_bytes, 16 * 1024 * 1024);
+        assert!(config.allowed_mime_types.is_empty());
+    }
+
+    #[test]
+    fn upload_config_deserialize() {
+        let toml_str = r#"
+            max_request_size_bytes = 1024
+            max_file_size_bytes = 256
+            allowed_mime_types = ["image/png", "image/jpeg"]
+        "#;
+        let config: UploadConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_request_size_bytes, 1024);
+        assert_eq!(config.max_file_size_bytes, 256);
+        assert_eq!(config.allowed_mime_types.len(), 2);
+    }
+
+    #[test]
     fn full_security_config_deserialize() {
         let toml_str = r#"
             [headers]
@@ -556,6 +624,11 @@ mod tests {
             enabled = true
             requests_per_second = 50.0
             burst = 100
+
+            [upload]
+            max_request_size_bytes = 4096
+            max_file_size_bytes = 1024
+            allowed_mime_types = ["text/plain"]
         "#;
         let config: SecurityConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.headers.x_frame_options, "DENY");
@@ -564,5 +637,8 @@ mod tests {
         assert!(config.rate_limit.enabled);
         assert!((config.rate_limit.requests_per_second - 50.0).abs() < f64::EPSILON);
         assert_eq!(config.rate_limit.burst, 100);
+        assert_eq!(config.upload.max_request_size_bytes, 4096);
+        assert_eq!(config.upload.max_file_size_bytes, 1024);
+        assert_eq!(config.upload.allowed_mime_types, vec!["text/plain"]);
     }
 }

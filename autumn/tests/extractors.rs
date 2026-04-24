@@ -1,6 +1,8 @@
 //!
 //! Integration tests for extractors.
 //!
+#[cfg(feature = "multipart")]
+use autumn_web::extract::Multipart;
 use autumn_web::extract::{Form, Json};
 use axum::Router;
 use axum::body::Body;
@@ -115,4 +117,193 @@ async fn form_extraction_works() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"Alice is 30");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_extraction_works() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+        let field = multipart
+            .next_field()
+            .await?
+            .expect("expected one multipart field");
+        let name = field.file_name().unwrap_or("missing").to_string();
+        let body = field.bytes_limited().await?;
+        Ok(format!("{name}:{}", body.len()))
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new().route("/", axum::routing::post(handler));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"hello.txt:11");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_mime_allow_list_skips_non_file_fields() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+        let mut text_seen = false;
+        let mut file_seen = false;
+
+        while let Some(field) = multipart.next_field().await? {
+            if field.file_name().is_some() {
+                file_seen = true;
+            } else {
+                text_seen = true;
+            }
+            let _ = field.bytes_limited().await?;
+        }
+
+        Ok(format!("text={text_seen},file={file_seen}"))
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nreport\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new()
+        .route("/", axum::routing::post(handler))
+        .layer(axum::middleware::from_fn(
+            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(autumn_web::security::config::UploadConfig {
+                        allowed_mime_types: vec!["text/plain".to_owned()],
+                        ..autumn_web::security::config::UploadConfig::default()
+                    });
+                next.run(req).await
+            },
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"text=true,file=true");
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_file_size_limit_returns_413() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<&'static str> {
+        let field = multipart.next_field().await?.expect("expected field");
+        let _ = field.bytes_limited().await?;
+        Ok("ok")
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new()
+        .route("/", axum::routing::post(handler))
+        .layer(axum::middleware::from_fn(
+            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(autumn_web::security::config::UploadConfig {
+                        max_file_size_bytes: 4,
+                        ..autumn_web::security::config::UploadConfig::default()
+                    });
+                next.run(req).await
+            },
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[cfg(feature = "multipart")]
+#[tokio::test]
+async fn multipart_request_size_limit_returns_413() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<&'static str> {
+        let _ = multipart.next_field().await?;
+        Ok("ok")
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new()
+        .route("/", axum::routing::post(handler))
+        .layer(axum::middleware::from_fn(
+            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut()
+                    .insert(autumn_web::security::config::UploadConfig {
+                        max_request_size_bytes: 8,
+                        ..autumn_web::security::config::UploadConfig::default()
+                    });
+                next.run(req).await
+            },
+        ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

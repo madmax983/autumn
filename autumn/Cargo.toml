@@ -17,7 +17,9 @@ flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
+multipart = ["axum/multipart"]
 tailwind = []
+openapi = []
 db = [
     "dep:deadpool",
     "dep:diesel",

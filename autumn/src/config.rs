@@ -80,6 +80,9 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //! | `AUTUMN_ENV` | active profile | `String` |
 //! | `AUTUMN_PROFILE` | active profile (legacy alias) | `String` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -518,6 +521,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// assert!(result.is_ok());
 /// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The config file exists but could not be read.
     #[error("failed to read autumn.toml: {0}")]
@@ -1054,6 +1058,23 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
             &mut self.security.rate_limit.trust_forwarded_headers,
         );
+
+        // Multipart uploads
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES",
+            &mut self.security.upload.max_request_size_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES",
+            &mut self.security.upload.max_file_size_bytes,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
+            &mut self.security.upload.allowed_mime_types,
+        );
     }
 
     /// Returns the active profile name, if any.
@@ -1225,6 +1246,7 @@ pub struct LogConfig {
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
     #[default]
@@ -1276,6 +1298,7 @@ pub struct TelemetryConfig {
 
 /// OTLP transport protocol selection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TelemetryProtocol {
     /// OTLP over gRPC.
     #[serde(alias = "grpc", alias = "GRPC")]

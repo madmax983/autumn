@@ -117,6 +117,17 @@ async fn main() {
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
+- [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
+
+## Stability
+
+Autumn commits to [Semantic Versioning](https://semver.org) for its public
+API starting at `1.0.0`. See [STABILITY.md](STABILITY.md) for the full
+definition of the stable surface, the MSRV policy, and the migration-guide
+process for future major releases.
+
+Until `1.0.0`, Autumn is in its `0.x` series — see the
+[pre-1.0 notes](STABILITY.md#pre-10-notes) for what that means in practice.
 
 ## Requirements
 
