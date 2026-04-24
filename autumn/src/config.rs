@@ -217,14 +217,14 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
 pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
     // 1. Preferred env var
     if let Ok(profile) = env.var("AUTUMN_ENV") {
-        if !profile.is_empty() {
+        if let Some(profile) = normalize_profile_name(&profile) {
             return Some(profile);
         }
     }
 
     // 2. Legacy env var
     if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        if !profile.is_empty() {
+        if let Some(profile) = normalize_profile_name(&profile) {
             return Some(profile);
         }
     }
@@ -234,11 +234,15 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
     for (i, arg) in args.iter().enumerate() {
         if arg == "--profile" {
             if let Some(profile) = args.get(i + 1) {
-                return Some(profile.clone());
+                if let Some(profile) = normalize_profile_name(profile) {
+                    return Some(profile);
+                }
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
-            return Some(profile.to_owned());
+            if let Some(profile) = normalize_profile_name(profile) {
+                return Some(profile);
+            }
         }
     }
 
@@ -248,6 +252,27 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
         Some("0") => Some("prod".to_owned()),
         _ => Some("dev".to_owned()),
     }
+}
+
+/// Normalize profile aliases and trim whitespace.
+///
+/// Supported aliases:
+/// - `production` -> `prod`
+/// - `development` -> `dev`
+fn normalize_profile_name(profile: &str) -> Option<String> {
+    let trimmed = profile.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    let normalized = match lowered.as_str() {
+        "production" => "prod",
+        "development" => "dev",
+        other => other,
+    };
+
+    Some(normalized.to_owned())
 }
 
 /// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
@@ -2326,6 +2351,20 @@ path = "/healthz"
         let env = MockEnv::new()
             .with("AUTUMN_ENV", "dev")
             .with("AUTUMN_PROFILE", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_production_alias() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "production");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("prod"));
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_development_alias_with_whitespace() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "  development  ");
         let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("dev"));
     }
