@@ -208,7 +208,7 @@ impl AuditSink for JsonlFileAuditSink {
                 .map_err(|error| {
                     AuditError::new(format!("failed to open audit log file: {error}"))
                 })?;
-            file.write_all(&encoded).await.map_err(|error| {
+            file.write_all(&encoded).await.map_err(|error| { AuditError::new(format!("failed to write audit event: {error}")) })?; file.sync_all().await.map_err(|error| {
                 AuditError::new(format!("failed to write audit event: {error}"))
             })?;
             Ok(())
