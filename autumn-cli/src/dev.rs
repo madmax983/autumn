@@ -225,7 +225,7 @@ pub fn run(package: Option<&str>, show_config: bool) {
         if result.refresh_watch_dirs {
             watch_dirs = resolve_watch_dirs();
             let watcher = debouncer.watcher();
-            ensure_watch_dirs_registered(watcher, &watch_dirs, &mut watched_dirs);
+            sync_watch_dirs(watcher, &watch_dirs, &mut watched_dirs);
         }
 
         if !result.keep_running {
@@ -418,6 +418,35 @@ fn ensure_watch_dirs_registered<W: notify::Watcher + ?Sized>(
             }
         }
     }
+}
+
+fn sync_watch_dirs<W: notify::Watcher + ?Sized>(
+    watcher: &mut W,
+    watch_dirs: &[String],
+    watched_dirs: &mut HashSet<String>,
+) {
+    let desired_dirs: HashSet<String> = watch_dirs.iter().cloned().collect();
+    let to_remove = removed_watch_dirs(watched_dirs, &desired_dirs);
+
+    for dir in to_remove {
+        if let Err(e) = watcher.unwatch(Path::new(&dir)) {
+            eprintln!("  Warning: could not unwatch {dir}/: {e}");
+        }
+        watched_dirs.remove(&dir);
+    }
+
+    ensure_watch_dirs_registered(watcher, watch_dirs, watched_dirs);
+}
+
+fn removed_watch_dirs(
+    watched_dirs: &HashSet<String>,
+    desired_dirs: &HashSet<String>,
+) -> Vec<String> {
+    watched_dirs
+        .iter()
+        .filter(|dir| !desired_dirs.contains(*dir))
+        .cloned()
+        .collect()
 }
 
 /// Build a `cargo build` command for the given package.
@@ -1367,6 +1396,26 @@ mod tests {
             kind: DebouncedEventKind::AnyContinuous,
         }];
         assert!(!includes_autumn_toml_change(&events));
+    }
+
+    #[test]
+    fn removed_watch_dirs_reports_entries_missing_from_new_config() {
+        let watched = HashSet::from([
+            "src".to_string(),
+            "static".to_string(),
+            "templates".to_string(),
+            "migrations".to_string(),
+            "views".to_string(),
+        ]);
+        let desired = HashSet::from([
+            "src".to_string(),
+            "static".to_string(),
+            "templates".to_string(),
+            "migrations".to_string(),
+        ]);
+
+        let removed = removed_watch_dirs(&watched, &desired);
+        assert_eq!(removed, vec!["views".to_string()]);
     }
 
     // ── build_cargo_command tests ──────────────────────────────────
