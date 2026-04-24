@@ -51,6 +51,41 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
+    // ECHO: Auto-wrap the function body if the return type is a known primitive.
+    let is_primitive = match &input_fn.sig.output {
+        syn::ReturnType::Type(_, ty) => {
+            if let syn::Type::Path(type_path) = &**ty {
+                if let Some(segment) = type_path.path.segments.last() {
+                    let ident = segment.ident.to_string();
+                    matches!(
+                        ident.as_str(),
+                        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" |
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" |
+                        "f32" | "f64" | "bool"
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+
+    if is_primitive {
+        let original_block = &input_fn.block;
+        let wrapped_block = quote! {
+            {
+                use ::autumn_web::response::IntoResponse;
+                let __ret = #original_block;
+                ::autumn_web::response::Primitive(__ret).into_response()
+            }
+        };
+        input_fn.block = Box::new(syn::parse2(wrapped_block).unwrap());
+        input_fn.sig.output = syn::parse2(quote! { -> ::autumn_web::response::Response }).unwrap();
+    }
+
     // Build the handler expression, chaining .layer() for each interceptor.
     // Interceptors are applied in reverse attribute order so that the first
     // #[intercept(...)] listed is the outermost layer (runs first).

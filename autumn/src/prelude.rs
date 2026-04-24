@@ -61,6 +61,8 @@ pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
 pub use crate::sse::{Event, Sse};
 /// State extractor.
 pub use axum::extract::State;
+/// Response types.
+pub use crate::response::{IntoResponse, Response};
 
 // ── Error handling ───────────────────────────────────────────────
 /// Structured audit event types.
