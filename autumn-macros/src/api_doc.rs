@@ -396,24 +396,38 @@ fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
 
 /// Emit a `::autumn_web::openapi::SchemaEntry` initializer for a type.
 ///
-/// The generated code dispatches at compile time to a const-fn-like
-/// branching expression that yields either:
-/// * a primitive schema when the type matches a known scalar, or
-/// * a `Ref` referencing the type's [`OpenApiSchema::schema_name()`]
-///   when the type is any other named path, or
-/// * a fallback "object"-typed name when we cannot identify the type.
+/// Handles the following patterns:
+///
+/// * `Vec<T>`         → `SchemaKind::Array(&inner)`  (array of `T`)
+/// * `Option<T>`      → `SchemaKind::Nullable(&inner)` (nullable `T`)
+/// * known primitive  → `SchemaKind::Primitive("string"|"integer"|…)`
+/// * everything else  → `SchemaKind::Ref` with the type's last path
+///   segment as the schema name (back-filled by the spec generator)
 fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
-    // Lift primitive detection out of the proc macro so the user's path
-    // like `crate::models::User` isn't re-parsed at compile time. We emit
-    // a const-dispatched expression using type-id-less pattern matching
-    // via `match` on a generated helper; the simpler approach here is to
-    // always emit a `Ref` with the type's last-segment name. This keeps
-    // the macro output short while still permitting users to register
-    // their types via `OpenApiSchema`.
+    // Vec<T> → array of <schema of T>.
+    if let Some(inner) = unwrap_single_generic(ty, "Vec") {
+        let inner_tokens = schema_entry_for_type(&inner);
+        return quote! {
+            ::autumn_web::openapi::SchemaEntry {
+                name: "array",
+                kind: ::autumn_web::openapi::SchemaKind::Array(&#inner_tokens),
+            }
+        };
+    }
+    // Option<T> → nullable <schema of T>.
+    if let Some(inner) = unwrap_single_generic(ty, "Option") {
+        let inner_tokens = schema_entry_for_type(&inner);
+        return quote! {
+            ::autumn_web::openapi::SchemaEntry {
+                name: "nullable",
+                kind: ::autumn_web::openapi::SchemaKind::Nullable(&#inner_tokens),
+            }
+        };
+    }
+
     let name = last_segment_name(ty).unwrap_or_else(|| "Schema".to_owned());
     let name_lit = LitStr::new(&name, Span::call_site());
-    let primitive = primitive_json_type(&name);
-    if let Some(json_type) = primitive {
+    if let Some(json_type) = primitive_json_type(&name) {
         let json_lit = LitStr::new(json_type, Span::call_site());
         quote! {
             ::autumn_web::openapi::SchemaEntry {

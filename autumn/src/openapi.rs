@@ -101,7 +101,7 @@ pub struct ApiDoc {
 }
 
 /// Reference to a schema definition, produced by the route macros.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SchemaEntry {
     /// Short human-readable type name (used as `#/components/schemas/Name`).
     pub name: &'static str,
@@ -117,6 +117,15 @@ pub enum SchemaKind {
     Ref,
     /// A primitive JSON type inlined at the reference site.
     Primitive(&'static str),
+    /// A JSON array whose items follow the referenced sub-schema. Used
+    /// for handlers that return `Json<Vec<T>>` (or accept one as a
+    /// request body) — emitting `Ref` for those would produce an
+    /// object schema instead of the array the endpoint actually
+    /// serializes.
+    Array(&'static SchemaEntry),
+    /// A nullable schema — used when the handler wraps the payload in
+    /// `Option<T>`. The referenced sub-entry describes `T`.
+    Nullable(&'static SchemaEntry),
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -392,14 +401,10 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
         }
 
         if let Some(entry) = &api_doc.request_body {
-            if entry.kind == SchemaKind::Ref {
-                referenced_names.insert(entry.name);
-            }
+            collect_ref_names(entry, &mut referenced_names);
         }
         if let Some(entry) = &api_doc.response {
-            if entry.kind == SchemaKind::Ref {
-                referenced_names.insert(entry.name);
-            }
+            collect_ref_names(entry, &mut referenced_names);
         }
 
         let operation = operation_for(api_doc);
@@ -529,6 +534,39 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
         SchemaKind::Ref => {
             serde_json::json!({ "$ref": format!("#/components/schemas/{}", entry.name) })
         }
+        SchemaKind::Array(items) => serde_json::json!({
+            "type": "array",
+            "items": schema_value_for(items),
+        }),
+        SchemaKind::Nullable(inner) => {
+            // OpenAPI 3.0: apply the `nullable: true` keyword alongside
+            // the inner schema body. For `$ref` we have to wrap in an
+            // `anyOf` since a bare `$ref` can't carry siblings.
+            if inner.kind == SchemaKind::Ref {
+                serde_json::json!({
+                    "anyOf": [schema_value_for(inner), { "type": "null" }],
+                })
+            } else {
+                let mut v = schema_value_for(inner);
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("nullable".to_owned(), serde_json::Value::Bool(true));
+                }
+                v
+            }
+        }
+    }
+}
+
+/// Walk into a `SchemaEntry` and yield every named ref reached through
+/// `Array` / `Nullable` wrappers. Back-fill logic uses this so a
+/// `Json<Vec<User>>` response registers a `User` component schema.
+fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&'static str>) {
+    match entry.kind {
+        SchemaKind::Ref => {
+            out.insert(entry.name);
+        }
+        SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => collect_ref_names(inner, out),
+        SchemaKind::Primitive(_) => {}
     }
 }
 

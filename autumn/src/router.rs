@@ -50,6 +50,16 @@ pub enum RouterBuildError {
         /// The offending value from the user's config.
         value: String,
     },
+    /// `openapi_json_path` and `swagger_ui_path` collide on the same
+    /// URL. Mounting both would cause axum to panic on overlapping
+    /// method routes at startup.
+    #[error(
+        "openapi_json_path and swagger_ui_path both resolve to {path:?}; they must differ or `swagger_ui_path` must be `None`"
+    )]
+    DuplicateOpenApiPath {
+        /// The path that both fields pointed at.
+        path: String,
+    },
 }
 
 /// Build the fully-configured Axum router from routes, config, and state.
@@ -298,6 +308,12 @@ fn build_openapi_router(
     validate_route_path("openapi_json_path", &config.openapi_json_path)?;
     if let Some(path) = &config.swagger_ui_path {
         validate_route_path("swagger_ui_path", path)?;
+        // Registering two GET handlers on the same path would cause an
+        // axum `Route::route` panic, so reject collisions as a
+        // configuration error instead.
+        if path == &config.openapi_json_path {
+            return Err(RouterBuildError::DuplicateOpenApiPath { path: path.clone() });
+        }
     }
 
     // Walk both top-level routes and scoped groups. For scoped groups the
@@ -1500,5 +1516,18 @@ mod tests {
         let out = super::build_openapi_router(&[], &[], Some(&config))
             .expect("valid paths must not error");
         assert!(out.is_some());
+    }
+
+    #[test]
+    fn openapi_rejects_duplicate_json_and_swagger_paths() {
+        let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path("/docs")
+            .swagger_ui_path(Some("/docs".to_owned()));
+        let err = super::build_openapi_router(&[], &[], Some(&config))
+            .expect_err("colliding paths should be rejected before axum panics");
+        assert!(matches!(
+            err,
+            RouterBuildError::DuplicateOpenApiPath { ref path } if path == "/docs"
+        ));
     }
 }

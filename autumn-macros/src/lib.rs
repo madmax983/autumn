@@ -467,6 +467,21 @@ pub fn api_doc(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 const ROUTE_ATTR_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "static_get", "ws"];
 
+/// Return `true` when an attribute names one of the Autumn route macros.
+///
+/// We match on the **last** path segment so qualified forms like
+/// `#[autumn_web::get("/x")]`, `#[autumn_macros::post("/x")]`, or
+/// even `#[crate::get("/x")]` are recognized alongside the bare
+/// `#[get("/x")]`. Unqualified identifiers are covered by the same
+/// logic because their path has a single segment.
+fn is_route_attribute(attr: &syn::Attribute) -> bool {
+    attr.path()
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .is_some_and(|name| ROUTE_ATTR_NAMES.contains(&name.as_str()))
+}
+
 fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr_ts: proc_macro2::TokenStream = attr.into();
     let mut input_fn: syn::ItemFn = match syn::parse(item.clone()) {
@@ -476,11 +491,7 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(_) => return item,
     };
 
-    let route_idx = input_fn.attrs.iter().position(|a| {
-        a.path()
-            .get_ident()
-            .is_some_and(|ident| ROUTE_ATTR_NAMES.contains(&ident.to_string().as_str()))
-    });
+    let route_idx = input_fn.attrs.iter().position(is_route_attribute);
 
     let Some(idx) = route_idx else {
         // Standalone `#[api_doc]` with no paired route macro is a no-op;

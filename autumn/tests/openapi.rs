@@ -72,6 +72,32 @@ async fn create_thing() -> (http::StatusCode, axum::Json<serde_json::Value>) {
     (http::StatusCode::CREATED, axum::Json(serde_json::json!({})))
 }
 
+// Qualified form: `#[api_doc(...)]` on top, `#[autumn_web::get(...)]`
+// qualified below. The reorder helper must recognize the qualified
+// path via its last segment so the overrides still flow through.
+#[api_doc(summary = "Fully-qualified get")]
+#[autumn_web::get("/qualified")]
+async fn qualified_get() -> &'static str {
+    "ok"
+}
+
+// `Json<Vec<T>>` — the generator must emit an array schema rather
+// than collapsing to a `$ref` to `Vec`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Widget {
+    id: i32,
+}
+
+#[get("/widgets")]
+async fn list_widgets() -> axum::Json<Vec<Widget>> {
+    axum::Json(vec![])
+}
+
+#[post("/widgets")]
+async fn post_widgets(axum::Json(_body): axum::Json<Vec<Widget>>) -> http::StatusCode {
+    http::StatusCode::OK
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -166,6 +192,53 @@ fn status_tuple_response_is_inferred_as_json() {
         .expect("(StatusCode, Json<T>) should be inferred");
     assert_eq!(resp.name, "Value");
     assert_eq!(resp.kind, SchemaKind::Ref);
+}
+
+#[test]
+fn api_doc_survives_above_qualified_route_attribute() {
+    let route = __autumn_route_info_qualified_get();
+    assert_eq!(
+        route.api_doc.summary,
+        Some("Fully-qualified get"),
+        "qualified route attr should still be detected by the reorder helper"
+    );
+}
+
+#[test]
+fn json_vec_response_is_emitted_as_array_schema() {
+    let route = __autumn_route_info_list_widgets();
+    let resp = route
+        .api_doc
+        .response
+        .as_ref()
+        .expect("Json<Vec<T>> must infer a response");
+    assert!(
+        matches!(resp.kind, SchemaKind::Array(_)),
+        "Json<Vec<T>> must become Array, got {:?}",
+        resp.kind
+    );
+
+    // Render through the spec generator to confirm the actual JSON.
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let media =
+        &spec.paths["/widgets"].get.as_ref().unwrap().responses["200"].content["application/json"];
+    assert_eq!(media.schema["type"], "array");
+    assert_eq!(
+        media.schema["items"]["$ref"], "#/components/schemas/Widget",
+        "array items must still ref the element type"
+    );
+}
+
+#[test]
+fn json_vec_request_body_is_emitted_as_array_schema() {
+    let route = __autumn_route_info_post_widgets();
+    let body = route
+        .api_doc
+        .request_body
+        .as_ref()
+        .expect("Json<Vec<T>> request body must infer");
+    assert!(matches!(body.kind, SchemaKind::Array(_)));
 }
 
 // ── Spec generation pipeline ───────────────────────────────────────
