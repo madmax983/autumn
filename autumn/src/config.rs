@@ -283,6 +283,18 @@ fn normalize_profile_name(profile: &str) -> Option<String> {
     Some(trimmed.to_owned())
 }
 
+/// Profile names to check for inline/file overrides.
+///
+/// For canonical profiles, include legacy aliases for compatibility so
+/// `production` and `development` profile sources are still loaded.
+fn profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
 /// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
 fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
     base.get("profile")
@@ -616,20 +628,27 @@ impl AutumnConfig {
             deep_merge(&mut merged, base.clone());
 
             // Layer 4: [profile.{name}] in autumn.toml
-            if let Some(inline_profile) = profile_section_from_base_toml(&base, &profile) {
-                deep_merge(&mut merged, inline_profile);
-                has_inline_profile_section = true;
+            for profile_name in profile_lookup_names(&profile) {
+                if let Some(inline_profile) = profile_section_from_base_toml(&base, profile_name) {
+                    deep_merge(&mut merged, inline_profile);
+                    has_inline_profile_section = true;
+                }
             }
         }
 
         // Layer 5: autumn-{profile}.toml (legacy compatibility)
-        let profile_path = find_config_file_named(&format!("autumn-{profile}.toml"), env);
-        match load_raw_toml(&profile_path)? {
-            Some(profile_toml) => deep_merge(&mut merged, profile_toml),
-            None if should_warn_missing_profile_file(&profile, has_inline_profile_section) => {
-                warn_profile_typo(&profile);
+        let mut has_profile_file = false;
+        for profile_name in profile_lookup_names(&profile) {
+            let profile_path = find_config_file_named(&format!("autumn-{profile_name}.toml"), env);
+            if let Some(profile_toml) = load_raw_toml(&profile_path)? {
+                deep_merge(&mut merged, profile_toml);
+                has_profile_file = true;
             }
-            None => {}
+        }
+        if !has_profile_file
+            && should_warn_missing_profile_file(&profile, has_inline_profile_section)
+        {
+            warn_profile_typo(&profile);
         }
 
         // Deserialize the merged TOML table into AutumnConfig
@@ -2861,6 +2880,50 @@ path = "/healthz"
         let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("staging"));
         assert_eq!(config.server.port, 4100);
+    }
+
+    #[test]
+    fn load_production_profile_reads_inline_profile_production_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &base_path,
+            r"
+            [profile.production.server]
+            port = 4200
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4200);
+    }
+
+    #[test]
+    fn load_production_profile_reads_legacy_autumn_production_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let production_path = dir.path().join("autumn-production.toml");
+        std::fs::write(
+            &production_path,
+            r"
+            [server]
+            port = 4300
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4300);
     }
 
     #[test]
