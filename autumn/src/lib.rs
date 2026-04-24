@@ -42,7 +42,7 @@
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`],
-//!   [`Json`], [`Path`], [`Query`]).
+//!   [`Json`], [`Path`], [`Query`], [`extract::Multipart`]).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 
 //! - [`middleware`] -- Built-in middleware (request IDs).

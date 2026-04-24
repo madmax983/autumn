@@ -1,7 +1,7 @@
 //!
 //! Integration tests for extractors.
 //!
-use autumn_web::extract::{Form, Json};
+use autumn_web::extract::{Form, Json, Multipart};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -115,4 +115,44 @@ async fn form_extraction_works() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"Alice is 30");
+}
+
+#[tokio::test]
+async fn multipart_extraction_works() {
+    async fn handler(mut multipart: Multipart) -> autumn_web::AutumnResult<String> {
+        let field = multipart
+            .next_field()
+            .await?
+            .expect("expected one multipart field");
+        let name = field.file_name().unwrap_or("missing").to_string();
+        let body = field.bytes_limited().await?;
+        Ok(format!("{name}:{}", body.len()))
+    }
+
+    let boundary = "X-BOUNDARY";
+    let payload = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\nContent-Type: text/plain\r\n\r\nhello world\r\n--{boundary}--\r\n"
+    );
+
+    let app = Router::new().route("/", axum::routing::post(handler));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"hello.txt:11");
 }
