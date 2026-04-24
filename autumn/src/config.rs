@@ -265,14 +265,15 @@ fn normalize_profile_name(profile: &str) -> Option<String> {
         return None;
     }
 
-    let lowered = trimmed.to_ascii_lowercase();
-    let normalized = match lowered.as_str() {
-        "production" => "prod",
-        "development" => "dev",
-        other => other,
-    };
+    if trimmed.eq_ignore_ascii_case("production") {
+        return Some("prod".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("development") {
+        return Some("dev".to_owned());
+    }
 
-    Some(normalized.to_owned())
+    // Preserve user-specified case for custom profile names.
+    Some(trimmed.to_owned())
 }
 
 /// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
@@ -2367,6 +2368,13 @@ path = "/healthz"
         let env = MockEnv::new().with("AUTUMN_ENV", "  development  ");
         let profile = resolve_profile(&env);
         assert_eq!(profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn resolve_profile_preserves_case_for_custom_profiles() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "QA");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile.as_deref(), Some("QA"));
     }
 
     #[test]
