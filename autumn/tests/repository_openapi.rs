@@ -5,7 +5,7 @@
 //! pins their `ApiDoc` shape so the generated spec accurately reflects
 //! the JSON request/response bodies that Autumn mounts.
 
-#![cfg(feature = "db")]
+#![cfg(all(feature = "db", feature = "openapi"))]
 
 use autumn_web::openapi::SchemaKind;
 

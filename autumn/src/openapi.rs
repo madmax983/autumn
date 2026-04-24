@@ -13,20 +13,27 @@
 //!
 //! # Quick start
 //!
-//! ```rust,no_run
+//! Enable the `openapi` feature in `Cargo.toml`, then:
+//!
+//! ```toml
+//! [dependencies]
+//! autumn-web = { version = "0.2", features = ["openapi"] }
+//! ```
+//!
+//! ```rust,ignore
 //! use autumn_web::prelude::*;
 //!
 //! #[get("/hello")]
 //! async fn hello() -> &'static str { "hi" }
 //!
-//! # #[autumn_web::main]
-//! # async fn main() {
-//! autumn_web::app()
-//!     .routes(routes![hello])
-//!     .openapi(autumn_web::openapi::OpenApiConfig::new("My API", "1.0.0"))
-//!     .run()
-//!     .await;
-//! # }
+//! #[autumn_web::main]
+//! async fn main() {
+//!     autumn_web::app()
+//!         .routes(routes![hello])
+//!         .openapi(autumn_web::openapi::OpenApiConfig::new("My API", "1.0.0"))
+//!         .run()
+//!         .await;
+//! }
 //! ```
 //!
 //! With `.openapi(...)` enabled, the following endpoints are mounted:
@@ -56,6 +63,7 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "openapi")]
 use serde::{Deserialize, Serialize};
 
 // ──────────────────────────────────────────────────────────────────
@@ -136,6 +144,7 @@ pub enum SchemaKind {
 ///
 /// Passed to [`AppBuilder::openapi`](crate::app::AppBuilder::openapi)
 /// to enable spec generation and mount the documentation endpoints.
+#[cfg(feature = "openapi")]
 #[derive(Clone)]
 pub struct OpenApiConfig {
     /// API title that appears in the Swagger UI header.
@@ -153,6 +162,7 @@ pub struct OpenApiConfig {
     pub additional_schemas: BTreeMap<String, serde_json::Value>,
 }
 
+#[cfg(feature = "openapi")]
 impl OpenApiConfig {
     /// Create a new config with the required `title` and `version`.
     #[must_use]
@@ -198,7 +208,7 @@ impl OpenApiConfig {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Schema trait + primitive impls
+// Schema trait + primitive impls (feature-gated)
 // ──────────────────────────────────────────────────────────────────
 
 /// Describes a type's JSON schema for OpenAPI generation.
@@ -207,6 +217,7 @@ impl OpenApiConfig {
 /// schemas in the generated spec. A blanket default is not provided —
 /// routes whose types do not implement this trait simply emit a generic
 /// `object` placeholder referring to the type name.
+#[cfg(feature = "openapi")]
 pub trait OpenApiSchema {
     /// Component schema name (appears under `#/components/schemas/`).
     fn schema_name() -> &'static str;
@@ -215,6 +226,7 @@ pub trait OpenApiSchema {
     fn schema() -> serde_json::Value;
 }
 
+#[cfg(feature = "openapi")]
 macro_rules! impl_primitive_schema {
     ($ty:ty, $name:literal, $json:literal) => {
         impl OpenApiSchema for $ty {
@@ -228,19 +240,33 @@ macro_rules! impl_primitive_schema {
     };
 }
 
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(bool, "boolean", "boolean");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(String, "string", "string");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(&'static str, "string", "string");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(i8, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(i16, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(i32, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(i64, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(u8, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(u16, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(u32, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(u64, "integer", "integer");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(f32, "number", "number");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(f64, "number", "number");
+#[cfg(feature = "openapi")]
 impl_primitive_schema!(serde_json::Value, "object", "object");
 
 // ──────────────────────────────────────────────────────────────────
@@ -256,6 +282,7 @@ pub struct SchemaRegistry {
 impl SchemaRegistry {
     /// Register a type via its [`OpenApiSchema`] implementation. A
     /// duplicate insertion is a no-op (the existing entry wins).
+    #[cfg(feature = "openapi")]
     pub fn register<T: OpenApiSchema>(&mut self) {
         let name = T::schema_name().to_owned();
         self.schemas.entry(name).or_insert_with(T::schema);
@@ -284,9 +311,12 @@ impl SchemaRegistry {
 //
 // Only the fields Autumn actually populates are modelled — unused
 // OpenAPI keys (callbacks, links, discriminators…) are intentionally
-// omitted so the generated JSON stays clean.
+// omitted so the generated JSON stays clean. Gated behind the
+// `openapi` feature so the runtime spec builder doesn't add code
+// size / dependency pressure to apps that never serve a JSON spec.
 // ──────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenApiSpec {
     pub openapi: String,
@@ -296,6 +326,7 @@ pub struct OpenApiSpec {
     pub components: Option<Components>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
     pub title: String,
@@ -304,6 +335,7 @@ pub struct Info {
     pub description: Option<String>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct PathItem {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,6 +350,7 @@ pub struct PathItem {
     pub patch: Option<Operation>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Operation {
     #[serde(rename = "operationId")]
@@ -335,6 +368,7 @@ pub struct Operation {
     pub responses: BTreeMap<String, Response>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Parameter {
     pub name: String,
@@ -344,12 +378,14 @@ pub struct Parameter {
     pub schema: serde_json::Value,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestBody {
     pub required: bool,
     pub content: BTreeMap<String, MediaType>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Response {
     pub description: String,
@@ -357,11 +393,13 @@ pub struct Response {
     pub content: BTreeMap<String, MediaType>,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MediaType {
     pub schema: serde_json::Value,
 }
 
+#[cfg(feature = "openapi")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Components {
     pub schemas: BTreeMap<String, serde_json::Value>,
@@ -375,6 +413,7 @@ pub struct Components {
 ///
 /// This is the core of the auto-generation: every route's [`ApiDoc`] is
 /// translated into an [`Operation`] under the matching [`PathItem`].
+#[cfg(feature = "openapi")]
 #[must_use]
 pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
@@ -458,6 +497,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
     }
 }
 
+#[cfg(feature = "openapi")]
 fn operation_for(api_doc: &ApiDoc) -> Operation {
     let tags = if api_doc.tags.is_empty() {
         default_tag(api_doc.path)
@@ -528,6 +568,7 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
     }
 }
 
+#[cfg(feature = "openapi")]
 fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
@@ -565,6 +606,7 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
 /// Walk into a `SchemaEntry` and yield every named ref reached through
 /// `Array` / `Nullable` wrappers. Back-fill logic uses this so a
 /// `Json<Vec<User>>` response registers a `User` component schema.
+#[cfg(feature = "openapi")]
 fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&'static str>) {
     match entry.kind {
         SchemaKind::Ref => {
@@ -575,12 +617,14 @@ fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&
     }
 }
 
+#[cfg(feature = "openapi")]
 fn default_tag(path: &str) -> Option<&str> {
     path.trim_start_matches('/')
         .split('/')
         .find(|seg| !seg.is_empty() && !seg.starts_with('{'))
 }
 
+#[cfg(feature = "openapi")]
 const fn status_description(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -608,6 +652,7 @@ const fn status_description(status: u16) -> &'static str {
 ///
 /// Uses the public unpkg CDN for Swagger UI assets so no static files
 /// need to be embedded in the framework binary.
+#[cfg(feature = "openapi")]
 #[must_use]
 pub fn swagger_ui_html(spec_url: &str, title: &str) -> String {
     let title = html_escape(title);
@@ -650,6 +695,7 @@ pub fn swagger_ui_html(spec_url: &str, title: &str) -> String {
     out
 }
 
+#[cfg(feature = "openapi")]
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -661,7 +707,7 @@ fn html_escape(s: &str) -> String {
 // Tests
 // ──────────────────────────────────────────────────────────────────
 
-#[cfg(test)]
+#[cfg(all(test, feature = "openapi"))]
 mod tests {
     use super::*;
 

@@ -87,6 +87,7 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        #[cfg(feature = "openapi")]
         openapi: None,
     }
 }
@@ -194,6 +195,11 @@ pub struct AppBuilder {
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
+    ///
+    /// Gated behind the `openapi` feature: apps that don't need a
+    /// served `OpenAPI` document shouldn't pay for the spec types or the
+    /// runtime collision-check machinery.
+    #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
 }
 
@@ -348,11 +354,16 @@ impl AppBuilder {
     ///
     /// Routes marked `#[api_doc(hidden)]` are excluded.
     ///
+    /// **Gated behind the `openapi` Cargo feature.** Add
+    /// `features = ["openapi"]` to your `autumn-web` dependency to
+    /// enable it; the default build excludes the runtime spec types
+    /// and endpoints to keep the binary small.
+    ///
     /// # Examples
     ///
     /// Zero-config:
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use autumn_web::prelude::*;
     /// use autumn_web::openapi::OpenApiConfig;
     ///
@@ -369,7 +380,7 @@ impl AppBuilder {
     ///
     /// With custom paths:
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use autumn_web::openapi::OpenApiConfig;
     ///
     /// let config = OpenApiConfig::new("My API", "1.0.0")
@@ -377,6 +388,7 @@ impl AppBuilder {
     ///     .openapi_json_path("/openapi.json")
     ///     .swagger_ui_path(Some("/docs".to_owned()));
     /// ```
+    #[cfg(feature = "openapi")]
     #[must_use]
     pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
         self.openapi = Some(config);
@@ -989,6 +1001,7 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "openapi")]
             openapi,
         } = self;
 
@@ -1068,6 +1081,7 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                #[cfg(feature = "openapi")]
                 openapi,
             },
         )
@@ -1184,7 +1198,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
-            openapi: _,
+            #[cfg(feature = "openapi")]
+                openapi: _,
         } = self;
 
         let all_routes = routes;
@@ -1240,6 +1255,7 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer: None,
                 session_store,
+                #[cfg(feature = "openapi")]
                 openapi: None,
             },
         )

@@ -5,6 +5,8 @@
 //! * `#[api_doc(...)]` overrides flow through to the generated spec.
 //! * `AppBuilder::openapi(...)` mounts `/v3/api-docs` and `/swagger-ui`.
 
+#![cfg(feature = "openapi")]
+
 use autumn_web::Route;
 use autumn_web::openapi::{ApiDoc, OpenApiConfig, SchemaKind};
 use autumn_web::prelude::*;
