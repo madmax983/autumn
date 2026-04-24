@@ -98,10 +98,10 @@ async fn feed(state: AppState) -> impl WsHandler {
             loop {
                 tokio::select! {
                     msg = rx.recv() => {
-                        if let Ok(m) = msg
-                            && socket.send(Message::Text(m.into_string().into())).await.is_err()
-                        {
-                            break;
+                        if let Ok(m) = msg {
+                            if socket.send(Message::Text(m.into_string().into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     () = shutdown.cancelled() => {

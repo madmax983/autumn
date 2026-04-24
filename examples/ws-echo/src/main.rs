@@ -55,10 +55,10 @@ async fn chat(state: AppState) -> impl WsHandler {
                         }
                     }
                     broadcast = rx.recv() => {
-                        if let Ok(msg) = broadcast
-                            && socket.send(Message::Text(msg.into_string().into())).await.is_err()
-                        {
-                            break;
+                        if let Ok(msg) = broadcast {
+                            if socket.send(Message::Text(msg.into_string().into())).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     () = shutdown.cancelled() => {
@@ -73,8 +73,5 @@ async fn chat(state: AppState) -> impl WsHandler {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(routes![echo, chat])
-        .run()
-        .await;
+    autumn_web::app().routes(routes![echo, chat]).run().await;
 }

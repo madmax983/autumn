@@ -162,7 +162,10 @@ async fn path_extractor_is_visible_in_handler() {
     let addr = serve().await;
     let mut stream = connect(addr, "/rooms/lobby").await;
 
-    stream.send(TMessage::Text("hi".into())).await.expect("send");
+    stream
+        .send(TMessage::Text("hi".into()))
+        .await
+        .expect("send");
     let reply = stream.next().await.expect("recv").expect("no error");
     match reply {
         TMessage::Text(t) => assert_eq!(t.as_str(), "lobby:hi"),
