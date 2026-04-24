@@ -391,15 +391,15 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             (register)(&mut registry);
         }
 
-        if let Some(entry) = &api_doc.request_body
-            && entry.kind == SchemaKind::Ref
-        {
-            referenced_names.insert(entry.name);
+        if let Some(entry) = &api_doc.request_body {
+            if entry.kind == SchemaKind::Ref {
+                referenced_names.insert(entry.name);
+            }
         }
-        if let Some(entry) = &api_doc.response
-            && entry.kind == SchemaKind::Ref
-        {
-            referenced_names.insert(entry.name);
+        if let Some(entry) = &api_doc.response {
+            if entry.kind == SchemaKind::Ref {
+                referenced_names.insert(entry.name);
+            }
         }
 
         let operation = operation_for(api_doc);

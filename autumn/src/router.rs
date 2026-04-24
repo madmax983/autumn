@@ -249,16 +249,16 @@ fn extract_path_params(path: &str) -> Vec<String> {
     let bytes = path.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'{'
-            && let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}')
-        {
-            let inner = &path[i + 1..i + 1 + end_rel];
-            let name = inner.split(':').next().unwrap_or(inner).trim();
-            if !name.is_empty() {
-                out.push(name.to_owned());
+        if bytes[i] == b'{' {
+            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
+                let inner = &path[i + 1..i + 1 + end_rel];
+                let name = inner.split(':').next().unwrap_or(inner).trim();
+                if !name.is_empty() {
+                    out.push(name.to_owned());
+                }
+                i += 1 + end_rel + 1;
+                continue;
             }
-            i += 1 + end_rel + 1;
-            continue;
         }
         i += 1;
     }
