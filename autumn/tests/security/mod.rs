@@ -8,5 +8,5 @@ pub mod csrf_length_timing;
 pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
-pub mod session_fixation;
 pub mod htmx_csrf_leak;
+pub mod session_fixation;

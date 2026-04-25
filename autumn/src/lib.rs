@@ -184,7 +184,7 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION, HTMX_CSRF_JS};
+pub use htmx::{HTMX_CSRF_JS, HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
