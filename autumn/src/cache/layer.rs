@@ -425,4 +425,50 @@ mod tests {
         // Just verify from_shared compiles and the layer can be used
         let _layer = CacheResponseLayer::from_shared(store);
     }
+
+    #[tokio::test]
+    async fn caches_get_responses_very_long_uri() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "hello"));
+
+        let long_uri = format!("/test/{}", "a".repeat(1000));
+
+        let req1 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp1 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req1)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let req2 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp2 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req2)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Should be cached despite long URI"
+        );
+    }
 }

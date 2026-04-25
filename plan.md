@@ -1,7 +1,12 @@
-1.  **Refactor `cache_key` creation in `autumn/src/cache/layer.rs` and `autumn/src/middleware/metrics.rs` to optimize out `format!` heap allocations.**
-    -   In `autumn/src/cache/layer.rs`'s `call` function, we currently create `let cache_key = format!("http:{}", req.uri());` on every GET request, which is a hot path for cache checking.
-        -   By replacing `format!` with formatting into a stack-allocated buffer (`[u8; 256]`), we can check the cache hit condition without allocating a `String` on the heap.
-        -   If there is a cache miss, we allocate a `String` to be moved into the async block.
-    -   In `autumn/src/middleware/metrics.rs`'s `record` function, a stack-allocated string `key_str` is already created, but if `is_new` is true, it redundantly calls `let key = format!("{method} {route}");`, allocating again when `key_str` already contains the valid string representation.
-        -   We can optimize the `is_new` block by using `key = if key_str.is_empty() { format!("{method} {route}") } else { key_str.to_owned() };` instead of running `format!` again.
-2.  **Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.**
+1. **Understand Codecov Failure**
+   - The CI is failing because `codecov/patch` shows `76.47% of diff hit (target 90.00%)`.
+   - This means that our newly added lines in `autumn/src/cache/layer.rs` and `autumn/src/middleware/metrics.rs` are not fully covered by tests.
+2. **Identify Uncovered Code**
+   - In `autumn/src/cache/layer.rs`, we added a fallback branch `super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))` for when the URI is extremely long (exceeds 512 bytes).
+   - We need to add a test in `autumn/src/cache/layer.rs` that explicitly calls the cache layer with an extremely long URI (e.g., > 512 chars) to trigger that fallback path.
+3. **Write Tests to Increase Coverage**
+   - Update `autumn/src/cache/layer.rs`'s test module to add a test case that makes a GET request with a very long URI and validates it correctly hits/misses the cache and doesn't panic.
+   - For `autumn/src/middleware/metrics.rs`, we added a `if key_str.is_empty()` check. This happens when the `{method} {route}` string exceeds 256 bytes. We should also add a test there to pass a very long route to `record()`.
+4. **Complete Pre-Commit Checks & Submit**
+   - Run tests `cargo test -p autumn-web --lib cache::layer` and `cargo test -p autumn-web --lib middleware::metrics`.
+   - Follow pre-commit checks and submit.

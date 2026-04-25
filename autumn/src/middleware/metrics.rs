@@ -585,4 +585,26 @@ mod tests {
         // Ensure that even though it errored, the active connection count was decremented
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn collector_records_request_very_long_route() {
+        let collector = MetricsCollector::new();
+        let long_route = "a".repeat(1000);
+
+        collector.record("GET", &long_route, 200, 15);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+
+        // Let's verify the route was recorded correctly.
+        let key = format!("GET {long_route}");
+        let route_snap = snap.http.by_route.get(&key).unwrap();
+        assert_eq!(route_snap.count, 1);
+
+        // Record again to hit the other path
+        collector.record("GET", &long_route, 200, 20);
+        let snap2 = collector.snapshot();
+        let route_snap2 = snap2.http.by_route.get(&key).unwrap();
+        assert_eq!(route_snap2.count, 2);
+    }
 }
