@@ -744,4 +744,37 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "1:10:0");
     }
+
+    #[tokio::test]
+    async fn extractor_handles_plus_sign_in_value() {
+        // `+` is decoded as a space, making "1 0" unparseable as u32 — size falls back to default.
+        let (status, body) = fetch("/items?page=2&size=1+0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("2:{DEFAULT_PAGE_SIZE}:{DEFAULT_PAGE_SIZE}"));
+    }
+
+    #[tokio::test]
+    async fn extractor_handles_malformed_percent_sequence_in_value() {
+        // `%xy` has non-hex digits — the literal `%` is passed through, making the value
+        // unparseable as u32, so size falls back to the default.
+        let (status, body) = fetch("/items?page=2&size=%xy5").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("2:{DEFAULT_PAGE_SIZE}:{DEFAULT_PAGE_SIZE}"));
+    }
+
+    #[tokio::test]
+    async fn extractor_handles_invalid_utf8_in_key() {
+        // `%80` decodes to byte 0x80 which is not valid UTF-8 — the key is skipped entirely.
+        let (status, body) = fetch("/items?%80=5&page=2&size=10").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "2:10:10");
+    }
+
+    #[tokio::test]
+    async fn extractor_handles_invalid_utf8_in_value() {
+        // `%80` in the value decodes to invalid UTF-8 — the pair is skipped, size falls back.
+        let (status, body) = fetch("/items?page=2&size=%80").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("2:{DEFAULT_PAGE_SIZE}:{DEFAULT_PAGE_SIZE}"));
+    }
 }
