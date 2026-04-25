@@ -402,7 +402,7 @@ fn default_session_key() -> String {
 }
 
 #[cfg(feature = "oauth2")]
-fn default_provider_scope() -> String {
+const fn default_provider_scope() -> String {
     String::new()
 }
 
@@ -435,13 +435,20 @@ pub struct OAuth2Config {
 /// A single OAuth2/OIDC provider configuration entry.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct OAuth2ProviderConfig {
+    /// The client ID provided by the `OAuth2` identity provider.
     pub client_id: String,
+    /// The client secret provided by the `OAuth2` identity provider.
     pub client_secret: String,
+    /// The authorization endpoint URL where users are redirected to authenticate.
     pub authorize_url: String,
+    /// The token endpoint URL used to exchange an authorization code for tokens.
     pub token_url: String,
+    /// The optional userinfo endpoint URL used to fetch profile details.
     #[serde(default)]
     pub userinfo_url: Option<String>,
+    /// The local redirect URI registered with the identity provider (e.g., `http://localhost/auth/callback`).
     pub redirect_uri: String,
+    /// The requested scope string (e.g., `openid profile email`).
     #[serde(default = "default_provider_scope")]
     pub scope: String,
     /// Expected OIDC issuer (`iss`) used for ID token validation.
@@ -456,7 +463,9 @@ pub struct OAuth2ProviderConfig {
 /// Query extractor payload for `OAuth2` callback handlers.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OAuth2Callback {
+    /// The authorization code returned by the provider.
     pub code: String,
+    /// The anti-CSRF state token passed during the authorization request.
     pub state: String,
 }
 
@@ -464,10 +473,15 @@ pub struct OAuth2Callback {
 /// Identity information extracted from an OIDC ID token or userinfo endpoint.
 #[derive(Debug, Clone)]
 pub struct OidcIdentity {
+    /// The primary subject identifier (`sub` claim) representing the user.
     pub subject: String,
+    /// The user's email address, if available in the claims.
     pub email: Option<String>,
+    /// The user's full name, if available in the claims.
     pub name: Option<String>,
+    /// The user's preferred username or nickname, if available in the claims.
     pub preferred_username: Option<String>,
+    /// The raw JSON claims extracted from the token or userinfo response.
     pub raw_claims: serde_json::Value,
 }
 

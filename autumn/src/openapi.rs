@@ -317,91 +317,129 @@ impl SchemaRegistry {
 // ──────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "openapi")]
+/// Represents a root OpenAPI 3.0 specification document.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenApiSpec {
+    /// The OpenAPI version string (e.g., `3.0.3`).
     pub openapi: String,
+    /// General information about the API.
     pub info: Info,
+    /// The available paths and operations for the API.
     pub paths: BTreeMap<String, PathItem>,
+    /// Reusable schemas, parameters, and other components.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Components>,
 }
 
 #[cfg(feature = "openapi")]
+/// Provides metadata about the API.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Info {
+    /// The title of the API.
     pub title: String,
+    /// The version of the OpenAPI document.
     pub version: String,
+    /// A description of the API.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
 
 #[cfg(feature = "openapi")]
+/// Describes the operations available on a single path.
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct PathItem {
+    /// A definition of a GET operation on this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub get: Option<Operation>,
+    /// A definition of a POST operation on this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub post: Option<Operation>,
+    /// A definition of a PUT operation on this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub put: Option<Operation>,
+    /// A definition of a DELETE operation on this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delete: Option<Operation>,
+    /// A definition of a PATCH operation on this path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub patch: Option<Operation>,
 }
 
 #[cfg(feature = "openapi")]
+/// Describes a single API operation on a path.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Operation {
+    /// Unique string used to identify the operation.
     #[serde(rename = "operationId")]
     pub operation_id: String,
+    /// A short summary of what the operation does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// A verbose explanation of the operation behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A list of tags for API documentation control.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// A list of parameters that are applicable for this operation.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<Parameter>,
+    /// The request body applicable for this operation.
     #[serde(rename = "requestBody", skip_serializing_if = "Option::is_none")]
     pub request_body: Option<RequestBody>,
+    /// The list of possible responses as they are returned from executing this operation.
     pub responses: BTreeMap<String, Response>,
 }
 
 #[cfg(feature = "openapi")]
+/// Describes a single operation parameter.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Parameter {
+    /// The name of the parameter.
     pub name: String,
+    /// The location of the parameter. Possible values are "query", "header", "path" or "cookie".
     #[serde(rename = "in")]
     pub location: String,
+    /// Determines whether this parameter is mandatory.
     pub required: bool,
+    /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
 }
 
 #[cfg(feature = "openapi")]
+/// Describes a single request body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RequestBody {
+    /// Determines if the request body is required in the request.
     pub required: bool,
+    /// The content of the request body, keyed by media type.
     pub content: BTreeMap<String, MediaType>,
 }
 
 #[cfg(feature = "openapi")]
+/// Describes a single response from an API Operation.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Response {
+    /// A short description of the response.
     pub description: String,
+    /// A map containing descriptions of potential response payloads, keyed by media type.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub content: BTreeMap<String, MediaType>,
 }
 
 #[cfg(feature = "openapi")]
+/// Provides schema and examples for the media type identified by its key.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MediaType {
+    /// The schema defining the content of the request, response, or parameter.
     pub schema: serde_json::Value,
 }
 
 #[cfg(feature = "openapi")]
+/// Holds a set of reusable objects for different aspects of the OAS.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Components {
+    /// Reusable Schema Objects.
     pub schemas: BTreeMap<String, serde_json::Value>,
 }
 
