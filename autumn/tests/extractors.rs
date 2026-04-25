@@ -189,9 +189,9 @@ async fn multipart_mime_allow_list_skips_non_file_fields() {
         .layer(axum::middleware::from_fn(
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 req.extensions_mut()
-                    .insert(autumn_web::security::config::UploadConfig {
+                    .insert(autumn_web::security::UploadConfig {
                         allowed_mime_types: vec!["text/plain".to_owned()],
-                        ..autumn_web::security::config::UploadConfig::default()
+                        ..autumn_web::security::UploadConfig::default()
                     });
                 next.run(req).await
             },
@@ -238,9 +238,9 @@ async fn multipart_file_size_limit_returns_413() {
         .layer(axum::middleware::from_fn(
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 req.extensions_mut()
-                    .insert(autumn_web::security::config::UploadConfig {
+                    .insert(autumn_web::security::UploadConfig {
                         max_file_size_bytes: 4,
-                        ..autumn_web::security::config::UploadConfig::default()
+                        ..autumn_web::security::UploadConfig::default()
                     });
                 next.run(req).await
             },
@@ -282,9 +282,9 @@ async fn multipart_request_size_limit_returns_413() {
         .layer(axum::middleware::from_fn(
             |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
                 req.extensions_mut()
-                    .insert(autumn_web::security::config::UploadConfig {
+                    .insert(autumn_web::security::UploadConfig {
                         max_request_size_bytes: 8,
-                        ..autumn_web::security::config::UploadConfig::default()
+                        ..autumn_web::security::UploadConfig::default()
                     });
                 next.run(req).await
             },
