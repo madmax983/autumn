@@ -341,7 +341,7 @@ impl Default for RateLimitConfig {
 /// Applies framework-level guardrails for `multipart/form-data` requests:
 ///
 /// - `max_request_size_bytes`: global request body cap (enforced by middleware)
-/// - `max_file_size_bytes`: per-file cap for [`crate::extract::MultipartField`] helpers
+/// - `max_file_size_bytes`: per-file cap for [`crate::extract::Multipart`] helpers
 /// - `allowed_mime_types`: optional MIME-type allow list for uploaded parts
 ///
 /// Leave `allowed_mime_types` empty to allow any content type.
