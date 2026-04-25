@@ -1078,16 +1078,17 @@ fn resolve_binary_from_metadata(
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
 
+            let is_bin =
+                |t: &&serde_json::Value| -> bool {
+                    t["kind"]
+                        .as_array()
+                        .is_some_and(|k| k.iter().any(|k| k == "bin"))
+                };
+
             // Prefer the binary whose src_path is exactly `src/main.rs` so
             // that secondary targets (e.g. a WASM client bin) are not
             // accidentally picked as the server binary.
-            let preferred = targets.iter().find(|t| {
-                let is_bin = t["kind"]
-                    .as_array()
-                    .is_some_and(|k| k.iter().any(|k| k == "bin"));
-                if !is_bin {
-                    return false;
-                }
+            let preferred = targets.iter().filter(|t| is_bin(t)).find(|t| {
                 t["src_path"]
                     .as_str()
                     .is_some_and(|p| Path::new(p) == manifest_dir.join("src/main.rs"))
@@ -1098,16 +1099,10 @@ fn resolve_binary_from_metadata(
             }
 
             // Fall back to the first bin target if no `src/main.rs` match.
-            targets.iter().find_map(|t| {
-                let is_bin = t["kind"]
-                    .as_array()
-                    .is_some_and(|k| k.iter().any(|k| k == "bin"));
-                if is_bin {
-                    t["name"].as_str().map(String::from)
-                } else {
-                    None
-                }
-            })
+            targets
+                .iter()
+                .filter(|t| is_bin(t))
+                .find_map(|t| t["name"].as_str().map(String::from))
         })
         .ok_or_else(|| {
             package.map_or_else(
@@ -1735,18 +1730,14 @@ mod tests {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let result =
             resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects/hello"));
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
     }
 
     #[test]
     fn resolve_binary_by_cwd() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert_eq!(path, expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
     }
 
     #[test]
@@ -1857,7 +1848,6 @@ mod tests {
         });
         let result =
             resolve_binary_from_metadata(&metadata, Some("myapp"), Path::new("/projects/myapp"));
-        assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
     }
 
@@ -1879,7 +1869,6 @@ mod tests {
             ]
         });
         let result = resolve_binary_from_metadata(&metadata, Some("app-b"), Path::new("/projects"));
-        assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/app-b"));
     }
 
