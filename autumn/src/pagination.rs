@@ -372,11 +372,15 @@ mod tests {
 
     #[test]
     fn empty_page_has_one_total_page() {
-        let page: Page<i32> = Page::empty(&PageRequest::default());
+        let req = PageRequest::new(5, 50);
+        let page: Page<i32> = Page::empty(&req);
+        assert_eq!(page.page, 5);
+        assert_eq!(page.size, 50);
         assert_eq!(page.total_elements, 0);
         assert_eq!(page.total_pages, 1);
         assert!(!page.has_next);
-        assert!(!page.has_previous);
+        assert!(page.has_previous);
+        assert!(page.content.is_empty());
     }
 
     #[test]
@@ -413,9 +417,38 @@ mod tests {
         let page = Page::new(vec![1_i32, 2, 3], 25, &req);
         let mapped = page.map(|n| n.to_string());
         assert_eq!(mapped.page, 2);
+        assert_eq!(mapped.size, 10);
         assert_eq!(mapped.total_elements, 25);
         assert_eq!(mapped.total_pages, 3);
+        assert!(mapped.has_next);
+        assert!(mapped.has_previous);
         assert_eq!(mapped.content, vec!["1", "2", "3"]);
+    }
+
+    // ── percent_decode ─────────────────────────────────────────
+
+    #[test]
+    fn percent_decode_happy_path() {
+        assert_eq!(percent_decode("hello%20world").unwrap(), "hello world");
+        assert_eq!(percent_decode("a%2Bb").unwrap(), "a+b");
+        assert_eq!(percent_decode("%32").unwrap(), "2");
+    }
+
+    #[test]
+    fn percent_decode_plus_to_space() {
+        assert_eq!(percent_decode("hello+world").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_invalid_hex_is_ignored() {
+        assert_eq!(percent_decode("abc%3Gdef").unwrap(), "abc%3Gdef");
+        assert_eq!(percent_decode("%%%").unwrap(), "%%%");
+    }
+
+    #[test]
+    fn percent_decode_incomplete_at_eof() {
+        assert_eq!(percent_decode("abc%").unwrap(), "abc%");
+        assert_eq!(percent_decode("abc%2").unwrap(), "abc%2");
     }
 
     // ── JSON serialization ─────────────────────────────────────
