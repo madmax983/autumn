@@ -1,12 +1,7 @@
-1. **Refactor `Schedule` to implement `std::fmt::Display`**
-   - The formatting of `Schedule` is duplicated in several places in `autumn/src/app.rs`.
-   - Implement `std::fmt::Display` for `autumn/src/task.rs`'s `Schedule`.
-2. **Update usages in `autumn/src/app.rs`**
-   - Update `app.rs` to use `Schedule`'s `Display` implementation instead of repeating `match` logic.
-3. **Verify Tests**
-   - Run `cargo test -p autumn-web` to ensure no behavior change.
-   - Run `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`.
-4. **Pre-commit Checks**
-   - Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.
-5. **Submit PR**
-   - Create PR with '⚒️ Forge: [refactor name]' format.
+1.  **Refactor `cache_key` creation in `autumn/src/cache/layer.rs` and `autumn/src/middleware/metrics.rs` to optimize out `format!` heap allocations.**
+    -   In `autumn/src/cache/layer.rs`'s `call` function, we currently create `let cache_key = format!("http:{}", req.uri());` on every GET request, which is a hot path for cache checking.
+        -   By replacing `format!` with formatting into a stack-allocated buffer (`[u8; 256]`), we can check the cache hit condition without allocating a `String` on the heap.
+        -   If there is a cache miss, we allocate a `String` to be moved into the async block.
+    -   In `autumn/src/middleware/metrics.rs`'s `record` function, a stack-allocated string `key_str` is already created, but if `is_new` is true, it redundantly calls `let key = format!("{method} {route}");`, allocating again when `key_str` already contains the valid string representation.
+        -   We can optimize the `is_new` block by using `key = if key_str.is_empty() { format!("{method} {route}") } else { key_str.to_owned() };` instead of running `format!` again.
+2.  **Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.**

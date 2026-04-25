@@ -109,11 +109,32 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        let cache_key = format!("http:{}", req.uri());
+        // ⚡ Bolt Optimization:
+        // Format the key into a stack-allocated buffer to avoid a heap allocation
+        // on every cache check. Fall back to allocating a String only if the URI
+        // is exceptionally long.
+        let mut buf = [0u8; 512];
+        let cache_key_str = {
+            let mut cursor = &mut buf[..];
+            if std::io::Write::write_fmt(&mut cursor, format_args!("http:{}", req.uri())).is_ok() {
+                let len = 512 - cursor.len();
+                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+            } else {
+                ""
+            }
+        };
+
         let store = self.store.clone();
 
+        let cache_hit = if cache_key_str.is_empty() {
+            // Fallback for very long URIs
+            super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
+        } else {
+            super::get::<CachedResponse>(store.as_ref(), cache_key_str)
+        };
+
         // Check for a cache hit
-        if let Some(cached) = super::get::<CachedResponse>(store.as_ref(), &cache_key) {
+        if let Some(cached) = cache_hit {
             return Box::pin(async move {
                 let mut builder = axum::response::Response::builder().status(cached.status);
                 if let Some(headers) = builder.headers_mut() {
@@ -131,6 +152,12 @@ where
 
         // Cache miss — call the inner service
         let mut inner = self.inner.clone();
+        let cache_key = if cache_key_str.is_empty() {
+            format!("http:{}", req.uri())
+        } else {
+            cache_key_str.to_owned()
+        };
+
         Box::pin(async move {
             let response = inner.call(req).await?;
 

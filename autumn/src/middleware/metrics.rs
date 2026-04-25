@@ -167,7 +167,11 @@ impl MetricsCollector {
         }
 
         if is_new {
-            let key = format!("{method} {route}");
+            let key = if key_str.is_empty() {
+                format!("{method} {route}")
+            } else {
+                key_str.to_owned()
+            };
             if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
                 let entry = shard.by_route.entry(key).or_default();
                 entry.count += 1;
