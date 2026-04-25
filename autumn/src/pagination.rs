@@ -602,7 +602,10 @@ mod tests {
 
     #[test]
     fn cursor_page_request_clamps_limit() {
-        let mut r = CursorPageRequest { limit: 9999, ..Default::default() };
+        let mut r = CursorPageRequest {
+            limit: 9999,
+            ..Default::default()
+        };
         assert_eq!(r.limit(), MAX_PAGE_SIZE);
 
         r.limit = 0;
