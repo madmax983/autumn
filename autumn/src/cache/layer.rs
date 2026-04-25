@@ -109,11 +109,32 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        let cache_key = format!("http:{}", req.uri());
+        // ⚡ Bolt Optimization:
+        // Format the key into a stack-allocated buffer to avoid a heap allocation
+        // on every cache check. Fall back to allocating a String only if the URI
+        // is exceptionally long.
+        let mut buf = [0u8; 512];
+        let cache_key_str = {
+            let mut cursor = &mut buf[..];
+            if std::io::Write::write_fmt(&mut cursor, format_args!("http:{}", req.uri())).is_ok() {
+                let len = 512 - cursor.len();
+                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+            } else {
+                ""
+            }
+        };
+
         let store = self.store.clone();
 
+        let cache_hit = if cache_key_str.is_empty() {
+            // Fallback for very long URIs
+            super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
+        } else {
+            super::get::<CachedResponse>(store.as_ref(), cache_key_str)
+        };
+
         // Check for a cache hit
-        if let Some(cached) = super::get::<CachedResponse>(store.as_ref(), &cache_key) {
+        if let Some(cached) = cache_hit {
             return Box::pin(async move {
                 let mut builder = axum::response::Response::builder().status(cached.status);
                 if let Some(headers) = builder.headers_mut() {
@@ -131,6 +152,12 @@ where
 
         // Cache miss — call the inner service
         let mut inner = self.inner.clone();
+        let cache_key = if cache_key_str.is_empty() {
+            format!("http:{}", req.uri())
+        } else {
+            cache_key_str.to_owned()
+        };
+
         Box::pin(async move {
             let response = inner.call(req).await?;
 
@@ -397,5 +424,51 @@ mod tests {
         let store = Arc::new(super::super::MokaCache::new(100, None));
         // Just verify from_shared compiles and the layer can be used
         let _layer = CacheResponseLayer::from_shared(store);
+    }
+
+    #[tokio::test]
+    async fn caches_get_responses_very_long_uri() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "hello"));
+
+        let long_uri = format!("/test/{}", "a".repeat(1000));
+
+        let req1 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp1 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req1)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let req2 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp2 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req2)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Should be cached despite long URI"
+        );
     }
 }
