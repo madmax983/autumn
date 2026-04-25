@@ -302,6 +302,10 @@ pub use autumn_macros::main;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
