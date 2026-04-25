@@ -88,7 +88,7 @@ impl Limiter {
             burst,
             burst_header,
             trust_forwarded_headers: config.trust_forwarded_headers,
-            buckets: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).unwrap())),
+            buckets: Mutex::new(LruCache::new(NonZeroUsize::new(10_000).expect("10_000 is non-zero"))),
         }
     }
 
