@@ -24,8 +24,18 @@ use std::time::Duration;
 /// Debounce interval for checking the shutdown flag in the watch loop.
 const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
 
-/// Set to `true` by the SIGINT handler to request a clean shutdown.
+/// Set to `true` by the SIGINT/SIGTERM handler to request a clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// SIGTERM handler – stores the shutdown flag using only async-signal-safe
+/// operations (an atomic store), then returns so the main loop can clean up.
+///
+/// SAFETY: `AtomicBool::store` is async-signal-safe; no heap allocation or
+/// lock acquisition is performed.
+#[cfg(unix)]
+extern "C" fn handle_sigterm(_signum: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
 
 /// Default debounce interval for file change events.
 const DEBOUNCE_MS: u64 = 500;
@@ -166,6 +176,17 @@ pub fn run(package: Option<&str>, show_config: bool) {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     }) {
         eprintln!("  Warning: failed to set Ctrl-C handler: {err}");
+    }
+
+    // Also handle SIGTERM so that `kill <pid>` stops the child server cleanly.
+    // SAFETY: the handler only performs an atomic store, which is
+    // async-signal-safe per POSIX.
+    #[cfg(unix)]
+    unsafe {
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGTERM,
+            nix::sys::signal::SigHandler::Handler(handle_sigterm),
+        );
     }
 
     let mut reload_state = match DevReloadState::initialize() {
@@ -1052,8 +1073,35 @@ fn resolve_binary_from_metadata(
     let bin_name = matching_packages
         .iter()
         .find_map(|pkg| {
-            pkg["targets"].as_array()?.iter().find_map(|t| {
-                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+            let targets = pkg["targets"].as_array()?;
+            let manifest_dir = Path::new(pkg["manifest_path"].as_str()?)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+
+            // Prefer the binary whose src_path is exactly `src/main.rs` so
+            // that secondary targets (e.g. a WASM client bin) are not
+            // accidentally picked as the server binary.
+            let preferred = targets.iter().find(|t| {
+                let is_bin = t["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == "bin"));
+                if !is_bin {
+                    return false;
+                }
+                t["src_path"]
+                    .as_str()
+                    .is_some_and(|p| Path::new(p) == manifest_dir.join("src/main.rs"))
+            });
+
+            if let Some(t) = preferred {
+                return t["name"].as_str().map(String::from);
+            }
+
+            // Fall back to the first bin target if no `src/main.rs` match.
+            targets.iter().find_map(|t| {
+                let is_bin = t["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == "bin"));
                 if is_bin {
                     t["name"].as_str().map(String::from)
                 } else {
@@ -1780,6 +1828,35 @@ mod tests {
         });
         let result =
             resolve_binary_from_metadata(&metadata, Some("multi"), Path::new("/projects/multi"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
+    }
+
+    #[test]
+    fn resolve_binary_prefers_main_rs_over_other_bins() {
+        // When a package has multiple bin targets, the one whose src_path is
+        // `src/main.rs` should be selected even if it is not listed first.
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "myapp",
+                "manifest_path": "/projects/myapp/Cargo.toml",
+                "targets": [
+                    {
+                        "name": "client",
+                        "kind": ["bin"],
+                        "src_path": "/projects/myapp/src/client.rs"
+                    },
+                    {
+                        "name": "server",
+                        "kind": ["bin"],
+                        "src_path": "/projects/myapp/src/main.rs"
+                    }
+                ]
+            }]
+        });
+        let result =
+            resolve_binary_from_metadata(&metadata, Some("myapp"), Path::new("/projects/myapp"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
     }
