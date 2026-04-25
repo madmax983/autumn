@@ -116,3 +116,19 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# DX Audit Report: Primitive Return Types
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Started a new project and created a simple route returning an integer: `async fn foo() -> i32 { 42 }`.
+- Expected the framework to handle the conversion and return `42` to the client.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: The code fails to compile with complex Axum-internal errors like `the trait bound fn() -> ... {foo}: Handler<_, _> is not satisfied`. This requires the user to know about `axum::response::IntoResponse` and explicitly convert to string.
+- This is frustrating because returning `String` or `&'static str` works fine, but simple primitives cause large compilation errors.
+
+## 3. 📢 REPORT - The Complaint
+- "Why can I return a String but not an integer? If I return `42`, the compiler dumps 20 lines of trait bound errors about Axum internals. Simple numbers shouldn't crash the compiler!"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that returning basic primitives (`i32`, `bool`, etc.) directly without converting them to Strings or JSON exposes internal traits like `IntoResponse`, hindering the DX of building simple endpoints.

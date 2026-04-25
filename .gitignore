@@ -6,3 +6,5 @@ mutants.out.old/
 pr_description.md
 *.sh
 *.py
+
+dx-audit-test/
