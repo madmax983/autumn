@@ -11,7 +11,7 @@ autumn-web = { path = "autumn" }
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.86.0"
+rust-version = "1.88.0"
 version = "0.2.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/madmax983/autumn"
@@ -55,7 +55,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
 # Pin time to a range that is compatible with MSRV 1.86.0. Without this,
 # bollard (pulled in by testcontainers dev/optional deps) resolves
 # bollard-stubs -> time@0.3.46+ which requires rustc 1.88.0.
-time = { version = ">=0.3, <0.3.46" }
+time = { version = ">=0.3" }
 
 # Proc macro
 syn = { version = "2", features = ["full"] }
