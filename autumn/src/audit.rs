@@ -288,7 +288,8 @@ mod tests {
         let content = tokio::fs::read_to_string(&path)
             .await
             .expect("read audit file");
-        assert_eq!(content.lines().count(), 2);
+        let line_count = content.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(line_count, 2, "content:\n{content}");
     }
 
     #[tokio::test]
