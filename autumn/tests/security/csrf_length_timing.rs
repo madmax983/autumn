@@ -1,5 +1,5 @@
-use autumn_web::security::CsrfLayer;
 use autumn_web::security::CsrfConfig;
+use autumn_web::security::CsrfLayer;
 use axum::{
     Router,
     body::Body,

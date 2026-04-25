@@ -80,7 +80,8 @@ pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
-    CsrfConfig, UploadConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy,
+    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
+    default_content_security_policy,
 };
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
