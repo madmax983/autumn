@@ -660,8 +660,14 @@ impl TestDb {
             .await
             .expect("failed to start Postgres testcontainer (is Docker running?)");
 
-        let host = container.get_host().await.expect("failed to build test router");
-        let port = container.get_host_port_ipv4(5432).await.expect("failed to build test router");
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to build test router");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to build test router");
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
