@@ -327,7 +327,11 @@ mod tests {
     async fn requests_under_limit_pass() {
         let app = app(&cfg(true, 1.0, 5));
         for _ in 0..5 {
-            let response = app.clone().oneshot(req_with_ip("1.1.1.1")).await.expect("infallible response builder");
+            let response = app
+                .clone()
+                .oneshot(req_with_ip("1.1.1.1"))
+                .await
+                .expect("infallible response builder");
             assert_eq!(response.status(), StatusCode::OK);
             assert!(response.headers().get("x-ratelimit-limit").is_some());
         }
@@ -339,12 +343,20 @@ mod tests {
 
         // Burn through the burst.
         for _ in 0..2 {
-            let response = app.clone().oneshot(req_with_ip("2.2.2.2")).await.expect("infallible response builder");
+            let response = app
+                .clone()
+                .oneshot(req_with_ip("2.2.2.2"))
+                .await
+                .expect("infallible response builder");
             assert_eq!(response.status(), StatusCode::OK);
         }
 
         // Next request is over the limit.
-        let response = app.clone().oneshot(req_with_ip("2.2.2.2")).await.expect("infallible response builder");
+        let response = app
+            .clone()
+            .oneshot(req_with_ip("2.2.2.2"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = response
             .headers()
@@ -372,13 +384,25 @@ mod tests {
         let app = app(&cfg(true, 0.1, 1));
 
         // Exhaust IP A.
-        let ok_a = app.clone().oneshot(req_with_ip("10.0.0.1")).await.expect("infallible response builder");
+        let ok_a = app
+            .clone()
+            .oneshot(req_with_ip("10.0.0.1"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(ok_a.status(), StatusCode::OK);
-        let blocked_a = app.clone().oneshot(req_with_ip("10.0.0.1")).await.expect("infallible response builder");
+        let blocked_a = app
+            .clone()
+            .oneshot(req_with_ip("10.0.0.1"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(blocked_a.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // IP B still has a full bucket.
-        let ok_b = app.clone().oneshot(req_with_ip("10.0.0.2")).await.expect("infallible response builder");
+        let ok_b = app
+            .clone()
+            .oneshot(req_with_ip("10.0.0.2"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(ok_b.status(), StatusCode::OK);
     }
 
@@ -386,15 +410,27 @@ mod tests {
     async fn tokens_refill_over_time() {
         let app = app(&cfg(true, 50.0, 1));
 
-        let first = app.clone().oneshot(req_with_ip("3.3.3.3")).await.expect("infallible response builder");
+        let first = app
+            .clone()
+            .oneshot(req_with_ip("3.3.3.3"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(first.status(), StatusCode::OK);
-        let blocked = app.clone().oneshot(req_with_ip("3.3.3.3")).await.expect("infallible response builder");
+        let blocked = app
+            .clone()
+            .oneshot(req_with_ip("3.3.3.3"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // Wait long enough for one token to refill (50 rps -> 20ms per token).
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        let after_refill = app.clone().oneshot(req_with_ip("3.3.3.3")).await.expect("infallible response builder");
+        let after_refill = app
+            .clone()
+            .oneshot(req_with_ip("3.3.3.3"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(after_refill.status(), StatusCode::OK);
     }
 
@@ -427,8 +463,12 @@ mod tests {
 
     #[test]
     fn client_ip_falls_back_to_connect_info() {
-        let mut req: Request<()> = Request::builder().body(()).expect("infallible response builder");
-        let addr: SocketAddr = "127.0.0.1:4242".parse().expect("infallible response builder");
+        let mut req: Request<()> = Request::builder()
+            .body(())
+            .expect("infallible response builder");
+        let addr: SocketAddr = "127.0.0.1:4242"
+            .parse()
+            .expect("infallible response builder");
         req.extensions_mut().insert(ConnectInfo(addr));
         assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("127.0.0.1"));
         // Untrusted limiter also falls back, since headers are ignored.
@@ -439,7 +479,9 @@ mod tests {
     fn client_ip_none_when_no_source() {
         // In-process callers without ConnectInfo (SSG, tests) must be
         // bypassed, not collapsed onto a shared fallback bucket.
-        let req: Request<()> = Request::builder().body(()).expect("infallible response builder");
+        let req: Request<()> = Request::builder()
+            .body(())
+            .expect("infallible response builder");
         assert!(limiter(true).client_ip(&req).is_none());
         assert!(limiter(false).client_ip(&req).is_none());
     }
@@ -465,7 +507,9 @@ mod tests {
             .header("X-Real-IP", "5.6.7.8")
             .body(())
             .expect("infallible response builder");
-        let addr: SocketAddr = "10.0.0.42:1111".parse().expect("infallible response builder");
+        let addr: SocketAddr = "10.0.0.42:1111"
+            .parse()
+            .expect("infallible response builder");
         req.extensions_mut().insert(ConnectInfo(addr));
         assert_eq!(limiter(false).client_ip(&req).as_deref(), Some("10.0.0.42"));
     }
@@ -483,7 +527,9 @@ mod tests {
             trust_forwarded_headers: false,
         };
         let app = app(&config);
-        let peer: SocketAddr = "198.51.100.1:2000".parse().expect("infallible response builder");
+        let peer: SocketAddr = "198.51.100.1:2000"
+            .parse()
+            .expect("infallible response builder");
 
         let make_req = |xff: &str| {
             let mut req = Request::builder()
@@ -496,10 +542,18 @@ mod tests {
             req
         };
 
-        let first = app.clone().oneshot(make_req("1.1.1.1")).await.expect("infallible response builder");
+        let first = app
+            .clone()
+            .oneshot(make_req("1.1.1.1"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(first.status(), StatusCode::OK);
         // Different XFF value, but same peer → still throttled.
-        let blocked = app.clone().oneshot(make_req("2.2.2.2")).await.expect("infallible response builder");
+        let blocked = app
+            .clone()
+            .oneshot(make_req("2.2.2.2"))
+            .await
+            .expect("infallible response builder");
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
