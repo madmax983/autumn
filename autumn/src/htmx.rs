@@ -47,6 +47,24 @@ pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 /// JavaScript under Autumn's default `script-src 'self'` policy.
 pub const HTMX_CSRF_JS: &str = r#"(function () {
   document.addEventListener("htmx:configRequest", function (evt) {
+    if (evt.detail && evt.detail.path) {
+      var path = evt.detail.path;
+      var isSameOrigin = false;
+      if (path.startsWith("/") && !path.startsWith("//")) {
+        isSameOrigin = true;
+      } else {
+        try {
+          var url = new URL(path, window.location.origin);
+          isSameOrigin = (url.origin === window.location.origin);
+        } catch (e) {
+          isSameOrigin = false;
+        }
+      }
+      if (!isSameOrigin) {
+        return;
+      }
+    }
+
     var meta = document.querySelector('meta[name="csrf-token"], meta[name="autumn-csrf-token"]');
 
     if (!meta || !evt.detail || !evt.detail.headers) {
