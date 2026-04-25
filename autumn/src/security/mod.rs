@@ -73,14 +73,14 @@
 //! }
 //! ```
 
-pub mod config;
-pub mod csrf;
-pub mod headers;
-pub mod rate_limit;
+pub(crate) mod config;
+pub(crate) mod csrf;
+pub(crate) mod headers;
+pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
-    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy,
+    CsrfConfig, UploadConfig, HeadersConfig, RateLimitConfig, SecurityConfig, default_content_security_policy,
 };
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;

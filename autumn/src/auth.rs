@@ -402,7 +402,7 @@ fn default_session_key() -> String {
 }
 
 #[cfg(feature = "oauth2")]
-fn default_provider_scope() -> String {
+const fn default_provider_scope() -> String {
     String::new()
 }
 
