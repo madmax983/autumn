@@ -1164,7 +1164,7 @@ pub fn try_build_router_with_static_inner(
                                 .status(http::StatusCode::OK)
                                 .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
                                 .body(body)
-                                .unwrap();
+                                .expect("infallible response builder");
                         }
                     }
                 }
