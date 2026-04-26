@@ -268,6 +268,7 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 }
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
@@ -412,8 +413,10 @@ mod tests {
         use tower::ServiceExt;
 
         #[derive(Clone)]
+        #[cfg(not(tarpaulin_include))]
         struct MockState;
 
+        #[cfg(not(tarpaulin_include))]
         impl DbState for MockState {
             fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
                 None

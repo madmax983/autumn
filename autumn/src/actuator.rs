@@ -1196,6 +1196,7 @@ pub(crate) fn actuator_router_with_prefix<
 }
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
@@ -1204,6 +1205,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[derive(Clone)]
+    #[cfg(not(tarpaulin_include))]
     struct MockActuatorState {
         profile: String,
         metrics: crate::middleware::MetricsCollector,
@@ -1222,6 +1224,7 @@ mod tests {
         >,
     }
 
+    #[cfg(not(tarpaulin_include))]
     impl ProvideActuatorState for MockActuatorState {
         fn metrics(&self) -> &crate::middleware::MetricsCollector {
             &self.metrics
@@ -1258,6 +1261,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(tarpaulin_include))]
     impl crate::probe::ProvideProbeState for MockActuatorState {
         fn probes(&self) -> &crate::probe::ProbeState {
             &self.probes
