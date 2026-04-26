@@ -39,7 +39,7 @@ const WATCH_FILES: &[&str] = &[
 ];
 
 /// Directories to watch recursively.
-const WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
+const WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations", "views"];
 
 const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";

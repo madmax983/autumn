@@ -52,7 +52,7 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
-    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+    let primitive_wrapper = if let Some(is_result) = should_stringify_primitive_output(&input_fn.sig.output) {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
@@ -75,10 +75,23 @@ pub fn route_macro(
             }
         }
 
+        let body = if is_result {
+            quote! {
+                match #fn_name(#(#call_args),*).await {
+                    ::core::result::Result::Ok(val) => ::autumn_web::reexports::axum::response::IntoResponse::into_response(val.to_string()),
+                    ::core::result::Result::Err(err) => ::autumn_web::reexports::axum::response::IntoResponse::into_response(err),
+                }
+            }
+        } else {
+            quote! {
+                ::autumn_web::reexports::axum::response::IntoResponse::into_response(#fn_name(#(#call_args),*).await.to_string())
+            }
+        };
+
         Some(quote! {
             #[doc(hidden)]
-            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
-                #fn_name(#(#call_args),*).await.to_string()
+            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::autumn_web::reexports::axum::response::Response {
+                #body
             }
         })
     } else {
@@ -142,36 +155,42 @@ pub fn route_macro(
     }
 }
 
-fn should_stringify_primitive_output(output: &ReturnType) -> bool {
-    let ReturnType::Type(_, ty) = output else {
-        return false;
-    };
-
-    let Type::Path(path) = ty.as_ref() else {
-        return false;
-    };
-
-    if path.qself.is_some() || path.path.segments.len() != 1 {
-        return false;
+// Returns Some(is_result) where is_result is true if it's wrapped in a Result/AutumnResult
+fn should_stringify_primitive_output(output: &ReturnType) -> Option<bool> {
+    fn is_primitive(ident: &str) -> bool {
+        matches!(
+            ident,
+            "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+                | "f32" | "f64"
+        )
     }
 
-    let ident = path.path.segments[0].ident.to_string();
-    matches!(
-        ident.as_str(),
-        "bool"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-            | "f32"
-            | "f64"
-    )
+    fn check_type(ty: &Type) -> Option<bool> {
+        if let Type::Path(path) = ty {
+            if path.qself.is_none() && path.path.segments.len() == 1 {
+                let segment = &path.path.segments[0];
+                let ident = segment.ident.to_string();
+                if is_primitive(&ident) {
+                    return Some(false);
+                }
+                if ident == "Result" || ident == "AutumnResult" {
+                    if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                        if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
+                            if let Some(false) = check_type(inner) {
+                                return Some(true);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    if let ReturnType::Type(_, ty) = output {
+        check_type(ty.as_ref())
+    } else {
+        None
+    }
 }

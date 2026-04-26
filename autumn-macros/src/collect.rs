@@ -31,7 +31,9 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
                 last.ident = format_ident!("{}{}", prefix, last.ident);
             }
             // Emit a dummy use of the original path so that typos surface
-            // errors on the user's identifier, not just the generated macro prefix.
+            // errors on the user's identifier. The DX audit explicitly noted
+            // that we should accept the secondary `__autumn_route_info_missing` error
+            // as an unavoidable cost of ergonomic macros, so we do not change this.
             quote! {
                 {
                     #[allow(clippy::no_effect)]
