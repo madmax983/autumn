@@ -454,6 +454,10 @@ pub fn model_list_page(
     search_query: &str,
     sort_by: Option<&str>,
     sort_dir: SortDirection,
+    // Active filters (already validated by the handler). Carried into
+    // every generated sort/pagination URL so navigation doesn't silently
+    // revert to unfiltered results.
+    filters: &[(String, String)],
     messages: &[FlashMessage],
     csrf_token: &str,
     prefix: &str,
@@ -470,6 +474,9 @@ pub fn model_list_page(
         })
         .collect();
     let search_enc = url_encode(search_query);
+    // Pre-encode active filters into a `&filter.<k>=<v>` suffix so
+    // sort/pagination links carry filter state forward without rebuilding it.
+    let filters_enc = encode_filter_suffix(filters);
 
     let content = html! {
         // Breadcrumbs
@@ -524,6 +531,7 @@ pub fn model_list_page(
                                     @if field.sortable {
                                         a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
                                             @if !search_enc.is_empty() { "&q=" (search_enc) }
+                                            (filters_enc)
                                         }
                                         style="color: inherit; text-decoration: none;" {
                                             (field.label)
@@ -609,7 +617,7 @@ pub fn model_list_page(
 
             // Pagination
             @if result.total_pages() > 1 {
-                (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, prefix))
+                (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
             }
         }
     };
@@ -828,6 +836,21 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Encode active filters as a URL suffix, e.g.
+/// `&filter.status=active&filter.tier=premium`. Empty when no filters are
+/// active. Both keys and values are percent-encoded so values containing
+/// `&`, `=`, or non-ASCII characters round-trip correctly.
+fn encode_filter_suffix(filters: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (k, v) in filters {
+        out.push_str("&filter.");
+        out.push_str(&url_encode(k));
+        out.push('=');
+        out.push_str(&url_encode(v));
+    }
+    out
+}
+
 /// UTF-8-safe truncation by character count. Appends `…` if truncated.
 fn truncate_display(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -1014,14 +1037,17 @@ fn render_form_widget(field: &AdminField, record: Option<&Value>) -> Markup {
 
 /// Render pagination controls.
 ///
-/// `search_enc` is expected to be already URL-encoded; callers pass the raw
-/// form for rendering and the encoded form for link building.
+/// `search_enc` and `filters_enc` are expected to be already URL-encoded;
+/// callers pass the raw form for rendering and the encoded form for link
+/// building.
+#[allow(clippy::too_many_arguments)]
 fn render_pagination(
     result: &ListResult,
     model_slug: &str,
     search_enc: &str,
     sort_by: Option<&str>,
     sort_dir: SortDirection,
+    filters_enc: &str,
     prefix: &str,
 ) -> Markup {
     let total_pages = result.total_pages();
@@ -1040,6 +1066,7 @@ fn render_pagination(
             s.push_str("&dir=");
             s.push_str(sort_dir.as_str());
         }
+        s.push_str(filters_enc);
         s
     };
     let base_qs = |page: u64| -> String { format!("{prefix}/{model_slug}?page={page}{suffix}") };
@@ -1471,6 +1498,7 @@ mod tests {
             None,
             SortDirection::Asc,
             &[],
+            &[],
             "t",
             "/admin",
             "/actuator",
@@ -1517,6 +1545,7 @@ mod tests {
             None,
             SortDirection::Asc,
             &[],
+            &[],
             "t",
             "/admin",
             "/actuator",
@@ -1560,6 +1589,7 @@ mod tests {
             None,
             SortDirection::Asc,
             &[],
+            &[],
             "t",
             "/admin",
             "/actuator",
@@ -1579,6 +1609,100 @@ mod tests {
         assert!(
             !html.contains("/admin/widgets/0"),
             "must not generate /0 links for rows missing id: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_carries_filters_into_sort_and_pagination_links() {
+        // Active filter must round-trip through every navigation URL the
+        // list view generates — sort header links AND pagination links.
+        // Otherwise a user with `?filter.status=active` who clicks a
+        // column header silently reverts to unfiltered results.
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let mut name = AdminField::new("name", AdminFieldKind::Text);
+        name.sortable = true;
+        let fields = vec![name];
+        // 60 records over per_page=25 → 3 pages, so pagination renders.
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "alice"})],
+            total: 60,
+            page: 1,
+            per_page: 25,
+        };
+        let active_filters = vec![
+            ("status".to_owned(), "active".to_owned()),
+            ("tier".to_owned(), "premium".to_owned()),
+        ];
+        let html = model_list_page(
+            &r,
+            "users",
+            "Users",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &active_filters,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        // Sort header link carries both filters.
+        assert!(
+            html.contains("filter.status=active"),
+            "sort link must preserve filter.status: {html}"
+        );
+        assert!(
+            html.contains("filter.tier=premium"),
+            "sort link must preserve filter.tier: {html}"
+        );
+        // Pagination link to page 2 carries both filters too.
+        assert!(
+            html.contains("page=2") && html.contains("filter.status=active"),
+            "pagination link must preserve filter.status: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_url_encodes_filter_values() {
+        // Filter values containing reserved chars must be percent-encoded
+        // so they round-trip through the URL parser cleanly.
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let mut name = AdminField::new("name", AdminFieldKind::Text);
+        name.sortable = true;
+        let fields = vec![name];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let active_filters = vec![("q".to_owned(), "a&b=c".to_owned())];
+        let html = model_list_page(
+            &r,
+            "users",
+            "Users",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &active_filters,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains("filter.q=a%26b%3Dc"),
+            "filter values must be percent-encoded in generated links: {html}"
         );
     }
 
@@ -1617,6 +1741,7 @@ mod tests {
             "",
             None,
             SortDirection::Asc,
+            &[],
             &[],
             "tok",
             "/admin",
@@ -1664,6 +1789,7 @@ mod tests {
             None,
             SortDirection::Asc,
             &[],
+            &[],
             "t",
             "/admin",
             "/actuator",
@@ -1699,6 +1825,7 @@ mod tests {
             "",
             None,
             SortDirection::Asc,
+            &[],
             &[],
             "tok",
             "/admin",

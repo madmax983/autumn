@@ -321,7 +321,7 @@ async fn model_list(
         search: (!q.is_empty()).then(|| q.clone()),
         sort_by: sort.clone(),
         sort_dir: dir,
-        filters,
+        filters: filters.clone(),
     };
 
     let result = model
@@ -341,6 +341,7 @@ async fn model_list(
         &q,
         sort.as_deref(),
         dir,
+        &filters,
         &messages,
         csrf.token(),
         &prefix,
