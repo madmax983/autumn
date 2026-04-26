@@ -191,13 +191,23 @@ fn resolve<'r>(
 }
 
 /// Filter a user-supplied sort key down to fields the model declared as
-/// both sortable and list-displayed. A `None` (or unrecognised key) means
-/// "no sort" — never forward arbitrary identifiers to the model.
+/// both sortable and list-displayed, AND that aren't of a sensitive kind
+/// (`Password`/`Hidden`). A `None` (or unrecognised key) means "no sort"
+/// — never forward arbitrary identifiers to the model.
+///
+/// The Hidden/Password exclusion mirrors the template-level filter on
+/// `list_fields`: those columns aren't visible in the table, so a sort
+/// header link can never produce them — only URL crafting can. Reject
+/// here so the model doesn't receive an unexpected ORDER BY against a
+/// column the admin chose to keep server-side.
 fn validate_sort_key(sort: Option<String>, fields: &[AdminField]) -> Option<String> {
     sort.filter(|s| {
-        fields
-            .iter()
-            .any(|f| f.name == s && f.sortable && f.list_display)
+        fields.iter().any(|f| {
+            f.name == s
+                && f.sortable
+                && f.list_display
+                && !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+        })
     })
 }
 
@@ -730,6 +740,25 @@ mod tests {
         secret.list_display = false;
         let schema = vec![secret];
         assert_eq!(validate_sort_key(Some("secret".into()), &schema), None);
+    }
+
+    #[test]
+    fn validate_sort_key_drops_sensitive_kinds_even_if_flagged_sortable() {
+        // AdminField::new defaults sortable=true and list_display=true for
+        // every kind, so without an explicit kind check, crafted
+        // `?sort=password_hash` or `?sort=internal_token` would reach the
+        // model. Mirror the template's Hidden/Password exclusion.
+        let pw = AdminField::new("password_hash", AdminFieldKind::Password);
+        let hidden = AdminField::new("internal_token", AdminFieldKind::Hidden);
+        let schema = vec![pw, hidden];
+        assert_eq!(
+            validate_sort_key(Some("password_hash".into()), &schema),
+            None
+        );
+        assert_eq!(
+            validate_sort_key(Some("internal_token".into()), &schema),
+            None
+        );
     }
 
     #[test]

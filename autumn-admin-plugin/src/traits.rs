@@ -259,8 +259,33 @@ pub trait AdminModel: Send + Sync + 'static {
         action: &str,
         ids: Vec<i64>,
     ) -> AdminFuture<'_, u64> {
-        let _ = (pool, action, ids);
-        Box::pin(async { Ok(0) })
+        // Default implementation: dispatch the built-in `"delete"` action
+        // by calling `self.delete` for each id. Any other action name
+        // returns an error so it doesn't silently no-op — overriders that
+        // declare custom actions must implement them here.
+        //
+        // We clone the pool (deadpool::Pool is Arc-backed, cheap) so the
+        // returned future only borrows from `&self` and avoids the
+        // lifetime mismatch between `&self` and `&pool` that would
+        // otherwise show up in the trait's elided `'_` return signature.
+        let action = action.to_owned();
+        let pool = pool.clone();
+        Box::pin(async move {
+            match action.as_str() {
+                "delete" => {
+                    let mut count: u64 = 0;
+                    for id in ids {
+                        self.delete(&pool, id).await?;
+                        count += 1;
+                    }
+                    Ok(count)
+                }
+                other => Err(AdminError::Other(format!(
+                    "unhandled bulk action '{other}'; \
+                     override AdminModel::execute_action to support it"
+                ))),
+            }
+        })
     }
 
     /// Return a display string for a record (used in breadcrumbs, titles).
@@ -401,6 +426,152 @@ fn humanize_field_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test fixture: an `AdminModel` whose `delete` records the id it was
+    /// asked to delete. Doesn't override `execute_action` — that's the
+    /// behaviour under test.
+    struct DeletingModel {
+        deleted: Mutex<Vec<i64>>,
+        fail_on: Option<i64>,
+    }
+
+    impl AdminModel for DeletingModel {
+        fn slug(&self) -> &'static str {
+            "tracked"
+        }
+        fn display_name(&self) -> &'static str {
+            "Tracked"
+        }
+        fn display_name_plural(&self) -> &'static str {
+            "Tracked"
+        }
+        fn fields(&self) -> Vec<AdminField> {
+            vec![]
+        }
+        fn list(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async {
+                Ok(ListResult {
+                    records: vec![],
+                    total: 0,
+                    page: 1,
+                    per_page: 25,
+                })
+            })
+        }
+        fn get(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+        ) -> AdminFuture<'_, Option<Value>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn create(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn update(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> {
+            Box::pin(async move { Ok(data) })
+        }
+        fn delete(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<
+                diesel_async::AsyncPgConnection,
+            >,
+            id: i64,
+        ) -> AdminFuture<'_, ()> {
+            let deleted = &self.deleted;
+            let fail_on = self.fail_on;
+            Box::pin(async move {
+                if Some(id) == fail_on {
+                    return Err(AdminError::Database("simulated failure".into()));
+                }
+                deleted.lock().unwrap().push(id);
+                Ok(())
+            })
+        }
+    }
+
+    /// Build a `Pool` whose manager would fail to connect — the test models
+    /// never call `pool.get()`, so the pool itself just sits unused.
+    fn dummy_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+        let mgr = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(
+            "postgresql://test",
+        );
+        Pool::builder(mgr).build().expect("build pool")
+    }
+
+    #[tokio::test]
+    async fn default_execute_action_delete_invokes_delete_for_each_id() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let count = model
+            .execute_action(&pool, "delete", vec![10, 20, 30])
+            .await
+            .expect("default delete should succeed");
+        assert_eq!(count, 3);
+        assert_eq!(*model.deleted.lock().unwrap(), vec![10, 20, 30]);
+    }
+
+    #[tokio::test]
+    async fn default_execute_action_delete_aborts_on_first_failure() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: Some(20),
+        };
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "delete", vec![10, 20, 30])
+            .await
+            .expect_err("delete should propagate failure");
+        assert!(matches!(err, AdminError::Database(_)));
+        // Only the pre-failure id was committed.
+        assert_eq!(*model.deleted.lock().unwrap(), vec![10]);
+    }
+
+    #[tokio::test]
+    async fn default_execute_action_rejects_unknown_action() {
+        let model = DeletingModel {
+            deleted: Mutex::new(vec![]),
+            fail_on: None,
+        };
+        let pool = dummy_pool();
+        let err = model
+            .execute_action(&pool, "promote", vec![1])
+            .await
+            .expect_err("unknown actions must error, not silently no-op");
+        assert!(
+            matches!(err, AdminError::Other(msg) if msg.contains("promote")),
+            "error should name the unhandled action"
+        );
+        assert!(model.deleted.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn humanize_converts_snake_case() {
