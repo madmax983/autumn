@@ -1758,9 +1758,9 @@ mod tests {
 
         let res = super::__check_secured(&session, &["admin", "editor"]).await;
         assert!(res.is_ok());
-  }
-  
-   #[tokio::test]
+    }
+
+    #[tokio::test]
     async fn test_hash_password_empty() {
         let test_input = String::new();
         let hash = super::hash_password(&test_input)
