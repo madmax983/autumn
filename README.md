@@ -48,6 +48,23 @@ autumn dev
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
 
+### Watching custom directories
+
+`autumn dev` always watches `src/`, `static/`, `templates/`, and `migrations/`
+plus the project's top-level config files (`autumn.toml`, `Cargo.toml`,
+`Cargo.lock`, `build.rs`, `tailwind.config.js`). To watch additional folders
+(for example, custom view or locale trees), add a `[dev]` section to
+`autumn.toml`:
+
+```toml
+[dev]
+watch_dirs = ["views", "locales"]
+```
+
+Listed directories are watched recursively in addition to the defaults.
+Changes inside them trigger a server restart and a full browser reload.
+Paths under `target/` and dotted directories are still ignored.
+
 If you add `#[static_get]` routes, `autumn build` pre-renders them into
 `dist/`.
 
