@@ -346,7 +346,7 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
 
 // ── Tower Layer / Service ───────────────────────────────────────
 
-/// Tower [`Layer`] that wraps a service with [`MetricsService`].
+/// Tower [`Layer`] that wraps a service with `MetricsService`.
 ///
 /// Records request count, latency, active connections, and status code
 /// distribution into a shared [`MetricsCollector`].

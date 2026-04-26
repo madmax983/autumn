@@ -18,7 +18,7 @@
 //!   the route macro strips it from the function's attribute list,
 //!   parses it here, and embeds the result in the generated `ApiDoc`
 //!   struct.
-//! * As a **standalone proc-macro** (see [`crate::api_doc`]) so Rust
+//! * As a **standalone proc-macro** (see [`macro@crate::api_doc`]) so Rust
 //!   accepts the attribute on its own. That entry point is a no-op
 //!   wrapper — the real work happens when a route macro is also
 //!   applied, since routes are the only places metadata is collected.
