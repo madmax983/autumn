@@ -27,16 +27,6 @@ const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
 /// Set to `true` by the SIGINT/SIGTERM handler to request a clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// SIGTERM handler – stores the shutdown flag using only async-signal-safe
-/// operations (an atomic store), then returns so the main loop can clean up.
-///
-/// SAFETY: `AtomicBool::store` is async-signal-safe; no heap allocation or
-/// lock acquisition is performed.
-#[cfg(unix)]
-extern "C" fn handle_sigterm(_signum: libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
-}
-
 /// Default debounce interval for file change events.
 const DEBOUNCE_MS: u64 = 500;
 
@@ -170,23 +160,14 @@ impl DevReloadState {
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
 
-    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
-    // of immediately terminating the process (and leaving the child running).
+    // Register SIGINT/SIGTERM handler so Ctrl+C or `kill <pid>` triggers a
+    // graceful shutdown instead of immediately terminating the process (and
+    // leaving the child running).  The `termination` feature of ctrlc also
+    // catches SIGTERM and SIGHUP on Unix without requiring unsafe code.
     if let Err(err) = ctrlc::set_handler(move || {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     }) {
         eprintln!("  Warning: failed to set Ctrl-C handler: {err}");
-    }
-
-    // Also handle SIGTERM so that `kill <pid>` stops the child server cleanly.
-    // SAFETY: the handler only performs an atomic store, which is
-    // async-signal-safe per POSIX.
-    #[cfg(unix)]
-    unsafe {
-        let _ = nix::sys::signal::signal(
-            nix::sys::signal::Signal::SIGTERM,
-            nix::sys::signal::SigHandler::Handler(handle_sigterm),
-        );
     }
 
     let mut reload_state = match DevReloadState::initialize() {
