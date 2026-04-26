@@ -1,48 +1,37 @@
-use autumn_web::security::{RateLimitConfig, RateLimitLayer};
-use axum::extract::ConnectInfo;
-use axum::{
-    Router,
-    body::Body,
-    http::{Request, StatusCode},
-};
-use std::net::SocketAddr;
-use tower::ServiceExt;
+use autumn_web::test::TestApp;
+use autumn_web::config::AutumnConfig;
+use axum::http::StatusCode;
 
 #[tokio::test]
+#[allow(clippy::similar_names)]
 async fn test_fallback_middleware_bypass() {
-    let config = RateLimitConfig {
-        enabled: true,
-        requests_per_second: 0.0001, // very strict
-        burst: 1,
-        ..Default::default()
-    };
+    let mut config = AutumnConfig::default();
+    config.security.rate_limit.enabled = true;
+    config.security.rate_limit.requests_per_second = 0.0001; // very strict
+    config.security.rate_limit.burst = 1;
+    // Trust forwarded headers to allow IP spoofing for the test
+    config.security.rate_limit.trust_forwarded_headers = true;
 
-    let app = Router::new()
-        // The FIX: fallback is now applied BEFORE layers.
-        .fallback(axum::routing::get(|| async {
-            axum::http::StatusCode::NOT_FOUND
-        }))
-        .layer(RateLimitLayer::from_config(&config));
+    // Use TestApp to build the application router, verifying Autumn's actual middleware assembly order.
+    let client = TestApp::new()
+        .config(config)
+        .build();
 
-    let peer: SocketAddr = "198.51.100.1:2000".parse().unwrap();
+    let req_one = client.get("/not-found")
+        .header("X-Forwarded-For", "198.51.100.1");
 
-    let mut req_one = Request::builder()
-        .uri("/not-found")
-        .body(Body::empty())
-        .unwrap();
-    req_one.extensions_mut().insert(ConnectInfo(peer));
+    let resp_one = req_one.send().await;
+    assert_eq!(resp_one.status, StatusCode::NOT_FOUND);
 
-    let resp_one = app.clone().oneshot(req_one).await.unwrap();
-    assert_eq!(resp_one.status(), StatusCode::NOT_FOUND);
+    let req_two = client.get("/not-found")
+        .header("X-Forwarded-For", "198.51.100.1");
 
-    let mut req_two = Request::builder()
-        .uri("/not-found")
-        .body(Body::empty())
-        .unwrap();
-    req_two.extensions_mut().insert(ConnectInfo(peer));
+    let resp_two = req_two.send().await;
 
-    let resp_two = app.oneshot(req_two).await.unwrap();
-
-    // With the fix, the fallback IS protected by rate limiting, so it returns 429
-    assert_eq!(resp_two.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The second request should be rate limited if the fallback is correctly protected.
+    assert_eq!(
+        resp_two.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "VULNERABILITY: Fallback bypassed rate limit!"
+    );
 }
