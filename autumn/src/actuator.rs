@@ -1196,7 +1196,6 @@ pub(crate) fn actuator_router_with_prefix<
 }
 
 #[cfg(test)]
-#[allow(unexpected_cfgs)]
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
@@ -1205,7 +1204,6 @@ mod tests {
     use tower::ServiceExt;
 
     #[derive(Clone)]
-    #[cfg(not(tarpaulin_include))]
     struct MockActuatorState {
         profile: String,
         metrics: crate::middleware::MetricsCollector,
@@ -1224,7 +1222,6 @@ mod tests {
         >,
     }
 
-    #[cfg(not(tarpaulin_include))]
     impl ProvideActuatorState for MockActuatorState {
         fn metrics(&self) -> &crate::middleware::MetricsCollector {
             &self.metrics
@@ -1261,7 +1258,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(tarpaulin_include))]
     impl crate::probe::ProvideProbeState for MockActuatorState {
         fn probes(&self) -> &crate::probe::ProbeState {
             &self.probes
@@ -1281,6 +1277,32 @@ mod tests {
         ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
         {
             self.pool.as_ref()
+        }
+    }
+
+    #[test]
+    fn mock_actuator_state_coverage() {
+        let state = test_state();
+        let _ = state.metrics();
+        let _ = state.log_levels();
+        let _ = state.task_registry();
+        let _ = state.config_props();
+        let _ = ProvideActuatorState::profile(&state);
+        let _ = ProvideActuatorState::uptime_display(&state);
+        let _ = crate::probe::ProvideProbeState::profile(&state);
+        let _ = crate::probe::ProvideProbeState::uptime_display(&state);
+        let _ = crate::probe::ProvideProbeState::probes(&state);
+        let _ = crate::probe::ProvideProbeState::health_detailed(&state);
+
+        #[cfg(feature = "ws")]
+        {
+            let _ = state.channels();
+            let _ = state.shutdown_token();
+        }
+        #[cfg(feature = "db")]
+        {
+            let _ = ProvideActuatorState::pool(&state);
+            let _ = crate::probe::ProvideProbeState::pool(&state);
         }
     }
 
