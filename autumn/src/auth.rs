@@ -1716,4 +1716,47 @@ mod tests {
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
     }
+
+    #[tokio::test]
+    async fn check_secured_unauthorized() {
+        let data = std::collections::HashMap::new();
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+
+        let err = super::__check_secured(&session, &[]).await.unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn check_secured_authorized_no_roles() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("user_id".into(), "42".into());
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+
+        let res = super::__check_secured(&session, &[]).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_secured_forbidden_missing_role() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("user_id".into(), "42".into());
+        data.insert("role".into(), "user".into());
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+
+        let err = super::__check_secured(&session, &["admin"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_secured_authorized_with_role() {
+        let mut data = std::collections::HashMap::new();
+        data.insert("user_id".into(), "42".into());
+        data.insert("role".into(), "admin".into());
+        let session = crate::session::Session::new_for_test("sess".into(), data);
+
+        let res = super::__check_secured(&session, &["admin", "editor"]).await;
+        assert!(res.is_ok());
+    }
 }
