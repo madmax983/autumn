@@ -292,22 +292,67 @@ fn parse_dev_config(toml_str: &str) -> Result<DevConfig, toml::de::Error> {
     Ok(parsed.dev)
 }
 
+/// Normalize and validate a single `[dev].watch_dirs` entry.
+///
+/// Returns the normalized path string (with `./` segments collapsed) on
+/// success, or `Err(reason)` if the entry must be rejected. Reasons cover
+/// absolute paths, parent traversal (`..`), and `target/` — any of which
+/// could subscribe huge or wrong trees and flood the debouncer.
+fn normalize_watch_dir(raw: &str) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("entry is empty");
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("absolute paths are not allowed; use a project-relative path");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                if part == std::ffi::OsStr::new("target") {
+                    return Err("`target` is reserved for cargo build artifacts");
+                }
+                normalized.push(part);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err("parent traversal (`..`) is not allowed");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err("absolute paths are not allowed; use a project-relative path");
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        return Err("entry resolves to an empty path");
+    }
+
+    Ok(normalized.to_string_lossy().into_owned())
+}
+
 /// Filter custom watch dirs to those that are safe and not already covered by
-/// the defaults. Keeps the watcher list deterministic and prevents redundant
-/// or hostile entries (e.g. `target`, absolute paths).
+/// the defaults. Keeps the watcher list deterministic and prevents hostile
+/// entries (e.g. `target`, absolute paths, `..`) from subscribing huge trees.
 fn sanitize_custom_watch_dirs(config: DevConfig) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     for raw in config.watch_dirs {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
+        let normalized = match normalize_watch_dir(&raw) {
+            Ok(value) => value,
+            Err(reason) => {
+                eprintln!("  Warning: ignoring [dev].watch_dirs entry {raw:?}: {reason}");
+                continue;
+            }
+        };
+        if DEFAULT_WATCH_DIRS.contains(&normalized.as_str()) {
             continue;
         }
-        if DEFAULT_WATCH_DIRS.contains(&trimmed) {
-            continue;
-        }
-        let candidate = trimmed.to_owned();
-        if !seen.contains(&candidate) {
-            seen.push(candidate);
+        if !seen.contains(&normalized) {
+            seen.push(normalized);
         }
     }
     seen
@@ -599,9 +644,11 @@ fn classify_change(
 
     // Files inside a user-configured custom watch directory don't have known
     // semantics — restart the server and trigger a full reload so the change
-    // is picked up regardless of what the directory contains.
+    // is picked up regardless of what the directory contains. Compare via
+    // `Path::starts_with` so multi-segment entries (e.g. `content/locales`)
+    // match correctly.
     for dir in custom_watch_dirs {
-        if has_component(path, dir) {
+        if path.starts_with(dir) {
             return ChangeEffect::RestartOnly;
         }
     }
@@ -1840,5 +1887,96 @@ watch_dirs = ["views", "locales"]
                 reload: ReloadKind::Full,
             }
         );
+    }
+
+    #[test]
+    fn custom_watch_dir_with_multi_segment_path_matches() {
+        // Regression: previously matched single components only, so a
+        // multi-segment dir like `content/locales` silently never matched.
+        let custom = vec!["content/locales".to_owned()];
+        assert_eq!(
+            classify_change(
+                Path::new("content/locales/en/messages.json"),
+                DebouncedEventKind::Any,
+                &custom,
+            ),
+            ChangeEffect::RestartOnly,
+        );
+    }
+
+    #[test]
+    fn custom_watch_dir_does_not_match_unrelated_prefix() {
+        // `views2/foo.html` must not be picked up by a `views` entry — the
+        // matcher is component-wise, not byte-prefix.
+        let custom = vec!["views".to_owned()];
+        assert_eq!(
+            classify_change(
+                Path::new("views2/foo.html"),
+                DebouncedEventKind::Any,
+                &custom,
+            ),
+            ChangeEffect::Ignore,
+        );
+    }
+
+    // ── normalize_watch_dir ────────────────────────────────────────
+
+    #[test]
+    fn normalize_strips_curdir_prefix() {
+        assert_eq!(normalize_watch_dir("./views"), Ok("views".to_owned()));
+    }
+
+    #[test]
+    fn normalize_preserves_multi_segment_paths() {
+        assert_eq!(
+            normalize_watch_dir("content/locales"),
+            Ok("content/locales".replace('/', std::path::MAIN_SEPARATOR_STR)),
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_empty_input() {
+        assert!(normalize_watch_dir("   ").is_err());
+        assert!(normalize_watch_dir("").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_parent_traversal() {
+        assert!(normalize_watch_dir("../up").is_err());
+        assert!(normalize_watch_dir("views/../etc").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_rejects_absolute_paths_unix() {
+        assert!(normalize_watch_dir("/etc/passwd").is_err());
+        assert!(normalize_watch_dir("/").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_target_anywhere() {
+        assert!(normalize_watch_dir("target").is_err());
+        assert!(normalize_watch_dir("nested/target/cache").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_curdir_only() {
+        // `.` alone has no Normal components, so the result would be empty.
+        assert!(normalize_watch_dir(".").is_err());
+        assert!(normalize_watch_dir("./").is_err());
+    }
+
+    #[test]
+    fn sanitize_warns_and_skips_unsafe_entries() {
+        let dirs = sanitize_custom_watch_dirs(DevConfig {
+            watch_dirs: vec![
+                "../escape".into(),
+                "target".into(),
+                "views".into(),
+                "./locales".into(),
+            ],
+        });
+        let expected_locales = "locales".to_owned();
+        assert_eq!(dirs, vec!["views".to_owned(), expected_locales]);
     }
 }

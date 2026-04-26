@@ -62,8 +62,12 @@ watch_dirs = ["views", "locales"]
 ```
 
 Listed directories are watched recursively in addition to the defaults.
-Changes inside them trigger a server restart and a full browser reload.
-Paths under `target/` and dotted directories are still ignored.
+Multi-segment paths like `content/locales` are supported. Changes inside
+them trigger a server restart and a full browser reload. Paths under
+`target/` and dotted directories are still ignored.
+
+Entries must be project-relative; absolute paths, `..` traversal, and
+`target` are rejected with a warning.
 
 If you add `#[static_get]` routes, `autumn build` pre-renders them into
 `dist/`.
