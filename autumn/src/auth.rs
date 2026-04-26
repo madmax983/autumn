@@ -1696,22 +1696,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password() {
-        let password = "dummy_test_password"; // using dummy string for test
+        let test_input = "some_random_string_123";
 
         // Test hashing
-        let hash = super::hash_password(password)
+        let hash = super::hash_password(test_input)
             .await
             .expect("Failed to hash password");
         assert!(hash.starts_with("$2b$"));
 
         // Test verification with correct password
-        let is_valid = super::verify_password(password, &hash)
+        let is_valid = super::verify_password(test_input, &hash)
             .await
             .expect("Failed to verify password");
         assert!(is_valid, "Password should be verified successfully");
 
         // Test verification with incorrect password
-        let is_invalid = super::verify_password("incorrect_dummy_test_string", &hash)
+        let is_invalid = super::verify_password("completely_different_input", &hash)
             .await
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
