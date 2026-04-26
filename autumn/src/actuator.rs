@@ -1206,8 +1206,6 @@ mod tests {
     #[derive(Clone)]
     struct MockActuatorState {
         profile: String,
-        #[allow(dead_code)]
-        started_at: std::time::Instant,
         metrics: crate::middleware::MetricsCollector,
         log_levels: LogLevels,
         task_registry: TaskRegistry,
@@ -1289,7 +1287,6 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> MockActuatorState {
         MockActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
-            started_at: std::time::Instant::now(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
