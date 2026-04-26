@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::LazyLock;
 
@@ -113,6 +114,10 @@ pub fn admin_router(
                 .delete(model_delete),
         )
         .route("/{slug}/{id}/edit", routing::get(model_edit_form))
+        // Bulk-action endpoint. Receives selected `ids[]` and an `action`
+        // name from the list-view form; dispatches to
+        // `AdminModel::execute_action`.
+        .route("/{slug}/actions", routing::post(model_action))
         .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
         .layer(axum::Extension(ActuatorPrefix(actuator_prefix)))
@@ -196,6 +201,29 @@ fn validate_sort_key(sort: Option<String>, fields: &[AdminField]) -> Option<Stri
     })
 }
 
+/// Pick `filter.<name>=<value>` pairs out of the raw query map and keep
+/// only those whose `<name>` matches a field declared as `filterable` in
+/// the model's schema. Sorted by name for stable output.
+fn extract_filters(raw: &HashMap<String, String>, fields: &[AdminField]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = raw
+        .iter()
+        .filter_map(|(k, v)| {
+            let name = k.strip_prefix("filter.")?;
+            // Must be declared filterable. Empty values count as "no
+            // filter on this field" and are dropped.
+            if v.is_empty() {
+                return None;
+            }
+            if !fields.iter().any(|f| f.name == name && f.filterable) {
+                return None;
+            }
+            Some((name.to_owned(), v.clone()))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// Translate an [`AdminError`] to the correct HTTP status. Validation errors
 /// become 400, missing records 404, database/other backend failures 500. The
 /// `action` word prefixes the message ("Create failed: ..."), which is handy
@@ -266,6 +294,7 @@ async fn model_list(
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
     Path(slug): Path<String>,
     Query(query): Query<ListQuery>,
+    Query(raw_query): Query<HashMap<String, String>>,
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
@@ -280,6 +309,11 @@ async fn model_list(
     // — the model never sees an unvalidated sort key, so it can't error
     // or build unsafe dynamic ORDER BY expressions.
     let sort = validate_sort_key(sort, &fields);
+    // Pull `?filter.<name>=<value>` keys out of the raw query string and
+    // validate against the model's declared filterable fields. Unknown or
+    // non-filterable names are dropped so a crafted URL can't drive
+    // arbitrary filter logic in `AdminModel::list`.
+    let filters = extract_filters(&raw_query, &fields);
 
     let params = ListParams {
         page,
@@ -287,7 +321,7 @@ async fn model_list(
         search: (!q.is_empty()).then(|| q.clone()),
         sort_by: sort.clone(),
         sort_dir: dir,
-        filters: vec![],
+        filters,
     };
 
     let result = model
@@ -295,12 +329,14 @@ async fn model_list(
         .await
         .map_err(|e| admin_err("List", e))?;
 
+    let actions = model.actions();
     let messages = flash.consume().await;
     Ok(render(templates::model_list_page(
         &registry,
         &slug,
         model.display_name_plural(),
         &fields,
+        &actions,
         &result,
         &q,
         sort.as_deref(),
@@ -471,6 +507,68 @@ async fn model_update(
     Ok(Redirect::to(&format!("{prefix}/{slug}/{id}")).into_response())
 }
 
+/// `POST /admin/{slug}/actions` — Execute a bulk action.
+///
+/// Form body carries `action=<name>`, repeated `ids=<id>` for each selected
+/// row, and `_csrf=<token>`. Validates the action name against the model's
+/// declared `actions()` list, parses every `ids` entry as `i64`, then
+/// dispatches to [`AdminModel::execute_action`].
+async fn model_action(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(slug): Path<String>,
+    flash: Flash,
+    body: axum::body::Bytes,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    // serde_urlencoded doesn't support repeated keys (`ids=1&ids=2&ids=3`),
+    // so parse with `form_urlencoded` directly.
+    let mut action: Option<String> = None;
+    let mut ids: Vec<i64> = Vec::new();
+    let mut malformed_id = false;
+    for (k, v) in form_urlencoded::parse(&body) {
+        match k.as_ref() {
+            "action" => action = Some(v.into_owned()),
+            "ids" => match v.parse::<i64>() {
+                Ok(id) => ids.push(id),
+                Err(_) => malformed_id = true,
+            },
+            // ignore _csrf and any unknown keys
+            _ => {}
+        }
+    }
+
+    if malformed_id {
+        return Err(AutumnError::bad_request_msg(
+            "bulk action: one or more `ids` values were not valid integers",
+        ));
+    }
+    let action = action
+        .ok_or_else(|| AutumnError::bad_request_msg("bulk action: missing `action` form field"))?;
+    if ids.is_empty() {
+        return Err(AutumnError::bad_request_msg(
+            "bulk action: select at least one row",
+        ));
+    }
+    // Validate the action name against the model's declared list.
+    if !model.actions().iter().any(|a| a.name == action) {
+        return Err(AutumnError::bad_request_msg(format!(
+            "bulk action: '{action}' is not declared by this model"
+        )));
+    }
+
+    let count = model
+        .execute_action(&pool, &action, ids)
+        .await
+        .map_err(|e| admin_err("Bulk action failed", e))?;
+    flash
+        .success(format!("Applied '{action}' to {count} record(s)."))
+        .await;
+    Ok(Redirect::to(&format!("{prefix}/{slug}")).into_response())
+}
+
 /// `DELETE /admin/{slug}/{id}` — Delete a record.
 ///
 /// Called from the detail view's `hx-delete` button. Returns an empty 200
@@ -631,6 +729,58 @@ mod tests {
         secret.list_display = false;
         let schema = vec![secret];
         assert_eq!(validate_sort_key(Some("secret".into()), &schema), None);
+    }
+
+    #[test]
+    fn extract_filters_keeps_declared_filterable_fields() {
+        let mut status = AdminField::new("status", AdminFieldKind::Text);
+        status.filterable = true;
+        let schema = vec![status, AdminField::new("name", AdminFieldKind::Text)];
+        let raw = HashMap::from([
+            ("filter.status".into(), "active".into()),
+            ("filter.name".into(), "alice".into()), // not filterable — drop
+            ("page".into(), "1".into()),            // not a filter — drop
+            ("filter.unknown".into(), "x".into()),  // not in schema — drop
+        ]);
+        let out = extract_filters(&raw, &schema);
+        assert_eq!(out, vec![("status".to_owned(), "active".to_owned())]);
+    }
+
+    #[test]
+    fn extract_filters_drops_empty_values() {
+        let mut status = AdminField::new("status", AdminFieldKind::Text);
+        status.filterable = true;
+        let schema = vec![status];
+        let raw = HashMap::from([("filter.status".into(), String::new())]);
+        assert_eq!(extract_filters(&raw, &schema), vec![]);
+    }
+
+    #[test]
+    fn extract_filters_handles_no_filters() {
+        let schema = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let raw = HashMap::from([("page".into(), "2".into()), ("q".into(), "x".into())]);
+        assert_eq!(extract_filters(&raw, &schema), vec![]);
+    }
+
+    #[test]
+    fn extract_filters_sorts_for_stable_output() {
+        let mut a = AdminField::new("zeta", AdminFieldKind::Text);
+        a.filterable = true;
+        let mut b = AdminField::new("alpha", AdminFieldKind::Text);
+        b.filterable = true;
+        let schema = vec![a, b];
+        let raw = HashMap::from([
+            ("filter.zeta".into(), "z".into()),
+            ("filter.alpha".into(), "a".into()),
+        ]);
+        let out = extract_filters(&raw, &schema);
+        assert_eq!(
+            out,
+            vec![
+                ("alpha".to_owned(), "a".to_owned()),
+                ("zeta".to_owned(), "z".to_owned()),
+            ]
+        );
     }
 
     #[test]

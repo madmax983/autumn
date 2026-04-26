@@ -12,7 +12,9 @@ use serde_json::Value;
 
 use crate::registry::AdminRegistry;
 use crate::routes::ADMIN_JS_PATH;
-use crate::traits::{AdminField, AdminFieldKind, ListResult, SortDirection, record_id};
+use crate::traits::{
+    AdminAction, AdminField, AdminFieldKind, ListResult, SortDirection, record_id,
+};
 
 // ── CSS ─────────────────────────────────────────────────────────────
 
@@ -197,6 +199,18 @@ const ADMIN_CSS: &str = "
     }
     textarea.form-input { min-height: 100px; resize: vertical; }
     select.form-input { appearance: auto; }
+
+    /* Action bar (bulk actions) */
+    .action-bar {
+        display: flex;
+        gap: 0.5rem;
+        align-items: center;
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
+        border-top: 1px solid var(--border);
+        font-size: 0.875rem;
+        color: var(--text-muted);
+    }
 
     /* Search bar */
     .search-bar {
@@ -435,6 +449,7 @@ pub fn model_list_page(
     model_slug: &str,
     model_name_plural: &str,
     fields: &[AdminField],
+    actions: &[AdminAction],
     result: &ListResult,
     search_query: &str,
     sort_by: Option<&str>,
@@ -487,6 +502,11 @@ pub fn model_list_page(
                     hx-select=".card > *"
                     hx-push-url="true" {}
             }
+
+            // Bulk-action form wraps the table so the row checkboxes
+            // submit alongside the action selector.
+            form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
+                input type="hidden" name="_csrf" value=(csrf_token);
 
             // Table
             div class="table-wrap" {
@@ -564,6 +584,28 @@ pub fn model_list_page(
                     }
                 }
             }
+
+                // Bulk-action bar — only rendered when the model declares
+                // at least one action. Sits below the table inside the
+                // wrapping form.
+                @if !actions.is_empty() {
+                    div class="action-bar" {
+                        label for="bulk-action" { "With selected:" }
+                        select name="action" id="bulk-action" class="form-input"
+                            style="width: auto; display: inline-block;" {
+                            @for a in actions {
+                                option value=(a.name) data-confirm=[a.confirm.then_some("1")] {
+                                    (a.label)
+                                }
+                            }
+                        }
+                        button type="submit" class="btn" data-bulk-submit="1" {
+                            "Apply"
+                        }
+                    }
+                }
+
+            } // /form
 
             // Pagination
             @if result.total_pages() > 1 {
@@ -1423,6 +1465,7 @@ mod tests {
             "users",
             "Users",
             &fields,
+            &[],
             &result,
             "",
             None,
@@ -1468,6 +1511,7 @@ mod tests {
             "users",
             "Users",
             &fields,
+            &[],
             &result,
             "",
             None,
@@ -1510,6 +1554,7 @@ mod tests {
             "widgets",
             "Widgets",
             &fields,
+            &[],
             &result,
             "",
             None,
@@ -1538,6 +1583,99 @@ mod tests {
     }
 
     #[test]
+    fn list_page_renders_bulk_action_form() {
+        use crate::traits::{ActionStyle, ListResult};
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let actions = vec![
+            AdminAction {
+                name: "delete",
+                label: "Delete selected".to_owned(),
+                style: ActionStyle::Danger,
+                confirm: true,
+            },
+            AdminAction {
+                name: "archive",
+                label: "Archive".to_owned(),
+                style: ActionStyle::Default,
+                confirm: false,
+            },
+        ];
+        let result = ListResult {
+            records: vec![serde_json::json!({"id": 1, "name": "x"})],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &actions,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "tok",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        // Form posts to the bulk-action endpoint with the CSRF token.
+        assert!(
+            html.contains(r#"action="/admin/widgets/actions""#),
+            "list view must wrap table in a form posting to /actions: {html}"
+        );
+        assert!(
+            html.contains(r#"name="_csrf" value="tok""#),
+            "_csrf token must be in the bulk-action form: {html}"
+        );
+        // Both action options appear, with the dangerous one tagged for
+        // client-side confirm.
+        assert!(html.contains(r#"value="delete""#));
+        assert!(html.contains(r#"value="archive""#));
+        assert!(
+            html.contains(r#"data-confirm="1""#),
+            "destructive action should set data-confirm: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_skips_action_bar_when_no_actions_declared() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[], // no actions
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            !html.contains("class=\"action-bar\""),
+            "no action-bar should render when actions is empty: {html}"
+        );
+    }
+
+    #[test]
     fn list_page_omits_sort_link_for_unsortable_fields() {
         use crate::traits::ListResult;
         let r = dummy_registry();
@@ -1556,6 +1694,7 @@ mod tests {
             "widgets",
             "Widgets",
             &fields,
+            &[],
             &result,
             "",
             None,
