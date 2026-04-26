@@ -1,12 +1,15 @@
-1. **Understand Codecov Failure**
-   - The CI is failing because `codecov/patch` shows `76.47% of diff hit (target 90.00%)`.
-   - This means that our newly added lines in `autumn/src/cache/layer.rs` and `autumn/src/middleware/metrics.rs` are not fully covered by tests.
-2. **Identify Uncovered Code**
-   - In `autumn/src/cache/layer.rs`, we added a fallback branch `super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))` for when the URI is extremely long (exceeds 512 bytes).
-   - We need to add a test in `autumn/src/cache/layer.rs` that explicitly calls the cache layer with an extremely long URI (e.g., > 512 chars) to trigger that fallback path.
-3. **Write Tests to Increase Coverage**
-   - Update `autumn/src/cache/layer.rs`'s test module to add a test case that makes a GET request with a very long URI and validates it correctly hits/misses the cache and doesn't panic.
-   - For `autumn/src/middleware/metrics.rs`, we added a `if key_str.is_empty()` check. This happens when the `{method} {route}` string exceeds 256 bytes. We should also add a test there to pass a very long route to `record()`.
-4. **Complete Pre-Commit Checks & Submit**
-   - Run tests `cargo test -p autumn-web --lib cache::layer` and `cargo test -p autumn-web --lib middleware::metrics`.
-   - Follow pre-commit checks and submit.
+1. **Objective**
+   - Address the security vulnerability where Axum fallback routes bypass security middlewares (like CSRF, CORS, Rate Limiting, and Upload middlewares).
+   - This occurs because `router.fallback(...)` was called AFTER `.layer(...)` applications in `autumn/src/router.rs`. In Axum, middleware added via `.layer()` only applies to routes and fallbacks defined *before* that call.
+
+2. **Actions**
+   - **Update `autumn/src/router.rs`**: Reorder the middleware application so that `router.fallback(crate::middleware::error_page_filter::fallback_404_handler)` is called *before* `apply_cors_middleware`, `apply_csrf_middleware`, `apply_rate_limit_middleware`, and `apply_upload_middleware`.
+   - **Add Regression Test**: Ensure `autumn/tests/security/fallback_middleware_bypass.rs` tests the fallback handler correctly. The test will expect `429 Too Many Requests` on the second request to a 404 route, preventing a rate limit DoS vulnerability.
+   - **Register the Regression Test**: Add `pub mod fallback_middleware_bypass;` to `autumn/tests/security/mod.rs`.
+
+3. **Verify**
+   - Run `cargo test -p autumn-web --test security_tests fallback_middleware_bypass` to verify the fix works.
+   - Run `cargo clippy -p autumn-web --all-targets` and `cargo fmt --all`.
+
+4. **Complete pre-commit steps to ensure proper testing, verification, review, and reflection are done.**
+   - Run `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, and `cargo fmt --all` to make sure all standards are adhered to.

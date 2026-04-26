@@ -932,6 +932,7 @@ fn apply_middleware(
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
+    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config);
     router = apply_rate_limit_middleware(router, config);
@@ -943,7 +944,6 @@ fn apply_middleware(
     tracing::debug!("Security headers enabled");
 
     // 404 fallback handler for unmatched routes
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
 
     // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
     // RequestIdLayer wraps the router, so user middleware sits INNER to
