@@ -405,35 +405,26 @@ mod tests {
 
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
         use axum::routing::get;
         use tower::ServiceExt;
 
+        #[derive(Clone)]
+        struct MockState;
+
+        impl DbState for MockState {
+            fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+                None
+            }
+        }
+
         async fn handler(_db: Db) -> &'static str {
             "ok"
         }
 
-        let app = Router::new().route("/", get(handler)).with_state(AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let app = Router::new().route("/", get(handler)).with_state(MockState);
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
