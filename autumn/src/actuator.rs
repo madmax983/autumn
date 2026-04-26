@@ -1966,17 +1966,18 @@ async fn ui_dashboard() -> impl IntoResponse {
                 title { "Autumn Actuator Dashboard" }
                 script src="/static/js/htmx.min.js" {}
                 style {
-                    "body { font-family: system-ui, sans-serif; background: #f9fafb; color: #111827; margin: 0; padding: 2rem; }"
+                    (crate::ui::tokens::TOKENS_CSS)
+                    "body { font-family: var(--font-family); background: var(--bg); color: var(--text); margin: 0; padding: 2rem; }"
                     "h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 1.5rem; }"
                     ".grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; }"
-                    ".card { background: white; padding: 1.5rem; border-radius: 0.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }"
-                    ".card h2 { font-size: 1.125rem; font-weight: 500; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.5rem; }"
+                    ".card { background: var(--surface); padding: 1.5rem; border-radius: var(--radius); box-shadow: var(--shadow); }"
+                    ".card h2 { font-size: 1.125rem; font-weight: 500; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; }"
                     ".stat { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }"
-                    ".stat-label { color: #6b7280; }"
+                    ".stat-label { color: var(--text-muted); }"
                     ".stat-value { font-weight: 500; }"
-                    ".task-item { border: 1px solid #e5e7eb; padding: 0.75rem; border-radius: 0.375rem; margin-bottom: 0.75rem; }"
+                    ".task-item { border: 1px solid var(--border); padding: 0.75rem; border-radius: 0.375rem; margin-bottom: 0.75rem; }"
                     ".task-name { font-weight: 600; display: block; margin-bottom: 0.25rem; }"
-                    ".task-meta { font-size: 0.875rem; color: #6b7280; }"
+                    ".task-meta { font-size: 0.875rem; color: var(--text-muted); }"
                     ".badge { display: inline-block; padding: 0.125rem 0.375rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 500; }"
                     ".badge-green { background: #dcfce7; color: #166534; }"
                     ".badge-gray { background: #f3f4f6; color: #374151; }"
