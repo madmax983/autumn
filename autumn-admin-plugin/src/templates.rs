@@ -499,14 +499,17 @@ pub fn model_list_page(
                 }
             }
 
-            // Search. Hidden inputs preserve any active filters so
-            // submitting a search doesn't silently drop them — same
-            // invariant as the filter-aware sort/pagination links.
+            // Search. Hidden inputs preserve any active filters so both
+            // full-form GET submits AND live-search HTMX requests carry
+            // the filter set forward (htmx only includes the triggering
+            // element by default — `hx-include="closest form"` pulls in
+            // every input in the form, including the filter hiddens).
             form class="search-bar" method="get" {
                 input type="search" name="q" placeholder="Search…"
                     value=(search_query)
                     hx-get={ (prefix) "/" (model_slug) }
                     hx-trigger="input changed delay:300ms"
+                    hx-include="closest form"
                     hx-target="closest .card"
                     hx-select=".card > *"
                     hx-push-url="true" {}
@@ -1731,6 +1734,15 @@ mod tests {
         assert!(
             html.contains(r#"<input type="hidden" name="filter.tier" value="premium""#),
             "search form should preserve filter.tier: {html}"
+        );
+        // Live-search must include the hidden filter inputs in the
+        // HTMX request, otherwise typing in the search box silently
+        // resets to unfiltered results. `hx-include="closest form"`
+        // pulls every form input (including the filter hiddens) into
+        // the request, matching the full-form GET-submit behaviour.
+        assert!(
+            html.contains(r#"hx-include="closest form""#),
+            "search input must hx-include the form so live-search carries filters: {html}"
         );
     }
 
