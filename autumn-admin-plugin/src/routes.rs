@@ -184,6 +184,17 @@ fn resolve<'r>(
     Ok((pool, model))
 }
 
+/// Filter a user-supplied sort key down to fields the model declared as
+/// both sortable and list-displayed. A `None` (or unrecognised key) means
+/// "no sort" — never forward arbitrary identifiers to the model.
+fn validate_sort_key(sort: Option<String>, fields: &[AdminField]) -> Option<String> {
+    sort.filter(|s| {
+        fields
+            .iter()
+            .any(|f| f.name == s && f.sortable && f.list_display)
+    })
+}
+
 /// Translate an [`AdminError`] to the correct HTTP status. Validation errors
 /// become 400, missing records 404, database/other backend failures 500. The
 /// `action` word prefixes the message ("Create failed: ..."), which is handy
@@ -262,6 +273,12 @@ async fn model_list(
     let ListQuery { page, q, sort, dir } = query;
     let page = page.max(1);
     let per_page = model.per_page();
+    let fields = model.fields();
+    // Validate the requested sort key against the model's declared
+    // sortable fields. A crafted `?sort=<unexpected>` is silently dropped
+    // — the model never sees an unvalidated sort key, so it can't error
+    // or build unsafe dynamic ORDER BY expressions.
+    let sort = validate_sort_key(sort, &fields);
 
     let params = ListParams {
         page,
@@ -277,7 +294,6 @@ async fn model_list(
         .await
         .map_err(|e| admin_err("List", e))?;
 
-    let fields = model.fields();
     let messages = flash.consume().await;
     Ok(render(templates::model_list_page(
         &registry,
@@ -576,6 +592,50 @@ mod tests {
         ]);
         let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
         assert_eq!(out, json!({"name": "", "bio": ""}));
+    }
+
+    #[test]
+    fn validate_sort_key_passes_known_sortable_displayed_fields() {
+        let fields = fields(&[("name", AdminFieldKind::Text)]);
+        assert_eq!(
+            validate_sort_key(Some("name".to_owned()), &fields),
+            Some("name".to_owned())
+        );
+    }
+
+    #[test]
+    fn validate_sort_key_drops_unknown_keys() {
+        // Crafted `?sort=<unexpected>` reaches model handler — must be dropped.
+        let fields = fields(&[("name", AdminFieldKind::Text)]);
+        assert_eq!(
+            validate_sort_key(Some("DROP TABLE users".into()), &fields),
+            None
+        );
+        assert_eq!(validate_sort_key(Some("password".into()), &fields), None);
+    }
+
+    #[test]
+    fn validate_sort_key_drops_non_sortable_fields() {
+        let mut computed = AdminField::new("computed", AdminFieldKind::Text);
+        computed.sortable = false;
+        let schema = vec![computed];
+        assert_eq!(validate_sort_key(Some("computed".into()), &schema), None);
+    }
+
+    #[test]
+    fn validate_sort_key_drops_hidden_columns() {
+        // Fields excluded from list_display can't be sorted by URL crafting
+        // either — the affordance doesn't exist in the UI.
+        let mut secret = AdminField::new("secret", AdminFieldKind::Text);
+        secret.list_display = false;
+        let schema = vec![secret];
+        assert_eq!(validate_sort_key(Some("secret".into()), &schema), None);
+    }
+
+    #[test]
+    fn validate_sort_key_passes_through_none() {
+        let fields = fields(&[("name", AdminFieldKind::Text)]);
+        assert_eq!(validate_sort_key(None, &fields), None);
     }
 
     #[test]

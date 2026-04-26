@@ -445,11 +445,14 @@ pub fn model_list_page(
     actuator_prefix: &str,
 ) -> Markup {
     // Password fields are documented as write-only — never surface their
-    // values (raw or hashed) in the index view, even if the model set
-    // `list_display = true`.
+    // values (raw or hashed) in the index view. Hidden fields are
+    // documented as "shown in detail, not editable" — so they should
+    // also stay out of the list view, regardless of `list_display`.
     let list_fields: Vec<_> = fields
         .iter()
-        .filter(|f| f.list_display && !matches!(f.kind, AdminFieldKind::Password))
+        .filter(|f| {
+            f.list_display && !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+        })
         .collect();
     let search_enc = url_encode(search_query);
 
@@ -1392,6 +1395,51 @@ mod tests {
         assert!(
             !html.contains("onclick=\""),
             "no inline event handlers allowed under default CSP: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_hides_hidden_fields_even_if_list_display_true() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        // Hidden contract: shown in detail, not in list. Even with
+        // list_display=true (the default), the column must not appear.
+        let fields = vec![
+            AdminField::new("name", AdminFieldKind::Text),
+            AdminField::new("internal_token", AdminFieldKind::Hidden),
+        ];
+        let result = ListResult {
+            records: vec![serde_json::json!({
+                "id": 1,
+                "name": "alice",
+                "internal_token": "INT-9999",
+            })],
+            total: 1,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "users",
+            "Users",
+            &fields,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            !html.contains("INT-9999"),
+            "hidden field value must not surface in list view: {html}"
+        );
+        assert!(
+            !html.contains("internal_token") && !html.contains("Internal Token"),
+            "hidden field column header must not appear: {html}"
         );
     }
 
