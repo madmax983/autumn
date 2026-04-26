@@ -97,6 +97,7 @@ pub fn admin_router(
     registry: Arc<AdminRegistry>,
     prefix: &str,
     actuator_prefix: String,
+    auth_session_key: String,
     require_role: Option<String>,
 ) -> axum::Router<AppState> {
     let router = axum::Router::new()
@@ -119,7 +120,7 @@ pub fn admin_router(
 
     match require_role {
         Some(role) => router.layer(from_fn(move |req, next| {
-            check_role(role.clone(), req, next)
+            check_role(role.clone(), auth_session_key.clone(), req, next)
         })),
         None => router,
     }

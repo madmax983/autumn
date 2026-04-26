@@ -55,6 +55,7 @@ pub struct AdminPlugin {
     registry: AdminRegistry,
     prefix: String,
     actuator_prefix: String,
+    auth_session_key: String,
     require_role: Option<String>,
 }
 
@@ -62,13 +63,16 @@ impl AdminPlugin {
     /// Create a new admin plugin with default settings.
     ///
     /// Mounts at `/admin` and requires the `"admin"` role in the session.
-    /// Links to the actuator UI under `/actuator`.
+    /// Links to the actuator UI under `/actuator`. Reads the user
+    /// identifier from session key `"user_id"` (Autumn's default
+    /// `auth.session_key`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             registry: AdminRegistry::new(),
             prefix: "/admin".to_owned(),
             actuator_prefix: "/actuator".to_owned(),
+            auth_session_key: "user_id".to_owned(),
             require_role: Some("admin".to_owned()),
         }
     }
@@ -87,6 +91,20 @@ impl AdminPlugin {
     #[must_use]
     pub fn actuator_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.actuator_prefix = prefix.into();
+        self
+    }
+
+    /// Override the session key the role middleware reads to detect an
+    /// authenticated user. Default: `"user_id"`, matching Autumn's default
+    /// `auth.session_key`. Must match whatever your application populates
+    /// after login — e.g. set this to `"uid"` if you configured
+    /// `auth.session_key = "uid"`.
+    ///
+    /// The plugin can't read `config.auth.session_key` automatically
+    /// because config is loaded after `Plugin::build` runs.
+    #[must_use]
+    pub fn auth_session_key(mut self, key: impl Into<String>) -> Self {
+        self.auth_session_key = key.into();
         self
     }
 
@@ -128,6 +146,7 @@ impl Plugin for AdminPlugin {
             registry,
             prefix,
             actuator_prefix,
+            auth_session_key,
             require_role,
         } = self;
         let registry = Arc::new(registry);
@@ -135,12 +154,14 @@ impl Plugin for AdminPlugin {
             Arc::clone(&registry),
             &prefix,
             actuator_prefix.clone(),
+            auth_session_key.clone(),
             require_role.clone(),
         );
 
         tracing::info!(
             prefix = %prefix,
             actuator_prefix = %actuator_prefix,
+            auth_session_key = %auth_session_key,
             models = registry.model_count(),
             role = require_role.as_deref().unwrap_or("<none>"),
             "🍂 Autumn Admin mounted"
