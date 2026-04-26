@@ -580,7 +580,6 @@ mod tests {
         assert_eq!(json["content"], serde_json::json!(["a", "b"]));
     }
 
-
     // ── CursorPage tests ───────────────────────────────────────
 
     #[test]
