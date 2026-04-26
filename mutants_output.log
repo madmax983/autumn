@@ -1,0 +1,15 @@
+Found 59 mutants to test
+ok       Unmutated baseline in 206s build + 430s test
+ INFO Auto-set test timeout to 2152s
+ERROR scenario execution internal error err=reopen /app/mutants.out/log/autumn__src__pagination.rs_line_115_col_24.log for append
+
+Caused by:
+    No such file or directory (os error 2) phase=Test
+ERROR Worker thread failed: reopen /app/mutants.out/log/autumn__src__pagination.rs_line_115_col_24.log for append
+
+Caused by:
+    No such file or directory (os error 2)
+Error: reopen /app/mutants.out/log/autumn__src__pagination.rs_line_115_col_24.log for append
+
+Caused by:
+    No such file or directory (os error 2)
