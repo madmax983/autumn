@@ -1696,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password() {
-        let test_input = std::env::var("DUMMY_VAR").unwrap_or_else(|_| "my_super_secret_test_input".to_string());
+        let test_input = uuid::Uuid::new_v4().to_string();
 
         // Test hashing
         let hash = super::hash_password(&test_input)
@@ -1711,7 +1711,7 @@ mod tests {
         assert!(is_valid, "Password should be verified successfully");
 
         // Test verification with incorrect password
-        let is_invalid = super::verify_password("wrong_password", &hash)
+        let is_invalid = super::verify_password(&uuid::Uuid::new_v4().to_string(), &hash)
             .await
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
@@ -1749,7 +1749,7 @@ mod tests {
     #[tokio::test]
     async fn test_hash_password_unicode() {
         // Test with non-ascii characters
-        let test_input = std::env::var("DUMMY_VAR").unwrap_or_else(|_| "🚀my_secrët_passwörd🔑".to_string());
+        let test_input = format!("{}🚀my_secrët_passwörd🔑", uuid::Uuid::new_v4());
         let hash = super::hash_password(&test_input)
             .await
             .expect("Failed to hash unicode password");
@@ -1764,7 +1764,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_password_invalid_hash() {
         // Ensure that providing invalid hashes doesn't crash or cause issues, but returns an error/false
-        let test_input = std::env::var("DUMMY_VAR").unwrap_or_else(|_| "my_super_secret_test_input".to_string());
+        let test_input = uuid::Uuid::new_v4().to_string();
 
         // Invalid prefix
         let result = super::verify_password(&test_input, "invalid_hash_string").await;
