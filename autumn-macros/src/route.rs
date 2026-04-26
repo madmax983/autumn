@@ -52,7 +52,9 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
-    let primitive_wrapper = if let Some(is_result) = should_stringify_primitive_output(&input_fn.sig.output) {
+    let primitive_wrapper = if let Some(is_result) =
+        should_stringify_primitive_output(&input_fn.sig.output)
+    {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
@@ -160,9 +162,21 @@ fn should_stringify_primitive_output(output: &ReturnType) -> Option<bool> {
     fn is_primitive(ident: &str) -> bool {
         matches!(
             ident,
-            "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
-                | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
-                | "f32" | "f64"
+            "bool"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
         )
     }
 

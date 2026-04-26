@@ -829,7 +829,8 @@ fn mount_scoped_groups(
         }
         sub_router = (group.apply_layer)(sub_router);
         // ECHO-002: Ensure nested routers inherit the 404 fallback
-        sub_router = sub_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        sub_router =
+            sub_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
         router = router.nest(&group.prefix, sub_router);
     }
     router
@@ -850,7 +851,8 @@ fn mount_raw_routers(
     // Nest user-supplied raw Axum routers under path prefixes.
     for (prefix, raw_router) in nest_routers {
         tracing::debug!(prefix = %prefix, "Nested raw Axum router");
-        let raw_router = raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        let raw_router =
+            raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
         router = router.nest(&prefix, raw_router);
     }
     router
