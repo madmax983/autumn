@@ -263,6 +263,121 @@ pub struct Page<T> {
     pub has_previous: bool,
 }
 
+// ── CursorRequest ───────────────────────────────────────────────────
+
+/// Cursor-based pagination parameters parsed from the query string.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CursorRequest {
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+impl CursorRequest {
+    /// Construct a [`CursorRequest`] explicitly.
+    #[must_use]
+    pub const fn new(cursor: Option<String>, limit: Option<u32>) -> Self {
+        Self { cursor, limit }
+    }
+
+    /// Resolved cursor.
+    #[must_use]
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
+
+    /// Resolved page size, clamped to <code>1..=[`MAX_PAGE_SIZE`]</code>.
+    #[must_use]
+    pub const fn limit(&self) -> u32 {
+        match self.limit {
+            Some(0) | None => DEFAULT_PAGE_SIZE,
+            Some(s) if s > MAX_PAGE_SIZE => MAX_PAGE_SIZE,
+            Some(s) => s,
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for CursorRequest
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .uri
+            .query()
+            .map_or_else(Self::default, parse_cursor_query))
+    }
+}
+
+fn parse_cursor_query(query: &str) -> CursorRequest {
+    let mut req = CursorRequest::default();
+    for pair in query.split('&').filter(|s| !s.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Ok(key) = percent_decode(raw_key) else {
+            continue;
+        };
+        let Ok(value) = percent_decode(raw_value) else {
+            continue;
+        };
+        match key.as_str() {
+            "cursor" => {
+                if !value.is_empty() {
+                    req.cursor = Some(value);
+                }
+            }
+            "limit" => {
+                if let Ok(n) = value.parse::<u32>() {
+                    req.limit = Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    req
+}
+
+// ── CursorPage ──────────────────────────────────────────────────────
+
+/// Cursor-based paginated response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorPage<T> {
+    /// The items for the current page.
+    pub content: Vec<T>,
+    /// The cursor to fetch the next page, or `None` if there are no more pages.
+    pub next_cursor: Option<String>,
+}
+
+impl<T> CursorPage<T> {
+    /// Build a page.
+    #[must_use]
+    pub const fn new(content: Vec<T>, next_cursor: Option<String>) -> Self {
+        Self {
+            content,
+            next_cursor,
+        }
+    }
+
+    /// Build an empty page.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            content: Vec::new(),
+            next_cursor: None,
+        }
+    }
+
+    /// Transform the content while preserving the cursor.
+    pub fn map<U, F: FnMut(T) -> U>(self, f: F) -> CursorPage<U> {
+        CursorPage {
+            content: self.content.into_iter().map(f).collect(),
+            next_cursor: self.next_cursor,
+        }
+    }
+}
+
 impl<T> Page<T> {
     /// Build a page from the materialized `items` and the total row
     /// count returned by the database.
@@ -465,6 +580,72 @@ mod tests {
         assert_eq!(json["has_next"], true);
         assert_eq!(json["has_previous"], true);
         assert_eq!(json["content"], serde_json::json!(["a", "b"]));
+    }
+
+    // ── CursorRequest tests ────────────────────────────────────
+
+    #[test]
+    fn cursor_defaults_when_nothing_provided() {
+        let r = CursorRequest::default();
+        assert_eq!(r.cursor(), None);
+        assert_eq!(r.limit(), DEFAULT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn cursor_limit_is_clamped_to_max() {
+        let r = CursorRequest::new(None, Some(9_999));
+        assert_eq!(r.limit(), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn cursor_limit_zero_falls_back_to_default() {
+        let r = CursorRequest::new(None, Some(0));
+        assert_eq!(r.limit(), DEFAULT_PAGE_SIZE);
+    }
+
+    #[tokio::test]
+    async fn cursor_extractor_parses_cursor_and_limit() {
+        let app = Router::new().route(
+            "/cursor",
+            get(|req: CursorRequest| async move { format!("{:?}:{}", req.cursor(), req.limit()) }),
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/cursor?cursor=abc&limit=25")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            "Some(\"abc\"):25"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_extractor_ignores_empty_cursor() {
+        let app = Router::new().route(
+            "/cursor",
+            get(|req: CursorRequest| async move { format!("{:?}:{}", req.cursor(), req.limit()) }),
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/cursor?cursor=&limit=25")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes.to_vec()).unwrap(), "None:25");
     }
 
     // ── Extractor tests ────────────────────────────────────────
