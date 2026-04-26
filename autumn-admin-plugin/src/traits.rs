@@ -265,9 +265,13 @@ pub trait AdminModel: Send + Sync + 'static {
 
     /// Return a display string for a record (used in breadcrumbs, titles).
     ///
-    /// Defaults to `"ModelName #id"`.
+    /// Defaults to `"ModelName #id"` (or `"ModelName <no id>"` when the
+    /// record has no numeric `id`).
     fn record_display(&self, record: &Value) -> String {
-        format!("{} #{}", self.display_name(), record_id(record))
+        record_id(record).map_or_else(
+            || format!("{} <no id>", self.display_name()),
+            |id| format!("{} #{id}", self.display_name()),
+        )
     }
 
     /// Records per page in the list view. Override to taste.
@@ -292,10 +296,15 @@ pub trait AdminModel: Send + Sync + 'static {
     }
 }
 
-/// Extract the `"id"` field of a record as `i64`, defaulting to `0`.
+/// Extract the `"id"` field of a record as `i64`.
+///
+/// Returns `None` when the field is missing or non-numeric. Callers in
+/// mutation paths should treat `None` as an error (the model returned a
+/// payload without a routable identifier); display contexts may fall back
+/// to a placeholder like `"#?"`.
 #[must_use]
-pub fn record_id(record: &Value) -> i64 {
-    record.get("id").and_then(Value::as_i64).unwrap_or(0)
+pub fn record_id(record: &Value) -> Option<i64> {
+    record.get("id").and_then(Value::as_i64)
 }
 
 // ── Query parameters ────────────────────────────────────────────────
@@ -448,6 +457,20 @@ mod tests {
         assert!(field.filterable);
         assert!(!field.required);
         assert!(field.editable);
+    }
+
+    #[test]
+    fn record_id_extracts_numeric_id() {
+        assert_eq!(record_id(&serde_json::json!({"id": 42})), Some(42));
+    }
+
+    #[test]
+    fn record_id_returns_none_for_missing_or_non_numeric() {
+        assert_eq!(record_id(&serde_json::json!({})), None);
+        assert_eq!(record_id(&serde_json::json!({"id": null})), None);
+        assert_eq!(record_id(&serde_json::json!({"id": "abc"})), None);
+        // Floats aren't valid IDs either — only integers.
+        assert_eq!(record_id(&serde_json::json!({"id": 1.5})), None);
     }
 
     #[test]

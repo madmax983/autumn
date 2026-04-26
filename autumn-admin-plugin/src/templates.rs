@@ -528,21 +528,33 @@ pub fn model_list_page(
                             }
                         }
                         @for record in &result.records {
-                            @let id = record_id(record);
+                            @let row_id = record_id(record);
                             tr {
                                 td class="checkbox-cell" {
-                                    input type="checkbox" class="row-check"
-                                        name="ids" value=(id);
+                                    // Only emit a bulk-action checkbox for rows with a
+                                    // routable id — otherwise the form would post id="" or
+                                    // the wrong record.
+                                    @if let Some(id) = row_id {
+                                        input type="checkbox" class="row-check"
+                                            name="ids" value=(id);
+                                    }
                                 }
                                 @for field in &list_fields {
                                     td { (render_cell_value(record, field)) }
                                 }
                                 td {
-                                    a href={ (prefix) "/" (model_slug) "/" (id) }
-                                        class="btn btn-sm" { "View" }
-                                    " "
-                                    a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
-                                        class="btn btn-sm" { "Edit" }
+                                    @if let Some(id) = row_id {
+                                        a href={ (prefix) "/" (model_slug) "/" (id) }
+                                            class="btn btn-sm" { "View" }
+                                        " "
+                                        a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
+                                            class="btn btn-sm" { "Edit" }
+                                    } @else {
+                                        // Surface the issue rather than rendering links to /0.
+                                        span style="color: var(--text-muted); font-size: 0.75rem;" {
+                                            "no id"
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1425,6 +1437,55 @@ mod tests {
         assert!(
             !html.contains("password_hash"),
             "password column must not have a header in list view: {html}"
+        );
+    }
+
+    #[test]
+    fn list_page_handles_records_without_numeric_id() {
+        // A model that returns a row whose `id` is missing (or non-numeric)
+        // must not render `/admin/widgets/0` action links — those would
+        // route mutations to the wrong row. Show "no id" instead.
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![
+                serde_json::json!({"id": 7, "name": "with id"}),
+                serde_json::json!({"name": "no id"}),
+            ],
+            total: 2,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        // Row with id renders working links and a checkbox.
+        assert!(
+            html.contains(r#"href="/admin/widgets/7""#),
+            "row with id should have working View link: {html}"
+        );
+        // Row without id shows the placeholder, never `/0` links.
+        assert!(
+            html.contains(r#"<span style="color: var(--text-muted); font-size: 0.75rem;">no id"#)
+                || html.contains("no id</span>"),
+            "row without id should show 'no id' placeholder: {html}"
+        );
+        assert!(
+            !html.contains("/admin/widgets/0"),
+            "must not generate /0 links for rows missing id: {html}"
         );
     }
 

@@ -341,10 +341,19 @@ async fn model_create(
         .create(&pool, strip_meta_fields(form_data, &fields))
         .await
         .map_err(|e| admin_err("Create failed", e))?;
+    // The post-create redirect needs a routable ID. Treat a missing or
+    // non-numeric `id` as a model-impl bug rather than silently sending
+    // the admin to `/{slug}/0` (which lands on the wrong row or a 404).
+    let new_id = record_id(&record).ok_or_else(|| {
+        AutumnError::internal_server_error_msg(format!(
+            "{} create returned a record without a numeric `id` field; cannot route post-create redirect",
+            model.display_name()
+        ))
+    })?;
     flash
         .success(format!("{} created.", model.display_name()))
         .await;
-    Ok(Redirect::to(&format!("{prefix}/{slug}/{}", record_id(&record))).into_response())
+    Ok(Redirect::to(&format!("{prefix}/{slug}/{new_id}")).into_response())
 }
 
 /// `GET /admin/{slug}/{id}` — Detail view.
