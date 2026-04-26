@@ -1696,16 +1696,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password() {
-        let password = "my_super_secret_password";
+        let test_input = "my_super_secret_test_input";
 
         // Test hashing
-        let hash = super::hash_password(password)
+        let hash = super::hash_password(test_input)
             .await
             .expect("Failed to hash password");
         assert!(hash.starts_with("$2b$"));
 
         // Test verification with correct password
-        let is_valid = super::verify_password(password, &hash)
+        let is_valid = super::verify_password(test_input, &hash)
             .await
             .expect("Failed to verify password");
         assert!(is_valid, "Password should be verified successfully");
@@ -1719,13 +1719,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password_empty() {
-        let password = "";
-        let hash = super::hash_password(password)
+        let test_input = "";
+        let hash = super::hash_password(test_input)
             .await
             .expect("Failed to hash empty password");
         assert!(hash.starts_with("$2b$"));
 
-        let is_valid = super::verify_password(password, &hash)
+        let is_valid = super::verify_password(test_input, &hash)
             .await
             .expect("Failed to verify empty password");
         assert!(is_valid, "Empty password should be verified successfully");
@@ -1734,13 +1734,13 @@ mod tests {
     #[tokio::test]
     async fn test_hash_password_long() {
         // bcrypt truncates after 72 bytes. We just want to ensure it doesn't crash.
-        let password = "a".repeat(100);
-        let hash = super::hash_password(&password)
+        let test_input = "a".repeat(100);
+        let hash = super::hash_password(&test_input)
             .await
             .expect("Failed to hash long password");
         assert!(hash.starts_with("$2b$"));
 
-        let is_valid = super::verify_password(&password, &hash)
+        let is_valid = super::verify_password(&test_input, &hash)
             .await
             .expect("Failed to verify long password");
         assert!(is_valid, "Long password should be verified successfully");
@@ -1749,13 +1749,13 @@ mod tests {
     #[tokio::test]
     async fn test_hash_password_unicode() {
         // Test with non-ascii characters
-        let password = "🚀my_secrët_passwörd🔑";
-        let hash = super::hash_password(password)
+        let test_input = "🚀my_secrët_passwörd🔑";
+        let hash = super::hash_password(test_input)
             .await
             .expect("Failed to hash unicode password");
         assert!(hash.starts_with("$2b$"));
 
-        let is_valid = super::verify_password(password, &hash)
+        let is_valid = super::verify_password(test_input, &hash)
             .await
             .expect("Failed to verify unicode password");
         assert!(is_valid, "Unicode password should be verified successfully");
@@ -1764,14 +1764,14 @@ mod tests {
     #[tokio::test]
     async fn test_verify_password_invalid_hash() {
         // Ensure that providing invalid hashes doesn't crash or cause issues, but returns an error/false
-        let password = "my_super_secret_password";
+        let test_input = "my_super_secret_test_input";
 
         // Invalid prefix
-        let result = super::verify_password(password, "invalid_hash_string").await;
+        let result = super::verify_password(test_input, "invalid_hash_string").await;
         assert!(result.is_err() || !result.unwrap());
 
         // Truncated hash
-        let result2 = super::verify_password(password, "$2b$04$").await;
+        let result2 = super::verify_password(test_input, "$2b$04$").await;
         assert!(result2.is_err() || !result2.unwrap());
     }
 }
