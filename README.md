@@ -66,8 +66,9 @@ Multi-segment paths like `content/locales` are supported. Changes inside
 them trigger a server restart and a full browser reload. Paths under
 `target/` and dotted directories are still ignored.
 
-Entries must be project-relative; absolute paths, `..` traversal, and
-`target` are rejected with a warning.
+Entries must be project-relative; absolute paths, `..` traversal,
+`target`, and dotted directories (e.g. `.git`) are rejected with a
+warning. Missing directories are skipped at startup.
 
 If you add `#[static_get]` routes, `autumn build` pre-renders them into
 `dist/`.

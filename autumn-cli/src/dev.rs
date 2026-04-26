@@ -208,7 +208,9 @@ pub fn run(package: Option<&str>, show_config: bool) {
         show_config,
     );
 
-    let custom_watch_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
+    let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -229,15 +231,11 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     // Watch any additional directories from `[dev] watch_dirs` in autumn.toml.
     for dir in &custom_watch_dirs {
-        let path = Path::new(dir);
-        if path.exists() {
-            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
-                eprintln!("  Warning: could not watch {dir}/: {e}");
-            } else {
-                eprintln!("  Watching custom directory: {dir}/");
-            }
+        let display = dir.relative.display();
+        if let Err(e) = watcher.watch(&dir.relative, notify::RecursiveMode::Recursive) {
+            eprintln!("  Warning: could not watch {display}/: {e}");
         } else {
-            eprintln!("  Warning: configured watch directory {dir}/ does not exist; skipping");
+            eprintln!("  Watching custom directory: {display}/");
         }
     }
 
@@ -296,8 +294,9 @@ fn parse_dev_config(toml_str: &str) -> Result<DevConfig, toml::de::Error> {
 ///
 /// Returns the normalized path string (with `./` segments collapsed) on
 /// success, or `Err(reason)` if the entry must be rejected. Reasons cover
-/// absolute paths, parent traversal (`..`), and `target/` — any of which
-/// could subscribe huge or wrong trees and flood the debouncer.
+/// absolute paths, parent traversal (`..`), `target/`, and dotted
+/// directories (e.g. `.git`) — any of which could subscribe huge or wrong
+/// trees and flood the debouncer.
 fn normalize_watch_dir(raw: &str) -> Result<String, &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -316,6 +315,10 @@ fn normalize_watch_dir(raw: &str) -> Result<String, &'static str> {
                 if part == std::ffi::OsStr::new("target") {
                     return Err("`target` is reserved for cargo build artifacts");
                 }
+                if part.to_string_lossy().starts_with('.') {
+                    return Err("dotted directories (e.g. `.git`) are not allowed; \
+                         the watcher would still pump their events");
+                }
                 normalized.push(part);
             }
             std::path::Component::CurDir => {}
@@ -333,6 +336,49 @@ fn normalize_watch_dir(raw: &str) -> Result<String, &'static str> {
     }
 
     Ok(normalized.to_string_lossy().into_owned())
+}
+
+/// A custom watch directory resolved at startup, with both the relative
+/// form (passed to `watcher.watch`) and the absolute form (used to anchor
+/// event matching to the project root).
+///
+/// `notify` backends typically dispatch absolute paths, but on some
+/// platforms relative paths can also flow through, so matching tries both.
+#[derive(Debug, Clone)]
+struct CustomWatchDir {
+    /// Relative path as configured. Passed to `watcher.watch()`.
+    relative: PathBuf,
+    /// Absolute (canonicalized when possible) path used to anchor event
+    /// matching to the project root, so a custom dir like `views` can't
+    /// false-match against an ancestor directory in the absolute path
+    /// (e.g. project at `/home/alice/views/app`).
+    absolute: PathBuf,
+}
+
+impl CustomWatchDir {
+    /// True if `event_path` falls inside this custom watch directory.
+    fn matches(&self, event_path: &Path) -> bool {
+        event_path.starts_with(&self.absolute) || event_path.starts_with(&self.relative)
+    }
+}
+
+/// Resolve sanitized relative watch dirs to `CustomWatchDir` entries,
+/// dropping any that don't exist on disk. Logs a warning per dropped
+/// entry so misconfiguration is visible.
+fn resolve_custom_watch_dirs(normalized: &[String], cwd: &Path) -> Vec<CustomWatchDir> {
+    normalized
+        .iter()
+        .filter_map(|rel| {
+            let relative = PathBuf::from(rel);
+            let cwd_joined = cwd.join(&relative);
+            if !cwd_joined.exists() {
+                eprintln!("  Warning: configured watch directory {rel}/ does not exist; skipping");
+                return None;
+            }
+            let absolute = std::fs::canonicalize(&cwd_joined).unwrap_or(cwd_joined);
+            Some(CustomWatchDir { relative, absolute })
+        })
+        .collect()
 }
 
 /// Filter custom watch dirs to those that are safe and not already covered by
@@ -362,7 +408,7 @@ fn sanitize_custom_watch_dirs(config: DevConfig) -> Vec<String> {
 /// Returns false if the channel was closed and the loop should exit.
 fn process_events(
     rx: &mpsc::Receiver<Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>>,
-    custom_watch_dirs: &[String],
+    custom_watch_dirs: &[CustomWatchDir],
     package: Option<&str>,
     child: &mut Option<Child>,
     reload_state: Option<&mut DevReloadState>,
@@ -456,7 +502,7 @@ fn execute_plan(
 /// Returns an empty vec if no changes are relevant.
 fn collect_relevant_changes(
     events: &[notify_debouncer_mini::DebouncedEvent],
-    custom_watch_dirs: &[String],
+    custom_watch_dirs: &[CustomWatchDir],
 ) -> Vec<String> {
     events
         .iter()
@@ -467,7 +513,7 @@ fn collect_relevant_changes(
 
 fn plan_changes(
     events: &[notify_debouncer_mini::DebouncedEvent],
-    custom_watch_dirs: &[String],
+    custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangePlan {
     let mut plan = ChangePlan::default();
     for event in events {
@@ -587,14 +633,18 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
-fn is_relevant_change(path: &Path, kind: DebouncedEventKind, custom_watch_dirs: &[String]) -> bool {
+fn is_relevant_change(
+    path: &Path,
+    kind: DebouncedEventKind,
+    custom_watch_dirs: &[CustomWatchDir],
+) -> bool {
     classify_change(path, kind, custom_watch_dirs) != ChangeEffect::Ignore
 }
 
 fn classify_change(
     path: &Path,
     kind: DebouncedEventKind,
-    custom_watch_dirs: &[String],
+    custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangeEffect {
     if !matches!(kind, DebouncedEventKind::Any) || should_ignore_path(path) {
         return ChangeEffect::Ignore;
@@ -646,49 +696,18 @@ fn classify_change(
     // semantics — restart the server and trigger a full reload so the change
     // is picked up regardless of what the directory contains.
     //
-    // `notify`'s backends tend to dispatch events with absolute paths even
-    // when the watch was registered with a relative path (FSEvents on macOS
-    // always, inotify after canonicalization on Linux), so a naive
-    // `Path::starts_with(relative_dir)` won't match. Use a component-level
-    // subsequence match so e.g. `views` matches `/repo/views/landing.html`
-    // and `content/locales` matches `/repo/content/locales/en.json`.
+    // Matching is anchored at the project root via the resolved absolute
+    // path, so an entry like `views` cannot false-match an ancestor
+    // directory of the same name (e.g. project at `/home/alice/views/app`).
+    // The relative form is also tried so events emitted as relative paths
+    // (rare but possible on some platforms) still match.
     for dir in custom_watch_dirs {
-        if path_contains_subpath(path, Path::new(dir)) {
+        if dir.matches(path) {
             return ChangeEffect::RestartOnly;
         }
     }
 
     ChangeEffect::Ignore
-}
-
-/// True if `subpath`'s normal components appear contiguously inside `path`.
-///
-/// Only `Component::Normal` parts are compared, so a `RootDir` or `CurDir`
-/// at the start of either path is ignored. This makes the check work for
-/// both relative event paths (`views/landing.html`) and absolute event
-/// paths (`/repo/views/landing.html`) against the same relative entry
-/// (`views`).
-fn path_contains_subpath(path: &Path, subpath: &Path) -> bool {
-    let normalize = |p: &Path| -> Vec<std::ffi::OsString> {
-        p.components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(part) => Some(part.to_os_string()),
-                _ => None,
-            })
-            .collect()
-    };
-
-    let needle = normalize(subpath);
-    if needle.is_empty() {
-        return false;
-    }
-    let haystack = normalize(path);
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle.as_slice())
 }
 
 fn should_ignore_path(path: &Path) -> bool {
@@ -1840,9 +1859,18 @@ watch_dirs = ["views", "locales"]
 
     // ── classify_change with custom dirs ───────────────────────────
 
+    /// Build a `CustomWatchDir` for tests. The absolute form is anchored
+    /// at the synthetic project root `/repo`.
+    fn test_dir(rel: &str) -> CustomWatchDir {
+        CustomWatchDir {
+            relative: PathBuf::from(rel),
+            absolute: PathBuf::from("/repo").join(rel),
+        }
+    }
+
     #[test]
     fn custom_watch_dir_change_triggers_restart() {
-        let custom = vec!["views".to_owned()];
+        let custom = vec![test_dir("views")];
         assert_eq!(
             classify_change(
                 Path::new("views/landing.html"),
@@ -1855,7 +1883,7 @@ watch_dirs = ["views", "locales"]
 
     #[test]
     fn custom_watch_dir_nested_change_triggers_restart() {
-        let custom = vec!["locales".to_owned()];
+        let custom = vec![test_dir("locales")];
         assert_eq!(
             classify_change(
                 Path::new("locales/en/messages.json"),
@@ -1870,7 +1898,7 @@ watch_dirs = ["views", "locales"]
     fn custom_watch_dir_does_not_override_known_dirs() {
         // A path under `src` keeps its BuildRestart effect even if the user
         // also lists a custom dir.
-        let custom = vec!["views".to_owned()];
+        let custom = vec![test_dir("views")];
         assert_eq!(
             classify_change(Path::new("src/main.rs"), DebouncedEventKind::Any, &custom),
             ChangeEffect::BuildRestart,
@@ -1880,7 +1908,7 @@ watch_dirs = ["views", "locales"]
     #[test]
     fn custom_watch_dir_respects_target_ignore() {
         // Even if the user names a custom dir, paths under target/ remain ignored.
-        let custom = vec!["views".to_owned()];
+        let custom = vec![test_dir("views")];
         assert_eq!(
             classify_change(
                 Path::new("target/views/cached.html"),
@@ -1911,7 +1939,7 @@ watch_dirs = ["views", "locales"]
             path: PathBuf::from("views/landing.html"),
             kind: DebouncedEventKind::Any,
         }];
-        let custom = vec!["views".to_owned()];
+        let custom = vec![test_dir("views")];
         let plan = plan_changes(&events, &custom);
         assert_eq!(
             plan,
@@ -1926,9 +1954,8 @@ watch_dirs = ["views", "locales"]
 
     #[test]
     fn custom_watch_dir_with_multi_segment_path_matches() {
-        // Regression: previously matched single components only, so a
-        // multi-segment dir like `content/locales` silently never matched.
-        let custom = vec!["content/locales".to_owned()];
+        // Multi-segment dir matches both components.
+        let custom = vec![test_dir("content/locales")];
         assert_eq!(
             classify_change(
                 Path::new("content/locales/en/messages.json"),
@@ -1941,9 +1968,9 @@ watch_dirs = ["views", "locales"]
 
     #[test]
     fn custom_watch_dir_does_not_match_unrelated_prefix() {
-        // `views2/foo.html` must not be picked up by a `views` entry — the
-        // matcher is component-wise, not byte-prefix.
-        let custom = vec!["views".to_owned()];
+        // `views2/foo.html` must not be picked up by a `views` entry —
+        // matching is component-wise, not byte-prefix.
+        let custom = vec![test_dir("views")];
         assert_eq!(
             classify_change(
                 Path::new("views2/foo.html"),
@@ -1957,11 +1984,12 @@ watch_dirs = ["views", "locales"]
     #[cfg(unix)]
     #[test]
     fn custom_watch_dir_matches_absolute_event_path() {
-        // Regression: `notify` backends typically dispatch events with the
-        // absolute, canonicalized path of the watched dir, so the matcher
-        // must work against `/abs/path/views/...` even when the user
-        // configured the relative `views`.
-        let custom = vec!["views".to_owned()];
+        // `notify` backends typically dispatch absolute event paths, so
+        // matching must work against the resolved absolute form.
+        let custom = vec![CustomWatchDir {
+            relative: PathBuf::from("views"),
+            absolute: PathBuf::from("/home/user/project/views"),
+        }];
         assert_eq!(
             classify_change(
                 Path::new("/home/user/project/views/landing.html"),
@@ -1975,7 +2003,10 @@ watch_dirs = ["views", "locales"]
     #[cfg(unix)]
     #[test]
     fn custom_watch_dir_matches_absolute_multi_segment_event_path() {
-        let custom = vec!["content/locales".to_owned()];
+        let custom = vec![CustomWatchDir {
+            relative: PathBuf::from("content/locales"),
+            absolute: PathBuf::from("/home/user/project/content/locales"),
+        }];
         assert_eq!(
             classify_change(
                 Path::new("/home/user/project/content/locales/en/messages.json"),
@@ -1986,61 +2017,61 @@ watch_dirs = ["views", "locales"]
         );
     }
 
-    // ── path_contains_subpath ──────────────────────────────────────
-
+    #[cfg(unix)]
     #[test]
-    fn path_contains_subpath_matches_single_component() {
-        assert!(path_contains_subpath(
-            Path::new("views/landing.html"),
-            Path::new("views"),
-        ));
+    fn custom_watch_dir_does_not_match_ancestor_directory() {
+        // Regression: matching is anchored to the project root via the
+        // resolved absolute path. If the project itself lives under
+        // `/home/alice/views/app`, a custom entry `views` must NOT match
+        // the root-level `README.md` event, even though `views` appears
+        // in the parent path.
+        let custom = vec![CustomWatchDir {
+            relative: PathBuf::from("views"),
+            absolute: PathBuf::from("/home/alice/views/app/views"),
+        }];
+        assert_eq!(
+            classify_change(
+                Path::new("/home/alice/views/app/README.md"),
+                DebouncedEventKind::Any,
+                &custom,
+            ),
+            ChangeEffect::Ignore,
+        );
     }
 
-    #[test]
-    fn path_contains_subpath_matches_contiguous_sequence() {
-        assert!(path_contains_subpath(
-            Path::new("a/b/content/locales/en.toml"),
-            Path::new("content/locales"),
-        ));
-    }
+    // ── CustomWatchDir::matches ────────────────────────────────────
 
     #[test]
-    fn path_contains_subpath_rejects_non_contiguous_sequence() {
-        assert!(!path_contains_subpath(
-            Path::new("content/middle/locales/en.toml"),
-            Path::new("content/locales"),
-        ));
+    fn custom_watch_dir_matches_relative_event_path() {
+        let dir = test_dir("views");
+        assert!(dir.matches(Path::new("views/file.html")));
+        assert!(dir.matches(Path::new("views")));
+        assert!(!dir.matches(Path::new("other/file.html")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn path_contains_subpath_rejects_partial_component() {
-        assert!(!path_contains_subpath(
-            Path::new("views2/foo.html"),
-            Path::new("views"),
-        ));
+    fn custom_watch_dir_matches_absolute_event_path_via_helper() {
+        let dir = CustomWatchDir {
+            relative: PathBuf::from("views"),
+            absolute: PathBuf::from("/repo/views"),
+        };
+        assert!(dir.matches(Path::new("/repo/views/file.html")));
+        assert!(!dir.matches(Path::new("/elsewhere/views/file.html")));
     }
 
-    #[test]
-    fn path_contains_subpath_ignores_root_and_curdir() {
-        // Root/`./` segments are stripped, so absolute and relative inputs
-        // are compared on their normal components only.
-        #[cfg(unix)]
-        assert!(path_contains_subpath(
-            Path::new("/abs/views/file"),
-            Path::new("./views"),
-        ));
-        assert!(path_contains_subpath(
-            Path::new("./views/file"),
-            Path::new("views"),
-        ));
-    }
+    // ── resolve_custom_watch_dirs ──────────────────────────────────
 
     #[test]
-    fn path_contains_subpath_rejects_empty_subpath() {
-        assert!(!path_contains_subpath(
-            Path::new("views/file"),
-            Path::new("")
-        ));
+    fn resolve_skips_missing_dirs() {
+        let cwd = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(cwd.path().join("views")).expect("mkdir views");
+        let resolved =
+            resolve_custom_watch_dirs(&["views".to_owned(), "missing".to_owned()], cwd.path());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].relative, PathBuf::from("views"));
+        assert!(resolved[0].absolute.ends_with("views"));
+        assert!(resolved[0].absolute.is_absolute());
     }
 
     // ── normalize_watch_dir ────────────────────────────────────────
@@ -2081,6 +2112,19 @@ watch_dirs = ["views", "locales"]
     fn normalize_rejects_target_anywhere() {
         assert!(normalize_watch_dir("target").is_err());
         assert!(normalize_watch_dir("nested/target/cache").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_dotted_components() {
+        // Dotted directories like `.git` would still be visited by the
+        // watcher even though `should_ignore_path` filters their events
+        // later, flooding the debouncer. Reject them up front.
+        assert!(normalize_watch_dir(".git").is_err());
+        assert!(normalize_watch_dir(".cache").is_err());
+        assert!(normalize_watch_dir("nested/.hidden").is_err());
+        // `./views` (CurDir prefix) is still allowed — only Normal components
+        // starting with `.` are rejected.
+        assert!(normalize_watch_dir("./views").is_ok());
     }
 
     #[test]
