@@ -499,7 +499,9 @@ pub fn model_list_page(
                 }
             }
 
-            // Search
+            // Search. Hidden inputs preserve any active filters so
+            // submitting a search doesn't silently drop them — same
+            // invariant as the filter-aware sort/pagination links.
             form class="search-bar" method="get" {
                 input type="search" name="q" placeholder="Search…"
                     value=(search_query)
@@ -508,6 +510,9 @@ pub fn model_list_page(
                     hx-target="closest .card"
                     hx-select=".card > *"
                     hx-push-url="true" {}
+                @for (k, v) in filters {
+                    input type="hidden" name={ "filter." (k) } value=(v);
+                }
             }
 
             // Bulk-action form wraps the table so the row checkboxes
@@ -890,10 +895,15 @@ fn normalize_date_input(s: &str) -> String {
 /// Browsers silently reject RFC 3339 with `Z`/offset; this maps common
 /// backend representations onto the local-time shape the input expects.
 ///
-/// Timezone-aware inputs are converted to UTC (same instant, different
-/// representation). If parsing fails, the original string is returned
-/// unchanged — better to show the server's value than silently blank the
-/// field on edit.
+/// **Wall-time preserved.** For RFC 3339 inputs with an explicit offset,
+/// the offset is dropped but the local clock components are kept as-is
+/// (we use `naive_local()`, not `naive_utc()`). That way an unchanged
+/// edit-save round trip doesn't shift the timestamp — `12:34+05:30`
+/// renders as `12:34`, posts back unchanged as `12:34`, and the model can
+/// re-attach whatever offset it wants.
+///
+/// If parsing fails, the original string is returned unchanged — better
+/// to show the server's value than silently blank the field on edit.
 fn normalize_datetime_local_input(s: &str) -> String {
     if s.is_empty() {
         return String::new();
@@ -905,9 +915,11 @@ fn normalize_datetime_local_input(s: &str) -> String {
     if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return ndt.format("%Y-%m-%dT%H:%M").to_string();
     }
-    // RFC 3339 with timezone — serialize as UTC, drop the offset.
+    // RFC 3339 with timezone — keep the local wall-clock components and
+    // drop the offset (don't shift to UTC; that would mutate the value
+    // on a no-op save).
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
-        return dt.naive_utc().format("%Y-%m-%dT%H:%M").to_string();
+        return dt.naive_local().format("%Y-%m-%dT%H:%M").to_string();
     }
     s.to_owned()
 }
@@ -1216,11 +1228,21 @@ mod tests {
     }
 
     #[test]
-    fn normalize_datetime_local_strips_rfc3339_offset() {
-        // +05:30 offset → converted to UTC (07:04), then rendered local-shaped.
+    fn normalize_datetime_local_preserves_wall_time_across_offsets() {
+        // Regression: previously this used naive_utc() which shifted
+        // 12:34+05:30 to 07:04 UTC. That mutated the value on a no-op
+        // edit-save round trip. Now we preserve the local wall clock —
+        // the offset is dropped, but 12:34 stays 12:34 so re-saving
+        // produces the same logical timestamp.
         assert_eq!(
             normalize_datetime_local_input("2026-04-24T12:34:56+05:30"),
-            "2026-04-24T07:04"
+            "2026-04-24T12:34"
+        );
+        // Negative offset, end-of-day boundary — verify the date doesn't
+        // flip either.
+        assert_eq!(
+            normalize_datetime_local_input("2026-04-24T23:30:00-04:00"),
+            "2026-04-24T23:30"
         );
     }
 
@@ -1664,6 +1686,51 @@ mod tests {
         assert!(
             html.contains("page=2") && html.contains("filter.status=active"),
             "pagination link must preserve filter.status: {html}"
+        );
+    }
+
+    #[test]
+    fn search_form_carries_filters_as_hidden_inputs() {
+        // Regression: search submit (method=get) drops anything not in
+        // the form. Active filters must round-trip via hidden inputs so
+        // typing a search query doesn't reset the dataset.
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let active_filters = vec![
+            ("status".to_owned(), "active".to_owned()),
+            ("tier".to_owned(), "premium".to_owned()),
+        ];
+        let html = model_list_page(
+            &r,
+            "users",
+            "Users",
+            &fields,
+            &[],
+            &result,
+            "",
+            None,
+            SortDirection::Asc,
+            &active_filters,
+            &[],
+            "t",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"<input type="hidden" name="filter.status" value="active""#),
+            "search form should preserve filter.status: {html}"
+        );
+        assert!(
+            html.contains(r#"<input type="hidden" name="filter.tier" value="premium""#),
+            "search form should preserve filter.tier: {html}"
         );
     }
 
