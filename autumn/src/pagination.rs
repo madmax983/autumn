@@ -323,10 +323,8 @@ fn parse_cursor_query(query: &str) -> CursorRequest {
             continue;
         };
         match key.as_str() {
-            "cursor" => {
-                if !value.is_empty() {
-                    req.cursor = Some(value);
-                }
+            "cursor" if !value.is_empty() => {
+                req.cursor = Some(value);
             }
             "limit" => {
                 if let Ok(n) = value.parse::<u32>() {
