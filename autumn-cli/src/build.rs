@@ -115,12 +115,11 @@ fn resolve_binary_from_metadata(
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
 
-            let is_bin =
-                |t: &&serde_json::Value| -> bool {
-                    t["kind"]
-                        .as_array()
-                        .is_some_and(|k| k.iter().any(|k| k == "bin"))
-                };
+            let is_bin = |t: &&serde_json::Value| -> bool {
+                t["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == "bin"))
+            };
 
             // Prefer the binary whose src_path is exactly `src/main.rs` so
             // that secondary targets (e.g. a WASM client bin) are not

@@ -24,7 +24,7 @@ use std::time::Duration;
 /// Debounce interval for checking the shutdown flag in the watch loop.
 const SHUTDOWN_CHECK_INTERVAL_MS: u64 = 200;
 
-/// Set to `true` by the SIGINT/SIGTERM handler to request a clean shutdown.
+/// Set to `true` by the SIGINT handler to request a clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Default debounce interval for file change events.
@@ -160,10 +160,8 @@ impl DevReloadState {
 pub fn run(package: Option<&str>, show_config: bool) {
     eprintln!("\u{1F342} autumn dev\n");
 
-    // Register SIGINT/SIGTERM handler so Ctrl+C or `kill <pid>` triggers a
-    // graceful shutdown instead of immediately terminating the process (and
-    // leaving the child running).  The `termination` feature of ctrlc also
-    // catches SIGTERM and SIGHUP on Unix without requiring unsafe code.
+    // Register SIGINT handler so Ctrl+C triggers a graceful shutdown instead
+    // of immediately terminating the process (and leaving the child running).
     if let Err(err) = ctrlc::set_handler(move || {
         SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
     }) {
@@ -534,9 +532,10 @@ fn stop_server(child: &mut Option<Child>) {
         #[cfg(unix)]
         {
             if let Some(pid) = validate_pid_for_kill(proc.id()) {
-                // SAFETY: pid > 0 (validated above); SIGTERM is a valid signal number.
-                if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
-                    let e = std::io::Error::last_os_error();
+                if let Err(e) = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGTERM,
+                ) {
                     eprintln!("  Warning: failed to send SIGTERM to process: {e}");
                 }
             }
@@ -1058,12 +1057,11 @@ fn resolve_binary_from_metadata(
                 .parent()
                 .unwrap_or_else(|| Path::new(""));
 
-            let is_bin =
-                |t: &&serde_json::Value| -> bool {
-                    t["kind"]
-                        .as_array()
-                        .is_some_and(|k| k.iter().any(|k| k == "bin"))
-                };
+            let is_bin = |t: &&serde_json::Value| -> bool {
+                t["kind"]
+                    .as_array()
+                    .is_some_and(|k| k.iter().any(|k| k == "bin"))
+            };
 
             // Prefer the binary whose src_path is exactly `src/main.rs` so
             // that secondary targets (e.g. a WASM client bin) are not
