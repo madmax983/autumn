@@ -749,6 +749,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_404_handler_returns_empty_no_content_for_favicon_head() {
+        let response = fallback_404_handler(
+            axum::http::Method::HEAD,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
     async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {
         let response = fallback_404_handler(
             axum::http::Method::POST,
