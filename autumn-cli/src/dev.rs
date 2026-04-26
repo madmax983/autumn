@@ -1127,7 +1127,7 @@ mod tests {
         let _guard = LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let previous = std::env::current_dir().expect("current cwd");
         std::env::set_current_dir(cwd).expect("set cwd");
