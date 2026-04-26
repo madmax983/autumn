@@ -18,6 +18,7 @@ use crate::parse;
 ///
 /// `http_method` is the uppercase method name (e.g., `"GET"`).
 /// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
+#[allow(clippy::too_many_lines)]
 pub fn route_macro(
     http_method: &str,
     axum_fn: &str,
@@ -191,7 +192,7 @@ fn should_stringify_primitive_output(output: &ReturnType) -> Option<bool> {
                 if ident == "Result" || ident == "AutumnResult" {
                     if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                         if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                            if let Some(false) = check_type(inner) {
+                            if check_type(inner) == Some(false) {
                                 return Some(true);
                             }
                         }
