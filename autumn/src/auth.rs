@@ -1716,4 +1716,62 @@ mod tests {
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
     }
+
+    #[tokio::test]
+    async fn test_hash_password_empty() {
+        let password = "";
+        let hash = super::hash_password(password)
+            .await
+            .expect("Failed to hash empty password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(password, &hash)
+            .await
+            .expect("Failed to verify empty password");
+        assert!(is_valid, "Empty password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_long() {
+        // bcrypt truncates after 72 bytes. We just want to ensure it doesn't crash.
+        let password = "a".repeat(100);
+        let hash = super::hash_password(&password)
+            .await
+            .expect("Failed to hash long password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(&password, &hash)
+            .await
+            .expect("Failed to verify long password");
+        assert!(is_valid, "Long password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_unicode() {
+        // Test with non-ascii characters
+        let password = "🚀my_secrët_passwörd🔑";
+        let hash = super::hash_password(password)
+            .await
+            .expect("Failed to hash unicode password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(password, &hash)
+            .await
+            .expect("Failed to verify unicode password");
+        assert!(is_valid, "Unicode password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_verify_password_invalid_hash() {
+        // Ensure that providing invalid hashes doesn't crash or cause issues, but returns an error/false
+        let password = "my_super_secret_password";
+
+        // Invalid prefix
+        let result = super::verify_password(password, "invalid_hash_string").await;
+        assert!(result.is_err() || !result.unwrap());
+
+        // Truncated hash
+        let result2 = super::verify_password(password, "$2b$04$").await;
+        assert!(result2.is_err() || !result2.unwrap());
+    }
 }
