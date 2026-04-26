@@ -1933,6 +1933,24 @@ mod tests {
             assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
         }
     }
+
+    #[tokio::test]
+    async fn test_actuator_router_calls_prefix_variant() {
+        // The `actuator_router` function is a convenience wrapper around `actuator_router_with_prefix`
+        // using "/actuator" as the prefix. We can test it by building it and hitting one of the endpoints.
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
 
 #[cfg(test)]
