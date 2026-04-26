@@ -644,16 +644,51 @@ fn classify_change(
 
     // Files inside a user-configured custom watch directory don't have known
     // semantics — restart the server and trigger a full reload so the change
-    // is picked up regardless of what the directory contains. Compare via
-    // `Path::starts_with` so multi-segment entries (e.g. `content/locales`)
-    // match correctly.
+    // is picked up regardless of what the directory contains.
+    //
+    // `notify`'s backends tend to dispatch events with absolute paths even
+    // when the watch was registered with a relative path (FSEvents on macOS
+    // always, inotify after canonicalization on Linux), so a naive
+    // `Path::starts_with(relative_dir)` won't match. Use a component-level
+    // subsequence match so e.g. `views` matches `/repo/views/landing.html`
+    // and `content/locales` matches `/repo/content/locales/en.json`.
     for dir in custom_watch_dirs {
-        if path.starts_with(dir) {
+        if path_contains_subpath(path, Path::new(dir)) {
             return ChangeEffect::RestartOnly;
         }
     }
 
     ChangeEffect::Ignore
+}
+
+/// True if `subpath`'s normal components appear contiguously inside `path`.
+///
+/// Only `Component::Normal` parts are compared, so a `RootDir` or `CurDir`
+/// at the start of either path is ignored. This makes the check work for
+/// both relative event paths (`views/landing.html`) and absolute event
+/// paths (`/repo/views/landing.html`) against the same relative entry
+/// (`views`).
+fn path_contains_subpath(path: &Path, subpath: &Path) -> bool {
+    let normalize = |p: &Path| -> Vec<std::ffi::OsString> {
+        p.components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(part) => Some(part.to_os_string()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let needle = normalize(subpath);
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack = normalize(path);
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle.as_slice())
 }
 
 fn should_ignore_path(path: &Path) -> bool {
@@ -1917,6 +1952,95 @@ watch_dirs = ["views", "locales"]
             ),
             ChangeEffect::Ignore,
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_watch_dir_matches_absolute_event_path() {
+        // Regression: `notify` backends typically dispatch events with the
+        // absolute, canonicalized path of the watched dir, so the matcher
+        // must work against `/abs/path/views/...` even when the user
+        // configured the relative `views`.
+        let custom = vec!["views".to_owned()];
+        assert_eq!(
+            classify_change(
+                Path::new("/home/user/project/views/landing.html"),
+                DebouncedEventKind::Any,
+                &custom,
+            ),
+            ChangeEffect::RestartOnly,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_watch_dir_matches_absolute_multi_segment_event_path() {
+        let custom = vec!["content/locales".to_owned()];
+        assert_eq!(
+            classify_change(
+                Path::new("/home/user/project/content/locales/en/messages.json"),
+                DebouncedEventKind::Any,
+                &custom,
+            ),
+            ChangeEffect::RestartOnly,
+        );
+    }
+
+    // ── path_contains_subpath ──────────────────────────────────────
+
+    #[test]
+    fn path_contains_subpath_matches_single_component() {
+        assert!(path_contains_subpath(
+            Path::new("views/landing.html"),
+            Path::new("views"),
+        ));
+    }
+
+    #[test]
+    fn path_contains_subpath_matches_contiguous_sequence() {
+        assert!(path_contains_subpath(
+            Path::new("a/b/content/locales/en.toml"),
+            Path::new("content/locales"),
+        ));
+    }
+
+    #[test]
+    fn path_contains_subpath_rejects_non_contiguous_sequence() {
+        assert!(!path_contains_subpath(
+            Path::new("content/middle/locales/en.toml"),
+            Path::new("content/locales"),
+        ));
+    }
+
+    #[test]
+    fn path_contains_subpath_rejects_partial_component() {
+        assert!(!path_contains_subpath(
+            Path::new("views2/foo.html"),
+            Path::new("views"),
+        ));
+    }
+
+    #[test]
+    fn path_contains_subpath_ignores_root_and_curdir() {
+        // Root/`./` segments are stripped, so absolute and relative inputs
+        // are compared on their normal components only.
+        #[cfg(unix)]
+        assert!(path_contains_subpath(
+            Path::new("/abs/views/file"),
+            Path::new("./views"),
+        ));
+        assert!(path_contains_subpath(
+            Path::new("./views/file"),
+            Path::new("views"),
+        ));
+    }
+
+    #[test]
+    fn path_contains_subpath_rejects_empty_subpath() {
+        assert!(!path_contains_subpath(
+            Path::new("views/file"),
+            Path::new("")
+        ));
     }
 
     // ── normalize_watch_dir ────────────────────────────────────────
