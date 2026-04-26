@@ -160,24 +160,29 @@ impl Limiter {
     /// used.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers {
-            if let Some(value) = req.headers().get("x-forwarded-for") {
-                if let Ok(s) = value.to_str() {
-                    if let Some(first) = s.split(',').next() {
-                        let trimmed = first.trim();
-                        if !trimmed.is_empty() {
-                            return Some(trimmed.to_owned());
-                        }
-                    }
-                }
+            let xff_ip = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+
+            if xff_ip.is_some() {
+                return xff_ip;
             }
 
-            if let Some(value) = req.headers().get("x-real-ip") {
-                if let Ok(s) = value.to_str() {
-                    let trimmed = s.trim();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed.to_owned());
-                    }
-                }
+            let real_ip = req
+                .headers()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+
+            if real_ip.is_some() {
+                return real_ip;
             }
         }
 
