@@ -534,10 +534,9 @@ fn stop_server(child: &mut Option<Child>) {
         #[cfg(unix)]
         {
             if let Some(pid) = validate_pid_for_kill(proc.id()) {
-                if let Err(e) = nix::sys::signal::kill(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGTERM,
-                ) {
+                // SAFETY: pid > 0 (validated above); SIGTERM is a valid signal number.
+                if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+                    let e = std::io::Error::last_os_error();
                     eprintln!("  Warning: failed to send SIGTERM to process: {e}");
                 }
             }
