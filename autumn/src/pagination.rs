@@ -580,6 +580,24 @@ mod tests {
         assert_eq!(json["content"], serde_json::json!(["a", "b"]));
     }
 
+
+    // ── CursorPage tests ───────────────────────────────────────
+
+    #[test]
+    fn cursor_page_empty_creates_empty_page() {
+        let page: CursorPage<i32> = CursorPage::empty();
+        assert!(page.content.is_empty());
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn cursor_page_map_transforms_content_and_preserves_cursor() {
+        let page = CursorPage::new(vec![1, 2, 3], Some("abc".to_string()));
+        let mapped = page.map(|n| n.to_string());
+        assert_eq!(mapped.content, vec!["1", "2", "3"]);
+        assert_eq!(mapped.next_cursor, Some("abc".to_string()));
+    }
+
     // ── CursorRequest tests ────────────────────────────────────
 
     #[test]
