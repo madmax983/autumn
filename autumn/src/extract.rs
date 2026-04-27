@@ -225,6 +225,74 @@ impl MultipartField<'_> {
         Ok(out)
     }
 
+    /// Stream this field into a [`BlobStore`](crate::storage::BlobStore)
+    /// while enforcing file-size limits.
+    ///
+    /// This is the production-ready replacement for [`save_to`](Self::save_to):
+    /// the bytes flow through the configured blob backend (Local for dev,
+    /// S3 for prod) so they survive container restarts and are visible to
+    /// every replica.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::extract::Multipart;
+    /// use autumn_web::storage::BlobStoreState;
+    ///
+    /// #[post("/avatar")]
+    /// async fn upload(state: State<AppState>, mut form: Multipart) -> AutumnResult<String> {
+    ///     let store = state.extension::<BlobStoreState>().expect("storage configured");
+    ///     while let Some(field) = form.next_field().await? {
+    ///         if field.name() == Some("avatar") {
+    ///             let blob = field
+    ///                 .save_to_blob_store(store.store().as_ref(), "avatars/me.png")
+    ///                 .await?;
+    ///             return Ok(blob.key);
+    ///         }
+    ///     }
+    ///     Err(autumn_web::AutumnError::bad_request_msg("missing avatar field"))
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field exceeds
+    /// `security.upload.max_file_size_bytes`, when the multipart body is
+    /// malformed, or when the underlying [`BlobStore`](crate::storage::BlobStore)
+    /// rejects the write.
+    #[cfg(feature = "storage")]
+    pub async fn save_to_blob_store(
+        mut self,
+        store: &(dyn crate::storage::BlobStore + '_),
+        key: impl Into<String>,
+    ) -> crate::AutumnResult<crate::storage::Blob> {
+        let key = key.into();
+        let content_type = self
+            .inner
+            .content_type()
+            .map(str::to_owned)
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = self
+            .inner
+            .chunk()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        {
+            if buf.len().saturating_add(chunk.len()) > self.max_file_size_bytes {
+                return Err(file_too_large_error(self.max_file_size_bytes));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        store
+            .put(&key, &content_type, bytes::Bytes::from(buf))
+            .await
+            .map_err(crate::storage::BlobStoreError::into_autumn_error)
+    }
+
     /// Stream this field to disk while enforcing file-size limits.
     ///
     /// # Errors

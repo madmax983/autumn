@@ -5,6 +5,12 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), and a feature-gated `S3BlobStore` shell behind `storage-s3`. `MultipartField::save_to_blob_store` integrates the existing extractor with the blob store. Profile-aware defaults mirror sessions: `dev` opts into `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. New `examples/avatars` demonstrates the upload-then-render flow with an integration test that proves bytes survive a process restart on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
+
 ## [0.3.0] - 2026-04-27
 
 ### Added

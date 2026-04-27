@@ -1,0 +1,18 @@
+[package]
+name = "avatars"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn", features = ["storage", "multipart"] }
+bytes = "1"
+maud = { version = "0.27", features = ["axum"] }
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http = { workspace = true }
+http-body-util = "0.1"
+tempfile = "3"

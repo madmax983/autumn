@@ -38,6 +38,13 @@ telemetry-otlp = [
     "dep:tracing-opentelemetry",
 ]
 redis = ["dep:redis"]
+# Pluggable file storage backends (Local always-on under `storage`,
+# S3 gated behind `storage-s3`). Off by default; enabling adds the
+# `BlobStore` trait, the `Blob` value type, and a Local backend.
+# When combined with `db`, opts diesel into `serde_json` so the `Blob`
+# value type can round-trip through a Postgres `JSONB` column.
+storage = ["diesel?/serde_json"]
+storage-s3 = ["storage"]
 
 [dependencies]
 autumn-macros = { version = "0.3.0", path = "../autumn-macros" }

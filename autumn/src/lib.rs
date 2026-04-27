@@ -112,6 +112,8 @@ pub(crate) mod route;
 pub use route::Route;
 pub mod security;
 pub mod session;
+#[cfg(feature = "storage")]
+pub mod storage;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;

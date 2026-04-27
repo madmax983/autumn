@@ -1058,6 +1058,11 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
+        // 4d. Fail-fast on invalid storage config — same rationale: surface
+        // configuration mistakes before we run migrations or bind the port.
+        #[cfg(feature = "storage")]
+        fail_fast_on_invalid_storage_config(&config);
+
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
         let pool = setup_database(&config, migrations, pool_provider_factory)
@@ -1086,6 +1091,12 @@ impl AppBuilder {
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+
+        // Provision the configured BlobStore (if any) and remember the
+        // optional serving route so the router can mount it below.
+        #[cfg(feature = "storage")]
+        let storage_router = setup_storage(&config, &state);
+
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1093,6 +1104,12 @@ impl AppBuilder {
         } else {
             None
         };
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers = merge_routers;
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_with_static_inner(
             all_routes,
             &config,
@@ -1673,6 +1690,158 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     if let Err(error) = config.session.backend_plan(config.profile.as_deref()) {
         eprintln!("Invalid session backend config: {error}");
         std::process::exit(1);
+    }
+}
+
+/// Run the same `backend_plan` resolution `setup_storage` will do later,
+/// but before any DB side effects, so configuration mistakes (e.g. a
+/// `prod` profile choosing `local` without explicit acknowledgement)
+/// fail the boot loudly instead of running migrations first.
+#[cfg(feature = "storage")]
+fn fail_fast_on_invalid_storage_config(config: &AutumnConfig) {
+    if let Err(error) = config.storage.backend_plan(config.profile.as_deref()) {
+        eprintln!("Invalid storage backend config: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Provision the configured [`BlobStore`](crate::storage::BlobStore),
+/// install it on [`AppState`] as a [`BlobStoreState`](crate::storage::BlobStoreState)
+/// extension, and return the optional serving router for the Local
+/// backend.
+#[cfg(feature = "storage")]
+fn setup_storage(
+    config: &AutumnConfig,
+    state: &AppState,
+) -> Option<axum::Router<AppState>> {
+    use crate::storage::{
+        BlobStoreState, LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey,
+    };
+
+    let plan = match config.storage.backend_plan(config.profile.as_deref()) {
+        Ok(plan) => plan,
+        Err(error) => {
+            // Reachable in tests / custom flows that bypass the
+            // fail-fast above; log + skip storage rather than crash.
+            tracing::error!(%error, "storage configured but invalid; skipping");
+            return None;
+        }
+    };
+
+    match plan {
+        StorageBackendPlan::Disabled => None,
+        StorageBackendPlan::Local {
+            provider_id,
+            root,
+            mount_path,
+            default_url_expiry_secs,
+            warn_in_production,
+        } => {
+            if warn_in_production {
+                tracing::warn!(
+                    "prod profile is using the local-disk blob store; \
+                     bytes won't survive replica turnover. Set \
+                     storage.backend=s3 or storage.allow_local_in_production=true \
+                     to acknowledge"
+                );
+            }
+            let signing_key = match config
+                .storage
+                .local
+                .signing_key
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => SigningKey::new(s.as_bytes().to_vec()),
+                None => {
+                    if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                        tracing::warn!(
+                            "no storage.local.signing_key configured in prod; \
+                             generated URLs won't survive a process restart. \
+                             Set [storage.local].signing_key or \
+                             AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
+                        );
+                    }
+                    SigningKey::random()
+                }
+            };
+            let store = match LocalBlobStore::new(
+                provider_id.clone(),
+                root.clone(),
+                mount_path.clone(),
+                std::time::Duration::from_secs(default_url_expiry_secs),
+                signing_key,
+            ) {
+                Ok(store) => store,
+                Err(err) => {
+                    tracing::error!(
+                        error = %err,
+                        root = %root.display(),
+                        "failed to initialize local blob store"
+                    );
+                    return None;
+                }
+            };
+            let serving = crate::storage::local::serve_router(store.clone());
+            let arc: SharedBlobStore = std::sync::Arc::new(store);
+            state.insert_extension::<BlobStoreState>(BlobStoreState::new(arc));
+            tracing::info!(
+                provider = %provider_id,
+                root = %root.display(),
+                mount = %mount_path,
+                "Local blob store mounted"
+            );
+            Some(serving)
+        }
+        StorageBackendPlan::S3 {
+            provider_id,
+            bucket,
+            region,
+            endpoint,
+            public_base_url,
+            force_path_style,
+            default_url_expiry_secs,
+        } => {
+            #[cfg(feature = "storage-s3")]
+            {
+                use crate::storage::s3::{S3BlobStore, S3Options};
+                let options = S3Options {
+                    provider_id: provider_id.clone(),
+                    bucket: bucket.clone(),
+                    region: region.clone(),
+                    endpoint: endpoint.clone(),
+                    public_base_url,
+                    force_path_style,
+                    default_expiry: std::time::Duration::from_secs(default_url_expiry_secs),
+                };
+                let arc: SharedBlobStore = std::sync::Arc::new(S3BlobStore::new(options));
+                state.insert_extension::<BlobStoreState>(BlobStoreState::new(arc));
+                tracing::info!(
+                    provider = %provider_id,
+                    bucket = %bucket,
+                    region = %region,
+                    endpoint = ?endpoint,
+                    "S3 blob store configured"
+                );
+                None
+            }
+            #[cfg(not(feature = "storage-s3"))]
+            {
+                let _ = (
+                    provider_id,
+                    bucket,
+                    region,
+                    endpoint,
+                    public_base_url,
+                    force_path_style,
+                    default_url_expiry_secs,
+                );
+                tracing::error!(
+                    "storage.backend=s3 selected but the `storage-s3` cargo feature is not enabled"
+                );
+                None
+            }
+        }
     }
 }
 
