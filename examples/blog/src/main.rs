@@ -1,7 +1,9 @@
+mod admin;
 mod models;
 mod routes;
 mod schema;
 
+use autumn_admin_plugin::AdminPlugin;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::{routes, static_routes};
 
@@ -11,6 +13,12 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        .plugin(
+            AdminPlugin::new()
+                .prefix("/backoffice")
+                .require_role(None::<String>)
+                .register(admin::PostAdmin),
+        )
         .routes(routes![
             // Public routes
             routes::about::about, // #[static_get] — pre-rendered
@@ -36,6 +44,8 @@ async fn main() {
 mod tests {
     use std::path::Path;
 
+    use autumn_admin_plugin::{AdminFieldKind, AdminModel};
+
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_posts/up.sql");
 
     #[test]
@@ -60,6 +70,35 @@ mod tests {
         assert!(
             sql.contains("ALTER SEQUENCE posts_id_seq AS BIGINT"),
             "post upgrade migration must widen the backing sequence to BIGINT",
+        );
+    }
+
+    #[test]
+    fn backoffice_admin_fields_match_blog_post_shape() {
+        let fields = super::admin::PostAdmin.fields();
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "title"
+                    && matches!(field.kind, AdminFieldKind::Text)
+                    && field.searchable
+            }),
+            "expected searchable title field in admin schema"
+        );
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "published"
+                    && matches!(field.kind, AdminFieldKind::Boolean)
+                    && field.filterable
+            }),
+            "expected filterable published field in admin schema"
+        );
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "created_at"
+                    && matches!(field.kind, AdminFieldKind::DateTime)
+                    && !field.editable
+            }),
+            "expected readonly created_at field in admin schema"
         );
     }
 }

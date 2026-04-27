@@ -39,7 +39,10 @@ mod templates;
 mod traits;
 
 pub use registry::AdminRegistry;
-pub use traits::{AdminAction, AdminField, AdminFieldKind, AdminModel};
+pub use traits::{
+    AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams,
+    ListResult, SortDirection,
+};
 
 use std::borrow::Cow;
 use std::sync::Arc;
