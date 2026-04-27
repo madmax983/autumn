@@ -243,3 +243,27 @@ fn is_primitive(ident: &str) -> bool {
             | "f64"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn test_primitive_check() {
+        let bare: ReturnType = parse_quote! { -> i32 };
+        assert!(matches!(check_primitive_output(&bare), Some(PrimitiveType::Bare)));
+
+        let res: ReturnType = parse_quote! { -> Result<i32, String> };
+        assert!(matches!(check_primitive_output(&res), Some(PrimitiveType::Result)));
+
+        let complex: ReturnType = parse_quote! { -> Vec<i32> };
+        assert!(matches!(check_primitive_output(&complex), None));
+
+        let res_complex: ReturnType = parse_quote! { -> Result<Vec<i32>, String> };
+        assert!(matches!(check_primitive_output(&res_complex), None));
+
+        let no_ret: ReturnType = parse_quote! {};
+        assert!(matches!(check_primitive_output(&no_ret), None));
+    }
+}
