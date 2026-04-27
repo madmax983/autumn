@@ -175,7 +175,7 @@ fn cursor_app() -> Router {
     async fn feed(req: CursorRequest) -> Json<CursorPage<FeedItem>> {
         // Sort newest-first with id as tie-breaker.
         let mut sorted = seed_feed(25);
-        sorted.sort_by(|a, b| (b.created_at, b.id).cmp(&(a.created_at, a.id)));
+        sorted.sort_by_key(|i| std::cmp::Reverse((i.created_at, i.id)));
 
         // Apply keyset filter (this is what the SQL query does in
         // production: `WHERE (created_at, id) < (?, ?)`).

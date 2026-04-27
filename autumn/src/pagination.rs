@@ -719,10 +719,8 @@ fn parse_cursor_query(query: &str) -> CursorRequest {
             continue;
         };
         match key.as_str() {
-            "cursor" => {
-                if !value.is_empty() {
-                    req.cursor = Some(value);
-                }
+            "cursor" if !value.is_empty() => {
+                req.cursor = Some(value);
             }
             "size" => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -1461,7 +1459,7 @@ mod tests {
             })
             .collect();
         // Sort newest-first so id=1 is first.
-        table.sort_by(|a, b| (b.created_at, b.id).cmp(&(a.created_at, a.id)));
+        table.sort_by_key(|r| std::cmp::Reverse((r.created_at, r.id)));
 
         // First request: no cursor, size=2.
         let req1 = CursorRequest::new(None, 2);
