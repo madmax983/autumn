@@ -32,7 +32,7 @@ pub struct S3Options {
     pub bucket: String,
     /// Region (or region-shaped string for non-AWS providers).
     pub region: String,
-    /// Custom endpoint URL (R2, MinIO, DO Spaces, Wasabi).
+    /// Custom endpoint URL (R2, `MinIO`, DO Spaces, Wasabi).
     pub endpoint: Option<String>,
     /// Public base URL for presigned URLs.
     pub public_base_url: Option<String>,
