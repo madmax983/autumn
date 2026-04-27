@@ -185,9 +185,7 @@ impl AdminModel for PostAdmin {
         let pool = pool.clone();
         Box::pin(async move {
             let new_post: NewPost = serde_json::from_value(data).map_err(Self::validation_error)?;
-            let new_post = new_post
-                .validated()
-                .map_err(Self::validation_error)?;
+            let new_post = new_post.validated().map_err(Self::validation_error)?;
             let mut conn = pool.get().await.map_err(Self::pool_error)?;
 
             let created = diesel::insert_into(posts::table)
@@ -210,9 +208,7 @@ impl AdminModel for PostAdmin {
         let pool = pool.clone();
         Box::pin(async move {
             let new_post: NewPost = serde_json::from_value(data).map_err(Self::validation_error)?;
-            let new_post = new_post
-                .validated()
-                .map_err(Self::validation_error)?;
+            let new_post = new_post.validated().map_err(Self::validation_error)?;
             let changes = UpdatePost {
                 title: Some(new_post.title),
                 slug: Some(new_post.slug),
