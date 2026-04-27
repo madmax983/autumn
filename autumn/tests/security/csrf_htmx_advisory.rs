@@ -1,5 +1,10 @@
-use axum::{body::Body, http::{Request, StatusCode}, routing::post, Router};
 use autumn_web::security::{CsrfConfig, CsrfLayer};
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, StatusCode},
+    routing::post,
+};
 use tower::ServiceExt;
 
 #[tokio::test]
