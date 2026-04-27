@@ -175,23 +175,30 @@ fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
 
 /// Minimal inline CSS fallback so error pages look reasonable even without
 /// Tailwind CSS loaded. Provides the essential layout and dark mode styling.
-const FALLBACK_STYLES: &str = r"<style>
-:root { color-scheme: light dark; }
+///
+/// Built at compile time by concatenating the shared [`crate::ui::tokens::TOKENS_CSS`]
+/// block with a small set of layout rules. Values that change in dark mode
+/// (`--bg`, `--text`) are overridden inside a `prefers-color-scheme: dark`
+/// block — other tokens are inherited.
+const FALLBACK_STYLES: &str = concat!(
+    "<style>",
+    ":root { color-scheme: light dark; }",
+    include_str!("../ui/tokens.css"),
+    "
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #0a0a0a; --text: #eee; --surface: #1a1a1a; --border: #2a2a2a; --text-muted: #888; }
+}
 body {
-    font-family: system-ui, -apple-system, sans-serif;
+    font-family: var(--font-family);
     margin: 0;
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 1rem;
-    background: #fff;
-    color: #111;
+    background: var(--bg);
+    color: var(--text);
 }
-.dark body, @media (prefers-color-scheme: dark) { body {
-    background: #0a0a0a;
-    color: #eee;
-}}
 .text-center { text-align: center; }
 code {
     padding: 0.125rem 0.5rem;
@@ -208,7 +215,8 @@ a {
     transition: opacity 0.15s;
 }
 a:hover { opacity: 0.8; }
-</style>";
+</style>"
+);
 
 #[cfg(test)]
 mod tests {
