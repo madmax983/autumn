@@ -82,8 +82,10 @@ pub type BlobFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BlobStoreErro
 /// Stream of byte chunks accepted by [`BlobStore::put_stream`].
 ///
 /// Each item is a `bytes::Bytes` chunk; errors propagate as
-/// [`BlobStoreError`].
-pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, BlobStoreError>> + Send>>;
+/// [`BlobStoreError`]. The lifetime parameter lets callers borrow the
+/// chunk source from their own stack (e.g. an in-flight multipart
+/// extractor) without forcing a `'static` bound.
+pub type ByteStream<'a> = Pin<Box<dyn Stream<Item = Result<Bytes, BlobStoreError>> + Send + 'a>>;
 
 /// Errors returned by [`BlobStore`] operations.
 #[derive(Debug, Error)]
@@ -184,7 +186,7 @@ pub trait BlobStore: Send + Sync + 'static {
         &'a self,
         key: &'a str,
         content_type: &'a str,
-        data: ByteStream,
+        data: ByteStream<'a>,
     ) -> BlobFuture<'a, Blob>;
 
     /// Read the bytes for `key` into memory.

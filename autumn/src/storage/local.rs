@@ -153,9 +153,20 @@ impl BlobStore for LocalBlobStore {
                     .map_err(BlobStoreError::io)?;
             }
             let etag = sha256_hex(&bytes);
-            tokio::fs::write(&path, &bytes)
-                .await
-                .map_err(BlobStoreError::io)?;
+
+            // Write to a temp file in the same directory, then rename
+            // into place. This means a partial write (disk full,
+            // crash, killed process) never leaves a truncated blob at
+            // `path` for a future `get` to serve.
+            let tmp_path = temp_sibling_path(&path);
+            if let Err(err) = tokio::fs::write(&tmp_path, &bytes).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(BlobStoreError::io(err));
+            }
+            if let Err(err) = tokio::fs::rename(&tmp_path, &path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(BlobStoreError::io(err));
+            }
             Ok(Blob {
                 provider_id: self.inner.provider_id.clone(),
                 key: key.to_owned(),
@@ -170,7 +181,7 @@ impl BlobStore for LocalBlobStore {
         &'a self,
         key: &'a str,
         content_type: &'a str,
-        mut data: ByteStream,
+        mut data: ByteStream<'a>,
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt as _;
@@ -182,13 +193,14 @@ impl BlobStore for LocalBlobStore {
                     .map_err(BlobStoreError::io)?;
             }
 
-            // Write through a closure so we can clean up the
-            // partially-written file on any error path. Without this,
-            // a client disconnect or transient I/O failure leaves a
-            // corrupt blob at `path` that future `get` calls would
-            // happily serve.
+            // Stream into a sibling temp file and rename into place
+            // only on a clean finish. A client disconnect, mid-stream
+            // error, or transient I/O failure leaves the temp file
+            // (which we unlink) and never touches `path`, so future
+            // `get` calls don't serve a corrupted blob.
+            let tmp_path = temp_sibling_path(&path);
             let result = async {
-                let mut file = tokio::fs::File::create(&path)
+                let mut file = tokio::fs::File::create(&tmp_path)
                     .await
                     .map_err(BlobStoreError::io)?;
                 let mut hasher = Sha256::new();
@@ -205,15 +217,21 @@ impl BlobStore for LocalBlobStore {
             .await;
 
             match result {
-                Ok((byte_size, etag)) => Ok(Blob {
-                    provider_id: self.inner.provider_id.clone(),
-                    key: key.to_owned(),
-                    content_type: content_type.to_owned(),
-                    byte_size,
-                    etag: Some(etag),
-                }),
+                Ok((byte_size, etag)) => {
+                    if let Err(err) = tokio::fs::rename(&tmp_path, &path).await {
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        return Err(BlobStoreError::io(err));
+                    }
+                    Ok(Blob {
+                        provider_id: self.inner.provider_id.clone(),
+                        key: key.to_owned(),
+                        content_type: content_type.to_owned(),
+                        byte_size,
+                        etag: Some(etag),
+                    })
+                }
                 Err(err) => {
-                    let _ = tokio::fs::remove_file(&path).await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
                     Err(err)
                 }
             }
@@ -346,6 +364,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex(hasher.finalize())
 }
 
+/// Build a same-directory temp path for atomic write-then-rename. The
+/// suffix carries a UUID v4 so concurrent writers to the same key
+/// don't collide. Same-directory placement is what makes the `rename`
+/// atomic on POSIX (cross-device renames would silently degrade to
+/// copy-and-delete).
+fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("blob"),
+        std::ffi::OsStr::to_owned,
+    );
+    name.push(".tmp.");
+    name.push(&id);
+    path.with_file_name(name)
+}
+
 /// Percent-encode each `/`-separated segment of `key` for use in a URL
 /// path. Segment separators stay raw so the path tree survives.
 fn encode_key_path(key: &str) -> String {
@@ -467,7 +501,7 @@ mod tests {
             Ok(Bytes::from_static(b"hello, ")),
             Ok(Bytes::from_static(b"world")),
         ];
-        let stream: ByteStream = Box::pin(stream::iter(chunks));
+        let stream: ByteStream<'static> = Box::pin(stream::iter(chunks));
         let blob = s
             .put_stream("greet.txt", "text/plain", stream)
             .await
@@ -588,7 +622,7 @@ mod tests {
             Ok(Bytes::from_static(b"first")),
             Err(BlobStoreError::Backend("boom".into())),
         ];
-        let stream: ByteStream = Box::pin(stream::iter(chunks));
+        let stream: ByteStream<'static> = Box::pin(stream::iter(chunks));
         let err = s
             .put_stream("interrupted.bin", "application/octet-stream", stream)
             .await
@@ -610,5 +644,41 @@ mod tests {
         assert_eq!(encode_key_path("a/b/c"), "a/b/c");
         assert_eq!(encode_key_path("a b/c?d"), "a%20b/c%3Fd");
         assert_eq!(encode_key_path("hash#frag/q"), "hash%23frag/q");
+    }
+
+    #[tokio::test]
+    async fn put_replaces_atomically() {
+        // Successive `put` calls to the same key replace via temp-file +
+        // rename. Concrete fault injection for a mid-write IO error is
+        // exercised through `put_stream_cleans_up_partial_file_on_error`;
+        // here we just confirm the happy path of atomic replacement.
+        let dir = temp_root();
+        let s = store(dir.path());
+        s.put(
+            "k.bin",
+            "application/octet-stream",
+            Bytes::from_static(b"first"),
+        )
+        .await
+        .unwrap();
+        s.put(
+            "k.bin",
+            "application/octet-stream",
+            Bytes::from_static(b"second"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(&s.get("k.bin").await.unwrap()[..], b"second");
+
+        // No leftover temp files in the storage root.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains(".tmp.")),
+            "temp file leaked: {entries:?}"
+        );
     }
 }

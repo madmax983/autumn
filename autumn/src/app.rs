@@ -1772,12 +1772,16 @@ fn setup_storage(config: &AutumnConfig, state: &AppState) -> Option<axum::Router
             ) {
                 Ok(store) => store,
                 Err(err) => {
+                    // The operator explicitly chose `storage.backend = "local"`
+                    // — a non-writable root means uploads can't possibly
+                    // work, so abort the boot rather than letting upload
+                    // handlers serve 500s after deploy.
                     tracing::error!(
                         error = %err,
                         root = %root.display(),
-                        "failed to initialize local blob store"
+                        "failed to initialize local blob store; aborting startup"
                     );
-                    return None;
+                    std::process::exit(1);
                 }
             };
             let serving = crate::storage::local::serve_router(&store);

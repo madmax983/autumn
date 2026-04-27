@@ -82,7 +82,7 @@ impl BlobStore for S3BlobStore {
         &'a self,
         _key: &'a str,
         _content_type: &'a str,
-        _data: ByteStream,
+        _data: ByteStream<'a>,
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move { Err(unsupported("S3BlobStore::put_stream")) })
     }

@@ -181,8 +181,16 @@ pub struct MultipartField<'a> {
     max_file_size_bytes: usize,
 }
 
+#[cfg(all(feature = "multipart", feature = "storage"))]
+struct MultipartFieldStreamState<'a> {
+    inner: axum::extract::multipart::Field<'a>,
+    total: usize,
+    max: usize,
+    errored: bool,
+}
+
 #[cfg(feature = "multipart")]
-impl MultipartField<'_> {
+impl<'a> MultipartField<'a> {
     /// Field name from the multipart form.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -262,32 +270,63 @@ impl MultipartField<'_> {
     /// malformed, or when the underlying [`BlobStore`](crate::storage::BlobStore)
     /// rejects the write.
     #[cfg(feature = "storage")]
-    pub async fn save_to_blob_store(
-        mut self,
-        store: &(dyn crate::storage::BlobStore + '_),
+    pub async fn save_to_blob_store<'b>(
+        self,
+        store: &'b (dyn crate::storage::BlobStore + '_),
         key: impl Into<String>,
-    ) -> crate::AutumnResult<crate::storage::Blob> {
+    ) -> crate::AutumnResult<crate::storage::Blob>
+    where
+        'a: 'b,
+    {
         let key = key.into();
         let content_type = self
             .inner
             .content_type()
             .map_or_else(|| "application/octet-stream".to_owned(), str::to_owned);
 
-        let mut buf: Vec<u8> = Vec::new();
-        while let Some(chunk) = self
-            .inner
-            .chunk()
-            .await
-            .map_err(|err| multipart_error_to_error(&err))?
-        {
-            if buf.len().saturating_add(chunk.len()) > self.max_file_size_bytes {
-                return Err(file_too_large_error(self.max_file_size_bytes));
+        // Adapt the multipart chunk iterator into the trait's
+        // `ByteStream`, enforcing the per-file size cap as we go so we
+        // never buffer the whole upload in memory and large files flow
+        // straight through to the store's streaming path.
+        let state = MultipartFieldStreamState {
+            inner: self.inner,
+            total: 0,
+            max: self.max_file_size_bytes,
+            errored: false,
+        };
+
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            if state.errored {
+                return None;
             }
-            buf.extend_from_slice(&chunk);
-        }
+            match state.inner.chunk().await {
+                Ok(Some(chunk)) => {
+                    state.total = state.total.saturating_add(chunk.len());
+                    if state.total > state.max {
+                        let err = crate::storage::BlobStoreError::InvalidInput(format!(
+                            "uploaded file exceeds limit of {} bytes",
+                            state.max,
+                        ));
+                        state.errored = true;
+                        Some((Err(err), state))
+                    } else {
+                        Some((Ok(chunk), state))
+                    }
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    state.errored = true;
+                    Some((
+                        Err(crate::storage::BlobStoreError::Io(err.to_string())),
+                        state,
+                    ))
+                }
+            }
+        });
+        let stream: crate::storage::ByteStream<'b> = Box::pin(stream);
 
         store
-            .put(&key, &content_type, bytes::Bytes::from(buf))
+            .put_stream(&key, &content_type, stream)
             .await
             .map_err(crate::storage::BlobStoreError::into_autumn_error)
     }
