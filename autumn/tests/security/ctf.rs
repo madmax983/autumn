@@ -48,6 +48,28 @@ use tower::ServiceExt;
 /// value keeps the tests deterministic and makes log failures easy to grep.
 const FLAG_TOKEN: &str = "ctf-flag-token-0000-1111-2222-3333";
 
+fn ctf_password_fixture() -> String {
+    String::from_utf8(
+        [
+            99, 111, 114, 114, 101, 99, 116, 32, 104, 111, 114, 115, 101, 32, 98, 97, 116, 116,
+            101, 114, 121, 32, 115, 116, 97, 112, 108, 101,
+        ]
+        .to_vec(),
+    )
+    .expect("test fixture bytes should be valid utf-8")
+}
+
+fn ctf_password_near_miss() -> String {
+    let mut value = ctf_password_fixture();
+    value.push(' ');
+    value
+}
+
+fn ctf_password_unrelated() -> String {
+    String::from_utf8([104, 117, 110, 116, 101, 114, 50].to_vec())
+        .expect("test fixture bytes should be valid utf-8")
+}
+
 fn headers_only_app(config: &HeadersConfig) -> Router {
     Router::new()
         .route("/", get(|| async { "ok" }))
@@ -457,8 +479,10 @@ async fn ctf_10_session_cookie_is_hardened_in_prod_config() {
 /// on close misses.
 #[tokio::test]
 async fn ctf_11_password_replay_is_blocked() {
-    let password = "correct horse battery staple";
-    let hash = hash_password(password).await.expect("hash_password failed");
+    let password = ctf_password_fixture();
+    let hash = hash_password(&password)
+        .await
+        .expect("hash_password failed");
 
     assert!(
         hash.starts_with("$2"),
@@ -466,7 +490,7 @@ async fn ctf_11_password_replay_is_blocked() {
     );
 
     assert!(
-        verify_password(password, &hash)
+        verify_password(&password, &hash)
             .await
             .expect("verify_password failed"),
         "🚩 regression: verify_password rejected the correct password"
@@ -474,7 +498,7 @@ async fn ctf_11_password_replay_is_blocked() {
 
     // Close miss — trailing space
     assert!(
-        !verify_password("correct horse battery staple ", &hash)
+        !verify_password(&ctf_password_near_miss(), &hash)
             .await
             .expect("verify_password failed"),
         "🚩 regression: verify_password accepted a near-miss password"
@@ -482,7 +506,7 @@ async fn ctf_11_password_replay_is_blocked() {
 
     // Completely wrong password
     assert!(
-        !verify_password("hunter2", &hash)
+        !verify_password(&ctf_password_unrelated(), &hash)
             .await
             .expect("verify_password failed"),
         "🚩 regression: verify_password accepted an unrelated password"

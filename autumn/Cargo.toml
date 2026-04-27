@@ -40,7 +40,7 @@ telemetry-otlp = [
 redis = ["dep:redis"]
 
 [dependencies]
-autumn-macros = { version = "0.2.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.3.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"

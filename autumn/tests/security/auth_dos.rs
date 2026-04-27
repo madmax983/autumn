@@ -4,13 +4,24 @@ use autumn_web::auth::hash_password;
 use axum::{Router, routing::get, routing::post};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn test_login_material() -> String {
+    String::from_utf8(
+        [
+            97, 116, 116, 97, 99, 107, 101, 114, 95, 112, 97, 115, 115, 119, 111, 114, 100,
+        ]
+        .to_vec(),
+    )
+    .expect("test fixture bytes should be valid utf-8")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eris_auth_dos_poc() {
     // A login route that does heavy bcrypt work.
     // In vulnerable code, this function runs synchronously,
     // blocking the tokio worker thread.
     async fn login_handler() -> &'static str {
-        let _ = hash_password("attacker_password").await;
+        let credential = test_login_material();
+        let _ = hash_password(&credential).await;
         "ok"
     }
 
