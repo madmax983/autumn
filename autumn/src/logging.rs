@@ -90,6 +90,34 @@ mod tests {
             let msg = err.downcast_ref::<&str>().map_or_else(|| err.downcast_ref::<String>().map_or("unknown", |s| s.as_str()), |s| *s);
             assert!(msg.contains("failed to initialize logging"), "Unexpected panic message: {msg}");
         }
+
+        #[test]
+        fn init_with_json_format_succeeds() {
+            let config = LogConfig {
+                level: "debug".to_owned(),
+                format: LogFormat::Json,
+            };
+            init(&config);
+        }
+
+        #[test]
+        fn init_with_auto_format_succeeds() {
+            let config = LogConfig {
+                level: "debug".to_owned(),
+                format: LogFormat::Auto,
+            };
+            init(&config);
+        }
+
+        #[test]
+        fn init_with_invalid_level_falls_back_without_panic() {
+            let config = LogConfig {
+                level: "invalid_level_format_[without_equal]".to_owned(),
+                format: LogFormat::Pretty,
+            };
+            init(&config);
+        }
+
     }
 
     use super::*;

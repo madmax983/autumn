@@ -562,4 +562,34 @@ mod tests {
         assert!(body_str.contains(r#""version""#));
         assert!(body_str.contains(r#""kind""#));
     }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_reads_state_from_file_with_env() {
+        let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = r#"{"version":123,"kind":"css"}"#;
+        std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
+
+        temp_env::async_with_vars(
+            [
+                (DEV_RELOAD_ENV, Some("1")),
+                (
+                    DEV_RELOAD_STATE_ENV,
+                    Some(tmp_file.path().to_str().unwrap()),
+                ),
+            ],
+            async {
+                let response = super::live_reload_state_handler().await.into_response();
+
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+                let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+                assert_eq!(body_str, content);
+            },
+        )
+        .await;
+    }
 }
