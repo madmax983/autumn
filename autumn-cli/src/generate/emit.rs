@@ -260,7 +260,9 @@ mod tests {
         plan.create(b.clone(), "2");
         let err = plan.execute(Flags::default()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(a.display().to_string().as_str()));
-        assert!(msg.contains(b.display().to_string().as_str()));
+        // The error message normalises path separators to `/` so the
+        // assertion needs to match that form (Windows uses `\` natively).
+        assert!(msg.contains(a.display().to_string().replace('\\', "/").as_str()));
+        assert!(msg.contains(b.display().to_string().replace('\\', "/").as_str()));
     }
 }

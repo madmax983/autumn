@@ -188,9 +188,26 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
 /// Parse a list of `name:Type` tokens.
 ///
 /// # Errors
-/// Bubbles up the first failed token.
+/// Bubbles up the first failed token, and rejects duplicate field names —
+/// emitting two entries with the same column name would produce duplicate
+/// struct members and duplicate SQL columns.
 pub fn parse_fields(tokens: &[String]) -> Result<Vec<Field>, GenerateError> {
-    tokens.iter().map(|t| parse_field(t)).collect()
+    let mut fields: Vec<Field> = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let field = parse_field(token)?;
+        if let Some(prev) = fields.iter().find(|f| f.name == field.name) {
+            return Err(GenerateError::InvalidField {
+                token: token.clone(),
+                reason: format!(
+                    "duplicate field name '{name}' (previously declared as '{name}:{prev_ty}')",
+                    name = field.name,
+                    prev_ty = prev.rust_type()
+                ),
+            });
+        }
+        fields.push(field);
+    }
+    Ok(fields)
 }
 
 fn parse_type(ty: &str) -> Option<(FieldKind, bool)> {
@@ -404,6 +421,19 @@ mod tests {
         assert_eq!(fs.len(), 2);
         assert_eq!(fs[0].name, "title");
         assert_eq!(fs[1].name, "count");
+    }
+
+    #[test]
+    fn duplicate_field_names_rejected() {
+        // `title:String title:Text` would emit two `title` columns.
+        let tokens = vec!["title:String".into(), "title:Text".into()];
+        let err = parse_fields(&tokens).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate"),
+            "expected duplicate error, got: {msg}"
+        );
+        assert!(msg.contains("title"));
     }
 
     #[test]

@@ -240,26 +240,46 @@ fn ensure_mods(existing: &str, mods: &[&str]) -> String {
         .map(|m| format!("mod {m};"))
         .collect::<Vec<_>>()
         .join("\n");
-    // Insert the block at the top of the file.
-    if existing.starts_with("//!") {
-        // Skip past the leading inner-doc-comment block, if any.
-        let split = existing
-            .lines()
-            .position(|l| !l.trim_start().starts_with("//!") && !l.trim().is_empty())
-            .unwrap_or(0);
-        let mut out = String::new();
-        for (i, line) in existing.lines().enumerate() {
-            if i == split {
-                out.push_str(&block);
-                out.push('\n');
-                out.push('\n');
-            }
+
+    // Mod declarations are *items* and must follow any crate-level inner
+    // attributes (`#![allow(...)]`, `//!` doc comments) — Rust rejects the
+    // file otherwise. Find the boundary between the leading attribute block
+    // and the first ordinary item, and insert there.
+    let split = existing
+        .lines()
+        .position(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with("//!") && !t.starts_with("#![")
+            // Inner attributes can also be written `# ! [...]` with whitespace,
+            // but in practice nobody does. Stick to the canonical shape.
+        })
+        .unwrap_or_else(|| existing.lines().count());
+
+    if split == 0 {
+        // No leading attributes — insert at the top.
+        return format!("{block}\n\n{existing}");
+    }
+
+    let mut out = String::with_capacity(existing.len() + block.len() + 4);
+    let lines: Vec<&str> = existing.lines().collect();
+    for line in &lines[..split] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&block);
+    out.push('\n');
+    if split < lines.len() {
+        out.push('\n');
+        for line in &lines[split..] {
             out.push_str(line);
             out.push('\n');
         }
-        return out;
     }
-    format!("{block}\n\n{existing}")
+    // Preserve the original trailing-newline status.
+    if !existing.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 fn has_mod_declaration(existing: &str, name: &str) -> bool {
@@ -545,6 +565,41 @@ async fn main() {
         assert!(updated.contains("mod schema;"));
         assert!(updated.contains("routes::posts::index"));
         assert!(updated.contains("index,")); // original entry preserved
+    }
+
+    #[test]
+    fn update_main_rs_preserves_inner_attributes() {
+        // Inserting `mod` items above `#![...]` would make the file reject —
+        // crate-level inner attributes must precede every item.
+        let original = "#![allow(clippy::needless_pass_by_value)]\n\
+#![deny(unsafe_code)]\n\
+\n\
+use autumn_web::prelude::*;\n\
+\n\
+#[autumn_web::main]\n\
+async fn main() {\n\
+    autumn_web::app().run().await;\n\
+}\n";
+        let updated = update_main_rs(original, &["models"], &[]);
+        let attr_pos = updated.find("#![allow").unwrap();
+        let mod_pos = updated.find("mod models;").unwrap();
+        assert!(
+            attr_pos < mod_pos,
+            "crate inner attributes must stay above mod items:\n{updated}"
+        );
+        assert!(updated.contains("#![deny(unsafe_code)]"));
+    }
+
+    #[test]
+    fn update_main_rs_inserts_after_doc_comment_block() {
+        let original = "//! Top-level docs.\n\
+//! Continuation.\n\
+\n\
+use autumn_web::prelude::*;\n";
+        let updated = update_main_rs(original, &["models"], &[]);
+        let docs_pos = updated.find("//! Top-level docs.").unwrap();
+        let mod_pos = updated.find("mod models;").unwrap();
+        assert!(docs_pos < mod_pos);
     }
 
     #[test]

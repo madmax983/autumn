@@ -107,8 +107,12 @@ pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&st
 fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
 
-    // Locate the `[dependencies]` table header.
-    let Some(deps_idx) = lines.iter().position(|l| l.trim() == "[dependencies]") else {
+    // Locate the `[dependencies]` table header. Tolerate trailing whitespace
+    // and `# comments` after the header (`[dependencies] # shared deps`).
+    let Some(deps_idx) = lines
+        .iter()
+        .position(|l| is_table_header(l, "dependencies"))
+    else {
         // No `[dependencies]` section yet — append one with all requested deps.
         use std::fmt::Write as _;
         let mut out = String::with_capacity(existing.len() + 64);
@@ -129,10 +133,7 @@ fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     // Find the next `[…]` table header (or the end of file).
     let next_section = lines[deps_idx + 1..]
         .iter()
-        .position(|l| {
-            let t = l.trim();
-            t.starts_with('[') && t.ends_with(']')
-        })
+        .position(|l| is_any_table_header(l))
         .map_or(lines.len(), |off| deps_idx + 1 + off);
 
     let dep_section = &lines[deps_idx + 1..next_section];
@@ -178,6 +179,40 @@ fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
         out.pop();
     }
     out
+}
+
+/// True iff `line` is a TOML table header for `[<table>]`, tolerating leading
+/// whitespace and trailing `# comment` text (which `cargo` itself accepts).
+fn is_table_header(line: &str, table: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some(close_idx) = rest.find(']') else {
+        return false;
+    };
+    if rest[..close_idx].trim() != table {
+        return false;
+    }
+    // Anything after `]` must be whitespace or a `#` comment.
+    let after = rest[close_idx + 1..].trim_start();
+    after.is_empty() || after.starts_with('#')
+}
+
+/// True iff `line` is *any* `[<table>]` header, regardless of the table name.
+fn is_any_table_header(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix('[') else {
+        return false;
+    };
+    let Some(close_idx) = rest.find(']') else {
+        return false;
+    };
+    if rest[..close_idx].trim().is_empty() {
+        return false;
+    }
+    let after = rest[close_idx + 1..].trim_start();
+    after.is_empty() || after.starts_with('#')
 }
 
 /// True iff `dep_section` contains a line declaring `crate_name = …`.
@@ -589,6 +624,35 @@ autumn-web = \"0.3\"\n";
         let original = "[dependencies]\n# autumn-web = \"0.2\"\n";
         let updated = ensure_cargo_dependencies(original, &[("autumn-web", "\"0.3\"")]);
         assert!(updated.contains("autumn-web = \"0.3\""));
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_handles_header_with_trailing_comment() {
+        // `[dependencies] # shared deps` is valid TOML — must not be treated
+        // as a missing section.
+        let original = "[dependencies] # shared deps\nautumn-web = \"0.3\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        // No second `[dependencies]` table appended.
+        assert_eq!(
+            updated.matches("[dependencies]").count(),
+            1,
+            "duplicate [dependencies] table appended:\n{updated}"
+        );
+        assert!(updated.contains("chrono = \"0.4\""));
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_treats_indented_section_as_a_header() {
+        // Indented headers are accepted by cargo and our scanner mustn't
+        // treat them as bare dep entries.
+        let original = "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.3\"\n\n  [dev-dependencies]\ntempfile = \"3\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        let chrono_pos = updated.find("chrono = \"0.4\"").unwrap();
+        let dev_deps_pos = updated.find("[dev-dependencies]").unwrap();
+        assert!(
+            chrono_pos < dev_deps_pos,
+            "chrono must land in [dependencies], not [dev-dependencies]"
+        );
     }
 
     #[test]
