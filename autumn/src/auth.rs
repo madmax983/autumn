@@ -1696,7 +1696,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hash_password() {
-        let password = "my_super_secret_password";
+        let password = "test_password_for_unit_tests_only";
 
         // Test hashing
         let hash = super::hash_password(password)
@@ -1711,7 +1711,7 @@ mod tests {
         assert!(is_valid, "Password should be verified successfully");
 
         // Test verification with incorrect password
-        let is_invalid = super::verify_password("wrong_password", &hash)
+        let is_invalid = super::verify_password("invalid_guess", &hash)
             .await
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
