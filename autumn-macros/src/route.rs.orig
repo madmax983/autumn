@@ -18,7 +18,6 @@ use crate::parse;
 ///
 /// `http_method` is the uppercase method name (e.g., `"GET"`).
 /// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
-#[allow(clippy::too_many_lines)]
 pub fn route_macro(
     http_method: &str,
     axum_fn: &str,
@@ -77,6 +76,7 @@ pub fn route_macro(
         }
 
         let is_result = is_result_type(&input_fn.sig.output);
+
 
         let wrapper_body = if is_result {
             quote! {
@@ -188,25 +188,10 @@ fn is_primitive_type(ty: &Type) -> bool {
 
         let single_seg = segs.len() == 1;
 
-        single_seg
-            && matches!(
-                ident.as_str(),
-                "bool"
-                    | "i8"
-                    | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "isize"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "usize"
-                    | "f32"
-                    | "f64"
-            )
+        single_seg && matches!(
+            ident.as_str(),
+            "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64"
+        )
     } else {
         false
     }

@@ -302,9 +302,6 @@ impl AppBuilder {
     /// Use the [`routes!`](crate::routes) macro to collect annotated
     /// handlers into the expected `Vec<Route>`.
     ///
-    /// *Note: if you encounter a compiler error mentioning `__autumn_route_info_...`,
-    /// it means a route handler passed to `routes!` was misspelled or not found.*
-    ///
     /// # Examples
     ///
     /// ```rust,no_run

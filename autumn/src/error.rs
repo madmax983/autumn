@@ -497,7 +497,24 @@ impl IntoResponse for AutumnError {
             },
         };
 
-        let mut response = (status, axum::Json(body)).into_response();
+        // Re-serialize the JSON body to compute its exact byte length.
+        // `axum::Json` implements `IntoResponse` and should set the Content-Length header itself,
+        // but if we do it explicitly here, we ensure it is preserved even through fallback
+        // routes and middleware transformations that might otherwise lose track of the body length.
+        let json_bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let content_length = json_bytes.len();
+
+        let mut response = (
+            status,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json_bytes,
+        )
+            .into_response();
+
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(content_length),
+        );
         response.extensions_mut().insert(error_info);
         response
     }

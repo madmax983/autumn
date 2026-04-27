@@ -11,9 +11,6 @@ use proc_macro2::TokenStream;
 /// Each path's last segment is transformed from `name` to
 /// `__autumn_route_info_name`, so module-qualified paths like `users::list`
 /// become `users::__autumn_route_info_list`.
-///
-/// *Note: if you encounter a compiler error mentioning `__autumn_route_info_...`,
-/// it means a route handler passed to `routes!` was misspelled or not found.*
 pub fn routes_macro(input: TokenStream) -> TokenStream {
     crate::collect::collect_companions(input, "__autumn_route_info_")
 }
