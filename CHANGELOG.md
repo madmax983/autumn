@@ -5,6 +5,20 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **cli:** `autumn generate model | migration | scaffold` for one-command
+  resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
+  `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route
+  handlers, smoke tests, and updates `routes![]` in `src/main.rs`. Supports
+  the documented field-type DSL (`String`, `Text`, `i32`, `i64`, `bool`,
+  `f32`, `f64`, `Uuid`, `NaiveDateTime`, `DateTime`, `Vec<u8>`/`Bytea`, plus
+  `Option<…>` for any of them) and `--dry-run` / `--force` flags. New
+  `docs/guide/generators.md` walks through the five-commands-to-CRUD flow.
+  Non-breaking; no runtime surface changes.
+
 ## [0.3.0] - 2026-04-27
 
 ### Added

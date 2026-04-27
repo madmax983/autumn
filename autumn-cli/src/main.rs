@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod build;
 mod dev;
 mod export;
+mod generate;
 mod migrate;
 mod monitor;
 mod new;
@@ -70,6 +71,31 @@ enum Commands {
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
     },
+    /// Scaffold models, migrations, and CRUD code for a new resource.
+    ///
+    /// Three subcommands collapse the repetitive five-file dance of adding
+    /// a resource — `#[model]` struct, Diesel migration, schema entry,
+    /// `#[repository]`, route handlers, Maud templates, `routes![]`
+    /// registration, smoke test — into a single command.
+    ///
+    /// # Field-type DSL
+    ///
+    /// Fields are passed as `name:Type` tokens. Supported types:
+    ///
+    ///   String, Text                 (TEXT)
+    ///   i32, i64                     (INTEGER, BIGINT)
+    ///   bool                         (BOOLEAN)
+    ///   f32, f64                     (REAL, DOUBLE PRECISION)
+    ///   Uuid                         (UUID)
+    ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
+    ///   Vec<u8>, Bytea               (BYTEA)
+    ///   Option<...>                  (any of the above, nullable)
+    ///
+    /// # Example
+    ///
+    ///   autumn generate scaffold Post title:String body:Text published:bool
+    #[command(subcommand, verbatim_doc_comment)]
+    Generate(GenerateCommands),
 }
 
 /// Subcommands for `autumn migrate`.
@@ -77,6 +103,60 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+}
+
+/// Subcommands for `autumn generate`.
+#[derive(Subcommand)]
+enum GenerateCommands {
+    /// Generate a `#[model]` struct, Diesel migration, and schema entry.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate model Post title:String body:Text published:bool
+    #[command(verbatim_doc_comment)]
+    Model {
+        /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
+        name: String,
+        /// Field DSL tokens, each `name:Type`.
+        fields: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate an empty Diesel migration directory.
+    ///
+    /// When the migration name follows the `Add<Field>To<Table>` or
+    /// `Remove<Field>From<Table>` convention, the generator emits the
+    /// matching `ALTER TABLE` statements automatically.
+    Migration {
+        /// Migration name (`PascalCase` or `snake_case`).
+        name: String,
+        /// Field DSL tokens — only used for `Add…To…` / `Remove…From…` names.
+        fields: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate model, migration, repository, HTML routes, smoke test, and
+    /// register the new routes in `src/main.rs`.
+    Scaffold {
+        /// Resource name (`PascalCase` or `snake_case`, e.g. `Post`).
+        name: String,
+        /// Field DSL tokens, each `name:Type`.
+        fields: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -98,6 +178,26 @@ fn main() {
         Commands::Export { url, output } => export::run(&url, &output),
         Commands::New { name } => new::run(&name),
         Commands::Setup { force } => setup::run(force),
+        Commands::Generate(cmd) => match cmd {
+            GenerateCommands::Model {
+                name,
+                fields,
+                dry_run,
+                force,
+            } => generate::model::run(&name, &fields, generate::Flags { dry_run, force }),
+            GenerateCommands::Migration {
+                name,
+                fields,
+                dry_run,
+                force,
+            } => generate::migration::run(&name, &fields, generate::Flags { dry_run, force }),
+            GenerateCommands::Scaffold {
+                name,
+                fields,
+                dry_run,
+                force,
+            } => generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }),
+        },
     }
 }
 
@@ -323,5 +423,97 @@ mod tests {
     #[test]
     fn unknown_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_model() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "model",
+            "Post",
+            "title:String",
+            "body:Text",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Model {
+            name,
+            fields,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate model");
+        };
+        assert_eq!(name, "Post");
+        assert_eq!(fields, vec!["title:String", "body:Text"]);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_model_with_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "model",
+            "Post",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Model { dry_run, force, .. }) = cli.command else {
+            panic!("expected generate model");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_migration() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "migration",
+            "AddTitleToPosts",
+            "title:String",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Migration { name, fields, .. }) = cli.command
+        else {
+            panic!("expected generate migration");
+        };
+        assert_eq!(name, "AddTitleToPosts");
+        assert_eq!(fields, vec!["title:String"]);
+    }
+
+    #[test]
+    fn parse_generate_scaffold() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold { name, fields, .. }) = cli.command
+        else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(name, "Post");
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn parse_generate_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_model_without_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate", "model"]).is_err());
     }
 }
