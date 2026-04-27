@@ -230,4 +230,15 @@ mod tests {
         assert!(should_auto_apply(Some("production"), true));
         assert!(!should_auto_apply(Some("staging"), true));
     }
+
+    #[test]
+    fn run_pending_connection_error() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let result = run_pending(url, MIGRATIONS);
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), MigrationError::Connection(_)));
+    }
 }
