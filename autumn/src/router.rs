@@ -331,6 +331,7 @@ fn extract_path_params(path: &str) -> Vec<String> {
 /// The spec is rendered once at build time and stored in an `Arc<String>`
 /// so the `/v3/api-docs` handler performs no serialization per request.
 #[cfg(feature = "openapi")]
+#[allow(clippy::too_many_lines)]
 fn build_openapi_router(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
