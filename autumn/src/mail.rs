@@ -95,8 +95,11 @@ impl MailConfig {
                 "mail.transport=\"log\" is blocked in prod; set mail.allow_log_in_production=true to override".to_owned(),
             );
         }
-        if matches!(self.transport, MailTransport::Smtp) && self.smtp.host.is_none() {
-            return Err("mail.smtp.host is required when mail.transport=\"smtp\"".to_owned());
+        if matches!(self.transport, MailTransport::Smtp) {
+            return Err(
+                "mail.transport=\"smtp\" is not supported yet; use \"log\", \"file\", or \"disabled\""
+                    .to_owned(),
+            );
         }
         Ok(())
     }
@@ -243,10 +246,11 @@ impl MailSender for FileSender {
                 .await
                 .map_err(AutumnError::internal_server_error)?;
             let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
             let to = mail.to.first().map_or("unknown".to_owned(), |value| {
                 value.replace(['/', '\\', ':', '@'], "_")
             });
-            let path = base.join(format!("{stamp}-{to}.eml"));
+            let path = base.join(format!("{stamp}-{to}-{suffix}.eml"));
             let payload = format!(
                 "From: {}\nTo: {}\nSubject: {}\n{}\nContent-Type: text/html; charset=utf-8\n\n{}\n",
                 mail.from.unwrap_or_else(default_from),
@@ -256,7 +260,15 @@ impl MailSender for FileSender {
                     .map_or_else(String::new, |reply| format!("Reply-To: {reply}\n")),
                 mail.html_body
             );
-            tokio::fs::write(path, payload)
+            use tokio::io::AsyncWriteExt as _;
+
+            let mut file = tokio::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .await
+                .map_err(AutumnError::internal_server_error)?;
+            file.write_all(payload.as_bytes())
                 .await
                 .map_err(AutumnError::internal_server_error)?;
             Ok(())
@@ -290,6 +302,18 @@ mod tests {
             .validate(Some("prod"))
             .expect_err("prod should block log transport by default");
         assert!(error.contains("allow_log_in_production"));
+    }
+
+    #[test]
+    fn smtp_transport_is_rejected_until_implemented() {
+        let config = MailConfig {
+            transport: MailTransport::Smtp,
+            ..MailConfig::default()
+        };
+        let error = config
+            .validate(Some("dev"))
+            .expect_err("smtp should fail fast until implemented");
+        assert!(error.contains("not supported yet"));
     }
 
     #[tokio::test]
