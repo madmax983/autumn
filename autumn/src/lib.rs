@@ -172,6 +172,19 @@ pub use pagination::Page;
 /// patterns.
 pub use pagination::PageRequest;
 
+/// Cursor pagination response wrapper. Companion to [`CursorRequest`]
+/// for keyset/seek pagination of real-time feeds.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::CursorPage;
+
+/// Cursor pagination parameters extracted from the query string.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::CursorRequest;
+
 /// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
 /// and validates via `validator::Validate` before the handler runs.
 /// Returns 422 with structured error details on validation failure.

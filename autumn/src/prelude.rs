@@ -72,8 +72,8 @@ pub use crate::audit::{AuditEvent, AuditStatus};
 pub use crate::error::{AutumnError, AutumnResult};
 
 // ── Pagination ──────────────────────────────────────────────────
-/// Pagination primitives — extractor and response wrapper.
-pub use crate::pagination::{Page, PageRequest};
+/// Pagination primitives — offset and cursor extractors and wrappers.
+pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
