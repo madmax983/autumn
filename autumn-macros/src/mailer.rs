@@ -57,6 +57,8 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let self_ty = input_impl.self_ty.clone();
+    let input_generics = input_impl.generics.clone();
+    let (impl_generics, _ty_generics, where_clause) = input_generics.split_for_impl();
     let mut methods = Vec::new();
     for item in &input_impl.items {
         if let ImplItem::Fn(method) = item {
@@ -100,7 +102,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #input_impl
 
-        impl #self_ty {
+        impl #impl_generics #self_ty #where_clause {
             #( #generated )*
         }
     }
@@ -126,5 +128,25 @@ mod tests {
         let rendered = out.to_string();
         assert!(rendered.contains("send_reset"));
         assert!(rendered.contains("deliver_later_reset"));
+    }
+
+    #[test]
+    fn preserves_impl_generics_and_where_clause() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl<T> AccountMailer<T>
+                where
+                    T: Clone,
+                {
+                    fn reset(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("impl < T > AccountMailer < T > where T : Clone"));
+        assert!(rendered.contains("send_reset"));
     }
 }
