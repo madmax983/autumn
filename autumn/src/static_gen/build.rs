@@ -172,17 +172,17 @@ pub async fn render_static_routes(
     let staging = dist_dir.with_extension("staging");
 
     // Clean staging dir if it exists from a previous failed build
-    if tokio::fs::try_exists(&staging).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(&staging).await?;
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
     }
-    tokio::fs::create_dir_all(&staging).await?;
+    std::fs::create_dir_all(&staging)?;
 
     // Pre-create all subdirectories (avoids races between concurrent tasks)
     for job in &jobs {
         let file_path = url_to_file_path(&job.url);
         let full_path = staging.join(&file_path);
         if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            std::fs::create_dir_all(parent)?;
         }
     }
 
@@ -223,7 +223,7 @@ pub async fn render_static_routes(
                 let file_path = url_to_file_path(&url);
                 // staging dir pre-created above, just write
                 let full_path = staging.join(&file_path);
-                tokio::fs::write(&full_path, &body_bytes).await?;
+                std::fs::write(&full_path, &body_bytes)?;
 
                 Ok((
                     url,
@@ -246,7 +246,7 @@ pub async fn render_static_routes(
                 manifest_routes.insert(path, entry);
             }
             Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&staging).await;
+                let _ = std::fs::remove_dir_all(&staging);
                 return Err(e);
             }
         }
@@ -259,13 +259,13 @@ pub async fn render_static_routes(
         routes: manifest_routes,
     };
     let json = serde_json::to_string_pretty(&manifest)?;
-    tokio::fs::write(staging.join("manifest.json"), json).await?;
+    std::fs::write(staging.join("manifest.json"), json)?;
 
     // Atomic swap: remove old dist, rename staging -> dist
-    if tokio::fs::try_exists(dist_dir).await.unwrap_or(false) {
-        tokio::fs::remove_dir_all(dist_dir).await?;
+    if dist_dir.exists() {
+        std::fs::remove_dir_all(dist_dir)?;
     }
-    tokio::fs::rename(&staging, dist_dir).await?;
+    std::fs::rename(&staging, dist_dir)?;
 
     Ok(())
 }

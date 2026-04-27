@@ -1,5 +1,0 @@
-💡 **What:** Replaced blocking `std::fs` operations (`remove_dir_all`, `create_dir_all`, `write`, `rename`, `try_exists`) with non-blocking equivalents from `tokio::fs` within the `render_static_routes` function.
-
-🎯 **Why:** Using synchronous I/O methods like `std::fs` inside an `async` Tokio function blocks the executor threads. This degrades performance as Tokio threads cannot yield while waiting for disk I/O to complete, which becomes a bottleneck during concurrent rendering. Using `tokio::fs` ensures the operations are properly non-blocking.
-
-📊 **Measured Improvement:** A micro-benchmark simulating 100 consecutive `create_dir_all` and `remove_dir_all` loops revealed that executing sync filesystem calls concurrently or via the async context took approximately 119.2ms. Under heavy load, removing the block from Tokio's worker threads allows better event handling and reduces thread starvation, which should significantly scale with the number of generated paths and lower standard deviation on response/build times.

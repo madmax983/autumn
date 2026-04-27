@@ -111,7 +111,7 @@ pub struct RouterContext {
     pub nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
-    /// [`RequestIdLayer`] on the ingress
+    /// [`RequestIdLayer`](crate::middleware::RequestIdLayer) on the ingress
     /// path so user middleware observes the generated request ID.
     pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,

@@ -1,5 +1,5 @@
-use autumn_web::test::TestApp;
 use autumn_web::config::AutumnConfig;
+use autumn_web::test::TestApp;
 use axum::http::StatusCode;
 
 #[tokio::test]
@@ -13,17 +13,17 @@ async fn test_fallback_middleware_bypass() {
     config.security.rate_limit.trust_forwarded_headers = true;
 
     // Use TestApp to build the application router, verifying Autumn's actual middleware assembly order.
-    let client = TestApp::new()
-        .config(config)
-        .build();
+    let client = TestApp::new().config(config).build();
 
-    let req_one = client.get("/not-found")
+    let req_one = client
+        .get("/not-found")
         .header("X-Forwarded-For", "198.51.100.1");
 
     let resp_one = req_one.send().await;
     assert_eq!(resp_one.status, StatusCode::NOT_FOUND);
 
-    let req_two = client.get("/not-found")
+    let req_two = client
+        .get("/not-found")
         .header("X-Forwarded-For", "198.51.100.1");
 
     let resp_two = req_two.send().await;

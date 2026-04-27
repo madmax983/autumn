@@ -3,7 +3,7 @@
 [![CI](https://github.com/madmax983/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/madmax983/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.86.0+](https://img.shields.io/badge/rust-1.86.0%2B-orange.svg)](https://www.rust-lang.org)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
@@ -47,28 +47,6 @@ autumn dev
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
 `/actuator/health`, `/actuator/info`, and `/static/js/htmx.min.js`.
-
-### Watching custom directories
-
-`autumn dev` always watches `src/`, `static/`, `templates/`, and `migrations/`
-plus the project's top-level config files (`autumn.toml`, `Cargo.toml`,
-`Cargo.lock`, `build.rs`, `tailwind.config.js`). To watch additional folders
-(for example, custom view or locale trees), add a `[dev]` section to
-`autumn.toml`:
-
-```toml
-[dev]
-watch_dirs = ["views", "locales"]
-```
-
-Listed directories are watched recursively in addition to the defaults.
-Multi-segment paths like `content/locales` are supported. Changes inside
-them trigger a server restart and a full browser reload. Paths under
-`target/` and dotted directories are still ignored.
-
-Entries must be project-relative; absolute paths, `..` traversal,
-`target`, and dotted directories (e.g. `.git`) are rejected with a
-warning. Missing directories are skipped at startup.
 
 If you add `#[static_get]` routes, `autumn build` pre-renders them into
 `dist/`.
@@ -153,7 +131,7 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 
 ## Requirements
 
-- Rust 1.88.0+ (edition 2024)
+- Rust 1.86.0+ (edition 2024)
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.

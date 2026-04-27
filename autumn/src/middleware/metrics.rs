@@ -132,16 +132,10 @@ impl MetricsCollector {
         }
 
         // Per-route (sharded)
-        // ⚡ Bolt Optimization:
-        // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
-        // We don't need cryptographic security or HashDoS resistance here since this is internal.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in route.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-
-        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(route, &mut hasher);
+        #[allow(clippy::cast_possible_truncation)]
+        let shard_idx = (std::hash::Hasher::finish(&hasher) % (SHARD_COUNT as u64)) as usize;
 
         // ⚡ Bolt Optimization:
         // Format the key into a stack-allocated buffer to avoid a heap allocation
@@ -352,7 +346,7 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
 
 // ── Tower Layer / Service ───────────────────────────────────────
 
-/// Tower [`Layer`] that wraps a service with `MetricsService`.
+/// Tower [`Layer`] that wraps a service with [`MetricsService`].
 ///
 /// Records request count, latency, active connections, and status code
 /// distribution into a shared [`MetricsCollector`].

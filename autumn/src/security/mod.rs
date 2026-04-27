@@ -8,10 +8,10 @@
 //!
 //! | Component | Module | Description |
 //! |-----------|--------|-------------|
-//! | Security headers | `headers` | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
-//! | CSRF protection | `csrf` | Token-based CSRF validation for mutating requests |
-//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
-//! | Configuration | `config` | `[security]` section in `autumn.toml` |
+//! | Security headers | [`headers`] | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
+//! | CSRF protection | [`csrf`] | Token-based CSRF validation for mutating requests |
+//! | Rate limiting | [`rate_limit`] | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
+//! | Configuration | [`config`] | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
 //! their own top-level modules ([`crate::auth`], [`crate::session`]).

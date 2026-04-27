@@ -73,7 +73,7 @@ impl fmt::Display for RequestId {
     }
 }
 
-/// Tower [`Layer`] that wraps a service with `RequestIdService`.
+/// Tower [`Layer`] that wraps a service with [`RequestIdService`].
 ///
 /// Applied automatically by [`AppBuilder::run`](crate::app::AppBuilder::run).
 /// If you are building a custom Axum router, you can add it manually:

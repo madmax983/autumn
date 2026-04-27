@@ -211,9 +211,6 @@ impl AuditSink for JsonlFileAuditSink {
             file.write_all(&encoded).await.map_err(|error| {
                 AuditError::new(format!("failed to write audit event: {error}"))
             })?;
-            file.sync_data()
-                .await
-                .map_err(|error| AuditError::new(format!("failed to sync audit file: {error}")))?;
             Ok(())
         })
     }
