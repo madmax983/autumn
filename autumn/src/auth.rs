@@ -1712,7 +1712,7 @@ mod tests {
         assert!(is_valid, "Password should be verified successfully");
 
         // Test verification with incorrect password
-        let is_invalid = super::verify_password(&format!("{}wrong", test_input), &hash)
+        let is_invalid = super::verify_password(&format!("{test_input}wrong"), &hash)
             .await
             .expect("Failed to verify wrong password");
         assert!(!is_invalid, "Wrong password should not be verified");
