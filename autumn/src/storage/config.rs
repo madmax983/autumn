@@ -135,7 +135,7 @@ pub struct StorageS3Config {
     pub region: Option<String>,
 
     /// Custom endpoint URL. Required for non-AWS providers (R2,
-    /// MinIO, DigitalOcean Spaces, Wasabi). Leave unset for AWS.
+    /// `MinIO`, `DigitalOcean` Spaces, Wasabi). Leave unset for AWS.
     #[serde(default)]
     pub endpoint: Option<String>,
 
@@ -153,7 +153,7 @@ pub struct StorageS3Config {
     #[serde(default)]
     pub secret_access_key_env: Option<String>,
 
-    /// Path-style addressing toggle (R2 / MinIO need this `true`).
+    /// Path-style addressing toggle (R2 / `MinIO` need this `true`).
     #[serde(default)]
     pub force_path_style: bool,
 

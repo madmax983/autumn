@@ -99,11 +99,7 @@ impl BlobStore for S3BlobStore {
         Box::pin(async move { Err(unsupported("S3BlobStore::head")) })
     }
 
-    fn presigned_url<'a>(
-        &'a self,
-        _key: &'a str,
-        _expires_in: Duration,
-    ) -> BlobFuture<'a, String> {
+    fn presigned_url<'a>(&'a self, _key: &'a str, _expires_in: Duration) -> BlobFuture<'a, String> {
         Box::pin(async move { Err(unsupported("S3BlobStore::presigned_url")) })
     }
 }

@@ -841,8 +841,16 @@ impl AutumnConfig {
             "AUTUMN_STORAGE__LOCAL__SIGNING_KEY",
             &mut self.storage.local.signing_key,
         );
-        parse_env_option_string(env, "AUTUMN_STORAGE__S3__BUCKET", &mut self.storage.s3.bucket);
-        parse_env_option_string(env, "AUTUMN_STORAGE__S3__REGION", &mut self.storage.s3.region);
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__BUCKET",
+            &mut self.storage.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__REGION",
+            &mut self.storage.s3.region,
+        );
         parse_env_option_string(
             env,
             "AUTUMN_STORAGE__S3__ENDPOINT",

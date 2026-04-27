@@ -271,8 +271,7 @@ impl MultipartField<'_> {
         let content_type = self
             .inner
             .content_type()
-            .map(str::to_owned)
-            .unwrap_or_else(|| "application/octet-stream".to_owned());
+            .map_or_else(|| "application/octet-stream".to_owned(), str::to_owned);
 
         let mut buf: Vec<u8> = Vec::new();
         while let Some(chunk) = self

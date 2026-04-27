@@ -8,8 +8,8 @@
 //!   `[storage.local].mount_path` (default `/_blobs`). URLs are signed
 //!   with HMAC-SHA256 and time-bounded.
 //! - **[`S3`](s3::S3BlobStore)** (gated behind `storage-s3`) — talks to
-//!   any S3-compatible endpoint (AWS S3, Cloudflare R2, MinIO,
-//!   DigitalOcean Spaces, Wasabi) and emits real S3 presigned URLs.
+//!   any S3-compatible endpoint (AWS S3, Cloudflare R2, `MinIO`,
+//!   `DigitalOcean` Spaces, Wasabi) and emits real S3 presigned URLs.
 //!
 //! ## Quick start
 //!
@@ -77,8 +77,7 @@ pub use local::LocalBlobStore;
 /// Pinning the future as a trait object keeps [`BlobStore`] dyn-safe so
 /// applications can hold an `Arc<dyn BlobStore>` and swap backends at
 /// runtime.
-pub type BlobFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, BlobStoreError>> + Send + 'a>>;
+pub type BlobFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BlobStoreError>> + Send + 'a>>;
 
 /// Stream of byte chunks accepted by [`BlobStore::put_stream`].
 ///
@@ -175,7 +174,8 @@ pub trait BlobStore: Send + Sync + 'static {
     fn provider_id(&self) -> &str;
 
     /// Store `bytes` under `key`, returning a [`Blob`] handle.
-    fn put<'a>(&'a self, key: &'a str, content_type: &'a str, bytes: Bytes) -> BlobFuture<'a, Blob>;
+    fn put<'a>(&'a self, key: &'a str, content_type: &'a str, bytes: Bytes)
+    -> BlobFuture<'a, Blob>;
 
     /// Stream `data` under `key`, returning a [`Blob`] handle.
     ///
@@ -201,11 +201,7 @@ pub trait BlobStore: Send + Sync + 'static {
     /// On the [`LocalBlobStore`] this is an HMAC-signed link to the
     /// mounted serving route. On S3 backends it is a real S3 presigned
     /// URL.
-    fn presigned_url<'a>(
-        &'a self,
-        key: &'a str,
-        expires_in: Duration,
-    ) -> BlobFuture<'a, String>;
+    fn presigned_url<'a>(&'a self, key: &'a str, expires_in: Duration) -> BlobFuture<'a, String>;
 }
 
 /// Type alias for a runtime-installed shared [`BlobStore`].

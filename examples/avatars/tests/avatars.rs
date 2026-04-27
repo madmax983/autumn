@@ -85,12 +85,9 @@ async fn presigned_url_round_trip_via_serving_route() {
     // Mount the serving router and dispatch the signed URL through it.
     let arc: SharedBlobStore = Arc::new(store.clone());
     let state = autumn_web::AppState::for_test().with_extension(BlobStoreState::new(arc));
-    let router = autumn_web::storage::local::serve_router(store).with_state(state);
+    let router = autumn_web::storage::local::serve_router(&store).with_state(state);
 
-    let request = Request::builder()
-        .uri(&url)
-        .body(Body::empty())
-        .unwrap();
+    let request = Request::builder().uri(&url).body(Body::empty()).unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -132,7 +129,7 @@ async fn tampered_signature_is_rejected() {
 
     let arc: SharedBlobStore = Arc::new(store.clone());
     let state = autumn_web::AppState::for_test().with_extension(BlobStoreState::new(arc));
-    let router = autumn_web::storage::local::serve_router(store).with_state(state);
+    let router = autumn_web::storage::local::serve_router(&store).with_state(state);
 
     let request = Request::builder()
         .uri(&tampered)

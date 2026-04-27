@@ -182,27 +182,41 @@ impl BlobStore for LocalBlobStore {
                     .map_err(BlobStoreError::io)?;
             }
 
-            let mut file = tokio::fs::File::create(&path)
-                .await
-                .map_err(BlobStoreError::io)?;
-            let mut hasher = Sha256::new();
-            let mut byte_size: u64 = 0;
-            while let Some(chunk) = data.next().await {
-                let chunk = chunk?;
-                hasher.update(&chunk);
-                byte_size = byte_size.saturating_add(chunk.len() as u64);
-                file.write_all(&chunk).await.map_err(BlobStoreError::io)?;
+            // Write through a closure so we can clean up the
+            // partially-written file on any error path. Without this,
+            // a client disconnect or transient I/O failure leaves a
+            // corrupt blob at `path` that future `get` calls would
+            // happily serve.
+            let result = async {
+                let mut file = tokio::fs::File::create(&path)
+                    .await
+                    .map_err(BlobStoreError::io)?;
+                let mut hasher = Sha256::new();
+                let mut byte_size: u64 = 0;
+                while let Some(chunk) = data.next().await {
+                    let chunk = chunk?;
+                    hasher.update(&chunk);
+                    byte_size = byte_size.saturating_add(chunk.len() as u64);
+                    file.write_all(&chunk).await.map_err(BlobStoreError::io)?;
+                }
+                file.flush().await.map_err(BlobStoreError::io)?;
+                Ok::<(u64, String), BlobStoreError>((byte_size, hex(hasher.finalize())))
             }
-            file.flush().await.map_err(BlobStoreError::io)?;
+            .await;
 
-            let etag = hex(&hasher.finalize());
-            Ok(Blob {
-                provider_id: self.inner.provider_id.clone(),
-                key: key.to_owned(),
-                content_type: content_type.to_owned(),
-                byte_size,
-                etag: Some(etag),
-            })
+            match result {
+                Ok((byte_size, etag)) => Ok(Blob {
+                    provider_id: self.inner.provider_id.clone(),
+                    key: key.to_owned(),
+                    content_type: content_type.to_owned(),
+                    byte_size,
+                    etag: Some(etag),
+                }),
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    Err(err)
+                }
+            }
         })
     }
 
@@ -249,11 +263,7 @@ impl BlobStore for LocalBlobStore {
         })
     }
 
-    fn presigned_url<'a>(
-        &'a self,
-        key: &'a str,
-        expires_in: Duration,
-    ) -> BlobFuture<'a, String> {
+    fn presigned_url<'a>(&'a self, key: &'a str, expires_in: Duration) -> BlobFuture<'a, String> {
         Box::pin(async move {
             validate_key(key)?;
             let expires_in = if expires_in.is_zero() {
@@ -268,9 +278,16 @@ impl BlobStore for LocalBlobStore {
                 .map(|d| d.as_secs())
                 .unwrap_or_default();
 
+            // Sign the canonical (unencoded) key — the serving route
+            // decodes path segments before re-signing for verification.
             let signature = sign(self.inner.signing_key.as_bytes(), key, exp_at);
+            // Percent-encode each segment so keys containing reserved
+            // URL characters (`?`, `#`, `%`, spaces, …) round-trip
+            // correctly through the path. `/` survives as the segment
+            // separator.
+            let encoded_key = encode_key_path(key);
             let url = format!(
-                "{base}/{key}?exp={exp_at}&sig={signature}",
+                "{base}/{encoded_key}?exp={exp_at}&sig={signature}",
                 base = self.inner.mount_path.trim_end_matches('/'),
             );
             Ok(url)
@@ -326,7 +343,34 @@ pub fn verify(
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hex(&hasher.finalize())
+    hex(hasher.finalize())
+}
+
+/// Percent-encode each `/`-separated segment of `key` for use in a URL
+/// path. Segment separators stay raw so the path tree survives.
+fn encode_key_path(key: &str) -> String {
+    use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+    // RFC 3986 path segment: encode controls, path-reserved, and
+    // anything that would alias another segment or query/fragment
+    // delimiter.
+    const PATH_SEGMENT: &AsciiSet = &CONTROLS
+        .add(b' ')
+        .add(b'"')
+        .add(b'#')
+        .add(b'%')
+        .add(b'/')
+        .add(b'<')
+        .add(b'>')
+        .add(b'?')
+        .add(b'`')
+        .add(b'{')
+        .add(b'}')
+        .add(b'\\');
+
+    key.split('/')
+        .map(|segment| utf8_percent_encode(segment, PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn hex<B: AsRef<[u8]>>(bytes: B) -> String {
@@ -348,8 +392,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Build the axum router that serves signed local-blob URLs.
 ///
 /// This is mounted by the framework at the configured `mount_path`.
-#[must_use]
-pub fn serve_router(store: LocalBlobStore) -> axum::Router<crate::AppState> {
+pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     use axum::extract::{Path, Query};
     use axum::response::IntoResponse;
 
@@ -360,16 +403,12 @@ pub fn serve_router(store: LocalBlobStore) -> axum::Router<crate::AppState> {
     }
 
     let store_for_route = store.clone();
+    let mount = format!("{}/{{*key}}", store.mount_path().trim_end_matches('/'));
 
     let handler = move |Path(blob_key): Path<String>, Query(q): Query<SignedQuery>| {
         let store = store_for_route.clone();
         async move {
-            if let Err(err) = verify(
-                store.signing_key().as_bytes(),
-                &blob_key,
-                q.exp,
-                &q.sig,
-            ) {
+            if let Err(err) = verify(store.signing_key().as_bytes(), &blob_key, q.exp, &q.sig) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
             match BlobStore::get(&store, &blob_key).await {
@@ -382,7 +421,6 @@ pub fn serve_router(store: LocalBlobStore) -> axum::Router<crate::AppState> {
         }
     };
 
-    let mount = format!("{}/{{*key}}", store.mount_path().trim_end_matches('/'));
     axum::Router::new().route(&mount, axum::routing::get(handler))
 }
 
@@ -521,5 +559,56 @@ mod tests {
             .unwrap();
         assert!(url.starts_with("/_blobs/a/b.png?exp="));
         assert!(url.contains("&sig="));
+    }
+
+    #[tokio::test]
+    async fn presigned_url_percent_encodes_reserved_chars() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        let url = s
+            .presigned_url("user 1/q?.png", Duration::from_secs(120))
+            .await
+            .unwrap();
+        // Spaces, '?', and other reserved chars are percent-encoded;
+        // '/' stays raw as a segment separator.
+        assert!(url.starts_with("/_blobs/user%201/q%3F.png?exp="));
+        assert!(url.contains("&sig="));
+    }
+
+    #[tokio::test]
+    async fn put_stream_cleans_up_partial_file_on_error() {
+        use futures::stream;
+
+        let dir = temp_root();
+        let s = store(dir.path());
+
+        // First chunk succeeds, second yields an error to short-circuit
+        // the write.
+        let chunks: Vec<Result<Bytes, BlobStoreError>> = vec![
+            Ok(Bytes::from_static(b"first")),
+            Err(BlobStoreError::Backend("boom".into())),
+        ];
+        let stream: ByteStream = Box::pin(stream::iter(chunks));
+        let err = s
+            .put_stream("interrupted.bin", "application/octet-stream", stream)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::Backend(_)));
+
+        // The partial file must not be left on disk.
+        let path = dir.path().join("interrupted.bin");
+        assert!(!path.exists(), "partial blob was not cleaned up");
+        assert!(matches!(
+            s.get("interrupted.bin").await.unwrap_err(),
+            BlobStoreError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn encode_key_path_passes_segments_separately() {
+        assert_eq!(encode_key_path("foo"), "foo");
+        assert_eq!(encode_key_path("a/b/c"), "a/b/c");
+        assert_eq!(encode_key_path("a b/c?d"), "a%20b/c%3Fd");
+        assert_eq!(encode_key_path("hash#frag/q"), "hash%23frag/q");
     }
 }

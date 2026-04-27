@@ -1710,10 +1710,8 @@ fn fail_fast_on_invalid_storage_config(config: &AutumnConfig) {
 /// extension, and return the optional serving router for the Local
 /// backend.
 #[cfg(feature = "storage")]
-fn setup_storage(
-    config: &AutumnConfig,
-    state: &AppState,
-) -> Option<axum::Router<AppState>> {
+#[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
+fn setup_storage(config: &AutumnConfig, state: &AppState) -> Option<axum::Router<AppState>> {
     use crate::storage::{
         BlobStoreState, LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey,
     };
@@ -1745,26 +1743,26 @@ fn setup_storage(
                      to acknowledge"
                 );
             }
-            let signing_key = match config
+            let signing_key = config
                 .storage
                 .local
                 .signing_key
                 .as_deref()
                 .filter(|s| !s.is_empty())
-            {
-                Some(s) => SigningKey::new(s.as_bytes().to_vec()),
-                None => {
-                    if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                        tracing::warn!(
-                            "no storage.local.signing_key configured in prod; \
-                             generated URLs won't survive a process restart. \
-                             Set [storage.local].signing_key or \
-                             AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
-                        );
-                    }
-                    SigningKey::random()
-                }
-            };
+                .map_or_else(
+                    || {
+                        if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                            tracing::warn!(
+                                "no storage.local.signing_key configured in prod; \
+                                 generated URLs won't survive a process restart. \
+                                 Set [storage.local].signing_key or \
+                                 AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
+                            );
+                        }
+                        SigningKey::random()
+                    },
+                    |s| SigningKey::new(s.as_bytes().to_vec()),
+                );
             let store = match LocalBlobStore::new(
                 provider_id.clone(),
                 root.clone(),
@@ -1782,7 +1780,7 @@ fn setup_storage(
                     return None;
                 }
             };
-            let serving = crate::storage::local::serve_router(store.clone());
+            let serving = crate::storage::local::serve_router(&store);
             let arc: SharedBlobStore = std::sync::Arc::new(store);
             state.insert_extension::<BlobStoreState>(BlobStoreState::new(arc));
             tracing::info!(

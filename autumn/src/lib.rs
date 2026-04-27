@@ -112,13 +112,13 @@ pub(crate) mod route;
 pub use route::Route;
 pub mod security;
 pub mod session;
-#[cfg(feature = "storage")]
-pub mod storage;
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
+#[cfg(feature = "storage")]
+pub mod storage;
 
 pub mod task;
 pub mod telemetry;

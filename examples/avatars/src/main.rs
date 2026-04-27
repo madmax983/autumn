@@ -42,19 +42,14 @@ async fn index(State(state): State<AppState>) -> Markup {
 }
 
 #[post("/avatar")]
-async fn upload(
-    State(state): State<AppState>,
-    mut form: Multipart,
-) -> AutumnResult<Markup> {
+async fn upload(State(state): State<AppState>, mut form: Multipart) -> AutumnResult<Markup> {
     let blobs = state
         .extension::<BlobStoreState>()
         .ok_or_else(|| AutumnError::internal_server_error_msg("storage not configured"))?;
     while let Some(field) = form.next_field().await? {
         if field.name() == Some("avatar") {
             let store = blobs.store().clone();
-            let blob = field
-                .save_to_blob_store(&*store, AVATAR_KEY)
-                .await?;
+            let blob = field.save_to_blob_store(&*store, AVATAR_KEY).await?;
             return Ok(html! {
                 p { "Uploaded " (blob.byte_size) " bytes (" (blob.content_type) ")." }
                 p { a href="/" { "Back" } }
@@ -66,8 +61,5 @@ async fn upload(
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .routes(routes![index, upload])
-        .run()
-        .await;
+    autumn_web::app().routes(routes![index, upload]).run().await;
 }

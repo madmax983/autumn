@@ -61,8 +61,8 @@ pub struct Blob {
     /// Optional ETag-style integrity tag reported by the backend.
     ///
     /// On the [`LocalBlobStore`](super::LocalBlobStore) this is a hex
-    /// SHA-256 of the bytes; on S3 it is the upstream ETag (typically
-    /// the MD5 hash, or a multipart-style composite for large objects).
+    /// SHA-256 of the bytes; on S3 it is the upstream `ETag` (typically
+    /// the `MD5` hash, or a multipart-style composite for large objects).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
 }
