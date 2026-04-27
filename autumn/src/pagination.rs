@@ -1076,7 +1076,11 @@ mod tests {
         };
         let token = Cursor::encode(&key).unwrap();
         // Only chars from the base64url alphabet — no `+`, `/`, `=`, `{`, `:`.
-        assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        assert!(
+            token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
     }
 
     #[test]
@@ -1269,10 +1273,7 @@ mod tests {
     async fn cursor_extractor_clamps_size_over_max() {
         let (status, body) = fetch_cursor("/feed?cursor=t&size=9999").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1)
-        );
+        assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
     }
 
     #[tokio::test]
@@ -1331,9 +1332,7 @@ mod tests {
             })
             .collect();
         // Sort newest-first so id=1 is first.
-        table.sort_by(|a, b| {
-            (b.created_at, b.id).cmp(&(a.created_at, a.id))
-        });
+        table.sort_by(|a, b| (b.created_at, b.id).cmp(&(a.created_at, a.id)));
 
         // First request: no cursor, size=2.
         let req1 = CursorRequest::new(None, 2);
@@ -1369,8 +1368,7 @@ mod tests {
         let fetched2: Vec<Row> = table
             .iter()
             .filter(|r| {
-                r.created_at < key.created_at
-                    || (r.created_at == key.created_at && r.id < key.id)
+                r.created_at < key.created_at || (r.created_at == key.created_at && r.id < key.id)
             })
             .take(fetch2)
             .cloned()

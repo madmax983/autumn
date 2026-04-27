@@ -190,9 +190,11 @@ fn cursor_app() -> Router {
         let fetch_limit = usize::try_from(req.fetch_limit()).unwrap_or(0);
         let fetched: Vec<FeedItem> = after_cursor.take(fetch_limit).collect();
 
-        Json(CursorPage::from_overfetched(fetched, &req, |i| ItemCursor {
-            created_at: i.created_at,
-            id: i.id,
+        Json(CursorPage::from_overfetched(fetched, &req, |i| {
+            ItemCursor {
+                created_at: i.created_at,
+                id: i.id,
+            }
         }))
     }
     Router::new().route("/feed", get(feed))
@@ -240,9 +242,10 @@ async fn cursor_pages_cover_every_item_with_no_duplicates() {
     let mut cursor: Option<String> = None;
     for _ in 0..10 {
         // safety bound — 25/3 = 9 pages max
-        let uri = cursor
-            .as_deref()
-            .map_or_else(|| "/feed?size=3".to_string(), |c| format!("/feed?size=3&cursor={c}"));
+        let uri = cursor.as_deref().map_or_else(
+            || "/feed?size=3".to_string(),
+            |c| format!("/feed?size=3&cursor={c}"),
+        );
         let (status, body) = fetch_cursor_json(&uri).await;
         assert_eq!(status, StatusCode::OK);
         for item in body["content"].as_array().unwrap() {
@@ -291,9 +294,10 @@ async fn cursor_tie_breaker_handles_duplicate_timestamps() {
     let mut seen = Vec::<i64>::new();
     let mut cursor: Option<String> = None;
     loop {
-        let uri = cursor
-            .as_deref()
-            .map_or_else(|| "/feed?size=2".to_string(), |c| format!("/feed?size=2&cursor={c}"));
+        let uri = cursor.as_deref().map_or_else(
+            || "/feed?size=2".to_string(),
+            |c| format!("/feed?size=2&cursor={c}"),
+        );
         let (_, body) = fetch_cursor_json(&uri).await;
         for it in body["content"].as_array().unwrap() {
             seen.push(it["id"].as_i64().unwrap());
