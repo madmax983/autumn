@@ -9,3 +9,5 @@ pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
 pub mod session_fixation;
+
+mod chaos_rate_limit_fuzz;
