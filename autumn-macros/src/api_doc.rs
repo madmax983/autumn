@@ -267,22 +267,23 @@ fn slice_str(items: &[LitStr]) -> TokenStream {
 /// contain regex (`{id:[0-9]+}`) take only the name before the colon.
 pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
-                let inner = &path[i + 1..i + 1 + end_rel];
-                let name = inner.split(':').next().unwrap_or(inner).trim();
-                if !name.is_empty() {
-                    out.push(name.to_owned());
-                }
-                i += 1 + end_rel + 1;
-                continue;
-            }
+    let mut remaining = path;
+
+    while let Some(start) = remaining.find('{') {
+        let after_brace = &remaining[start + 1..];
+        let Some(end_rel) = after_brace.find('}') else {
+            break;
+        };
+
+        let inner = &after_brace[..end_rel];
+        let name = inner.split(':').next().unwrap_or(inner).trim();
+        if !name.is_empty() {
+            out.push(name.to_owned());
         }
-        i += 1;
+
+        remaining = &after_brace[end_rel + 1..];
     }
+
     out
 }
 
