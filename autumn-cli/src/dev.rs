@@ -1859,7 +1859,7 @@ watch_dirs = ["views", "locales"]
                 "views".into(),
                 "  locales  ".into(),
                 String::new(),
-                "custom".into()
+                "custom".into(),
             ],
         });
         assert_eq!(dirs, vec!["custom"]);
@@ -2150,7 +2150,7 @@ watch_dirs = ["views", "locales"]
                 "target".into(),
                 "views".into(),
                 "./locales".into(),
-                "other".into()
+                "other".into(),
             ],
         });
         assert_eq!(dirs, vec!["other".to_owned()]);
