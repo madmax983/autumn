@@ -166,6 +166,12 @@ pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
             reason: format!("'{name}' is not a valid snake_case identifier"),
         });
     }
+    if is_rust_keyword(name) {
+        return Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!("'{name}' is a Rust keyword and cannot be used as a struct field name"),
+        });
+    }
 
     let (kind, nullable) = parse_type(ty).ok_or_else(|| GenerateError::InvalidField {
         token: token.to_owned(),
@@ -237,6 +243,21 @@ fn is_valid_ident(s: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Strict and reserved Rust keywords that cannot appear as a struct field name
+/// without raw-identifier syntax. Rather than emitting `r#type:` we reject the
+/// input so the generator never produces broken code.
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "do", "dyn", "else", "enum",
+    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+    "mut", "pub", "ref", "return", "self", "static", "struct", "super", "trait", "true", "try",
+    "type", "unsafe", "use", "where", "while", "yield", "abstract", "become", "box", "final",
+    "macro", "override", "priv", "typeof", "unsized", "virtual",
+];
+
+fn is_rust_keyword(s: &str) -> bool {
+    RUST_KEYWORDS.contains(&s)
 }
 
 #[cfg(test)]
@@ -340,6 +361,24 @@ mod tests {
     fn pascal_case_name_rejected() {
         let err = parse_field("Title:String").unwrap_err();
         assert!(err.to_string().contains("snake_case"));
+    }
+
+    #[test]
+    fn rust_keyword_field_name_rejected() {
+        // `pub type: String` would be a Rust syntax error.
+        let err = parse_field("type:String").unwrap_err();
+        assert!(err.to_string().contains("Rust keyword"));
+    }
+
+    #[test]
+    fn other_keywords_also_rejected() {
+        for kw in ["fn", "match", "struct", "self", "impl", "ref", "move"] {
+            let token = format!("{kw}:String");
+            assert!(
+                parse_field(&token).is_err(),
+                "expected '{kw}' to be rejected"
+            );
+        }
     }
 
     #[test]

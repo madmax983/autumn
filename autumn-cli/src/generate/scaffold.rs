@@ -12,10 +12,15 @@ use std::path::Path;
 
 use super::dsl::{Field, parse_fields};
 use super::emit::Plan;
-use super::model::plan_model;
+use super::model::{plan_cargo_deps, plan_model};
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{add_mod_declaration, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+
+/// Extra dependencies the *scaffold* generator's output requires on top of
+/// [`super::model::MODEL_DEPS`] — `maud` for HTML rendering in routes.
+const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] =
+    &[("maud", "{ version = \"0.27\", features = [\"axum\"] }")];
 
 /// Compute the file actions for `autumn generate scaffold`.
 ///
@@ -80,6 +85,19 @@ pub fn plan_scaffold(
         &route_entries,
     );
     plan.modify(main_path, updated);
+
+    // The Maud `html!` macro pulls in a direct `maud` dep on top of the
+    // model's deps. Both modify actions target Cargo.toml, so we combine
+    // them into a single deduplicated call — otherwise the second write
+    // would clobber the first (each rendering is computed at plan time
+    // against the on-disk Cargo.toml).
+    plan.actions.retain(|a| !a.path().ends_with("Cargo.toml"));
+    let combined: Vec<(&str, &str)> = super::model::MODEL_DEPS
+        .iter()
+        .copied()
+        .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
+        .collect();
+    plan_cargo_deps(&mut plan, project_root, &combined);
 
     Ok(plan)
 }

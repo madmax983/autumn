@@ -301,8 +301,8 @@ fn generate_model_help_shows_example() {
 
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate
 /// scaffold`, and `cargo check` the result against the local `autumn-web`
-/// crate. Verifies the generated code actually type-checks under the
-/// workspace's clippy lint set.
+/// crate. Verifies the generator adds every dep its emitted code needs and
+/// that the generated code actually type-checks.
 ///
 /// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
 #[test]
@@ -311,8 +311,10 @@ fn generated_scaffold_cargo_checks() {
     use std::fmt::Write as _;
     let (_tmp, project) = fresh_project("scaffold-build");
 
-    // Patch Cargo.toml to use the local autumn crate so we don't need the
-    // crates.io copy to exist at this version.
+    // Patch Cargo.toml to point at the *local* autumn-web crate (so we don't
+    // depend on crates.io having this exact version published). We do NOT
+    // pre-add the diesel/maud/etc deps here — that's what the generator is
+    // supposed to do automatically.
     let cargo_toml_path = project.join("Cargo.toml");
     let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -325,16 +327,6 @@ fn generated_scaffold_cargo_checks() {
         autumn_web.display().to_string().replace('\\', "/")
     )
     .unwrap();
-    // The scaffold templates reference Diesel + Maud directly. Add them
-    // explicitly so the generated routes compile.
-    let dep_block = "\n\
-chrono = { version = \"0.4\", features = [\"serde\"] }\n\
-diesel = { version = \"2\", features = [\"postgres\", \"chrono\"] }\n\
-diesel-async = { version = \"0.8\", features = [\"postgres\"] }\n\
-diesel_migrations = \"2\"\n\
-maud = { version = \"0.27\", features = [\"axum\"] }\n\
-serde = { version = \"1\", features = [\"derive\"] }\n";
-    content = content.replace("[dependencies]", &format!("[dependencies]{dep_block}"));
     fs::write(&cargo_toml_path, content).unwrap();
     // Drop build.rs so we don't need the Tailwind CLI installed.
     let _ = fs::remove_file(project.join("build.rs"));
@@ -350,6 +342,15 @@ serde = { version = \"1\", features = [\"derive\"] }\n";
             "published:bool",
         ],
     );
+
+    // The generator must have added every dep its emitted code needs.
+    let cargo_toml_after = fs::read_to_string(&cargo_toml_path).unwrap();
+    for dep in ["chrono", "diesel", "diesel-async", "maud", "serde"] {
+        assert!(
+            cargo_toml_after.contains(&format!("{dep} =")),
+            "Cargo.toml is missing '{dep}' after `generate scaffold`"
+        );
+    }
 
     let check = Command::new("cargo")
         .args(["check"])

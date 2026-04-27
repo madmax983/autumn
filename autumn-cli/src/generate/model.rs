@@ -60,8 +60,141 @@ pub fn plan_model(
         append_schema_table(&schema_existing, &table, &fields),
     );
 
+    // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
+    // for `diesel`, `serde`, and `chrono`, none of which are in the
+    // freshly-`autumn new`-ed project.
+    plan_cargo_deps(&mut plan, project_root, MODEL_DEPS);
+
     Ok(plan)
 }
+
+/// Direct dependencies the *model* generator's output requires at compile time.
+pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
+    ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
+    (
+        "diesel",
+        "{ version = \"2\", features = [\"postgres\", \"chrono\"] }",
+    ),
+    (
+        "diesel-async",
+        "{ version = \"0.8\", features = [\"postgres\"] }",
+    ),
+    (
+        "pq-sys",
+        "{ version = \"0.7\", features = [\"bundled_without_openssl\"] }",
+    ),
+    ("diesel_migrations", "\"2\""),
+    ("serde", "{ version = \"1\", features = [\"derive\"] }"),
+];
+
+/// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
+/// in `deps` is present under `[dependencies]` in the project's `Cargo.toml`.
+/// Existing entries are left untouched.
+pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&str, &str)]) {
+    let cargo_toml_path = project_root.join("Cargo.toml");
+    let existing = read_or_empty(&cargo_toml_path);
+    let updated = ensure_cargo_dependencies(&existing, deps);
+    if updated != existing {
+        plan.modify(cargo_toml_path, updated);
+    }
+}
+
+/// Insert each `(crate, version_spec)` pair at the end of the `[dependencies]`
+/// section, skipping entries already present. Pure string transformation —
+/// preserves the rest of the file as-is. If the file has no `[dependencies]`
+/// section yet, appends a new one with the requested entries.
+fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
+    let lines: Vec<&str> = existing.lines().collect();
+
+    // Locate the `[dependencies]` table header.
+    let Some(deps_idx) = lines.iter().position(|l| l.trim() == "[dependencies]") else {
+        // No `[dependencies]` section yet — append one with all requested deps.
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(existing.len() + 64);
+        out.push_str(existing);
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[dependencies]\n");
+        for (name, spec) in deps {
+            let _ = writeln!(out, "{name} = {spec}");
+        }
+        return out;
+    };
+
+    // Find the next `[…]` table header (or the end of file).
+    let next_section = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && t.ends_with(']')
+        })
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+
+    let dep_section = &lines[deps_idx + 1..next_section];
+
+    let to_add: Vec<(&str, &str)> = deps
+        .iter()
+        .copied()
+        .filter(|(name, _)| !dep_section_has(dep_section, name))
+        .collect();
+    if to_add.is_empty() {
+        return existing.to_owned();
+    }
+
+    // Drop trailing blank lines from the dep section so the insertion sits
+    // flush against the existing entries.
+    let mut insert_at = next_section;
+    while insert_at > deps_idx + 1 && lines[insert_at - 1].trim().is_empty() {
+        insert_at -= 1;
+    }
+
+    let inserted: Vec<String> = to_add
+        .iter()
+        .map(|(name, spec)| format!("{name} = {spec}"))
+        .collect();
+
+    let mut out = String::with_capacity(
+        existing.len() + inserted.iter().map(String::len).sum::<usize>() + 16,
+    );
+    for line in &lines[..insert_at] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for entry in &inserted {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    for line in &lines[insert_at..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Preserve whether the original file ended with a newline.
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// True iff `dep_section` contains a line declaring `crate_name = …`.
+fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
+    dep_section.iter().any(|l| {
+        let t = l.trim_start();
+        // Strip leading `#` so commented-out lines don't count.
+        if t.starts_with('#') {
+            return false;
+        }
+        t.split_once('=')
+            .is_some_and(|(name, _)| name.trim() == crate_name)
+    })
+}
+
+/// Reserved resource names whose snake-case form would collide with a special
+/// file in the generated layout (e.g. `mod` → `src/models/mod.rs`).
+const RESERVED_RESOURCE_NAMES: &[&str] = &["mod", "main", "lib", "self", "super", "crate"];
 
 /// Validate a resource name is a non-empty `PascalCase` or `snake_case` identifier.
 pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
@@ -85,6 +218,15 @@ pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
             format!("contains invalid character '{bad}'"),
+        ));
+    }
+    let snake_name = super::naming::snake(name);
+    if RESERVED_RESOURCE_NAMES.contains(&snake_name.as_str()) {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            format!(
+                "'{name}' is reserved — its snake_case form ('{snake_name}') collides with a special file"
+            ),
         ));
     }
     Ok(())
@@ -184,6 +326,24 @@ mod tests {
         let tmp = project();
         let err = plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
         assert!(matches!(err, GenerateError::InvalidName(_, _)));
+    }
+
+    #[test]
+    fn plan_rejects_reserved_resource_names() {
+        // Without this guard, `mod` → `src/models/mod.rs` would silently
+        // overwrite the per-resource model file with the mod aggregator.
+        for name in ["mod", "main", "lib", "Mod"] {
+            let tmp = project();
+            let err = plan_model(tmp.path(), name, &[], "20260427000000").unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidName(_, _)),
+                "expected '{name}' to be rejected"
+            );
+            assert!(
+                err.to_string().contains("reserved"),
+                "expected reserved-name error for '{name}'"
+            );
+        }
     }
 
     #[test]
@@ -309,7 +469,101 @@ mod tests {
             .iter()
             .filter(|a| matches!(a, Action::Modify { .. }))
             .count();
-        // mod.rs and schema.rs are always Modify.
-        assert!(modify_count >= 2);
+        // mod.rs, schema.rs, and Cargo.toml are always Modify.
+        assert!(modify_count >= 3);
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_appends_missing() {
+        let original = "[package]\n\
+name = \"x\"\n\
+\n\
+[dependencies]\n\
+autumn-web = \"0.3\"\n";
+        let updated = ensure_cargo_dependencies(
+            original,
+            &[
+                ("chrono", "\"0.4\""),
+                ("autumn-web", "\"99\""), // already present — must not duplicate
+            ],
+        );
+        assert!(updated.contains("autumn-web = \"0.3\""));
+        assert!(updated.contains("chrono = \"0.4\""));
+        assert_eq!(updated.matches("autumn-web =").count(), 1);
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_idempotent() {
+        let original = "[package]\nname = \"x\"\n\n[dependencies]\nchrono = \"0.4\"\n";
+        let once = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        let twice = ensure_cargo_dependencies(&once, &[("chrono", "\"0.4\"")]);
+        assert_eq!(once, twice);
+        assert_eq!(once, original);
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_inserts_before_next_section() {
+        let original = "[package]\nname = \"x\"\n\n\
+[dependencies]\nautumn-web = \"0.3\"\n\n\
+[dev-dependencies]\ntempfile = \"3\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        let chrono_pos = updated.find("chrono = \"0.4\"").unwrap();
+        let dev_deps_pos = updated.find("[dev-dependencies]").unwrap();
+        assert!(
+            chrono_pos < dev_deps_pos,
+            "chrono must land in [dependencies], not [dev-dependencies]"
+        );
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_skips_commented_out_entries() {
+        let original = "[dependencies]\n# autumn-web = \"0.2\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("autumn-web", "\"0.3\"")]);
+        assert!(updated.contains("autumn-web = \"0.3\""));
+    }
+
+    #[test]
+    fn plan_includes_cargo_toml_modification() {
+        let tmp = project();
+        let plan = plan_model(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.path().ends_with("Cargo.toml")),
+            "plan must touch Cargo.toml so generated code compiles"
+        );
+    }
+
+    #[test]
+    fn execute_adds_chrono_and_diesel_to_cargo_toml() {
+        let tmp = TempDir::new().unwrap();
+        // Realistic `autumn new` Cargo.toml.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nedition = \"2024\"\n\n\
+[dependencies]\nautumn-web = \"0.3\"\n",
+        )
+        .unwrap();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let cargo_toml = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        for dep in [
+            "chrono",
+            "diesel",
+            "diesel-async",
+            "serde",
+            "diesel_migrations",
+        ] {
+            assert!(
+                cargo_toml.contains(&format!("{dep} =")),
+                "missing '{dep}' in Cargo.toml after `generate model`:\n{cargo_toml}"
+            );
+        }
     }
 }
