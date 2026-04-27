@@ -914,6 +914,8 @@ fn mount_raw_routers(
     // Nest user-supplied raw Axum routers under path prefixes.
     for (prefix, raw_router) in nest_routers {
         tracing::debug!(prefix = %prefix, "Nested raw Axum router");
+        let raw_router =
+            raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
         router = router.nest(&prefix, raw_router);
     }
     router

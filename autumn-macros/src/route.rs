@@ -17,6 +17,7 @@ use crate::parse;
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
 ///
 /// `http_method` is the uppercase method name (e.g., `"GET"`).
+#[allow(clippy::too_many_lines)]
 /// `axum_fn` is the lowercase axum routing function name (e.g., `"get"`).
 pub fn route_macro(
     http_method: &str,
@@ -52,7 +53,7 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
-    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+    let primitive_wrapper = if let Some(prim_type) = check_primitive_output(&input_fn.sig.output) {
         let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
         let mut wrapper_inputs = Vec::new();
         let mut call_args = Vec::new();
@@ -75,10 +76,47 @@ pub fn route_macro(
             }
         }
 
+        let body = match prim_type {
+            PrimitiveType::Bare => quote! {
+                #fn_name(#(#call_args),*).await.to_string()
+            },
+            PrimitiveType::Result => quote! {
+                match #fn_name(#(#call_args),*).await {
+                    ::std::result::Result::Ok(val) => ::std::result::Result::Ok(val.to_string()),
+                    ::std::result::Result::Err(err) => ::std::result::Result::Err(err),
+                }
+            },
+        };
+
+        let ret_ty = match prim_type {
+            PrimitiveType::Bare => quote! { -> ::std::string::String },
+            PrimitiveType::Result => {
+                let ReturnType::Type(_, ty) = &input_fn.sig.output else {
+                    unreachable!()
+                };
+                let Type::Path(path) = ty.as_ref() else {
+                    unreachable!()
+                };
+                let err_ty = if let syn::PathArguments::AngleBracketed(args) =
+                    &path.path.segments.last().unwrap().arguments
+                {
+                    if args.args.len() == 2 {
+                        let err_arg = &args.args[1];
+                        quote! { #err_arg }
+                    } else {
+                        quote! { _ }
+                    }
+                } else {
+                    quote! { _ }
+                };
+                quote! { -> ::std::result::Result<::std::string::String, #err_ty> }
+            }
+        };
+
         Some(quote! {
             #[doc(hidden)]
-            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
-                #fn_name(#(#call_args),*).await.to_string()
+            async fn #wrapper_name(#(#wrapper_inputs),*) #ret_ty {
+                #body
             }
         })
     } else {
@@ -142,22 +180,52 @@ pub fn route_macro(
     }
 }
 
-fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+enum PrimitiveType {
+    Bare,
+    Result,
+}
+
+fn check_primitive_output(output: &ReturnType) -> Option<PrimitiveType> {
     let ReturnType::Type(_, ty) = output else {
-        return false;
+        return None;
     };
 
     let Type::Path(path) = ty.as_ref() else {
-        return false;
+        return None;
     };
 
-    if path.qself.is_some() || path.path.segments.len() != 1 {
-        return false;
+    if path.qself.is_some() || path.path.segments.is_empty() {
+        return None;
     }
 
-    let ident = path.path.segments[0].ident.to_string();
+    let ident = path.path.segments.last().unwrap().ident.to_string();
+    if ident == "Result" {
+        // Check if the first generic argument is a primitive
+        if let syn::PathArguments::AngleBracketed(args) =
+            &path.path.segments.last().unwrap().arguments
+        {
+            if let Some(syn::GenericArgument::Type(Type::Path(inner_path))) = args.args.first() {
+                if inner_path.qself.is_none() && inner_path.path.segments.len() == 1 {
+                    let inner_ident = inner_path.path.segments[0].ident.to_string();
+                    if is_primitive(&inner_ident) {
+                        return Some(PrimitiveType::Result);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    if path.path.segments.len() == 1 && is_primitive(&ident) {
+        return Some(PrimitiveType::Bare);
+    }
+
+    None
+}
+
+fn is_primitive(ident: &str) -> bool {
     matches!(
-        ident.as_str(),
+        ident,
         "bool"
             | "i8"
             | "i16"
