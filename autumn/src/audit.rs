@@ -219,6 +219,39 @@ impl AuditSink for JsonlFileAuditSink {
     }
 }
 
+/// A sink that broadcasts audit events to a WebSocket/SSE channel.
+///
+/// Available when the `ws` feature is enabled. Useful for real-time admin dashboards.
+#[cfg(feature = "ws")]
+#[derive(Clone)]
+pub struct ChannelAuditSink {
+    sender: crate::channels::Sender,
+}
+
+#[cfg(feature = "ws")]
+impl ChannelAuditSink {
+    /// Create a new channel sink targeting the provided sender.
+    #[must_use]
+    pub const fn new(sender: crate::channels::Sender) -> Self {
+        Self { sender }
+    }
+}
+
+#[cfg(feature = "ws")]
+impl AuditSink for ChannelAuditSink {
+    fn write(&self, event: AuditEvent) -> AuditWriteFuture<'_> {
+        let sender = self.sender.clone();
+        Box::pin(async move {
+            let json = serde_json::to_string(&event).map_err(|e| {
+                AuditError::new(format!("failed to serialize audit event for channel: {e}"))
+            })?;
+            // Ignore send errors -- they just mean no one is currently subscribed to the channel.
+            let _ = sender.send(json);
+            Ok(())
+        })
+    }
+}
+
 /// Helper to write an audit event using the logger stored in [`AppState`].
 ///
 /// # Errors
@@ -335,5 +368,22 @@ mod tests {
             1,
             "second sink should still receive event"
         );
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn channel_sink_broadcasts_events() {
+        let channels = crate::channels::Channels::new(16);
+        let sender = channels.sender("audit-events");
+        let mut rx = channels.subscribe("audit-events");
+
+        let sink = ChannelAuditSink::new(sender);
+        let event = AuditEvent::new("admin", "test.action", "target", None, AuditStatus::Success);
+
+        sink.write(event.clone()).await.expect("channel sink write");
+
+        let msg = rx.recv().await.expect("should receive message");
+        let received_event: AuditEvent = serde_json::from_str(msg.as_str()).expect("valid json");
+        assert_eq!(received_event.action, "test.action");
     }
 }
