@@ -270,7 +270,7 @@ impl MultipartField<'_> {
 fn multipart_rejection_to_error(
     err: &axum::extract::multipart::MultipartRejection,
 ) -> crate::AutumnError {
-    crate::AutumnError::bad_request_msg(format!("multipart parse error: {err}"))
+    crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
 }
 
 #[cfg(feature = "multipart")]
