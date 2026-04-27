@@ -14,7 +14,6 @@
 //! ## Quick start
 //!
 //! ```rust,no_run
-//! use std::sync::Arc;
 //! use autumn_web::storage::{Blob, BlobStore, BlobStoreError};
 //!
 //! async fn upload<S: BlobStore + ?Sized>(store: &S, key: &str, bytes: bytes::Bytes)
@@ -103,6 +102,11 @@ pub enum BlobStoreError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
 
+    /// Caller exceeded a backend size limit (per-file or per-request).
+    /// Maps to HTTP `413 Payload Too Large`.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     /// I/O failure (filesystem, network, transport).
     #[error("io error: {0}")]
     Io(String),
@@ -142,6 +146,7 @@ impl BlobStoreError {
             Self::NotFound(_) => http::StatusCode::NOT_FOUND,
             Self::PermissionDenied(_) => http::StatusCode::FORBIDDEN,
             Self::InvalidInput(_) | Self::Signature(_) => http::StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge(_) => http::StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unsupported(_) => http::StatusCode::NOT_IMPLEMENTED,
             Self::Io(_) | Self::Backend(_) => http::StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -258,6 +263,23 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             "blob key must be relative".into(),
         ));
     }
+    // Windows drive-letter forms (`C:\…`, `C:/…`, `\\?\…`, `\\server\share\…`)
+    // would be treated as absolute by `Path::join` on Windows, silently
+    // escaping the storage root regardless of whether the host happens
+    // to be Linux. Reject them up-front so the same key contract holds
+    // on every platform.
+    let bytes = key.as_bytes();
+    let drive_letter = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    if drive_letter {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key looks like a Windows drive-letter path".into(),
+        ));
+    }
+    if key.starts_with("\\\\") || key.starts_with("//") {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key looks like a UNC / network path".into(),
+        ));
+    }
     for segment in key.split(['/', '\\']) {
         if segment == ".." {
             return Err(BlobStoreError::InvalidInput(
@@ -303,6 +325,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_key_rejects_windows_drive_letter() {
+        for k in [r"C:\tmp\x", "C:/tmp/x", "z:\\foo", "a:bar"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_unc_paths() {
+        for k in [r"\\server\share\file", "//server/share/file"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn error_status_mapping() {
         assert_eq!(
             BlobStoreError::NotFound("x".into()).status(),
@@ -319,6 +363,10 @@ mod tests {
         assert_eq!(
             BlobStoreError::Signature("x".into()).status(),
             http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            BlobStoreError::PayloadTooLarge("x".into()).status(),
+            http::StatusCode::PAYLOAD_TOO_LARGE
         );
         assert_eq!(
             BlobStoreError::Unsupported("x".into()).status(),

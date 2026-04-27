@@ -303,7 +303,7 @@ impl<'a> MultipartField<'a> {
                 Ok(Some(chunk)) => {
                     state.total = state.total.saturating_add(chunk.len());
                     if state.total > state.max {
-                        let err = crate::storage::BlobStoreError::InvalidInput(format!(
+                        let err = crate::storage::BlobStoreError::PayloadTooLarge(format!(
                             "uploaded file exceeds limit of {} bytes",
                             state.max,
                         ));

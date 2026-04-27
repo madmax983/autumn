@@ -28,6 +28,15 @@ use super::{BlobFuture, BlobStore, BlobStoreError, ByteStream, validate_key};
 #[derive(Clone)]
 pub struct SigningKey(Arc<Vec<u8>>);
 
+impl std::fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't leak key material into logs.
+        f.debug_struct("SigningKey")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 impl SigningKey {
     /// Create a key from explicit bytes.
     #[must_use]
@@ -56,11 +65,12 @@ impl SigningKey {
 ///
 /// Construct via [`LocalBlobStore::new`]. The framework wires this up
 /// from `[storage.local]` automatically when `storage.backend = "local"`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct LocalBlobStore {
     inner: Arc<LocalInner>,
 }
 
+#[derive(Debug)]
 struct LocalInner {
     provider_id: String,
     root: PathBuf,
@@ -86,13 +96,24 @@ impl LocalBlobStore {
         default_expiry: Duration,
         signing_key: SigningKey,
     ) -> Result<Self, BlobStoreError> {
+        let mount_path = mount_path.into();
+        // axum panics with `Paths must start with a '/'` if we hand it a
+        // mount path that doesn't lead with a slash. Catch that here as
+        // a recoverable configuration error so a bad
+        // `[storage.local].mount_path` (or the env-var equivalent)
+        // surfaces a clean message instead of a router-build panic.
+        if !mount_path.starts_with('/') {
+            return Err(BlobStoreError::InvalidInput(format!(
+                "storage.local.mount_path must start with '/' (got {mount_path:?})"
+            )));
+        }
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(BlobStoreError::io)?;
         Ok(Self {
             inner: Arc::new(LocalInner {
                 provider_id: provider_id.into(),
                 root,
-                mount_path: mount_path.into(),
+                mount_path,
                 default_expiry,
                 signing_key,
             }),
@@ -543,6 +564,20 @@ mod tests {
             .put("../escape.txt", "text/plain", Bytes::from_static(b"x"))
             .await
             .unwrap_err();
+        assert!(matches!(err, BlobStoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn new_rejects_mount_path_without_leading_slash() {
+        let dir = temp_root();
+        let err = LocalBlobStore::new(
+            "test",
+            dir.path().to_path_buf(),
+            "_blobs", // missing leading slash
+            Duration::from_secs(60),
+            SigningKey::new(b"k".to_vec()),
+        )
+        .unwrap_err();
         assert!(matches!(err, BlobStoreError::InvalidInput(_)));
     }
 
