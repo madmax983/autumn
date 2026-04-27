@@ -9,7 +9,7 @@
 //! # Quick start
 //!
 //! ```rust,ignore
-//! use autumn_admin_plugin::AdminPlugin;
+//! use autumn_admin_plugin::{prelude::*, AdminPlugin};
 //!
 //! autumn_web::app()
 //!     .plugin(
@@ -43,6 +43,14 @@ pub use traits::{
     AdminAction, AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams,
     ListResult, SortDirection,
 };
+
+/// Common downstream imports for implementing admin models.
+pub mod prelude {
+    pub use crate::{
+        AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
+        SortDirection,
+    };
+}
 
 use std::borrow::Cow;
 use std::sync::Arc;

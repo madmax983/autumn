@@ -1,7 +1,4 @@
-use autumn_admin_plugin::{
-    AdminError, AdminField, AdminFieldKind, AdminFuture, AdminModel, ListParams, ListResult,
-    SortDirection,
-};
+use autumn_admin_plugin::prelude::*;
 use diesel::OptionalExtension;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;

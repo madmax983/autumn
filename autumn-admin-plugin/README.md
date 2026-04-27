@@ -29,8 +29,10 @@ autumn-admin-plugin = "0.3"
 ## Quick Start
 
 ```rust,ignore
+use autumn_admin_plugin::{prelude::*, AdminPlugin};
+
 struct ProjectAdmin;
-// Implement `autumn_admin_plugin::AdminModel` for your type.
+// Implement `AdminModel` for your type.
 // Supply field metadata plus `list`, `get`, `create`, `update`, and `delete`.
 
 #[autumn_web::main]
