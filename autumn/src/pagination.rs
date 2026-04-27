@@ -92,6 +92,26 @@
 //! pagination parameters should not 400. Unparseable or tampered cursors
 //! decode to `None` (i.e. fall back to the first page) for the same reason.
 //!
+//! # Signed cursors (optional)
+//!
+//! Plain cursors are *opaque but unsigned* — the same model used by
+//! Stripe, GitHub, and Relay. Forging one is equivalent to seeking to
+//! an arbitrary offset, which clients can already do with `?page=N`,
+//! so for sort-key-only cursors (timestamp + id) signing adds no real
+//! protection.
+//!
+//! However, if a handler ever encodes anything *sensitive to tampering*
+//! into the cursor payload — a tenant id, a user scope, anything the
+//! handler relies on to filter results — switch to the signed API:
+//!
+//! - [`Cursor::encode_signed`] / [`Cursor::decode_signed`]
+//! - [`CursorRequest::decode_signed`]
+//! - [`CursorPage::from_overfetched_signed`]
+//!
+//! All three take a key as `&[u8]`. Tokens are signed with HMAC-SHA256
+//! and verified in constant time; tampered or unsigned tokens decode
+//! to `None`.
+//!
 //! # Response shape
 //!
 //! [`Page<T>`] serializes as:
@@ -514,6 +534,66 @@ impl Cursor {
         let bytes = base64url_decode(token)?;
         serde_json::from_slice(&bytes).ok()
     }
+
+    /// Encode a value as a *signed* cursor token using HMAC-SHA256.
+    ///
+    /// Use this when the cursor payload encodes anything sensitive to
+    /// tampering — for example a tenant boundary, a user id, or any
+    /// scope a handler relies on to filter results. Without signing,
+    /// a client could edit the JSON and re-encode it. Plain
+    /// [`Cursor::encode`] is fine for cursors that only carry sort-key
+    /// values (timestamps, primary keys), since forging one is
+    /// equivalent to seeking to an arbitrary offset.
+    ///
+    /// The token format is `<base64url(json)>.<base64url(hmac)>`.
+    /// The signature covers exactly the payload bytes; the encoded
+    /// payload itself is not encrypted (cursors are not secrets).
+    ///
+    /// # Errors
+    ///
+    /// Returns `serde_json::Error` if the value cannot be serialized.
+    pub fn encode_signed<T: Serialize>(value: &T, key: &[u8]) -> Result<String, serde_json::Error> {
+        let payload = serde_json::to_vec(value)?;
+        let payload_b64 = base64url_encode(&payload);
+        let mac = hmac_sha256(key, payload_b64.as_bytes());
+        let sig_b64 = base64url_encode(&mac);
+        Ok(format!("{payload_b64}.{sig_b64}"))
+    }
+
+    /// Decode a signed cursor token, verifying its HMAC-SHA256 signature.
+    ///
+    /// Returns `None` for any of: malformed structure, malformed
+    /// base64, signature mismatch, JSON that doesn't match `T`. The
+    /// signature is verified in constant time. A handler that uses
+    /// this should treat `None` the same way it treats no cursor
+    /// (fall back to first page) rather than returning an error —
+    /// the goal is to ignore tampered cursors, not to surface them
+    /// as user-facing failures.
+    #[must_use]
+    pub fn decode_signed<T: DeserializeOwned>(token: &str, key: &[u8]) -> Option<T> {
+        let (payload_b64, sig_b64) = token.split_once('.')?;
+        let expected_sig = base64url_decode(sig_b64)?;
+        let actual_sig = hmac_sha256(key, payload_b64.as_bytes());
+        if !constant_time_eq(&expected_sig, &actual_sig) {
+            return None;
+        }
+        let payload = base64url_decode(payload_b64)?;
+        serde_json::from_slice(&payload).ok()
+    }
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    // `Hmac::new_from_slice` accepts any key length.
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 // ── CursorRequest ───────────────────────────────────────────────────
@@ -570,6 +650,17 @@ impl CursorRequest {
     #[must_use]
     pub fn decode<T: DeserializeOwned>(&self) -> Option<T> {
         Cursor::decode(self.cursor.as_deref()?)
+    }
+
+    /// Decode a *signed* cursor, verifying its HMAC-SHA256 signature
+    /// against `key`. See [`Cursor::decode_signed`] for the threat
+    /// model and when to use signed vs. unsigned cursors.
+    ///
+    /// Returns `None` if the cursor is missing, malformed, or has an
+    /// invalid signature.
+    #[must_use]
+    pub fn decode_signed<T: DeserializeOwned>(&self, key: &[u8]) -> Option<T> {
+        Cursor::decode_signed(self.cursor.as_deref()?, key)
     }
 
     /// Resolved page size, clamped to <code>1..=[`MAX_PAGE_SIZE`]</code>.
@@ -698,10 +789,51 @@ impl<T> CursorPage<T> {
     /// successful query, which is the wrong tradeoff for a list
     /// endpoint.
     #[must_use]
-    pub fn from_overfetched<K, F>(mut items: Vec<T>, request: &CursorRequest, cursor_fn: F) -> Self
+    pub fn from_overfetched<K, F>(items: Vec<T>, request: &CursorRequest, cursor_fn: F) -> Self
     where
         K: Serialize,
         F: FnOnce(&T) -> K,
+    {
+        Self::from_overfetched_inner(items, request, cursor_fn, |k| Cursor::encode(&k).ok())
+    }
+
+    /// Variant of [`Self::from_overfetched`] that signs `next_cursor`
+    /// with HMAC-SHA256 using `key`.
+    ///
+    /// Use this when the cursor payload encodes anything sensitive to
+    /// tampering (tenant ids, user scopes). For sort-key-only cursors
+    /// (timestamp + id), plain [`Self::from_overfetched`] is fine —
+    /// forging an unsigned cursor is equivalent to seeking to an
+    /// arbitrary offset, which clients can already do with `?page=N`.
+    ///
+    /// The corresponding extractor side calls
+    /// [`CursorRequest::decode_signed`] with the same key.
+    #[must_use]
+    pub fn from_overfetched_signed<K, F>(
+        items: Vec<T>,
+        request: &CursorRequest,
+        key: &[u8],
+        cursor_fn: F,
+    ) -> Self
+    where
+        K: Serialize,
+        F: FnOnce(&T) -> K,
+    {
+        Self::from_overfetched_inner(items, request, cursor_fn, |k| {
+            Cursor::encode_signed(&k, key).ok()
+        })
+    }
+
+    fn from_overfetched_inner<K, F, E>(
+        mut items: Vec<T>,
+        request: &CursorRequest,
+        cursor_fn: F,
+        encode: E,
+    ) -> Self
+    where
+        K: Serialize,
+        F: FnOnce(&T) -> K,
+        E: FnOnce(K) -> Option<String>,
     {
         let size = request.size();
         let limit = size as usize;
@@ -714,10 +846,7 @@ impl<T> CursorPage<T> {
             // it (rather than the popped row) means the next query
             // can use a strict inequality and still see every row,
             // even under concurrent inserts that land between pages.
-            items
-                .last()
-                .map(cursor_fn)
-                .and_then(|k| Cursor::encode(&k).ok())
+            items.last().map(cursor_fn).and_then(encode)
         } else {
             None
         };
@@ -1392,5 +1521,143 @@ mod tests {
             !all.iter().any(|r| r.id == 99),
             "concurrently-inserted row not duplicated"
         );
+    }
+
+    // ── Signed cursors ─────────────────────────────────────────
+
+    const TEST_KEY: &[u8] = b"test-signing-key-do-not-use-in-prod";
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct ScopedCursor {
+        tenant_id: i64,
+        cursor_id: i64,
+    }
+
+    #[test]
+    fn signed_cursor_round_trip() {
+        let payload = ScopedCursor {
+            tenant_id: 42,
+            cursor_id: 7,
+        };
+        let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
+        // Token shape: <payload>.<sig>
+        assert!(token.contains('.'));
+        let decoded: ScopedCursor = Cursor::decode_signed(&token, TEST_KEY).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn signed_cursor_rejects_tampered_payload() {
+        let payload = ScopedCursor {
+            tenant_id: 42,
+            cursor_id: 7,
+        };
+        let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
+        // Forge: re-encode a payload with tenant_id=99 but reuse the
+        // original signature.
+        let forged_payload = ScopedCursor {
+            tenant_id: 99,
+            cursor_id: 7,
+        };
+        let forged_b64 = base64url_encode(&serde_json::to_vec(&forged_payload).unwrap());
+        let (_, sig_b64) = token.split_once('.').unwrap();
+        let forged_token = format!("{forged_b64}.{sig_b64}");
+        let decoded: Option<ScopedCursor> = Cursor::decode_signed(&forged_token, TEST_KEY);
+        assert!(decoded.is_none(), "tampered cursor must not verify");
+    }
+
+    #[test]
+    fn signed_cursor_rejects_wrong_key() {
+        let payload = ScopedCursor {
+            tenant_id: 42,
+            cursor_id: 7,
+        };
+        let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
+        let decoded: Option<ScopedCursor> = Cursor::decode_signed(&token, b"different-key");
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn signed_cursor_rejects_unsigned_token() {
+        // A plain (unsigned) token should not verify against the
+        // signed decoder — even though it's structurally valid JSON.
+        let payload = ScopedCursor {
+            tenant_id: 42,
+            cursor_id: 7,
+        };
+        let unsigned = Cursor::encode(&payload).unwrap();
+        let decoded: Option<ScopedCursor> = Cursor::decode_signed(&unsigned, TEST_KEY);
+        assert!(
+            decoded.is_none(),
+            "unsigned token must not pass signed verification"
+        );
+    }
+
+    #[test]
+    fn signed_cursor_rejects_missing_signature_segment() {
+        // Token without a `.` separator.
+        let decoded: Option<ScopedCursor> = Cursor::decode_signed("just-some-bytes", TEST_KEY);
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn signed_cursor_rejects_garbage() {
+        let decoded: Option<ScopedCursor> = Cursor::decode_signed("!!!.!!!", TEST_KEY);
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn cursor_request_decode_signed_returns_none_when_missing() {
+        let r = CursorRequest::default();
+        let decoded: Option<ScopedCursor> = r.decode_signed(TEST_KEY);
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn cursor_request_decode_signed_round_trips() {
+        let payload = ScopedCursor {
+            tenant_id: 42,
+            cursor_id: 7,
+        };
+        let token = Cursor::encode_signed(&payload, TEST_KEY).unwrap();
+        let r = CursorRequest::new(Some(token), 10);
+        let decoded: ScopedCursor = r.decode_signed(TEST_KEY).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn cursor_page_from_overfetched_signed_emits_signed_token() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1_i32, 2, 3]; // overfetch by 1
+        let page = CursorPage::from_overfetched_signed(items, &req, TEST_KEY, |&n| ScopedCursor {
+            tenant_id: 42,
+            cursor_id: i64::from(n),
+        });
+        assert!(page.has_next);
+        let token = page.next_cursor.as_ref().unwrap();
+        assert!(token.contains('.'), "signed token format is payload.sig");
+        // Round-trip through the signed decoder.
+        let key: ScopedCursor = Cursor::decode_signed(token, TEST_KEY).unwrap();
+        assert_eq!(key.cursor_id, 2); // boundary = last kept item
+        // Plain decoder must NOT happen to extract a structurally
+        // valid value, because the token contains the signature suffix.
+        let mishandled: Option<ScopedCursor> = Cursor::decode(token);
+        assert!(mishandled.is_none());
+    }
+
+    #[test]
+    fn signed_cursor_signature_is_constant_time_compared() {
+        // Smoke test: same key, same input → identical sig. Different
+        // key → different sig. (Constant-time-ness itself is not
+        // observable from this test; we're just exercising the path.)
+        let p = ScopedCursor {
+            tenant_id: 1,
+            cursor_id: 1,
+        };
+        let a = Cursor::encode_signed(&p, b"k1").unwrap();
+        let b = Cursor::encode_signed(&p, b"k1").unwrap();
+        let c = Cursor::encode_signed(&p, b"k2").unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 }
