@@ -420,16 +420,67 @@ fn build_openapi_router(
     );
 
     if let Some(path) = swagger_path {
-        let spec_url = json_path.clone();
+        let [css_path, bundle_path, initializer_path] =
+            crate::openapi::swagger_ui_asset_paths(&path);
+        let html_body = Arc::new(crate::openapi::swagger_ui_html(
+            &title,
+            &css_path,
+            &bundle_path,
+            &initializer_path,
+        ));
+        let initializer_body = Arc::new(crate::openapi::swagger_ui_initializer_js(&json_path));
         router = router.route(
             &path,
             axum::routing::get(move || {
-                let html = crate::openapi::swagger_ui_html(&spec_url, &title);
+                let html = html_body.clone();
                 async move {
                     use axum::response::IntoResponse;
                     (
                         [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        html,
+                        (*html).clone(),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        router = router.route(
+            &css_path,
+            axum::routing::get(|| async move {
+                use axum::response::IntoResponse;
+                (
+                    [(http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+                    crate::openapi::SWAGGER_UI_CSS,
+                )
+                    .into_response()
+            }),
+        );
+        router = router.route(
+            &bundle_path,
+            axum::routing::get(|| async move {
+                use axum::body::Bytes;
+                use axum::response::IntoResponse;
+                (
+                    [(
+                        http::header::CONTENT_TYPE,
+                        "application/javascript; charset=utf-8",
+                    )],
+                    Bytes::from_static(crate::openapi::SWAGGER_UI_BUNDLE),
+                )
+                    .into_response()
+            }),
+        );
+        router = router.route(
+            &initializer_path,
+            axum::routing::get(move || {
+                let js = initializer_body.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    (
+                        [(
+                            http::header::CONTENT_TYPE,
+                            "application/javascript; charset=utf-8",
+                        )],
+                        (*js).clone(),
                     )
                         .into_response()
                 }
@@ -440,6 +491,7 @@ fn build_openapi_router(
     tracing::debug!(
         openapi_json = %json_path,
         swagger_ui = ?config.swagger_ui_path,
+        swagger_ui_version = crate::openapi::SWAGGER_UI_VERSION,
         "Mounted OpenAPI endpoints"
     );
 
@@ -611,6 +663,16 @@ fn reject_openapi_path_collisions(
     )?;
     if let Some(path) = &openapi.swagger_ui_path {
         check_openapi_path_against("swagger_ui_path", path, &claimed, nest_routers)?;
+        let mut claimed_with_openapi = claimed.clone();
+        claimed_with_openapi.insert(openapi.openapi_json_path.clone());
+        for asset_path in crate::openapi::swagger_ui_asset_paths(path) {
+            check_openapi_path_against(
+                "swagger_ui_path",
+                &asset_path,
+                &claimed_with_openapi,
+                nest_routers,
+            )?;
+        }
     }
 
     // Raw merged routers are opaque — we can't inspect their route
@@ -2021,6 +2083,47 @@ mod tests {
                 field: "openapi_json_path",
                 ..
             }
+        ));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn try_build_router_rejects_swagger_ui_asset_path_colliding_with_user_route() {
+        let config = AutumnConfig::default();
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0");
+
+        let user_route = Route {
+            method: http::Method::GET,
+            path: "/swagger-ui/swagger-ui.css",
+            handler: axum::routing::get(collision_test_handler),
+            name: "swagger-ui-asset-collides",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/swagger-ui/swagger-ui.css",
+                operation_id: "swagger_ui_asset_collides",
+                success_status: 200,
+                ..Default::default()
+            },
+        };
+
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+        };
+        let err = super::try_build_router_inner(vec![user_route], &config, test_state(), ctx)
+            .expect_err("swagger ui asset path should be reserved");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "swagger_ui_path",
+                ref path,
+            } if path == "/swagger-ui/swagger-ui.css"
         ));
     }
 

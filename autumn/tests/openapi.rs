@@ -332,8 +332,43 @@ async fn swagger_ui_endpoint_returns_html_referencing_spec_url() {
     response.assert_ok();
 
     let body = response.text();
-    assert!(body.contains("SwaggerUIBundle"));
-    assert!(body.contains("/v3/api-docs"));
+    let csp = response
+        .header("content-security-policy")
+        .expect("default security headers should include a CSP");
+    assert!(csp.contains("script-src 'self'"), "csp = {csp}");
+    assert!(body.contains("/swagger-ui/swagger-ui.css"));
+    assert!(body.contains("/swagger-ui/swagger-ui-bundle.js"));
+    assert!(body.contains("/swagger-ui/swagger-initializer.js"));
+    assert!(!body.contains("unpkg.com"));
+    assert!(!body.contains("window.onload = function()"));
+}
+
+#[tokio::test]
+async fn swagger_ui_assets_are_served_same_origin() {
+    let client = TestApp::new()
+        .routes(routes![hello])
+        .openapi(OpenApiConfig::new("Demo", "1.0.0"))
+        .build();
+
+    client
+        .get("/swagger-ui/swagger-ui.css")
+        .send()
+        .await
+        .assert_ok()
+        .assert_header("content-type", "text/css; charset=utf-8");
+    client
+        .get("/swagger-ui/swagger-ui-bundle.js")
+        .send()
+        .await
+        .assert_ok()
+        .assert_header("content-type", "application/javascript; charset=utf-8");
+    let init = client
+        .get("/swagger-ui/swagger-initializer.js")
+        .send()
+        .await;
+    init.assert_ok()
+        .assert_header("content-type", "application/javascript; charset=utf-8");
+    assert!(init.text().contains(r#""/v3/api-docs""#));
 }
 
 #[tokio::test]
@@ -360,6 +395,12 @@ async fn custom_openapi_paths_are_honored() {
 
     client.get("/openapi.json").send().await.assert_ok();
     client.get("/docs").send().await.assert_ok();
+    client.get("/docs/swagger-ui.css").send().await.assert_ok();
+    client
+        .get("/docs/swagger-initializer.js")
+        .send()
+        .await
+        .assert_ok();
 
     // The default paths should now return 404
     let default_json = client.get("/v3/api-docs").send().await;

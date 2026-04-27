@@ -686,18 +686,55 @@ const fn status_description(status: u16) -> &'static str {
 // Swagger UI HTML
 // ──────────────────────────────────────────────────────────────────
 
-/// Minimal Swagger UI bootstrap HTML that loads the generated JSON.
-///
-/// Uses the public unpkg CDN for Swagger UI assets so no static files
-/// need to be embedded in the framework binary.
+#[cfg(feature = "openapi")]
+pub(crate) const SWAGGER_UI_VERSION: &str = "5.32.4";
+#[cfg(feature = "openapi")]
+pub(crate) const SWAGGER_UI_CSS: &str = include_str!("../vendor/swagger-ui/swagger-ui.css");
+#[cfg(feature = "openapi")]
+pub(crate) const SWAGGER_UI_BUNDLE: &[u8] =
+    include_bytes!("../vendor/swagger-ui/swagger-ui-bundle.js");
+#[cfg(feature = "openapi")]
+const SWAGGER_UI_CSS_FILE: &str = "swagger-ui.css";
+#[cfg(feature = "openapi")]
+const SWAGGER_UI_BUNDLE_FILE: &str = "swagger-ui-bundle.js";
+#[cfg(feature = "openapi")]
+const SWAGGER_UI_INITIALIZER_FILE: &str = "swagger-initializer.js";
+
+/// Compute the same-origin asset URLs mounted beneath the Swagger UI HTML path.
 #[cfg(feature = "openapi")]
 #[must_use]
-pub fn swagger_ui_html(spec_url: &str, title: &str) -> String {
+pub(crate) fn swagger_ui_asset_paths(swagger_path: &str) -> [String; 3] {
+    [
+        swagger_ui_asset_path(swagger_path, SWAGGER_UI_CSS_FILE),
+        swagger_ui_asset_path(swagger_path, SWAGGER_UI_BUNDLE_FILE),
+        swagger_ui_asset_path(swagger_path, SWAGGER_UI_INITIALIZER_FILE),
+    ]
+}
+
+#[cfg(feature = "openapi")]
+#[must_use]
+fn swagger_ui_asset_path(swagger_path: &str, asset_file: &str) -> String {
+    let base = swagger_path.trim_end_matches('/');
+    if base.is_empty() || base == "/" {
+        format!("/{asset_file}")
+    } else {
+        format!("{base}/{asset_file}")
+    }
+}
+
+/// Minimal Swagger UI bootstrap HTML that loads same-origin vendored assets.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn swagger_ui_html(
+    title: &str,
+    css_url: &str,
+    bundle_url: &str,
+    initializer_url: &str,
+) -> String {
     let title = html_escape(title);
-    let spec_url = html_escape(spec_url);
-    // Assembled as a single String (not a format!()) to avoid conflicts
-    // between Rust's raw-string `#` delimiters and the CSS selector
-    // `#swagger-ui` in the embedded JS.
+    let css_url = html_escape(css_url);
+    let bundle_url = html_escape(bundle_url);
+    let initializer_url = html_escape(initializer_url);
     let mut out = String::with_capacity(1024);
     out.push_str("<!DOCTYPE html>\n");
     out.push_str("<html lang=\"en\">\n");
@@ -706,30 +743,40 @@ pub fn swagger_ui_html(spec_url: &str, title: &str) -> String {
     out.push_str("    <title>");
     out.push_str(&title);
     out.push_str("</title>\n");
-    out.push_str(
-        "    <link rel=\"stylesheet\" \
-         href=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui.css\" />\n",
-    );
+    out.push_str("    <link rel=\"stylesheet\" href=\"");
+    out.push_str(&css_url);
+    out.push_str("\" />\n");
     out.push_str("  </head>\n");
     out.push_str("  <body>\n");
     out.push_str("    <div id=\"swagger-ui\"></div>\n");
-    out.push_str(
-        "    <script src=\"https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js\" \
-         charset=\"UTF-8\"></script>\n",
-    );
-    out.push_str("    <script>\n");
-    out.push_str("      window.onload = function() {\n");
-    out.push_str("        window.ui = SwaggerUIBundle({\n");
-    out.push_str("          url: \"");
-    out.push_str(&spec_url);
-    out.push_str("\",\n");
-    out.push_str("          dom_id: \"#swagger-ui\",\n");
-    out.push_str("          deepLinking: true\n");
-    out.push_str("        });\n");
-    out.push_str("      };\n");
-    out.push_str("    </script>\n");
+    out.push_str("    <script src=\"");
+    out.push_str(&bundle_url);
+    out.push_str("\" charset=\"UTF-8\"></script>\n");
+    out.push_str("    <script src=\"");
+    out.push_str(&initializer_url);
+    out.push_str("\" charset=\"UTF-8\"></script>\n");
     out.push_str("  </body>\n");
     out.push_str("</html>\n");
+    out
+}
+
+/// External Swagger UI initializer script so the default `script-src 'self'`
+/// CSP can boot the docs UI without permitting inline JavaScript.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn swagger_ui_initializer_js(spec_url: &str) -> String {
+    let spec_url = serde_json::to_string(spec_url)
+        .unwrap_or_else(|e| format!("\"/v3/api-docs?serialization_error={e}\""));
+    let mut out = String::with_capacity(256);
+    out.push_str("window.onload = function() {\n");
+    out.push_str("  window.ui = SwaggerUIBundle({\n");
+    out.push_str("    url: ");
+    out.push_str(&spec_url);
+    out.push_str(",\n");
+    out.push_str("    dom_id: \"#swagger-ui\",\n");
+    out.push_str("    deepLinking: true\n");
+    out.push_str("  });\n");
+    out.push_str("};\n");
     out
 }
 
@@ -831,6 +878,28 @@ mod tests {
         let op = spec.paths["/users/{id}"].get.as_ref().unwrap();
         let media = op.responses["200"].content.get("application/json").unwrap();
         assert_eq!(media.schema, serde_json::json!({ "type": "string" }));
+    }
+
+    #[test]
+    fn swagger_ui_html_uses_same_origin_assets() {
+        let html = swagger_ui_html(
+            "Demo",
+            "/swagger-ui/swagger-ui.css",
+            "/swagger-ui/swagger-ui-bundle.js",
+            "/swagger-ui/swagger-initializer.js",
+        );
+        assert!(html.contains("/swagger-ui/swagger-ui.css"));
+        assert!(html.contains("/swagger-ui/swagger-ui-bundle.js"));
+        assert!(html.contains("/swagger-ui/swagger-initializer.js"));
+        assert!(!html.contains("unpkg.com"));
+        assert!(!html.contains("window.onload = function()"));
+    }
+
+    #[test]
+    fn swagger_ui_initializer_js_references_spec_url() {
+        let js = swagger_ui_initializer_js("/v3/api-docs");
+        assert!(js.contains("SwaggerUIBundle"));
+        assert!(js.contains(r#""/v3/api-docs""#));
     }
 
     #[test]
@@ -977,15 +1046,25 @@ mod tests {
 
     #[test]
     fn swagger_ui_html_embeds_spec_url() {
-        let html = swagger_ui_html("/v3/api-docs", "My API");
-        assert!(html.contains("/v3/api-docs"));
+        let html = swagger_ui_html(
+            "My API",
+            "/swagger-ui/swagger-ui.css",
+            "/swagger-ui/swagger-ui-bundle.js",
+            "/swagger-ui/swagger-initializer.js",
+        );
+        assert!(html.contains("/swagger-ui/swagger-ui.css"));
         assert!(html.contains("My API"));
     }
 
     #[test]
     fn swagger_ui_html_escapes_attributes() {
-        let html = swagger_ui_html("/v3/api-docs?x=<y>", "A \"cool\" & fun API");
-        assert!(html.contains("/v3/api-docs?x=&lt;y&gt;"));
+        let html = swagger_ui_html(
+            "A \"cool\" & fun API",
+            "/swagger-ui/swagger-ui.css?x=<y>",
+            "/swagger-ui/swagger-ui-bundle.js",
+            "/swagger-ui/swagger-initializer.js",
+        );
+        assert!(html.contains("/swagger-ui/swagger-ui.css?x=&lt;y&gt;"));
         assert!(html.contains("A &quot;cool&quot; &amp; fun API"));
     }
 }
