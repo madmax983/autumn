@@ -1,2 +1,0 @@
-Found 58 mutants to test
- WARN An explicit test timeout is recommended when using --baseline=skip; using 300 seconds by default
