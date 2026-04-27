@@ -199,19 +199,29 @@ fn is_table_header(line: &str, table: &str) -> bool {
     after.is_empty() || after.starts_with('#')
 }
 
-/// True iff `line` is *any* `[<table>]` header, regardless of the table name.
+/// True iff `line` is *any* TOML table header — either a single-bracket
+/// `[section]` or an array-of-tables `[[section]]`. Both must terminate the
+/// `[dependencies]` table when scanning forward.
 fn is_any_table_header(line: &str) -> bool {
     let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix('[') else {
+    // Strip one or two opening brackets — `[[…]]` is the array-of-tables form.
+    let after_open = trimmed
+        .strip_prefix("[[")
+        .or_else(|| trimmed.strip_prefix('['));
+    let Some(rest) = after_open else {
         return false;
     };
+    // Find the *first* closing bracket. Whether it's `]` or `]]`, the inner
+    // name is everything before that first `]`.
     let Some(close_idx) = rest.find(']') else {
         return false;
     };
     if rest[..close_idx].trim().is_empty() {
         return false;
     }
+    // Anything after the closing bracket(s) must be whitespace or `# comment`.
     let after = rest[close_idx + 1..].trim_start();
+    let after = after.strip_prefix(']').unwrap_or(after).trim_start();
     after.is_empty() || after.starts_with('#')
 }
 
@@ -616,6 +626,23 @@ autumn-web = \"0.3\"\n";
         assert!(
             chrono_pos < dev_deps_pos,
             "chrono must land in [dependencies], not [dev-dependencies]"
+        );
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_treats_array_of_tables_as_boundary() {
+        // `[[bin]]` is an array-of-tables header — it must terminate the
+        // `[dependencies]` block. Without this, generated deps land *inside*
+        // the `[[bin]]` entry and Cargo silently ignores them.
+        let original = "[package]\nname = \"x\"\n\n\
+[dependencies]\nautumn-web = \"0.3\"\n\n\
+[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n";
+        let updated = ensure_cargo_dependencies(original, &[("chrono", "\"0.4\"")]);
+        let chrono_pos = updated.find("chrono = \"0.4\"").unwrap();
+        let bin_pos = updated.find("[[bin]]").unwrap();
+        assert!(
+            chrono_pos < bin_pos,
+            "chrono must land in [dependencies], not inside [[bin]]:\n{updated}"
         );
     }
 

@@ -270,11 +270,15 @@ pub async fn update(
     mut db: Db,
     Form(form): Form<New{pascal_name}>,
 ) -> AutumnResult<Markup> {{
-    diesel::update({plural}::table.find(*id))
+    let updated = diesel::update({plural}::table.find(*id))
         .set(({update_columns}))
         .execute(&mut *db)
-        .await
-        .map_err(AutumnError::not_found)?;
+        .await?;
+    if updated == 0 {{
+        return Err(AutumnError::not_found_msg(format!(
+            "{pascal_name} with id {{}} not found", *id
+        )));
+    }}
     Ok(redirect_to(&format!("/{plural}/{{}}", *id)))
 }}
 
@@ -480,6 +484,11 @@ async fn main() {
         // remains available via the auto-generated repository handler.
         assert!(routes.contains("#[post(\"/posts/{id}/update\")]"));
         assert!(routes.contains("posts::title.eq(form.title.clone())"));
+        // `execute()` returns the affected row count — `Ok(0)` means the id
+        // didn't exist, and we must return 404 instead of redirecting as if
+        // the save succeeded. DB errors stay distinct from "not found".
+        assert!(routes.contains("if updated == 0"));
+        assert!(routes.contains("AutumnError::not_found_msg"));
         // The HTML edit form must point at the new HTML update handler, not
         // the JSON PUT endpoint — browsers cannot submit PUT without JS.
         assert!(routes.contains("/posts/{}/update"));
