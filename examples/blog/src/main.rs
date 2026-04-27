@@ -44,7 +44,7 @@ async fn main() {
 mod tests {
     use std::path::Path;
 
-    use autumn_admin_plugin::{AdminFieldKind, AdminModel};
+    use autumn_admin_plugin::prelude::*;
 
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_posts/up.sql");
 
