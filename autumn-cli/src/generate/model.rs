@@ -130,13 +130,27 @@ fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
         return out;
     };
 
-    // Find the next `[…]` table header (or the end of file).
-    let next_section = lines[deps_idx + 1..]
+    // We split two concerns here:
+    // 1. The "scan extent" — how far the dependency section reaches when
+    //    deciding which deps are already declared. `[dependencies.<crate>]`
+    //    subtables are *part of* `[dependencies]`, so they extend the scan
+    //    until a real boundary like `[dev-dependencies]` or `[[bin]]`.
+    // 2. The "insertion point" — where to write new shorthand `key = value`
+    //    entries. This stops at the FIRST table header (subtable or not),
+    //    because TOML attaches shorthand keys to whichever section header
+    //    precedes them: a `chrono = "0.4"` placed *after* a
+    //    `[dependencies.chrono]` line would become a key inside that
+    //    subtable, not a sibling shorthand dep.
+    let scan_end = lines[deps_idx + 1..]
+        .iter()
+        .position(|l| is_any_table_header(l) && !is_dep_subtable_boundary_marker(l))
+        .map_or(lines.len(), |off| deps_idx + 1 + off);
+    let insert_end = lines[deps_idx + 1..]
         .iter()
         .position(|l| is_any_table_header(l))
         .map_or(lines.len(), |off| deps_idx + 1 + off);
 
-    let dep_section = &lines[deps_idx + 1..next_section];
+    let dep_section = &lines[deps_idx + 1..scan_end];
 
     let to_add: Vec<(&str, &str)> = deps
         .iter()
@@ -147,9 +161,9 @@ fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
         return existing.to_owned();
     }
 
-    // Drop trailing blank lines from the dep section so the insertion sits
+    // Drop trailing blank lines from the shorthand block so the insertion sits
     // flush against the existing entries.
-    let mut insert_at = next_section;
+    let mut insert_at = insert_end;
     while insert_at > deps_idx + 1 && lines[insert_at - 1].trim().is_empty() {
         insert_at -= 1;
     }
@@ -225,7 +239,32 @@ fn is_any_table_header(line: &str) -> bool {
     after.is_empty() || after.starts_with('#')
 }
 
-/// True iff `dep_section` contains a line declaring `crate_name = …`.
+/// If `line` is a `[dependencies.<crate>]` subtable header, return the inner
+/// crate name. Such headers declare a table-form dependency and are part of
+/// the dependency section, not a boundary that ends it.
+fn dep_subtable_crate_name(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('[')?;
+    let close_idx = rest.find(']')?;
+    let after = rest[close_idx + 1..].trim_start();
+    if !after.is_empty() && !after.starts_with('#') {
+        return None;
+    }
+    let inner = rest[..close_idx].trim();
+    let dep_name = inner.strip_prefix("dependencies")?.trim_start();
+    let dep_name = dep_name.strip_prefix('.')?.trim_start();
+    if dep_name.is_empty() {
+        return None;
+    }
+    Some(dep_name)
+}
+
+fn is_dep_subtable_boundary_marker(line: &str) -> bool {
+    dep_subtable_crate_name(line).is_some()
+}
+
+/// True iff `dep_section` contains a line declaring `crate_name = …`, or a
+/// `[dependencies.<crate_name>]` subtable header.
 fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
     dep_section.iter().any(|l| {
         let t = l.trim_start();
@@ -233,6 +272,11 @@ fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
         if t.starts_with('#') {
             return false;
         }
+        // `[dependencies.<crate>]` subtable form.
+        if let Some(name) = dep_subtable_crate_name(l) {
+            return name == crate_name;
+        }
+        // `crate = …` shorthand form.
         t.split_once('=')
             .is_some_and(|(name, _)| name.trim() == crate_name)
     })
@@ -644,6 +688,56 @@ autumn-web = \"0.3\"\n";
             chrono_pos < bin_pos,
             "chrono must land in [dependencies], not inside [[bin]]:\n{updated}"
         );
+    }
+
+    #[test]
+    fn ensure_cargo_dependencies_recognises_subtable_form() {
+        // `[dependencies.chrono]` is the table-form way to declare a dep.
+        // The scanner must treat that header as part of `[dependencies]`,
+        // not as the next section, AND must recognise that `chrono` is
+        // already declared so we don't duplicate it.
+        let original = "[package]\nname = \"x\"\n\n\
+[dependencies]\nautumn-web = \"0.3\"\n\n\
+[dependencies.chrono]\nversion = \"0.4\"\nfeatures = [\"serde\"]\n";
+        let updated = ensure_cargo_dependencies(
+            original,
+            &[
+                ("chrono", "\"99\""), // already declared via subtable — must not duplicate
+                ("diesel", "\"2\""),
+            ],
+        );
+        // `chrono` already declared via [dependencies.chrono] — must not be
+        // re-added in shorthand form.
+        assert!(
+            !updated.contains("chrono = \"99\""),
+            "[dependencies.chrono] subtable form must count as 'chrono is declared':\n{updated}"
+        );
+        // `diesel` was missing and should land inside [dependencies] — i.e.
+        // before the [dependencies.chrono] subtable header.
+        let diesel_pos = updated.find("diesel = \"2\"").unwrap();
+        let chrono_subtable_pos = updated.find("[dependencies.chrono]").unwrap();
+        assert!(
+            diesel_pos < chrono_subtable_pos,
+            "new dep must land inside [dependencies], above any [dependencies.X] subtable:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn dep_subtable_crate_name_parses_canonical_form() {
+        assert_eq!(
+            dep_subtable_crate_name("[dependencies.chrono]"),
+            Some("chrono")
+        );
+        assert_eq!(
+            dep_subtable_crate_name("  [dependencies.chrono] # opt"),
+            Some("chrono")
+        );
+        // Non-dependency tables, dev-deps, and bare `[dependencies]` are not
+        // subtable forms.
+        assert_eq!(dep_subtable_crate_name("[dependencies]"), None);
+        assert_eq!(dep_subtable_crate_name("[dev-dependencies.chrono]"), None);
+        assert_eq!(dep_subtable_crate_name("[package]"), None);
+        assert_eq!(dep_subtable_crate_name("[[bin]]"), None);
     }
 
     #[test]
