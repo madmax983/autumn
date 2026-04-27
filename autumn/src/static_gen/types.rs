@@ -187,7 +187,7 @@ mod tests {
 
         let manifest = StaticManifest {
             generated_at: "2026-03-27T12:00:00Z".to_owned(),
-            autumn_version: "0.2.0".to_owned(),
+            autumn_version: "0.3.0".to_owned(),
             routes,
         };
 
@@ -205,7 +205,7 @@ mod tests {
         let loaded = StaticManifest::load(&file_path).expect("load");
 
         assert_eq!(loaded.generated_at, "2026-03-27T12:00:00Z");
-        assert_eq!(loaded.autumn_version, "0.2.0");
+        assert_eq!(loaded.autumn_version, "0.3.0");
         assert_eq!(loaded.routes.len(), 2);
 
         let root_entry = loaded.routes.get("/").expect("root route");

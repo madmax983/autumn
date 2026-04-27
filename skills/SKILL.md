@@ -14,7 +14,7 @@ description: >
 
 **Repository**: https://github.com/madmax983/autumn  
 **Branch**: `trunk-dev`  
-**Version**: 0.2.0 | **Edition**: 2024 | **MSRV**: 1.88.0  
+**Version**: 0.3.0 | **Edition**: 2024 | **MSRV**: 1.88.0  
 **Author**: madmax983  
 
 autumn-web is a Spring Boot-style web framework for Rust, built on Axum. It assembles

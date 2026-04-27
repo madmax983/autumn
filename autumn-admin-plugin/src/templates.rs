@@ -5,8 +5,6 @@
 //! color palette, clean cards with subtle shadows.
 
 use autumn_web::flash::FlashMessage;
-use autumn_web::ui::tokens::{FLASH_CSS, TOKENS_CSS};
-use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -16,9 +14,25 @@ use crate::traits::{
     AdminAction, AdminField, AdminFieldKind, ListResult, SortDirection, record_id,
 };
 
+const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
+const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
+const TOKENS_CSS: &str = include_str!("tokens.css");
+const FLASH_CSS: &str = "\
+.flash {
+    padding: 0.75rem 1rem;
+    border-radius: 0.375rem;
+    margin-bottom: 1rem;
+    font-size: 0.875rem;
+}
+.flash-success { background: var(--success-light); color: var(--success); border: 1px solid var(--success); }
+.flash-error { background: var(--danger-light); color: var(--danger); border: 1px solid var(--danger); }
+.flash-warning { background: var(--warning-light); color: var(--warning); border: 1px solid var(--warning); }
+.flash-info { background: var(--primary-light); color: var(--primary); border: 1px solid var(--primary); }
+";
+
 // ── CSS ─────────────────────────────────────────────────────────────
 
-/// Admin-specific styles that build on the framework's shared tokens
+/// Admin-specific styles that build on the plugin's shared tokens
 /// ([`TOKENS_CSS`]) and flash styles ([`FLASH_CSS`]).
 const ADMIN_CSS: &str = "
     * { box-sizing: border-box; margin: 0; padding: 0; }
