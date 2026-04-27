@@ -59,5 +59,13 @@ async fn havoc_rate_limit_fuzz_bounds() {
 
         // Should not panic on second request (where it might deny or hit edge cases)
         let _ = svc.ready().await.unwrap().call(req2).await;
+
+        let req3 = Request::builder()
+            .header("X-Forwarded-For", "1.2.3.4")
+            .body(Body::empty())
+            .unwrap();
+
+        // Should not panic on third request (ensures deficit calculation is fully evaluated)
+        let _ = svc.ready().await.unwrap().call(req3).await;
     }
 }
