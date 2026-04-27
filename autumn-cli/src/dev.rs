@@ -40,14 +40,7 @@ const WATCH_FILES: &[&str] = &[
 ];
 
 /// Directories that are always watched recursively, regardless of config.
-const DEFAULT_WATCH_DIRS: &[&str] = &[
-    "src",
-    "static",
-    "templates",
-    "migrations",
-    "views",
-    "locales",
-];
+const DEFAULT_WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
 
 /// Path of the project config file relative to the dev server's working directory.
 const AUTUMN_TOML: &str = "autumn.toml";
@@ -1847,7 +1840,7 @@ watch_dirs = ["views", "locales"]
         let dirs = sanitize_custom_watch_dirs(DevConfig {
             watch_dirs: vec!["src".into(), "static".into(), "views".into()],
         });
-        assert!(dirs.is_empty());
+        assert_eq!(dirs, vec!["views"]);
     }
 
     #[test]
@@ -1859,10 +1852,9 @@ watch_dirs = ["views", "locales"]
                 "views".into(),
                 "  locales  ".into(),
                 String::new(),
-                "custom".into(),
             ],
         });
-        assert_eq!(dirs, vec!["custom"]);
+        assert_eq!(dirs, vec!["views", "locales"]);
     }
 
     // ── classify_change with custom dirs ───────────────────────────
@@ -2150,9 +2142,9 @@ watch_dirs = ["views", "locales"]
                 "target".into(),
                 "views".into(),
                 "./locales".into(),
-                "other".into(),
             ],
         });
-        assert_eq!(dirs, vec!["other".to_owned()]);
+        let expected_locales = "locales".to_owned();
+        assert_eq!(dirs, vec!["views".to_owned(), expected_locales]);
     }
 }
