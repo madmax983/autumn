@@ -384,6 +384,12 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut storage = toml::map::Map::new();
             storage.insert("backend".into(), "local".into());
             table.insert("storage".into(), toml::Value::Table(storage));
+            #[cfg(feature = "mail")]
+            {
+                let mut mail = toml::map::Map::new();
+                mail.insert("transport".into(), "log".into());
+                table.insert("mail".into(), toml::Value::Table(mail));
+            }
 
             // Dev: CSRF disabled (default), HSTS off (default)
         }
@@ -627,6 +633,10 @@ pub struct AutumnConfig {
     #[cfg(feature = "storage")]
     #[serde(default)]
     pub storage: crate::storage::StorageConfig,
+    /// Transactional email settings.
+    #[cfg(feature = "mail")]
+    #[serde(default)]
+    pub mail: crate::mail::MailConfig,
 }
 
 impl AutumnConfig {
@@ -746,6 +756,8 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        #[cfg(feature = "mail")]
+        self.mail.validate(self.profile.as_deref())?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -811,87 +823,8 @@ impl AutumnConfig {
         self.apply_security_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
         self.apply_storage_env_overrides_with_env(env);
-    }
-
-    #[cfg(feature = "storage")]
-    fn apply_storage_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(val) = env.var("AUTUMN_STORAGE__BACKEND") {
-            match crate::storage::StorageBackend::from_env_value(&val) {
-                Some(backend) => self.storage.backend = backend,
-                None => eprintln!(
-                    "Warning: AUTUMN_STORAGE__BACKEND={val:?} is not valid \
-                     (expected disabled, local, or s3), ignoring"
-                ),
-            }
-        }
-        parse_env_string(
-            env,
-            "AUTUMN_STORAGE__DEFAULT_PROVIDER",
-            &mut self.storage.default_provider,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION",
-            &mut self.storage.allow_local_in_production,
-        );
-        if let Ok(val) = env.var("AUTUMN_STORAGE__LOCAL__ROOT") {
-            self.storage.local.root = std::path::PathBuf::from(val);
-        }
-        parse_env_string(
-            env,
-            "AUTUMN_STORAGE__LOCAL__MOUNT_PATH",
-            &mut self.storage.local.mount_path,
-        );
-        parse_env(
-            env,
-            "AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS",
-            &mut self.storage.local.default_url_expiry_secs,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__LOCAL__SIGNING_KEY",
-            &mut self.storage.local.signing_key,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__BUCKET",
-            &mut self.storage.s3.bucket,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__REGION",
-            &mut self.storage.s3.region,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__ENDPOINT",
-            &mut self.storage.s3.endpoint,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
-            &mut self.storage.s3.public_base_url,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV",
-            &mut self.storage.s3.access_key_id_env,
-        );
-        parse_env_option_string(
-            env,
-            "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
-            &mut self.storage.s3.secret_access_key_env,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_STORAGE__S3__FORCE_PATH_STYLE",
-            &mut self.storage.s3.force_path_style,
-        );
-        parse_env(
-            env,
-            "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
-            &mut self.storage.s3.default_url_expiry_secs,
-        );
+        #[cfg(feature = "mail")]
+        self.apply_mail_env_overrides_with_env(env);
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -1190,6 +1123,57 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
             &mut self.security.allow_unauthorized_repository_api,
         );
+    }
+
+    #[cfg(feature = "mail")]
+    fn apply_mail_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_MAIL__TRANSPORT") {
+            match crate::mail::Transport::from_env_value(&val) {
+                Some(transport) => self.mail.transport = transport,
+                None => eprintln!(
+                    "Warning: AUTUMN_MAIL__TRANSPORT={val:?} is not valid \
+                     (expected log, file, smtp, or disabled), ignoring"
+                ),
+            }
+        }
+        parse_env_option_string(env, "AUTUMN_MAIL__FROM", &mut self.mail.from);
+        parse_env_option_string(env, "AUTUMN_MAIL__REPLY_TO", &mut self.mail.reply_to);
+        parse_env_bool(
+            env,
+            "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
+            &mut self.mail.allow_log_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
+            self.mail.file_dir = PathBuf::from(val);
+        }
+        parse_env_option_string(env, "AUTUMN_MAIL__SMTP__HOST", &mut self.mail.smtp.host);
+        if let Ok(val) = env.var("AUTUMN_MAIL__SMTP__PORT") {
+            match val.parse::<u16>() {
+                Ok(port) => self.mail.smtp.port = Some(port),
+                Err(_) => {
+                    eprintln!("Warning: AUTUMN_MAIL__SMTP__PORT={val:?} is not valid, ignoring");
+                }
+            }
+        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__USERNAME",
+            &mut self.mail.smtp.username,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__PASSWORD_ENV",
+            &mut self.mail.smtp.password_env,
+        );
+        if let Ok(val) = env.var("AUTUMN_MAIL__SMTP__TLS") {
+            match crate::mail::TlsMode::from_env_value(&val) {
+                Some(tls) => self.mail.smtp.tls = tls,
+                None => eprintln!(
+                    "Warning: AUTUMN_MAIL__SMTP__TLS={val:?} is not valid \
+                     (expected disabled, starttls, or tls), ignoring"
+                ),
+            }
+        }
     }
 
     /// Returns the active profile name, if any.

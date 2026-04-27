@@ -1179,6 +1179,11 @@ impl AppBuilder {
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1377,6 +1382,11 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 

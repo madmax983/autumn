@@ -15,6 +15,7 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod mailer;
 mod main_macro;
 mod model;
 mod oauth2_callback;
@@ -177,6 +178,12 @@ pub fn routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
+#[proc_macro_attribute]
+pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
+    mailer::mailer_macro(attr.into(), item.into()).into()
 }
 
 /// Attribute macro for Autumn database models.
