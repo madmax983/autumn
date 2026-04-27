@@ -20,12 +20,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Toolchain versions
-        run: |
-          rustc --version
-          cargo --version
-          cargo fmt --version
-          cargo clippy --version
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy

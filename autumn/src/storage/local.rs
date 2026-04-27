@@ -314,8 +314,7 @@ impl BlobStore for LocalBlobStore {
                 .checked_add(expires_in)
                 .unwrap_or(UNIX_EPOCH)
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
+                .map_or(0, |d| d.as_secs());
 
             // Sign the canonical (unencoded) key — the serving route
             // decodes path segments before re-signing for verification.
@@ -371,8 +370,7 @@ pub fn verify(
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     if expires_at < now {
         return Err(BlobStoreError::Signature("signed url expired".into()));
     }
