@@ -252,10 +252,16 @@ mod tests {
     #[test]
     fn test_primitive_check() {
         let bare: ReturnType = parse_quote! { -> i32 };
-        assert!(matches!(check_primitive_output(&bare), Some(PrimitiveType::Bare)));
+        assert!(matches!(
+            check_primitive_output(&bare),
+            Some(PrimitiveType::Bare)
+        ));
 
         let res: ReturnType = parse_quote! { -> Result<i32, String> };
-        assert!(matches!(check_primitive_output(&res), Some(PrimitiveType::Result)));
+        assert!(matches!(
+            check_primitive_output(&res),
+            Some(PrimitiveType::Result)
+        ));
 
         let complex: ReturnType = parse_quote! { -> Vec<i32> };
         assert!(matches!(check_primitive_output(&complex), None));
