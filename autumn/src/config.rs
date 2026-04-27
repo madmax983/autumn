@@ -136,14 +136,14 @@ impl Env for OsEnv {
             if let Some(dir) = MACRO_MANIFEST_DIR.get() {
                 return Ok(dir.clone());
             }
-        } else if key == "AUTUMN_IS_DEBUG" {
-            if let Some(is_debug) = MACRO_IS_DEBUG.get() {
-                return Ok(if *is_debug {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                });
-            }
+        } else if key == "AUTUMN_IS_DEBUG"
+            && let Some(is_debug) = MACRO_IS_DEBUG.get()
+        {
+            return Ok(if *is_debug {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            });
         }
         std::env::var(key)
     }
@@ -245,12 +245,12 @@ fn resolve_profile_input(env: &dyn Env) -> String {
     // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = args.get(i + 1) {
-                let trimmed = profile.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
-                }
+        if arg == "--profile"
+            && let Some(profile) = args.get(i + 1)
+        {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
@@ -1304,12 +1304,13 @@ impl DatabaseConfig {
     ///
     /// Returns a validation error if the URL has an invalid scheme.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref url) = self.url {
-            if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
-                return Err(ConfigError::Validation(format!(
-                    "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
-                )));
-            }
+        if let Some(ref url) = self.url
+            && !url.starts_with("postgres://")
+            && !url.starts_with("postgresql://")
+        {
+            return Err(ConfigError::Validation(format!(
+                "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
+            )));
         }
         Ok(())
     }

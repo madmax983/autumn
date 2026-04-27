@@ -1220,19 +1220,19 @@ pub fn try_build_router_with_static_inner(
                     } else {
                         path
                     };
-                    if let Some(file_path) = static_layer.resolve(normalized) {
-                        if let Ok(contents) = tokio::fs::read(&file_path).await {
-                            let body = if is_head {
-                                axum::body::Body::empty()
-                            } else {
-                                axum::body::Body::from(contents)
-                            };
-                            return http::Response::builder()
-                                .status(http::StatusCode::OK)
-                                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                                .body(body)
-                                .expect("infallible response builder");
-                        }
+                    if let Some(file_path) = static_layer.resolve(normalized)
+                        && let Ok(contents) = tokio::fs::read(&file_path).await
+                    {
+                        let body = if is_head {
+                            axum::body::Body::empty()
+                        } else {
+                            axum::body::Body::from(contents)
+                        };
+                        return http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(body)
+                            .expect("infallible response builder");
                     }
                 }
                 next.run(req).await

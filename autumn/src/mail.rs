@@ -7,8 +7,8 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::FromRequestParts;
 use lettre::message::{Mailbox, MultiPart, SinglePart};
@@ -786,7 +786,15 @@ mod tests {
         let second = file_transport_filename(&mail);
 
         assert_ne!(first, second);
-        assert!(first.ends_with(".eml"));
-        assert!(second.ends_with(".eml"));
+        assert!(
+            Path::new(&first)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
+        );
+        assert!(
+            Path::new(&second)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
+        );
     }
 }

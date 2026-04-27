@@ -187,7 +187,7 @@ impl AdminModel for PostAdmin {
             let new_post: NewPost = serde_json::from_value(data).map_err(Self::validation_error)?;
             let new_post = new_post
                 .validated()
-                .map_err(|error| Self::validation_error(error))?;
+                .map_err(Self::validation_error)?;
             let mut conn = pool.get().await.map_err(Self::pool_error)?;
 
             let created = diesel::insert_into(posts::table)
@@ -212,7 +212,7 @@ impl AdminModel for PostAdmin {
             let new_post: NewPost = serde_json::from_value(data).map_err(Self::validation_error)?;
             let new_post = new_post
                 .validated()
-                .map_err(|error| Self::validation_error(error))?;
+                .map_err(Self::validation_error)?;
             let changes = UpdatePost {
                 title: Some(new_post.title),
                 slug: Some(new_post.slug),
