@@ -544,7 +544,7 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
 /// We check against:
 /// * user routes (top-level + scoped groups) that will be mounted
 ///   before the `OpenAPI` sub-router merges in,
-/// * framework `GET`s: probes, actuator, htmx asset, and dev
+/// * framework `GET`s: probes, actuator, htmx assets, and dev
 ///   live-reload when enabled,
 /// * nest prefixes from [`AppBuilder::nest`](crate::app::AppBuilder::nest)
 ///   when the `OpenAPI` path falls under one.
@@ -591,7 +591,10 @@ fn reject_openapi_path_collisions(
         claimed.insert(path);
     }
     #[cfg(feature = "htmx")]
-    claimed.insert("/static/js/htmx.min.js".to_owned());
+    {
+        claimed.insert(crate::htmx::HTMX_JS_PATH.to_owned());
+        claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
+    }
     // Dev live-reload endpoints are only mounted when the env vars
     // that enable them are set, but reserving the paths regardless
     // makes the error message deterministic across dev/prod.
@@ -2018,6 +2021,33 @@ mod tests {
                 field: "openapi_json_path",
                 ..
             }
+        ));
+    }
+
+    #[cfg(all(feature = "openapi", feature = "htmx"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_colliding_with_htmx_csrf_route() {
+        let config = AutumnConfig::default();
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path(crate::htmx::HTMX_CSRF_JS_PATH);
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("htmx csrf helper path should be reserved");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == crate::htmx::HTMX_CSRF_JS_PATH
         ));
     }
 
