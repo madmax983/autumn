@@ -30,7 +30,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::config::AutumnConfig;
+use tracing::Instrument as _;
+
+use crate::config::{AutumnConfig, ConfigLoader};
+#[cfg(feature = "db")]
+use crate::db::DatabasePoolProvider;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -70,6 +74,7 @@ pub fn app() -> AppBuilder {
         scoped_groups: Vec::new(),
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
+        custom_layers: Vec::new(),
         startup_hooks: Vec::new(),
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
@@ -77,6 +82,14 @@ pub fn app() -> AppBuilder {
         error_page_renderer: None,
         #[cfg(feature = "db")]
         migrations: Vec::new(),
+        config_loader_factory: None,
+        #[cfg(feature = "db")]
+        pool_provider_factory: None,
+        telemetry_provider: None,
+        session_store: None,
+        #[cfg(feature = "openapi")]
+        openapi: None,
+        audit_logger: None,
     }
 }
 
@@ -84,6 +97,38 @@ type StartupHookFuture = Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + 
 type StartupHook = Box<dyn Fn(AppState) -> StartupHookFuture + Send + Sync>;
 type ShutdownHookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type ShutdownHook = Box<dyn Fn() -> ShutdownHookFuture + Send + Sync>;
+
+// ── Tier-1 subsystem factories ────────────────────────────────
+//
+// `ConfigLoader` and `DatabasePoolProvider` use RPIT (`-> impl Future + Send`)
+// in their trait methods, so `Box<dyn Trait>` is not dyn-compatible. We store
+// boxed factory closures that capture the concrete impl at the call site and
+// erase its future type via `Pin<Box<dyn Future>>`. `TelemetryProvider`'s
+// `init` is sync, so it's stored as a normal `Box<dyn>`.
+type ConfigLoaderFactory = Box<
+    dyn FnOnce() -> Pin<
+            Box<dyn Future<Output = Result<AutumnConfig, crate::config::ConfigError>> + Send>,
+        > + Send,
+>;
+#[cfg(feature = "db")]
+type PoolProviderFactory = Box<
+    dyn FnOnce(
+            crate::config::DatabaseConfig,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Option<
+                                diesel_async::pooled_connection::deadpool::Pool<
+                                    diesel_async::AsyncPgConnection,
+                                >,
+                            >,
+                            crate::db::PoolError,
+                        >,
+                    > + Send,
+            >,
+        > + Send,
+>;
 
 /// Builder for configuring and launching an Autumn application.
 ///
@@ -121,6 +166,9 @@ pub struct AppBuilder {
     scoped_groups: Vec<ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
+    /// Custom Tower layers registered via [`AppBuilder::layer`], applied
+    /// inside `RequestIdLayer` on ingress so they observe the request ID.
+    custom_layers: Vec<CustomLayerRegistration>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -131,6 +179,31 @@ pub struct AppBuilder {
     /// Embedded Diesel migrations, registered via `.migrations()`.
     #[cfg(feature = "db")]
     migrations: Vec<migrate::EmbeddedMigrations>,
+    /// Custom config loader (tier-1 subsystem replacement). When `None`, the
+    /// default [`TomlEnvConfigLoader`](crate::config::TomlEnvConfigLoader) runs.
+    config_loader_factory: Option<ConfigLoaderFactory>,
+    /// Custom DB pool provider (tier-1 subsystem replacement). When `None`,
+    /// the default [`DieselDeadpoolPoolProvider`](crate::db::DieselDeadpoolPoolProvider) runs.
+    #[cfg(feature = "db")]
+    pool_provider_factory: Option<PoolProviderFactory>,
+    /// Custom telemetry provider (tier-1 subsystem replacement). When `None`,
+    /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
+    telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
+    /// Custom session store (tier-1 subsystem replacement). When `Some`,
+    /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
+    /// and uses this store directly.
+    session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// `OpenAPI` generation configuration. When `Some`, the router mounts
+    /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
+    /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
+    ///
+    /// Gated behind the `openapi` feature: apps that don't need a
+    /// served `OpenAPI` document shouldn't pay for the spec types or the
+    /// runtime collision-check machinery.
+    #[cfg(feature = "openapi")]
+    openapi: Option<crate::openapi::OpenApiConfig>,
+    /// Shared audit logger used for append-only compliance events.
+    audit_logger: Option<Arc<crate::audit::AuditLogger>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -143,6 +216,83 @@ pub(crate) struct ScopedGroup {
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+}
+
+/// A deferred router mutator that applies a user-registered
+/// [`tower::Layer`] to the app-wide router.
+///
+/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
+/// `apply_middleware` where the final layer stack is assembled.
+pub(crate) type CustomLayerApplier =
+    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
+/// Metadata and deferred application closure for a user-registered layer.
+pub(crate) struct CustomLayerRegistration {
+    /// Concrete type for the registered layer.
+    pub(crate) type_id: TypeId,
+    /// Deferred router mutation that applies the layer.
+    pub(crate) apply: CustomLayerApplier,
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Marker trait for types that can be registered with
+/// [`AppBuilder::layer`] as an app-wide Tower middleware.
+///
+/// Any [`tower::Layer`] whose produced service is a compatible axum
+/// service (i.e. `Service<Request, Response = Response, Error = Infallible>`,
+/// plus the usual `Clone + Send + Sync + 'static` bounds and a `Send`
+/// future) implements this trait automatically via a blanket impl.
+///
+/// The trait is **sealed**: it exists only to surface a clean
+/// `IntoAppLayer is not implemented for YourType` error message when a
+/// candidate layer fails to meet axum's service bounds, instead of a
+/// 40-line associated-type wall. You cannot implement it manually, and
+/// you should not need to — just bring your own `tower::Layer`.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a usable Autumn app-wide Tower layer",
+    label = "this type does not implement `tower::Layer<axum::routing::Route>` with the required service bounds",
+    note = "`AppBuilder::layer(..)` requires:\n    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,\n    L::Service: Service<axum::extract::Request, Response = axum::response::Response, Error = Infallible> + Clone + Send + Sync + 'static,\n    <L::Service as Service<axum::extract::Request>>::Future: Send + 'static\nSee docs/guide/middleware.md for common patterns and how to wrap raw-error layers (e.g. TimeoutLayer) with HandleErrorLayer."
+)]
+pub trait IntoAppLayer: sealed::Sealed + Send + Sync + 'static {
+    /// Apply this layer to the given router. Not intended for direct use.
+    #[doc(hidden)]
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState>;
+}
+
+impl<L> sealed::Sealed for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+}
+
+impl<L> IntoAppLayer for L
+where
+    L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<
+            axum::extract::Request,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + Sync
+        + 'static,
+    <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+{
+    fn apply_to(self, router: axum::Router<AppState>) -> axum::Router<AppState> {
+        router.layer(self)
+    }
 }
 
 impl AppBuilder {
@@ -191,6 +341,60 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Enable `OpenAPI` (Swagger) spec auto-generation.
+    ///
+    /// When called, the framework inspects every registered route's
+    /// [`ApiDoc`](crate::openapi::ApiDoc) metadata — inferred at compile
+    /// time from the route path, HTTP method, extractor types, and any
+    /// [`#[api_doc(...)]`](crate::api_doc) overrides — and serves an
+    /// `OpenAPI` 3.0 JSON document at `OpenApiConfig::openapi_json_path`
+    /// (default `/v3/api-docs`). If
+    /// `OpenApiConfig::swagger_ui_path` is set (default `/swagger-ui`),
+    /// a Swagger UI HTML page is served there too.
+    ///
+    /// Routes marked `#[api_doc(hidden)]` are excluded.
+    ///
+    /// **Gated behind the `openapi` Cargo feature.** Add
+    /// `features = ["openapi"]` to your `autumn-web` dependency to
+    /// enable it; the default build excludes the runtime spec types
+    /// and endpoints to keep the binary small.
+    ///
+    /// # Examples
+    ///
+    /// Zero-config:
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// # #[get("/hello")] async fn hello() -> &'static str { "hi" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![hello])
+    ///     .openapi(OpenApiConfig::new("My API", "1.0.0"))
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// With custom paths:
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::openapi::OpenApiConfig;
+    ///
+    /// let config = OpenApiConfig::new("My API", "1.0.0")
+    ///     .description("Full product API")
+    ///     .openapi_json_path("/openapi.json")
+    ///     .swagger_ui_path(Some("/docs".to_owned()));
+    /// ```
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
+        self.openapi = Some(config);
         self
     }
 
@@ -318,6 +522,110 @@ impl AppBuilder {
         self
     }
 
+    /// Apply a custom [`tower::Layer`] to the entire application.
+    ///
+    /// This is the escape hatch for integrating any middleware from the
+    /// Tower / Tower-HTTP ecosystem (timeouts, rate limiting, bespoke
+    /// tracing, request signing, etc.) without forking the framework.
+    ///
+    /// The generic bound is [`IntoAppLayer`], a sealed trait with a blanket
+    /// impl for every `tower::Layer` that meets axum's service requirements
+    /// — in practice this means any standard Tower layer whose service
+    /// produces `Infallible` errors. If your layer produces real errors
+    /// (like `TimeoutLayer`'s `BoxError`), wrap it with
+    /// [`axum::error_handling::HandleErrorLayer`] before passing it here.
+    ///
+    /// # Ordering
+    ///
+    /// User layers are applied **inside** Autumn's request-ID layer on the
+    /// ingress path, which means your middleware always sees the generated
+    /// `RequestId` in the request extensions. The full stack (outermost to
+    /// innermost on ingress) is:
+    ///
+    /// `Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->`
+    /// `SecurityHeaders -> RequestId -> [user layers, registration order]`
+    /// `-> CSRF -> CORS -> route handler`
+    ///
+    /// When `.layer()` is called multiple times, the **first** call becomes
+    /// the outermost user layer on ingress (matching `tower::ServiceBuilder`
+    /// semantics): the layer from the first `.layer(...)` call sees the
+    /// request first on the way in and the response last on the way out.
+    ///
+    /// # Scope
+    ///
+    /// This layer applies **globally** to every route in the app, including
+    /// routes added later by plugins, routes mounted via `.merge` / `.nest`,
+    /// and the built-in `404` fallback. Use [`AppBuilder::scoped`] when you
+    /// need middleware scoped to a group of routes.
+    ///
+    /// Shared state (pools, metrics registries, rate-limit stores, etc.)
+    /// should be wrapped in `Arc` so the layer can satisfy the
+    /// `Clone + Send + Sync + 'static` bounds without moving the state.
+    ///
+    /// See [the middleware guide](https://github.com/madmax983/autumn/blob/trunk/docs/guide/middleware.md)
+    /// for ready-made recipes.
+    ///
+    /// # Examples
+    ///
+    /// Adding a Tower timeout layer in one line (Tower's `TimeoutLayer`
+    /// returns `BoxError`, so it must be paired with `HandleErrorLayer` to
+    /// satisfy axum's `Infallible` error requirement):
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use autumn_web::prelude::*;
+    /// use axum::{error_handling::HandleErrorLayer, http::StatusCode};
+    /// use tower::{ServiceBuilder, timeout::TimeoutLayer};
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .layer(
+    ///         ServiceBuilder::new()
+    ///             .layer(HandleErrorLayer::new(|_| async {
+    ///                 StatusCode::REQUEST_TIMEOUT
+    ///             }))
+    ///             .layer(TimeoutLayer::new(Duration::from_secs(5))),
+    ///     )
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
+        self.custom_layers.push(CustomLayerRegistration {
+            type_id: TypeId::of::<L>(),
+            apply: Box::new(move |router| layer.apply_to(router)),
+        });
+        self
+    }
+
+    /// Returns `true` when a custom layer of type `L` has already been
+    /// registered via [`AppBuilder::layer`].
+    ///
+    /// Intended for plugin pre-flight validation before the app is started.
+    #[must_use]
+    pub fn has_layer<L: 'static>(&self) -> bool {
+        let layer_type = TypeId::of::<L>();
+        self.custom_layers
+            .iter()
+            .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Returns the registered custom layer types in registration order.
+    ///
+    /// This includes only user-installed layers from
+    /// [`AppBuilder::layer`], not framework-managed middleware.
+    #[must_use]
+    pub fn get_layer_types(&self) -> Vec<TypeId> {
+        self.custom_layers
+            .iter()
+            .map(|registered| registered.type_id)
+            .collect()
+    }
+
     /// Merge a raw Axum router into the application.
     ///
     /// This is an escape hatch for when Autumn's route macros are not
@@ -328,8 +636,9 @@ impl AppBuilder {
     /// config, etc.) and Autumn's global middleware (request IDs,
     /// security headers, session management) applies to its routes.
     ///
-    /// Merged routes are added **after** Autumn's annotated routes, so
-    /// if both define the same path, the annotated route takes precedence.
+    /// Merged routes are added **after** Autumn's annotated routes.
+    /// If both define the same method+path pair, Axum treats that as an
+    /// overlap and router construction will fail.
     ///
     /// Can be called multiple times -- routers are accumulated.
     ///
@@ -476,6 +785,120 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    // ── Tier-1 subsystem replacement hooks ─────────────────────
+    //
+    // Each `with_*` method swaps a framework-default subsystem for a
+    // user-provided trait impl. The defaults preserve current behaviour, so
+    // applications that don't customize see no change. Plugins typically chain
+    // these in their `build()` body to ship a subsystem (e.g. an
+    // `AwsSecretsConfigPlugin` that calls `app.with_config_loader(...)`).
+    // See `docs/guides/extensibility.md`.
+
+    /// Install a custom [`ConfigLoader`],
+    /// replacing the default TOML + env loader.
+    ///
+    /// Useful when your config lives somewhere other than `autumn.toml` —
+    /// AWS Secrets Manager, Vault, a JSON file, an HTTP fetch, etc. Emits a
+    /// `tracing::warn!` if a loader was already installed.
+    #[must_use]
+    pub fn with_config_loader<L>(mut self, loader: L) -> Self
+    where
+        L: crate::config::ConfigLoader,
+    {
+        if self.config_loader_factory.is_some() {
+            tracing::warn!(
+                "config loader replaced; the previously-installed loader was overwritten"
+            );
+        }
+        self.config_loader_factory = Some(Box::new(move || {
+            Box::pin(async move { loader.load().await })
+        }));
+        self
+    }
+
+    /// Install a custom [`DatabasePoolProvider`],
+    /// replacing the default `deadpool + diesel-async` pool factory.
+    ///
+    /// Useful for adding metrics/circuit-breaker wrappers, switching to a
+    /// per-shard pool, or driving a non-default backend at the same
+    /// `Pool<AsyncPgConnection>` interface. Emits a `tracing::warn!` if a
+    /// provider was already installed.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_pool_provider<P>(mut self, provider: P) -> Self
+    where
+        P: crate::db::DatabasePoolProvider,
+    {
+        if self.pool_provider_factory.is_some() {
+            tracing::warn!(
+                "database pool provider replaced; the previously-installed provider was overwritten"
+            );
+        }
+        self.pool_provider_factory =
+            Some(Box::new(move |config: crate::config::DatabaseConfig| {
+                Box::pin(async move { provider.create_pool(&config).await })
+            }));
+        self
+    }
+
+    /// Install a custom [`TelemetryProvider`](crate::telemetry::TelemetryProvider),
+    /// replacing the default `tracing-subscriber + OTLP` initializer.
+    ///
+    /// Useful for shipping a Datadog tracer, Honeycomb beeline, Sentry
+    /// integration, or any other observability backend. Emits a
+    /// `tracing::warn!` if a provider was already installed.
+    #[must_use]
+    pub fn with_telemetry_provider<T>(mut self, provider: T) -> Self
+    where
+        T: crate::telemetry::TelemetryProvider,
+    {
+        if self.telemetry_provider.is_some() {
+            tracing::warn!(
+                "telemetry provider replaced; the previously-installed provider was overwritten"
+            );
+        }
+        self.telemetry_provider = Some(Box::new(provider));
+        self
+    }
+
+    /// Install a custom [`SessionStore`](crate::session::SessionStore),
+    /// bypassing the config-driven `memory`/`redis` backend selection.
+    ///
+    /// Useful for backing sessions with a database, encrypted cookie store,
+    /// or enterprise SSO bridge. Emits a `tracing::warn!` if a store was
+    /// already installed.
+    #[must_use]
+    pub fn with_session_store<S>(mut self, store: S) -> Self
+    where
+        S: crate::session::SessionStore,
+    {
+        if self.session_store.is_some() {
+            tracing::warn!(
+                "session store replaced; the previously-installed store was overwritten"
+            );
+        }
+        self.session_store = Some(Arc::new(store));
+        self
+    }
+
+    /// Register an additional audit sink for structured audit events.
+    ///
+    /// Multiple calls accumulate sinks. Logged events are fanned out to all
+    /// configured sinks.
+    #[must_use]
+    pub fn with_audit_sink<S>(mut self, sink: S) -> Self
+    where
+        S: crate::audit::AuditSink,
+    {
+        let logger = self
+            .audit_logger
+            .take()
+            .map_or_else(crate::audit::AuditLogger::new, |logger| (*logger).clone())
+            .with_sink(Arc::new(sink));
+        self.audit_logger = Some(Arc::new(logger));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -586,6 +1009,7 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            custom_layers,
             startup_hooks,
             shutdown_hooks,
             extensions: _,
@@ -593,12 +1017,21 @@ impl AppBuilder {
             error_page_renderer,
             #[cfg(feature = "db")]
             migrations,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store,
+            #[cfg(feature = "openapi")]
+            openapi,
+            audit_logger,
         } = self;
 
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (config, _telemetry_guard) = load_config_and_telemetry();
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // 3. Validate routes
         assert!(
@@ -620,12 +1053,19 @@ impl AppBuilder {
             log_startup_transparency(&all_routes, &tasks, &scoped_groups, &config);
         }
 
+        // 4c. Fail-fast on invalid session config — but only when no custom
+        // SessionStore was installed via with_session_store(...). Done before
+        // setup_database so a doomed boot doesn't run migrations first.
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
+
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations).unwrap_or_else(|e| {
-            tracing::error!("{e}");
-            std::process::exit(1);
-        });
+        let pool = setup_database(&config, migrations, pool_provider_factory)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!("{e}");
+                std::process::exit(1);
+            });
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -643,6 +1083,9 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -660,7 +1103,11 @@ impl AppBuilder {
                 scoped_groups,
                 merge_routers,
                 nest_routers,
+                custom_layers,
                 error_page_renderer,
+                session_store,
+                #[cfg(feature = "openapi")]
+                openapi,
             },
         )
         .unwrap_or_else(|error| {
@@ -683,11 +1130,14 @@ impl AppBuilder {
         let server_shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
-            axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    server_shutdown_wait.cancelled().await;
-                })
-                .await
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                server_shutdown_wait.cancelled().await;
+            })
+            .await
         });
 
         let shutdown_state = state.clone();
@@ -760,6 +1210,7 @@ impl AppBuilder {
             scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
+            custom_layers,
             startup_hooks: _,
             shutdown_hooks: _,
             extensions: _,
@@ -767,12 +1218,21 @@ impl AppBuilder {
             error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store,
+            #[cfg(feature = "openapi")]
+                openapi: _,
+            audit_logger: _,
         } = self;
 
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (config, _telemetry_guard) = load_config_and_telemetry();
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -780,12 +1240,19 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
+        // Fail-fast on invalid session config — only when no custom store
+        // was installed. Symmetrical to the same check in run() so static
+        // builds don't run migrations against a doomed boot either.
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
+
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, vec![]).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        let pool = setup_database(&config, vec![], pool_provider_factory)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
 
         let mut state = build_state(
             &config,
@@ -795,12 +1262,33 @@ impl AppBuilder {
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
-        // Build the full router (same as production)
-        let router =
-            crate::router::try_build_router(all_routes, &config, state).unwrap_or_else(|error| {
-                eprintln!("Failed to build router: {error}");
-                std::process::exit(1);
-            });
+        // Build the full router (same as production). Use the inner builder
+        // so the custom session store installed via with_session_store(...)
+        // is honored during static generation — apps that swap in a custom
+        // store specifically to avoid Redis/external backends at build time
+        // would otherwise silently fall back to the config-driven backend.
+        // Custom Tower layers registered via .layer(...) are likewise
+        // applied so static output matches the production response pipeline.
+        let router = crate::router::try_build_router_inner(
+            all_routes,
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                error_page_renderer: None,
+                session_store,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to build router: {error}");
+            std::process::exit(1);
+        });
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -841,10 +1329,7 @@ fn start_task_scheduler(
 ) {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
     for task_info in &tasks {
-        let schedule_desc = match &task_info.schedule {
-            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-            crate::task::Schedule::Cron { expression, .. } => format!("cron {expression}"),
-        };
+        let schedule_desc = task_info.schedule.to_string();
         tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
     }
 
@@ -855,71 +1340,17 @@ fn start_task_scheduler(
         let state = state.clone();
         let name = task_info.name.clone();
         let handler = task_info.handler;
+        let schedule_desc = task_info.schedule.to_string();
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
                 // Register with the task registry for /actuator/tasks
-                let schedule_desc = format!("every {}s", delay.as_secs());
                 state.task_registry.register(&name, &schedule_desc);
 
                 tokio::spawn(async move {
                     loop {
                         tokio::time::sleep(delay).await;
-                        tracing::debug!(task = %name, "Running scheduled task");
-                        state.task_registry.record_start(&name);
-                        #[cfg(feature = "ws")]
-                        {
-                            let msg = serde_json::json!({
-                                "event": "started",
-                                "task": name,
-                                "timestamp": chrono::Utc::now().to_rfc3339()
-                            });
-                            let _ = state.channels().sender("sys:tasks").send(msg.to_string());
-                        }
-
-                        let start = std::time::Instant::now();
-                        match (handler)(state.clone()).await {
-                            Ok(()) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                state.task_registry.record_success(&name, duration_ms);
-                                tracing::debug!(task = %name, "Task completed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "success",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                            Err(e) => {
-                                let duration_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                                let error_str = e.to_string();
-                                state
-                                    .task_registry
-                                    .record_failure(&name, duration_ms, &error_str);
-                                tracing::warn!(task = %name, error = %e, "Task failed");
-
-                                #[cfg(feature = "ws")]
-                                {
-                                    let msg = serde_json::json!({
-                                        "event": "failure",
-                                        "task": name,
-                                        "duration_ms": duration_ms,
-                                        "error": error_str,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    });
-                                    let _ =
-                                        state.channels().sender("sys:tasks").send(msg.to_string());
-                                }
-                            }
-                        }
+                        execute_fixed_delay_task(name.clone(), state.clone(), handler).await;
                     }
                 });
             }
@@ -927,7 +1358,6 @@ fn start_task_scheduler(
                 expression,
                 timezone,
             } => {
-                let schedule_desc = format!("cron {expression}");
                 state.task_registry.register(&name, &schedule_desc);
                 cron_tasks.push((name, expression, timezone, handler));
             }
@@ -947,44 +1377,90 @@ fn send_ws_sys_task_msg(
     state: &AppState,
     event: &str,
     name: &str,
-    extra: Option<(&str, serde_json::Value)>,
+    extra: Vec<(&str, serde_json::Value)>,
 ) {
     #[cfg(feature = "ws")]
     {
-        let mut map = serde_json::Map::new();
-        map.insert(
-            "event".to_string(),
-            serde_json::Value::String(event.to_string()),
-        );
-        map.insert(
-            "task".to_string(),
-            serde_json::Value::String(name.to_string()),
-        );
-        map.insert(
-            "timestamp".to_string(),
-            serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
-        );
-        if let Some((k, v)) = extra {
-            map.insert(k.to_string(), v);
+        // ⚡ Bolt Optimization:
+        // Use serde_json::json! to avoid multiple String allocations (`.to_string()`)
+        // and repetitive `Map::insert` calls for `sys:tasks` websocket messages.
+        let mut msg = serde_json::json!({
+            "event": event,
+            "task": name,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Some(map) = msg.as_object_mut() {
+            for (k, v) in extra {
+                map.insert(k.to_string(), v);
+            }
         }
-        let msg = serde_json::Value::Object(map);
         let _ = state.channels().sender("sys:tasks").send(msg.to_string());
     }
 }
 
-async fn execute_cron_task_result(
+async fn execute_task_result(
     state: &AppState,
     handler: crate::task::TaskHandler,
     start: std::time::Instant,
+    name: &str,
+    schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
-    match (handler)(state.clone()).await {
-        Ok(()) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Ok(duration_ms)
+    // A fresh span per run so OTLP-enabled deployments see each invocation
+    // as its own trace rather than inheriting whatever was current on the
+    // scheduler thread.
+    let task_span = tracing::info_span!(
+        parent: None,
+        "scheduled_task",
+        otel.kind = "internal",
+        task = %name,
+        schedule = schedule,
+    );
+    let result = (handler)(state.clone()).instrument(task_span).await;
+    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    match result {
+        Ok(()) => Ok(duration_ms),
+        Err(e) => Err((duration_ms, e.to_string())),
+    }
+}
+
+/// Handle the execution of a single fixed-delay task.
+async fn execute_fixed_delay_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+) {
+    tracing::debug!(task = %name, "Running scheduled task");
+    state.task_registry.record_start(&name);
+
+    send_ws_sys_task_msg(&state, "started", &name, vec![]);
+
+    let start = std::time::Instant::now();
+    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
+        Ok(duration_ms) => {
+            state.task_registry.record_success(&name, duration_ms);
+            tracing::debug!(task = %name, "Task completed");
+            send_ws_sys_task_msg(
+                &state,
+                "success",
+                &name,
+                vec![("duration_ms", serde_json::json!(duration_ms))],
+            );
         }
-        Err(e) => {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            Err((duration_ms, e.to_string()))
+        Err((duration_ms, error_str)) => {
+            state
+                .task_registry
+                .record_failure(&name, duration_ms, &error_str);
+            tracing::warn!(task = %name, error = %error_str, "Task failed");
+            send_ws_sys_task_msg(
+                &state,
+                "failure",
+                &name,
+                vec![
+                    ("duration_ms", serde_json::json!(duration_ms)),
+                    ("error", serde_json::json!(error_str)),
+                ],
+            );
         }
     }
 }
@@ -994,10 +1470,10 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
-    send_ws_sys_task_msg(&state, "started", &name, None);
+    send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_cron_task_result(&state, handler, start).await {
+    match execute_task_result(&state, handler, start, &name, "cron").await {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -1005,7 +1481,7 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
                 &state,
                 "success",
                 &name,
-                Some(("duration_ms", serde_json::json!(duration_ms))),
+                vec![("duration_ms", serde_json::json!(duration_ms))],
             );
         }
         Err((duration_ms, error_str)) => {
@@ -1017,7 +1493,10 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
                 &state,
                 "failure",
                 &name,
-                Some(("error", serde_json::json!(error_str))),
+                vec![
+                    ("duration_ms", serde_json::json!(duration_ms)),
+                    ("error", serde_json::json!(error_str)),
+                ],
             );
         }
     }
@@ -1175,41 +1654,90 @@ fn log_startup_transparency(
     tracing::info!("Configuration:{}", format_config_summary(config));
 }
 
-fn load_config_and_telemetry() -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
-    // 1. Load configuration (profile-aware)
-    let config = AutumnConfig::load().unwrap_or_else(|e| {
+/// Fail the boot fast (before any DB side effects) when the default
+/// session backend is misconfigured.
+///
+/// `AutumnConfig::validate()` is intentionally session-agnostic so that a
+/// custom [`SessionStore`](crate::session::SessionStore) installed via
+/// [`AppBuilder::with_session_store`] can override an otherwise-invalid
+/// `session.backend = "redis"`-without-`redis.url` config. But when no
+/// custom store is installed, the config-driven path will fail later in
+/// `apply_session_layer` — and by then, `setup_database` has already run
+/// migrations, leaving DB side effects from a doomed boot. This helper
+/// runs the same `backend_plan` check `apply_session_layer` does, but
+/// before any side effects, and only when the override path is inactive.
+fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session_store: bool) {
+    if has_custom_session_store {
+        return;
+    }
+    if let Err(error) = config.session.backend_plan(config.profile.as_deref()) {
+        eprintln!("Invalid session backend config: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn load_config_and_telemetry(
+    config_loader: Option<ConfigLoaderFactory>,
+    telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
+) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
+    // 1. Load configuration via the installed loader, falling back to the
+    //    five-layer TOML + env default.
+    let config = match config_loader {
+        Some(factory) => factory().await,
+        None => crate::config::TomlEnvConfigLoader::new().load().await,
+    }
+    .unwrap_or_else(|e| {
         eprintln!("Failed to load configuration: {e}");
         std::process::exit(1);
     });
 
-    // 2. Initialize logging/telemetry immediately after config.
-    let telemetry_guard = crate::logging::init_with_telemetry(
-        &config.log,
-        &config.telemetry,
-        config.profile.as_deref(),
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("Failed to initialize telemetry: {error}");
-        std::process::exit(1);
-    });
+    // 2. Initialize logging/telemetry via the installed provider, falling
+    //    back to the default `tracing-subscriber + OTLP` initializer.
+    let provider: Box<dyn crate::telemetry::TelemetryProvider> = telemetry_provider
+        .unwrap_or_else(|| Box::new(crate::telemetry::TracingOtlpTelemetryProvider::new()));
+    let telemetry_guard = provider
+        .init(&config.log, &config.telemetry, config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize telemetry: {error}");
+            std::process::exit(1);
+        });
 
     (config, telemetry_guard)
 }
 
 #[cfg(feature = "db")]
-fn setup_database(
+async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    pool_provider: Option<PoolProviderFactory>,
 ) -> Result<
     Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
     String,
 > {
-    let pool = crate::db::create_pool(&config.database)
-        .map_err(|e| format!("Failed to create database pool: {e}"))?;
+    let pool = match pool_provider {
+        Some(factory) => factory(config.database.clone()).await,
+        None => {
+            crate::db::DieselDeadpoolPoolProvider::new()
+                .create_pool(&config.database)
+                .await
+        }
+    }
+    .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    if let Some(url) = &config.database.url {
-        for mig in migrations {
-            crate::migrate::auto_migrate(url, config.profile.as_deref(), mig);
+    // Skip migrations when the provider opted out of a database (returned
+    // `Ok(None)`) — even if `database.url` is configured. Custom providers
+    // signal "this app runs without a DB" by returning None; running
+    // migrations against the URL anyway would defeat the opt-out.
+    if pool.is_some() {
+        if let Some(url) = &config.database.url {
+            for mig in migrations {
+                crate::migrate::auto_migrate(
+                    url,
+                    config.profile.as_deref(),
+                    config.database.auto_migrate_in_production,
+                    mig,
+                );
+            }
         }
     }
 
@@ -1284,7 +1812,10 @@ fn format_route_lines(
         "GET"
     );
     #[cfg(feature = "htmx")]
-    out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+    {
+        out.push_str("\n    /static/js/htmx.min.js GET -> htmx");
+        out.push_str("\n    /static/js/autumn-htmx-csrf.js GET -> htmx csrf");
+    }
     out
 }
 
@@ -1298,10 +1829,7 @@ fn format_task_lines(tasks: &[crate::task::TaskInfo]) -> Option<String> {
 
     let mut out = String::new();
     for task in tasks {
-        let schedule = match &task.schedule {
-            crate::task::Schedule::FixedDelay(d) => format!("every {}s", d.as_secs()),
-            crate::task::Schedule::Cron { expression, .. } => format!("cron \"{expression}\""),
-        };
+        let schedule = task.schedule.to_string();
         let _ = write!(out, "\n    {} ({schedule})", task.name);
     }
     Some(out)
@@ -1457,6 +1985,13 @@ mod tests {
             path,
             handler: axum::routing::get(|| async { "ok" }),
             name,
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path,
+                operation_id: name,
+                success_status: 200,
+                ..Default::default()
+            },
         }
     }
 
@@ -1676,6 +2211,13 @@ mod tests {
             path: "/submit",
             handler: axum::routing::post(|| async { "posted" }),
             name: "submit",
+            api_doc: crate::openapi::ApiDoc {
+                method: "POST",
+                path: "/submit",
+                operation_id: "submit",
+                success_status: 200,
+                ..Default::default()
+            },
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -1721,12 +2263,26 @@ mod tests {
                 path: "/admin",
                 handler: axum::routing::get(|| async { "list" }),
                 name: "admin_list",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/admin",
+                    operation_id: "admin_list",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: http::Method::POST,
                 path: "/admin",
                 handler: axum::routing::post(|| async { "created" }),
                 name: "create",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/admin",
+                    operation_id: "create",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
         ];
         let config = AutumnConfig::default();
@@ -1790,14 +2346,14 @@ mod tests {
     #[tokio::test]
     async fn htmx_handler_returns_javascript_with_correct_headers() {
         let app = axum::Router::new().route(
-            "/static/js/htmx.min.js",
+            crate::htmx::HTMX_JS_PATH,
             axum::routing::get(crate::router::htmx_handler),
         );
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1845,13 +2401,50 @@ mod tests {
 
     #[cfg(feature = "htmx")]
     #[tokio::test]
+    async fn htmx_csrf_handler_returns_csp_compatible_javascript() {
+        let app = axum::Router::new().route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(crate::router::htmx_csrf_handler),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+        assert!(!js.contains("<script"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
     async fn build_router_serves_htmx_js() {
         let router = test_router(vec![test_get_route("/dummy", "dummy")]);
 
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/static/js/htmx.min.js")
+                    .uri(crate::htmx::HTMX_JS_PATH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1866,6 +2459,86 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(ct.contains("javascript"));
+    }
+
+    #[cfg(feature = "htmx")]
+    #[tokio::test]
+    async fn build_router_serves_htmx_csrf_js() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::htmx::HTMX_CSRF_JS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("framework JS should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let js = std::str::from_utf8(&body).expect("csrf helper should be valid utf-8");
+        assert!(js.contains("htmx:configRequest"));
+        assert!(js.contains("X-CSRF-Token"));
+    }
+
+    #[tokio::test]
+    async fn build_router_serves_default_favicon_without_404() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            response.headers().contains_key("content-security-policy"),
+            "framework fallback responses should still receive security headers"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_router_does_not_override_user_favicon_route() {
+        let router = test_router(vec![test_get_route(
+            crate::router::DEFAULT_FAVICON_PATH,
+            "favicon",
+        )]);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(crate::router::DEFAULT_FAVICON_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 
     #[tokio::test]
@@ -1933,6 +2606,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .expect("static-first HTML should still receive security headers")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("script-src 'self'"), "csp = {csp}");
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1950,6 +2630,13 @@ mod tests {
                     path: "/about",
                     handler: axum::routing::get(|| async { "About Page Content" }),
                     name: "about",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/about",
+                        operation_id: "about",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }],
                 &config,
                 state,
@@ -1996,6 +2683,13 @@ mod tests {
                         axum::response::Html("<html><body><main>ok</main></body></html>")
                     }),
                     name: "page",
+                    api_doc: crate::openapi::ApiDoc {
+                        method: "GET",
+                        path: "/page",
+                        operation_id: "page",
+                        success_status: 200,
+                        ..Default::default()
+                    },
                 }]);
 
                 let response = router
@@ -2008,6 +2702,53 @@ mod tests {
                     .unwrap();
                 let html = std::str::from_utf8(&body).expect("utf-8");
                 assert!(html.contains("/__autumn/live-reload"));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn build_router_mounts_dev_reload_script_endpoint_when_enabled() {
+        // The injected <script src="/__autumn/live-reload.js"> tag only works
+        // under the default CSP (`script-src 'self'`) if the framework
+        // actually serves the JS at that path. This guards against the
+        // regression where the script endpoint is forgotten.
+        let reload_file = tempfile::NamedTempFile::new().expect("reload state file");
+        std::fs::write(reload_file.path(), r#"{"version":0,"kind":"full"}"#).expect("write");
+        temp_env::async_with_vars(
+            [
+                ("AUTUMN_DEV_RELOAD", Some("1")),
+                (
+                    "AUTUMN_DEV_RELOAD_STATE",
+                    Some(reload_file.path().to_str().expect("utf-8 path")),
+                ),
+            ],
+            async {
+                let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+
+                let response = router
+                    .oneshot(
+                        Request::builder()
+                            .uri("/__autumn/live-reload.js")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("application/javascript; charset=utf-8")
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let js = std::str::from_utf8(&body).expect("utf-8");
+                assert!(js.contains("fetch("), "js body: {js}");
             },
         )
         .await;
@@ -2380,7 +3121,7 @@ mod tests {
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
-        assert!(output.contains("nightly (cron \"0 0 * * *\")"));
+        assert!(output.contains("nightly (cron 0 0 * * *)"));
     }
 
     #[test]
@@ -2651,23 +3392,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_cron_task_result_ok_returns_duration() {
+    async fn execute_task_result_ok_returns_duration() {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result =
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_ok(), "expected Ok from successful handler");
         // duration_ms should be a reasonable value (not MAX)
         assert!(result.unwrap() < u64::MAX);
     }
 
     #[tokio::test]
-    async fn execute_cron_task_result_err_returns_duration_and_message() {
+    async fn execute_task_result_err_returns_duration_and_message() {
         let state = AppState::for_test();
         let handler: crate::task::TaskHandler =
             |_| Box::pin(async { Err(crate::AutumnError::bad_request_msg("test error")) });
         let start = std::time::Instant::now();
-        let result = super::execute_cron_task_result(&state, handler, start).await;
+        let result =
+            super::execute_task_result(&state, handler, start, "test_task", "fixed_delay").await;
         assert!(result.is_err(), "expected Err from failing handler");
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);

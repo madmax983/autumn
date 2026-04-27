@@ -27,6 +27,7 @@ pub struct TaskInfo {
 }
 
 /// How a scheduled task is triggered.
+#[non_exhaustive]
 pub enum Schedule {
     /// Run after a fixed delay from the end of the previous run.
     FixedDelay(Duration),
@@ -37,6 +38,15 @@ pub enum Schedule {
         /// The timezone for the cron expression (e.g., `"America/New_York"`).
         timezone: Option<String>,
     },
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FixedDelay(d) => write!(f, "every {}s", d.as_secs()),
+            Self::Cron { expression, .. } => write!(f, "cron {expression}"),
+        }
+    }
 }
 
 /// Parse a human-readable duration string like `"5m"`, `"1h 30m"`.

@@ -5,8 +5,8 @@
 //! loading.
 
 use autumn_web::extract::Path;
+use autumn_web::extract::State;
 use autumn_web::prelude::*;
-use autumn_web::reexports::axum::extract::State;
 use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;

@@ -11,10 +11,12 @@
 //! Users should not depend on this crate directly — use `autumn-web` instead,
 //! which re-exports everything.
 
+mod api_doc;
 mod cached;
 mod collect;
 mod main_macro;
 mod model;
+mod oauth2_callback;
 mod parse;
 mod repository;
 mod route;
@@ -119,6 +121,15 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("DELETE", "delete", attr.into(), item.into()).into()
+}
+
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// This is a convenience alias for `#[get(\"...\")]`, intended for OAuth
+/// callback endpoints such as `/auth/github/callback`.
+#[proc_macro_attribute]
+pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
+    oauth2_callback::oauth2_callback_macro(attr.into(), item.into()).into()
 }
 
 /// Collect annotated route handlers into a `Vec<Route>`.
@@ -397,6 +408,118 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
     cached::cached_macro(attr.into(), item.into()).into()
+}
+
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
+///
+/// Applied on top of a route macro (`#[get]`, `#[post]`, etc.), this
+/// attribute lets you override or add documentation fields that cannot
+/// be inferred from the handler signature (summaries, descriptions,
+/// tags, custom success status codes).
+///
+/// The route macro consumes this attribute and folds the metadata into
+/// the route's `ApiDoc`. When no route macro is applied, the attribute
+/// is a no-op.
+///
+/// # Supported keys
+///
+/// | Key | Type | Effect |
+/// |-----|------|--------|
+/// | `summary` | string | Short one-line description |
+/// | `description` | string | Longer multi-line description |
+/// | `tag` | string | Single `OpenAPI` tag for grouping |
+/// | `tags` | `[string, ...]` | Multiple `OpenAPI` tags |
+/// | `operation_id` | string | Override the default operation id |
+/// | `status` | integer | Success HTTP status code (defaults to `200`) |
+/// | `hidden` | flag / bool | Exclude the route from the generated spec |
+///
+/// # Examples
+///
+/// ```ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// #[api_doc(summary = "Fetch a user by id", tag = "users")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+///
+/// #[post("/users")]
+/// #[api_doc(description = "Create a new user", status = 201)]
+/// async fn create_user(Json(req): Json<serde_json::Value>) -> Json<serde_json::Value> {
+///     Json(req)
+/// }
+///
+/// #[get("/internal/metrics")]
+/// #[api_doc(hidden)]
+/// async fn metrics() -> &'static str { "" }
+/// ```
+#[proc_macro_attribute]
+pub fn api_doc(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Rust expands attribute macros top-down (outermost first), so if the
+    // user writes
+    //
+    //   #[api_doc(summary = "...")]
+    //   #[get("/x")]
+    //   async fn handler() { ... }
+    //
+    // this macro fires BEFORE `#[get]` and would strip `#[api_doc]` from
+    // the item — the route macro would then never see the overrides.
+    //
+    // To support both orderings, we detect any pending route attribute
+    // (`get`, `post`, etc.) sitting below us and reorder: we remove the
+    // route attribute and emit it as the NEW outermost attribute, and
+    // we re-attach `#[api_doc(...)]` to the function body. Rust then
+    // expands the route macro next, which finds and consumes the
+    // preserved `#[api_doc]` via the usual attribute-list walk.
+    api_doc_standalone(attr, item)
+}
+
+const ROUTE_ATTR_NAMES: &[&str] = &["get", "post", "put", "delete", "patch", "static_get", "ws"];
+
+/// Return `true` when an attribute names one of the Autumn route macros.
+///
+/// We match on the **last** path segment so qualified forms like
+/// `#[autumn_web::get("/x")]`, `#[autumn_macros::post("/x")]`, or
+/// even `#[crate::get("/x")]` are recognized alongside the bare
+/// `#[get("/x")]`. Unqualified identifiers are covered by the same
+/// logic because their path has a single segment.
+fn is_route_attribute(attr: &syn::Attribute) -> bool {
+    attr.path()
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+        .is_some_and(|name| ROUTE_ATTR_NAMES.contains(&name.as_str()))
+}
+
+fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr_ts: proc_macro2::TokenStream = attr.into();
+    let mut input_fn: syn::ItemFn = match syn::parse(item.clone()) {
+        Ok(f) => f,
+        // Not a function (e.g. applied to a struct) — leave it alone so
+        // the user sees the usual "expected function" error from rustc.
+        Err(_) => return item,
+    };
+
+    let route_idx = input_fn.attrs.iter().position(is_route_attribute);
+
+    let Some(idx) = route_idx else {
+        // Standalone `#[api_doc]` with no paired route macro is a no-op;
+        // route metadata is only emitted through route macros.
+        return quote::quote! { #input_fn }.into();
+    };
+
+    let route_attr = input_fn.attrs.remove(idx);
+    let preserved: syn::Attribute = syn::parse_quote! {
+        #[api_doc(#attr_ts)]
+    };
+    input_fn.attrs.insert(0, preserved);
+
+    quote::quote! {
+        #route_attr
+        #input_fn
+    }
+    .into()
 }
 
 /// Annotate an async function as a WebSocket route handler.

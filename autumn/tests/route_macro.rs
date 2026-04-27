@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the single route macro.
+//!
 use autumn_web::extract::Path;
 use autumn_web::{delete, get, post, put};
 
@@ -50,6 +53,18 @@ async fn returns_json() -> axum::Json<serde_json::Value> {
 #[get("/status")]
 async fn returns_status() -> http::StatusCode {
     http::StatusCode::NO_CONTENT
+}
+
+#[get("/primitive-int")]
+#[allow(clippy::unused_async)]
+async fn returns_primitive_int() -> i32 {
+    42
+}
+
+#[get("/primitive-bool")]
+#[allow(clippy::unused_async)]
+async fn returns_primitive_bool() -> bool {
+    true
 }
 
 // ── GET tests ────────────────────────────────────────────────────────
@@ -183,6 +198,34 @@ fn status_code_return_type_compiles_with_debug_handler() {
     assert_eq!(route.method, http::Method::GET);
     assert_eq!(route.path, "/status");
     assert_eq!(route.name, "returns_status");
+}
+
+#[test]
+fn primitive_int_return_type_compiles_with_route_macro() {
+    let route = __autumn_route_info_returns_primitive_int();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/primitive-int");
+    assert_eq!(route.name, "returns_primitive_int");
+}
+
+#[test]
+fn primitive_bool_return_type_compiles_with_route_macro() {
+    let route = __autumn_route_info_returns_primitive_bool();
+    assert_eq!(route.method, http::Method::GET);
+    assert_eq!(route.path, "/primitive-bool");
+    assert_eq!(route.name, "returns_primitive_bool");
+}
+
+#[tokio::test]
+async fn primitive_int_handler_keeps_declared_return_type_for_direct_calls() {
+    let value: i32 = returns_primitive_int().await;
+    assert_eq!(value, 42);
+}
+
+#[tokio::test]
+async fn primitive_bool_handler_keeps_declared_return_type_for_direct_calls() {
+    let value: bool = returns_primitive_bool().await;
+    assert!(value);
 }
 
 // ── Path parameter tests (S-006) ────────────────────────────────────

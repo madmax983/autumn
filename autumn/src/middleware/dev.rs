@@ -16,6 +16,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 
 pub const LIVE_RELOAD_PATH: &str = "/__autumn/live-reload";
+pub const LIVE_RELOAD_SCRIPT_PATH: &str = "/__autumn/live-reload.js";
 const DEV_RELOAD_ENV: &str = "AUTUMN_DEV_RELOAD";
 const DEV_RELOAD_STATE_ENV: &str = "AUTUMN_DEV_RELOAD_STATE";
 const DEV_RELOAD_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
@@ -38,6 +39,23 @@ pub async fn live_reload_state_handler() -> impl IntoResponse {
     headers.insert(
         CONTENT_TYPE,
         HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    apply_no_store(headers);
+    response
+}
+
+/// Serves the live-reload polling client as an external JavaScript file.
+///
+/// The script is served as a same-origin `<script src="...">` rather than
+/// injected inline so that it passes a `script-src 'self'` Content Security
+/// Policy (the framework-default CSP). See [`LIVE_RELOAD_SCRIPT_PATH`].
+pub async fn live_reload_script_handler() -> impl IntoResponse {
+    let mut response = Response::new(Body::from(live_reload_script_body()));
+    *response.status_mut() = StatusCode::OK;
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/javascript; charset=utf-8"),
     );
     apply_no_store(headers);
     response
@@ -73,11 +91,10 @@ async fn inject_live_reload_into_response(response: Response<Body>) -> Response<
         return Response::from_parts(parts, Body::from(body));
     }
 
-    if let Ok(value) = HeaderValue::from_str(&updated.len().to_string()) {
-        parts.headers.insert(CONTENT_LENGTH, value);
-    } else {
-        parts.headers.remove(CONTENT_LENGTH);
-    }
+    // Avoids heap allocation by using zero-cost numeric conversion
+    parts
+        .headers
+        .insert(CONTENT_LENGTH, HeaderValue::from(updated.len()));
 
     Response::from_parts(parts, Body::from(updated))
 }
@@ -131,10 +148,19 @@ fn inject_snippet(body: &[u8]) -> Vec<u8> {
     body.to_vec()
 }
 
+/// Returns the `<script src=...>` tag injected into HTML responses.
+///
+/// The actual JavaScript lives at [`LIVE_RELOAD_SCRIPT_PATH`] so the tag
+/// has no inline body and works under a same-origin-only CSP
+/// (`script-src 'self'`). Tests and internal callers may still ask for
+/// the bare tag via this function.
 fn live_reload_script() -> String {
+    format!(r#"<script src="{LIVE_RELOAD_SCRIPT_PATH}"></script>"#)
+}
+
+fn live_reload_script_body() -> String {
     format!(
-        r#"<script>
-(() => {{
+        r#"(() => {{
   const endpoint = "{LIVE_RELOAD_PATH}";
   let version = null;
   let polling = false;
@@ -204,7 +230,7 @@ fn live_reload_script() -> String {
   }}, 700);
   void poll();
 }})();
-</script>"#
+"#
     )
 }
 
@@ -393,7 +419,7 @@ mod tests {
     fn inject_snippet_inserts_before_body_or_appends_to_html_shell() {
         let with_body = inject_snippet(b"<html><body><main>ok</main></body></html>");
         let with_body = std::str::from_utf8(&with_body).expect("utf-8 html");
-        assert!(with_body.contains(LIVE_RELOAD_PATH));
+        assert!(with_body.contains(LIVE_RELOAD_SCRIPT_PATH));
         assert!(with_body.contains("</script></body>"));
 
         let html_shell = inject_snippet(b"<html><main>ok</main></html>");
@@ -402,6 +428,60 @@ mod tests {
 
         let plain = inject_snippet(b"not html");
         assert_eq!(&plain[..], b"not html");
+    }
+
+    #[test]
+    fn injected_snippet_uses_external_src_no_inline_js() {
+        // The default Autumn CSP is `script-src 'self'` (no 'unsafe-inline'),
+        // so the injected snippet must be a plain external-src <script> tag
+        // with no inline JavaScript body — otherwise the browser will refuse
+        // to execute it and live reload silently breaks.
+        let injected = inject_snippet(b"<html><body>ok</body></html>");
+        let html = std::str::from_utf8(&injected).expect("utf-8 html");
+
+        assert!(
+            html.contains(&format!(
+                r#"<script src="{LIVE_RELOAD_SCRIPT_PATH}"></script>"#
+            )),
+            "expected external-src script tag, got: {html}"
+        );
+        // None of the inline script body should leak into the HTML.
+        assert!(
+            !html.contains("setInterval"),
+            "inline JS leaked into HTML: {html}"
+        );
+        assert!(
+            !html.contains("fetch("),
+            "inline JS leaked into HTML: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_reload_script_handler_serves_js_with_correct_content_type() {
+        let response = live_reload_script_handler().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let js = std::str::from_utf8(&body).expect("utf-8");
+        // Sanity-check: handler returns the real polling client, not the
+        // <script> wrapper tag.
+        assert!(js.contains("fetch("), "expected polling client, got: {js}");
+        assert!(
+            !js.contains("<script"),
+            "JS body must not contain HTML tags"
+        );
     }
 
     #[test]
@@ -455,5 +535,61 @@ mod tests {
         let malformed = inject_snippet(b"<html<body>");
         let result = std::str::from_utf8(&malformed).expect("utf-8");
         assert!(result.ends_with("</script>"));
+    }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_returns_json_and_headers() {
+        let response = super::live_reload_state_handler().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json; charset=utf-8"
+        );
+
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            DEV_RELOAD_CACHE_CONTROL
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+        // Assert valid JSON string containing expected structure
+        assert!(body_str.contains(r#""version""#));
+        assert!(body_str.contains(r#""kind""#));
+    }
+
+    #[tokio::test]
+    async fn live_reload_state_handler_reads_state_from_file_with_env() {
+        let tmp_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+        let content = r#"{"version":123,"kind":"css"}"#;
+        std::fs::write(tmp_file.path(), content).expect("failed to write to temp file");
+
+        temp_env::async_with_vars(
+            [
+                (DEV_RELOAD_ENV, Some("1")),
+                (
+                    DEV_RELOAD_STATE_ENV,
+                    Some(tmp_file.path().to_str().unwrap()),
+                ),
+            ],
+            async {
+                let response = super::live_reload_state_handler().await.into_response();
+
+                assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+                let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body_str = std::str::from_utf8(&body_bytes).unwrap();
+
+                assert_eq!(body_str, content);
+            },
+        )
+        .await;
     }
 }

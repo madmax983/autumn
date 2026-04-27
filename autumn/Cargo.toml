@@ -17,7 +17,10 @@ flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
 htmx = []
+multipart = ["axum/multipart"]
 tailwind = []
+oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
+openapi = []
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -37,7 +40,7 @@ telemetry-otlp = [
 redis = ["dep:redis"]
 
 [dependencies]
-autumn-macros = { version = "0.2.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.3.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"
@@ -79,6 +82,11 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 subtle = "2.6.1"
 url = "2.5.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+jsonwebtoken = { version = "10.1.0", optional = true }
+lru = "0.17.0"
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }
@@ -87,16 +95,18 @@ http.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio.workspace = true
-tower.workspace = true
+tower = { workspace = true, features = ["timeout", "util"] }
 trybuild = "1"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 redis.workspace = true
 proptest = "1.4"
+time = { workspace = true }
 tokio-tungstenite = "0.29.0"
 loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
+rusty-fork = "0.3.1"
 
 [lints]
 workspace = true

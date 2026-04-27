@@ -85,6 +85,14 @@ pub trait Plugin: Sized + Send + 'static {
     /// [`AppBuilder::on_startup`], [`AppBuilder::on_shutdown`],
     /// [`AppBuilder::nest`], [`AppBuilder::with_extension`] and (with the
     /// `db` feature) [`AppBuilder::migrations`].
+    ///
+    /// Plugins can also install **tier-1 subsystem replacements** here —
+    /// [`AppBuilder::with_config_loader`], [`AppBuilder::with_pool_provider`]
+    /// (with the `db` feature), [`AppBuilder::with_telemetry_provider`], and
+    /// [`AppBuilder::with_session_store`] — which is the canonical way to
+    /// distribute a custom subsystem (e.g. `AwsSecretsConfigPlugin`) for
+    /// downstream consumers as a one-line install. See
+    /// `docs/guide/extensibility.md` for the full extensibility model.
     #[must_use]
     fn build(self, app: AppBuilder) -> AppBuilder;
 }
@@ -148,11 +156,17 @@ mod tests {
         }
 
         fn events(&self) -> Vec<&'static str> {
-            self.events.lock().unwrap().clone()
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .clone()
         }
 
         fn push(&self, label: &'static str) {
-            self.events.lock().unwrap().push(label);
+            self.events
+                .lock()
+                .expect("lock shouldn't be poisoned")
+                .push(label);
         }
     }
 

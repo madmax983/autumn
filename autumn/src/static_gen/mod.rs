@@ -12,7 +12,7 @@
 //! 1. **Build phase:** `autumn build` discovers your `#[static_get]` routes and runs them, saving the HTML to `dist/`.
 //! 2. **Runtime phase:** The `StaticFileLayer` intercepts requests. If a pre-rendered file exists, it serves it directly!
 
-pub mod build;
+pub(crate) mod build;
 mod middleware;
 mod types;
 

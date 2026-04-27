@@ -132,13 +132,52 @@ impl MetricsCollector {
         }
 
         // Per-route (sharded)
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(route, &mut hasher);
-        #[allow(clippy::cast_possible_truncation)]
-        let shard_idx = (std::hash::Hasher::finish(&hasher) % (SHARD_COUNT as u64)) as usize;
+        // ⚡ Bolt Optimization:
+        // FNV-1a hash is faster than DefaultHasher (SipHash) for short strings like routes.
+        // We don't need cryptographic security or HashDoS resistance here since this is internal.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in route.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
 
-        let key = format!("{method} {route}");
-        {
+        let shard_idx = usize::try_from(hash % (SHARD_COUNT as u64)).unwrap_or_default();
+
+        // ⚡ Bolt Optimization:
+        // Format the key into a stack-allocated buffer to avoid a heap allocation
+        // on every request. Fall back to allocating a String only if the route
+        // is exceptionally long (which is rare) or if it's a new route missing
+        // from the metrics map.
+        let mut buf = [0u8; 256];
+        let key_str = {
+            let mut cursor = &mut buf[..];
+            if std::io::Write::write_fmt(&mut cursor, format_args!("{method} {route}")).is_ok() {
+                let len = 256 - cursor.len();
+                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+            } else {
+                ""
+            }
+        };
+
+        let mut is_new = false;
+        if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
+            if let Some(entry) = shard.by_route.get_mut(key_str) {
+                entry.count += 1;
+                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+                    entry.latencies_ms.pop_front();
+                }
+                entry.latencies_ms.push_back(latency_ms);
+            } else {
+                is_new = true;
+            }
+        }
+
+        if is_new {
+            let key = if key_str.is_empty() {
+                format!("{method} {route}")
+            } else {
+                key_str.to_owned()
+            };
             if let Ok(mut shard) = self.inner.shards[shard_idx].write() {
                 let entry = shard.by_route.entry(key).or_default();
                 entry.count += 1;
@@ -313,7 +352,7 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
 
 // ── Tower Layer / Service ───────────────────────────────────────
 
-/// Tower [`Layer`] that wraps a service with [`MetricsService`].
+/// Tower [`Layer`] that wraps a service with `MetricsService`.
 ///
 /// Records request count, latency, active connections, and status code
 /// distribution into a shared [`MetricsCollector`].
@@ -551,5 +590,27 @@ mod tests {
 
         // Ensure that even though it errored, the active connection count was decremented
         assert_eq!(collector.inner.requests_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn collector_records_request_very_long_route() {
+        let collector = MetricsCollector::new();
+        let long_route = "a".repeat(1000);
+
+        collector.record("GET", &long_route, 200, 15);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.http.requests_total, 1);
+
+        // Let's verify the route was recorded correctly.
+        let key = format!("GET {long_route}");
+        let route_snap = snap.http.by_route.get(&key).unwrap();
+        assert_eq!(route_snap.count, 1);
+
+        // Record again to hit the other path
+        collector.record("GET", &long_route, 200, 20);
+        let snap2 = collector.snapshot();
+        let route_snap2 = snap2.http.by_route.get(&key).unwrap();
+        assert_eq!(route_snap2.count, 2);
     }
 }

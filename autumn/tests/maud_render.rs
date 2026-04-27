@@ -1,3 +1,6 @@
+//!
+//! Integration tests for maud rendering.
+//!
 #![cfg(feature = "maud")]
 
 use autumn_web::{Markup, html};

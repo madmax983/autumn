@@ -103,9 +103,9 @@ impl ErrorPageRenderer for DefaultErrorPages {
                         }
                     }
                     div class="mt-8" {
-                        a href="javascript:history.back()"
+                        a href="/"
                           class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go back"
+                            "Go to homepage"
                         }
                     }
                 }
@@ -175,23 +175,30 @@ fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
 
 /// Minimal inline CSS fallback so error pages look reasonable even without
 /// Tailwind CSS loaded. Provides the essential layout and dark mode styling.
-const FALLBACK_STYLES: &str = r"<style>
-:root { color-scheme: light dark; }
+///
+/// Built at compile time by concatenating the shared [`crate::ui::tokens::TOKENS_CSS`]
+/// block with a small set of layout rules. Values that change in dark mode
+/// (`--bg`, `--text`) are overridden inside a `prefers-color-scheme: dark`
+/// block — other tokens are inherited.
+const FALLBACK_STYLES: &str = concat!(
+    "<style>",
+    ":root { color-scheme: light dark; }",
+    include_str!("../ui/tokens.css"),
+    "
+@media (prefers-color-scheme: dark) {
+    :root { --bg: #0a0a0a; --text: #eee; --surface: #1a1a1a; --border: #2a2a2a; --text-muted: #888; }
+}
 body {
-    font-family: system-ui, -apple-system, sans-serif;
+    font-family: var(--font-family);
     margin: 0;
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 1rem;
-    background: #fff;
-    color: #111;
+    background: var(--bg);
+    color: var(--text);
 }
-.dark body, @media (prefers-color-scheme: dark) { body {
-    background: #0a0a0a;
-    color: #eee;
-}}
 .text-center { text-align: center; }
 code {
     padding: 0.125rem 0.5rem;
@@ -208,7 +215,8 @@ a {
     transition: opacity 0.15s;
 }
 a:hover { opacity: 0.8; }
-</style>";
+</style>"
+);
 
 #[cfg(test)]
 mod tests {
@@ -307,6 +315,17 @@ mod tests {
         assert!(s.contains("<!DOCTYPE html>"));
         assert!(s.contains("<html"));
         assert!(s.contains("</html>"));
+    }
+
+    #[test]
+    fn default_pages_do_not_use_javascript_urls() {
+        let pages = DefaultErrorPages;
+        let html = pages.render_422(&make_ctx(StatusCode::UNPROCESSABLE_ENTITY));
+        let s = html.into_string();
+        assert!(
+            !s.contains("javascript:"),
+            "default error pages must work under script-src 'self'",
+        );
     }
 
     #[test]

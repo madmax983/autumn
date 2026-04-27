@@ -3,9 +3,10 @@
 **Epic:** EPIC-011 (v1.0 Security & Stability)
 **Priority:** Should Have
 **Story Points:** 5
-**Status:** Not Started
+**Status:** Done
 **Assigned To:** markm
 **Created:** 2026-03-31
+**Completed:** 2026-04-20
 **Sprint:** Backlog
 
 ---
@@ -54,3 +55,24 @@ Success = Developers can enable CORS for specific origins simply by updating `au
 🚫 **Out of Scope:**
 - Route-specific CORS configuration (global only for Phase 1).
 - Dynamic CORS policies that query a database to determine allowed origins.
+
+---
+
+## Implementation Notes
+
+Delivered in `autumn/src/config.rs` (`CorsConfig`) and `autumn/src/router.rs`
+(`apply_cors_middleware`, `build_cors_layer`).
+
+- Config struct exposes `allowed_origins`, `allowed_methods`, `allowed_headers`,
+  `allow_credentials`, `max_age_secs`.
+- Dev profile seeds `allowed_origins = ["*"]`; prod profile leaves it empty so
+  no `CorsLayer` is attached (same-origin only).
+- Env overrides with `AUTUMN_CORS__*` prefix (CSV for list fields).
+- `CorsConfig::validate()` rejects `allow_credentials=true` combined with a
+  `"*"` origin — the Fetch spec forbids it and `tower-http` would panic at
+  layer build.
+- Malformed origin/method/header strings are logged (`tracing::warn!`) instead
+  of silently dropped, so typos in `autumn.toml` are diagnosable.
+- Tests cover: middleware skipped when origins empty, headers present when
+  configured, preflight (OPTIONS) returns `Allow-Origin`/`Allow-Methods`/
+  `Allow-Headers`/`Max-Age`, and the wildcard+credentials validation error.

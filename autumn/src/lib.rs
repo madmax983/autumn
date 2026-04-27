@@ -32,7 +32,7 @@
 //! | HTTP server | [Axum] | Routing, extractors, middleware |
 //! | HTML templates | [Maud] | Type-safe, compiled HTML via `html!` macro |
 //! | Database | [Diesel] | Async Postgres via `diesel-async` + deadpool |
-//! | Client interactivity | htmx | Embedded JS served at `/static/js/htmx.min.js` |
+//! | Client interactivity | htmx | Embedded JS served from same-origin `/static/js/` routes |
 //! | Styling | Tailwind CSS | Downloaded + managed by `autumn-cli` |
 //!
 //! ## Modules
@@ -42,10 +42,11 @@
 //! - [`db`] -- Database connection pool and the [`Db`] request extractor.
 //! - [`error`] -- Framework error type ([`AutumnError`]) and result alias.
 //! - [`extract`] -- Re-exported Axum extractors ([`Form`],
-//!   [`Json`], [`Path`], [`Query`]).
+//!   [`Json`], [`Path`], [`Query`], and optional multipart support).
 //! - [`health`] -- Compatibility alias for readiness plus legacy health helpers.
 
 //! - [`middleware`] -- Built-in middleware (request IDs).
+//! - [`pagination`] -- Standardized `page`/`size` extractor and response wrapper.
 //! - [`prelude`] -- Glob import for the most common types.
 
 //!
@@ -67,6 +68,7 @@ extern crate self as autumn_web;
 
 pub mod actuator;
 pub mod app;
+pub mod audit;
 pub mod auth;
 pub mod cache;
 #[cfg(feature = "ws")]
@@ -103,6 +105,8 @@ pub mod flash;
 pub(crate) mod htmx;
 pub(crate) mod logging;
 pub mod middleware;
+pub mod openapi;
+pub mod pagination;
 pub mod prelude;
 pub(crate) mod route;
 pub use route::Route;
@@ -115,7 +119,8 @@ pub mod sse;
 pub mod static_gen;
 
 pub mod task;
-pub(crate) mod telemetry;
+pub mod telemetry;
+pub mod ui;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;
@@ -155,6 +160,31 @@ pub use db::Db;
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
 
+/// Paginated list response wrapper with navigation metadata.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::Page;
+
+/// Pagination parameters extracted from the query string.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::PageRequest;
+
+/// Cursor pagination response wrapper. Companion to [`CursorRequest`]
+/// for keyset/seek pagination of real-time feeds.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::CursorPage;
+
+/// Cursor pagination parameters extracted from the query string.
+///
+/// See the [`pagination`] module for the full query contract and usage
+/// patterns.
+pub use pagination::CursorRequest;
+
 /// Auto-validating extractor. Wraps `Json<T>`, `Form<T>`, or `Query<T>`
 /// and validates via `validator::Validate` before the handler runs.
 /// Returns 422 with structured error details on validation failure.
@@ -168,7 +198,7 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::HTMX_VERSION;
+pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
@@ -192,6 +222,24 @@ pub use validation::ValidateExt;
 /// }
 /// ```
 pub use autumn_macros::delete;
+
+/// Enrich a route handler's auto-generated `OpenAPI` documentation.
+///
+/// See the [`openapi`] module and the [`autumn_macros::api_doc`]
+/// attribute docs for details on the supported keys.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/users/{id}")]
+/// #[api_doc(summary = "Fetch a user by id", tag = "users")]
+/// async fn get_user(Path(id): Path<i32>) -> String {
+///     format!("User {id}")
+/// }
+/// ```
+pub use autumn_macros::api_doc;
 
 /// Annotate an async function as a `GET` route handler.
 ///
@@ -268,6 +316,10 @@ pub use autumn_macros::main;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::model;
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
@@ -600,6 +652,10 @@ pub use crate::extract::Form;
 
 /// Query extractor.
 pub use crate::extract::Query;
+
+/// State extractor.
+/// Re-exported from [Axum](https://docs.rs/axum).
+pub use axum::extract::State;
 
 /// Re-exports of upstream crates used in macro-generated code.
 ///

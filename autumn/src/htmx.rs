@@ -1,8 +1,10 @@
 //! Embedded htmx JavaScript.
 //!
 //! htmx is embedded directly in the Autumn binary via [`include_bytes!`]
-//! and served at `/static/js/htmx.min.js`. No CDN, no npm, no build
-//! step required.
+//! and served at [`HTMX_JS_PATH`]. A small CSRF helper is also served at
+//! [`HTMX_CSRF_JS_PATH`] so htmx forms can work with Autumn's default
+//! `script-src 'self'` Content Security Policy. No CDN, no npm, no build step
+//! required.
 //!
 //! The framework automatically mounts a route handler that serves this
 //! file with immutable caching headers. Reference it in your HTML
@@ -10,6 +12,7 @@
 //!
 //! ```html
 //! <script src="/static/js/htmx.min.js"></script>
+//! <script src="/static/js/autumn-htmx-csrf.js"></script>
 //! ```
 
 use axum::extract::FromRequestParts;
@@ -24,6 +27,37 @@ use std::convert::Infallible;
 /// served automatically by the framework at `/static/js/htmx.min.js`
 /// with `Cache-Control: public, max-age=31536000, immutable`.
 pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
+
+/// Same-origin path where Autumn serves embedded htmx.
+pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
+
+/// Same-origin path where Autumn serves the htmx CSRF helper.
+///
+/// The helper reads a CSRF token from either:
+/// - `<meta name="csrf-token" content="...">`
+/// - `<meta name="autumn-csrf-token" content="...">`
+///
+/// The request header defaults to `X-CSRF-Token`; override it with
+/// `data-header="..."` on the meta tag when using a custom CSRF header name.
+pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
+
+/// CSP-compatible htmx CSRF helper JavaScript.
+///
+/// Served as an external same-origin script so applications do not need inline
+/// JavaScript under Autumn's default `script-src 'self'` policy.
+pub const HTMX_CSRF_JS: &str = r#"(function () {
+  document.addEventListener("htmx:configRequest", function (evt) {
+    var meta = document.querySelector('meta[name="csrf-token"], meta[name="autumn-csrf-token"]');
+
+    if (!meta || !evt.detail || !evt.detail.headers) {
+      return;
+    }
+
+    var header = meta.getAttribute("data-header") || "X-CSRF-Token";
+    evt.detail.headers[header] = meta.getAttribute("content") || "";
+  });
+})();
+"#;
 
 /// htmx version string for diagnostics and cache busting.
 ///
@@ -95,6 +129,11 @@ where
 ///
 /// See <https://htmx.org/reference/#response_headers> for more details.
 pub trait HxResponseExt: IntoResponse + Sized {
+    /// Allows you to do a client-side redirect that does not do a full page reload (`HX-Location`).
+    fn hx_location(self, url: &str) -> Response {
+        append_hx_header(self, "hx-location", url)
+    }
+
     /// Pushes a new URL into the history stack (`HX-Push-Url`).
     fn hx_push_url(self, url: &str) -> Response {
         append_hx_header(self, "hx-push-url", url)
@@ -176,6 +215,20 @@ mod tests {
         assert_eq!(HTMX_VERSION, "2.0.4");
     }
 
+    #[test]
+    fn htmx_asset_paths_are_same_origin_static_paths() {
+        assert_eq!(HTMX_JS_PATH, "/static/js/htmx.min.js");
+        assert_eq!(HTMX_CSRF_JS_PATH, "/static/js/autumn-htmx-csrf.js");
+    }
+
+    #[test]
+    fn htmx_csrf_js_configures_request_header_without_inline_wrapper() {
+        assert!(HTMX_CSRF_JS.contains("htmx:configRequest"));
+        assert!(HTMX_CSRF_JS.contains("X-CSRF-Token"));
+        assert!(HTMX_CSRF_JS.contains("csrf-token"));
+        assert!(!HTMX_CSRF_JS.contains("<script"));
+    }
+
     #[tokio::test]
     async fn hx_request_extractor_parses_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder()
@@ -209,6 +262,7 @@ mod tests {
     async fn hx_response_ext_adds_headers() {
         use axum::response::IntoResponse;
         let response = "hello"
+            .hx_location("/some-location")
             .hx_push_url("/new-url")
             .hx_redirect("/login")
             .hx_refresh()
@@ -221,6 +275,7 @@ mod tests {
             .into_response();
 
         let headers = response.headers();
+        assert_eq!(headers.get("hx-location").unwrap(), "/some-location");
         assert_eq!(headers.get("hx-push-url").unwrap(), "/new-url");
         assert_eq!(headers.get("hx-redirect").unwrap(), "/login");
         assert_eq!(headers.get("hx-refresh").unwrap(), "true");
@@ -247,6 +302,7 @@ mod tests {
         let invalid_header_value = "invalid\nvalue";
 
         let response = "hello"
+            .hx_location(invalid_header_value)
             .hx_push_url(invalid_header_value)
             .hx_redirect(invalid_header_value)
             .hx_refresh() // valid by default
@@ -259,6 +315,7 @@ mod tests {
             .into_response();
 
         let headers = response.headers();
+        assert!(headers.get("hx-location").is_none());
         assert!(headers.get("hx-push-url").is_none());
         assert!(headers.get("hx-redirect").is_none());
         // hx_refresh is always set to "true" internally, so it will be present

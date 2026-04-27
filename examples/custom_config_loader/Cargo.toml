@@ -1,0 +1,9 @@
+[package]
+name = "custom-config-loader-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { path = "../../autumn" }
+serde_json = "1"

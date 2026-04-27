@@ -109,11 +109,32 @@ where
             return Box::pin(self.inner.call(req));
         }
 
-        let cache_key = format!("http:{}", req.uri());
+        // ⚡ Bolt Optimization:
+        // Format the key into a stack-allocated buffer to avoid a heap allocation
+        // on every cache check. Fall back to allocating a String only if the URI
+        // is exceptionally long.
+        let mut buf = [0u8; 512];
+        let cache_key_str = {
+            let mut cursor = &mut buf[..];
+            if std::io::Write::write_fmt(&mut cursor, format_args!("http:{}", req.uri())).is_ok() {
+                let len = 512 - cursor.len();
+                std::str::from_utf8(&buf[..len]).unwrap_or_default()
+            } else {
+                ""
+            }
+        };
+
         let store = self.store.clone();
 
+        let cache_hit = if cache_key_str.is_empty() {
+            // Fallback for very long URIs
+            super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
+        } else {
+            super::get::<CachedResponse>(store.as_ref(), cache_key_str)
+        };
+
         // Check for a cache hit
-        if let Some(cached) = super::get::<CachedResponse>(store.as_ref(), &cache_key) {
+        if let Some(cached) = cache_hit {
             return Box::pin(async move {
                 let mut builder = axum::response::Response::builder().status(cached.status);
                 if let Some(headers) = builder.headers_mut() {
@@ -123,7 +144,7 @@ where
                     axum::response::Response::builder()
                         .status(StatusCode::INTERNAL_SERVER_ERROR)
                         .body(Body::empty())
-                        .unwrap()
+                        .expect("infallible response builder")
                 });
                 Ok(resp)
             });
@@ -131,6 +152,12 @@ where
 
         // Cache miss — call the inner service
         let mut inner = self.inner.clone();
+        let cache_key = if cache_key_str.is_empty() {
+            format!("http:{}", req.uri())
+        } else {
+            cache_key_str.to_owned()
+        };
+
         Box::pin(async move {
             let response = inner.call(req).await?;
 
@@ -146,7 +173,7 @@ where
                 let resp = axum::response::Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .body(Body::empty())
-                    .unwrap();
+                    .expect("infallible response builder");
                 return Ok(resp);
             };
             let body_bytes = collected.to_bytes();
@@ -193,7 +220,7 @@ mod tests {
                 Ok(axum::response::Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from(body))
-                    .unwrap())
+                    .expect("infallible response builder"))
             }
         })
     }
@@ -208,23 +235,39 @@ mod tests {
             .service(counting_service(counter.clone(), "hello"));
 
         // First request — cache miss
-        let req = Request::get("/test").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/test")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
-            .unwrap()
+            .expect("infallible response builder")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Second request — cache hit, inner service NOT called
-        let req = Request::get("/test").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/test")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body())
             .await
-            .unwrap()
+            .expect("infallible response builder")
             .to_bytes();
         assert_eq!(body.as_ref(), b"hello");
         assert_eq!(
@@ -243,12 +286,28 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(counting_service(counter.clone(), "created"));
 
-        let req = Request::post("/items").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::post("/items")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let _resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        let req = Request::post("/items").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::post("/items")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let _resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
@@ -271,7 +330,7 @@ mod tests {
                         axum::response::Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .body(Body::from("not found"))
-                            .unwrap(),
+                            .expect("infallible response builder"),
                     )
                 }
             })
@@ -281,12 +340,28 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(svc_inner);
 
-        let req = Request::get("/missing").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/missing")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        let req = Request::get("/missing").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/missing")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             counter.load(Ordering::SeqCst),
@@ -304,10 +379,26 @@ mod tests {
             .layer(CacheResponseLayer::from_cache(store))
             .service(counting_service(counter.clone(), "ok"));
 
-        let req = Request::get("/a").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
-        let req = Request::get("/b").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/a")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let _resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
+        let req = Request::get("/b")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let _resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             2,
@@ -315,8 +406,16 @@ mod tests {
         );
 
         // But repeating /a should hit
-        let req = Request::get("/a").body(Body::empty()).unwrap();
-        let _resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        let req = Request::get("/a")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let _resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
         assert_eq!(counter.load(Ordering::SeqCst), 2, "/a should be cached");
     }
 
@@ -325,5 +424,51 @@ mod tests {
         let store = Arc::new(super::super::MokaCache::new(100, None));
         // Just verify from_shared compiles and the layer can be used
         let _layer = CacheResponseLayer::from_shared(store);
+    }
+
+    #[tokio::test]
+    async fn caches_get_responses_very_long_uri() {
+        let store = super::super::MokaCache::new(100, None);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_cache(store))
+            .service(counting_service(counter.clone(), "hello"));
+
+        let long_uri = format!("/test/{}", "a".repeat(1000));
+
+        let req1 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp1 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req1)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        let req2 = Request::get(&long_uri)
+            .body(Body::empty())
+            .expect("infallible response builder");
+
+        let resp2 = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req2)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Should be cached despite long URI"
+        );
     }
 }

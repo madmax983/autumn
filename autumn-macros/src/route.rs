@@ -2,11 +2,16 @@
 //!
 //! Generates a companion `__autumn_route_info_{name}()` function for each
 //! annotated handler, pairing the HTTP method and path with an Axum
-//! `MethodRouter`.
+//! `MethodRouter`. The companion also carries an [`ApiDoc`] describing
+//! the route for `OpenAPI` auto-generation.
+//!
+//! [`ApiDoc`]: ../../autumn_web/openapi/struct.ApiDoc.html
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+use syn::{FnArg, ReturnType, Type};
 
+use crate::api_doc;
 use crate::parse;
 
 /// Core implementation shared by all route macros (`#[get]`, `#[post]`, etc.).
@@ -32,6 +37,14 @@ pub fn route_macro(
     // Extract #[intercept(LayerType)] attributes from the handler.
     let interceptors = parse::extract_interceptors(&mut input_fn.attrs);
 
+    // Extract #[api_doc(...)] overrides before emitting the function, so
+    // the attribute doesn't leak onto the emitted fn definition and
+    // trigger an "unknown attribute" error.
+    let api_doc_attr = match api_doc::extract(&mut input_fn.attrs) {
+        Ok(v) => v,
+        Err(err) => return err,
+    };
+
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let vis = &input_fn.vis;
@@ -39,11 +52,49 @@ pub fn route_macro(
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
 
+    let primitive_wrapper = if should_stringify_primitive_output(&input_fn.sig.output) {
+        let wrapper_name = format_ident!("__autumn_primitive_handler_{}", fn_name);
+        let mut wrapper_inputs = Vec::new();
+        let mut call_args = Vec::new();
+
+        for (idx, arg) in input_fn.sig.inputs.iter().enumerate() {
+            match arg {
+                FnArg::Typed(pat_type) => {
+                    let arg_name = format_ident!("__autumn_arg_{idx}");
+                    let ty = &pat_type.ty;
+                    wrapper_inputs.push(quote! { #arg_name: #ty });
+                    call_args.push(quote! { #arg_name });
+                }
+                FnArg::Receiver(receiver) => {
+                    return syn::Error::new_spanned(
+                        receiver,
+                        "Autumn route handlers cannot take a self receiver",
+                    )
+                    .to_compile_error();
+                }
+            }
+        }
+
+        Some(quote! {
+            #[doc(hidden)]
+            async fn #wrapper_name(#(#wrapper_inputs),*) -> ::std::string::String {
+                #fn_name(#(#call_args),*).await.to_string()
+            }
+        })
+    } else {
+        None
+    };
+
+    let handler_name = primitive_wrapper.as_ref().map_or_else(
+        || fn_name.clone(),
+        |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
+    );
+
     // Build the handler expression, chaining .layer() for each interceptor.
     // Interceptors are applied in reverse attribute order so that the first
     // #[intercept(...)] listed is the outermost layer (runs first).
     let mut handler_expr: TokenStream =
-        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#fn_name) };
+        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
 
     for interceptor in interceptors.iter().rev() {
         // Explicit error type annotation avoids inference ambiguity when
@@ -55,16 +106,20 @@ pub fn route_macro(
         };
     }
 
-    // Note: we intentionally do NOT apply #[axum::debug_handler] here.
-    // That macro generates code with `::axum::` paths, which don't resolve
-    // when the user only depends on `autumn-web` (axum is a transitive dep).
-    // Custom compile_error! diagnostics (S-007) provide error guidance instead.
+    // ── OpenAPI metadata ────────────────────────────────────────
+    let path_params = api_doc::extract_path_params(&path.value());
+    let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
+    let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
+    let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
+    let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
+    let http_method_lit = syn::LitStr::new(http_method, proc_macro2::Span::call_site());
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
         // to import axum manually. However, the path resolution in Axum macros makes this impossible
         // natively. Custom compile errors handle the type checks.
         #input_fn
+        #primitive_wrapper
 
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {
@@ -73,7 +128,50 @@ pub fn route_macro(
                 path: #path,
                 handler: #handler_expr,
                 name: ::core::stringify!(#fn_name),
+                api_doc: ::autumn_web::openapi::ApiDoc {
+                    method: #http_method_lit,
+                    path: #path,
+                    path_params: #path_params_tokens,
+                    request_body: #request_body,
+                    response: #response_body,
+                    register_schemas: ::core::option::Option::None,
+                    #api_doc_fields
+                },
             }
         }
     }
+}
+
+fn should_stringify_primitive_output(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+
+    let Type::Path(path) = ty.as_ref() else {
+        return false;
+    };
+
+    if path.qself.is_some() || path.path.segments.len() != 1 {
+        return false;
+    }
+
+    let ident = path.path.segments[0].ident.to_string();
+    matches!(
+        ident.as_str(),
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "f32"
+            | "f64"
+    )
 }

@@ -1,3 +1,6 @@
+//!
+//! Integration tests for the raw router escape hatch.
+//!
 use autumn_web::test::TestApp;
 use autumn_web::{AppState, get, routes};
 
@@ -128,6 +131,31 @@ async fn raw_routes_can_extract_app_state() {
         .await
         .assert_status(200)
         .assert_body_eq("test");
+}
+
+#[tokio::test]
+async fn merged_routes_get_request_id_header() {
+    let raw = axum::Router::<AppState>::new().route("/raw", axum::routing::get(|| async { "raw" }));
+    let app = TestApp::new().merge(raw).build();
+    app.get("/raw")
+        .send()
+        .await
+        .assert_status(200)
+        .assert_header_contains("x-request-id", "-");
+}
+
+#[tokio::test]
+async fn merged_router_favicon_route_wins_without_startup_conflict() {
+    let raw = axum::Router::<AppState>::new().route(
+        "/favicon.ico",
+        axum::routing::get(|| async { "raw favicon" }),
+    );
+    let app = TestApp::new().merge(raw).build();
+    app.get("/favicon.ico")
+        .send()
+        .await
+        .assert_status(200)
+        .assert_body_eq("raw favicon");
 }
 
 #[tokio::test]

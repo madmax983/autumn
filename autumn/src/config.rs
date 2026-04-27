@@ -6,8 +6,9 @@
 //! 1. **Framework defaults** (this module) -- compiled into the binary.
 //! 2. **Profile smart defaults** -- per-profile values for `dev`/`prod`.
 //! 3. **`autumn.toml`** -- project-level overrides checked into source control.
-//! 4. **`autumn-{profile}.toml`** -- profile-specific overrides.
-//! 5. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
+//! 4. **`[profile.{name}]` in `autumn.toml`** -- profile-specific overrides.
+//! 5. **`autumn-{profile}.toml`** -- legacy profile-specific overrides.
+//! 6. **`AUTUMN_*` environment variables** -- deployment/CI overrides.
 //!
 //! An Autumn application runs with zero configuration -- every field
 //! has a sensible default value. Override only what you need.
@@ -15,9 +16,10 @@
 //! # Profiles
 //!
 //! Profiles are resolved in precedence order:
-//! 1. `AUTUMN_PROFILE` environment variable
-//! 2. `--profile` CLI flag
-//! 3. Auto-detect from debug/release build mode
+//! 1. `AUTUMN_ENV` environment variable
+//! 2. `AUTUMN_PROFILE` environment variable (legacy alias)
+//! 3. `--profile` CLI flag
+//! 4. Auto-detect from debug/release build mode
 //!
 //! # Example
 //!
@@ -41,6 +43,7 @@
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
 //! | `AUTUMN_DATABASE__POOL_SIZE` | `database.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
+//! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
 //! | `AUTUMN_LOG__FORMAT` | `log.format` | `Auto` / `Pretty` / `Json` |
 //! | `AUTUMN_TELEMETRY__ENABLED` | `telemetry.enabled` | `bool` |
@@ -71,7 +74,15 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
-//! | `AUTUMN_PROFILE` | active profile | `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_ENV` | active profile | `String` |
+//! | `AUTUMN_PROFILE` | active profile (legacy alias) | `String` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
+//! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -199,38 +210,129 @@ fn load_raw_toml(path: &Path) -> Result<Option<toml::Value>, ConfigError> {
     }
 }
 
-/// Resolve the active profile using the three-mechanism precedence chain.
+/// Resolve the active profile using the precedence chain.
 ///
-/// 1. `AUTUMN_PROFILE` env var (highest priority)
-/// 2. `--profile <name>` CLI flag
-/// 3. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
-pub(crate) fn resolve_profile(env: &dyn Env) -> Option<String> {
-    // 1. Env var
-    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        if !profile.is_empty() {
-            return Some(profile);
+/// 1. `AUTUMN_ENV` env var (highest priority)
+/// 2. `AUTUMN_PROFILE` env var (legacy alias)
+/// 3. `--profile <name>` CLI flag
+/// 4. Auto-detect from build mode (`AUTUMN_IS_DEBUG` set by `#[autumn_web::main]`)
+/// 5. Fallback to `dev`
+pub(crate) fn resolve_profile(env: &dyn Env) -> String {
+    let selected_profile_input = resolve_profile_input(env);
+    normalize_profile_name(&selected_profile_input).unwrap_or_else(|| "dev".to_owned())
+}
+
+/// Resolve the raw profile selector value (before normalization).
+fn resolve_profile_input(env: &dyn Env) -> String {
+    // 1. Preferred env var
+    if let Ok(profile) = env.var("AUTUMN_ENV") {
+        let trimmed = profile.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
         }
     }
 
-    // 2. CLI flag
+    // 2. Legacy env var
+    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
+        let trimmed = profile.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+
+    // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
         if arg == "--profile" {
             if let Some(profile) = args.get(i + 1) {
-                return Some(profile.clone());
+                let trimmed = profile.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_owned();
+                }
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
-            return Some(profile.to_owned());
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
         }
     }
 
-    // 3. Auto-detect from build mode
-    match env.var("AUTUMN_IS_DEBUG").ok().as_deref() {
-        Some("1") => Some("dev".to_owned()),
-        Some("0") => Some("prod".to_owned()),
-        _ => None,
+    // 4. Auto-detect from build mode
+    if env.var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
+        return "prod".to_owned();
     }
+    "dev".to_owned()
+}
+
+/// Normalize profile aliases and trim whitespace.
+///
+/// Supported aliases:
+/// - `production` -> `prod`
+/// - `development` -> `dev`
+/// - `prod`/`PROD` -> `prod`
+/// - `dev`/`DEV` -> `dev`
+fn normalize_profile_name(profile: &str) -> Option<String> {
+    let trimmed = profile.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.eq_ignore_ascii_case("production") {
+        return Some("prod".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("development") {
+        return Some("dev".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("prod") {
+        return Some("prod".to_owned());
+    }
+    if trimmed.eq_ignore_ascii_case("dev") {
+        return Some("dev".to_owned());
+    }
+
+    // Preserve user-specified case for custom profile names.
+    Some(trimmed.to_owned())
+}
+
+/// Profile names to check for inline/file overrides.
+///
+/// For canonical profiles, include legacy aliases for compatibility so
+/// `production` and `development` profile sources are still loaded.
+fn profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Ordered file lookup names for profile override file compatibility.
+///
+/// Only one profile override file is loaded: the first existing file in this
+/// ordered list. The order prefers the explicitly-selected spelling.
+fn profile_override_file_lookup_names(profile: &str, selected_profile_input: &str) -> Vec<String> {
+    match profile {
+        "prod" if selected_profile_input.eq_ignore_ascii_case("production") => {
+            vec!["production".to_owned(), "prod".to_owned()]
+        }
+        "prod" => vec!["prod".to_owned(), "production".to_owned()],
+        "dev" if selected_profile_input.eq_ignore_ascii_case("development") => {
+            vec!["development".to_owned(), "dev".to_owned()]
+        }
+        "dev" => vec!["dev".to_owned(), "development".to_owned()],
+        other => vec![other.to_owned()],
+    }
+}
+
+/// Extract `[profile.<name>]` table from a parsed `autumn.toml`.
+fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<toml::Value> {
+    base.get("profile")
+        .and_then(toml::Value::as_table)
+        .and_then(|profiles| profiles.get(profile))
+        .and_then(toml::Value::as_table)
+        .map(|table| toml::Value::Table(table.clone()))
 }
 
 /// Profile-specific smart defaults as a TOML table.
@@ -345,8 +447,9 @@ fn deep_merge_with_depth(base: &mut toml::Value, overlay: toml::Value, depth: us
             overlay_val.is_table() && base_table.get(&key).is_some_and(toml::Value::is_table);
 
         if is_recursive_merge {
-            let base_val = base_table.get_mut(&key).unwrap();
-            deep_merge_with_depth(base_val, overlay_val, depth + 1);
+            if let Some(base_val) = base_table.get_mut(&key) {
+                deep_merge_with_depth(base_val, overlay_val, depth + 1);
+            }
         } else {
             base_table.insert(key, overlay_val);
         }
@@ -377,23 +480,27 @@ fn warn_profile_typo(profile: &str) {
     }
 }
 
+fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: bool) -> bool {
+    profile != "dev" && profile != "prod" && !has_inline_profile_section
+}
+
 /// Levenshtein edit distance between two strings.
 ///
 /// ⚡ Bolt Optimization:
-/// Avoids allocating two `Vec<char>` buffers by iterating directly over `Chars`.
-/// While this re-evaluates UTF-8 boundaries in the inner loop, avoiding the heap
-/// allocations is typically faster for the short strings compared here (e.g., config profile typos).
+/// Reduces memory allocations by using a single `Vec` instead of two and
+/// iterating directly over `Chars` to avoid `Vec<char>` allocations.
 fn levenshtein(a: &str, b: &str) -> usize {
     let n = b.chars().count();
-    let mut prev = (0..=n).collect::<Vec<_>>();
-    let mut curr = vec![0; n + 1];
+    let mut prev: Vec<usize> = (0..=n).collect();
     for (i, a_ch) in a.chars().enumerate() {
-        curr[0] = i + 1;
+        let mut prev_diag = prev[0];
+        prev[0] = i + 1;
         for (j, b_ch) in b.chars().enumerate() {
+            let old_prev = prev[j + 1];
             let cost = usize::from(a_ch != b_ch);
-            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            prev[j + 1] = (prev[j + 1] + 1).min(prev[j] + 1).min(prev_diag + cost);
+            prev_diag = old_prev;
         }
-        std::mem::swap(&mut prev, &mut curr);
     }
     prev[n]
 }
@@ -414,6 +521,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// assert!(result.is_ok());
 /// ```
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// The config file exists but could not be read.
     #[error("failed to read autumn.toml: {0}")]
@@ -456,7 +564,7 @@ pub enum ConfigError {
 /// assert_eq!(config.log.level, "info");
 /// assert_eq!(config.health.path, "/health");
 /// ```
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutumnConfig {
     /// Active profile name (e.g., "dev", "prod", "staging").
     /// Resolved at load time, not deserialized from TOML.
@@ -507,12 +615,13 @@ pub struct AutumnConfig {
 impl AutumnConfig {
     /// Load configuration with profile-aware layering.
     ///
-    /// Applies the five-layer configuration system:
+    /// Applies the six-layer configuration system:
     /// 1. Framework defaults
     /// 2. Profile smart defaults (dev/prod)
     /// 3. `autumn.toml` (base config)
-    /// 4. `autumn-{profile}.toml` (profile overrides)
-    /// 5. `AUTUMN_*` environment variables
+    /// 4. `[profile.{name}]` section in `autumn.toml`
+    /// 5. `autumn-{profile}.toml` (legacy profile overrides)
+    /// 6. `AUTUMN_*` environment variables
     ///
     /// # Errors
     ///
@@ -539,36 +648,51 @@ impl AutumnConfig {
     /// # Panics
     /// Panics if the internally-built TOML table fails to re-serialize.
     pub fn load_with_env(env: &dyn Env) -> Result<Self, ConfigError> {
-        let profile = resolve_profile(env);
+        let selected_profile_input = resolve_profile_input(env);
+        let profile =
+            normalize_profile_name(&selected_profile_input).unwrap_or_else(|| "dev".to_owned());
+        let mut has_inline_profile_section = false;
 
-        // Build merged TOML: profile smart defaults ← autumn.toml ← autumn-{profile}.toml
-        let mut merged = profile.as_ref().map_or_else(
-            || toml::Value::Table(toml::map::Map::new()),
-            |p| profile_defaults_as_toml(p),
-        );
+        // Build merged TOML:
+        // profile smart defaults ← autumn.toml ← [profile.{name}] ← autumn-{profile}.toml
+        let mut merged = profile_defaults_as_toml(&profile);
 
         // Layer 3: base autumn.toml
         if let Some(base) = load_raw_toml(&find_config_file_named("autumn.toml", env))? {
-            deep_merge(&mut merged, base);
+            deep_merge(&mut merged, base.clone());
+
+            // Layer 4: [profile.{name}] in autumn.toml
+            for profile_name in profile_lookup_names(&profile) {
+                if let Some(inline_profile) = profile_section_from_base_toml(&base, profile_name) {
+                    deep_merge(&mut merged, inline_profile);
+                    has_inline_profile_section = true;
+                }
+            }
         }
 
-        // Layer 4: autumn-{profile}.toml
-        if let Some(ref p) = profile {
-            let profile_path = find_config_file_named(&format!("autumn-{p}.toml"), env);
-            match load_raw_toml(&profile_path)? {
-                Some(profile_toml) => deep_merge(&mut merged, profile_toml),
-                None if p != "dev" && p != "prod" => warn_profile_typo(p),
-                None => {}
+        // Layer 5: autumn-{profile}.toml (legacy compatibility)
+        let mut has_profile_file = false;
+        for profile_name in profile_override_file_lookup_names(&profile, &selected_profile_input) {
+            let profile_path = find_config_file_named(&format!("autumn-{profile_name}.toml"), env);
+            if let Some(profile_toml) = load_raw_toml(&profile_path)? {
+                deep_merge(&mut merged, profile_toml);
+                has_profile_file = true;
+                break;
             }
+        }
+        if !has_profile_file
+            && should_warn_missing_profile_file(&profile, has_inline_profile_section)
+        {
+            warn_profile_typo(&profile);
         }
 
         // Deserialize the merged TOML table into AutumnConfig
         let toml_str =
             toml::to_string(&merged).expect("internal error: failed to serialize merged config");
         let mut config: Self = toml::from_str(&toml_str)?;
-        config.profile = profile;
+        config.profile = Some(profile);
 
-        // Layer 5: env var overrides (highest priority)
+        // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
         config.validate()?;
@@ -604,17 +728,16 @@ impl AutumnConfig {
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
-        match self.session.backend_plan(self.profile.as_deref()) {
-            Ok(crate::session::SessionBackendPlan::Memory {
-                warn_in_production: true,
-            }) => eprintln!(
-                "Warning: prod profile is using in-memory sessions. Configure \
-                 `session.backend = \"redis\"` or set \
-                 `session.allow_memory_in_production = true` to acknowledge the risk."
-            ),
-            Ok(_) => {}
-            Err(error) => return Err(ConfigError::Validation(error.to_string())),
-        }
+        self.cors.validate()?;
+        // Session backend validation deliberately lives in
+        // `crate::session::apply_session_layer`, not here. That function
+        // short-circuits when a custom `SessionStore` was installed via
+        // `AppBuilder::with_session_store(...)`, so the (then-irrelevant)
+        // `session.backend = "redis"` config without a redis URL doesn't
+        // need to fail the boot. Validating the same thing here would
+        // defeat the override and exit the app before the custom store
+        // ever gets a chance to apply. The "prod profile + memory backend"
+        // warning lives in `apply_session_layer` for the same reason.
         Ok(())
     }
 
@@ -632,6 +755,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
+    /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
     /// - `AUTUMN_LOG__LEVEL` → `log.level` (String, tracing filter directive)
@@ -694,6 +818,11 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
+            &mut self.database.auto_migrate_in_production,
+        );
     }
 
     fn apply_log_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -723,9 +852,11 @@ impl AutumnConfig {
             "AUTUMN_TELEMETRY__SERVICE_NAME",
             &mut self.telemetry.service_name,
         );
-        if let Ok(val) = env.var("AUTUMN_TELEMETRY__SERVICE_NAMESPACE") {
-            self.telemetry.service_namespace = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_TELEMETRY__SERVICE_NAMESPACE",
+            &mut self.telemetry.service_namespace,
+        );
         parse_env_string(
             env,
             "AUTUMN_TELEMETRY__SERVICE_VERSION",
@@ -736,9 +867,11 @@ impl AutumnConfig {
             "AUTUMN_TELEMETRY__ENVIRONMENT",
             &mut self.telemetry.environment,
         );
-        if let Ok(val) = env.var("AUTUMN_TELEMETRY__OTLP_ENDPOINT") {
-            self.telemetry.otlp_endpoint = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_TELEMETRY__OTLP_ENDPOINT",
+            &mut self.telemetry.otlp_endpoint,
+        );
         if let Ok(val) = env.var("AUTUMN_TELEMETRY__PROTOCOL") {
             match TelemetryProtocol::from_env_value(&val) {
                 Some(protocol) => self.telemetry.protocol = protocol,
@@ -832,9 +965,11 @@ impl AutumnConfig {
             "AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION",
             &mut self.session.allow_memory_in_production,
         );
-        if let Ok(val) = env.var("AUTUMN_SESSION__REDIS__URL") {
-            self.session.redis.url = if val.is_empty() { None } else { Some(val) };
-        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_SESSION__REDIS__URL",
+            &mut self.session.redis.url,
+        );
         parse_env_string(
             env,
             "AUTUMN_SESSION__REDIS__KEY_PREFIX",
@@ -901,6 +1036,45 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__CSRF__COOKIE_NAME",
             &mut self.security.csrf.cookie_name,
         );
+
+        // Rate limiting
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__ENABLED",
+            &mut self.security.rate_limit.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND",
+            &mut self.security.rate_limit.requests_per_second,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__BURST",
+            &mut self.security.rate_limit.burst,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
+            &mut self.security.rate_limit.trust_forwarded_headers,
+        );
+
+        // Multipart uploads
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES",
+            &mut self.security.upload.max_request_size_bytes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES",
+            &mut self.security.upload.max_file_size_bytes,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
+            &mut self.security.upload.allowed_mime_types,
+        );
     }
 
     /// Returns the active profile name, if any.
@@ -932,7 +1106,7 @@ impl AutumnConfig {
 /// assert_eq!(server.port, 3000);
 /// assert_eq!(server.host, "127.0.0.1");
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     /// Port to listen on. Default: `3000`.
     #[serde(default = "default_port")]
@@ -969,6 +1143,7 @@ pub struct ServerConfig {
 /// | `url` | `None` |
 /// | `pool_size` | `10` |
 /// | `connect_timeout_secs` | `5` |
+/// | `auto_migrate_in_production` | `false` |
 ///
 /// # Examples
 ///
@@ -979,7 +1154,7 @@ pub struct ServerConfig {
 /// assert!(db.url.is_none());
 /// assert_eq!(db.pool_size, 10);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
     /// Postgres connection URL. `None` means no database is configured.
     ///
@@ -996,6 +1171,14 @@ pub struct DatabaseConfig {
     /// Default: `5`.
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
+
+    /// When true, permits automatic migration application while running with
+    /// `prod`/`production` profile. Default: `false`.
+    ///
+    /// Keep this disabled for multi-replica production fleets and use an
+    /// explicit migration job (`autumn migrate`) instead.
+    #[serde(default)]
+    pub auto_migrate_in_production: bool,
 }
 
 impl DatabaseConfig {
@@ -1030,7 +1213,7 @@ impl DatabaseConfig {
 /// assert_eq!(log.level, "info");
 /// assert_eq!(log.format, LogFormat::Auto);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct LogConfig {
     /// Tracing filter directive. Default: `"info"`.
     ///
@@ -1062,7 +1245,8 @@ pub struct LogConfig {
 ///
 /// assert_eq!(LogFormat::default(), LogFormat::Auto);
 /// ```
-#[derive(Debug, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogFormat {
     /// Pretty in dev, JSON in production (based on `AUTUMN_ENV`).
     #[default]
@@ -1077,7 +1261,7 @@ pub enum LogFormat {
 ///
 /// Controls whether Autumn enables OTLP trace export and how the process
 /// identifies itself in resource metadata.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     /// Enable framework-managed telemetry. Default: `false`.
     #[serde(default)]
@@ -1114,6 +1298,7 @@ pub struct TelemetryConfig {
 
 /// OTLP transport protocol selection.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TelemetryProtocol {
     /// OTLP over gRPC.
     #[serde(alias = "grpc", alias = "GRPC")]
@@ -1156,7 +1341,7 @@ impl TelemetryProtocol {
 /// assert_eq!(health.startup_path, "/startup");
 /// assert!(!health.detailed);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
     /// Compatibility alias path for readiness. Default: `"/health"`.
     ///
@@ -1188,7 +1373,7 @@ pub struct HealthConfig {
 /// Controls which operational endpoints are exposed. The `sensitive` flag
 /// determines whether sensitive endpoints (env, configprops, loggers,
 /// tasks) are available. Defaults to `true` for `dev`, `false` for `prod`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ActuatorConfig {
     /// URL prefix for actuator endpoints. Default: `"/actuator"`.
     #[serde(default = "default_actuator_prefix")]
@@ -1249,7 +1434,7 @@ fn default_actuator_prefix() -> String {
 /// assert!(cors.allowed_origins.is_empty());
 /// assert!(!cors.allow_credentials);
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CorsConfig {
     /// Origins allowed to make cross-origin requests.
     ///
@@ -1291,6 +1476,27 @@ impl Default for CorsConfig {
     }
 }
 
+impl CorsConfig {
+    /// Validate CORS configuration for combinations rejected by browsers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `allow_credentials = true` is combined
+    /// with a wildcard `"*"` origin. Browsers refuse this combination per the
+    /// Fetch spec, and `tower-http`'s `CorsLayer` panics when asked to build
+    /// it, so we fail fast at config load with an actionable message.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.allow_credentials && self.allowed_origins.iter().any(|o| o == "*") {
+            return Err(ConfigError::Validation(
+                "CORS: allow_credentials=true is incompatible with allowed_origins=[\"*\"]; \
+                 list explicit origins instead (browsers reject the wildcard+credentials combo)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn default_cors_methods() -> Vec<String> {
     vec![
         "GET".to_owned(),
@@ -1317,6 +1523,12 @@ fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
             Ok(v) => *target = v,
             Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
         }
+    }
+}
+
+fn parse_env_option_string(env: &dyn Env, key: &str, target: &mut Option<String>) {
+    if let Ok(val) = env.var(key) {
+        *target = if val.is_empty() { None } else { Some(val) };
     }
 }
 
@@ -1414,6 +1626,7 @@ impl Default for DatabaseConfig {
             url: None,
             pool_size: default_pool_size(),
             connect_timeout_secs: default_connect_timeout(),
+            auto_migrate_in_production: false,
         }
     }
 }
@@ -1454,10 +1667,128 @@ impl Default for HealthConfig {
     }
 }
 
+// ----------------------------------------------------------------------------
+// ConfigLoader — tier-1 boot-time replaceable config loading
+// ----------------------------------------------------------------------------
+
+/// Pluggable boot-time configuration loader.
+///
+/// Replace the default TOML + env loader with a custom strategy (e.g. AWS
+/// Secrets Manager, Consul, a JSON file, an HTTP fetch) by implementing this
+/// trait and installing it on the [`AppBuilder`](crate::app::AppBuilder) via
+/// [`with_config_loader`](crate::app::AppBuilder::with_config_loader).
+///
+/// The trait's return type uses `impl Future + Send` so implementations can
+/// freely use `async fn` in their bodies while the framework can still spawn
+/// the load on any executor.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::config::{AutumnConfig, ConfigError, ConfigLoader};
+///
+/// pub struct JsonFileConfigLoader { path: std::path::PathBuf }
+///
+/// impl ConfigLoader for JsonFileConfigLoader {
+///     async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+///         let bytes = std::fs::read(&self.path).map_err(ConfigError::Io)?;
+///         serde_json::from_slice(&bytes)
+///             .map_err(|e| ConfigError::Validation(e.to_string()))
+///     }
+/// }
+/// ```
+pub trait ConfigLoader: Send + Sync + 'static {
+    /// Load and return a fully-resolved [`AutumnConfig`].
+    ///
+    /// Implementations are responsible for any layering, profile resolution,
+    /// and validation they care to apply. The default implementation
+    /// ([`TomlEnvConfigLoader`]) preserves Autumn's five-layer load
+    /// (framework defaults → profile defaults → `autumn.toml` →
+    /// `autumn-{profile}.toml` → `AUTUMN_*` env vars).
+    fn load(&self) -> impl std::future::Future<Output = Result<AutumnConfig, ConfigError>> + Send;
+}
+
+/// Default [`ConfigLoader`] — Autumn's five-layer TOML + env load strategy.
+///
+/// Delegates to [`AutumnConfig::load_with_env`] using [`OsEnv`] for environment
+/// variable reads. This is the loader used when no override is installed via
+/// [`with_config_loader`](crate::app::AppBuilder::with_config_loader).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TomlEnvConfigLoader;
+
+impl TomlEnvConfigLoader {
+    /// Construct a new default loader.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl ConfigLoader for TomlEnvConfigLoader {
+    async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+        AutumnConfig::load_with_env(&OsEnv)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
+
+    /// Mock loader for tests — returns a hand-built config without touching disk.
+    struct MockConfigLoader {
+        config: AutumnConfig,
+    }
+
+    impl ConfigLoader for MockConfigLoader {
+        async fn load(&self) -> Result<AutumnConfig, ConfigError> {
+            Ok(self.config.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn config_loader_trait_returns_supplied_config() {
+        let mut custom = AutumnConfig::default();
+        custom.server.port = 9999;
+        custom.profile = Some("integration-test".to_owned());
+
+        let loader = MockConfigLoader {
+            config: custom.clone(),
+        };
+        let resolved = loader.load().await.expect("mock loader should succeed");
+
+        assert_eq!(resolved.server.port, 9999);
+        assert_eq!(resolved.profile.as_deref(), Some("integration-test"));
+    }
+
+    #[test]
+    fn validate_does_not_error_on_redis_backend_without_url() {
+        // Regression: previously `validate()` called
+        // `session.backend_plan(profile)` which returned an error for
+        // `backend = "redis"` without `redis.url`, exiting the boot before
+        // a `with_session_store(...)` override could apply. Session
+        // backend validation now lives in `apply_session_layer`, which
+        // short-circuits when a custom store is installed. `validate()`
+        // is config-shape-only and must accept this combination.
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Redis;
+        config.session.redis.url = None;
+
+        config.validate().expect(
+            "validate() must accept redis-backend-without-url so custom \
+             session store overrides aren't blocked at boot",
+        );
+    }
+
+    #[tokio::test]
+    async fn default_toml_env_loader_succeeds_without_files() {
+        // No autumn.toml in the test runner's pwd; loader should fall back to
+        // framework defaults rather than failing.
+        let loader = TomlEnvConfigLoader::new();
+        let resolved = loader.load().await.expect("default loader should succeed");
+        // Default port is 3000 per ServerConfig::default — sanity check.
+        assert_eq!(resolved.server.port, 3000);
+    }
 
     #[test]
     fn database_config_validate_none() {
@@ -1593,18 +1924,23 @@ mod tests {
     }
 
     #[test]
-    fn autumn_config_validate_session_err() {
+    fn autumn_config_validate_no_longer_errors_on_invalid_session_backend() {
+        // Session backend validation moved to `apply_session_layer` so a
+        // custom store installed via `AppBuilder::with_session_store(...)`
+        // can override an otherwise-invalid backend config without the boot
+        // exiting first. `validate()` is config-shape-only now; runtime
+        // session selection (and the backend error) lives in
+        // `apply_session_layer`, which short-circuits when a custom store
+        // is installed. `crate::session::tests::session_backend_plan_*`
+        // still cover the underlying error cases directly on
+        // `SessionConfig::backend_plan`.
         let mut config = AutumnConfig::default();
         config.session.backend = crate::session::SessionBackend::Redis;
         config.session.redis.url = None;
 
-        let result = config.validate();
-        assert!(result.is_err());
-        if let Err(ConfigError::Validation(msg)) = result {
-            assert!(msg.contains("session.backend=redis requires session.redis.url"));
-        } else {
-            panic!("Expected ConfigError::Validation");
-        }
+        config
+            .validate()
+            .expect("validate() must accept invalid session backend so custom store can override");
     }
 
     #[test]
@@ -1662,6 +1998,7 @@ mod tests {
         assert!(config.database.url.is_none());
         assert_eq!(config.database.pool_size, 10);
         assert_eq!(config.database.connect_timeout_secs, 5);
+        assert!(!config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "info");
         assert_eq!(config.log.format, LogFormat::Auto);
         assert_eq!(config.health.path, "/health");
@@ -1712,6 +2049,7 @@ shutdown_timeout_secs = 60
 url = "postgres://user:pass@db:5432/myapp"
 pool_size = 20
 connect_timeout_secs = 10
+auto_migrate_in_production = true
 
 [log]
 level = "debug"
@@ -1733,6 +2071,7 @@ path = "/healthz"
         );
         assert_eq!(config.database.pool_size, 20);
         assert_eq!(config.database.connect_timeout_secs, 10);
+        assert!(config.database.auto_migrate_in_production);
         assert_eq!(config.log.level, "debug");
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.health.path, "/healthz");
@@ -1810,6 +2149,14 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 10);
     }
 
+    #[test]
+    fn env_override_database_auto_migrate_in_production() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.database.auto_migrate_in_production);
+    }
+
     // ── Server env override tests ────────────────────────────────
 
     #[test]
@@ -1820,6 +2167,70 @@ path = "/healthz"
         assert_eq!(config.server.port, 8080);
     }
 
+    #[test]
+    fn parse_env_works() {
+        let env = MockEnv::new().with("SOME_NUM", "123");
+        let mut target: u32 = 0;
+        parse_env(&env, "SOME_NUM", &mut target);
+        assert_eq!(target, 123);
+
+        let env_err = MockEnv::new().with("SOME_NUM", "abc");
+        let mut target_err: u32 = 0;
+        parse_env(&env_err, "SOME_NUM", &mut target_err);
+        assert_eq!(target_err, 0); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_option_string_works() {
+        let env = MockEnv::new().with("SOME_OPT", "val");
+        let mut target = None;
+        parse_env_option_string(&env, "SOME_OPT", &mut target);
+        assert_eq!(target, Some("val".to_string()));
+
+        let env_empty = MockEnv::new().with("SOME_OPT", "");
+        let mut target_empty = Some("old".to_string());
+        parse_env_option_string(&env_empty, "SOME_OPT", &mut target_empty);
+        assert_eq!(target_empty, None);
+    }
+
+    #[test]
+    fn parse_env_string_works() {
+        let env = MockEnv::new().with("SOME_STR", "val");
+        let mut target = "old".to_string();
+        parse_env_string(&env, "SOME_STR", &mut target);
+        assert_eq!(target, "val");
+    }
+
+    #[test]
+    fn parse_env_bool_works() {
+        let env = MockEnv::new().with("SOME_BOOL", "true");
+        let mut target = false;
+        parse_env_bool(&env, "SOME_BOOL", &mut target);
+        assert!(target);
+
+        let env2 = MockEnv::new().with("SOME_BOOL", "1");
+        let mut target2 = false;
+        parse_env_bool(&env2, "SOME_BOOL", &mut target2);
+        assert!(target2);
+
+        let env3 = MockEnv::new().with("SOME_BOOL", "0");
+        let mut target3 = true;
+        parse_env_bool(&env3, "SOME_BOOL", &mut target3);
+        assert!(!target3);
+
+        let env_err = MockEnv::new().with("SOME_BOOL", "invalid");
+        let mut target_err = true;
+        parse_env_bool(&env_err, "SOME_BOOL", &mut target_err);
+        assert!(target_err); // Unchanged
+    }
+
+    #[test]
+    fn parse_env_csv_works() {
+        let env = MockEnv::new().with("SOME_CSV", "a, b,c");
+        let mut target = vec![];
+        parse_env_csv(&env, "SOME_CSV", &mut target);
+        assert_eq!(target, vec!["a", "b", "c"]);
+    }
     #[test]
     fn env_override_server_host() {
         let env = MockEnv::new().with("AUTUMN_SERVER__HOST", "0.0.0.0");
@@ -2004,24 +2415,79 @@ path = "/healthz"
     // ── Profile tests ──────────────────────────────────────────
 
     #[test]
-    fn resolve_profile_from_env() {
+    fn resolve_profile_from_autumn_env() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_from_legacy_env() {
         let env = MockEnv::new().with("AUTUMN_PROFILE", "staging");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("staging"));
+        assert_eq!(profile, "staging");
+    }
+
+    #[test]
+    fn resolve_profile_prefers_autumn_env_over_legacy_alias() {
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "dev")
+            .with("AUTUMN_PROFILE", "prod");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_production_alias() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "production");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_development_alias_with_whitespace() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "  development  ");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_normalizes_uppercase_dev_and_prod() {
+        let prod_env = MockEnv::new().with("AUTUMN_ENV", "PROD");
+        let prod = resolve_profile(&prod_env);
+        assert_eq!(prod, "prod");
+
+        let dev_env = MockEnv::new().with("AUTUMN_ENV", "DEV");
+        let dev = resolve_profile(&dev_env);
+        assert_eq!(dev, "dev");
+    }
+
+    #[test]
+    fn resolve_profile_preserves_case_for_custom_profiles() {
+        let env = MockEnv::new().with("AUTUMN_ENV", "QA");
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "QA");
     }
 
     #[test]
     fn resolve_profile_auto_detect_debug() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "1");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("dev"));
+        assert_eq!(profile, "dev");
     }
 
     #[test]
     fn resolve_profile_auto_detect_release() {
         let env = MockEnv::new().with("AUTUMN_IS_DEBUG", "0");
         let profile = resolve_profile(&env);
-        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(profile, "prod");
+    }
+
+    #[test]
+    fn resolve_profile_defaults_to_dev_when_no_signal_present() {
+        let env = MockEnv::new();
+        let profile = resolve_profile(&env);
+        assert_eq!(profile, "dev");
     }
 
     #[test]
@@ -2051,6 +2517,27 @@ path = "/healthz"
         assert_eq!(config.server.shutdown_timeout_secs, 30);
         assert_eq!(config.telemetry.environment, "production");
         assert!(!config.health.detailed);
+        // AC: HSTS auto-enabled in the production profile.
+        assert!(
+            config.security.headers.strict_transport_security,
+            "prod profile must auto-enable Strict-Transport-Security"
+        );
+        // Defaults should still be secure-by-default in prod.
+        assert_eq!(config.security.headers.x_frame_options, "DENY");
+        assert!(config.security.headers.x_content_type_options);
+        assert!(!config.security.headers.content_security_policy.is_empty());
+    }
+
+    #[test]
+    fn dev_profile_does_not_auto_enable_hsts() {
+        let defaults = profile_defaults_as_toml("dev");
+        let toml_str = toml::to_string(&defaults).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+
+        assert!(
+            !config.security.headers.strict_transport_security,
+            "dev profile must not force HSTS on (local http development)"
+        );
     }
 
     #[test]
@@ -2142,6 +2629,33 @@ path = "/healthz"
             config.database.url.as_deref(),
             Some("postgres://localhost/myapp_dev")
         ); // from profile
+    }
+
+    #[test]
+    fn inline_profile_section_overrides_base_toml() {
+        let mut merged = toml::Value::Table(toml::map::Map::new());
+        let base: toml::Value = toml::from_str(
+            r#"
+            [server]
+            port = 3000
+
+            [log]
+            level = "info"
+
+            [profile.dev.log]
+            level = "debug"
+            "#,
+        )
+        .unwrap();
+
+        deep_merge(&mut merged, base.clone());
+        let inline = profile_section_from_base_toml(&base, "dev").unwrap();
+        deep_merge(&mut merged, inline);
+
+        let toml_str = toml::to_string(&merged).unwrap();
+        let config: AutumnConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.server.port, 3000);
+        assert_eq!(config.log.level, "debug");
     }
 
     #[test]
@@ -2273,6 +2787,22 @@ path = "/healthz"
     }
 
     #[test]
+    fn should_warn_missing_profile_file_custom_without_inline() {
+        assert!(should_warn_missing_profile_file("staging", false));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_custom_with_inline() {
+        assert!(!should_warn_missing_profile_file("staging", true));
+    }
+
+    #[test]
+    fn should_not_warn_missing_profile_file_dev_or_prod() {
+        assert!(!should_warn_missing_profile_file("dev", false));
+        assert!(!should_warn_missing_profile_file("prod", false));
+    }
+
+    #[test]
     fn levenshtein_threshold_in_warn_profile_typo() {
         assert!(levenshtein("dve", "dev") <= 2);
         assert!(levenshtein("xyz", "dev") > 2);
@@ -2307,6 +2837,40 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.cors.max_age_secs, 3600);
+    }
+
+    #[test]
+    fn cors_validate_rejects_wildcard_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = true;
+
+        let result = config.validate();
+        match result {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(
+                    msg.contains("allow_credentials") && msg.contains('*'),
+                    "message should mention credentials and wildcard, got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cors_validate_accepts_wildcard_without_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["*".to_owned()];
+        config.cors.allow_credentials = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cors_validate_accepts_explicit_origins_with_credentials() {
+        let mut config = AutumnConfig::default();
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+        config.cors.allow_credentials = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2345,6 +2909,127 @@ path = "/healthz"
 
         let config = AutumnConfig::load_with_env(&env).unwrap();
         assert_eq!(config.profile.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn load_custom_profile_uses_inline_profile_without_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &base_path,
+            r"
+            [server]
+            port = 3000
+
+            [profile.staging.server]
+            port = 4100
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "staging")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("staging"));
+        assert_eq!(config.server.port, 4100);
+    }
+
+    #[test]
+    fn load_production_profile_reads_inline_profile_production_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("autumn.toml");
+        std::fs::write(
+            &base_path,
+            r"
+            [profile.production.server]
+            port = 4200
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4200);
+    }
+
+    #[test]
+    fn load_production_profile_reads_legacy_autumn_production_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let production_path = dir.path().join("autumn-production.toml");
+        std::fs::write(
+            &production_path,
+            r"
+            [server]
+            port = 4300
+            ",
+        )
+        .unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4300);
+    }
+
+    #[test]
+    fn load_prod_prefers_autumn_prod_toml_before_production_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let prod_path = dir.path().join("autumn-prod.toml");
+        let production_path = dir.path().join("autumn-production.toml");
+
+        std::fs::write(
+            &prod_path,
+            r"
+            [server]
+            port = 4400
+            ",
+        )
+        .unwrap();
+        // Malformed TOML should be ignored because `autumn-prod.toml` is chosen first.
+        std::fs::write(&production_path, "[server\nport = 4500").unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "prod")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4400);
+    }
+
+    #[test]
+    fn load_production_prefers_autumn_production_toml_before_prod_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let prod_path = dir.path().join("autumn-prod.toml");
+        let production_path = dir.path().join("autumn-production.toml");
+
+        std::fs::write(
+            &production_path,
+            r"
+            [server]
+            port = 4500
+            ",
+        )
+        .unwrap();
+        // Malformed TOML should be ignored because `autumn-production.toml` is chosen first.
+        std::fs::write(&prod_path, "[server\nport = 4400").unwrap();
+
+        let env = MockEnv::new()
+            .with("AUTUMN_ENV", "production")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert_eq!(config.profile.as_deref(), Some("prod"));
+        assert_eq!(config.server.port, 4500);
     }
 
     #[test]

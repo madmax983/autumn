@@ -14,10 +14,11 @@ use opentelemetry::{KeyValue, trace::TracerProvider as _};
 #[cfg(feature = "telemetry-otlp")]
 use opentelemetry_otlp::WithExportConfig as _;
 #[cfg(feature = "telemetry-otlp")]
-use opentelemetry_sdk::{Resource, trace::SdkTracerProvider};
+use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator, trace::SdkTracerProvider};
 
 /// Concrete log formatting chosen for the running process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ResolvedLogFormat {
     /// Human-readable developer logs.
     Pretty,
@@ -71,6 +72,7 @@ pub struct TelemetryResource {
 
 /// Errors that can occur while planning or initializing telemetry.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum TelemetryInitError {
     /// Telemetry was enabled without an OTLP endpoint.
     #[error("telemetry is enabled but no OTLP endpoint was configured")]
@@ -111,7 +113,13 @@ pub struct TelemetryGuard {
 }
 
 impl TelemetryGuard {
-    const fn disabled() -> Self {
+    /// Construct a no-op telemetry guard.
+    ///
+    /// Useful for [`TelemetryProvider`] implementations that decide at runtime
+    /// not to register a global tracing subscriber — e.g. a Datadog provider
+    /// reading a feature flag, or any custom impl that wants to opt out of
+    /// telemetry without panicking.
+    pub const fn disabled() -> Self {
         Self {
             #[cfg(feature = "telemetry-otlp")]
             provider: None,
@@ -393,6 +401,12 @@ fn build_tracer_provider(otlp: &OtlpTraceRuntime) -> Result<SdkTracerProvider, T
     }
     .map_err(|error| TelemetryInitError::ExporterInit(error.to_string()))?;
 
+    // Install a W3C Trace Context propagator so the `TraceContextLayer`
+    // middleware can extract incoming `traceparent` headers and inject
+    // the current context into outgoing responses. Uses the global
+    // text-map propagator slot maintained by `opentelemetry::global`.
+    opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
+
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
         .with_batch_exporter(exporter)
@@ -409,4 +423,228 @@ fn build_resource_attributes(resource: &TelemetryResource) -> [KeyValue; 3] {
         KeyValue::new("service.version", resource.service_version.clone()),
         KeyValue::new("deployment.environment", resource.environment.clone()),
     ]
+}
+
+// ----------------------------------------------------------------------------
+// TelemetryProvider — tier-1 boot-time replaceable telemetry init
+// ----------------------------------------------------------------------------
+
+/// Pluggable boot-time telemetry initializer.
+///
+/// Replace the default `tracing-subscriber + OTLP` initializer with a custom
+/// strategy (Datadog tracer, Honeycomb beeline, Sentry breadcrumbs, custom
+/// log aggregator) by implementing this trait and installing it on the
+/// [`AppBuilder`](crate::app::AppBuilder) via
+/// [`with_telemetry_provider`](crate::app::AppBuilder::with_telemetry_provider).
+///
+/// Initialization is synchronous — the trait mirrors the shape of the
+/// underlying [`init`] free function. Custom providers that need async setup
+/// can spin up a runtime internally or, more commonly, do their async work
+/// from within the returned [`TelemetryGuard`]'s lifecycle hooks.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::config::{LogConfig, TelemetryConfig};
+/// use autumn_web::telemetry::{TelemetryGuard, TelemetryInitError, TelemetryProvider};
+///
+/// pub struct DatadogTelemetryProvider;
+///
+/// impl TelemetryProvider for DatadogTelemetryProvider {
+///     fn init(
+///         &self,
+///         _log: &LogConfig,
+///         _telemetry: &TelemetryConfig,
+///         _profile: Option<&str>,
+///     ) -> Result<TelemetryGuard, TelemetryInitError> {
+///         // configure datadog-tracing here, then return a guard whose Drop
+///         // cleanly flushes the exporter.
+///         Ok(TelemetryGuard::disabled())
+///     }
+/// }
+/// ```
+pub trait TelemetryProvider: Send + Sync + 'static {
+    /// Initialize tracing/log subscribers and any exporters.
+    ///
+    /// Returns a [`TelemetryGuard`] whose `Drop` impl is responsible for
+    /// flushing exporters and tearing down any background tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryInitError`] if subscriber registration or exporter
+    /// setup fails. Propagates to bootstrap and aborts the app.
+    fn init(
+        &self,
+        log: &LogConfig,
+        telemetry: &TelemetryConfig,
+        profile: Option<&str>,
+    ) -> Result<TelemetryGuard, TelemetryInitError>;
+}
+
+/// Default [`TelemetryProvider`] — `tracing-subscriber` with optional OTLP export.
+///
+/// Delegates to the free function [`init`]. This is the provider used when no
+/// override is installed via
+/// [`with_telemetry_provider`](crate::app::AppBuilder::with_telemetry_provider).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TracingOtlpTelemetryProvider;
+
+impl TracingOtlpTelemetryProvider {
+    /// Construct a new default telemetry provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl TelemetryProvider for TracingOtlpTelemetryProvider {
+    fn init(
+        &self,
+        log: &LogConfig,
+        telemetry: &TelemetryConfig,
+        profile: Option<&str>,
+    ) -> Result<TelemetryGuard, TelemetryInitError> {
+        init(log, telemetry, profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No-op provider for tests — returns a disabled guard without touching the
+    /// global tracing subscriber. Verifies the trait actually overrides the
+    /// default `tracing-subscriber + OTLP` initializer.
+    struct NoOpTelemetryProvider;
+
+    impl TelemetryProvider for NoOpTelemetryProvider {
+        fn init(
+            &self,
+            _log: &LogConfig,
+            _telemetry: &TelemetryConfig,
+            _profile: Option<&str>,
+        ) -> Result<TelemetryGuard, TelemetryInitError> {
+            Ok(TelemetryGuard::disabled())
+        }
+    }
+
+    #[test]
+    fn telemetry_provider_trait_returns_supplied_guard() {
+        let provider = NoOpTelemetryProvider;
+        let log = LogConfig::default();
+        let telemetry = TelemetryConfig::default();
+        // Should succeed and not touch the global subscriber.
+        let guard = provider
+            .init(&log, &telemetry, Some("test"))
+            .expect("no-op provider should succeed");
+        // Sanity: the disabled guard must be droppable without panic.
+        drop(guard);
+    }
+    #[test]
+    fn build_filter_falls_back_to_info_on_invalid_level() {
+        let log = LogConfig {
+            level: "this_is_not_a_valid_directive_it_lacks_an_equal_sign_and_is_not_a_level,foo=bar=baz=invalid".to_owned(),
+            ..Default::default()
+        };
+
+        let filter = build_filter(&log);
+        assert_eq!(filter.to_string(), "info");
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[test]
+    fn build_resource_attributes_populates_otel_semantic_keys() {
+        let resource = TelemetryResource {
+            service_name: "svc".into(),
+            service_namespace: Some("team".into()),
+            service_version: "1.2.3".into(),
+            environment: "staging".into(),
+        };
+        let attrs = build_resource_attributes(&resource);
+        let pairs: std::collections::HashMap<_, _> = attrs
+            .iter()
+            .map(|kv| (kv.key.as_str().to_owned(), kv.value.to_string()))
+            .collect();
+        assert_eq!(
+            pairs.get("service.namespace").map(String::as_str),
+            Some("team")
+        );
+        assert_eq!(
+            pairs.get("service.version").map(String::as_str),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            pairs.get("deployment.environment").map(String::as_str),
+            Some("staging")
+        );
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    struct MapExtractor<'a>(&'a std::collections::HashMap<&'static str, &'static str>);
+
+    #[cfg(feature = "telemetry-otlp")]
+    impl opentelemetry::propagation::Extractor for MapExtractor<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key).copied()
+        }
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().copied().collect()
+        }
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[tokio::test]
+    async fn build_tracer_provider_installs_w3c_propagator_and_returns_provider() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        // Exercises the full provider-construction path: resource building,
+        // tonic exporter setup, global propagator install, and batch
+        // provider assembly. Uses a bogus endpoint — exporter construction
+        // is lazy, so no network IO happens here.
+        let otlp = OtlpTraceRuntime {
+            endpoint: "http://127.0.0.1:65530".into(),
+            protocol: TelemetryProtocol::Grpc,
+            resource: TelemetryResource {
+                service_name: "unit-test".into(),
+                service_namespace: None,
+                service_version: "0.0.0".into(),
+                environment: "test".into(),
+            },
+        };
+        let provider = build_tracer_provider(&otlp)
+            .expect("tonic exporter + provider build should succeed lazily");
+
+        // Confirm the propagator global now round-trips a W3C traceparent —
+        // i.e., the install line ran.
+        let headers = std::collections::HashMap::from([(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        )]);
+        let cx =
+            opentelemetry::global::get_text_map_propagator(|p| p.extract(&MapExtractor(&headers)));
+        assert!(
+            cx.span().span_context().is_valid(),
+            "global propagator should have been installed"
+        );
+
+        let _ = provider.shutdown();
+    }
+
+    #[cfg(feature = "telemetry-otlp")]
+    #[tokio::test]
+    async fn build_tracer_provider_supports_http_protobuf_protocol() {
+        let otlp = OtlpTraceRuntime {
+            endpoint: "http://127.0.0.1:65531".into(),
+            protocol: TelemetryProtocol::HttpProtobuf,
+            resource: TelemetryResource {
+                service_name: "unit-test".into(),
+                service_namespace: None,
+                service_version: "0.0.0".into(),
+                environment: "test".into(),
+            },
+        };
+        let provider =
+            build_tracer_provider(&otlp).expect("http-protobuf exporter should build lazily");
+        let _ = provider.shutdown();
+    }
 }

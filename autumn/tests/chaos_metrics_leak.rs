@@ -1,3 +1,6 @@
+//!
+//! Chaos tests for metrics leak.
+//!
 use autumn_web::middleware::{MetricsCollector, MetricsLayer};
 use axum::body::Body;
 use axum::http::Request;

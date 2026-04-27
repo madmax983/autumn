@@ -105,7 +105,10 @@ pub struct TestApp {
     routes: Vec<Route>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    custom_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
+    #[cfg(feature = "openapi")]
+    openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
 }
@@ -123,10 +126,26 @@ impl TestApp {
             routes: Vec::new(),
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
             config,
+            #[cfg(feature = "openapi")]
+            openapi: None,
             #[cfg(feature = "db")]
             pool: None,
         }
+    }
+
+    /// Enable `OpenAPI` spec generation for the test app.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::openapi`] so integration tests
+    /// can exercise the `/v3/api-docs` and `/swagger-ui` endpoints.
+    ///
+    /// Gated behind the `openapi` Cargo feature.
+    #[cfg(feature = "openapi")]
+    #[must_use]
+    pub fn openapi(mut self, config: crate::openapi::OpenApiConfig) -> Self {
+        self.openapi = Some(config);
+        self
     }
 
     /// Merge a router into the internal application state.
@@ -145,6 +164,20 @@ impl TestApp {
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    /// Apply a custom [`tower::Layer`] to the entire test application.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::layer`] so tests can exercise the
+    /// exact middleware wiring that `AppBuilder::run()` produces.
+    #[must_use]
+    pub fn layer<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
+        self.custom_layers
+            .push(crate::app::CustomLayerRegistration {
+                type_id: std::any::TypeId::of::<L>(),
+                apply: Box::new(move |router| layer.apply_to(router)),
+            });
         self
     }
 
@@ -213,14 +246,23 @@ impl TestApp {
             shutdown: tokio_util::sync::CancellationToken::new(),
         };
 
-        let router = crate::router::try_build_router_merged(
+        let router = crate::router::try_build_router_inner(
             self.routes,
             &self.config,
             state,
-            self.merge_routers,
-            self.nest_routers,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: self.merge_routers,
+                nest_routers: self.nest_routers,
+                custom_layers: self.custom_layers,
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: self.openapi,
+            },
         )
-        .unwrap();
+        .expect("failed to build test router");
         TestClient { router }
     }
 }
@@ -618,8 +660,14 @@ impl TestDb {
             .await
             .expect("failed to start Postgres testcontainer (is Docker running?)");
 
-        let host = container.get_host().await.unwrap();
-        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let host = container
+            .get_host()
+            .await
+            .expect("failed to build test router");
+        let port = container
+            .get_host_port_ipv4(5432)
+            .await
+            .expect("failed to build test router");
         let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
 
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
@@ -713,18 +761,39 @@ mod tests {
                 path: "/hello",
                 handler: routing::get(hello),
                 name: "hello",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/hello",
+                    operation_id: "hello",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: Method::POST,
                 path: "/echo",
                 handler: routing::post(echo_json),
                 name: "echo",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/echo",
+                    operation_id: "echo",
+                    success_status: 200,
+                    ..Default::default()
+                },
             },
             Route {
                 method: Method::POST,
                 path: "/create",
                 handler: routing::post(status_201),
                 name: "create",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "POST",
+                    path: "/create",
+                    operation_id: "create",
+                    success_status: 201,
+                    ..Default::default()
+                },
             },
         ]
     }

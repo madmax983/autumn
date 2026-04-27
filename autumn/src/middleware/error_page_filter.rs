@@ -231,17 +231,57 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
         return false;
     }
 
-    // Simple heuristic: if text/html appears before application/json,
-    // or if text/html is present and application/json is not, prefer HTML.
-    let html_pos = accept.find("text/html");
-    let json_pos = accept.find("application/json");
+    let mut html: Option<(f32, usize)> = None;
+    let mut json: Option<(f32, usize)> = None;
+    let mut wildcard: Option<(f32, usize)> = None;
 
-    match (html_pos, json_pos) {
-        (Some(_), None) => true,
-        (Some(h), Some(j)) => h < j,
-        (None, Some(_)) => false,
-        // `*/*` without specific types -- default to HTML for browsers
-        (None, None) => accept.contains("*/*"),
+    for (index, raw_part) in accept.split(',').enumerate() {
+        let part = raw_part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let mut mime = "";
+        let mut q = 1.0_f32;
+
+        for (i, segment) in part.split(';').enumerate() {
+            let segment = segment.trim();
+            if i == 0 {
+                mime = segment;
+                continue;
+            }
+
+            if let Some(value) = segment.strip_prefix("q=") {
+                if let Ok(parsed) = value.trim().parse::<f32>() {
+                    q = parsed.clamp(0.0, 1.0);
+                }
+            }
+        }
+
+        match mime {
+            "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
+                html = Some((q, index));
+            }
+            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+                json = Some((q, index));
+            }
+            "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
+                wildcard = Some((q, index));
+            }
+            _ => {}
+        }
+    }
+
+    match (html, json, wildcard) {
+        (Some((hq, hidx)), Some((jq, jidx)), _) => {
+            if (hq - jq).abs() < f32::EPSILON {
+                hidx < jidx
+            } else {
+                hq > jq
+            }
+        }
+        (Some(_), None, _) | (None, None, Some(_)) => true,
+        (None, Some(_), _) | (None, None, None) => false,
     }
 }
 
@@ -249,8 +289,15 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
 /// error pages instead of Axum's default plain-text "Not Found".
-pub async fn fallback_404_handler(uri: axum::http::Uri) -> crate::error::AutumnError {
+pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && uri.path() == crate::router::DEFAULT_FAVICON_PATH
+    {
+        return axum::http::StatusCode::NO_CONTENT.into_response();
+    }
+
     crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
+        .into_response()
 }
 
 #[cfg(test)]
@@ -305,6 +352,24 @@ mod tests {
     fn prefers_html_when_html_first() {
         let req = Request::builder()
             .header("accept", "text/html, application/json")
+            .body(Body::empty())
+            .unwrap();
+        assert!(accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_json_when_json_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "text/html;q=0.4, application/json;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_html_when_html_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "application/json;q=0.3, text/html;q=0.8")
             .body(Body::empty())
             .unwrap();
         assert!(accepts_html(&req));
@@ -549,6 +614,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_renderer_is_ignored_for_json_requests() {
+        use crate::error_pages::{ErrorContext, ErrorPageRenderer};
+        use maud::{Markup, html};
+
+        struct LoudCustomPages;
+        impl ErrorPageRenderer for LoudCustomPages {
+            fn render_error(&self, ctx: &ErrorContext) -> Markup {
+                html! {
+                    h1 { "LOUD CUSTOM " (ctx.status.as_u16()) }
+                }
+            }
+        }
+
+        let renderer: crate::error_pages::SharedRenderer = Arc::new(LoudCustomPages);
+        let error_page_filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+        };
+        let filters: Vec<Arc<dyn crate::middleware::ExceptionFilter>> =
+            vec![Arc::new(error_page_filter)];
+
+        let app = Router::new()
+            .route(
+                "/err",
+                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("nope")) }),
+            )
+            .layer(ErrorPageContextLayer)
+            .layer(ExceptionFilterLayer::new(filters));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/err")
+                    .header("accept", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .expect("content-type should be present")
+            .to_str()
+            .expect("content-type should be valid UTF-8");
+        assert!(
+            ct.contains("application/json"),
+            "JSON requests should still get JSON, got: {ct}"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("LOUD CUSTOM 404"),
+            "custom HTML renderer should not run for JSON requests, got: {body_str}"
+        );
+    }
+
+    #[tokio::test]
     async fn success_responses_not_affected() {
         let app = test_router_with_error_pages(false);
         let resp = app
@@ -572,27 +700,77 @@ mod tests {
     #[tokio::test]
     async fn fallback_404_handler_creates_correct_error() {
         let uri = axum::http::Uri::from_static("/some/unknown/path");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /some/unknown/path");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /some/unknown/path"));
     }
 
     #[tokio::test]
     async fn fallback_404_handler_ignores_query_params() {
         let uri = axum::http::Uri::from_static("/search?q=rust&sort=desc");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /search");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /search"));
     }
 
     #[tokio::test]
     async fn fallback_404_handler_with_root_path() {
         let uri = axum::http::Uri::from_static("/");
-        let error = fallback_404_handler(uri).await;
+        let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(error.status(), StatusCode::NOT_FOUND);
-        assert_eq!(error.to_string(), "No route matches /");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("No route matches /"));
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_returns_empty_no_content_for_favicon_get() {
+        let response = fallback_404_handler(
+            axum::http::Method::GET,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_returns_empty_no_content_for_favicon_head() {
+        let response = fallback_404_handler(
+            axum::http::Method::HEAD,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_404_handler_keeps_non_get_favicon_requests_as_not_found() {
+        let response = fallback_404_handler(
+            axum::http::Method::POST,
+            axum::http::Uri::from_static(crate::router::DEFAULT_FAVICON_PATH),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

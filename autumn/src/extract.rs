@@ -86,3 +86,204 @@ pub use axum::extract::Path;
 /// }
 /// ```
 pub use axum::extract::Query;
+
+/// Multipart form-data extractor with Autumn upload policy integration.
+///
+/// This wraps Axum's multipart extractor and applies framework-level
+/// validation from `security.upload`:
+///
+/// - MIME allow-list checks (`allowed_mime_types`)
+/// - Per-file size caps when consuming field bytes or streaming to disk
+///
+/// Request size limits are enforced per request in this extractor via
+/// `security.upload.max_request_size_bytes`.
+#[cfg(feature = "multipart")]
+pub struct Multipart {
+    inner: axum::extract::Multipart,
+    config: crate::security::config::UploadConfig,
+}
+
+#[cfg(feature = "multipart")]
+impl Multipart {
+    /// Read the next multipart field, validating MIME type when configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::AutumnError`] when multipart parsing fails or the
+    /// field MIME type is not allowed by config.
+    pub async fn next_field(&mut self) -> crate::AutumnResult<Option<MultipartField<'_>>> {
+        let Some(field) = self
+            .inner
+            .next_field()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        else {
+            return Ok(None);
+        };
+
+        // Only enforce MIME allow-lists for file parts. Regular form
+        // fields often omit `Content-Type`.
+        if field.file_name().is_some() && !self.config.allowed_mime_types.is_empty() {
+            let Some(content_type) = field.content_type().map(str::to_owned) else {
+                return Err(crate::AutumnError::bad_request_msg(
+                    "missing content type on uploaded file",
+                ));
+            };
+            if !self
+                .config
+                .allowed_mime_types
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&content_type))
+            {
+                return Err(crate::AutumnError::bad_request_msg(format!(
+                    "unsupported upload content type: {content_type}"
+                )));
+            }
+        }
+
+        Ok(Some(MultipartField {
+            inner: field,
+            max_file_size_bytes: self.config.max_file_size_bytes,
+        }))
+    }
+}
+
+#[cfg(feature = "multipart")]
+impl<S> axum::extract::FromRequest<S> for Multipart
+where
+    S: Send + Sync,
+    axum::extract::Multipart:
+        axum::extract::FromRequest<S, Rejection = axum::extract::multipart::MultipartRejection>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request(
+        mut req: axum::extract::Request,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let config = req
+            .extensions()
+            .get::<crate::security::config::UploadConfig>()
+            .cloned()
+            .unwrap_or_default();
+        axum::extract::DefaultBodyLimit::max(config.max_request_size_bytes).apply(&mut req);
+        let inner = axum::extract::Multipart::from_request(req, state)
+            .await
+            .map_err(|err| multipart_rejection_to_error(&err))?;
+        Ok(Self { inner, config })
+    }
+}
+
+/// A multipart field wrapper that provides safe streaming helpers.
+#[cfg(feature = "multipart")]
+pub struct MultipartField<'a> {
+    inner: axum::extract::multipart::Field<'a>,
+    max_file_size_bytes: usize,
+}
+
+#[cfg(feature = "multipart")]
+impl MultipartField<'_> {
+    /// Field name from the multipart form.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name()
+    }
+
+    /// Uploaded file name (if this field represents a file).
+    #[must_use]
+    pub fn file_name(&self) -> Option<&str> {
+        self.inner.file_name()
+    }
+
+    /// Declared MIME type for this field.
+    #[must_use]
+    pub fn content_type(&self) -> Option<&str> {
+        self.inner.content_type()
+    }
+
+    /// Read this field fully into memory while enforcing file-size limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `413 Payload Too Large` if the field exceeds
+    /// `security.upload.max_file_size_bytes`.
+    pub async fn bytes_limited(mut self) -> crate::AutumnResult<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut read = 0usize;
+        while let Some(chunk) = self
+            .inner
+            .chunk()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        {
+            read += chunk.len();
+            if read > self.max_file_size_bytes {
+                return Err(file_too_large_error(self.max_file_size_bytes));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+
+    /// Stream this field to disk while enforcing file-size limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails or the file exceeds configured
+    /// limits. Partial files are removed on limit violations.
+    pub async fn save_to<P: AsRef<std::path::Path>>(
+        mut self,
+        path: P,
+    ) -> crate::AutumnResult<usize> {
+        use tokio::io::AsyncWriteExt as _;
+
+        let path = path.as_ref();
+        let mut file = tokio::fs::File::create(path)
+            .await
+            .map_err(crate::AutumnError::internal_server_error)?;
+
+        let mut written = 0usize;
+        while let Some(chunk) = self
+            .inner
+            .chunk()
+            .await
+            .map_err(|err| multipart_error_to_error(&err))?
+        {
+            written += chunk.len();
+            if written > self.max_file_size_bytes {
+                drop(file);
+                let _ = tokio::fs::remove_file(path).await;
+                return Err(file_too_large_error(self.max_file_size_bytes));
+            }
+            file.write_all(&chunk)
+                .await
+                .map_err(crate::AutumnError::internal_server_error)?;
+        }
+        file.flush()
+            .await
+            .map_err(crate::AutumnError::internal_server_error)?;
+        Ok(written)
+    }
+}
+
+#[cfg(feature = "multipart")]
+fn multipart_rejection_to_error(
+    err: &axum::extract::multipart::MultipartRejection,
+) -> crate::AutumnError {
+    crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
+}
+
+#[cfg(feature = "multipart")]
+fn multipart_error_to_error(err: &axum::extract::multipart::MultipartError) -> crate::AutumnError {
+    crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
+}
+
+#[cfg(feature = "multipart")]
+fn file_too_large_error(max_file_size_bytes: usize) -> crate::AutumnError {
+    crate::AutumnError::bad_request_msg(format!(
+        "uploaded file exceeds limit of {max_file_size_bytes} bytes",
+    ))
+    .with_status(http::StatusCode::PAYLOAD_TOO_LARGE)
+}
+
+pub use axum::extract::State;

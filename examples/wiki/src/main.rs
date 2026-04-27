@@ -1,3 +1,8 @@
+//! Example Wiki application demonstrating the Autumn web framework.
+//!
+//! This example shows how to build a typical server-side rendered application
+//! with forms, database access, and HTML templates.
+
 mod hooks;
 mod models;
 mod repositories;

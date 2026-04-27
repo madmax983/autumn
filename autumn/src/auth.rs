@@ -53,15 +53,25 @@
 //! `401 Unauthorized` before they reach the handler. It checks for the
 //! presence of a session key (default: `"user_id"`).
 
+#[cfg(feature = "oauth2")]
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+#[cfg(feature = "oauth2")]
+use std::time::Duration;
 
 use axum::extract::FromRequestParts;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use http::request::Parts;
+#[cfg(feature = "oauth2")]
+use jsonwebtoken::jwk::JwkSet;
+#[cfg(feature = "oauth2")]
+use serde::Deserialize;
+#[cfg(feature = "oauth2")]
+use url::Url;
 
 // ── Password hashing ────────────────────────────────────────────
 
@@ -375,6 +385,12 @@ pub struct AuthConfig {
     /// Session key used to identify authenticated users.
     #[serde(default = "default_session_key")]
     pub session_key: String,
+
+    /// OAuth2/OIDC provider configuration by provider key
+    /// (for example: `github`, `google`, `okta`).
+    #[cfg(feature = "oauth2")]
+    #[serde(default)]
+    pub oauth2: OAuth2Config,
 }
 
 const fn default_bcrypt_cost() -> u32 {
@@ -385,11 +401,452 @@ fn default_session_key() -> String {
     "user_id".to_owned()
 }
 
+#[cfg(feature = "oauth2")]
+const fn default_provider_scope() -> String {
+    String::new()
+}
+
+#[cfg(feature = "oauth2")]
+const OAUTH_HTTP_TIMEOUT_SECS: u64 = 15;
+
+#[cfg(feature = "oauth2")]
+/// `OAuth2` provider map loaded from `autumn.toml`.
+///
+/// Example:
+///
+/// ```toml
+/// [auth.oauth2.github]
+/// client_id = "..."
+/// client_secret = "..."
+/// authorize_url = "https://github.com/login/oauth/authorize"
+/// token_url = "https://github.com/login/oauth/access_token"
+/// userinfo_url = "https://api.github.com/user"
+/// redirect_uri = "http://localhost:3000/auth/github/callback"
+/// scope = "read:user user:email"
+/// ```
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OAuth2Config {
+    /// Dynamic provider table keyed by provider name.
+    #[serde(flatten)]
+    pub providers: HashMap<String, OAuth2ProviderConfig>,
+}
+
+#[cfg(feature = "oauth2")]
+/// A single OAuth2/OIDC provider configuration entry.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct OAuth2ProviderConfig {
+    /// The client ID provided by the `OAuth2` identity provider.
+    pub client_id: String,
+    /// The client secret provided by the `OAuth2` identity provider.
+    pub client_secret: String,
+    /// The authorization endpoint URL where users are redirected to authenticate.
+    pub authorize_url: String,
+    /// The token endpoint URL used to exchange an authorization code for tokens.
+    pub token_url: String,
+    /// The optional userinfo endpoint URL used to fetch profile details.
+    #[serde(default)]
+    pub userinfo_url: Option<String>,
+    /// The local redirect URI registered with the identity provider (e.g., `http://localhost/auth/callback`).
+    pub redirect_uri: String,
+    /// The requested scope string (e.g., `openid profile email`).
+    #[serde(default = "default_provider_scope")]
+    pub scope: String,
+    /// Expected OIDC issuer (`iss`) used for ID token validation.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// JWKS endpoint URL used to verify ID token signatures.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+/// Query extractor payload for `OAuth2` callback handlers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OAuth2Callback {
+    /// The authorization code returned by the provider.
+    pub code: String,
+    /// The anti-CSRF state token passed during the authorization request.
+    pub state: String,
+}
+
+#[cfg(feature = "oauth2")]
+/// Identity information extracted from an OIDC ID token or userinfo endpoint.
+#[derive(Debug, Clone)]
+pub struct OidcIdentity {
+    /// The primary subject identifier (`sub` claim) representing the user.
+    pub subject: String,
+    /// The user's email address, if available in the claims.
+    pub email: Option<String>,
+    /// The user's full name, if available in the claims.
+    pub name: Option<String>,
+    /// The user's preferred username or nickname, if available in the claims.
+    pub preferred_username: Option<String>,
+    /// The raw JSON claims extracted from the token or userinfo response.
+    pub raw_claims: serde_json::Value,
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Deserialize)]
+struct OAuth2TokenResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type: Option<String>,
+    id_token: Option<String>,
+}
+
+#[cfg(feature = "oauth2")]
+/// Build an `OAuth2` authorization URL and persist anti-CSRF state + nonce in session.
+///
+/// # Errors
+///
+/// Returns an error if `authorize_url` is not a valid URL.
+pub async fn oauth2_authorize_url(
+    session: &crate::session::Session,
+    provider_name: &str,
+    provider: &OAuth2ProviderConfig,
+) -> crate::AutumnResult<String> {
+    let state = uuid::Uuid::new_v4().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    session
+        .insert(format!("oauth2:{provider_name}:state"), state.clone())
+        .await;
+    session
+        .insert(format!("oauth2:{provider_name}:nonce"), nonce.clone())
+        .await;
+
+    let mut url = Url::parse(&provider.authorize_url)
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid authorize_url: {e}")))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("response_type", "code");
+        q.append_pair("client_id", &provider.client_id);
+        q.append_pair("redirect_uri", &provider.redirect_uri);
+        if !provider.scope.trim().is_empty() {
+            q.append_pair("scope", &provider.scope);
+        }
+        q.append_pair("state", &state);
+        q.append_pair("nonce", &nonce);
+    }
+    Ok(url.into())
+}
+
+#[cfg(feature = "oauth2")]
+/// Exchange callback code for tokens, validate state/nonce, and return OIDC identity.
+///
+/// On success this method rotates the session ID and writes:
+/// - `session_key` (OIDC `sub`)
+/// - `auth_provider` (provider key, like `github`)
+///
+/// # Errors
+///
+/// Returns an error when callback state/nonce validation fails, token exchange
+/// fails, ID token/userinfo payloads are invalid, or identity extraction fails.
+pub async fn oauth2_finish_login(
+    session: &crate::session::Session,
+    session_key: &str,
+    provider_name: &str,
+    provider: &OAuth2ProviderConfig,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<OidcIdentity> {
+    validate_callback_state(session, provider_name, callback).await?;
+    let token = exchange_oauth2_token(provider, callback).await?;
+    let (claims, source) = load_identity_claims(provider, &token).await?;
+    validate_oidc_nonce(session, provider_name, &claims, source).await?;
+    let subject = extract_subject(&claims, source)?;
+    finalize_oauth2_session(session, session_key, provider_name, subject, claims).await
+}
+
+#[cfg(feature = "oauth2")]
+async fn validate_callback_state(
+    session: &crate::session::Session,
+    provider_name: &str,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<()> {
+    let state_key = format!("oauth2:{provider_name}:state");
+    // Read without removing so a stray/attacker-controlled callback with a
+    // wrong state value cannot consume the real state and break the pending
+    // legitimate redirect.
+    let expected_state = session.get(&state_key).await.ok_or_else(|| {
+        crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
+    })?;
+    if subtle::ConstantTimeEq::ct_eq(expected_state.as_bytes(), callback.state.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(crate::AutumnError::unauthorized_msg(
+            "oauth2 state mismatch",
+        ));
+    }
+    // Remove the state only after a successful constant-time match.
+    session.remove(&state_key).await;
+    Ok(())
+}
+
+#[cfg(feature = "oauth2")]
+async fn exchange_oauth2_token(
+    provider: &OAuth2ProviderConfig,
+    callback: &OAuth2Callback,
+) -> crate::AutumnResult<OAuth2TokenResponse> {
+    let token_response = oauth_http_client()?
+        .post(&provider.token_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", callback.code.as_str()),
+            ("redirect_uri", provider.redirect_uri.as_str()),
+            ("client_id", provider.client_id.as_str()),
+            ("client_secret", provider.client_secret.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            crate::AutumnError::service_unavailable_msg(format!("token request failed: {e}"))
+        })?
+        .error_for_status()
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("token exchange failed: {e}")))?;
+
+    let token_content_type = token_response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let token_body = token_response.text().await.map_err(|e| {
+        crate::AutumnError::bad_request_msg(format!("invalid token response body: {e}"))
+    })?;
+    parse_oauth2_token_response(token_content_type.as_deref(), &token_body)
+}
+
+#[cfg(feature = "oauth2")]
+async fn load_identity_claims(
+    provider: &OAuth2ProviderConfig,
+    token: &OAuth2TokenResponse,
+) -> crate::AutumnResult<(serde_json::Value, IdentitySource)> {
+    if let Some(id_token) = token.id_token.as_deref() {
+        return Ok((
+            validate_and_decode_id_token(id_token, provider).await?,
+            IdentitySource::IdToken,
+        ));
+    }
+    if let Some(userinfo_url) = &provider.userinfo_url {
+        let claims = oauth_http_client()?
+            .get(userinfo_url)
+            .header(
+                reqwest::header::USER_AGENT,
+                concat!("autumn-web/", env!("CARGO_PKG_VERSION")),
+            )
+            .bearer_auth(&token.access_token)
+            .send()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::service_unavailable_msg(format!("userinfo request failed: {e}"))
+            })?
+            .error_for_status()
+            .map_err(|e| crate::AutumnError::unauthorized_msg(format!("userinfo failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| {
+                crate::AutumnError::bad_request_msg(format!("invalid userinfo payload: {e}"))
+            })?;
+        return Ok((claims, IdentitySource::UserInfo));
+    }
+    Err(crate::AutumnError::bad_request_msg(
+        "provider must return id_token or configure userinfo_url",
+    ))
+}
+
+#[cfg(feature = "oauth2")]
+async fn validate_oidc_nonce(
+    session: &crate::session::Session,
+    provider_name: &str,
+    claims: &serde_json::Value,
+    source: IdentitySource,
+) -> crate::AutumnResult<()> {
+    let nonce_key = format!("oauth2:{provider_name}:nonce");
+    let stored_nonce = session.remove(&nonce_key).await;
+    if source == IdentitySource::IdToken {
+        // The nonce MUST be present in the session for ID-token logins.
+        // A missing nonce (e.g. session was partially cleared) must be
+        // treated as an error to prevent replay/mix-up attacks.
+        let expected_nonce = stored_nonce.ok_or_else(|| {
+            crate::AutumnError::unauthorized_msg("oauth2 nonce missing from session")
+        })?;
+        let actual_nonce = claims
+            .get("nonce")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| crate::AutumnError::unauthorized_msg("missing oidc nonce claim"))?;
+        if subtle::ConstantTimeEq::ct_eq(expected_nonce.as_bytes(), actual_nonce.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(crate::AutumnError::unauthorized_msg("oidc nonce mismatch"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "oauth2")]
+async fn finalize_oauth2_session(
+    session: &crate::session::Session,
+    session_key: &str,
+    provider_name: &str,
+    subject: String,
+    claims: serde_json::Value,
+) -> crate::AutumnResult<OidcIdentity> {
+    session.insert(session_key, subject.clone()).await;
+    session.insert("auth_provider", provider_name).await;
+    session.rotate_id().await;
+    Ok(OidcIdentity {
+        subject,
+        email: claims
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        name: claims
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        preferred_username: claims
+            .get("preferred_username")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        raw_claims: claims,
+    })
+}
+
+#[cfg(feature = "oauth2")]
+fn parse_oauth2_token_response(
+    content_type: Option<&str>,
+    body: &str,
+) -> crate::AutumnResult<OAuth2TokenResponse> {
+    let looks_like_json = content_type.is_some_and(|v| v.contains("application/json"))
+        || body.trim_start().starts_with('{');
+    if looks_like_json {
+        return serde_json::from_str(body).map_err(|e| {
+            crate::AutumnError::bad_request_msg(format!("invalid json token response: {e}"))
+        });
+    }
+
+    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    let access_token = form.get("access_token").cloned().ok_or_else(|| {
+        crate::AutumnError::bad_request_msg("token response missing access_token")
+    })?;
+    Ok(OAuth2TokenResponse {
+        access_token,
+        token_type: form.get("token_type").cloned(),
+        id_token: form.get("id_token").cloned(),
+    })
+}
+
+#[cfg(feature = "oauth2")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    IdToken,
+    UserInfo,
+}
+
+#[cfg(feature = "oauth2")]
+fn extract_subject(
+    claims: &serde_json::Value,
+    source: IdentitySource,
+) -> crate::AutumnResult<String> {
+    if let Some(sub) = claims.get("sub").and_then(serde_json::Value::as_str) {
+        return Ok(sub.to_owned());
+    }
+
+    if source == IdentitySource::UserInfo {
+        if let Some(id) = claims.get("id").and_then(serde_json::Value::as_i64) {
+            return Ok(id.to_string());
+        }
+        if let Some(id) = claims.get("id").and_then(serde_json::Value::as_str) {
+            return Ok(id.to_owned());
+        }
+        return Err(crate::AutumnError::bad_request_msg(
+            "missing identity claim: expected sub or id from userinfo",
+        ));
+    }
+
+    Err(crate::AutumnError::bad_request_msg("missing sub claim"))
+}
+
+#[cfg(feature = "oauth2")]
+async fn validate_and_decode_id_token(
+    token: &str,
+    provider: &OAuth2ProviderConfig,
+) -> crate::AutumnResult<serde_json::Value> {
+    let issuer = provider
+        .issuer
+        .as_deref()
+        .ok_or_else(|| crate::AutumnError::bad_request_msg("provider.issuer required for oidc"))?;
+    let jwks_url = provider.jwks_url.as_deref().ok_or_else(|| {
+        crate::AutumnError::bad_request_msg("provider.jwks_url required for oidc")
+    })?;
+
+    let header = jsonwebtoken::decode_header(token).map_err(|e| {
+        crate::AutumnError::unauthorized_msg(format!("invalid id_token header: {e}"))
+    })?;
+    let kid = header
+        .kid
+        .as_deref()
+        .ok_or_else(|| crate::AutumnError::unauthorized_msg("id_token header missing kid"))?;
+    let alg = header.alg;
+
+    let jwks: JwkSet = oauth_http_client()?
+        .get(jwks_url)
+        .send()
+        .await
+        .map_err(|e| {
+            crate::AutumnError::service_unavailable_msg(format!("jwks request failed: {e}"))
+        })?
+        .error_for_status()
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("jwks fetch failed: {e}")))?
+        .json()
+        .await
+        .map_err(|e| crate::AutumnError::bad_request_msg(format!("invalid jwks response: {e}")))?;
+
+    let jwk = jwks
+        .keys
+        .iter()
+        .find(|k| k.common.key_id.as_deref() == Some(kid))
+        .ok_or_else(|| crate::AutumnError::unauthorized_msg("no jwk matched id_token kid"))?;
+    let decoding_key = jsonwebtoken::DecodingKey::from_jwk(jwk)
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid jwk key: {e}")))?;
+
+    let mut validation = jsonwebtoken::Validation::new(alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(std::slice::from_ref(&provider.client_id));
+    validation.required_spec_claims = ["exp", "iss", "aud", "sub"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    validation.validate_exp = true;
+    validation.validate_nbf = true;
+
+    let claims = jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, &validation)
+        .map_err(|e| crate::AutumnError::unauthorized_msg(format!("invalid id_token: {e}")))?;
+    Ok(claims.claims)
+}
+
+#[cfg(feature = "oauth2")]
+fn oauth_http_client() -> crate::AutumnResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| {
+            crate::AutumnError::service_unavailable_msg(format!(
+                "failed to build oauth http client: {e}"
+            ))
+        })
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             bcrypt_cost: default_bcrypt_cost(),
             session_key: default_session_key(),
+            #[cfg(feature = "oauth2")]
+            oauth2: OAuth2Config::default(),
         }
     }
 }
@@ -438,6 +895,160 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(config.bcrypt_cost, 12);
         assert_eq!(config.session_key, "user_id");
+        #[cfg(feature = "oauth2")]
+        assert!(config.oauth2.providers.is_empty());
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn oauth2_config_deserializes_provider_tables() {
+        let cfg: crate::config::AutumnConfig = toml::from_str(
+            r#"
+            [auth.oauth2.github]
+            client_id = "cid"
+            client_secret = "secret"
+            authorize_url = "https://github.com/login/oauth/authorize"
+            token_url = "https://github.com/login/oauth/access_token"
+            redirect_uri = "http://localhost:3000/auth/github/callback"
+            "#,
+        )
+        .unwrap();
+        let provider = cfg.auth.oauth2.providers.get("github").unwrap();
+        assert_eq!(provider.client_id, "cid");
+        assert_eq!(provider.scope, "");
+        assert!(provider.issuer.is_none());
+        assert!(provider.jwks_url.is_none());
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn oauth2_authorize_url_sets_state_and_nonce() {
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+        };
+        let url = oauth2_authorize_url(&session, "github", &provider)
+            .await
+            .unwrap();
+        assert!(url.contains("response_type=code"));
+        assert!(session.get("oauth2:github:state").await.is_some());
+        assert!(session.get("oauth2:github:nonce").await.is_some());
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn oauth2_authorize_url_omits_scope_when_empty() {
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: String::new(),
+            issuer: None,
+            jwks_url: None,
+        };
+        let url = oauth2_authorize_url(&session, "github", &provider)
+            .await
+            .unwrap();
+        assert!(!url.contains("scope="));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_id_token_requires_oidc_metadata() {
+        let provider = OAuth2ProviderConfig {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            authorize_url: "https://idp.example/authorize".into(),
+            token_url: "https://idp.example/token".into(),
+            userinfo_url: None,
+            redirect_uri: "http://localhost:3000/callback".into(),
+            scope: "openid profile".into(),
+            issuer: None,
+            jwks_url: None,
+        };
+        let err = validate_and_decode_id_token("bad.token.value", &provider)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "provider.issuer required for oidc");
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn parse_oauth2_token_response_supports_form_encoded_payload() {
+        let token = parse_oauth2_token_response(
+            Some("application/x-www-form-urlencoded"),
+            "access_token=abc123&token_type=bearer",
+        )
+        .unwrap();
+        assert_eq!(token.access_token, "abc123");
+        assert_eq!(token.token_type.as_deref(), Some("bearer"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn extract_subject_allows_userinfo_id_fallback() {
+        let claims = serde_json::json!({ "id": 42 });
+        let subject = extract_subject(&claims, IdentitySource::UserInfo).unwrap();
+        assert_eq!(subject, "42");
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_callback_state_preserves_state_on_mismatch() {
+        // An attacker hitting the callback with a wrong state must NOT
+        // consume the real state stored in the session; the legitimate
+        // provider redirect must still succeed.
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        session
+            .insert("oauth2:github:state".to_owned(), "real-state".to_owned())
+            .await;
+        let bad_callback = OAuth2Callback {
+            code: "c".into(),
+            state: "wrong-state".into(),
+        };
+        let err = validate_callback_state(&session, "github", &bad_callback)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("state mismatch"));
+        // Real state must still be present after the failed attempt.
+        assert_eq!(
+            session.get("oauth2:github:state").await.as_deref(),
+            Some("real-state")
+        );
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[tokio::test]
+    async fn validate_oidc_nonce_rejects_missing_nonce_for_id_token() {
+        // ID-token logins must fail when there is no stored nonce (e.g.,
+        // session was partially cleared or forged).
+        let session = crate::session::Session::new_for_test("s1".into(), HashMap::new());
+        // No nonce key inserted — simulates a cleared / missing session.
+        let claims = serde_json::json!({ "nonce": "any" });
+        let err = validate_oidc_nonce(&session, "github", &claims, IdentitySource::IdToken)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("nonce missing from session"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn extract_subject_requires_sub_for_id_token() {
+        let claims = serde_json::json!({ "id": "abc" });
+        let err = extract_subject(&claims, IdentitySource::IdToken).unwrap_err();
+        assert_eq!(err.to_string(), "missing sub claim");
     }
 
     #[test]
@@ -1081,5 +1692,86 @@ mod tests {
         let config = AuthConfig::default();
         assert_eq!(config.bcrypt_cost, DEFAULT_BCRYPT_COST);
         assert_eq!(config.session_key, "user_id");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password() {
+        let test_input = uuid::Uuid::new_v4().to_string();
+
+        // Test hashing
+        let hash = super::hash_password(&test_input)
+            .await
+            .expect("Failed to hash password");
+        assert!(hash.starts_with("$2b$"));
+
+        // Test verification with correct password
+        let is_valid = super::verify_password(&test_input, &hash)
+            .await
+            .expect("Failed to verify password");
+        assert!(is_valid, "Password should be verified successfully");
+
+        // Test verification with incorrect password
+        let is_invalid = super::verify_password(&uuid::Uuid::new_v4().to_string(), &hash)
+            .await
+            .expect("Failed to verify wrong password");
+        assert!(!is_invalid, "Wrong password should not be verified");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_empty() {
+        let test_input = String::new();
+        let hash = super::hash_password(&test_input)
+            .await
+            .expect("Failed to hash empty password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(&test_input, &hash)
+            .await
+            .expect("Failed to verify empty password");
+        assert!(is_valid, "Empty password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_long() {
+        // bcrypt truncates after 72 bytes. We just want to ensure it doesn't crash.
+        let test_input = "a".repeat(100);
+        let hash = super::hash_password(&test_input)
+            .await
+            .expect("Failed to hash long password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(&test_input, &hash)
+            .await
+            .expect("Failed to verify long password");
+        assert!(is_valid, "Long password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_hash_password_unicode() {
+        // Test with non-ascii characters
+        let test_input = format!("{}🚀my_secrët_passwörd🔑", uuid::Uuid::new_v4());
+        let hash = super::hash_password(&test_input)
+            .await
+            .expect("Failed to hash unicode password");
+        assert!(hash.starts_with("$2b$"));
+
+        let is_valid = super::verify_password(&test_input, &hash)
+            .await
+            .expect("Failed to verify unicode password");
+        assert!(is_valid, "Unicode password should be verified successfully");
+    }
+
+    #[tokio::test]
+    async fn test_verify_password_invalid_hash() {
+        // Ensure that providing invalid hashes doesn't crash or cause issues, but returns an error/false
+        let test_input = uuid::Uuid::new_v4().to_string();
+
+        // Invalid prefix
+        let result = super::verify_password(&test_input, "invalid_hash_string").await;
+        assert!(result.is_err() || !result.unwrap());
+
+        // Truncated hash
+        let result2 = super::verify_password(&test_input, "$2b$04$").await;
+        assert!(result2.is_err() || !result2.unwrap());
     }
 }

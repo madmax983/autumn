@@ -8,9 +8,10 @@
 //!
 //! | Component | Module | Description |
 //! |-----------|--------|-------------|
-//! | Security headers | [`headers`] | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
-//! | CSRF protection | [`csrf`] | Token-based CSRF validation for mutating requests |
-//! | Configuration | [`config`] | `[security]` section in `autumn.toml` |
+//! | Security headers | `headers` | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
+//! | CSRF protection | `csrf` | Token-based CSRF validation for mutating requests |
+//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
+//! | Configuration | `config` | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
 //! their own top-level modules ([`crate::auth`], [`crate::session`]).
@@ -36,7 +37,7 @@
 //! xss_protection = true                # X-XSS-Protection: 1; mode=block
 //! strict_transport_security = true     # HSTS (auto-enabled in prod)
 //! hsts_max_age_secs = 31536000         # 1 year
-//! content_security_policy = ""         # set to enable CSP
+//! content_security_policy = "default-src 'self'; ..."  # htmx-friendly default; "" disables
 //! referrer_policy = "strict-origin-when-cross-origin"
 //! permissions_policy = ""              # set to enable Permissions-Policy
 //!
@@ -44,6 +45,11 @@
 //! enabled = true                       # auto-enabled in prod
 //! token_header = "X-CSRF-Token"
 //! cookie_name = "autumn-csrf"
+//!
+//! [security.rate_limit]
+//! enabled = true                       # per-IP token bucket
+//! requests_per_second = 10.0
+//! burst = 20
 //! ```
 //!
 //! ## Quick start
@@ -67,11 +73,16 @@
 //! }
 //! ```
 
-pub mod config;
-pub mod csrf;
-pub mod headers;
+pub(crate) mod config;
+pub(crate) mod csrf;
+pub(crate) mod headers;
+pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
-pub use config::{CsrfConfig, HeadersConfig, SecurityConfig};
+pub use config::{
+    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
+    default_content_security_policy,
+};
 pub use csrf::{CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
+pub use rate_limit::RateLimitLayer;

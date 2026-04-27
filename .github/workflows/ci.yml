@@ -54,7 +54,12 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --all-features --no-report
+          cargo llvm-cov --no-report -p autumn-web --all-features \
+            --test db_hooks_lifecycle -- --ignored
+          cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
         with:
@@ -63,11 +68,13 @@ jobs:
           fail_ci_if_error: false
 
   msrv:
-    name: MSRV (1.86.0)
+    name: MSRV (1.88.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
+      - name: Check MSRV alignment
+        run: ./scripts/check-msrv.sh
       - name: Check MSRV compiles
         run: cargo check --workspace

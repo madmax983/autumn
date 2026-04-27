@@ -30,6 +30,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use std::time::Duration;
+use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
 use crate::error::AutumnError;
@@ -105,18 +106,52 @@ type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncP
 ///     Ok("database is reachable")
 /// }
 /// ```
-pub struct Db(PooledConnection);
+pub struct Db {
+    conn: PooledConnection,
+    /// Span covering the full checkout-to-release window. Dropped when
+    /// `Db` is dropped at the end of the request, so span duration
+    /// reflects real connection hold time rather than just `pool.get()`
+    /// latency. Exposed via [`Db::span`] so handlers can attach
+    /// per-query spans as children with
+    /// [`tracing::Instrument::instrument`].
+    span: tracing::Span,
+}
+
+impl Db {
+    /// Connection-scoped span. Instrument a query future with this to
+    /// emit a child span tagged under the connection checkout window.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use tracing::Instrument as _;
+    ///
+    /// # async fn example(mut db: Db) -> AutumnResult<()> {
+    /// let span = db.span().clone();
+    /// // run a Diesel query here, e.g. users::table.load(&mut *db)
+    /// async {
+    ///     // ... diesel_async query ...
+    ///     Ok::<_, AutumnError>(())
+    /// }
+    /// .instrument(span)
+    /// .await
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+}
 
 impl std::ops::Deref for Db {
     type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.conn
     }
 }
 
 impl std::ops::DerefMut for Db {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.conn
     }
 }
 
@@ -134,12 +169,101 @@ where
             .pool()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
-        let conn = pool.get().await.map_err(|e| {
-            tracing::error!("Failed to acquire database connection: {e}");
-            AutumnError::service_unavailable_msg(e.to_string())
-        })?;
+        // Span covers the full time the connection is held — from
+        // checkout through the end of the request — rather than just
+        // `pool.get()`. Dropping `Db` closes the span, so span duration
+        // reflects real connection hold time and `db.system=postgresql`
+        // propagates to any query futures handlers instrument with
+        // `db.span()`.
+        let span = tracing::info_span!(
+            "db.connection",
+            otel.kind = "client",
+            db.system = "postgresql",
+        );
+        let conn = async {
+            pool.get().await.map_err(|e| {
+                tracing::error!("Failed to acquire database connection: {e}");
+                AutumnError::service_unavailable_msg(e.to_string())
+            })
+        }
+        .instrument(span.clone())
+        .await?;
 
-        Ok(Self(conn))
+        Ok(Self { conn, span })
+    }
+}
+
+// ----------------------------------------------------------------------------
+// DatabasePoolProvider — tier-1 boot-time replaceable pool factory
+// ----------------------------------------------------------------------------
+
+/// Pluggable boot-time database pool factory.
+///
+/// Replace the default `deadpool + diesel-async` factory with a custom
+/// strategy (custom metrics wrapper, circuit breaker, separate pools per
+/// shard, etc.) by implementing this trait and installing it on the
+/// [`AppBuilder`](crate::app::AppBuilder) via
+/// [`with_pool_provider`](crate::app::AppBuilder::with_pool_provider).
+///
+/// The trait abstracts the *factory*, not the pool *type* — the return type is
+/// fixed at `Pool<AsyncPgConnection>` for now. Swapping to a different backend
+/// (e.g. `MySQL`, `SQLite`) would require generic `Pool<C>` propagation through
+/// `Db` / `DbState` / `AppState` and is intentionally out of scope.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use autumn_web::config::DatabaseConfig;
+/// use autumn_web::db::{DatabasePoolProvider, PoolError};
+/// use diesel_async::AsyncPgConnection;
+/// use diesel_async::pooled_connection::deadpool::Pool;
+///
+/// pub struct MetricsPoolProvider;
+///
+/// impl DatabasePoolProvider for MetricsPoolProvider {
+///     async fn create_pool(
+///         &self,
+///         config: &DatabaseConfig,
+///     ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+///         // Wrap the default pool with custom metrics, then return it.
+///         autumn_web::db::create_pool(config)
+///     }
+/// }
+/// ```
+pub trait DatabasePoolProvider: Send + Sync + 'static {
+    /// Create a connection pool from the resolved [`DatabaseConfig`].
+    ///
+    /// Returning `Ok(None)` signals that the application should run without a
+    /// database — useful for static-site / API-gateway use cases or for
+    /// disabling the DB in test contexts.
+    fn create_pool(
+        &self,
+        config: &DatabaseConfig,
+    ) -> impl std::future::Future<Output = Result<Option<Pool<AsyncPgConnection>>, PoolError>> + Send;
+}
+
+/// Default [`DatabasePoolProvider`] — the `deadpool + diesel-async` factory.
+///
+/// Delegates to the free function [`create_pool`]. This is the provider used
+/// when no override is installed via
+/// [`with_pool_provider`](crate::app::AppBuilder::with_pool_provider).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DieselDeadpoolPoolProvider;
+
+impl DieselDeadpoolPoolProvider {
+    /// Construct a new default provider.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
+    async fn create_pool(
+        &self,
+        config: &DatabaseConfig,
+    ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+        create_pool(config)
     }
 }
 
@@ -149,7 +273,70 @@ mod tests {
     use crate::config::DatabaseConfig;
     use std::time::Duration;
 
+    // ── Pool provider trait tests ────────────────────────────────
+
+    /// No-op provider for tests — always returns `Ok(None)` regardless of the
+    /// supplied config. Verifies the trait actually overrides the default
+    /// (which would otherwise build a pool from the URL).
+    struct NoOpPoolProvider;
+
+    impl DatabasePoolProvider for NoOpPoolProvider {
+        async fn create_pool(
+            &self,
+            _config: &DatabaseConfig,
+        ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_provider_trait_returns_supplied_pool() {
+        // Even with a configured URL, the no-op provider returns None — proving
+        // the trait can replace the default factory's behaviour.
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/ignored".to_owned()),
+            ..Default::default()
+        };
+        let provider = NoOpPoolProvider;
+        let pool = provider
+            .create_pool(&config)
+            .await
+            .expect("no-op provider should succeed");
+        assert!(
+            pool.is_none(),
+            "no-op provider must override default behaviour"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_pool_provider_matches_free_function() {
+        let config = DatabaseConfig::default();
+        let via_provider = DieselDeadpoolPoolProvider::new()
+            .create_pool(&config)
+            .await
+            .expect("default provider should succeed");
+        let via_function = create_pool(&config).expect("free fn should succeed");
+        assert_eq!(via_provider.is_none(), via_function.is_none());
+    }
+
     // ── Pool creation tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn default_pool_provider_respects_url_config() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/test".into()),
+            ..Default::default()
+        };
+        let provider = DieselDeadpoolPoolProvider::new();
+        let pool = provider
+            .create_pool(&config)
+            .await
+            .expect("default provider should succeed");
+        assert!(
+            pool.is_some(),
+            "default provider should return Some when url is provided"
+        );
+    }
 
     #[test]
     fn create_pool_with_no_url_returns_none() {

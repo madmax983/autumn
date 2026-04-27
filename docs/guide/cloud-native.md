@@ -64,6 +64,22 @@ protocol = "Grpc"
 If you are not ready for OTLP yet, force `log.format = "Json"` so your logs are
 at least machine-readable.
 
+### What you get automatically
+
+With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
+
+- **W3C Trace Context propagation.** Incoming `traceparent` / `tracestate`
+  headers are extracted and attached to a server span; the current context
+  is injected back into the response headers so callers can continue the
+  trace. No manual middleware setup required.
+- **Scheduled task traces.** Each invocation of a `#[scheduled]` function
+  runs inside a fresh root span (`scheduled_task` / `task=<name>`) so
+  every run shows up as its own trace in your APM.
+- **Database spans.** The `Db` extractor opens a `db.connection.acquire`
+  span tagged with `db.system=postgresql` whose scope covers the lifetime
+  of the pooled connection — Diesel activity performed through it appears
+  as a child of the request span in Jaeger / Tempo / Datadog.
+
 ## Sessions
 
 In-memory sessions are fine for local development and single-process demos.
