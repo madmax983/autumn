@@ -41,17 +41,15 @@ pub fn plan_model(
 
     let mod_path = models_dir.join("mod.rs");
     let mod_existing = read_or_empty(&mod_path);
-    plan.modify(
-        mod_path,
-        add_mod_declaration(&mod_existing, &snake_name),
-    );
+    plan.modify(mod_path, add_mod_declaration(&mod_existing, &snake_name));
 
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
-    let migration_dir = project_root
-        .join("migrations")
-        .join(&migration_dir_name);
-    plan.create(migration_dir.join("up.sql"), create_table_sql(&table, &fields));
+    let migration_dir = project_root.join("migrations").join(&migration_dir_name);
+    plan.create(
+        migration_dir.join("up.sql"),
+        create_table_sql(&table, &fields),
+    );
     plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
 
     // (c) `src/schema.rs` entry
@@ -80,7 +78,10 @@ pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
             "must start with a letter".into(),
         ));
     }
-    if let Some(bad) = name.chars().find(|c| !c.is_ascii_alphanumeric() && *c != '_') {
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '_')
+    {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
             format!("contains invalid character '{bad}'"),
@@ -181,8 +182,7 @@ mod tests {
     #[test]
     fn plan_rejects_lowercase_first_char() {
         let tmp = project();
-        let err =
-            plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
+        let err = plan_model(tmp.path(), "123Bad", &[], "20260427000000").unwrap_err();
         assert!(matches!(err, GenerateError::InvalidName(_, _)));
     }
 
@@ -228,7 +228,8 @@ mod tests {
         assert!(model.contains("created_at: chrono::NaiveDateTime"));
 
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
         )
         .unwrap();
         assert!(up.contains("CREATE TABLE posts ("));

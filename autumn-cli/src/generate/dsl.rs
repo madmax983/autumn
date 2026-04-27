@@ -144,10 +144,12 @@ pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
 /// Returns [`GenerateError::InvalidField`] if the token is malformed or the
 /// type is not in the supported set.
 pub fn parse_field(token: &str) -> Result<Field, GenerateError> {
-    let (name, ty) = token.split_once(':').ok_or_else(|| GenerateError::InvalidField {
-        token: token.to_owned(),
-        reason: "expected `name:Type` (missing colon)".into(),
-    })?;
+    let (name, ty) = token
+        .split_once(':')
+        .ok_or_else(|| GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: "expected `name:Type` (missing colon)".into(),
+        })?;
 
     let name = name.trim();
     let ty = ty.trim();

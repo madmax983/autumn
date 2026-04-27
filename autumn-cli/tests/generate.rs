@@ -84,11 +84,7 @@ fn generate_model_in_fresh_project() {
     let migrations = fs::read_dir(project.join("migrations"))
         .unwrap()
         .filter_map(Result::ok)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .ends_with("_create_posts")
-        })
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
         .collect::<Vec<_>>();
     assert_eq!(migrations.len(), 1);
     let dir = migrations[0].path();
@@ -106,13 +102,7 @@ fn generate_model_dry_run_writes_nothing() {
     let (_tmp, project) = fresh_project("dryrun-app");
     let (stdout, _stderr) = run_autumn(
         &project,
-        &[
-            "generate",
-            "model",
-            "Post",
-            "title:String",
-            "--dry-run",
-        ],
+        &["generate", "model", "Post", "title:String", "--dry-run"],
     );
     assert!(stdout.contains("Dry run"));
     assert!(stdout.contains("src/models/post.rs"));
@@ -123,15 +113,10 @@ fn generate_model_dry_run_writes_nothing() {
 #[test]
 fn generate_model_collision_without_force() {
     let (_tmp, project) = fresh_project("collide-app");
-    run_autumn(
-        &project,
-        &["generate", "model", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
     // Re-run without --force. Should fail with collision message.
-    let (_, stderr, code) = run_autumn_failing(
-        &project,
-        &["generate", "model", "Post", "title:String"],
-    );
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "model", "Post", "title:String"]);
     assert_eq!(code, Some(1));
     assert!(
         stderr.contains("would overwrite") && stderr.contains("post.rs"),
@@ -142,23 +127,14 @@ fn generate_model_collision_without_force() {
 #[test]
 fn generate_model_force_overwrites() {
     let (_tmp, project) = fresh_project("force-app");
-    run_autumn(
-        &project,
-        &["generate", "model", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
     // Modify the model file so we can detect the overwrite.
     let model_path = project.join("src/models/post.rs");
     let original = fs::read_to_string(&model_path).unwrap();
     fs::write(&model_path, "// touched").unwrap();
     run_autumn(
         &project,
-        &[
-            "generate",
-            "model",
-            "Post",
-            "title:String",
-            "--force",
-        ],
+        &["generate", "model", "Post", "title:String", "--force"],
     );
     let regenerated = fs::read_to_string(&model_path).unwrap();
     assert_eq!(regenerated, original);
@@ -167,10 +143,8 @@ fn generate_model_force_overwrites() {
 #[test]
 fn generate_model_invalid_field_lists_supported_set() {
     let (_tmp, project) = fresh_project("badtype-app");
-    let (_, stderr, code) = run_autumn_failing(
-        &project,
-        &["generate", "model", "Post", "price:Decimal"],
-    );
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "model", "Post", "price:Decimal"]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("unsupported type"));
     assert!(stderr.contains("Supported:"));
@@ -182,12 +156,7 @@ fn generate_migration_add_columns_emits_alter() {
     let (_tmp, project) = fresh_project("migrate-app");
     run_autumn(
         &project,
-        &[
-            "generate",
-            "migration",
-            "AddTitleToPosts",
-            "title:String",
-        ],
+        &["generate", "migration", "AddTitleToPosts", "title:String"],
     );
     let migrations = fs::read_dir(project.join("migrations"))
         .unwrap()
@@ -199,18 +168,14 @@ fn generate_migration_add_columns_emits_alter() {
         })
         .collect::<Vec<_>>();
     assert_eq!(migrations.len(), 1);
-    let up =
-        fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
     assert!(up.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL"));
 }
 
 #[test]
 fn generate_migration_unknown_pattern_is_empty() {
     let (_tmp, project) = fresh_project("empty-mig-app");
-    run_autumn(
-        &project,
-        &["generate", "migration", "BackfillSomething"],
-    );
+    run_autumn(&project, &["generate", "migration", "BackfillSomething"]);
     let migrations = fs::read_dir(project.join("migrations"))
         .unwrap()
         .filter_map(Result::ok)
@@ -221,8 +186,7 @@ fn generate_migration_unknown_pattern_is_empty() {
         })
         .collect::<Vec<_>>();
     assert_eq!(migrations.len(), 1);
-    let up =
-        fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
     assert!(up.is_empty());
 }
 
@@ -299,10 +263,8 @@ fn generate_scaffold_full_e2e_post() {
 #[test]
 fn generate_outside_project_root_fails_clearly() {
     let tmp = tempfile::tempdir().unwrap();
-    let (_, stderr, code) = run_autumn_failing(
-        tmp.path(),
-        &["generate", "model", "Post", "title:String"],
-    );
+    let (_, stderr, code) =
+        run_autumn_failing(tmp.path(), &["generate", "model", "Post", "title:String"]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("not inside an Autumn project"));
 }
@@ -372,10 +334,7 @@ diesel-async = { version = \"0.8\", features = [\"postgres\"] }\n\
 diesel_migrations = \"2\"\n\
 maud = { version = \"0.27\", features = [\"axum\"] }\n\
 serde = { version = \"1\", features = [\"derive\"] }\n";
-    content = content.replace(
-        "[dependencies]",
-        &format!("[dependencies]{dep_block}"),
-    );
+    content = content.replace("[dependencies]", &format!("[dependencies]{dep_block}"));
     fs::write(&cargo_toml_path, content).unwrap();
     // Drop build.rs so we don't need the Tailwind CLI installed.
     let _ = fs::remove_file(project.join("build.rs"));

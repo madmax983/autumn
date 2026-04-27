@@ -360,7 +360,11 @@ async fn main() {
         let plan = plan_scaffold(
             tmp.path(),
             "Post",
-            &["title:String".into(), "body:Text".into(), "published:bool".into()],
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
             "20260427000000",
         )
         .unwrap();

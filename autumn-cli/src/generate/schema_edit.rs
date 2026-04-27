@@ -358,7 +358,11 @@ fn augment_routes_body(body: &str, entries: &[String]) -> String {
 fn leading_indent(body: &str) -> String {
     body.lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.chars().take_while(|c| *c == ' ' || *c == '\t').collect::<String>())
+        .map(|l| {
+            l.chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect::<String>()
+        })
         .max_by_key(String::len)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "            ".to_owned())
@@ -370,10 +374,7 @@ mod tests {
     use crate::generate::dsl::parse_field;
 
     fn fields(tokens: &[&str]) -> Vec<Field> {
-        tokens
-            .iter()
-            .map(|t| parse_field(t).unwrap())
-            .collect()
+        tokens.iter().map(|t| parse_field(t).unwrap()).collect()
     }
 
     #[test]

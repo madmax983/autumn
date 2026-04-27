@@ -112,7 +112,9 @@ mod tests {
         let tmp = project();
         let plan = plan_migration(tmp.path(), "BackfillSomething", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
-        let dir = tmp.path().join("migrations/20260427000000_backfill_something");
+        let dir = tmp
+            .path()
+            .join("migrations/20260427000000_backfill_something");
         let up = fs::read_to_string(dir.join("up.sql")).unwrap();
         let down = fs::read_to_string(dir.join("down.sql")).unwrap();
         assert!(up.is_empty());
@@ -131,7 +133,8 @@ mod tests {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_add_title_to_posts/up.sql"),
+            tmp.path()
+                .join("migrations/20260427000000_add_title_to_posts/up.sql"),
         )
         .unwrap();
         let down = fs::read_to_string(
@@ -168,7 +171,8 @@ mod tests {
         let plan = plan_migration(tmp.path(), "AddTitleToPosts", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_add_title_to_posts/up.sql"),
+            tmp.path()
+                .join("migrations/20260427000000_add_title_to_posts/up.sql"),
         )
         .unwrap();
         assert!(up.is_empty());
@@ -186,7 +190,8 @@ mod tests {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_add_title_to_posts/up.sql"),
+            tmp.path()
+                .join("migrations/20260427000000_add_title_to_posts/up.sql"),
         )
         .unwrap();
         assert!(up.contains("ALTER TABLE posts ADD COLUMN title TEXT NOT NULL"));

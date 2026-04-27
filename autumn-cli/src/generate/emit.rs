@@ -259,5 +259,4 @@ mod tests {
         assert!(msg.contains(a.display().to_string().as_str()));
         assert!(msg.contains(b.display().to_string().as_str()));
     }
-
 }
