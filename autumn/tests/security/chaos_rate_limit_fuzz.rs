@@ -68,4 +68,16 @@ async fn havoc_rate_limit_fuzz_bounds() {
         // Should not panic on third request (ensures deficit calculation is fully evaluated)
         let _ = svc.ready().await.unwrap().call(req3).await;
     }
+
+    // Force evaluate remaining_tokens branches
+    let config = RateLimitConfig {
+        enabled: true,
+        requests_per_second: f64::MAX,
+        burst: u32::MAX,
+        trust_forwarded_headers: true,
+    };
+    let layer = RateLimitLayer::from_config(&config);
+    let mut svc = layer.layer(MockService);
+    let req = Request::builder().header("X-Forwarded-For", "1.2.3.4").body(Body::empty()).unwrap();
+    let _ = svc.ready().await.unwrap().call(req).await;
 }
