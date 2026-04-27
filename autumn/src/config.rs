@@ -384,13 +384,6 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             let mut storage = toml::map::Map::new();
             storage.insert("backend".into(), "local".into());
             table.insert("storage".into(), toml::Value::Table(storage));
-            #[cfg(feature = "mail")]
-            {
-                let mut mail = toml::map::Map::new();
-                mail.insert("transport".into(), "log".into());
-                table.insert("mail".into(), toml::Value::Table(mail));
-            }
-
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -433,6 +426,25 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     }
 
     toml::Value::Table(table)
+}
+
+#[cfg(feature = "mail")]
+fn has_mail_config_source(merged: &toml::Value, env: &dyn Env) -> bool {
+    merged.get("mail").is_some()
+        || [
+            "AUTUMN_MAIL__TRANSPORT",
+            "AUTUMN_MAIL__FROM",
+            "AUTUMN_MAIL__REPLY_TO",
+            "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
+            "AUTUMN_MAIL__FILE_DIR",
+            "AUTUMN_MAIL__SMTP__HOST",
+            "AUTUMN_MAIL__SMTP__PORT",
+            "AUTUMN_MAIL__SMTP__USERNAME",
+            "AUTUMN_MAIL__SMTP__PASSWORD_ENV",
+            "AUTUMN_MAIL__SMTP__TLS",
+        ]
+        .into_iter()
+        .any(|key| env.var(key).is_ok())
 }
 
 /// Maximum recursion depth for merging TOML tables.
@@ -721,6 +733,11 @@ impl AutumnConfig {
 
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
+
+        #[cfg(feature = "mail")]
+        if config.profile.as_deref() == Some("dev") && !has_mail_config_source(&merged, env) {
+            config.mail.transport = crate::mail::Transport::Log;
+        }
 
         config.validate()?;
         Ok(config)

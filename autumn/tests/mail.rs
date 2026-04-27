@@ -40,6 +40,25 @@ from = "noreply@example.com"
     );
 }
 
+#[test]
+fn mail_table_without_transport_stays_disabled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("autumn.toml"),
+        r#"
+[mail]
+from = "noreply@example.com"
+"#,
+    )
+    .expect("write config");
+    let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+
+    let config = AutumnConfig::load_with_env(&env).expect("config should load");
+
+    assert_eq!(config.mail.transport, Transport::Disabled);
+    assert_eq!(config.mail.from.as_deref(), Some("noreply@example.com"));
+}
+
 #[tokio::test]
 async fn file_transport_writes_rfc822_message_for_inspection() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -69,6 +88,45 @@ async fn file_transport_writes_rfc822_message_for_inspection() {
     assert!(body.contains("From: Autumn <noreply@example.com>"));
     assert!(body.contains("Subject: Reset your password"));
     assert!(body.contains("Use code 123456"));
+}
+
+#[tokio::test]
+async fn file_transport_keeps_both_messages_for_same_recipient() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mailer = Mailer::builder()
+        .from("Autumn <noreply@example.com>")
+        .transport(Transport::File)
+        .file_dir(dir.path())
+        .build()
+        .expect("file mailer should build");
+
+    let first = Mail::builder()
+        .to("Ada Lovelace <ada@example.com>")
+        .subject("First")
+        .text("first body")
+        .build()
+        .expect("first mail should build");
+    let second = Mail::builder()
+        .to("Ada Lovelace <ada@example.com>")
+        .subject("Second")
+        .text("second body")
+        .build()
+        .expect("second mail should build");
+
+    let (first_result, second_result) = tokio::join!(mailer.send(first), mailer.send(second));
+    first_result.expect("first send should succeed");
+    second_result.expect("second send should succeed");
+
+    let mut bodies = std::fs::read_dir(dir.path())
+        .expect("mail dir exists")
+        .map(|entry| entry.expect("dir entry").path())
+        .map(|path| std::fs::read_to_string(path).expect("eml readable"))
+        .collect::<Vec<_>>();
+    bodies.sort();
+
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies.iter().any(|body| body.contains("Subject: First")));
+    assert!(bodies.iter().any(|body| body.contains("Subject: Second")));
 }
 
 #[tokio::test]

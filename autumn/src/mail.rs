@@ -7,6 +7,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
@@ -23,13 +24,13 @@ use crate::{AppState, AutumnError, AutumnResult};
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     /// Write full email contents to the tracing log at INFO.
-    #[default]
     Log,
     /// Write RFC 822 `.eml` files under `target/mail` or a configured dir.
     File,
     /// Send through SMTP using Lettre.
     Smtp,
     /// Drop all email sends successfully.
+    #[default]
     Disabled,
 }
 
@@ -557,6 +558,8 @@ struct FileTransport {
     dir: PathBuf,
 }
 
+static FILE_TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl MailTransport for FileTransport {
     fn send<'a>(
         &'a self,
@@ -564,13 +567,15 @@ impl MailTransport for FileTransport {
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
         Box::pin(async move {
             tokio::fs::create_dir_all(&self.dir).await?;
-            let filename = format!(
-                "{}-{}.eml",
-                chrono::Utc::now().format("%Y%m%d%H%M%S%3f"),
-                sanitize_filename(mail.to.first().map_or("unknown", String::as_str))
-            );
+            let filename = file_transport_filename(&mail);
             let path = self.dir.join(filename);
-            tokio::fs::write(path, render_eml(&mail)).await?;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .await?;
+            let eml = render_eml(&mail);
+            tokio::io::AsyncWriteExt::write_all(&mut file, eml.as_bytes()).await?;
             Ok(())
         })
     }
@@ -632,6 +637,17 @@ fn sanitize_filename(value: &str) -> String {
             }
         })
         .collect()
+}
+
+fn file_transport_filename(mail: &Mail) -> String {
+    let sequence = FILE_TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{:016x}-{}.eml",
+        chrono::Utc::now().format("%Y%m%d%H%M%S%6f"),
+        std::process::id(),
+        sequence,
+        sanitize_filename(mail.to.first().map_or("unknown", String::as_str))
+    )
 }
 
 fn render_eml(mail: &Mail) -> String {
@@ -750,5 +766,27 @@ mod tests {
             sanitize_filename("Ada Lovelace <ada@example.com>"),
             "Ada_Lovelace__ada_example.com_"
         );
+    }
+
+    #[test]
+    fn transport_default_is_disabled() {
+        assert_eq!(Transport::default(), Transport::Disabled);
+    }
+
+    #[test]
+    fn file_transport_filename_is_unique_for_same_recipient() {
+        let mail = Mail::builder()
+            .to("Ada Lovelace <ada@example.com>")
+            .subject("Hello")
+            .text("body")
+            .build()
+            .expect("mail should build");
+
+        let first = file_transport_filename(&mail);
+        let second = file_transport_filename(&mail);
+
+        assert_ne!(first, second);
+        assert!(first.ends_with(".eml"));
+        assert!(second.ends_with(".eml"));
     }
 }
