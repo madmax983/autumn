@@ -246,9 +246,12 @@ fn is_valid_ident(s: &str) -> bool {
 }
 
 /// Strict and reserved Rust keywords that cannot appear as a struct field name
-/// without raw-identifier syntax. Rather than emitting `r#type:` we reject the
-/// input so the generator never produces broken code.
-const RUST_KEYWORDS: &[&str] = &[
+/// or module name without raw-identifier syntax. Rather than emitting `r#type:`
+/// we reject the input so the generator never produces broken code.
+///
+/// Public so the resource-name validator in [`super::model`] can share the same
+/// list.
+pub(super) const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "do", "dyn", "else", "enum",
     "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
     "mut", "pub", "ref", "return", "self", "static", "struct", "super", "trait", "true", "try",
@@ -256,7 +259,7 @@ const RUST_KEYWORDS: &[&str] = &[
     "macro", "override", "priv", "typeof", "unsized", "virtual",
 ];
 
-fn is_rust_keyword(s: &str) -> bool {
+pub(super) fn is_rust_keyword(s: &str) -> bool {
     RUST_KEYWORDS.contains(&s)
 }
 

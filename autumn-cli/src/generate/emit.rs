@@ -146,8 +146,12 @@ impl Plan {
 }
 
 fn relative_display(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+    let display = path
+        .strip_prefix(root)
+        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
+    // Always render with forward slashes so the generator's output (and any
+    // tests that grep for it) is platform-consistent.
+    display.replace('\\', "/")
 }
 
 #[cfg(test)]

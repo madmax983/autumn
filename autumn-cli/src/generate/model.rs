@@ -27,6 +27,7 @@ pub fn plan_model(
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
     let fields = parse_fields(field_tokens)?;
+    validate_field_names(&fields)?;
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -194,7 +195,7 @@ fn dep_section_has(dep_section: &[&str], crate_name: &str) -> bool {
 
 /// Reserved resource names whose snake-case form would collide with a special
 /// file in the generated layout (e.g. `mod` → `src/models/mod.rs`).
-const RESERVED_RESOURCE_NAMES: &[&str] = &["mod", "main", "lib", "self", "super", "crate"];
+const RESERVED_RESOURCE_NAMES: &[&str] = &["main", "lib"];
 
 /// Validate a resource name is a non-empty `PascalCase` or `snake_case` identifier.
 pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
@@ -221,6 +222,17 @@ pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
         ));
     }
     let snake_name = super::naming::snake(name);
+    // Snake-case form is used as a module name (`pub mod <snake_name>;`) and as
+    // a `crate::models::<snake_name>::…` import path. Rust keywords like `type`,
+    // `match`, and `mod` would emit syntactically invalid code.
+    if super::dsl::is_rust_keyword(&snake_name) {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            format!(
+                "'{name}' is a Rust keyword (its snake_case form '{snake_name}' cannot be a module name)"
+            ),
+        ));
+    }
     if RESERVED_RESOURCE_NAMES.contains(&snake_name.as_str()) {
         return Err(GenerateError::InvalidName(
             name.to_owned(),
@@ -228,6 +240,28 @@ pub(super) fn validate_resource_name(name: &str) -> Result<(), GenerateError> {
                 "'{name}' is reserved — its snake_case form ('{snake_name}') collides with a special file"
             ),
         ));
+    }
+    Ok(())
+}
+
+/// Field names the model template emits unconditionally (`id` and
+/// `created_at`). User-provided fields with these names would produce
+/// duplicate struct members and duplicate columns in the migration.
+const RESERVED_FIELD_NAMES: &[&str] = &["id", "created_at"];
+
+/// Reject user fields whose name collides with a column the template always
+/// emits.
+fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
+    for f in fields {
+        if RESERVED_FIELD_NAMES.contains(&f.name.as_str()) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:{}", f.name, f.rust_type()),
+                reason: format!(
+                    "'{}' is reserved — the generator always emits this column",
+                    f.name
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -299,6 +333,8 @@ mod tests {
                     .unwrap()
                     .display()
                     .to_string()
+                    // Normalize for cross-platform comparisons (Windows uses `\`).
+                    .replace('\\', "/")
             })
             .collect()
     }
@@ -339,9 +375,42 @@ mod tests {
                 matches!(err, GenerateError::InvalidName(_, _)),
                 "expected '{name}' to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn plan_rejects_keyword_resource_names() {
+        // `Type` → `mod type;` is invalid Rust syntax without raw idents.
+        for name in ["Type", "type", "Match", "match", "Self", "Trait"] {
+            let tmp = project();
+            let err = plan_model(tmp.path(), name, &[], "20260427000000").unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidName(_, _)),
+                "expected '{name}' to be rejected as a keyword"
+            );
+            assert!(
+                err.to_string().contains("keyword"),
+                "expected keyword error for '{name}'; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_rejects_id_or_created_at_as_user_field() {
+        // The model template always emits `id` and `created_at`. Letting the
+        // user re-declare them would produce duplicate struct members and
+        // duplicate SQL columns.
+        for token in ["id:i64", "created_at:NaiveDateTime"] {
+            let tmp = project();
+            let err =
+                plan_model(tmp.path(), "Post", &[token.into()], "20260427000000").unwrap_err();
+            assert!(
+                matches!(err, GenerateError::InvalidField { .. }),
+                "expected '{token}' to be rejected"
+            );
             assert!(
                 err.to_string().contains("reserved"),
-                "expected reserved-name error for '{name}'"
+                "expected reserved-field error for '{token}'; got: {err}"
             );
         }
     }

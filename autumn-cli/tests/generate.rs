@@ -215,7 +215,7 @@ fn generate_scaffold_full_e2e_post() {
     assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
     assert!(repo.contains("pub trait PostRepository"));
 
-    // HTML routes — index/show/new/edit/create only; update + delete go
+    // HTML routes — index/show/new/create/edit_form/update; delete goes
     // through the repository's auto-generated JSON REST API.
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     for needle in [
@@ -224,8 +224,10 @@ fn generate_scaffold_full_e2e_post() {
         "#[get(\"/posts/new\")]",
         "#[post(\"/posts\")]",
         "#[get(\"/posts/{id}/edit\")]",
+        "#[post(\"/posts/{id}/update\")]",
         "pub async fn index",
         "pub async fn show",
+        "pub async fn update",
     ] {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
@@ -247,6 +249,7 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::new_form",
         "routes::posts::create",
         "routes::posts::edit_form",
+        "routes::posts::update",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
         "repositories::post::post_api_create",

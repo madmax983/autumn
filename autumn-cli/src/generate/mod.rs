@@ -52,7 +52,7 @@ pub enum GenerateError {
 fn format_collisions(paths: &[PathBuf]) -> String {
     paths
         .iter()
-        .map(|p| format!("  {}", p.display()))
+        .map(|p| format!("  {}", p.display().to_string().replace('\\', "/")))
         .collect::<Vec<_>>()
         .join("\n")
 }
