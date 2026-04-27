@@ -27,8 +27,8 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, tasks,
+    api_doc, cached, delete, get, mailer, main, oauth2_callback, post, put, routes, scheduled,
+    secured, service, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -60,6 +60,8 @@ pub use crate::htmx::HxResponseExt;
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+#[cfg(feature = "mail")]
+pub use crate::mail::{Mail, Mailer};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// State extractor.

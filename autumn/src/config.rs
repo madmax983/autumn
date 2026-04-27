@@ -374,6 +374,10 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             );
             table.insert("cors".into(), toml::Value::Table(cors));
 
+            let mut mail = toml::map::Map::new();
+            mail.insert("transport".into(), "log".into());
+            table.insert("mail".into(), toml::Value::Table(mail));
+
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -607,6 +611,11 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
 
+    /// Transactional email settings.
+    #[cfg(feature = "mail")]
+    #[serde(default)]
+    pub mail: crate::mail::MailConfig,
+
     /// Security settings (headers, CSRF).
     #[serde(default)]
     pub security: crate::security::config::SecurityConfig,
@@ -729,6 +738,10 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        #[cfg(feature = "mail")]
+        self.mail
+            .validate(self.profile.as_deref())
+            .map_err(ConfigError::Validation)?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -791,6 +804,8 @@ impl AutumnConfig {
         self.apply_cors_env_overrides_with_env(env);
         self.apply_session_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
+        #[cfg(feature = "mail")]
+        self.apply_mail_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
     }
 
@@ -980,6 +995,65 @@ impl AutumnConfig {
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
+    }
+
+    #[cfg(feature = "mail")]
+    fn apply_mail_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_MAIL__TRANSPORT") {
+            match val.to_lowercase().as_str() {
+                "log" => self.mail.transport = crate::mail::MailTransport::Log,
+                "file" => self.mail.transport = crate::mail::MailTransport::File,
+                "smtp" => self.mail.transport = crate::mail::MailTransport::Smtp,
+                "disabled" => self.mail.transport = crate::mail::MailTransport::Disabled,
+                _ => eprintln!(
+                    "Warning: AUTUMN_MAIL__TRANSPORT={val:?} is not valid \
+                     (expected log, file, smtp, or disabled), ignoring"
+                ),
+            }
+        }
+        parse_env_string(env, "AUTUMN_MAIL__FROM", &mut self.mail.from);
+        parse_env_option_string(env, "AUTUMN_MAIL__REPLY_TO", &mut self.mail.reply_to);
+        parse_env_bool(
+            env,
+            "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
+            &mut self.mail.allow_log_in_production,
+        );
+        if let Ok(dir) = env.var("AUTUMN_MAIL__FILE_OUTPUT_DIR") {
+            self.mail.file_output_dir = PathBuf::from(dir);
+        }
+        parse_env_option_string(env, "AUTUMN_MAIL__SMTP__HOST", &mut self.mail.smtp.host);
+        if let Ok(val) = env.var("AUTUMN_MAIL__SMTP__PORT") {
+            match val.parse::<u16>() {
+                Ok(port) => self.mail.smtp.port = Some(port),
+                Err(_) => {
+                    eprintln!("Warning: AUTUMN_MAIL__SMTP__PORT={val:?} is not valid u16, ignoring")
+                }
+            }
+        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__USERNAME",
+            &mut self.mail.smtp.username,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__PASSWORD_ENV",
+            &mut self.mail.smtp.password_env,
+        );
+        if let Ok(mode) = env.var("AUTUMN_MAIL__SMTP__SECURITY") {
+            self.mail.smtp.security = match mode.to_lowercase().as_str() {
+                "starttls" => crate::mail::SmtpSecurityMode::StartTls,
+                "tls" => crate::mail::SmtpSecurityMode::Tls,
+                "none" => crate::mail::SmtpSecurityMode::None,
+                _ => {
+                    eprintln!(
+                        "Warning: AUTUMN_MAIL__SMTP__SECURITY={mode:?} is not valid \
+                         (expected starttls, tls, or none), ignoring"
+                    );
+                    self.mail.smtp.security.clone()
+                }
+            };
+        }
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.

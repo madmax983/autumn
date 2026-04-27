@@ -1057,6 +1057,8 @@ impl AppBuilder {
         // SessionStore was installed via with_session_store(...). Done before
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        #[cfg(feature = "mail")]
+        fail_fast_on_invalid_mail_config(&config);
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
@@ -1083,6 +1085,8 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        install_mailer_extension(&state, &config);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1244,6 +1248,8 @@ impl AppBuilder {
         // was installed. Symmetrical to the same check in run() so static
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        #[cfg(feature = "mail")]
+        fail_fast_on_invalid_mail_config(&config);
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
@@ -1259,6 +1265,8 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        install_mailer_extension(&state, &config);
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -1674,6 +1682,26 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
         eprintln!("Invalid session backend config: {error}");
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "mail")]
+fn fail_fast_on_invalid_mail_config(config: &AutumnConfig) {
+    if let Err(error) = config.mail.validate(config.profile.as_deref()) {
+        eprintln!("Invalid mail config: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "mail")]
+fn install_mailer_extension(state: &AppState, config: &AutumnConfig) {
+    let mailer = config
+        .mail
+        .build_mailer(config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize mailer: {error}");
+            std::process::exit(1);
+        });
+    state.insert_extension(mailer);
 }
 
 async fn load_config_and_telemetry(

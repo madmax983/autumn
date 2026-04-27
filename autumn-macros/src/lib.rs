@@ -14,6 +14,7 @@
 mod api_doc;
 mod cached;
 mod collect;
+mod mailer_macro;
 mod main_macro;
 mod model;
 mod oauth2_callback;
@@ -175,6 +176,14 @@ pub fn routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Mark a mailer struct or impl block.
+///
+/// This macro is currently a marker hook and keeps the annotated item unchanged.
+#[proc_macro_attribute]
+pub fn mailer(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    mailer_macro::mailer_macro(item.into()).into()
 }
 
 /// Attribute macro for Autumn database models.

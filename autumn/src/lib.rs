@@ -104,6 +104,8 @@ pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
 pub(crate) mod logging;
+#[cfg(feature = "mail")]
+pub mod mail;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
@@ -199,6 +201,8 @@ pub use validation::Validated;
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+#[cfg(feature = "mail")]
+pub use mail::{Mail, MailConfig, MailTransport, Mailer};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
@@ -259,6 +263,9 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Mark a struct/impl as an Autumn mailer type.
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer;
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup
