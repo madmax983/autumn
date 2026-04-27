@@ -9,3 +9,4 @@ pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
 pub mod session_fixation;
+pub mod csrf_htmx_advisory;
