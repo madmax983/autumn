@@ -8,6 +8,7 @@ resolver = "3"
 # different crates and types wouldn't unify across the boundary).
 [patch.crates-io]
 autumn-web = { path = "autumn" }
+autumn-harvest-plugin = { path = "patched-crates/autumn-harvest-plugin" }
 
 [workspace.package]
 edition = "2024"
