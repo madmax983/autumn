@@ -209,6 +209,32 @@ impl<'a> MultipartField<'a> {
         self.inner.content_type()
     }
 
+    /// Tighten the per-field upload cap below the global
+    /// `security.upload.max_file_size_bytes`.
+    ///
+    /// Routes can use this to enforce stricter caps than the global
+    /// policy. The effective cap is `min(current, max)` — calling this
+    /// with a value larger than the global is a no-op, so a route
+    /// can't accidentally relax the framework-level limit.
+    ///
+    /// Returns `413 Payload Too Large` if subsequent reads exceed the
+    /// tightened cap, just like the unchained form.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Cap avatar uploads at 2 MiB even if the global cap is higher.
+    /// let blob = field
+    ///     .with_max_bytes(2 * 1024 * 1024)
+    ///     .save_to_blob_store(&*store, &key)
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_max_bytes(mut self, max: usize) -> Self {
+        self.max_file_size_bytes = self.max_file_size_bytes.min(max);
+        self
+    }
+
     /// Read this field fully into memory while enforcing file-size limits.
     ///
     /// # Errors

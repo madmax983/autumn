@@ -103,7 +103,16 @@ pub async fn upload_avatar(
     while let Some(field) = form.next_field().await? {
         if field.name() == Some("avatar") {
             let store = blobs.store().clone();
-            let blob = field.save_to_blob_store(&*store, &key).await?;
+            // Tighten the framework's global upload cap to a route-
+            // local 2 MiB. The form text and the actual write cap
+            // stay in sync this way; without `.with_max_bytes`,
+            // `save_to_blob_store` would only enforce
+            // `security.upload.max_file_size_bytes`, which can be
+            // higher than the route policy.
+            let blob = field
+                .with_max_bytes(AVATAR_MAX_BYTES)
+                .save_to_blob_store(&*store, &key)
+                .await?;
             new_blob = Some(blob);
             break;
         }
