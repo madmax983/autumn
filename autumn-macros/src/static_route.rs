@@ -178,6 +178,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     hidden: false,
                     register_schemas: ::core::option::Option::None,
                 },
+                repository: ::core::option::Option::None,
             }
         }
 

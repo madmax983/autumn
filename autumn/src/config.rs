@@ -83,6 +83,8 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
+//! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -1172,6 +1174,21 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
             &mut self.security.upload.allowed_mime_types,
+        );
+
+        // Authorization deny shape + repository-API escape hatch.
+        if let Ok(value) = env.var("AUTUMN_SECURITY__FORBIDDEN_RESPONSE") {
+            match value.parse::<crate::authorization::ForbiddenResponse>() {
+                Ok(parsed) => self.security.forbidden_response = parsed,
+                Err(err) => tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__FORBIDDEN_RESPONSE={value:?}: {err}"
+                ),
+            }
+        }
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            &mut self.security.allow_unauthorized_repository_api,
         );
     }
 
@@ -3310,5 +3327,65 @@ path = "/healthz"
         } else {
             panic!("Expected a table");
         }
+    }
+
+    // ── AUTUMN_SECURITY__FORBIDDEN_RESPONSE / __ALLOW_UNAUTHORIZED_REPOSITORY_API ──
+
+    #[test]
+    fn env_override_forbidden_response_403() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "403");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_404() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "404");
+        let mut config = AutumnConfig::default();
+        // Pre-set to 403 to confirm env actually flips it back to 404.
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::NotFound404
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_invalid_keeps_existing() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "418");
+        let mut config = AutumnConfig::default();
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        // Invalid value warns and leaves the existing setting alone.
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.security.allow_unauthorized_repository_api);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.security.allow_unauthorized_repository_api);
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api_false_overrides_toml_true() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            "false",
+        );
+        let mut config = AutumnConfig::default();
+        config.security.allow_unauthorized_repository_api = true;
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.security.allow_unauthorized_repository_api);
     }
 }

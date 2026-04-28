@@ -79,6 +79,25 @@ pub struct SecurityConfig {
     /// Multipart upload safeguards and validation policy.
     #[serde(default)]
     pub upload: UploadConfig,
+
+    /// HTTP status returned when a [`Policy`](crate::authorization::Policy)
+    /// denies a record-level action. Defaults to `"404"` to mirror the
+    /// Rails / Phoenix posture of hiding existence from unauthorized
+    /// clients.
+    #[serde(default)]
+    pub forbidden_response: crate::authorization::ForbiddenResponse,
+
+    /// Allow `#[repository(api = "...")]` to mount auto-generated
+    /// CRUD endpoints in `prod` builds without a paired `policy =`
+    /// argument.
+    ///
+    /// Default: `false`. The framework refuses to start when an
+    /// `api =` repository has no `policy =` because the auto-
+    /// generated endpoints would be reachable by any authenticated
+    /// user. Flip this to `true` only when the lack of authz is
+    /// genuinely intended (e.g. a fully-public read-only API).
+    #[serde(default)]
+    pub allow_unauthorized_repository_api: bool,
 }
 
 /// Security response headers configuration.

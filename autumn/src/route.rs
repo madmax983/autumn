@@ -14,6 +14,55 @@ use http::Method;
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
+/// Metadata attached to routes emitted by the `#[repository(api = ...)]` macro.
+///
+/// Lets the app builder validate, at startup, that every auto-mounted CRUD
+/// endpoint is paired with a registered
+/// [`Policy`](crate::authorization::Policy).
+#[derive(Debug, Clone, Copy)]
+pub struct RepositoryApiMeta {
+    /// Stringified resource type name (e.g., `"Post"`). Used for
+    /// log messages and to look up the registered policy via
+    /// [`std::any::TypeId`] indirectly through the generated check
+    /// function in [`Self::policy_check`].
+    pub resource_type_name: &'static str,
+
+    /// Path prefix mounted by this repository (e.g., `"/api/posts"`).
+    pub api_path: &'static str,
+
+    /// `true` when the macro form used `policy = SomePolicy`, so the
+    /// auto-generated handlers enforce a record-level check before
+    /// running. `false` when the macro form is just
+    /// `#[repository(api = "...")]` — that form is rejected in
+    /// `prod` profile builds unless
+    /// `[security] allow_unauthorized_repository_api = true`.
+    pub has_policy: bool,
+
+    /// Type-erased registry probe emitted by the macro when
+    /// `policy = ...` is set. Returns `true` if a [`Policy`] is
+    /// registered on the runtime
+    /// [`PolicyRegistry`](crate::authorization::PolicyRegistry) for
+    /// the resource type. Lets the app builder fail fast at
+    /// startup when a developer wires `policy = X` on the
+    /// `#[repository]` macro but forgets to call
+    /// `.policy::<R, _>(X)` on the builder — without this check,
+    /// every protected request would 500 with "no policy
+    /// registered" instead of failing fast at boot. `None` when
+    /// the macro form omits `policy = ...`.
+    pub policy_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
+
+    /// Type-erased registry probe emitted by the macro when
+    /// `scope = ...` is set. Returns `true` if a [`Scope`] is
+    /// registered for the resource type. Companion to
+    /// [`Self::policy_check`] for the scope-list code path: the
+    /// generated `GET /<api>` handler resolves the scope from the
+    /// registry on every request, so a missing
+    /// `.scope::<R, _>(...)` registration would 500 every list
+    /// call. The startup guard fails fast instead. `None` when
+    /// the macro form omits `scope = ...`.
+    pub scope_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -52,4 +101,9 @@ pub struct Route {
     /// `AppBuilder::openapi` when
     /// generating `/v3/api-docs`.
     pub api_doc: ApiDoc,
+
+    /// Repository auto-API metadata, populated by the
+    /// `#[repository(api = ...)]` macro. `None` for hand-written
+    /// route handlers.
+    pub repository: Option<RepositoryApiMeta>,
 }

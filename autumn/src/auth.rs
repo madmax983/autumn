@@ -1098,6 +1098,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1150,6 +1153,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         // Middleware that inserts a user into extensions
@@ -1210,6 +1216,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1326,6 +1335,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1392,6 +1404,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1463,6 +1478,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1530,6 +1548,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1590,6 +1611,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()

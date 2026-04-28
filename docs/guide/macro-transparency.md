@@ -442,6 +442,50 @@ async fn admin_panel(__autumn_session: Session) -> AutumnResult<&'static str> {
 - Roles listed (`#[secured("admin", "editor")]`) = must have at least one of
   the listed roles (403 if missing)
 
+### `#[authorize("action", resource = Type)]`
+
+Injects hidden `Session` and `State<AppState>` extractors and a
+record-level [`Policy`](./authorization.md) check at the top of your
+handler. Mirrors `#[secured]` but answers "are you allowed to act on
+*this* record?" instead of "are you allowed to call this *route*?"
+
+**You write:**
+
+```rust
+#[get("/posts/{id}/edit")]
+#[authorize("update", resource = Post)]
+async fn edit_post(post: Post) -> AutumnResult<Markup> {
+    Ok(html! { h1 { (post.title) } })
+}
+```
+
+**Effectively becomes:**
+
+```rust
+#[get("/posts/{id}/edit")]
+async fn edit_post(
+    __autumn_session: Session,
+    State(__autumn_state): State<AppState>,
+    post: Post,
+) -> AutumnResult<Markup> {
+    ::autumn_web::authorization::__check_policy::<Post>(
+        &__autumn_state,
+        &__autumn_session,
+        "update",
+        &post,
+    ).await?;
+    Ok(html! { h1 { (post.title) } })
+}
+```
+
+- The `from = name` argument overrides the default snake-case parameter
+  binding (default: `Post` → `post`).
+- The check returns the configured deny status — `404` by default to
+  avoid leaking record existence, configurable via
+  `[security] forbidden_response = "403"`.
+- Coexists with `#[secured]`: stack both attributes when a route should
+  require both authentication/role gating and a record-level check.
+
 ### `#[static_get("/path")]`
 
 Generates both a route companion (same as `#[get]`) and a static metadata

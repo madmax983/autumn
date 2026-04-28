@@ -15,6 +15,8 @@ use quote::quote;
 use syn::parse::Parser as _;
 use syn::{ItemFn, LitStr};
 
+use crate::param_helpers::has_input_named;
+
 /// Parse the `#[secured(...)]` attribute arguments.
 ///
 /// Returns a (possibly empty) list of role strings.
@@ -59,11 +61,18 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Inject the hidden Session parameter at the start of the parameter list
-    let session_param: syn::FnArg = syn::parse_quote! {
-        __autumn_session: ::autumn_web::session::Session
-    };
-    input_fn.sig.inputs.insert(0, session_param);
+    // Inject the hidden Session parameter at the start of the parameter
+    // list — but only if no other macro (typically `#[authorize]`) has
+    // already injected one. Without this guard, stacking
+    // `#[authorize]` + `#[secured]` in either attribute order would
+    // produce duplicate `__autumn_session` parameters and fail to
+    // compile.
+    if !has_input_named(&input_fn, "__autumn_session") {
+        let session_param: syn::FnArg = syn::parse_quote! {
+            __autumn_session: ::autumn_web::session::Session
+        };
+        input_fn.sig.inputs.insert(0, session_param);
+    }
 
     // Prepend the check call to the function body
     let original_body = &input_fn.block;

@@ -137,6 +137,7 @@ pub fn route_macro(
                     register_schemas: ::core::option::Option::None,
                     #api_doc_fields
                 },
+                repository: ::core::option::Option::None,
             }
         }
     }

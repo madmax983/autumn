@@ -70,6 +70,7 @@ pub mod actuator;
 pub mod app;
 pub mod audit;
 pub mod auth;
+pub mod authorization;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -109,7 +110,7 @@ pub mod openapi;
 pub mod pagination;
 pub mod prelude;
 pub(crate) mod route;
-pub use route::Route;
+pub use route::{RepositoryApiMeta, Route};
 pub mod security;
 pub mod session;
 #[cfg(feature = "redis")]
@@ -516,6 +517,24 @@ pub use autumn_macros::scheduled;
 /// }
 /// ```
 pub use autumn_macros::secured;
+
+/// Enforce a record-level [`Policy`](crate::authorization::Policy)
+/// before a handler runs. Coexists with [`secured`](macro@secured):
+/// `#[secured]` answers "are you in?", `#[authorize]` answers
+/// "are you allowed to act on *this record*?"
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/posts/{id}/edit")]
+/// #[authorize("update", resource = Post)]
+/// async fn edit_post(post: Post) -> AutumnResult<Markup> {
+///     Ok(html! { h1 { (post.title) } })
+/// }
+/// ```
+pub use autumn_macros::authorize;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;

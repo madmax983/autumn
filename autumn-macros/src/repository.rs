@@ -35,6 +35,8 @@ struct RepoConfig {
     table_name: String,
     hooks_type: Option<Ident>,
     api_path: Option<String>,
+    policy_type: Option<Ident>,
+    scope_type: Option<Ident>,
 }
 
 fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
@@ -42,6 +44,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut table_name: Option<String> = None;
     let mut hooks_type: Option<Ident> = None;
     let mut api_path: Option<String> = None;
+    let mut policy_type: Option<Ident> = None;
+    let mut scope_type: Option<Ident> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -58,12 +62,21 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             let value: LitStr = meta.value()?.parse()?;
             api_path = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("policy") {
+            let value: Ident = meta.value()?.parse()?;
+            policy_type = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("scope") {
+            let value: Ident = meta.value()?.parse()?;
+            scope_type = Some(value);
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
-            Err(meta
-                .error("expected model name, table = \"...\", hooks = Type, or api = \"/path\""))
+            Err(meta.error(
+                "expected model name, table = \"...\", hooks = Type, api = \"/path\", policy = Type, or scope = Type",
+            ))
         }
     })
     .parse2(attr)?;
@@ -81,6 +94,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         table_name: table,
         hooks_type,
         api_path,
+        policy_type,
+        scope_type,
     })
 }
 
@@ -470,13 +485,217 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let id_path = format!("{api_path}/{{id}}");
 
+        let has_policy = config.policy_type.is_some();
+        let policy_check_show = if has_policy {
+            quote! {
+                ::autumn_web::authorization::__check_policy::<#model_name>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    "show",
+                    &record,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        // POST endpoint runs `can_create` *before* the insert so a
+        // denied check never commits a row. Naive after-the-fact
+        // policy checks would write the row, then return 403/404,
+        // leaving the data behind.
+        let policy_check_create_pre = if has_policy {
+            quote! {
+                ::autumn_web::authorization::__check_policy_create::<#model_name>(
+                    &__autumn_state,
+                    &__autumn_session,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        let policy_check_update_pre = if has_policy {
+            quote! {
+                let __existing = repo.find_by_id(id).await?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
+                ::autumn_web::authorization::__check_policy::<#model_name>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    "update",
+                    &__existing,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        let policy_check_delete_pre = if has_policy {
+            quote! {
+                let __existing = repo.find_by_id(id).await?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
+                ::autumn_web::authorization::__check_policy::<#model_name>(
+                    &__autumn_state,
+                    &__autumn_session,
+                    "delete",
+                    &__existing,
+                )
+                .await?;
+            }
+        } else {
+            quote! {}
+        };
+        let session_state_args = if has_policy {
+            quote! {
+                ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                    ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
+                __autumn_session: ::autumn_web::session::Session,
+            }
+        } else {
+            quote! {}
+        };
+        // List endpoint behavior, in order of precedence:
+        //
+        // 1. `scope = SomeScope`: invoke the registered scope (the
+        //    most efficient form — the scope filters at the SQL level
+        //    via Diesel).
+        // 2. `policy = SomePolicy` without `scope`: load every
+        //    record, then filter through `Policy::can_show` per row.
+        //    Slower than (1) for large tables, but closes the
+        //    "policy guards show/update/delete but list returns
+        //    everything" data-exposure path. Users who care about
+        //    perf should also set `scope = SomeScope`.
+        // 3. Neither: plain `repo.find_all()` (public list).
+        let scope_list_body = if config.scope_type.is_some() {
+            quote! {
+                let __scope = __autumn_state
+                    .scope::<#model_name>()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "missing scope registration"
+                    ))?;
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                    &__autumn_state,
+                    &__autumn_session,
+                ).await;
+                let mut __conn = repo.__autumn_acquire_conn().await?;
+                let records = __scope.list(&__ctx, &mut __conn).await?;
+                Ok(::autumn_web::prelude::Json(records))
+            }
+        } else if has_policy {
+            quote! {
+                let __policy = __autumn_state
+                    .policy::<#model_name>()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "missing policy registration"
+                    ))?;
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                    &__autumn_state,
+                    &__autumn_session,
+                ).await;
+                let __all = repo.find_all().await?;
+                let mut __filtered = ::std::vec::Vec::with_capacity(__all.len());
+                for __record in __all {
+                    if __policy.can_show(&__ctx, &__record).await {
+                        __filtered.push(__record);
+                    }
+                }
+                Ok(::autumn_web::prelude::Json(__filtered))
+            }
+        } else {
+            quote! {
+                Ok(::autumn_web::prelude::Json(repo.find_all().await?))
+            }
+        };
+        // Inject session + state extractors when *either* a scope
+        // or a policy is configured — both code paths above need
+        // them.
+        let list_session_state_args = if config.scope_type.is_some() || has_policy {
+            quote! {
+                ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                    ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
+                __autumn_session: ::autumn_web::session::Session,
+            }
+        } else {
+            quote! {}
+        };
+        let resource_type_name_lit = model_name.to_string();
+        let api_path_lit = api_path.clone();
+
+        // Compile-time assertion: when the user writes
+        // `policy = SomePolicy`, the generated code references the
+        // type so a typo (or a real type that doesn't `impl
+        // Policy<Model>`) fails compilation here, not at the first
+        // request with `500 missing policy registration`.
+        let policy_type_assertion = if let Some(ref policy_type) = config.policy_type {
+            quote! {
+                const _: fn() = || {
+                    fn __autumn_assert_policy<P: ::autumn_web::authorization::Policy<#model_name>>() {}
+                    __autumn_assert_policy::<#policy_type>();
+                };
+            }
+        } else {
+            quote! {}
+        };
+        // Emit a type-erased registry probe so the app builder can
+        // verify at startup that the policy was actually registered
+        // via `.policy::<R, _>(...)`. Without this, forgetting the
+        // `.policy(...)` call would compile and boot, then 500 on
+        // every protected request.
+        let policy_check_fn = if config.policy_type.is_some() {
+            quote! {
+                ::core::option::Option::Some(
+                    (|registry: &::autumn_web::authorization::PolicyRegistry| {
+                        registry.has_policy::<#model_name>()
+                    }) as fn(&::autumn_web::authorization::PolicyRegistry) -> bool
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+        // Companion probe for `scope = ...`. ONLY attached to the
+        // `_api_list` route's metadata — the other auto-generated
+        // routes (`*_api_get` / `*_api_create` / `*_api_update` /
+        // `*_api_delete`) never call `scope.list`, so flagging them
+        // for missing scope registration would fire the prod fail-
+        // fast even when the user intentionally mounted only
+        // non-list endpoints with `scope = ...` configured (the
+        // app's reads happen via custom queries, but the scope is
+        // still declared so `Note::scope(&ctx)` works in hand-
+        // written list handlers). The non-list routes below get
+        // `scope_check: None` regardless.
+        let list_scope_check_fn = if config.scope_type.is_some() {
+            quote! {
+                ::core::option::Option::Some(
+                    (|registry: &::autumn_web::authorization::PolicyRegistry| {
+                        registry.scope::<#model_name>().is_some()
+                    }) as fn(&::autumn_web::authorization::PolicyRegistry) -> bool
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+        let non_list_scope_check_fn = quote! { ::core::option::Option::None };
+        let scope_type_assertion = if let Some(ref scope_type) = config.scope_type {
+            quote! {
+                const _: fn() = || {
+                    fn __autumn_assert_scope<S: ::autumn_web::authorization::Scope<#model_name>>() {}
+                    __autumn_assert_scope::<#scope_type>();
+                };
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
 
+            #policy_type_assertion
+            #scope_type_assertion
+
             #vis async fn #list_fn(
+                #list_session_state_args
                 repo: #pg_name,
             ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<Vec<#model_name>>> {
-                Ok(::autumn_web::prelude::Json(repo.find_all().await?))
+                #scope_list_body
             }
 
             #[doc(hidden)]
@@ -504,15 +723,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         ..::core::default::Default::default()
                     },
+                    repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
+                        resource_type_name: #resource_type_name_lit,
+                        api_path: #api_path_lit,
+                        has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
+                        scope_check: #list_scope_check_fn,
+                    }),
                 }
             }
 
             #vis async fn #get_fn(
+                #session_state_args
                 ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
                 repo: #pg_name,
             ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>> {
                 let record = repo.find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
+                #policy_check_show
                 Ok(::autumn_web::prelude::Json(record))
             }
 
@@ -537,13 +765,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         ..::core::default::Default::default()
                     },
+                    repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
+                        resource_type_name: #resource_type_name_lit,
+                        api_path: #api_path_lit,
+                        has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
+                        scope_check: #non_list_scope_check_fn,
+                    }),
                 }
             }
 
             #vis async fn #create_fn(
+                #session_state_args
                 repo: #pg_name,
                 ::autumn_web::prelude::Json(new): ::autumn_web::prelude::Json<#new_name>,
             ) -> ::autumn_web::AutumnResult<(::autumn_web::reexports::http::StatusCode, ::autumn_web::prelude::Json<#model_name>)> {
+                #policy_check_create_pre
                 let record = repo.save(&new).await?;
                 Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
             }
@@ -574,14 +811,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         ..::core::default::Default::default()
                     },
+                    repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
+                        resource_type_name: #resource_type_name_lit,
+                        api_path: #api_path_lit,
+                        has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
+                        scope_check: #non_list_scope_check_fn,
+                    }),
                 }
             }
 
             #vis async fn #update_fn(
+                #session_state_args
                 ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
                 repo: #pg_name,
                 ::autumn_web::prelude::Json(patch): ::autumn_web::prelude::Json<#update_name>,
             ) -> ::autumn_web::AutumnResult<::autumn_web::prelude::Json<#model_name>> {
+                #policy_check_update_pre
                 let record = repo.update(id, &patch).await?;
                 Ok(::autumn_web::prelude::Json(record))
             }
@@ -613,13 +859,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ),
                         ..::core::default::Default::default()
                     },
+                    repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
+                        resource_type_name: #resource_type_name_lit,
+                        api_path: #api_path_lit,
+                        has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
+                        scope_check: #non_list_scope_check_fn,
+                    }),
                 }
             }
 
             #vis async fn #delete_fn(
+                #session_state_args
                 ::autumn_web::extract::Path(id): ::autumn_web::extract::Path<i64>,
                 repo: #pg_name,
             ) -> ::autumn_web::AutumnResult<::autumn_web::reexports::http::StatusCode> {
+                #policy_check_delete_pre
                 repo.delete_by_id(id).await?;
                 Ok(::autumn_web::reexports::http::StatusCode::NO_CONTENT)
             }
@@ -639,6 +894,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         success_status: 204,
                         ..::core::default::Default::default()
                     },
+                    repository: ::core::option::Option::Some(::autumn_web::RepositoryApiMeta {
+                        resource_type_name: #resource_type_name_lit,
+                        api_path: #api_path_lit,
+                        has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
+                        scope_check: #non_list_scope_check_fn,
+                    }),
                 }
             }
         }
@@ -732,6 +994,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #(#derived_impl_methods)*
+        }
+
+        impl #pg_name {
+            /// Acquire a database connection from the repository's
+            /// pool. Used by `#[repository(scope = ...)]`-generated
+            /// list endpoints; not part of the public surface.
+            #[doc(hidden)]
+            pub async fn __autumn_acquire_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            > {
+                self.pool.get().await.map_err(::autumn_web::AutumnError::from)
+            }
         }
 
         // Extractor: pull pool from AppState (same pattern as Db extractor)
