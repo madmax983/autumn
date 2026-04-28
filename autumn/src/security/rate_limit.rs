@@ -130,31 +130,15 @@ impl Limiter {
 
         match tokens_after {
             Ok(remaining_tokens) => {
-                let remaining = if remaining_tokens.is_nan() || remaining_tokens.is_infinite() {
-                    0
-                } else {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    {
-                        remaining_tokens.clamp(0.0, f64::from(u32::MAX)).floor() as u32
-                    }
-                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let remaining = remaining_tokens.floor() as u32;
                 Decision::Allowed { remaining }
             }
             Err(current_tokens) => {
                 let deficit = 1.0 - current_tokens;
                 let secs = (deficit / self.refill_per_sec).ceil().max(1.0);
-                let retry_after_secs = if secs.is_nan() || secs.is_infinite() {
-                    1
-                } else {
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        clippy::cast_precision_loss
-                    )]
-                    {
-                        secs.clamp(1.0, u64::MAX as f64) as u64
-                    }
-                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let retry_after_secs = secs as u64;
                 Decision::Denied { retry_after_secs }
             }
         }

@@ -44,3 +44,20 @@ full file at any point, check the corresponding checkpoint or refer to
 If you have already read the [Getting Started guide](../getting-started.md),
 you can skim Chapter 1 — it covers similar ground but establishes the project
 you will build on for the rest of the tutorial.
+
+## Want the short version?
+
+If you're already comfortable with Rust web frameworks and just want a
+working CRUD app, the [Code Generators guide](../generators.md) collapses
+this whole tutorial into five commands:
+
+```bash
+autumn new my-app
+cd my-app
+autumn generate scaffold Post title:String body:Text published:bool
+autumn migrate
+autumn dev
+```
+
+The tutorial explains *why* each piece exists; the generators guide
+shows *how* to skip the typing once you know.

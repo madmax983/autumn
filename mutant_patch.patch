@@ -1,0 +1,36 @@
+<<<<<<< SEARCH
+    #[test]
+    fn size_is_clamped_to_max() {
+        let r = PageRequest::new(1, 9_999);
+        assert_eq!(r.size(), MAX_PAGE_SIZE);
+        assert_eq!(r.limit(), i64::from(MAX_PAGE_SIZE));
+
+        // Mutants check: off-by-one boundary
+        let exact = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let size = MAX_PAGE_SIZE + 1;
+        let over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = PageRequest::new(1, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
+    }
+=======
+    #[test]
+    fn size_is_clamped_to_max() {
+        let r = PageRequest::new(1, 9_999);
+        assert_eq!(r.size(), MAX_PAGE_SIZE);
+        assert_eq!(r.limit(), i64::from(MAX_PAGE_SIZE));
+
+        // Mutants check: off-by-one boundary
+        let exact = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = PageRequest::new(1, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
+    }
+>>>>>>> REPLACE
