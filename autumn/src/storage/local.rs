@@ -587,28 +587,68 @@ fn meta_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-/// Write the sidecar metadata after the bytes have committed. Failure
-/// is logged but not surfaced — losing the sidecar reduces a future
-/// `get` to `application/octet-stream`, which is exactly the
+/// Write the sidecar metadata after the bytes have committed.
+///
+/// Goes through the same temp-file + atomic-rename pattern as blob
+/// bytes so a hostile or accidental symlink at the sidecar path can't
+/// be followed: `tokio::fs::write` would otherwise dereference a
+/// symlink and clobber arbitrary files reachable through it. The
+/// temp file uses `create_new(true)` so even on the temp path an
+/// existing file or symlink errors out (the uuid suffix means an
+/// attacker can't predict the path), and the final rename replaces
+/// the dirent atomically without following whatever was at the
+/// destination.
+///
+/// Failure is logged but not surfaced — losing the sidecar reduces a
+/// future `get` to `application/octet-stream`, which is exactly the
 /// pre-sidecar behavior.
 async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
+    use tokio::io::AsyncWriteExt as _;
+
     let path = meta_sidecar_path(blob_path);
-    match serde_json::to_vec(meta) {
-        Ok(bytes) => {
-            if let Err(err) = tokio::fs::write(&path, bytes).await {
-                tracing::warn!(
-                    error = %err,
-                    sidecar = %path.display(),
-                    "failed to write blob metadata sidecar; serving will default to octet-stream"
-                );
-            }
+    let bytes = match serde_json::to_vec(meta) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to serialize blob metadata sidecar");
+            return;
         }
+    };
+
+    let tmp = temp_sibling_path(&path);
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .await
+    {
+        Ok(f) => f,
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "failed to serialize blob metadata sidecar"
+                tmp = %tmp.display(),
+                "failed to create blob metadata sidecar temp file"
             );
+            return;
         }
+    };
+    if let Err(err) = file.write_all(&bytes).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::warn!(error = %err, "failed to write blob metadata sidecar bytes");
+        return;
+    }
+    if let Err(err) = file.flush().await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::warn!(error = %err, "failed to flush blob metadata sidecar");
+        return;
+    }
+    drop(file);
+    if let Err(err) = atomic_replace(&tmp, &path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        tracing::warn!(
+            error = %err,
+            sidecar = %path.display(),
+            "failed to commit blob metadata sidecar; serving will default to octet-stream"
+        );
     }
 }
 
@@ -841,6 +881,40 @@ mod tests {
         assert!(matches!(err, BlobStoreError::PermissionDenied(_)));
         // Outside dir is untouched.
         assert!(!outside.path().join("leaked.txt").exists());
+    }
+
+    /// A hostile symlink planted at the *sidecar* path is the same
+    /// threat as one planted at the blob path: the naïve
+    /// `tokio::fs::write` would follow it and clobber arbitrary
+    /// targets. The temp-file + atomic-rename pattern in
+    /// `write_meta_sidecar` replaces the dirent atomically without
+    /// following whatever was there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_write_does_not_follow_hostile_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("untouchable");
+        std::fs::write(&target, b"original-contents").unwrap();
+
+        let dir = temp_root();
+        let s = store(dir.path());
+
+        // Plant a symlink at the *sidecar* path before the put runs.
+        // The sidecar for key `victim.bin` is `victim.bin.meta`.
+        let sidecar_path = dir.path().join("victim.bin.meta");
+        symlink(&target, &sidecar_path).unwrap();
+
+        // The put succeeds (sidecar errors are logged, not surfaced) —
+        // the important invariant is the symlink target.
+        s.put("victim.bin", "image/png", Bytes::from_static(b"pixels"))
+            .await
+            .unwrap();
+
+        // The original symlink target must still hold its original
+        // bytes, *not* the sidecar JSON.
+        assert_eq!(std::fs::read(&target).unwrap(), b"original-contents");
     }
 
     #[test]
