@@ -1,0 +1,2 @@
+I will run `rustup component add llvm-tools-preview --toolchain nightly-x86_64-unknown-linux-gnu` to install the `llvm-tools-preview` component for the selected toolchain.
+Proceed? [Y/n]

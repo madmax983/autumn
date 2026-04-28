@@ -83,4 +83,18 @@ async fn havoc_rate_limit_fuzz_bounds() {
         .body(Body::empty())
         .unwrap();
     let _ = svc.ready().await.unwrap().call(req).await;
+
+    // Force Deny path evaluation when requests_per_second is MIN_POSITIVE
+    let config = RateLimitConfig {
+        enabled: true,
+        requests_per_second: f64::MIN_POSITIVE,
+        burst: 1,
+        trust_forwarded_headers: true,
+    };
+    let layer = RateLimitLayer::from_config(&config);
+    let mut svc = layer.layer(MockService);
+    let req1 = Request::builder().header("X-Forwarded-For", "4.5.6.7").body(Body::empty()).unwrap();
+    let _ = svc.ready().await.unwrap().call(req1).await;
+    let req2 = Request::builder().header("X-Forwarded-For", "4.5.6.7").body(Body::empty()).unwrap();
+    let _ = svc.ready().await.unwrap().call(req2).await;
 }
