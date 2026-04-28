@@ -1267,6 +1267,14 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
+        // Preflight the configured BlobStore the same way `run()` does.
+        // Static routes can read presigned URLs out of `BlobStoreState`
+        // during pre-rendering (e.g. `<img src=blob.url()>`); without
+        // the bootstrap they'd 500 during `autumn build` even though
+        // the server path works.
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = preflight_storage(&config);
+
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
         let pool = setup_database(&config, vec![], pool_provider_factory)
@@ -1284,6 +1292,12 @@ impl AppBuilder {
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
+        // Install the preflighted storage and remember the serving
+        // router so static generation hits the same `/_blobs/...`
+        // routes the server path serves.
+        #[cfg(feature = "storage")]
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
         // is honored during static generation — apps that swap in a custom
@@ -1291,6 +1305,12 @@ impl AppBuilder {
         // would otherwise silently fall back to the config-driven backend.
         // Custom Tower layers registered via .layer(...) are likewise
         // applied so static output matches the production response pipeline.
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -1298,7 +1318,7 @@ impl AppBuilder {
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
                 scoped_groups: Vec::new(),
-                merge_routers: Vec::new(),
+                merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
                 error_page_renderer: None,
