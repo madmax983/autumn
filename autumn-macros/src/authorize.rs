@@ -117,10 +117,7 @@ fn expect_ident(expr: &Expr, hint: &str) -> syn::Result<Ident> {
         Expr::Lit(ExprLit {
             lit: Lit::Str(s), ..
         }) => Ok(format_ident!("{}", s.value())),
-        _ => Err(syn::Error::new_spanned(
-            expr,
-            format!("expected `{hint}`"),
-        )),
+        _ => Err(syn::Error::new_spanned(expr, format!("expected `{hint}`"))),
     }
 }
 

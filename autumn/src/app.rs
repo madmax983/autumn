@@ -2055,10 +2055,7 @@ fn validate_repository_api_policies(
     let mut record_route = |route: &Route| {
         if let Some(meta) = route.repository {
             if !meta.has_policy && seen.insert(meta.api_path) {
-                offenders.push((
-                    meta.resource_type_name.to_owned(),
-                    meta.api_path.to_owned(),
-                ));
+                offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
         }
     };

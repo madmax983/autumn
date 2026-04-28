@@ -20,11 +20,7 @@ use crate::models::Post;
 pub struct PostPolicy;
 
 impl Policy<Post> for PostPolicy {
-    fn can_show<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _post: &'a Post,
-    ) -> BoxFuture<'a, bool> {
+    fn can_show<'a>(&'a self, _ctx: &'a PolicyContext, _post: &'a Post) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
 
@@ -32,24 +28,12 @@ impl Policy<Post> for PostPolicy {
         Box::pin(async move { ctx.is_authenticated() })
     }
 
-    fn can_update<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        post: &'a Post,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(post.author_id)
-        })
+    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, post: &'a Post) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(post.author_id) })
     }
 
-    fn can_delete<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        post: &'a Post,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(post.author_id)
-        })
+    fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, post: &'a Post) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(post.author_id) })
     }
 }
 

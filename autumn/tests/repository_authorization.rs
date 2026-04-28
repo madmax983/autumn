@@ -67,33 +67,17 @@ pub trait NoteRepository {}
 pub struct NotePolicy;
 
 impl Policy<Note> for NotePolicy {
-    fn can_show<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
+    fn can_show<'a>(&'a self, _ctx: &'a PolicyContext, _note: &'a Note) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
     fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async move { ctx.is_authenticated() })
     }
-    fn can_update<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
-        })
+    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id) })
     }
-    fn can_delete<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
-        })
+    fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id) })
     }
 }
 
@@ -197,12 +181,7 @@ async fn seed_note(pool: &Pool<AsyncPgConnection>, title: &str, author_id: i64) 
         .unwrap()
 }
 
-async fn seed_session(
-    store: &MemoryStore,
-    sid: &str,
-    user_id: &str,
-    role: Option<&str>,
-) {
+async fn seed_session(store: &MemoryStore, sid: &str, user_id: &str, role: Option<&str>) {
     let mut data = std::collections::HashMap::new();
     data.insert("user_id".to_owned(), user_id.to_owned());
     if let Some(r) = role {

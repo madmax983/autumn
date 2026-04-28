@@ -94,9 +94,8 @@ pub struct PolicyContext {
     /// that need to consult related rows (e.g. group membership)
     /// can borrow a connection here.
     #[cfg(feature = "db")]
-    pub pool: Option<
-        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-    >,
+    pub pool:
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Registered [`Policy`] / [`Scope`] map, cloned from
     /// `AppState`. Lets the [`Scoped`] blanket trait resolve a
@@ -131,10 +130,7 @@ impl PolicyContext {
     /// Build a fully-populated [`PolicyContext`] from `AppState` +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(
-        state: &crate::AppState,
-        session: &Session,
-    ) -> Self {
+    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -174,9 +170,7 @@ impl PolicyContext {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        candidates
-            .into_iter()
-            .any(|c| self.has_role(c.as_ref()))
+        candidates.into_iter().any(|c| self.has_role(c.as_ref()))
     }
 
     /// Attach a database pool to the context. Used by the framework
@@ -217,11 +211,7 @@ impl PolicyContext {
 /// for unknown verbs.
 pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     /// Decide whether the current user may *show* the resource.
-    fn can_show<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _resource: &'a R,
-    ) -> BoxFuture<'a, bool> {
+    fn can_show<'a>(&'a self, _ctx: &'a PolicyContext, _resource: &'a R) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
 
@@ -241,20 +231,12 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     }
 
     /// Decide whether the current user may *update* the resource.
-    fn can_update<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _resource: &'a R,
-    ) -> BoxFuture<'a, bool> {
+    fn can_update<'a>(&'a self, _ctx: &'a PolicyContext, _resource: &'a R) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
 
     /// Decide whether the current user may *delete* the resource.
-    fn can_delete<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _resource: &'a R,
-    ) -> BoxFuture<'a, bool> {
+    fn can_delete<'a>(&'a self, _ctx: &'a PolicyContext, _resource: &'a R) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
 
@@ -316,10 +298,7 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
 /// has no connection arg.
 #[cfg(not(feature = "db"))]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
-    fn list<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-    ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
+    fn list<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
@@ -439,10 +418,7 @@ impl PolicyRegistry {
         R: Send + Sync + 'static,
         P: Policy<R>,
     {
-        let mut inner = self
-            .inner
-            .write()
-            .expect("policy registry lock poisoned");
+        let mut inner = self.inner.write().expect("policy registry lock poisoned");
         let key = TypeId::of::<R>();
         assert!(
             !inner.policies.contains_key(&key),
@@ -463,10 +439,7 @@ impl PolicyRegistry {
         R: Send + Sync + 'static,
         S: Scope<R>,
     {
-        let mut inner = self
-            .inner
-            .write()
-            .expect("policy registry lock poisoned");
+        let mut inner = self.inner.write().expect("policy registry lock poisoned");
         let key = TypeId::of::<R>();
         assert!(
             !inner.scopes.contains_key(&key),
@@ -485,10 +458,7 @@ impl PolicyRegistry {
     /// previous writer panicked while holding the lock).
     #[must_use]
     pub fn policy<R: Send + Sync + 'static>(&self) -> Option<Arc<dyn Policy<R>>> {
-        let inner = self
-            .inner
-            .read()
-            .expect("policy registry lock poisoned");
+        let inner = self.inner.read().expect("policy registry lock poisoned");
         inner
             .policies
             .get(&TypeId::of::<R>())
@@ -502,10 +472,7 @@ impl PolicyRegistry {
     /// Panics if the registry's internal `RwLock` is poisoned.
     #[must_use]
     pub fn scope<R: Send + Sync + 'static>(&self) -> Option<Arc<dyn Scope<R>>> {
-        let inner = self
-            .inner
-            .read()
-            .expect("policy registry lock poisoned");
+        let inner = self.inner.read().expect("policy registry lock poisoned");
         inner
             .scopes
             .get(&TypeId::of::<R>())
@@ -529,10 +496,7 @@ impl PolicyRegistry {
 
 impl std::fmt::Debug for PolicyRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self
-            .inner
-            .read()
-            .expect("policy registry lock poisoned");
+        let inner = self.inner.read().expect("policy registry lock poisoned");
         f.debug_struct("PolicyRegistry")
             .field("policies", &inner.policies.len())
             .field("scopes", &inner.scopes.len())
@@ -586,8 +550,7 @@ impl ForbiddenResponse {
     /// endpoints when a policy denies an action.
     #[must_use]
     pub fn into_error(self) -> crate::AutumnError {
-        crate::AutumnError::from(std::io::Error::other(self.message()))
-            .with_status(self.status())
+        crate::AutumnError::from(std::io::Error::other(self.message())).with_status(self.status())
     }
 }
 
@@ -761,21 +724,13 @@ mod tests {
     struct AdminOrOwnerPolicy;
 
     impl Policy<Note> for AdminOrOwnerPolicy {
-        fn can_show<'a>(
-            &'a self,
-            _ctx: &'a PolicyContext,
-            _note: &'a Note,
-        ) -> BoxFuture<'a, bool> {
+        fn can_show<'a>(&'a self, _ctx: &'a PolicyContext, _note: &'a Note) -> BoxFuture<'a, bool> {
             Box::pin(async { true })
         }
-        fn can_update<'a>(
-            &'a self,
-            ctx: &'a PolicyContext,
-            note: &'a Note,
-        ) -> BoxFuture<'a, bool> {
-            Box::pin(async move {
-                ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
-            })
+        fn can_update<'a>(&'a self, ctx: &'a PolicyContext, note: &'a Note) -> BoxFuture<'a, bool> {
+            Box::pin(
+                async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id) },
+            )
         }
         fn can_delete<'a>(
             &'a self,

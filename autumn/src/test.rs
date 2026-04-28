@@ -120,8 +120,7 @@ pub struct TestApp {
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
 }
 
-type TestPolicyRegistration =
-    Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
+type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
 impl TestApp {
     /// Create a new test app builder with default configuration.

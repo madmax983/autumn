@@ -26,30 +26,14 @@ struct Note {
 struct AdminOrOwnerPolicy;
 
 impl Policy<Note> for AdminOrOwnerPolicy {
-    fn can_show<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
+    fn can_show<'a>(&'a self, _ctx: &'a PolicyContext, _note: &'a Note) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
-    fn can_update<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
-        })
+    fn can_update<'a>(&'a self, ctx: &'a PolicyContext, note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id) })
     }
-    fn can_delete<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
-        })
+    fn can_delete<'a>(&'a self, ctx: &'a PolicyContext, note: &'a Note) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id) })
     }
 }
 
@@ -67,8 +51,7 @@ async fn update_note_inline(
     session: Session,
 ) -> AutumnResult<&'static str> {
     let _ = id;
-    autumn_web::authorization::authorize::<Note>(&state, &session, "update", &FIXED_NOTE)
-        .await?;
+    autumn_web::authorization::authorize::<Note>(&state, &session, "update", &FIXED_NOTE).await?;
     Ok("ok")
 }
 
