@@ -1014,13 +1014,18 @@ mod tests {
     async fn presigned_url_percent_encodes_reserved_chars() {
         let dir = temp_root();
         let s = store(dir.path());
+        // Space and `#` pass `validate_key` (the Windows-reserved
+        // rejection set is `< > : " | ? *` + control bytes only) but
+        // still need percent-encoding inside the URL path.
         let url = s
-            .presigned_url("user 1/q?.png", Duration::from_secs(120))
+            .presigned_url("user 1/note#1.png", Duration::from_secs(120))
             .await
             .unwrap();
-        // Spaces, '?', and other reserved chars are percent-encoded;
-        // '/' stays raw as a segment separator.
-        assert!(url.starts_with("/_blobs/user%201/q%3F.png?exp="));
+        // `/` stays raw as a segment separator.
+        assert!(
+            url.starts_with("/_blobs/user%201/note%231.png?exp="),
+            "unexpected URL: {url}"
+        );
         assert!(url.contains("&sig="));
     }
 
