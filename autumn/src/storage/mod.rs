@@ -330,7 +330,13 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
     // trait-level invariant; other backends (S3) don't need it but
     // benefit from key portability.
     if let Some(last) = key.rsplit('/').next() {
-        if last.len() >= 5 && last[last.len() - 5..].eq_ignore_ascii_case(".meta") {
+        // Byte-level suffix comparison so a non-ASCII final segment
+        // (e.g. `"ééé"`, where each `é` is 2 bytes and the byte index
+        // 5-from-the-end lands mid-char) doesn't panic on string-slice
+        // bounds. The reserved suffix is pure ASCII, so comparing the
+        // last 5 raw bytes case-insensitively is unambiguous.
+        let bytes = last.as_bytes();
+        if bytes.len() >= 5 && bytes[bytes.len() - 5..].eq_ignore_ascii_case(b".meta") {
             return Err(BlobStoreError::InvalidInput(
                 "blob keys ending in `.meta` are reserved (local backend uses `<key>.meta` \
                  sidecar files for content-type metadata)"
@@ -454,6 +460,24 @@ mod tests {
         for k in ["meta.png", "foo.metadata", "a.meta.gz", "metafile"] {
             validate_key(k).unwrap_or_else(|_| panic!("key {k:?} should be accepted"));
         }
+    }
+
+    #[test]
+    fn validate_key_handles_non_ascii_without_panicking() {
+        // The `.meta` suffix check must compare raw bytes, not a
+        // `&str` slice — otherwise a non-ASCII key whose byte length
+        // is ≥ 5 with a UTF-8 char boundary mid-suffix would panic
+        // with "byte index N is not a char boundary". Pin that we
+        // accept such keys cleanly instead.
+        for k in ["ééé", "résumé.png", "東京", "cafe\u{0301}"] {
+            validate_key(k).unwrap_or_else(|err| {
+                panic!("non-ASCII key {k:?} should validate cleanly, got {err:?}")
+            });
+        }
+        // Non-ASCII keys that *do* end in `.meta` must still be
+        // rejected (the suffix is ASCII).
+        let err = validate_key("résumé.meta").unwrap_err();
+        assert!(matches!(err, BlobStoreError::InvalidInput(_)));
     }
 
     #[test]
