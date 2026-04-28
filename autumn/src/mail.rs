@@ -877,15 +877,14 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let error = match SmtpTransport::new(SmtpConfig {
+        let Err(error) = SmtpTransport::new(SmtpConfig {
             host: Some("smtp.example.com".to_owned()),
             port: Some(587),
             username: Some("mailer".to_owned()),
             password_env: Some(missing_key.clone()),
             tls: TlsMode::StartTls,
-        }) {
-            Ok(_) => panic!("missing password env should fail at startup"),
-            Err(error) => error,
+        }) else {
+            panic!("missing password env should fail at startup");
         };
 
         assert!(error.to_string().contains(&missing_key));
@@ -893,15 +892,14 @@ mod tests {
 
     #[test]
     fn smtp_transport_rejects_missing_password_env_key_when_username_is_set() {
-        let error = match SmtpTransport::new(SmtpConfig {
+        let Err(error) = SmtpTransport::new(SmtpConfig {
             host: Some("smtp.example.com".to_owned()),
             port: Some(587),
             username: Some("mailer".to_owned()),
             password_env: None,
             tls: TlsMode::StartTls,
-        }) {
-            Ok(_) => panic!("missing password_env setting should fail at startup"),
-            Err(error) => error,
+        }) else {
+            panic!("missing password_env setting should fail at startup");
         };
 
         assert!(error.to_string().contains("mail.smtp.password_env"));
@@ -909,9 +907,8 @@ mod tests {
 
     #[test]
     fn mailer_builder_rejects_invalid_default_from_address() {
-        let error = match Mailer::builder().from("not an email address").build() {
-            Ok(_) => panic!("invalid default from should fail fast"),
-            Err(error) => error,
+        let Err(error) = Mailer::builder().from("not an email address").build() else {
+            panic!("invalid default from should fail fast");
         };
 
         match error {
@@ -935,9 +932,8 @@ mod tests {
             ..Default::default()
         };
 
-        let error = match Mailer::from_config(&config) {
-            Ok(_) => panic!("invalid configured reply-to should fail at construction"),
-            Err(error) => error,
+        let Err(error) = Mailer::from_config(&config) else {
+            panic!("invalid configured reply-to should fail at construction");
         };
 
         match error {
