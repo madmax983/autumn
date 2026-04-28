@@ -525,8 +525,15 @@ impl MailerBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error when the SMTP transport cannot be configured.
+    /// Returns an error when the SMTP transport or default addresses cannot be configured.
     pub fn build(self) -> Result<Mailer, MailError> {
+        if let Some(from) = &self.from {
+            parse_mailbox(from)?;
+        }
+        if let Some(reply_to) = &self.reply_to {
+            parse_mailbox(reply_to)?;
+        }
+
         let transport: Arc<dyn MailTransport> = match self.transport {
             Transport::Log => Arc::new(LogTransport),
             Transport::File => Arc::new(FileTransport { dir: self.file_dir }),
@@ -898,6 +905,47 @@ mod tests {
         };
 
         assert!(error.to_string().contains("mail.smtp.password_env"));
+    }
+
+    #[test]
+    fn mailer_builder_rejects_invalid_default_from_address() {
+        let error = match Mailer::builder().from("not an email address").build() {
+            Ok(_) => panic!("invalid default from should fail fast"),
+            Err(error) => error,
+        };
+
+        match error {
+            MailError::InvalidAddress { address, .. } => {
+                assert_eq!(address, "not an email address");
+            }
+            other => panic!("expected invalid address error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mailer_from_config_rejects_invalid_default_reply_to_address() {
+        let config = MailConfig {
+            transport: Transport::Smtp,
+            from: Some("Autumn <noreply@example.com>".to_owned()),
+            reply_to: Some("definitely not an address".to_owned()),
+            smtp: SmtpConfig {
+                host: Some("smtp.example.com".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = match Mailer::from_config(&config) {
+            Ok(_) => panic!("invalid configured reply-to should fail at construction"),
+            Err(error) => error,
+        };
+
+        match error {
+            MailError::InvalidAddress { address, .. } => {
+                assert_eq!(address, "definitely not an address");
+            }
+            other => panic!("expected invalid address error, got {other:?}"),
+        }
     }
 
     #[test]
