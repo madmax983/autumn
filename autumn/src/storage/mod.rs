@@ -318,6 +318,18 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
                 "blob key contains an empty segment".into(),
             ));
         }
+        // Windows silently strips trailing `.` and trailing space from
+        // filenames (`foo.png.` → `foo.png`, `con ` → `con`). That
+        // would let two distinct logical keys alias the same on-disk
+        // file on Windows, and could bypass the reserved-name guard
+        // below (a segment of `con ` passes the literal `==` check
+        // but normalizes to `con` once Windows touches it).
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return Err(BlobStoreError::InvalidInput(format!(
+                "blob key segment {segment:?} ends with `.` or space; Windows normalizes \
+                 these and would alias the segment with its stripped form"
+            )));
+        }
         // Windows rejects these characters in filenames; a key
         // containing any of them passes Linux/S3 but errors with
         // I/O on Windows. Same portability rationale as the
@@ -655,6 +667,37 @@ mod tests {
             "con-tinuation.png",
             "com10.log", // reserved set is com1-9 only
         ];
+        for k in accepted {
+            validate_key(k)
+                .unwrap_or_else(|err| panic!("key {k:?} should be accepted, got {err:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_trailing_dot_or_space_segments() {
+        // Windows strips trailing `.` and trailing space from
+        // filenames, so two distinct logical keys would alias on the
+        // local backend (and bypass the reserved-name guard for
+        // `con ` / `con.`). Reject up-front.
+        let rejected = [
+            "foo.",            // trailing dot
+            "avatars/me.png.", // trailing dot on last segment
+            "x./y",            // trailing dot mid-path
+            "foo ",            // trailing space
+            "x /y",            // trailing space mid-path
+            "con ",            // would alias `con` after Windows normalization
+            "con.",            // same
+        ];
+        for k in rejected {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+        // Internal/leading dots and spaces are still fine; only the
+        // segment-trailing forms are forbidden.
+        let accepted = ["foo.bar", "a b", " foo", "x/y/.hidden"];
         for k in accepted {
             validate_key(k)
                 .unwrap_or_else(|err| panic!("key {k:?} should be accepted, got {err:?}"));
