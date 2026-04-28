@@ -106,18 +106,15 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .generics
             .params
             .iter()
-            .map(|param| match param {
+            .filter_map(|param| match param {
                 GenericParam::Type(param) => {
                     let ident = &param.ident;
-                    quote! { #ident }
+                    Some(quote! { #ident })
                 }
-                GenericParam::Lifetime(param) => {
-                    let lifetime = &param.lifetime;
-                    quote! { #lifetime }
-                }
+                GenericParam::Lifetime(_) => None,
                 GenericParam::Const(param) => {
                     let ident = &param.ident;
-                    quote! { #ident }
+                    Some(quote! { #ident })
                 }
             })
             .collect::<Vec<_>>();
@@ -246,6 +243,25 @@ mod tests {
         );
         let rendered = out.to_string();
         assert!(rendered.contains("self . welcome :: < T >"));
+    }
+
+    #[test]
+    fn does_not_forward_lifetime_generics_into_helper_calls() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn welcome<'a>(&self, to: &'a str) -> Mail {
+                        let _ = to;
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("pub async fn send_welcome < 'a >"));
+        assert!(rendered.contains("self . welcome"));
+        assert!(!rendered.contains("self . welcome :: < 'a >"));
     }
 
     #[test]
