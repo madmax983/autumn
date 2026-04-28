@@ -18,7 +18,7 @@
 //!
 //! **Requires Docker** to be running.
 
-#![cfg(all(feature = "db"))]
+#![cfg(feature = "db")]
 
 use autumn_web::authorization::{
     BoxFuture, ForbiddenResponse, Policy, PolicyContext, Scope, Scoped,
@@ -74,11 +74,7 @@ impl Policy<Note> for NotePolicy {
     ) -> BoxFuture<'a, bool> {
         Box::pin(async { true })
     }
-    fn can_create<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        _note: &'a Note,
-    ) -> BoxFuture<'a, bool> {
+    fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async move { ctx.is_authenticated() })
     }
     fn can_update<'a>(
@@ -142,7 +138,7 @@ async fn list_my_notes(
     mut db: Db,
 ) -> AutumnResult<Json<Vec<Note>>> {
     let ctx = PolicyContext::from_request(&state, &session).await;
-    let notes = Note::scope(&ctx).load(&mut *db).await?;
+    let notes = Note::scope(&ctx).load(&mut db).await?;
     Ok(Json(notes))
 }
 

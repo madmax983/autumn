@@ -14,9 +14,10 @@ use http::Method;
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
-/// Metadata attached to routes emitted by the `#[repository(api = ...)]`
-/// macro so the app builder can validate, at startup, that every
-/// auto-mounted CRUD endpoint is paired with a registered
+/// Metadata attached to routes emitted by the `#[repository(api = ...)]` macro.
+///
+/// Lets the app builder validate, at startup, that every auto-mounted CRUD
+/// endpoint is paired with a registered
 /// [`Policy`](crate::authorization::Policy).
 #[derive(Debug, Clone, Copy)]
 pub struct RepositoryApiMeta {

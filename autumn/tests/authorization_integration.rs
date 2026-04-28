@@ -178,11 +178,11 @@ where
 {
     type Rejection = std::convert::Infallible;
 
-    fn from_request_parts(
+    async fn from_request_parts(
         _parts: &mut http::request::Parts,
         _state: &S,
-    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move { Ok(Self(FIXED_NOTE)) }
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(FIXED_NOTE))
     }
 }
 

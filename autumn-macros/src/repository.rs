@@ -499,13 +499,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
-        let policy_check_create = if has_policy {
+        // POST endpoint runs `can_create` *before* the insert so a
+        // denied check never commits a row. Naive after-the-fact
+        // policy checks would write the row, then return 403/404,
+        // leaving the data behind.
+        let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy::<#model_name>(
+                ::autumn_web::authorization::__check_policy_create::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
-                    "create",
-                    &record,
                 )
                 .await?;
             }
@@ -671,8 +673,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 repo: #pg_name,
                 ::autumn_web::prelude::Json(new): ::autumn_web::prelude::Json<#new_name>,
             ) -> ::autumn_web::AutumnResult<(::autumn_web::reexports::http::StatusCode, ::autumn_web::prelude::Json<#model_name>)> {
+                #policy_check_create_pre
                 let record = repo.save(&new).await?;
-                #policy_check_create
                 Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
             }
 

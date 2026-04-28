@@ -28,11 +28,7 @@ impl Policy<Post> for PostPolicy {
         Box::pin(async { true })
     }
 
-    fn can_create<'a>(
-        &'a self,
-        ctx: &'a PolicyContext,
-        _post: &'a Post,
-    ) -> BoxFuture<'a, bool> {
+    fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async move { ctx.is_authenticated() })
     }
 
@@ -129,14 +125,12 @@ mod tests {
     #[tokio::test]
     async fn unauthenticated_user_cannot_create() {
         let policy = PostPolicy;
-        let post = make_post(0);
-        assert!(!policy.can_create(&ctx(None, None), &post).await);
+        assert!(!policy.can_create(&ctx(None, None)).await);
     }
 
     #[tokio::test]
     async fn authenticated_user_can_create() {
         let policy = PostPolicy;
-        let post = make_post(0);
-        assert!(policy.can_create(&ctx(Some("1"), None), &post).await);
+        assert!(policy.can_create(&ctx(Some("1"), None)).await);
     }
 }

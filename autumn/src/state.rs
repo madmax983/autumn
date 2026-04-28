@@ -264,7 +264,7 @@ impl AppState {
     /// Override the configured deny response (test helper).
     #[doc(hidden)]
     #[must_use]
-    pub fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
+    pub const fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
         self.forbidden_response = value;
         self
     }

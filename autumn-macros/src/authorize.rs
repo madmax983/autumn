@@ -10,7 +10,7 @@
 //!
 //! - `#[authorize("update", resource = Post)]` — call
 //!   `Post`'s registered policy with action `"update"` against a
-//!   handler argument named `post` (snake_case of `Post`).
+//!   handler argument named `post` (`snake_case` of `Post`).
 //! - `#[authorize("update", resource = Post, from = post)]` — same,
 //!   with an explicit argument name. Use when the handler binds
 //!   the loaded resource under a different name.
@@ -90,15 +90,15 @@ fn parse_authorize_args(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
         }
     }
 
-    if let Some(action) = first_string_literal(&args.action) {
+    if let Some(action) = first_string_literal(args.action.as_ref()) {
         args.action = Some(action);
     }
 
     Ok(args)
 }
 
-fn first_string_literal(action: &Option<String>) -> Option<String> {
-    action.as_ref().and_then(|s| {
+fn first_string_literal(action: Option<&String>) -> Option<String> {
+    action.and_then(|s| {
         // Strip surrounding quotes if the action came in as a stringified literal.
         let trimmed = s.trim();
         if (trimmed.starts_with('"') && trimmed.ends_with('"'))
@@ -143,21 +143,17 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the args first; the parser may surface a leading `"action"`
     // string literal as the bare-Path action via the `Meta::Path` branch
     // by pre-parsing it.
-    let attr_for_parse = attr.clone();
-    let mut args = match parse_with_leading_literal(attr_for_parse) {
+    let mut args = match parse_with_leading_literal(attr) {
         Ok(a) => a,
         Err(err) => return err.to_compile_error(),
     };
 
-    let action_str = match args.action.take() {
-        Some(s) => s,
-        None => {
-            return syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "#[authorize] requires an action: #[authorize(\"update\", resource = Type)]",
-            )
-            .to_compile_error();
-        }
+    let Some(action_str) = args.action.take() else {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[authorize] requires an action: #[authorize(\"update\", resource = Type)]",
+        )
+        .to_compile_error();
     };
 
     let Some(resource_ident) = args.resource else {
@@ -224,7 +220,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// so we strip and re-thread it before the punctuated parse.
 fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
     use proc_macro2::TokenTree;
-    let mut iter = attr.clone().into_iter().peekable();
+    let mut iter = attr.into_iter().peekable();
     let mut leading_action: Option<String> = None;
     if let Some(TokenTree::Literal(lit)) = iter.peek() {
         let lit_str = lit.to_string();

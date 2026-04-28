@@ -113,12 +113,15 @@ pub struct TestApp {
     pool: Option<Pool<AsyncPgConnection>>,
     /// Deferred policy / scope registrations applied during
     /// [`TestApp::build`].
-    policy_registrations: Vec<Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>>,
+    policy_registrations: Vec<TestPolicyRegistration>,
     /// Override for [`AppState::forbidden_response`]. Defaults to
     /// the value derived from
     /// [`SecurityConfig::forbidden_response`](crate::security::SecurityConfig::forbidden_response).
     forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
 }
+
+type TestPolicyRegistration =
+    Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
 impl TestApp {
     /// Create a new test app builder with default configuration.
@@ -178,7 +181,7 @@ impl TestApp {
     /// `#[repository(policy = ...)]` handlers. Useful for
     /// round-tripping the `403`-vs-`404` decision in tests.
     #[must_use]
-    pub fn forbidden_response(
+    pub const fn forbidden_response(
         mut self,
         value: crate::authorization::ForbiddenResponse,
     ) -> Self {

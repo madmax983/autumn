@@ -148,7 +148,7 @@ impl PolicyContext {
 
     /// Returns `true` when the request has a resolved authenticated user.
     #[must_use]
-    pub fn is_authenticated(&self) -> bool {
+    pub const fn is_authenticated(&self) -> bool {
         self.user_id.is_some()
     }
 
@@ -226,14 +226,17 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     }
 
     /// Decide whether the current user may *create* a resource of
-    /// this type. The `_resource` argument carries the proposed
-    /// new value (or a sentinel value for shapes that have no pre-
-    /// insert form).
-    fn can_create<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _resource: &'a R,
-    ) -> BoxFuture<'a, bool> {
+    /// this type.
+    ///
+    /// `can_create` takes no `&R` argument because, at the moment
+    /// the framework asks "may this user create one of these?",
+    /// no instance exists yet — only the proposed insert payload
+    /// (typically `NewR`). Implementations therefore decide based
+    /// on `ctx.user_id` and `ctx.roles` alone. The
+    /// `#[repository(policy = ...)]`-generated `POST` handler
+    /// invokes this *before* the insert so a denied check never
+    /// commits a row.
+    fn can_create<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
     }
 
@@ -256,7 +259,9 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     }
 
     /// Decide a custom verb. Defaults to dispatching the four
-    /// built-ins by name.
+    /// built-ins by name. The `resource` argument is ignored when
+    /// dispatching to `can_create`, since `can_create` operates
+    /// pre-insert and has no resource instance.
     fn can<'a>(
         &'a self,
         action: &'a str,
@@ -266,7 +271,7 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
         Box::pin(async move {
             match action {
                 "show" | "read" => self.can_show(ctx, resource).await,
-                "create" => self.can_create(ctx, resource).await,
+                "create" => self.can_create(ctx).await,
                 "update" | "edit" => self.can_update(ctx, resource).await,
                 "delete" | "destroy" => self.can_delete(ctx, resource).await,
                 _ => false,
@@ -334,7 +339,7 @@ pub struct ScopeQuery<'a, R: Send + Sync + 'static> {
 }
 
 #[cfg(feature = "db")]
-impl<'a, R: Send + Sync + 'static> ScopeQuery<'a, R> {
+impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     /// Load the records the current user is allowed to read.
     ///
     /// Resolves the [`Scope`] registered on the app's
@@ -361,7 +366,7 @@ impl<'a, R: Send + Sync + 'static> ScopeQuery<'a, R> {
 }
 
 #[cfg(not(feature = "db"))]
-impl<'a, R: Send + Sync + 'static> ScopeQuery<'a, R> {
+impl<R: Send + Sync + 'static> ScopeQuery<'_, R> {
     pub async fn load(self) -> crate::AutumnResult<Vec<R>> {
         let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
             crate::AutumnError::from(std::io::Error::other(format!(
@@ -391,7 +396,7 @@ pub trait Scoped: Send + Sync + Sized + 'static {
     /// Open a deferred [`ScopeQuery`] for this type. Resolves the
     /// registered scope at `.load()` time, not here.
     #[must_use]
-    fn scope<'a>(ctx: &'a PolicyContext) -> ScopeQuery<'a, Self> {
+    fn scope(ctx: &PolicyContext) -> ScopeQuery<'_, Self> {
         ScopeQuery {
             ctx,
             _marker: std::marker::PhantomData,
@@ -473,6 +478,11 @@ impl PolicyRegistry {
     }
 
     /// Resolve the registered [`Policy`] for resource `R`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned (a
+    /// previous writer panicked while holding the lock).
     #[must_use]
     pub fn policy<R: Send + Sync + 'static>(&self) -> Option<Arc<dyn Policy<R>>> {
         let inner = self
@@ -486,6 +496,10 @@ impl PolicyRegistry {
     }
 
     /// Resolve the registered [`Scope`] for resource `R`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     #[must_use]
     pub fn scope<R: Send + Sync + 'static>(&self) -> Option<Arc<dyn Scope<R>>> {
         let inner = self
@@ -499,6 +513,10 @@ impl PolicyRegistry {
     }
 
     /// Returns `true` when a policy is registered for resource `R`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry's internal `RwLock` is poisoned.
     #[must_use]
     pub fn has_policy<R: Send + Sync + 'static>(&self) -> bool {
         self.inner
@@ -533,18 +551,13 @@ impl std::fmt::Debug for PolicyRegistry {
 /// defaults; flip to `403` via
 /// `[security] forbidden_response = "403"` in `autumn.toml` when
 /// the leak is acceptable (e.g. internal admin tooling).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ForbiddenResponse {
     /// Return `403 Forbidden`.
     Forbidden403,
     /// Return `404 Not Found` (default, hides existence).
+    #[default]
     NotFound404,
-}
-
-impl Default for ForbiddenResponse {
-    fn default() -> Self {
-        Self::NotFound404
-    }
 }
 
 impl ForbiddenResponse {
@@ -680,6 +693,60 @@ where
     authorize(state, session, action, resource).await
 }
 
+/// Pre-insert authorization helper for the
+/// `#[repository(policy = ...)]`-generated `POST` endpoint.
+///
+/// Resolves the registered [`Policy`] for `R` and calls
+/// [`Policy::can_create`] *before* the row is persisted, closing
+/// the "deny still wrote a row" hole that catches naive
+/// after-the-fact policy checks. Use [`authorize_create`] from
+/// user code; this is the framework's `__`-prefixed alias.
+#[doc(hidden)]
+pub async fn __check_policy_create<R>(
+    state: &crate::AppState,
+    session: &Session,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    authorize_create::<R>(state, session).await
+}
+
+/// Run a policy's `can_create` check before persisting a new record.
+///
+/// Mirrors [`authorize`] but takes no resource argument: at create
+/// time, no record instance exists yet — only the proposed insert
+/// payload — so policies decide based on `ctx.user_id` and
+/// `ctx.roles` alone.
+///
+/// # Errors
+///
+/// Returns the configured deny response when the policy denies.
+/// Returns `500` when no policy is registered for `R`.
+pub async fn authorize_create<R>(
+    state: &crate::AppState,
+    session: &Session,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
+        crate::AutumnError::from(std::io::Error::other(format!(
+            "no policy registered for resource type {}",
+            std::any::type_name::<R>()
+        )))
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    let ctx = PolicyContext::from_request(state, session).await;
+
+    if policy.can_create(&ctx).await {
+        Ok(())
+    } else {
+        Err(state.forbidden_response().into_error())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,7 +806,7 @@ mod tests {
         let c = ctx(Some("1"), None);
         let n = Note { author_id: 1 };
         assert!(!policy.can_show(&c, &n).await);
-        assert!(!policy.can_create(&c, &n).await);
+        assert!(!policy.can_create(&c).await);
         assert!(!policy.can_update(&c, &n).await);
         assert!(!policy.can_delete(&c, &n).await);
         assert!(!policy.can("publish", &c, &n).await);

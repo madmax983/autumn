@@ -1149,7 +1149,7 @@ impl AppBuilder {
         // "a developer who flips the `api =` switch on a
         // `#[repository]` exposes mutate endpoints that any
         // authenticated user can call against any record."
-        validate_repository_api_policies(&all_routes, &config);
+        validate_repository_api_policies(&all_routes, &scoped_groups, &config);
 
         // 6. Build the router (with optional static-file layer)
         let state = build_state(
@@ -1833,13 +1833,17 @@ async fn setup_database(
 /// auto-generated CRUD endpoints with no record-level authz is a
 /// security regression. The escape hatch is
 /// `[security] allow_unauthorized_repository_api = true`.
-fn validate_repository_api_policies(routes: &[Route], config: &AutumnConfig) {
+fn validate_repository_api_policies(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) {
     let profile = config.profile.as_deref().unwrap_or("default");
     let strict = profile == "prod" && !config.security.allow_unauthorized_repository_api;
 
     let mut offenders: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
-    for route in routes {
+    let mut record_route = |route: &Route| {
         if let Some(meta) = route.repository {
             if !meta.has_policy && seen.insert(meta.api_path) {
                 offenders.push((
@@ -1847,6 +1851,18 @@ fn validate_repository_api_policies(routes: &[Route], config: &AutumnConfig) {
                     meta.api_path.to_owned(),
                 ));
             }
+        }
+    };
+    // Both top-level routes (registered via `.routes(...)`) and routes
+    // mounted under a `.scoped(prefix, layer, routes)` group need the
+    // same fail-fast check — otherwise a `#[repository(api = ...)]`
+    // inside a scoped group would bypass the guard.
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
         }
     }
 
