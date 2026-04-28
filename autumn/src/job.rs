@@ -300,11 +300,13 @@ async fn execute_local_job(
                     .job_registry
                     .record_retry(&job.name, &e.to_string(), job.attempt);
                 let sender = tx.clone();
+                let registry = state.job_registry.clone();
                 let name = job.name.clone();
                 let payload = job.payload;
                 let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    registry.record_enqueue(&name);
                     let _ = sender
                         .send(QueuedJob {
                             name,
@@ -531,6 +533,7 @@ fn start_redis_runtime(
                                 initial_backoff_ms: backoff_ms,
                             };
                             if let Ok(encoded) = serde_json::to_string(&retry) {
+                                state.job_registry.record_enqueue(&retry.name);
                                 let _ = connection.lpush::<_, _, ()>(&queue_key, encoded).await;
                             }
                         } else {
