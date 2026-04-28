@@ -287,6 +287,23 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
                 "blob key contains traversal segment".into(),
             ));
         }
+        // `.` and empty segments collapse on the filesystem (`a/./b`,
+        // `a//b`, and `a/b` all resolve to the same path on POSIX) and
+        // are normalized away by most HTTP clients before they reach
+        // the serving route. Either way, two distinct logical keys
+        // would alias and the HMAC signature would no longer match
+        // the path the client actually requests. Reject them here so
+        // every key is canonical at the point it's persisted or signed.
+        if segment == "." {
+            return Err(BlobStoreError::InvalidInput(
+                "blob key contains a `.` segment".into(),
+            ));
+        }
+        if segment.is_empty() {
+            return Err(BlobStoreError::InvalidInput(
+                "blob key contains an empty segment".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -339,6 +356,34 @@ mod tests {
     #[test]
     fn validate_key_rejects_unc_paths() {
         for k in [r"\\server\share\file", "//server/share/file"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_dot_segments() {
+        // `a/./b` would resolve to `a/b` on the filesystem, aliasing two
+        // distinct logical keys. HTTP clients also tend to normalize
+        // these out of URL paths, breaking signature verification.
+        for k in ["a/./b", "./foo", "a/././b", "a/.\\b"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_empty_segments() {
+        // Same aliasing/canonicalization problem as `.` segments.
+        // `a//b` collapses to `a/b` on POSIX; `a/b/` produces a trailing
+        // empty segment that HTTP clients silently strip.
+        for k in ["a//b", "a/b/", "a///b"] {
             let err = validate_key(k).unwrap_err();
             assert!(
                 matches!(err, BlobStoreError::InvalidInput(_)),
