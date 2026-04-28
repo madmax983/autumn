@@ -121,6 +121,30 @@ fn expect_ident(expr: &Expr, hint: &str) -> syn::Result<Ident> {
     }
 }
 
+/// Return `true` when `func` already has a parameter bound to a
+/// pattern with the given identifier name. Used to detect cases
+/// like `#[secured]` having already injected `__autumn_session`,
+/// so `#[authorize]` doesn't double-inject and trigger a duplicate-
+/// parameter compile error.
+fn has_input_named(func: &ItemFn, name: &str) -> bool {
+    func.sig.inputs.iter().any(|arg| match arg {
+        syn::FnArg::Typed(pt) => pat_binds_name(&pt.pat, name),
+        syn::FnArg::Receiver(_) => false,
+    })
+}
+
+fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
+    match pat {
+        syn::Pat::Ident(i) => i.ident == name,
+        // `State(__autumn_state)`: walk the inner pattern.
+        syn::Pat::TupleStruct(ts) => ts.elems.iter().any(|p| pat_binds_name(p, name)),
+        syn::Pat::Tuple(t) => t.elems.iter().any(|p| pat_binds_name(p, name)),
+        syn::Pat::Struct(s) => s.fields.iter().any(|fp| pat_binds_name(&fp.pat, name)),
+        syn::Pat::Reference(r) => pat_binds_name(&r.pat, name),
+        _ => false,
+    }
+}
+
 fn snake_case(name: &str) -> String {
     let mut out = String::new();
     for (i, ch) in name.chars().enumerate() {
@@ -184,15 +208,25 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // registered policy from `AppState`. We wrap AppState in
     // `State<...>` because AppState itself is not a
     // `FromRequestParts` extractor — only `State<AppState>` is.
-    let session_param: syn::FnArg = parse_quote! {
-        __autumn_session: ::autumn_web::session::Session
-    };
-    let state_param: syn::FnArg = parse_quote! {
-        ::autumn_web::reexports::axum::extract::State(__autumn_state):
-            ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
-    };
-    input_fn.sig.inputs.insert(0, state_param);
-    input_fn.sig.inputs.insert(0, session_param);
+    //
+    // Skip injection when the function already has a parameter
+    // bound to `__autumn_session` / `__autumn_state` — the common
+    // case is stacking `#[authorize]` on top of `#[secured]`, which
+    // already injects `__autumn_session`. Re-injecting would
+    // produce a duplicate parameter name and fail to compile.
+    if !has_input_named(&input_fn, "__autumn_state") {
+        let state_param: syn::FnArg = parse_quote! {
+            ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
+        };
+        input_fn.sig.inputs.insert(0, state_param);
+    }
+    if !has_input_named(&input_fn, "__autumn_session") {
+        let session_param: syn::FnArg = parse_quote! {
+            __autumn_session: ::autumn_web::session::Session
+        };
+        input_fn.sig.inputs.insert(0, session_param);
+    }
 
     let action_lit = syn::LitStr::new(&action_str, proc_macro2::Span::call_site());
     let original_body = &input_fn.block;

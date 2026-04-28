@@ -28,6 +28,12 @@ fn compile_fail_tests() {
 
     // Cached macro failures
     t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
+
+    // `policy = T` rejects a type that doesn't impl `Policy<Model>`
+    // at compile time, closing the silent-typo / wrong-type path that
+    // would otherwise only fail at request time with `500`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_invalid_policy_type.rs");
 }
 
 #[test]
@@ -69,6 +75,8 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_with_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_with_policy.rs");
 
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");

@@ -620,8 +620,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let resource_type_name_lit = model_name.to_string();
         let api_path_lit = api_path.clone();
 
+        // Compile-time assertion: when the user writes
+        // `policy = SomePolicy`, the generated code references the
+        // type so a typo (or a real type that doesn't `impl
+        // Policy<Model>`) fails compilation here, not at the first
+        // request with `500 missing policy registration`.
+        let policy_type_assertion = if let Some(ref policy_type) = config.policy_type {
+            quote! {
+                const _: fn() = || {
+                    fn __autumn_assert_policy<P: ::autumn_web::authorization::Policy<#model_name>>() {}
+                    __autumn_assert_policy::<#policy_type>();
+                };
+            }
+        } else {
+            quote! {}
+        };
+        let scope_type_assertion = if let Some(ref scope_type) = config.scope_type {
+            quote! {
+                const _: fn() = || {
+                    fn __autumn_assert_scope<S: ::autumn_web::authorization::Scope<#model_name>>() {}
+                    __autumn_assert_scope::<#scope_type>();
+                };
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
+
+            #policy_type_assertion
+            #scope_type_assertion
 
             #vis async fn #list_fn(
                 #list_session_state_args

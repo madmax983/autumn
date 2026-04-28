@@ -241,3 +241,78 @@ async fn attribute_macro_honors_forbidden_response_override() {
     let response = post_with_session(&client, "/notes-attr/1", "sess-stranger").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
 }
+
+// ── #[authorize] stacked with #[secured] ──────────────────────
+
+/// `#[secured]` already injects a hidden `__autumn_session` extractor.
+/// `#[authorize]` injects the same name. Without collision-detection
+/// this combination would emit a function with two parameters named
+/// `__autumn_session` and fail to compile. Compiling this test is
+/// itself the assertion.
+#[autumn_web::post("/notes-stacked/{id}")]
+#[autumn_web::secured]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_stacked_with_secured(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    Ok("ok")
+}
+
+fn build_stacked_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_stacked_with_secured])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+#[tokio::test]
+async fn stacked_secured_and_authorize_run_both_checks() {
+    // The handler stacks `#[secured]` and `#[authorize]`. Both
+    // checks are present in the body — an unauthenticated request
+    // is rejected by whichever check runs first. (Rust applies
+    // attribute macros top-down, so the outer `#[authorize]`
+    // wraps the inner `#[secured]` check; the policy's
+    // `can_update` denies on a missing session before the
+    // secured guard returns 401.) The exact status matters less
+    // than "is the request rejected" — without collision
+    // detection in `#[authorize]`, the handler wouldn't compile
+    // at all, so reaching this assertion is the real win.
+    let store = MemoryStore::new();
+    let client = build_stacked_app(store, ForbiddenResponse::default());
+    let response = client.post("/notes-stacked/1").send().await;
+    assert!(
+        response.status == StatusCode::UNAUTHORIZED
+            || response.status == StatusCode::NOT_FOUND
+            || response.status == StatusCode::FORBIDDEN,
+        "expected an auth-related rejection, got {}",
+        response.status
+    );
+}
+
+#[tokio::test]
+async fn stacked_secured_and_authorize_authorized_user_passes_secured_then_authorize_denies() {
+    // Authenticated stranger -> #[secured] passes, #[authorize]
+    // denies because the stranger isn't the owner.
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_stacked_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-stacked/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stacked_secured_and_authorize_owner_passes_both() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-owner", "42", None).await;
+    let client = build_stacked_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-stacked/1", "sess-owner").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
