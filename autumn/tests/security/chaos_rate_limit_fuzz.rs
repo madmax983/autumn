@@ -78,6 +78,9 @@ async fn havoc_rate_limit_fuzz_bounds() {
     };
     let layer = RateLimitLayer::from_config(&config);
     let mut svc = layer.layer(MockService);
-    let req = Request::builder().header("X-Forwarded-For", "1.2.3.4").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .header("X-Forwarded-For", "1.2.3.4")
+        .body(Body::empty())
+        .unwrap();
     let _ = svc.ready().await.unwrap().call(req).await;
 }
