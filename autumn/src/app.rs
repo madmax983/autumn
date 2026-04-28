@@ -90,6 +90,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
+        policy_registrations: Vec::new(),
     }
 }
 
@@ -158,6 +159,10 @@ type PoolProviderFactory = Box<
 ///         .await;
 /// }
 /// ```
+/// Closure that registers a policy or scope on the runtime
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
+
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
@@ -204,6 +209,12 @@ pub struct AppBuilder {
     openapi: Option<crate::openapi::OpenApiConfig>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    /// Deferred [`Policy`](crate::authorization::Policy) and
+    /// [`Scope`](crate::authorization::Scope) registrations applied
+    /// to [`AppState::policy_registry`] just before the router is
+    /// built. Stored as boxed closures so we can carry the
+    /// generic type parameters across the builder boundary.
+    policy_registrations: Vec<PolicyRegistration>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -899,6 +910,59 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`Policy`](crate::authorization::Policy)
+    /// implementation for resource type `R`.
+    ///
+    /// Multiple policies per resource are not supported: registering
+    /// `R` twice causes a startup-time panic with a clear error
+    /// message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::authorization::{Policy, PolicyContext};
+    ///
+    /// #[derive(Default)]
+    /// struct PostPolicy;
+    /// impl Policy<Post> for PostPolicy { /* ... */ }
+    ///
+    /// autumn_web::app()
+    ///     .routes(routes![...])
+    ///     .policy::<Post, _>(PostPolicy)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn policy<R, P>(mut self, policy: P) -> Self
+    where
+        R: Send + Sync + 'static,
+        P: crate::authorization::Policy<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_policy::<R, _>(policy);
+        }));
+        self
+    }
+
+    /// Register a [`Scope`](crate::authorization::Scope) implementation
+    /// for resource type `R`. The scope filters list endpoints
+    /// (`GET /<api>` for `#[repository(api = "...", scope = ...)]`)
+    /// to records the current user is allowed to read.
+    ///
+    /// Default impls return an empty list so a missing scope opt-in
+    /// fails closed.
+    #[must_use]
+    pub fn scope<R, S>(mut self, scope: S) -> Self
+    where
+        R: Send + Sync + 'static,
+        S: crate::authorization::Scope<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_scope::<R, _>(scope);
+        }));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -1025,6 +1089,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
+            policy_registrations,
         } = self;
 
         let all_routes = routes;
@@ -1077,12 +1142,28 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
+        // 5b. Fail-fast on `#[repository(api = ...)]` endpoints that
+        // were mounted without a paired `policy = ...` argument when
+        // running in `prod` profile and the explicit escape hatch is
+        // off. Hides exactly the footgun called out in the issue:
+        // "a developer who flips the `api =` switch on a
+        // `#[repository]` exposes mutate endpoints that any
+        // authenticated user can call against any record."
+        validate_repository_api_policies(&all_routes, &config);
+
         // 6. Build the router (with optional static-file layer)
         let state = build_state(
             &config,
             #[cfg(feature = "db")]
             pool,
         );
+        // Apply deferred policy / scope registrations onto the live
+        // app state. Done before the router is built so any panic
+        // from double-registration surfaces during startup, not
+        // mid-request.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1226,6 +1307,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
                 openapi: _,
             audit_logger: _,
+            policy_registrations: _,
         } = self;
 
         let all_routes = routes;
@@ -1744,6 +1826,55 @@ async fn setup_database(
     Ok(pool)
 }
 
+/// Refuse to start when a `#[repository(api = ...)]`-mounted route
+/// has no paired `policy = ...` argument in `prod` profile builds.
+///
+/// The issue text spells out the rationale: silently shipping
+/// auto-generated CRUD endpoints with no record-level authz is a
+/// security regression. The escape hatch is
+/// `[security] allow_unauthorized_repository_api = true`.
+fn validate_repository_api_policies(routes: &[Route], config: &AutumnConfig) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict = profile == "prod" && !config.security.allow_unauthorized_repository_api;
+
+    let mut offenders: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    for route in routes {
+        if let Some(meta) = route.repository {
+            if !meta.has_policy && seen.insert(meta.api_path) {
+                offenders.push((
+                    meta.resource_type_name.to_owned(),
+                    meta.api_path.to_owned(),
+                ));
+            }
+        }
+    }
+
+    if offenders.is_empty() {
+        return;
+    }
+
+    let listing = offenders
+        .iter()
+        .map(|(name, path)| format!("  - #[repository({name}, api = \"{path}\")]"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if strict {
+        tracing::error!(
+            "refusing to start: the following #[repository(api = ...)] endpoints have no paired `policy = ...` argument:\n{listing}\n\
+             Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
+        );
+        std::process::exit(1);
+    } else {
+        tracing::warn!(
+            "the following #[repository(api = ...)] endpoints have no paired `policy = ...` argument; \
+             auto-generated CRUD endpoints will accept writes from any authenticated user:\n{listing}\n\
+             This will become a startup-time error in `prod` profile builds."
+        );
+    }
+}
+
 fn build_state(
     config: &AutumnConfig,
     #[cfg(feature = "db")] pool: Option<
@@ -1766,6 +1897,9 @@ fn build_state(
         channels: crate::channels::Channels::new(32),
         #[cfg(feature = "ws")]
         shutdown: tokio_util::sync::CancellationToken::new(),
+        policy_registry: crate::authorization::PolicyRegistry::default(),
+        forbidden_response: config.security.forbidden_response,
+        auth_session_key: config.auth.session_key.clone(),
     }
 }
 
@@ -1974,6 +2108,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -1992,6 +2129,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }
     }
 
@@ -2145,6 +2283,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -2218,6 +2359,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -2238,6 +2380,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -2270,6 +2415,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: http::Method::POST,
@@ -2283,6 +2429,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
         ];
         let config = AutumnConfig::default();
@@ -2304,6 +2451,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -2585,6 +2735,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -2637,6 +2790,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }],
                 &config,
                 state,
@@ -2690,6 +2844,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }]);
 
                 let response = router
@@ -2878,6 +3033,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -3017,6 +3175,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3054,6 +3215,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3296,6 +3460,9 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -3356,6 +3523,9 @@ mod tests {
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

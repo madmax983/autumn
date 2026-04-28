@@ -220,6 +220,26 @@ async fn admin_panel() -> &'static str {
 }
 ```
 
+### Record-level authorization
+
+Spring Security's `@PreAuthorize` / `@PostAuthorize`, Rails Pundit,
+Phoenix Bodyguard, Django `has_object_permission`, and Rails
+`before_action` all answer the same question: "is this user allowed to
+act on *this specific record*?" Autumn's `Policy` trait + `#[authorize]`
+macro is the trait-plugin idiom for the same surface.
+
+| Framework            | Record-level authz idiom                                                  | Autumn equivalent                                                                       |
+|----------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| Spring               | `@PreAuthorize("...")` / `@PostAuthorize`                                 | `#[authorize("update", resource = Post)]`                                               |
+| Rails                | `Pundit` — `authorize @post`, `policy_scope(Post)`, `before_action`       | `#[authorize(...)]` + `Scope` trait + `Policy::register_*`                              |
+| Phoenix              | `Bodyguard.permit(MyApp.Blog, :update_post, user, post)`                  | `autumn_web::authorization::authorize::<Post>(...)` (inline) or `#[authorize]`          |
+| Django               | `has_object_permission` (DRF) / `django-guardian`                         | `Policy::can_show / can_update / can_delete`                                            |
+| Loco.rs / axum / actix-web / rocket | Hand-rolled `if record.author_id != user_id` everywhere    | Single `Policy<R>` impl + `.policy::<R, _>(...)` registration                           |
+
+See [`docs/guide/authorization.md`](./authorization.md) for the full
+walkthrough including scope queries, `[security] forbidden_response`,
+and the reddit-clone migration.
+
 ### Actuator
 
 Both frameworks provide actuator endpoints out of the box:

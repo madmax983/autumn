@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **authorization:** First-class record-level authorization — `Policy` /
+  `Scope` traits, `PolicyContext` carrying the resolved `Session` /
+  user / role set / `Db` handle, an `#[authorize("action", resource = Type)]`
+  attribute macro that resolves the registered policy and short-circuits
+  with the configured deny response before the handler body runs, a
+  `policy = SomePolicy` argument on `#[repository(api = "...")]` that
+  wires the same checks into every auto-generated POST/PATCH/PUT/DELETE
+  endpoint plus `GET /<api>/{id}` for read scoping, a `scope = SomeScope`
+  companion that constrains list endpoints, and a `[security]
+  forbidden_response = "404" | "403"` knob (default `"404"` to mirror
+  Rails / Phoenix and avoid leaking record existence). Register on the
+  app builder via `.policy::<R, _>(...)` / `.scope::<R, _>(...)`.
+  `examples/reddit-clone`'s `PostPolicy` replaces every hand-rolled
+  `if post.author_id != user_id` check; `git grep -n "author_id != user_id"
+  examples/reddit-clone/` now returns empty (#496).
+  - **Behavior change:** `#[repository(api = "...")]` without a paired
+    `policy = ...` argument is now a startup-time error in `prod`
+    profile builds. The escape hatch is `[security]
+    allow_unauthorized_repository_api = true`. Downstream apps using the
+    `api =` switch must add `policy = SomePolicy` (or opt out
+    explicitly) — this is the one behavior change downstream apps have
+    to address.
 - **cli:** `autumn generate model | migration | scaffold` for one-command
   resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
   `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route

@@ -1459,6 +1459,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 
@@ -1802,6 +1805,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             }],
             apply_layer: Box::new(|r| r),
         };
@@ -1868,6 +1872,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -2040,6 +2045,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {
@@ -2105,6 +2111,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {

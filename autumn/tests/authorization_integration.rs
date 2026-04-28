@@ -1,0 +1,260 @@
+//! Integration tests for record-level authorization (issue #496).
+//!
+//! Covers the four acceptance-criteria checks the issue calls out:
+//!
+//! 1. A user with no role cannot update another user's record via a
+//!    hand-written handler.
+//! 2. A user with the `admin` role can.
+//! 3. The unauthorized response is `404` by default.
+//! 4. A custom `forbidden_response = "403"` round-trips correctly.
+
+use autumn_web::authorization::{BoxFuture, ForbiddenResponse, Policy, PolicyContext};
+use autumn_web::prelude::*;
+use autumn_web::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+use autumn_web::test::TestApp;
+use http::StatusCode;
+
+// ── Test resource and policy ──────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+struct Note {
+    id: i64,
+    author_id: i64,
+}
+
+#[derive(Default, Clone)]
+struct AdminOrOwnerPolicy;
+
+impl Policy<Note> for AdminOrOwnerPolicy {
+    fn can_show<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _note: &'a Note,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+    fn can_update<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        note: &'a Note,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
+        })
+    }
+    fn can_delete<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        note: &'a Note,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move {
+            ctx.has_role("admin") || ctx.user_id_i64() == Some(note.author_id)
+        })
+    }
+}
+
+const FIXED_NOTE: Note = Note {
+    id: 1,
+    author_id: 42,
+};
+
+// ── Hand-written handler exercising the inline `authorize` helper ──
+
+#[autumn_web::put("/notes/{id}")]
+async fn update_note_inline(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    State(state): State<AppState>,
+    session: Session,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    autumn_web::authorization::authorize::<Note>(&state, &session, "update", &FIXED_NOTE)
+        .await?;
+    Ok("ok")
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+
+fn build_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_inline])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+async fn seed_session(store: &MemoryStore, sid: &str, user_id: &str, role: Option<&str>) {
+    let mut data = std::collections::HashMap::new();
+    data.insert("user_id".to_owned(), user_id.to_owned());
+    if let Some(role) = role {
+        data.insert("role".to_owned(), role.to_owned());
+    }
+    store.save(sid, data).await.unwrap();
+}
+
+async fn put_with_session(
+    client: &autumn_web::test::TestClient,
+    path: &str,
+    sid: &str,
+) -> autumn_web::test::TestResponse {
+    client
+        .put(path)
+        .header("Cookie", &format!("autumn.sid={sid}"))
+        .send()
+        .await
+}
+
+// ── Tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unauthenticated_request_is_denied() {
+    let store = MemoryStore::new();
+    let client = build_app(store, ForbiddenResponse::default());
+    // No session cookie at all -> ctx has no user_id, policy denies.
+    let response = client.put("/notes/1").send().await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn non_owner_without_role_cannot_update() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_app(store, ForbiddenResponse::default());
+    let response = put_with_session(&client, "/notes/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_can_update_anyones_record() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-admin", "999", Some("admin")).await;
+    let client = build_app(store, ForbiddenResponse::default());
+    let response = put_with_session(&client, "/notes/1", "sess-admin").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owner_can_update_their_own_record() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-owner", "42", None).await;
+    let client = build_app(store, ForbiddenResponse::default());
+    let response = put_with_session(&client, "/notes/1", "sess-owner").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn forbidden_response_default_is_404() {
+    // No policy registration mismatch — just validates the default
+    // status the framework picks when a policy denies.
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_app(store, ForbiddenResponse::default());
+    let response = put_with_session(&client, "/notes/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn forbidden_response_can_be_set_to_403() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_app(store, ForbiddenResponse::Forbidden403);
+    let response = put_with_session(&client, "/notes/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+}
+
+// ── #[authorize] attribute macro coverage ─────────────────────
+
+/// Custom `FromRequestParts` extractor that loads our test fixture
+/// without needing a real database — lets us exercise the
+/// `#[authorize]` attribute macro path.
+struct LoadedNote(Note);
+
+impl<S> axum::extract::FromRequestParts<S> for LoadedNote
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        _parts: &mut http::request::Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        async move { Ok(Self(FIXED_NOTE)) }
+    }
+}
+
+/// Wrap the loaded note in a fresh `Note` binding so the
+/// snake-cased default param name resolves.
+#[autumn_web::post("/notes-attr/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+async fn update_note_attr(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    Ok("ok")
+}
+
+fn build_attr_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_attr])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+async fn post_with_session(
+    client: &autumn_web::test::TestClient,
+    path: &str,
+    sid: &str,
+) -> autumn_web::test::TestResponse {
+    client
+        .post(path)
+        .header("Cookie", &format!("autumn.sid={sid}"))
+        .send()
+        .await
+}
+
+#[tokio::test]
+async fn attribute_macro_denies_non_owner_with_404() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_attr_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-attr/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn attribute_macro_allows_owner() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-owner", "42", None).await;
+    let client = build_attr_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-attr/1", "sess-owner").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn attribute_macro_allows_admin() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-admin", "999", Some("admin")).await;
+    let client = build_attr_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-attr/1", "sess-admin").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn attribute_macro_honors_forbidden_response_override() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-stranger", "999", None).await;
+    let client = build_attr_app(store, ForbiddenResponse::Forbidden403);
+    let response = post_with_session(&client, "/notes-attr/1", "sess-stranger").await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+}

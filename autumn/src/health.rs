@@ -72,6 +72,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 
@@ -150,6 +153,9 @@ mod tests {
                 channels: crate::channels::Channels::new(32),
                 #[cfg(feature = "ws")]
                 shutdown: tokio_util::sync::CancellationToken::new(),
+                policy_registry: crate::authorization::PolicyRegistry::default(),
+                forbidden_response: crate::authorization::ForbiddenResponse::default(),
+                auth_session_key: "user_id".to_owned(),
             });
 
         let response = app

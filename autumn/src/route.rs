@@ -14,6 +14,30 @@ use http::Method;
 use crate::openapi::ApiDoc;
 use crate::state::AppState;
 
+/// Metadata attached to routes emitted by the `#[repository(api = ...)]`
+/// macro so the app builder can validate, at startup, that every
+/// auto-mounted CRUD endpoint is paired with a registered
+/// [`Policy`](crate::authorization::Policy).
+#[derive(Debug, Clone, Copy)]
+pub struct RepositoryApiMeta {
+    /// Stringified resource type name (e.g., `"Post"`). Used for
+    /// log messages and to look up the registered policy via
+    /// [`std::any::TypeId`] indirectly through the generated check
+    /// function in [`Self::policy_check`].
+    pub resource_type_name: &'static str,
+
+    /// Path prefix mounted by this repository (e.g., `"/api/posts"`).
+    pub api_path: &'static str,
+
+    /// `true` when the macro form used `policy = SomePolicy`, so the
+    /// auto-generated handlers enforce a record-level check before
+    /// running. `false` when the macro form is just
+    /// `#[repository(api = "...")]` — that form is rejected in
+    /// `prod` profile builds unless
+    /// `[security] allow_unauthorized_repository_api = true`.
+    pub has_policy: bool,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -52,4 +76,9 @@ pub struct Route {
     /// `AppBuilder::openapi` when
     /// generating `/v3/api-docs`.
     pub api_doc: ApiDoc,
+
+    /// Repository auto-API metadata, populated by the
+    /// `#[repository(api = ...)]` macro. `None` for hand-written
+    /// route handlers.
+    pub repository: Option<RepositoryApiMeta>,
 }

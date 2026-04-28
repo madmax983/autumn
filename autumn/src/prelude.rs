@@ -27,8 +27,8 @@
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled,
+    secured, service, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -92,6 +92,11 @@ pub use crate::auth::Auth;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 
+// ── Authorization ────────────────────────────────────────────────
+/// Record-level authorization primitives. See
+/// [`crate::authorization`] for the full surface.
+pub use crate::authorization::{Policy, PolicyContext, Scope};
+
 // ── Security ───────────────────────────────────────────────────
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
@@ -124,6 +129,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -142,6 +150,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

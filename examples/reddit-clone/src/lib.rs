@@ -3,6 +3,7 @@ pub mod hooks;
 pub mod live_bus;
 pub mod live_events;
 pub mod models;
+pub mod policies;
 pub mod repositories;
 pub mod routes;
 pub mod schema;
