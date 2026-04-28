@@ -1335,7 +1335,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
                 openapi: _,
             audit_logger: _,
-            policy_registrations: _,
+            policy_registrations,
         } = self;
 
         let all_routes = routes;
@@ -1379,6 +1379,19 @@ impl AppBuilder {
         );
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+
+        // Apply deferred policy / scope registrations onto the live
+        // app state — same as `run()`. Static routes can carry
+        // `#[authorize]` checks or live behind `#[repository(policy =
+        // ..., scope = ...)]` index endpoints; without registering
+        // here, every such pre-render call would 500 at build time
+        // with `no policy/scope registered`, and `render_static_routes`
+        // would treat that as a build failure even though
+        // `.policy(...)` / `.scope(...)` was configured on the
+        // builder.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
 
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
