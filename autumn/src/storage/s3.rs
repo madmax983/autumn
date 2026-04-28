@@ -109,3 +109,85 @@ fn unsupported(op: &str) -> BlobStoreError {
         "{op} is not yet implemented; pin an SDK in storage::s3 to enable"
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream;
+
+    fn store() -> S3BlobStore {
+        S3BlobStore::new(S3Options {
+            provider_id: "s3-prod".into(),
+            bucket: "uploads".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("https://example.com".into()),
+            public_base_url: None,
+            force_path_style: false,
+            default_expiry: Duration::from_secs(60),
+        })
+    }
+
+    #[test]
+    fn options_round_trip() {
+        let s = store();
+        assert_eq!(s.provider_id(), "s3-prod");
+        assert_eq!(s.options().bucket, "uploads");
+        assert_eq!(s.options().region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn put_returns_unsupported() {
+        let err = store()
+            .put("k", "image/png", Bytes::from_static(b"x"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn put_stream_returns_unsupported() {
+        let chunks: Vec<Result<Bytes, BlobStoreError>> = vec![Ok(Bytes::from_static(b"x"))];
+        let stream: ByteStream<'static> = Box::pin(stream::iter(chunks));
+        let err = store()
+            .put_stream("k", "image/png", stream)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn get_returns_unsupported() {
+        let err = store().get("k").await.unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_returns_unsupported() {
+        let err = store().delete("k").await.unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn head_returns_unsupported() {
+        let err = store().head("k").await.unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn presigned_url_returns_unsupported() {
+        let err = store()
+            .presigned_url("k", Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::Unsupported(_)));
+    }
+
+    #[test]
+    fn unsupported_message_includes_operation_and_hint() {
+        let err = unsupported("S3BlobStore::put");
+        let msg = err.to_string();
+        assert!(msg.contains("S3BlobStore::put"));
+        assert!(msg.contains("storage::s3"));
+    }
+}

@@ -735,4 +735,60 @@ mod tests {
             "temp file leaked: {entries:?}"
         );
     }
+
+    #[tokio::test]
+    async fn atomic_replace_overwrites_existing_destination() {
+        let dir = temp_root();
+        let dst = dir.path().join("target.bin");
+        tokio::fs::write(&dst, b"old").await.unwrap();
+        let tmp = dir.path().join("staging.tmp");
+        tokio::fs::write(&tmp, b"new").await.unwrap();
+
+        atomic_replace(&tmp, &dst).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"new");
+        assert!(!tmp.exists(), "temp file should be consumed by rename");
+    }
+
+    #[tokio::test]
+    async fn atomic_replace_creates_new_destination() {
+        let dir = temp_root();
+        let dst = dir.path().join("fresh.bin");
+        let tmp = dir.path().join("staging.tmp");
+        tokio::fs::write(&tmp, b"hello").await.unwrap();
+
+        atomic_replace(&tmp, &dst).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn atomic_replace_propagates_io_errors() {
+        let dir = temp_root();
+        let tmp = dir.path().join("missing.tmp"); // never created
+        let dst = dir.path().join("target.bin");
+        let err = atomic_replace(&tmp, &dst).await.unwrap_err();
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::NotFound),
+            "expected NotFound, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[test]
+    fn temp_sibling_path_keeps_parent_directory() {
+        let original = std::path::Path::new("/var/lib/blobs/avatars/me.png");
+        let tmp = temp_sibling_path(original);
+        assert_eq!(tmp.parent(), original.parent());
+        let name = tmp.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("me.png.tmp."));
+    }
+
+    #[test]
+    fn signing_key_debug_does_not_leak_material() {
+        let key = SigningKey::new(b"super-secret".to_vec());
+        let dbg = format!("{key:?}");
+        assert!(!dbg.contains("super-secret"));
+        assert!(dbg.contains("len"));
+    }
 }
