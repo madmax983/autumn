@@ -4,6 +4,7 @@ pub mod cookie_tossing;
 pub mod csrf_cookie_tossing;
 pub mod csrf_empty_bypass;
 pub mod csrf_form_bypass;
+pub mod csrf_htmx_advisory;
 pub mod csrf_length_timing;
 pub mod csrf_path_traversal;
 pub mod csrf_timing;

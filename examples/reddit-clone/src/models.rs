@@ -1,3 +1,5 @@
+use autumn_web::storage::Blob;
+
 use crate::schema::{comments, posts, subreddits, users, votes};
 
 // Manual model -- password_hash should never be auto-exposed via API.
@@ -12,6 +14,11 @@ pub struct User {
     pub karma: i64,
     pub role: String,
     pub created_at: chrono::NaiveDateTime,
+    /// Blob handle pointing into the configured `BlobStore`. Lifecycle
+    /// (presence, deletion) is the application's job; the bytes are the
+    /// store's. Demonstrates the `[storage]` feature's `#[model]`
+    /// integration end-to-end.
+    pub avatar: Option<Blob>,
 }
 
 #[derive(Debug, Clone, diesel::Insertable, serde::Deserialize)]

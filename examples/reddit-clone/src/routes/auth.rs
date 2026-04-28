@@ -247,6 +247,7 @@ pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::
 
 #[get("/u/{username}")]
 pub async fn profile(
+    State(state): State<AppState>,
     Path(name): Path<String>,
     session: Session,
     csrf: CsrfToken,
@@ -261,6 +262,24 @@ pub async fn profile(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("User u/{name} not found")))?;
 
+    // Mint a presigned URL for the user's avatar (if any) through the
+    // configured BlobStore. In dev that's an HMAC-signed link served by
+    // the framework's mounted `/_blobs` route; in prod it's a real S3
+    // presigned URL.
+    let avatar_url = match (
+        user.avatar.as_ref(),
+        state.extension::<autumn_web::storage::BlobStoreState>(),
+    ) {
+        (Some(blob), Some(blobs)) => blobs
+            .store()
+            .clone()
+            .presigned_url(&blob.key, std::time::Duration::from_secs(300))
+            .await
+            .ok(),
+        _ => None,
+    };
+    let is_self = current_user.as_deref() == Some(user.username.as_str());
+
     Ok(layout(
         &format!("u/{}", user.username),
         current_user.as_deref(),
@@ -268,9 +287,14 @@ pub async fn profile(
         html! {
             div class="bg-white rounded-lg shadow p-6" {
                 div class="flex items-center gap-4 mb-4" {
-                    div class="w-16 h-16 bg-orange-100 text-orange-600 rounded-full \
-                               flex items-center justify-center text-2xl font-bold" {
-                        (user.username.chars().next().unwrap_or('?').to_uppercase().to_string())
+                    @if let Some(url) = &avatar_url {
+                        img src=(url) alt=(format!("u/{} avatar", user.username))
+                            class="w-16 h-16 rounded-full object-cover";
+                    } @else {
+                        div class="w-16 h-16 bg-orange-100 text-orange-600 rounded-full \
+                                   flex items-center justify-center text-2xl font-bold" {
+                            (user.username.chars().next().unwrap_or('?').to_uppercase().to_string())
+                        }
                     }
                     div {
                         h1 class="text-2xl font-bold" { "u/" (user.username) }
@@ -278,6 +302,12 @@ pub async fn profile(
                             (user.karma) " karma"
                             " \u{2022} joined "
                             (user.created_at.format("%b %d, %Y"))
+                        }
+                        @if is_self {
+                            p class="text-xs mt-1" {
+                                a href="/settings/avatar"
+                                  class="text-orange-600 hover:underline" { "Change picture" }
+                            }
                         }
                     }
                 }

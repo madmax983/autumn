@@ -23,6 +23,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
+- **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
 - **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
 
 ## Quickstart

@@ -118,6 +118,8 @@ pub(crate) mod session_redis;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
+#[cfg(feature = "storage")]
+pub mod storage;
 
 pub mod task;
 pub mod telemetry;

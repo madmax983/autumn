@@ -181,8 +181,16 @@ pub struct MultipartField<'a> {
     max_file_size_bytes: usize,
 }
 
+#[cfg(all(feature = "multipart", feature = "storage"))]
+struct MultipartFieldStreamState<'a> {
+    inner: axum::extract::multipart::Field<'a>,
+    total: usize,
+    max: usize,
+    errored: bool,
+}
+
 #[cfg(feature = "multipart")]
-impl MultipartField<'_> {
+impl<'a> MultipartField<'a> {
     /// Field name from the multipart form.
     #[must_use]
     pub fn name(&self) -> Option<&str> {
@@ -199,6 +207,32 @@ impl MultipartField<'_> {
     #[must_use]
     pub fn content_type(&self) -> Option<&str> {
         self.inner.content_type()
+    }
+
+    /// Tighten the per-field upload cap below the global
+    /// `security.upload.max_file_size_bytes`.
+    ///
+    /// Routes can use this to enforce stricter caps than the global
+    /// policy. The effective cap is `min(current, max)` — calling this
+    /// with a value larger than the global is a no-op, so a route
+    /// can't accidentally relax the framework-level limit.
+    ///
+    /// Returns `413 Payload Too Large` if subsequent reads exceed the
+    /// tightened cap, just like the unchained form.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// // Cap avatar uploads at 2 MiB even if the global cap is higher.
+    /// let blob = field
+    ///     .with_max_bytes(2 * 1024 * 1024)
+    ///     .save_to_blob_store(&*store, &key)
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_max_bytes(mut self, max: usize) -> Self {
+        self.max_file_size_bytes = self.max_file_size_bytes.min(max);
+        self
     }
 
     /// Read this field fully into memory while enforcing file-size limits.
@@ -223,6 +257,107 @@ impl MultipartField<'_> {
             out.extend_from_slice(&chunk);
         }
         Ok(out)
+    }
+
+    /// Stream this field into a [`BlobStore`](crate::storage::BlobStore)
+    /// while enforcing file-size limits.
+    ///
+    /// This is the production-ready replacement for [`save_to`](Self::save_to):
+    /// the bytes flow through the configured blob backend (Local for dev,
+    /// S3 for prod) so they survive container restarts and are visible to
+    /// every replica.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::extract::Multipart;
+    /// use autumn_web::storage::BlobStoreState;
+    ///
+    /// #[post("/avatar")]
+    /// async fn upload(state: State<AppState>, mut form: Multipart) -> AutumnResult<String> {
+    ///     let store = state.extension::<BlobStoreState>().expect("storage configured");
+    ///     while let Some(field) = form.next_field().await? {
+    ///         if field.name() == Some("avatar") {
+    ///             let blob = field
+    ///                 .save_to_blob_store(store.store().as_ref(), "avatars/me.png")
+    ///                 .await?;
+    ///             return Ok(blob.key);
+    ///         }
+    ///     }
+    ///     Err(autumn_web::AutumnError::bad_request_msg("missing avatar field"))
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the field exceeds
+    /// `security.upload.max_file_size_bytes`, when the multipart body is
+    /// malformed, or when the underlying [`BlobStore`](crate::storage::BlobStore)
+    /// rejects the write.
+    #[cfg(feature = "storage")]
+    pub async fn save_to_blob_store<'b>(
+        self,
+        store: &'b (dyn crate::storage::BlobStore + '_),
+        key: impl Into<String>,
+    ) -> crate::AutumnResult<crate::storage::Blob>
+    where
+        'a: 'b,
+    {
+        let key = key.into();
+        let content_type = self
+            .inner
+            .content_type()
+            .map_or_else(|| "application/octet-stream".to_owned(), str::to_owned);
+
+        // Adapt the multipart chunk iterator into the trait's
+        // `ByteStream`, enforcing the per-file size cap as we go so we
+        // never buffer the whole upload in memory and large files flow
+        // straight through to the store's streaming path.
+        let state = MultipartFieldStreamState {
+            inner: self.inner,
+            total: 0,
+            max: self.max_file_size_bytes,
+            errored: false,
+        };
+
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            if state.errored {
+                return None;
+            }
+            match state.inner.chunk().await {
+                Ok(Some(chunk)) => {
+                    state.total = state.total.saturating_add(chunk.len());
+                    if state.total > state.max {
+                        let err = crate::storage::BlobStoreError::PayloadTooLarge(format!(
+                            "uploaded file exceeds limit of {} bytes",
+                            state.max,
+                        ));
+                        state.errored = true;
+                        Some((Err(err), state))
+                    } else {
+                        Some((Ok(chunk), state))
+                    }
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    // multer/axum already classifies multipart parser
+                    // failures: 400 for malformed bodies, 413 for body
+                    // limit violations, etc. Preserve that — wrapping
+                    // every parser error as `Io` would silently turn
+                    // client errors into 500s on the way out.
+                    state.errored = true;
+                    let mapped = blob_error_from_multipart(&err);
+                    Some((Err(mapped), state))
+                }
+            }
+        });
+        let stream: crate::storage::ByteStream<'b> = Box::pin(stream);
+
+        store
+            .put_stream(&key, &content_type, stream)
+            .await
+            .map_err(crate::storage::BlobStoreError::into_autumn_error)
     }
 
     /// Stream this field to disk while enforcing file-size limits.
@@ -271,6 +406,29 @@ fn multipart_rejection_to_error(
     err: &axum::extract::multipart::MultipartRejection,
 ) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
+}
+
+#[cfg(feature = "multipart")]
+/// Map a multipart parser error to a `BlobStoreError` variant whose
+/// `status()` matches what the parser would have reported as an HTTP
+/// response — so a malformed-body parser failure becomes 400, a body-
+/// limit violation becomes 413, and only true server-side problems
+/// stay as 500. Without this, every parser error would wrap as
+/// `BlobStoreError::Io` and `into_autumn_error` would surface them all
+/// as 500s.
+#[cfg(all(feature = "multipart", feature = "storage"))]
+fn blob_error_from_multipart(
+    err: &axum::extract::multipart::MultipartError,
+) -> crate::storage::BlobStoreError {
+    let status = err.status();
+    let body = err.body_text();
+    if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+        crate::storage::BlobStoreError::PayloadTooLarge(body)
+    } else if status.is_client_error() {
+        crate::storage::BlobStoreError::InvalidInput(body)
+    } else {
+        crate::storage::BlobStoreError::Io(body)
+    }
 }
 
 #[cfg(feature = "multipart")]
