@@ -29,6 +29,20 @@ impl AccountMailer {
             .build()
             .expect("valid mail")
     }
+
+    fn welcome_with_marker<T>(&self, to: String) -> Mail
+    where
+        T: Default,
+    {
+        let _ = std::mem::size_of_val(self);
+        let _ = T::default();
+        Mail::builder()
+            .to(to)
+            .subject("Welcome")
+            .text("hello")
+            .build()
+            .expect("valid mail")
+    }
 }
 
 struct GenericAccountMailer<T> {
@@ -120,6 +134,30 @@ fn mailer_macro_supports_generic_template_methods() {
     runtime
         .block_on(account.send_welcome(&mailer, "user@example.com"))
         .expect("generic method send helper should work");
+
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("mail dir exists")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn mailer_macro_supports_non_inferable_generic_template_methods() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mailer = Mailer::builder()
+        .from("noreply@example.com")
+        .transport(Transport::File)
+        .file_dir(dir.path())
+        .build()
+        .expect("mailer should build");
+
+    let account = AccountMailer;
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    runtime
+        .block_on(account.send_welcome_with_marker::<String>(&mailer, "user@example.com".to_owned()))
+        .expect("non-inferable generic method send helper should work");
 
     assert_eq!(
         std::fs::read_dir(dir.path())

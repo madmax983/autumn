@@ -2,7 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, ImplItem, ImplItemFn, ItemImpl, Pat, ReturnType, Type};
+use syn::{FnArg, GenericParam, ImplItem, ImplItemFn, ItemImpl, Pat, ReturnType, Type};
 
 struct MailMethod {
     method: syn::Ident,
@@ -77,10 +77,34 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let send_method = &method.send_method;
         let later_method = &method.later_method;
         let method_generic_params = &method.generics.params;
-        let method_generic_args = if method_generic_params.is_empty() {
+        let method_generic_decl = if method_generic_params.is_empty() {
             quote! {}
         } else {
             quote! { <#method_generic_params> }
+        };
+        let method_generic_call_args = method
+            .generics
+            .params
+            .iter()
+            .map(|param| match param {
+                GenericParam::Type(param) => {
+                    let ident = &param.ident;
+                    quote! { #ident }
+                }
+                GenericParam::Lifetime(param) => {
+                    let lifetime = &param.lifetime;
+                    quote! { #lifetime }
+                }
+                GenericParam::Const(param) => {
+                    let ident = &param.ident;
+                    quote! { #ident }
+                }
+            })
+            .collect::<Vec<_>>();
+        let method_generic_call = if method_generic_call_args.is_empty() {
+            quote! {}
+        } else {
+            quote! { ::<#(#method_generic_call_args),*> }
         };
         let method_where_clause = &method.generics.where_clause;
         let arg_defs = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
@@ -88,25 +112,25 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let arg_names = method.args.iter().map(|(name, _)| quote! { #name });
         let arg_names_later = method.args.iter().map(|(name, _)| quote! { #name });
         quote! {
-            pub async fn #send_method #method_generic_args (
+            pub async fn #send_method #method_generic_decl (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
                 #( #arg_defs, )*
             ) -> ::autumn_web::AutumnResult<()>
             #method_where_clause
             {
-                let mail = self.#original( #( #arg_names, )* );
+                let mail = self.#original #method_generic_call ( #( #arg_names, )* );
                 mailer.send(mail).await.map_err(::autumn_web::AutumnError::internal_server_error)
             }
 
-            pub fn #later_method #method_generic_args (
+            pub fn #later_method #method_generic_decl (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
                 #( #arg_defs_later, )*
             )
             #method_where_clause
             {
-                let mail = self.#original( #( #arg_names_later, )* );
+                let mail = self.#original #method_generic_call ( #( #arg_names_later, )* );
                 mailer.deliver_later(mail);
             }
         }
@@ -182,5 +206,25 @@ mod tests {
         assert!(rendered.contains("pub async fn send_welcome < T >"));
         assert!(rendered.contains("where T : std :: fmt :: Display"));
         assert!(rendered.contains("pub fn deliver_later_welcome < T >"));
+    }
+
+    #[test]
+    fn forwards_method_generics_into_helper_calls() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn welcome<T>(&self, to: String) -> Mail
+                    where
+                        T: Default,
+                    {
+                        let _ = T::default();
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("self . welcome :: < T >"));
     }
 }
