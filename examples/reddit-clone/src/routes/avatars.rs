@@ -23,6 +23,16 @@ use super::layout::{hx_redirect_to, layout};
 /// further than the global, never loosen it.
 const AVATAR_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// Server-side MIME allowlist for avatar uploads. The HTML `accept`
+/// attribute is a UI hint only — clients can declare any
+/// content_type. The local backend's serving route now returns the
+/// persisted content_type, so an unfiltered upload would let an
+/// attacker stash e.g. an HTML file under the app's origin and have
+/// it served as `text/html`. Enforce the allowlist here, not in the
+/// framework's global `security.upload.allowed_mime_types`, since
+/// other routes may legitimately accept other types.
+const AVATAR_ALLOWED_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
+
 #[get("/settings/avatar")]
 #[secured]
 pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
@@ -102,6 +112,21 @@ pub async fn upload_avatar(
     let mut new_blob: Option<Blob> = None;
     while let Some(field) = form.next_field().await? {
         if field.name() == Some("avatar") {
+            // Enforce the MIME allowlist server-side. The HTML
+            // `accept` attribute is hint-only; without this check a
+            // crafted client could upload non-image content
+            // (e.g. an HTML file) which would later be served from
+            // the app origin with attacker-controlled
+            // `Content-Type` — a stored-XSS vector now that the
+            // local serving route honors the persisted MIME.
+            let content_type = field.content_type().unwrap_or("");
+            if !AVATAR_ALLOWED_MIME_TYPES.contains(&content_type) {
+                return Err(AutumnError::unprocessable_msg(format!(
+                    "unsupported avatar content type: {content_type:?} \
+                     (allowed: {AVATAR_ALLOWED_MIME_TYPES:?})"
+                )));
+            }
+
             let store = blobs.store().clone();
             // Tighten the framework's global upload cap to a route-
             // local 2 MiB. The form text and the actual write cap
