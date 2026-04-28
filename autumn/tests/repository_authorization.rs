@@ -397,3 +397,168 @@ async fn handwritten_list_handler_uses_scope_via_blanket_trait() {
     assert_eq!(body[0]["author_id"], 1);
     assert_eq!(body[0]["title"], "alice's");
 }
+
+// ── Policy-without-scope: list applies `can_show` per record ─
+
+diesel::table! {
+    test_secret_notes (id) {
+        id -> Int8,
+        title -> Text,
+        author_id -> Int8,
+    }
+}
+
+#[autumn_web::model(table = "test_secret_notes")]
+pub struct SecretNote {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub author_id: i64,
+}
+
+// Mounted with `policy = ...` but *no* `scope = ...`. Used by
+// `policy_without_scope_filters_index_via_can_show` to confirm the
+// list endpoint falls back to per-record `can_show` filtering and
+// does not just return everything (the data-exposure path the codex
+// review caught).
+#[autumn_web::repository(
+    SecretNote,
+    table = "test_secret_notes",
+    api = "/api/secret-notes",
+    policy = SecretNotePolicy,
+)]
+pub trait SecretNoteRepository {}
+
+#[derive(Default, Clone)]
+pub struct SecretNotePolicy;
+
+impl Policy<SecretNote> for SecretNotePolicy {
+    fn can_show<'a>(&'a self, ctx: &'a PolicyContext, note: &'a SecretNote) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.user_id_i64() == Some(note.author_id) })
+    }
+    fn can_update<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        note: &'a SecretNote,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.user_id_i64() == Some(note.author_id) })
+    }
+    fn can_delete<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        note: &'a SecretNote,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async move { ctx.user_id_i64() == Some(note.author_id) })
+    }
+}
+
+const CREATE_SECRET_NOTES_SQL: &str = r"
+    CREATE TABLE IF NOT EXISTS test_secret_notes (
+        id BIGSERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        author_id BIGINT NOT NULL
+    )
+";
+
+async fn setup_secret_notes_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager).max_size(5).build().expect("pool");
+
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query("DROP TABLE IF EXISTS test_secret_notes")
+        .execute(&mut conn)
+        .await
+        .expect("drop");
+    diesel::sql_query(CREATE_SECRET_NOTES_SQL)
+        .execute(&mut conn)
+        .await
+        .expect("create");
+
+    (pool, container)
+}
+
+async fn seed_secret(pool: &Pool<AsyncPgConnection>, title: &str, author_id: i64) -> i64 {
+    let mut conn = pool.get().await.unwrap();
+    diesel::insert_into(test_secret_notes::table)
+        .values((
+            test_secret_notes::title.eq(title),
+            test_secret_notes::author_id.eq(author_id),
+        ))
+        .returning(test_secret_notes::id)
+        .get_result(&mut conn)
+        .await
+        .unwrap()
+}
+
+fn build_secret_app(
+    pool: Pool<AsyncPgConnection>,
+    store: MemoryStore,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .with_db(pool)
+        .routes(vec![
+            __autumn_route_info_secret_note_api_list(),
+            __autumn_route_info_secret_note_api_get(),
+        ])
+        .policy::<SecretNote, _>(SecretNotePolicy)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn policy_without_scope_filters_index_via_can_show() {
+    let (pool, _container) = setup_secret_notes_pool().await;
+    seed_secret(&pool, "alice's secret", 1).await;
+    seed_secret(&pool, "bob's secret #1", 2).await;
+    seed_secret(&pool, "bob's secret #2", 2).await;
+
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-bob", "2", None).await;
+    let client = build_secret_app(pool, store);
+
+    let response = client
+        .get("/api/secret-notes")
+        .header("Cookie", "autumn.sid=sess-bob")
+        .send()
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body.len(), 2, "should only see bob's secrets");
+    for note in &body {
+        assert_eq!(note["author_id"], 2);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn policy_without_scope_returns_empty_when_no_records_pass_can_show() {
+    let (pool, _container) = setup_secret_notes_pool().await;
+    seed_secret(&pool, "alice's", 1).await;
+
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-bob", "999", None).await;
+    let client = build_secret_app(pool, store);
+
+    let response = client
+        .get("/api/secret-notes")
+        .header("Cookie", "autumn.sid=sess-bob")
+        .send()
+        .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Vec<serde_json::Value> = serde_json::from_slice(&response.body).unwrap();
+    assert!(body.is_empty());
+}

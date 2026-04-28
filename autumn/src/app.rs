@@ -2051,10 +2051,23 @@ fn validate_repository_api_policies(
     let strict = profile == "prod" && !config.security.allow_unauthorized_repository_api;
 
     let mut offenders: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
+        // Only mutating verbs (POST / PUT / PATCH / DELETE) trigger the
+        // unauthorized-repository guard. Read-only mounts
+        // (`*_api_list`, `*_api_get`) without a policy are *not* the
+        // footgun the issue calls out — that footgun is "a developer
+        // who flips the `api =` switch on a `#[repository]` exposes
+        // mutate endpoints that any authenticated user can call
+        // against any record." A repository mounted with only the
+        // GET routes is safe to start without a policy. Read-leak
+        // concerns are handled separately by `scope = ...`.
         if let Some(meta) = route.repository {
-            if !meta.has_policy && seen.insert(meta.api_path) {
+            if !meta.has_policy
+                && is_mutating_method(&route.method)
+                && seen.insert((meta.resource_type_name, meta.api_path))
+            {
                 offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
         }
@@ -2084,16 +2097,142 @@ fn validate_repository_api_policies(
 
     if strict {
         tracing::error!(
-            "refusing to start: the following #[repository(api = ...)] endpoints have no paired `policy = ...` argument:\n{listing}\n\
+            "refusing to start: the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument:\n{listing}\n\
              Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
         );
         std::process::exit(1);
     } else {
         tracing::warn!(
-            "the following #[repository(api = ...)] endpoints have no paired `policy = ...` argument; \
-             auto-generated CRUD endpoints will accept writes from any authenticated user:\n{listing}\n\
+            "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
+             auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
              This will become a startup-time error in `prod` profile builds."
         );
+    }
+}
+
+const fn is_mutating_method(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::POST | http::Method::PUT | http::Method::PATCH | http::Method::DELETE
+    )
+}
+
+#[cfg(test)]
+mod validate_repository_api_policies_tests {
+    use super::*;
+    use crate::RepositoryApiMeta;
+
+    fn build_route(
+        method: http::Method,
+        path: &'static str,
+        meta: Option<RepositoryApiMeta>,
+    ) -> Route {
+        Route {
+            method,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "test_route",
+            api_doc: crate::openapi::ApiDoc::default(),
+            repository: meta,
+        }
+    }
+
+    fn unguarded(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+        }
+    }
+
+    fn collect_offenders(routes: &[Route]) -> Vec<(String, String)> {
+        let mut offenders: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+            std::collections::HashSet::new();
+        for route in routes {
+            if let Some(meta) = route.repository {
+                if !meta.has_policy
+                    && is_mutating_method(&route.method)
+                    && seen.insert((meta.resource_type_name, meta.api_path))
+                {
+                    offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                }
+            }
+        }
+        offenders
+    }
+
+    #[test]
+    fn read_only_mount_without_policy_is_not_an_offender() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::GET,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert!(
+            offenders.is_empty(),
+            "read-only mounts should not trigger the unauthorized-repo guard"
+        );
+    }
+
+    #[test]
+    fn write_mount_without_policy_is_an_offender() {
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        )];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+        assert_eq!(offenders[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn mixed_mount_only_dedups_one_offender_per_repository() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::PUT,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+    }
+
+    #[test]
+    fn is_mutating_method_classifies_methods() {
+        assert!(is_mutating_method(&http::Method::POST));
+        assert!(is_mutating_method(&http::Method::PUT));
+        assert!(is_mutating_method(&http::Method::PATCH));
+        assert!(is_mutating_method(&http::Method::DELETE));
+        assert!(!is_mutating_method(&http::Method::GET));
+        assert!(!is_mutating_method(&http::Method::HEAD));
+        assert!(!is_mutating_method(&http::Method::OPTIONS));
     }
 }
 

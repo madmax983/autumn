@@ -854,4 +854,276 @@ mod tests {
         assert!(c.has_any_role(["admin", "editor"]));
         assert!(!c.has_any_role(["viewer", "guest"]));
     }
+
+    #[test]
+    fn anonymous_context_is_not_authenticated() {
+        let c = ctx(None, None);
+        assert!(!c.is_authenticated());
+        assert!(c.user_id_i64().is_none());
+        assert!(!c.has_role("admin"));
+        assert!(!c.has_any_role(["admin", "editor"]));
+    }
+
+    #[test]
+    fn user_id_i64_handles_non_numeric_session_value() {
+        let c = ctx(Some("not-a-number"), None);
+        assert!(c.user_id_i64().is_none());
+    }
+
+    #[test]
+    fn forbidden_response_status_and_message_round_trip() {
+        assert_eq!(
+            ForbiddenResponse::Forbidden403.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ForbiddenResponse::NotFound404.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(ForbiddenResponse::Forbidden403.message(), "forbidden");
+        assert_eq!(ForbiddenResponse::NotFound404.message(), "not found");
+    }
+
+    #[test]
+    fn forbidden_response_into_error_carries_status_and_message() {
+        let err = ForbiddenResponse::NotFound404.into_error();
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert_eq!(err.to_string(), "not found");
+
+        let err = ForbiddenResponse::Forbidden403.into_error();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        assert_eq!(err.to_string(), "forbidden");
+    }
+
+    #[test]
+    fn forbidden_response_parses_empty_string_as_default_404() {
+        assert_eq!(
+            "".parse::<ForbiddenResponse>().unwrap(),
+            ForbiddenResponse::NotFound404
+        );
+        assert_eq!(
+            "not_found".parse::<ForbiddenResponse>().unwrap(),
+            ForbiddenResponse::NotFound404
+        );
+        assert_eq!(
+            "NotFound".parse::<ForbiddenResponse>().unwrap(),
+            ForbiddenResponse::NotFound404
+        );
+        assert_eq!(
+            "Forbidden".parse::<ForbiddenResponse>().unwrap(),
+            ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn forbidden_response_parse_error_carries_input_value() {
+        let err = "418".parse::<ForbiddenResponse>().unwrap_err();
+        assert!(err.contains("418"));
+        assert!(err.contains("403"));
+        assert!(err.contains("404"));
+    }
+
+    #[test]
+    fn forbidden_response_deserializes_from_toml() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            value: ForbiddenResponse,
+        }
+        let h: Holder = toml::from_str(r#"value = "403""#).unwrap();
+        assert_eq!(h.value, ForbiddenResponse::Forbidden403);
+        let h: Holder = toml::from_str(r#"value = "404""#).unwrap();
+        assert_eq!(h.value, ForbiddenResponse::NotFound404);
+        let err = toml::from_str::<Holder>(r#"value = "418""#).unwrap_err();
+        assert!(err.to_string().contains("418"));
+    }
+
+    #[test]
+    fn registry_scope_double_registration_panics_with_clear_message() {
+        let registry = PolicyRegistry::default();
+        registry.register_scope::<Note, _>(EmptyScope);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.register_scope::<Note, _>(EmptyScope);
+        }))
+        .unwrap_err();
+        let msg = panicked
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panicked.downcast_ref::<&'static str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("already registered"),
+            "expected double-registration panic, got {msg:?}"
+        );
+    }
+
+    struct OtherResource;
+    struct OtherPolicy;
+    impl Policy<OtherResource> for OtherPolicy {}
+    struct ThirdResource;
+    struct EmptyScope;
+    impl Scope<Note> for EmptyScope {}
+
+    #[test]
+    fn registry_resolves_distinct_resource_types_independently() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
+        registry.register_policy::<OtherResource, _>(OtherPolicy);
+
+        assert!(registry.has_policy::<Note>());
+        assert!(registry.has_policy::<OtherResource>());
+        // Resources without registrations don't false-positive.
+        assert!(!registry.has_policy::<ThirdResource>());
+        assert!(registry.scope::<Note>().is_none());
+    }
+
+    #[test]
+    fn registry_debug_shows_counts() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
+        registry.register_scope::<Note, _>(EmptyScope);
+        let dbg = format!("{registry:?}");
+        assert!(dbg.contains("PolicyRegistry"));
+        assert!(dbg.contains("policies"));
+        assert!(dbg.contains("scopes"));
+    }
+
+    fn detached_state_with(
+        _registry: PolicyRegistry,
+        forbidden: ForbiddenResponse,
+    ) -> crate::AppState {
+        crate::AppState::detached()
+            .with_forbidden_response(forbidden)
+            .with_auth_session_key("user_id")
+    }
+
+    fn session_with(user_id: Option<&str>, role: Option<&str>) -> Session {
+        let mut data = HashMap::new();
+        if let Some(u) = user_id {
+            data.insert("user_id".to_owned(), u.to_owned());
+        }
+        if let Some(r) = role {
+            data.insert("role".to_owned(), r.to_owned());
+        }
+        Session::new_for_test(String::new(), data)
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_500_when_no_policy_registered() {
+        let state = detached_state_with(PolicyRegistry::default(), ForbiddenResponse::default());
+        let session = session_with(Some("42"), None);
+        let n = Note { author_id: 42 };
+        let err = authorize::<Note>(&state, &session, "update", &n)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_configured_deny_when_policy_denies() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let state = detached_state_with(registry.clone(), ForbiddenResponse::Forbidden403);
+        // Inject the registry into the live state's registry.
+        let live = state.policy_registry();
+        // Move registrations from `registry` into the state's registry.
+        // (`detached()` starts with an empty registry; we copy in.)
+        live.register_policy::<Note, _>(AdminOrOwnerPolicy);
+
+        let session = session_with(Some("99"), None); // not the owner, no role
+        let n = Note { author_id: 42 };
+        let err = authorize::<Note>(&state, &session, "update", &n)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorize_returns_ok_when_policy_allows() {
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("42"), None); // owner
+        let n = Note { author_id: 42 };
+        authorize::<Note>(&state, &session, "update", &n)
+            .await
+            .expect("owner is allowed to update");
+    }
+
+    #[tokio::test]
+    async fn authorize_create_returns_500_when_no_policy_registered() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("42"), None);
+        let err = authorize_create::<Note>(&state, &session)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn authorize_create_dispatches_can_create() {
+        struct AuthOnlyCreatePolicy;
+        impl Policy<Note> for AuthOnlyCreatePolicy {
+            fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.is_authenticated() })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AuthOnlyCreatePolicy);
+
+        let anon = session_with(None, None);
+        let err = authorize_create::<Note>(&state, &anon).await.unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        let user = session_with(Some("1"), None);
+        authorize_create::<Note>(&state, &user)
+            .await
+            .expect("authenticated user passes can_create");
+    }
+
+    #[tokio::test]
+    async fn check_policy_alias_round_trips() {
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("42"), None);
+        let n = Note { author_id: 42 };
+        // The macro-internal alias goes through `authorize` — exercise
+        // the full round-trip.
+        __check_policy::<Note>(&state, &session, "update", &n)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn from_request_clones_pool_and_registry_from_state() {
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("7"), Some("admin"));
+        let ctx = PolicyContext::from_request(&state, &session).await;
+        assert_eq!(ctx.user_id.as_deref(), Some("7"));
+        assert!(ctx.has_role("admin"));
+        // The registry was cloned from state — `Note` resolves.
+        assert!(ctx.policy_registry.has_policy::<Note>());
+    }
+
+    #[tokio::test]
+    async fn scoped_blanket_trait_constructible_without_registered_scope() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("1"), None);
+        let ctx = PolicyContext::from_request(&state, &session).await;
+        // No scope registered for `Note`.
+        let _query = Note::scope(&ctx);
+        // The `db`-feature `load(&mut conn)` form is exercised by the
+        // testcontainer suite; here we just confirm the registry-miss
+        // surfaces only at `.load()` time, not at `scope(&ctx)` time.
+        assert!(ctx.policy_registry.scope::<Note>().is_none());
+    }
 }

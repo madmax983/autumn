@@ -553,6 +553,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // List endpoint behavior, in order of precedence:
+        //
+        // 1. `scope = SomeScope`: invoke the registered scope (the
+        //    most efficient form — the scope filters at the SQL level
+        //    via Diesel).
+        // 2. `policy = SomePolicy` without `scope`: load every
+        //    record, then filter through `Policy::can_show` per row.
+        //    Slower than (1) for large tables, but closes the
+        //    "policy guards show/update/delete but list returns
+        //    everything" data-exposure path. Users who care about
+        //    perf should also set `scope = SomeScope`.
+        // 3. Neither: plain `repo.find_all()` (public list).
         let scope_list_body = if config.scope_type.is_some() {
             quote! {
                 let __scope = __autumn_state
@@ -568,12 +580,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let records = __scope.list(&__ctx, &mut __conn).await?;
                 Ok(::autumn_web::prelude::Json(records))
             }
+        } else if has_policy {
+            quote! {
+                let __policy = __autumn_state
+                    .policy::<#model_name>()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
+                        "missing policy registration"
+                    ))?;
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                    &__autumn_state,
+                    &__autumn_session,
+                ).await;
+                let __all = repo.find_all().await?;
+                let mut __filtered = ::std::vec::Vec::with_capacity(__all.len());
+                for __record in __all {
+                    if __policy.can_show(&__ctx, &__record).await {
+                        __filtered.push(__record);
+                    }
+                }
+                Ok(::autumn_web::prelude::Json(__filtered))
+            }
         } else {
             quote! {
                 Ok(::autumn_web::prelude::Json(repo.find_all().await?))
             }
         };
-        let list_session_state_args = if config.scope_type.is_some() {
+        // Inject session + state extractors when *either* a scope
+        // or a policy is configured — both code paths above need
+        // them.
+        let list_session_state_args = if config.scope_type.is_some() || has_policy {
             quote! {
                 ::autumn_web::reexports::axum::extract::State(__autumn_state):
                     ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>,
