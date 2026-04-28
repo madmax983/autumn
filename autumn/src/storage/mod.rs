@@ -345,22 +345,34 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
         }
     }
     // Case-insensitive filesystems (Windows NTFS default, macOS APFS
-    // default) collapse `Avatars/Me.png` and `avatars/me.png` to the
-    // same on-disk file, so two distinct logical keys would silently
-    // overwrite each other on the local backend while staying
-    // distinct in the app's data layer (different HMAC signatures,
-    // different DB rows). S3 keeps them distinct, so an app that
-    // works on local would also break on a backend swap. Reject
-    // uppercase ASCII letters in keys — lowercase ASCII is the
-    // portable subset that behaves identically on every backend +
-    // every filesystem. Apps that need case preservation should
-    // encode it (e.g. base64) before passing to the store.
-    if key.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(BlobStoreError::InvalidInput(
-            "blob keys must be lowercase ASCII (uppercase letters alias on case-insensitive \
-             filesystems and break portability between local and S3)"
-                .into(),
-        ));
+    // default) collapse keys whose Unicode case-fold is identical to
+    // the same on-disk path, so two distinct logical keys would
+    // silently overwrite each other on the local backend while
+    // staying distinct in the app's data layer (different HMAC
+    // signatures, different DB rows). S3 keeps them distinct, so an
+    // app that "works" on local also breaks on a backend swap.
+    // Reject any character whose Unicode default case-fold differs
+    // from itself: that's both ASCII uppercase (`A-Z`) and Unicode
+    // uppercase (`Ä`, `É`, `İ`, …). Apps that need case preservation
+    // should encode it (base64, percent-encoding, …) before passing
+    // the key to the store.
+    for c in key.chars() {
+        let mut lower = c.to_lowercase();
+        // The char is "already lowercase / caseless" iff its default
+        // case-fold yields exactly itself as a single code point.
+        // - `'Ä'.to_lowercase()` yields `'ä'` → reject.
+        // - `'ä'.to_lowercase()` yields `'ä'` → accept.
+        // - `'東'.to_lowercase()` yields `'東'` → accept (caseless).
+        // - `'A'.to_lowercase()` yields `'a'` → reject.
+        let first = lower.next();
+        let trailing = lower.next();
+        if first != Some(c) || trailing.is_some() {
+            return Err(BlobStoreError::InvalidInput(
+                "blob keys must be lowercase (uppercase Unicode aliases on case-insensitive \
+                 filesystems and breaks portability between local and S3)"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -499,21 +511,46 @@ mod tests {
     }
 
     #[test]
-    fn validate_key_rejects_uppercase_ascii() {
-        // Case-insensitive filesystems (NTFS, APFS) would alias these
-        // with their lowercase counterparts on the local backend
-        // while staying distinct in app data. Reject up-front so the
-        // portable subset (lowercase ASCII) is the only valid form.
-        for k in ["Foo.png", "AVATARS/me.png", "aBc", "x/Y/z"] {
+    fn validate_key_rejects_uppercase() {
+        // Case-insensitive filesystems (NTFS, APFS) alias these with
+        // their lowercase counterparts on the local backend while
+        // keeping them distinct in app data. Reject up-front so the
+        // portable subset (Unicode-lowercase / caseless) is the only
+        // valid form. Covers ASCII uppercase + Unicode uppercase
+        // (`Ä`, `É`, `İ`, etc.) — anything whose Unicode default
+        // case-fold differs from itself.
+        let rejected = [
+            // ASCII uppercase
+            "Foo.png",
+            "AVATARS/me.png",
+            "aBc",
+            "x/Y/z",
+            // Unicode uppercase variants
+            "Ärger.png",
+            "documents/Émile.txt",
+            "İstanbul/photo.jpg",
+            "ΟΛΑ.txt", // Greek Omicron-Lambda-Alpha
+        ];
+        for k in rejected {
             let err = validate_key(k).unwrap_err();
             assert!(
                 matches!(err, BlobStoreError::InvalidInput(_)),
-                "key {k:?} should be rejected for uppercase ASCII"
+                "key {k:?} should be rejected for uppercase"
             );
         }
-        // Lowercase ASCII + non-ASCII characters stay valid; the
-        // restriction is specifically about ASCII case-folding.
-        for k in ["foo.png", "avatars/me.png", "résumé.png", "東京/photo.jpg"] {
+        // Lowercase ASCII, lowercase Unicode, and caseless characters
+        // stay valid.
+        let accepted = [
+            "foo.png",
+            "avatars/me.png",
+            "résumé.png",
+            "ärger.png",
+            "émile.txt",
+            "istanbul/photo.jpg",
+            "東京/photo.jpg", // CJK ideographs are caseless
+            "café/menu.txt",
+        ];
+        for k in accepted {
             validate_key(k)
                 .unwrap_or_else(|err| panic!("key {k:?} should be accepted, got {err:?}"));
         }
