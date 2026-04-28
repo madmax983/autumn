@@ -145,8 +145,13 @@ impl BlobStoreError {
     pub const fn status(&self) -> http::StatusCode {
         match self {
             Self::NotFound(_) => http::StatusCode::NOT_FOUND,
-            Self::PermissionDenied(_) => http::StatusCode::FORBIDDEN,
-            Self::InvalidInput(_) | Self::Signature(_) => http::StatusCode::BAD_REQUEST,
+            // `Signature` is an auth failure (the URL was tampered with
+            // or has expired), not a malformed-input error — map it
+            // alongside `PermissionDenied` so handlers using `?` get
+            // 403 consistently with what `local::serve_router` returns
+            // directly when verifying a presigned URL.
+            Self::PermissionDenied(_) | Self::Signature(_) => http::StatusCode::FORBIDDEN,
+            Self::InvalidInput(_) => http::StatusCode::BAD_REQUEST,
             Self::PayloadTooLarge(_) => http::StatusCode::PAYLOAD_TOO_LARGE,
             Self::Unsupported(_) => http::StatusCode::NOT_IMPLEMENTED,
             Self::Io(_) | Self::Backend(_) => http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -430,7 +435,7 @@ mod tests {
         );
         assert_eq!(
             BlobStoreError::Signature("x".into()).status(),
-            http::StatusCode::BAD_REQUEST
+            http::StatusCode::FORBIDDEN
         );
         assert_eq!(
             BlobStoreError::PayloadTooLarge("x".into()).status(),
