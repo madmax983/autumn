@@ -98,6 +98,16 @@ async fn presigned_url_round_trip_via_serving_route() {
     let request = Request::builder().uri(&url).body(Body::empty()).unwrap();
     let response = router.oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // The serving route reads the persisted sidecar metadata so the
+    // response carries the original content_type, not the
+    // `application/octet-stream` default of `Bytes::into_response`.
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain")
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"hello");
 }

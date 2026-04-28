@@ -197,6 +197,28 @@ impl LocalBlobStore {
         }
         Ok(target)
     }
+
+    /// Serve-side helper: read the bytes plus the persisted metadata
+    /// for a blob. Used by [`serve_router`] so locally-served URLs
+    /// reflect the original `content_type` instead of defaulting to
+    /// `application/octet-stream`. Returns `None` for the metadata
+    /// when the sidecar is missing (older blobs, or backends that
+    /// were filled by something other than `put`/`put_stream`).
+    pub(crate) async fn get_with_meta(
+        &self,
+        key: &str,
+    ) -> Result<(Bytes, Option<StoredBlobMeta>), BlobStoreError> {
+        let path = self.safe_path_for_key(key).await?;
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => Bytes::from(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BlobStoreError::NotFound(key.to_owned()));
+            }
+            Err(err) => return Err(BlobStoreError::io(err)),
+        };
+        let meta = read_meta_sidecar(&path).await;
+        Ok((bytes, meta))
+    }
 }
 
 impl BlobStore for LocalBlobStore {
@@ -232,6 +254,20 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
+            // Persist the content_type + etag in a sibling sidecar so
+            // `head`, `get_with_meta`, and the serving route can return
+            // the right MIME instead of `application/octet-stream`. A
+            // sidecar write failure after the bytes commit is logged
+            // (but doesn't unwind the put) — the bytes are still
+            // there, just without metadata.
+            write_meta_sidecar(
+                &path,
+                &StoredBlobMeta {
+                    content_type: content_type.to_owned(),
+                    etag: Some(etag.clone()),
+                },
+            )
+            .await;
             Ok(Blob {
                 provider_id: self.inner.provider_id.clone(),
                 key: key.to_owned(),
@@ -287,6 +323,14 @@ impl BlobStore for LocalBlobStore {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         return Err(BlobStoreError::io(err));
                     }
+                    write_meta_sidecar(
+                        &path,
+                        &StoredBlobMeta {
+                            content_type: content_type.to_owned(),
+                            etag: Some(etag.clone()),
+                        },
+                    )
+                    .await;
                     Ok(Blob {
                         provider_id: self.inner.provider_id.clone(),
                         key: key.to_owned(),
@@ -319,6 +363,10 @@ impl BlobStore for LocalBlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
+            // Clean up the metadata sidecar too. Best-effort: a stray
+            // sidecar without bytes is harmless (it just gets ignored
+            // on the next put or get).
+            let _ = tokio::fs::remove_file(meta_sidecar_path(&path)).await;
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -331,15 +379,24 @@ impl BlobStore for LocalBlobStore {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
             match tokio::fs::metadata(&path).await {
-                Ok(meta) => Ok(Some(BlobMeta {
-                    key: key.to_owned(),
-                    // The on-disk format does not preserve content-type;
-                    // callers that care should remember the value from
-                    // the originating `Blob`.
-                    content_type: "application/octet-stream".to_owned(),
-                    byte_size: meta.len(),
-                    etag: None,
-                })),
+                Ok(fs_meta) => {
+                    // Prefer the persisted sidecar metadata
+                    // (content_type + etag) over the filesystem
+                    // defaults. Fall back to `application/octet-stream`
+                    // for blobs written by something other than
+                    // `put`/`put_stream` (older deployments, manual
+                    // file drops, …).
+                    let sidecar = read_meta_sidecar(&path).await;
+                    Ok(Some(BlobMeta {
+                        key: key.to_owned(),
+                        content_type: sidecar.as_ref().map_or_else(
+                            || "application/octet-stream".to_owned(),
+                            |m| m.content_type.clone(),
+                        ),
+                        byte_size: fs_meta.len(),
+                        etag: sidecar.and_then(|m| m.etag),
+                    }))
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(err) => Err(BlobStoreError::io(err)),
             }
@@ -501,6 +558,69 @@ fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
+/// Persisted metadata that travels alongside each blob's bytes.
+///
+/// Written by `put`/`put_stream` to a `<path>.meta` sibling so the
+/// serving route can return the original `Content-Type` instead of
+/// the default `application/octet-stream`.
+///
+/// **Caveat**: a blob whose key happens to end in `.meta` and aliases
+/// the sidecar of a sibling key would collide. Document the constraint
+/// in [`docs/guide/storage.md`](../../../docs/guide/storage.md) — in
+/// practice keys come from app code (`avatars/{user_id}.png`,
+/// `attachments/{uuid}.pdf`) so the chance is vanishing. The S3
+/// backend has no equivalent issue because S3 stores `Content-Type` as
+/// part of the object's metadata.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct StoredBlobMeta {
+    pub content_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+}
+
+fn meta_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("blob"),
+        std::ffi::OsStr::to_owned,
+    );
+    name.push(".meta");
+    path.with_file_name(name)
+}
+
+/// Write the sidecar metadata after the bytes have committed. Failure
+/// is logged but not surfaced — losing the sidecar reduces a future
+/// `get` to `application/octet-stream`, which is exactly the
+/// pre-sidecar behavior.
+async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
+    let path = meta_sidecar_path(blob_path);
+    match serde_json::to_vec(meta) {
+        Ok(bytes) => {
+            if let Err(err) = tokio::fs::write(&path, bytes).await {
+                tracing::warn!(
+                    error = %err,
+                    sidecar = %path.display(),
+                    "failed to write blob metadata sidecar; serving will default to octet-stream"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to serialize blob metadata sidecar"
+            );
+        }
+    }
+}
+
+/// Read the sidecar metadata for a blob. Returns `None` for a missing
+/// or unparseable sidecar so the serving / `head` paths can fall back
+/// gracefully.
+async fn read_meta_sidecar(blob_path: &std::path::Path) -> Option<StoredBlobMeta> {
+    let path = meta_sidecar_path(blob_path);
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Percent-encode each `/`-separated segment of `key` for use in a URL
 /// path. Segment separators stay raw so the path tree survives.
 fn encode_key_path(key: &str) -> String {
@@ -566,8 +686,12 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
             if let Err(err) = verify(store.signing_key().as_bytes(), &blob_key, q.exp, &q.sig) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
-            match BlobStore::get(&store, &blob_key).await {
-                Ok(bytes) => bytes.into_response(),
+            match store.get_with_meta(&blob_key).await {
+                Ok((bytes, meta)) => {
+                    let content_type = meta
+                        .map_or_else(|| "application/octet-stream".to_owned(), |m| m.content_type);
+                    ([(http::header::CONTENT_TYPE, content_type)], bytes).into_response()
+                }
                 Err(BlobStoreError::NotFound(_)) => {
                     (StatusCode::NOT_FOUND, "not found").into_response()
                 }
@@ -910,6 +1034,56 @@ mod tests {
         assert_eq!(backup.parent(), original.parent());
         let name = backup.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("me.png.bak."));
+    }
+
+    #[test]
+    fn meta_sidecar_path_appends_meta_suffix() {
+        let blob = std::path::Path::new("/var/lib/blobs/avatars/me.png");
+        let sidecar = meta_sidecar_path(blob);
+        assert_eq!(sidecar.parent(), blob.parent());
+        assert_eq!(sidecar.file_name().unwrap(), "me.png.meta");
+    }
+
+    #[tokio::test]
+    async fn put_persists_content_type_for_head_and_serve() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        let blob = s
+            .put("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+        assert_eq!(blob.content_type, "image/png");
+
+        let meta = s.head("a/b.png").await.unwrap().expect("blob exists");
+        assert_eq!(meta.content_type, "image/png");
+        assert!(meta.etag.is_some(), "etag should round-trip via sidecar");
+    }
+
+    #[tokio::test]
+    async fn delete_cleans_up_meta_sidecar() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        s.put("k.png", "image/png", Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        let resolved = s.safe_path_for_key("k.png").await.unwrap();
+        assert!(meta_sidecar_path(&resolved).exists());
+
+        s.delete("k.png").await.unwrap();
+        assert!(!meta_sidecar_path(&resolved).exists());
+    }
+
+    #[tokio::test]
+    async fn head_falls_back_to_octet_stream_without_sidecar() {
+        // Simulate an older blob written without a sidecar.
+        let dir = temp_root();
+        let s = store(dir.path());
+        let path = dir.path().join("legacy.bin");
+        tokio::fs::write(&path, b"raw").await.unwrap();
+        let meta = s.head("legacy.bin").await.unwrap().expect("blob exists");
+        assert_eq!(meta.content_type, "application/octet-stream");
+        assert_eq!(meta.byte_size, 3);
+        assert!(meta.etag.is_none());
     }
 
     /// Simulates the Windows fallback's "second rename fails" branch
