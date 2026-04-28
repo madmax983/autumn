@@ -319,6 +319,25 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             ));
         }
     }
+    // The local backend persists `<path>.meta` sidecars next to each
+    // blob's bytes (carrying the original `content_type` so the serving
+    // route can render images, PDFs, etc. correctly). If we let user
+    // keys end in `.meta`, the sidecar of key `foo` and the bytes of
+    // key `foo.meta` would collide — overwriting each other on `put`,
+    // and returning sidecar JSON in place of bytes on `get`. Reserve
+    // the suffix everywhere (case-insensitive — some filesystems are
+    // case-insensitive too) so the local-backend invariant is also a
+    // trait-level invariant; other backends (S3) don't need it but
+    // benefit from key portability.
+    if let Some(last) = key.rsplit('/').next() {
+        if last.len() >= 5 && last[last.len() - 5..].eq_ignore_ascii_case(".meta") {
+            return Err(BlobStoreError::InvalidInput(
+                "blob keys ending in `.meta` are reserved (local backend uses `<key>.meta` \
+                 sidecar files for content-type metadata)"
+                    .into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -416,6 +435,24 @@ mod tests {
                 matches!(err, BlobStoreError::InvalidInput(_)),
                 "key {k:?} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validate_key_reserves_meta_suffix() {
+        // The local backend stores `<key>.meta` sidecars; a user key
+        // ending in `.meta` would collide with another key's sidecar.
+        // Case-insensitive because some filesystems normalize case.
+        for k in ["foo.meta", "avatars/me.meta", "FOO.META", "x/y/Z.MeTa"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be reserved",
+            );
+        }
+        // But these are fine — not the right suffix.
+        for k in ["meta.png", "foo.metadata", "a.meta.gz", "metafile"] {
+            validate_key(k).unwrap_or_else(|_| panic!("key {k:?} should be accepted"));
         }
     }
 
