@@ -156,7 +156,9 @@ fn mailer_macro_supports_non_inferable_generic_template_methods() {
     let account = AccountMailer;
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     runtime
-        .block_on(account.send_welcome_with_marker::<String>(&mailer, "user@example.com".to_owned()))
+        .block_on(
+            account.send_welcome_with_marker::<String>(&mailer, "user@example.com".to_owned()),
+        )
         .expect("non-inferable generic method send helper should work");
 
     assert_eq!(
@@ -164,5 +166,30 @@ fn mailer_macro_supports_non_inferable_generic_template_methods() {
             .expect("mail dir exists")
             .count(),
         1
+    );
+}
+
+#[test]
+fn mailer_macro_deliver_later_helper_does_not_panic_without_runtime() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mailer = Mailer::builder()
+        .from("noreply@example.com")
+        .transport(Transport::File)
+        .file_dir(dir.path())
+        .build()
+        .expect("mailer should build");
+
+    let account = AccountMailer;
+    account.deliver_later_reset_password(
+        &mailer,
+        "user@example.com".to_owned(),
+        "abc123".to_owned(),
+    );
+
+    assert_eq!(
+        std::fs::read_dir(dir.path())
+            .expect("mail dir exists")
+            .count(),
+        0
     );
 }

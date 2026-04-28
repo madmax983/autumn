@@ -319,6 +319,9 @@ pub enum MailError {
     /// Message could not be built or validated.
     #[error("invalid mail message: {0}")]
     InvalidMessage(String),
+    /// Deferred delivery could not be scheduled.
+    #[error("mail runtime unavailable: {0}")]
+    RuntimeUnavailable(String),
     /// Address parsing failed.
     #[error("invalid mail address {address:?}: {source}")]
     InvalidAddress {
@@ -416,12 +419,30 @@ impl Mailer {
     /// behind the same call once the web crate and Harvest plugin share a
     /// first-class queue contract.
     pub fn deliver_later(&self, mail: Mail) {
+        if let Err(error) = self.try_deliver_later(mail) {
+            tracing::error!(error = %error, "background mail delivery was not scheduled");
+        }
+    }
+
+    /// Queue mail for later delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no active Tokio runtime is available to host the
+    /// background task.
+    pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         let mailer = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            MailError::RuntimeUnavailable(
+                "deliver_later requires an active Tokio runtime".to_owned(),
+            )
+        })?;
+        handle.spawn(async move {
             if let Err(error) = mailer.send(mail).await {
                 tracing::error!(error = %error, "background mail delivery failed");
             }
         });
+        Ok(())
     }
 }
 
@@ -857,5 +878,35 @@ mod tests {
         };
 
         assert!(error.to_string().contains("mail.smtp.password_env"));
+    }
+
+    #[test]
+    fn try_deliver_later_returns_error_without_runtime() {
+        let mailer = Mailer::builder().build().expect("mailer should build");
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hello")
+            .text("hello")
+            .build()
+            .expect("mail should build");
+
+        let error = mailer
+            .try_deliver_later(mail)
+            .expect_err("missing runtime should return an error");
+
+        assert!(error.to_string().contains("active Tokio runtime"));
+    }
+
+    #[test]
+    fn deliver_later_does_not_panic_without_runtime() {
+        let mailer = Mailer::builder().build().expect("mailer should build");
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hello")
+            .text("hello")
+            .build()
+            .expect("mail should build");
+
+        mailer.deliver_later(mail);
     }
 }
