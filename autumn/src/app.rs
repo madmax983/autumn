@@ -1058,10 +1058,14 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
-        // 4d. Fail-fast on invalid storage config — same rationale: surface
-        // configuration mistakes before we run migrations or bind the port.
+        // 4d. Provision the configured BlobStore *before* `setup_database`.
+        // `LocalBlobStore::new` does real IO (creates + canonicalizes the
+        // root) and the storage code may `process::exit(1)` on failure
+        // (unwritable root, or `storage.backend = "s3"` while the SDK
+        // wiring is still tracked in #530). Doing it before migrations
+        // means a doomed boot can't mutate the DB schema first.
         #[cfg(feature = "storage")]
-        fail_fast_on_invalid_storage_config(&config);
+        let storage_bootstrap = preflight_storage(&config);
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
@@ -1092,10 +1096,11 @@ impl AppBuilder {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
 
-        // Provision the configured BlobStore (if any) and remember the
-        // optional serving route so the router can mount it below.
+        // Install the preflighted blob store on the freshly-built
+        // AppState, and remember the serving router so it gets merged
+        // into the user's router below.
         #[cfg(feature = "storage")]
-        let storage_router = setup_storage(&config, &state);
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -1693,38 +1698,54 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
-/// Run the same `backend_plan` resolution `setup_storage` will do later,
-/// but before any DB side effects, so configuration mistakes (e.g. a
-/// `prod` profile choosing `local` without explicit acknowledgement)
-/// fail the boot loudly instead of running migrations first.
+/// Constructed [`BlobStore`](crate::storage::BlobStore) plus the
+/// optional axum router that serves signed URLs for the Local backend.
+/// Returned by [`preflight_storage`] before any DB side effects so a
+/// doomed boot can't run migrations first; installed onto
+/// [`AppState`] later via [`StorageBootstrap::install`].
 #[cfg(feature = "storage")]
-fn fail_fast_on_invalid_storage_config(config: &AutumnConfig) {
-    if let Err(error) = config.storage.backend_plan(config.profile.as_deref()) {
-        eprintln!("Invalid storage backend config: {error}");
-        std::process::exit(1);
+struct StorageBootstrap {
+    store: crate::storage::SharedBlobStore,
+    serving: Option<axum::Router<AppState>>,
+}
+
+#[cfg(feature = "storage")]
+impl StorageBootstrap {
+    /// Install the preflighted store on `AppState` and return the
+    /// optional serving router so the caller can merge it into the
+    /// app router.
+    fn install(self, state: &AppState) -> Option<axum::Router<AppState>> {
+        state.insert_extension::<crate::storage::BlobStoreState>(
+            crate::storage::BlobStoreState::new(self.store),
+        );
+        self.serving
     }
 }
 
-/// Provision the configured [`BlobStore`](crate::storage::BlobStore),
-/// install it on [`AppState`] as a [`BlobStoreState`](crate::storage::BlobStoreState)
-/// extension, and return the optional serving router for the Local
-/// backend.
+/// Provision the configured [`BlobStore`](crate::storage::BlobStore)
+/// before any database side effects. Construction is the side-effecting
+/// step (creates + canonicalizes the storage root, may
+/// `process::exit(1)` on a misconfiguration); we deliberately run it
+/// before `setup_database` so a doomed boot doesn't apply migrations
+/// first. Installation onto `AppState` happens later via
+/// [`StorageBootstrap::install`].
 #[cfg(feature = "storage")]
 #[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
-fn setup_storage(config: &AutumnConfig, state: &AppState) -> Option<axum::Router<AppState>> {
-    use crate::storage::{
-        BlobStoreState, LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey,
-    };
+fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
+    use crate::storage::{LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey};
 
-    let plan = match config.storage.backend_plan(config.profile.as_deref()) {
-        Ok(plan) => plan,
-        Err(error) => {
-            // Reachable in tests / custom flows that bypass the
-            // fail-fast above; log + skip storage rather than crash.
-            tracing::error!(%error, "storage configured but invalid; skipping");
-            return None;
-        }
-    };
+    let plan = config
+        .storage
+        .backend_plan(config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            // Cover the cases `backend_plan` rejects up front:
+            // `LocalInProduction` (prod + local without ack),
+            // `MissingS3Bucket`/`MissingS3Region`/`S3FeatureDisabled`.
+            // Each is a configuration mistake — fail the boot loudly
+            // rather than running migrations and then dying.
+            tracing::error!(%error, "invalid storage backend config; aborting startup");
+            std::process::exit(1);
+        });
 
     match plan {
         StorageBackendPlan::Disabled => None,
@@ -1786,14 +1807,16 @@ fn setup_storage(config: &AutumnConfig, state: &AppState) -> Option<axum::Router
             };
             let serving = crate::storage::local::serve_router(&store);
             let arc: SharedBlobStore = std::sync::Arc::new(store);
-            state.insert_extension::<BlobStoreState>(BlobStoreState::new(arc));
             tracing::info!(
                 provider = %provider_id,
                 root = %root.display(),
                 mount = %mount_path,
                 "Local blob store mounted"
             );
-            Some(serving)
+            Some(StorageBootstrap {
+                store: arc,
+                serving: Some(serving),
+            })
         }
         StorageBackendPlan::S3 {
             provider_id,
