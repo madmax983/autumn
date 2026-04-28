@@ -264,6 +264,15 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             "blob key must be relative".into(),
         ));
     }
+    // Backslashes alias to forward slashes on Windows (`a\b` and `a/b`
+    // resolve to the same filesystem path), so two distinct logical
+    // keys would collide. Reject backslashes entirely so the canonical
+    // separator is always `/` regardless of the host platform.
+    if key.contains('\\') {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key contains a backslash; use `/` as the segment separator".into(),
+        ));
+    }
     // Windows drive-letter forms (`C:\…`, `C:/…`, `\\?\…`, `\\server\share\…`)
     // would be treated as absolute by `Path::join` on Windows, silently
     // escaping the storage root regardless of whether the host happens
@@ -281,7 +290,7 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             "blob key looks like a UNC / network path".into(),
         ));
     }
-    for segment in key.split(['/', '\\']) {
+    for segment in key.split('/') {
         if segment == ".." {
             return Err(BlobStoreError::InvalidInput(
                 "blob key contains traversal segment".into(),
@@ -384,6 +393,19 @@ mod tests {
         // `a//b` collapses to `a/b` on POSIX; `a/b/` produces a trailing
         // empty segment that HTTP clients silently strip.
         for k in ["a//b", "a/b/", "a///b"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_backslash_separator() {
+        // Backslashes alias to forward slashes on Windows; reject them
+        // entirely so the canonical separator is always `/`.
+        for k in [r"a\b", r"avatars\me.png", r"x\y\z"] {
             let err = validate_key(k).unwrap_err();
             assert!(
                 matches!(err, BlobStoreError::InvalidInput(_)),

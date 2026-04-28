@@ -74,6 +74,12 @@ pub struct LocalBlobStore {
 struct LocalInner {
     provider_id: String,
     root: PathBuf,
+    /// `root` after `std::fs::canonicalize` — i.e. the actual on-disk
+    /// location after any symlinks have been followed. Stashed at
+    /// construction time and used by `safe_path_for_key` to verify
+    /// that user-supplied keys can't escape the configured root via a
+    /// hostile or accidental symlink in the storage tree.
+    canonical_root: PathBuf,
     mount_path: String,
     default_expiry: Duration,
     signing_key: SigningKey,
@@ -109,10 +115,16 @@ impl LocalBlobStore {
         }
         let root = root.into();
         std::fs::create_dir_all(&root).map_err(BlobStoreError::io)?;
+        // Canonicalize once at construction — `safe_path_for_key`
+        // compares each operation's resolved target against this so
+        // a hostile symlink inside the storage tree (e.g.
+        // `root/avatars -> /etc`) can't be used to escape the root.
+        let canonical_root = std::fs::canonicalize(&root).map_err(BlobStoreError::io)?;
         Ok(Self {
             inner: Arc::new(LocalInner {
                 provider_id: provider_id.into(),
                 root,
+                canonical_root,
                 mount_path,
                 default_expiry,
                 signing_key,
@@ -139,19 +151,51 @@ impl LocalBlobStore {
         &self.inner.root
     }
 
-    fn resolve(&self, key: &str) -> Result<PathBuf, BlobStoreError> {
+    /// Resolve a user-supplied key to a `PathBuf` and verify the
+    /// resolved path stays under the canonical storage root.
+    ///
+    /// Beyond the lexical checks in [`validate_key`], this walks the
+    /// deepest existing prefix of the target, follows any symlinks
+    /// along the way (`tokio::fs::canonicalize`), and asserts the
+    /// result is still under `canonical_root`. That blocks the hostile-
+    /// symlink case where `root/avatars -> /etc` would otherwise let a
+    /// key like `avatars/passwd` read or write outside the blob
+    /// directory.
+    ///
+    /// There's still a TOCTOU window between this check and the IO
+    /// that follows; a co-located attacker who can win that race needs
+    /// `openat`-style primitives to fully eliminate, which Rust's std
+    /// doesn't expose. The check still removes the common "operator
+    /// configured a symlink they didn't realize was unsafe" failure
+    /// mode.
+    async fn safe_path_for_key(&self, key: &str) -> Result<PathBuf, BlobStoreError> {
         validate_key(key)?;
-        let path = self.inner.root.join(key);
-        // Defense in depth: re-canonicalize against a possible symlink.
-        if path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(BlobStoreError::InvalidInput(
-                "blob key escapes storage root".into(),
+        let target = self.inner.root.join(key);
+
+        // `canonicalize` errors with NotFound when the target doesn't
+        // exist yet (which is normal for `put`). Walk up to the deepest
+        // ancestor that exists, canonicalize that, and check it.
+        let mut probe = target.clone();
+        let canon_existing = loop {
+            match tokio::fs::canonicalize(&probe).await {
+                Ok(p) => break p,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if !probe.pop() {
+                        return Err(BlobStoreError::io(
+                            "storage root vanished while resolving blob key",
+                        ));
+                    }
+                }
+                Err(err) => return Err(BlobStoreError::io(err)),
+            }
+        };
+
+        if !canon_existing.starts_with(&self.inner.canonical_root) {
+            return Err(BlobStoreError::PermissionDenied(
+                "blob key resolves outside storage root".into(),
             ));
         }
-        Ok(path)
+        Ok(target)
     }
 }
 
@@ -167,7 +211,7 @@ impl BlobStore for LocalBlobStore {
         bytes: Bytes,
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
-            let path = self.resolve(key)?;
+            let path = self.safe_path_for_key(key).await?;
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
@@ -207,7 +251,7 @@ impl BlobStore for LocalBlobStore {
         Box::pin(async move {
             use tokio::io::AsyncWriteExt as _;
 
-            let path = self.resolve(key)?;
+            let path = self.safe_path_for_key(key).await?;
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
@@ -261,7 +305,7 @@ impl BlobStore for LocalBlobStore {
 
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
-            let path = self.resolve(key)?;
+            let path = self.safe_path_for_key(key).await?;
             match tokio::fs::read(&path).await {
                 Ok(bytes) => Ok(Bytes::from(bytes)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -274,7 +318,7 @@ impl BlobStore for LocalBlobStore {
 
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
-            let path = self.resolve(key)?;
+            let path = self.safe_path_for_key(key).await?;
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => Ok(()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -285,7 +329,7 @@ impl BlobStore for LocalBlobStore {
 
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
-            let path = self.resolve(key)?;
+            let path = self.safe_path_for_key(key).await?;
             match tokio::fs::metadata(&path).await {
                 Ok(meta) => Ok(Some(BlobMeta {
                     key: key.to_owned(),
@@ -598,6 +642,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BlobStoreError::InvalidInput(_)));
+    }
+
+    /// A hostile or accidental symlink inside the storage tree can
+    /// turn a legitimate-looking key into a path-escape. Pin that we
+    /// catch the canonical-path mismatch before any IO happens.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_keys_traversing_root_escaping_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        // Create a sensitive file outside the storage root.
+        std::fs::write(outside.path().join("secret"), b"do not read").unwrap();
+
+        let dir = temp_root();
+        // root/escape -> outside_dir
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        let s = store(dir.path());
+        let err = s.get("escape/secret").await.unwrap_err();
+        assert!(
+            matches!(err, BlobStoreError::PermissionDenied(_)),
+            "expected PermissionDenied, got {err:?}"
+        );
+
+        // And the same for writes — `put` to a key that resolves
+        // outside the root must refuse before any bytes hit disk.
+        let err = s
+            .put(
+                "escape/leaked.txt",
+                "text/plain",
+                Bytes::from_static(b"oops"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BlobStoreError::PermissionDenied(_)));
+        // Outside dir is untouched.
+        assert!(!outside.path().join("leaked.txt").exists());
     }
 
     #[test]
