@@ -318,6 +318,38 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
                 "blob key contains an empty segment".into(),
             ));
         }
+        // Windows rejects these characters in filenames; a key
+        // containing any of them passes Linux/S3 but errors with
+        // I/O on Windows. Same portability rationale as the
+        // uppercase check above. Control chars (< 0x20) are also
+        // rejected on Windows and rarely meaningful as path
+        // components anyway.
+        if segment.bytes().any(|b| {
+            matches!(
+                b,
+                b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' | 0x01..=0x1F
+            )
+        }) {
+            return Err(BlobStoreError::InvalidInput(
+                "blob key contains a Windows-reserved filename character (`<`, `>`, \
+                 `:`, `\"`, `|`, `?`, `*`, or a control byte) — keys must be portable \
+                 across local and S3 backends"
+                    .into(),
+            ));
+        }
+        // Windows reserved device names: a key like `con/foo` or
+        // `nul.png` errors with I/O on Windows even though Linux/S3
+        // accept it. Compare against the Unicode-lowercased
+        // basename (the part before the first `.`). The uppercase
+        // check above already enforces lowercase, so checking the
+        // raw lowercase set is sufficient.
+        let basename = segment.split('.').next().unwrap_or("");
+        if WINDOWS_RESERVED_NAMES.contains(&basename) {
+            return Err(BlobStoreError::InvalidInput(format!(
+                "blob key segment {segment:?} starts with a Windows-reserved device name \
+                 (`con`, `prn`, `aux`, `nul`, `com1-9`, `lpt1-9`)"
+            )));
+        }
     }
     // The local backend persists `<path>.meta` sidecars next to each
     // blob's bytes (carrying the original `content_type` so the serving
@@ -376,6 +408,14 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
     }
     Ok(())
 }
+
+/// Windows reserves these device names regardless of file extension
+/// (`con.txt`, `con/foo`, etc.). Lowercase-only because the uppercase
+/// check in `validate_key` already enforces all-lowercase keys.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+    "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
 
 #[cfg(test)]
 mod tests {
@@ -549,6 +589,71 @@ mod tests {
             "istanbul/photo.jpg",
             "東京/photo.jpg", // CJK ideographs are caseless
             "café/menu.txt",
+        ];
+        for k in accepted {
+            validate_key(k)
+                .unwrap_or_else(|err| panic!("key {k:?} should be accepted, got {err:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_windows_reserved_chars() {
+        // `<`, `>`, `:`, `"`, `|`, `?`, `*` aren't allowed in Windows
+        // filenames; control bytes (\x01-\x1F) likewise. Reject so the
+        // local backend behaves the same on every platform.
+        let rejected = [
+            "foo<bar",
+            "foo>bar",
+            "foo:bar",
+            "foo\"bar",
+            "foo|bar",
+            "foo?bar",
+            "foo*bar",
+            "foo\x01bar",
+            "foo\x1fbar",
+        ];
+        for k in rejected {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_key_rejects_windows_reserved_names() {
+        // `con.png`, `nul/foo`, `com1.txt`, etc. error with I/O on
+        // Windows even with valid characters and casing. Reject the
+        // entire reserved set per segment.
+        let rejected = [
+            "con",
+            "con.png",
+            "con/foo.png",
+            "x/nul",
+            "x/nul.txt",
+            "aux.bin",
+            "prn",
+            "com1.log",
+            "com9",
+            "lpt1",
+            "lpt9.txt",
+        ];
+        for k in rejected {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected"
+            );
+        }
+        // Names that *contain* a reserved word but aren't equal to one
+        // before the first dot stay valid.
+        let accepted = [
+            "console.png",
+            "lptastic.txt",
+            "x/auxiliary.bin",
+            "con-tinuation.png",
+            "com10.log", // reserved set is com1-9 only
         ];
         for k in accepted {
             validate_key(k)
