@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), and a feature-gated `S3BlobStore` shell behind `storage-s3`. `MultipartField::save_to_blob_store` integrates the existing extractor with the blob store. Profile-aware defaults mirror sessions: `dev` opts into `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. New `examples/avatars` demonstrates the upload-then-render flow with an integration test that proves bytes survive a process restart on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
+- **cli:** `autumn generate model | migration | scaffold` for one-command
+  resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
+  `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route
+  handlers, smoke tests, and updates `routes![]` in `src/main.rs`. Supports
+  the documented field-type DSL (`String`, `Text`, `i32`, `i64`, `bool`,
+  `f32`, `f64`, `Uuid`, `NaiveDateTime`, `DateTime`, `Vec<u8>`/`Bytea`, plus
+  `Option<…>` for any of them) and `--dry-run` / `--force` flags. New
+  `docs/guide/generators.md` walks through the five-commands-to-CRUD flow.
+  Non-breaking; no runtime surface changes.
 
 ## [0.3.0] - 2026-04-27
 

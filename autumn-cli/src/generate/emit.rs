@@ -1,0 +1,268 @@
+//! File-emission engine shared by every generator.
+//!
+//! Generators describe what they want to do as a list of [`Action`]s, and
+//! [`Plan::execute`] handles all the side-effecting filesystem work — including
+//! collision detection, `--force` / `--dry-run`, and the human-readable
+//! "Created/Modified" output that mirrors `autumn new`.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use super::{Flags, GenerateError};
+
+/// One filesystem operation the generator wants to perform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// Create a new file. Treated as a collision if the file already exists.
+    Create { path: PathBuf, contents: String },
+    /// Modify an existing file (or create it if absent). Never a collision.
+    Modify { path: PathBuf, contents: String },
+}
+
+impl Action {
+    /// The path this action targets.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Create { path, .. } | Self::Modify { path, .. } => path,
+        }
+    }
+}
+
+/// A complete generator plan — a sequence of actions plus the project root
+/// they are anchored against.
+#[derive(Debug, Default)]
+pub struct Plan {
+    /// Project root all action paths are interpreted relative to.
+    pub project_root: PathBuf,
+    /// The actions this plan will perform when executed.
+    pub actions: Vec<Action>,
+}
+
+impl Plan {
+    /// Create an empty plan rooted at `project_root`.
+    #[must_use]
+    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            project_root: project_root.into(),
+            actions: Vec::new(),
+        }
+    }
+
+    /// Push a [`Action::Create`] action.
+    pub fn create(&mut self, path: impl Into<PathBuf>, contents: impl Into<String>) {
+        self.actions.push(Action::Create {
+            path: path.into(),
+            contents: contents.into(),
+        });
+    }
+
+    /// Push a [`Action::Modify`] action.
+    pub fn modify(&mut self, path: impl Into<PathBuf>, contents: impl Into<String>) {
+        self.actions.push(Action::Modify {
+            path: path.into(),
+            contents: contents.into(),
+        });
+    }
+
+    /// All `Create` actions whose target file already exists on disk.
+    fn collisions(&self) -> Vec<PathBuf> {
+        self.actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Create { path, .. } if path.exists() => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run the plan, honouring `--dry-run` and `--force`.
+    ///
+    /// On `--dry-run` we print the action list and exit early without touching
+    /// the filesystem. On a real run we emit a `Created`/`Modified` line per
+    /// action, in the same style as `autumn new`.
+    ///
+    /// # Errors
+    /// Returns [`GenerateError::Collisions`] when any `Create` would overwrite
+    /// an existing file and `--force` was not passed; or [`GenerateError::Io`]
+    /// for filesystem failures during emission.
+    pub fn execute(&self, flags: Flags) -> Result<(), GenerateError> {
+        if flags.dry_run {
+            self.print_dry_run();
+            return Ok(());
+        }
+
+        if !flags.force {
+            let collisions = self.collisions();
+            if !collisions.is_empty() {
+                return Err(GenerateError::Collisions(collisions));
+            }
+        }
+
+        // Make sure parent directories of every file action exist.
+        let mut dirs: BTreeSet<PathBuf> = BTreeSet::new();
+        for action in &self.actions {
+            let path = action.path();
+            if let Some(parent) = path.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        for dir in &dirs {
+            fs::create_dir_all(dir)?;
+        }
+
+        for action in &self.actions {
+            let (path, contents) = match action {
+                Action::Create { path, contents } | Action::Modify { path, contents } => {
+                    (path, contents)
+                }
+            };
+            let label = match (action, path.exists()) {
+                (Action::Create { .. }, _) => "Created",
+                (_, true) => "Modified",
+                _ => "Created",
+            };
+            fs::write(path, contents)?;
+            println!("  {label} {}", relative_display(path, &self.project_root));
+        }
+        Ok(())
+    }
+
+    fn print_dry_run(&self) {
+        println!("Dry run — no files written.");
+        for action in &self.actions {
+            let label = match action {
+                Action::Create { path, .. } if path.exists() => "Would overwrite",
+                Action::Modify { path, .. } if path.exists() => "Would modify",
+                Action::Create { .. } | Action::Modify { .. } => "Would create",
+            };
+            println!(
+                "  {label} {}",
+                relative_display(action.path(), &self.project_root)
+            );
+        }
+    }
+}
+
+fn relative_display(path: &Path, root: &Path) -> String {
+    let display = path
+        .strip_prefix(root)
+        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string());
+    // Always render with forward slashes so the generator's output (and any
+    // tests that grep for it) is platform-consistent.
+    display.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Plan) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plan = Plan::new(tmp.path());
+        (tmp, plan)
+    }
+
+    #[test]
+    fn create_action_writes_file() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags::default()).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hello");
+    }
+
+    #[test]
+    fn create_action_creates_parent_dirs() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("nested/dir/out.txt");
+        plan.create(target.clone(), "hi");
+        plan.execute(Flags::default()).unwrap();
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn collision_without_force_errors() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "old").unwrap();
+        plan.create(target.clone(), "new");
+        let err = plan.execute(Flags::default()).unwrap_err();
+        match err {
+            GenerateError::Collisions(paths) => {
+                assert_eq!(paths, vec![target.clone()]);
+            }
+            _ => panic!("expected collision error, got {err:?}"),
+        }
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+    }
+
+    #[test]
+    fn collision_with_force_overwrites() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "old").unwrap();
+        plan.create(target.clone(), "new");
+        plan.execute(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn modify_action_overwrites_without_force() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "old").unwrap();
+        plan.modify(target.clone(), "new");
+        plan.execute(Flags::default()).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+    }
+
+    #[test]
+    fn dry_run_writes_nothing() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        plan.create(target.clone(), "hello");
+        plan.execute(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn dry_run_skips_collision_check() {
+        let (tmp, mut plan) = fixture();
+        let target = tmp.path().join("out.txt");
+        fs::write(&target, "existing").unwrap();
+        plan.create(target.clone(), "new");
+        plan.execute(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "existing");
+    }
+
+    #[test]
+    fn collision_lists_every_offender() {
+        let (tmp, mut plan) = fixture();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        fs::write(&a, "x").unwrap();
+        fs::write(&b, "y").unwrap();
+        plan.create(a.clone(), "1");
+        plan.create(b.clone(), "2");
+        let err = plan.execute(Flags::default()).unwrap_err();
+        let msg = err.to_string();
+        // The error message normalises path separators to `/` so the
+        // assertion needs to match that form (Windows uses `\` natively).
+        assert!(msg.contains(a.display().to_string().replace('\\', "/").as_str()));
+        assert!(msg.contains(b.display().to_string().replace('\\', "/").as_str()));
+    }
+}

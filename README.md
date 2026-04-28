@@ -39,6 +39,9 @@ cd my-app
 # Optional: download Tailwind CSS for styled builds
 autumn setup
 
+# Optional: scaffold a CRUD resource (see docs/guide/generators.md)
+# autumn generate scaffold Post title:String body:Text published:bool
+
 # Development server with file watching
 autumn dev
 
@@ -136,6 +139,7 @@ async fn main() {
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [API Reference](https://docs.rs/autumn-web)
