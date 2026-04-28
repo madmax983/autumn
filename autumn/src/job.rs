@@ -479,37 +479,36 @@ fn start_redis_runtime(
 
                 state.job_registry.record_start(&parsed.name);
 
-                let (handler, max_attempts, backoff_ms) = {
+                let maybe_info = {
                     let guard = jobs_by_name.read().expect("job registry lock poisoned");
-                    let Some(info) = guard.get(&parsed.name) else {
-                        state.job_registry.record_failure(
-                            &parsed.name,
-                            "unknown job type".to_owned(),
-                            true,
-                        );
-                        if let Ok(encoded) = serde_json::to_string(&parsed) {
-                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                        }
-                        continue;
-                    };
-
-                    (
-                        info.handler,
-                        if parsed.max_attempts != 0 {
-                            parsed.max_attempts
-                        } else if info.max_attempts != 0 {
-                            info.max_attempts
-                        } else {
-                            default_attempts
-                        },
-                        if parsed.initial_backoff_ms != 0 {
-                            parsed.initial_backoff_ms
-                        } else if info.initial_backoff_ms != 0 {
-                            info.initial_backoff_ms
-                        } else {
-                            default_backoff
-                        },
-                    )
+                    guard
+                        .get(&parsed.name)
+                        .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+                };
+                let Some((handler, info_max_attempts, info_backoff_ms)) = maybe_info else {
+                    state.job_registry.record_failure(
+                        &parsed.name,
+                        "unknown job type".to_owned(),
+                        true,
+                    );
+                    if let Ok(encoded) = serde_json::to_string(&parsed) {
+                        let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
+                    }
+                    continue;
+                };
+                let max_attempts = if parsed.max_attempts != 0 {
+                    parsed.max_attempts
+                } else if info_max_attempts != 0 {
+                    info_max_attempts
+                } else {
+                    default_attempts
+                };
+                let backoff_ms = if parsed.initial_backoff_ms != 0 {
+                    parsed.initial_backoff_ms
+                } else if info_backoff_ms != 0 {
+                    info_backoff_ms
+                } else {
+                    default_backoff
                 };
 
                 match (handler)(state.clone(), parsed.payload.clone()).await {
