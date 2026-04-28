@@ -80,6 +80,30 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
 
+## File Uploads
+
+The `Multipart` extractor's `save_to(path)` primitive writes to the local
+disk of whichever pod handled the request — invisible to the next replica
+and gone on the next deploy. For multi-replica deployments that accept
+user-uploaded files (avatars, attachments, generated reports), enable the
+`storage` feature and pick the `S3` backend:
+
+```toml
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-app-uploads"
+region = "us-east-1"
+```
+
+In `prod`, `backend = "local"` fails fast at startup unless you set
+`storage.allow_local_in_production = true` — same pattern as the session
+backend's memory-in-prod check.
+
+See [storage.md](storage.md) for the full backend, configuration, and
+production-checklist story.
+
 ## Sessions
 
 In-memory sessions are fine for local development and single-process demos.
@@ -129,6 +153,7 @@ Before calling an Autumn app "cloud ready", verify:
 - probes target `/live`, `/ready`, and `/startup`
 - logs or traces land in your collector
 - sessions are externalized if replicas > 1
+- file uploads use the `S3` blob store if replicas > 1
 - migrations run before web rollout
 - background jobs use the right runtime model
 - the generated container image builds without manual template surgery
