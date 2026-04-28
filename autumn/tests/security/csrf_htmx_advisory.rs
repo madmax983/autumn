@@ -22,10 +22,14 @@ async fn eris_htmx_csrf_bypass_poc() {
             ..Default::default()
         }));
 
+    let legit_cookie_token = "legit_victim_token";
+
     let req = Request::builder()
         .method("POST")
         .uri("/submit")
+        .header("Cookie", format!("autumn-csrf={legit_cookie_token}"))
         .header("Content-Type", "application/x-www-form-urlencoded")
+        // Attacker omits HX-Request header and standard _csrf token
         .body(Body::empty())
         .unwrap();
 
