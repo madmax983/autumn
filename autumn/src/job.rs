@@ -466,6 +466,13 @@ fn start_redis_runtime(
                     Ok(v) => v,
                     Err(error) => {
                         tracing::warn!(error = %error, "invalid durable job payload");
+                        let malformed = serde_json::json!({
+                            "error": error.to_string(),
+                            "raw_payload": body,
+                        });
+                        if let Ok(encoded) = serde_json::to_string(&malformed) {
+                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
+                        }
                         continue;
                     }
                 };
@@ -480,6 +487,9 @@ fn start_redis_runtime(
                             "unknown job type".to_owned(),
                             true,
                         );
+                        if let Ok(encoded) = serde_json::to_string(&parsed) {
+                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
+                        }
                         continue;
                     };
 
