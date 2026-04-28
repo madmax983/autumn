@@ -651,11 +651,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { ::core::option::Option::None }
         };
-        // Companion probe for `scope = ...`. The generated list
-        // handler resolves the scope from the registry per request,
-        // so without startup validation a missing
-        // `.scope::<R, _>(...)` call would 500 every list response.
-        let scope_check_fn = if config.scope_type.is_some() {
+        // Companion probe for `scope = ...`. ONLY attached to the
+        // `_api_list` route's metadata — the other auto-generated
+        // routes (`*_api_get` / `*_api_create` / `*_api_update` /
+        // `*_api_delete`) never call `scope.list`, so flagging them
+        // for missing scope registration would fire the prod fail-
+        // fast even when the user intentionally mounted only
+        // non-list endpoints with `scope = ...` configured (the
+        // app's reads happen via custom queries, but the scope is
+        // still declared so `Note::scope(&ctx)` works in hand-
+        // written list handlers). The non-list routes below get
+        // `scope_check: None` regardless.
+        let list_scope_check_fn = if config.scope_type.is_some() {
             quote! {
                 ::core::option::Option::Some(
                     (|registry: &::autumn_web::authorization::PolicyRegistry| {
@@ -666,6 +673,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { ::core::option::Option::None }
         };
+        let non_list_scope_check_fn = quote! { ::core::option::Option::None };
         let scope_type_assertion = if let Some(ref scope_type) = config.scope_type {
             quote! {
                 const _: fn() = || {
@@ -720,7 +728,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
-                        scope_check: #scope_check_fn,
+                        scope_check: #list_scope_check_fn,
                     }),
                 }
             }
@@ -762,7 +770,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
-                        scope_check: #scope_check_fn,
+                        scope_check: #non_list_scope_check_fn,
                     }),
                 }
             }
@@ -808,7 +816,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
-                        scope_check: #scope_check_fn,
+                        scope_check: #non_list_scope_check_fn,
                     }),
                 }
             }
@@ -856,7 +864,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
-                        scope_check: #scope_check_fn,
+                        scope_check: #non_list_scope_check_fn,
                     }),
                 }
             }
@@ -891,7 +899,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
-                        scope_check: #scope_check_fn,
+                        scope_check: #non_list_scope_check_fn,
                     }),
                 }
             }
