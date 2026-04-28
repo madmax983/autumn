@@ -359,15 +359,16 @@ async fn verify_csrf_token(
 
     if let Ok(body_str) = std::str::from_utf8(&bytes) {
         for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == settings.form_field {
-                    if let Some(c) = cookie_token {
-                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
-                            token_found = true;
-                        }
+            let Some((key, value)) = pair.split_once('=') else {
+                continue;
+            };
+            if key == settings.form_field {
+                if let Some(c) = cookie_token {
+                    if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
+                        token_found = true;
                     }
-                    break;
                 }
+                break;
             }
         }
     }

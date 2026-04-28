@@ -153,9 +153,10 @@ where
                     // Format UUID directly into a stack buffer to avoid a String allocation.
                     let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
                     let s = id.0.as_hyphenated().encode_lower(&mut buf);
-                    if let Ok(value) = HeaderValue::from_bytes(s.as_bytes()) {
-                        response.headers_mut().insert(X_REQUEST_ID.clone(), value);
-                    }
+                    let Ok(value) = HeaderValue::from_bytes(s.as_bytes()) else {
+                        return Poll::Ready(Ok(response));
+                    };
+                    response.headers_mut().insert(X_REQUEST_ID.clone(), value);
                 }
                 Poll::Ready(Ok(response))
             }

@@ -158,10 +158,11 @@ impl Flash {
             let payload = serde_json::json!({
                 "flash": messages
             });
-            if let Ok(v) = http::header::HeaderValue::from_str(&payload.to_string()) {
-                res.headers_mut()
-                    .insert(http::header::HeaderName::from_static("hx-trigger"), v);
-            }
+            let Ok(v) = http::header::HeaderValue::from_str(&payload.to_string()) else {
+                return res;
+            };
+            res.headers_mut()
+                .insert(http::header::HeaderName::from_static("hx-trigger"), v);
         }
         res
     }

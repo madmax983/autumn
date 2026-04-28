@@ -256,14 +256,16 @@ fn parse_query(query: &str) -> PageRequest {
         };
         match key.as_str() {
             "page" => {
-                if let Ok(n) = value.parse::<u32>() {
-                    req.page = Some(n);
-                }
+                let Ok(n) = value.parse::<u32>() else {
+                    continue;
+                };
+                req.page = Some(n);
             }
             "size" => {
-                if let Ok(n) = value.parse::<u32>() {
-                    req.size = Some(n);
-                }
+                let Ok(n) = value.parse::<u32>() else {
+                    continue;
+                };
+                req.size = Some(n);
             }
             _ => {}
         }
@@ -287,15 +289,15 @@ fn percent_decode(input: &str) -> Result<String, std::str::Utf8Error> {
             b'%' if i + 2 < bytes.len() => {
                 let hi = (bytes[i + 1] as char).to_digit(16);
                 let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    // h and l are both `0..=15` from `to_digit(16)`, so
-                    // `(h << 4) | l` fits in a u8 by construction.
-                    out.push(u8::try_from((h << 4) | l).unwrap_or(0));
-                    i += 3;
-                } else {
+                let (Some(h), Some(l)) = (hi, lo) else {
                     out.push(bytes[i]);
                     i += 1;
-                }
+                    continue;
+                };
+                // h and l are both `0..=15` from `to_digit(16)`, so
+                // `(h << 4) | l` fits in a u8 by construction.
+                out.push(u8::try_from((h << 4) | l).unwrap_or(0));
+                i += 3;
             }
             b => {
                 out.push(b);
@@ -723,9 +725,10 @@ fn parse_cursor_query(query: &str) -> CursorRequest {
                 req.cursor = Some(value);
             }
             "size" => {
-                if let Ok(n) = value.parse::<u32>() {
-                    req.size = Some(n);
-                }
+                let Ok(n) = value.parse::<u32>() else {
+                    continue;
+                };
+                req.size = Some(n);
             }
             _ => {}
         }
