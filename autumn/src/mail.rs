@@ -602,8 +602,7 @@ impl SmtpTransport {
         if let Some(username) = config.username {
             let password_env = config.password_env.ok_or_else(|| {
                 MailError::InvalidMessage(
-                    "mail.smtp.password_env is required when mail.smtp.username is set"
-                        .to_owned(),
+                    "mail.smtp.password_env is required when mail.smtp.username is set".to_owned(),
                 )
             })?;
             let password = std::env::var(&password_env).map_err(|error| {
