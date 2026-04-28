@@ -34,6 +34,10 @@ pub trait ProvideActuatorState {
     /// for async scheduled background tasks.
     fn task_registry(&self) -> &TaskRegistry;
 
+    /// Returns a reference to the [`JobRegistry`] holding queue and failure
+    /// information for ad-hoc background jobs.
+    fn job_registry(&self) -> &JobRegistry;
+
     /// Returns a reference to the [`ConfigProperties`] snapshot, providing
     /// active configuration state for the environment endpoint.
     fn config_props(&self) -> &ConfigProperties;
@@ -173,6 +177,126 @@ pub struct TaskStatus {
 #[derive(Clone)]
 pub struct TaskRegistry {
     inner: Arc<RwLock<HashMap<String, TaskStatus>>>,
+}
+
+/// On-demand background job status information.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobStatus {
+    /// Approximate queued jobs waiting to run.
+    pub queued: u64,
+    /// Number of currently running jobs.
+    pub in_flight: u64,
+    /// Total successful executions.
+    pub total_successes: u64,
+    /// Total failed executions.
+    pub total_failures: u64,
+    /// Total dead-lettered executions.
+    pub dead_letters: u64,
+    /// Last observed error for this job, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Registry of ad-hoc jobs and their runtime status.
+#[derive(Clone)]
+pub struct JobRegistry {
+    inner: Arc<RwLock<HashMap<String, JobStatus>>>,
+}
+
+impl JobRegistry {
+    /// Create a new empty job registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a job name with initial counters.
+    pub fn register(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.entry(name.to_string()).or_insert(JobStatus {
+                queued: 0,
+                in_flight: 0,
+                total_successes: 0,
+                total_failures: 0,
+                dead_letters: 0,
+                last_error: None,
+            });
+        }
+    }
+
+    /// Record that a new job instance was enqueued.
+    pub fn record_enqueue(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            let status = guard.entry(name.to_string()).or_insert(JobStatus {
+                queued: 0,
+                in_flight: 0,
+                total_successes: 0,
+                total_failures: 0,
+                dead_letters: 0,
+                last_error: None,
+            });
+            status.queued = status.queued.saturating_add(1);
+        }
+    }
+
+    /// Record that a queued job started execution.
+    pub fn record_start(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some(status) = guard.get_mut(name) {
+                status.queued = status.queued.saturating_sub(1);
+                status.in_flight = status.in_flight.saturating_add(1);
+            }
+        }
+    }
+
+    /// Record a successful execution.
+    pub fn record_success(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some(status) = guard.get_mut(name) {
+                status.in_flight = status.in_flight.saturating_sub(1);
+                status.total_successes = status.total_successes.saturating_add(1);
+                status.last_error = None;
+            }
+        }
+    }
+
+    /// Record a retriable failure.
+    pub fn record_retry(&self, name: &str, error: &str, _attempt: u32) {
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some(status) = guard.get_mut(name) {
+                status.in_flight = status.in_flight.saturating_sub(1);
+                status.last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Record a terminal failure.
+    pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
+        if let Ok(mut guard) = self.inner.write() {
+            if let Some(status) = guard.get_mut(name) {
+                status.in_flight = status.in_flight.saturating_sub(1);
+                status.total_failures = status.total_failures.saturating_add(1);
+                status.last_error = Some(error);
+                if dead_lettered {
+                    status.dead_letters = status.dead_letters.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Snapshot all registered jobs.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<String, JobStatus> {
+        self.inner.read().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl Default for JobRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskRegistry {
@@ -996,6 +1120,14 @@ pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     }))
 }
 
+/// `GET <actuator-prefix>/jobs` -- ad-hoc background job status.
+pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let jobs = state.job_registry().snapshot();
+    Json(serde_json::json!({ "jobs": jobs }))
+}
+
 // ── Channels (sensitive) ───────────────────────────────────────
 
 /// `GET <actuator-prefix>/channels` -- get current channel snapshots.
@@ -1093,6 +1225,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
         paths.push(actuator_route_path(prefix, "/tasks"));
+        paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
@@ -1165,6 +1298,10 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(tasks_endpoint::<S>),
             )
             .route(
+                &actuator_route_path(prefix, "/jobs"),
+                axum::routing::get(jobs_endpoint::<S>),
+            )
+            .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
             );
@@ -1222,6 +1359,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
+            job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -1727,6 +1865,37 @@ mod tests {
         assert_eq!(task["total_failures"], 0);
         assert_eq!(task["last_result"], "ok");
         assert_eq!(task["last_duration_ms"], 150);
+    }
+
+    #[tokio::test]
+    async fn actuator_jobs_returns_registered_jobs() {
+        let state = test_state();
+        state.job_registry().register("send_email");
+        state.job_registry().record_enqueue("send_email");
+        state.job_registry().record_start("send_email");
+        state.job_registry().record_success("send_email");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let job = &json["jobs"]["send_email"];
+        assert_eq!(job["queued"], 0);
+        assert_eq!(job["in_flight"], 0);
+        assert_eq!(job["total_successes"], 1);
+        assert_eq!(job["total_failures"], 0);
     }
 
     #[tokio::test]

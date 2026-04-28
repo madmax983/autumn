@@ -603,6 +603,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub session: crate::session::SessionConfig,
 
+    /// Background job backend and runtime settings.
+    #[serde(default)]
+    pub jobs: JobConfig,
+
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -610,6 +614,80 @@ pub struct AutumnConfig {
     /// Security settings (headers, CSRF).
     #[serde(default)]
     pub security: crate::security::config::SecurityConfig,
+}
+
+/// Background job runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobConfig {
+    /// Runtime backend selection.
+    ///
+    /// - `local` (default): in-process Tokio queue
+    /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    #[serde(default = "default_job_backend")]
+    pub backend: String,
+    /// Number of concurrent worker loops to spawn.
+    #[serde(default = "default_job_workers")]
+    pub workers: usize,
+    /// Default max attempts when `#[job(max_attempts = ...)]` is not set.
+    #[serde(default = "default_job_max_attempts")]
+    pub max_attempts: u32,
+    /// Default initial retry backoff in milliseconds.
+    #[serde(default = "default_job_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Redis backend options.
+    #[serde(default)]
+    pub redis: JobRedisConfig,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_job_backend(),
+            workers: default_job_workers(),
+            max_attempts: default_job_max_attempts(),
+            initial_backoff_ms: default_job_backoff_ms(),
+            redis: JobRedisConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobRedisConfig {
+    /// Redis URL used when `jobs.backend = "redis"`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Key prefix for all queue keys.
+    #[serde(default = "default_jobs_redis_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for JobRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_jobs_redis_prefix(),
+        }
+    }
+}
+
+fn default_job_backend() -> String {
+    "local".to_owned()
+}
+
+const fn default_job_workers() -> usize {
+    1
+}
+
+const fn default_job_max_attempts() -> u32 {
+    5
+}
+
+const fn default_job_backoff_ms() -> u64 {
+    250
+}
+
+fn default_jobs_redis_prefix() -> String {
+    "autumn:jobs".to_owned()
 }
 
 impl AutumnConfig {

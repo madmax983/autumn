@@ -69,6 +69,7 @@ pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
+        jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -161,6 +162,7 @@ type PoolProviderFactory = Box<
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
@@ -331,6 +333,13 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register ad-hoc background jobs with the application.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
         self
     }
 
@@ -1004,6 +1013,7 @@ impl AppBuilder {
         let Self {
             routes,
             tasks,
+            jobs,
             static_metas: _,
             exception_filters,
             scoped_groups,
@@ -1180,6 +1190,9 @@ impl AppBuilder {
             if !tasks.is_empty() {
                 start_task_scheduler(tasks, &state, server_shutdown.clone());
             }
+            if !jobs.is_empty() {
+                crate::job::start_runtime(jobs, &state, server_shutdown.clone(), &config.jobs);
+            }
             state.probes().mark_startup_complete();
         }
 
@@ -1205,6 +1218,7 @@ impl AppBuilder {
         let Self {
             routes,
             tasks: _,
+            jobs: _,
             static_metas,
             exception_filters: _,
             scoped_groups: _,
@@ -1761,6 +1775,7 @@ fn build_state(
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
+        job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels::new(32),
@@ -1969,6 +1984,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2140,6 +2156,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2233,6 +2250,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2299,6 +2317,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2580,6 +2599,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2873,6 +2893,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3012,6 +3033,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3049,6 +3071,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3293,6 +3316,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -3353,6 +3377,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),

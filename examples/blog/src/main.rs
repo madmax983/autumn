@@ -3,7 +3,7 @@ mod routes;
 mod schema;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
-use autumn_web::{routes, static_routes};
+use autumn_web::{jobs, routes, static_routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -26,7 +26,9 @@ async fn main() {
             // JSON API
             routes::api::list_json,
             routes::api::create_json,
+            routes::api::enqueue_publish_webhook,
         ])
+        .jobs(jobs![routes::api::publish_webhook])
         .static_routes(static_routes![routes::about::about,])
         .run()
         .await;
