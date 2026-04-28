@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
+#[cfg(feature = "redis")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -43,6 +44,7 @@ struct QueuedJob {
     initial_backoff_ms: u64,
 }
 
+#[cfg(feature = "redis")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableQueuedJob {
     name: String,
@@ -63,6 +65,12 @@ pub(crate) fn init_global_job_client(client: JobClient) {
     let _ = GLOBAL_JOB_CLIENT.set(client);
 }
 
+/// Enqueue a job payload on the configured runtime backend.
+///
+/// # Errors
+///
+/// Returns an internal error when the jobs runtime is not initialized or when
+/// the active backend rejects the enqueue operation.
 pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     let Some(client) = global_job_client() else {
         return Err(AutumnError::internal_server_error(std::io::Error::other(
@@ -73,6 +81,11 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
 }
 
 impl JobClient {
+    /// Enqueue a job by name with a JSON payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when enqueueing fails in the active backend.
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
         self.registry.record_enqueue(name);
 
@@ -115,7 +128,7 @@ impl JobClient {
 pub(crate) fn start_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
 ) {
     match config.backend.as_str() {
@@ -176,7 +189,7 @@ pub(crate) fn start_runtime(
 pub(crate) fn start_local_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
     workers: usize,
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
@@ -216,7 +229,7 @@ pub(crate) fn start_local_runtime(
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => break,
+                    () = shutdown.cancelled() => break,
                     maybe = async {
                         let mut guard = shared_rx.lock().await;
                         guard.recv().await
@@ -238,33 +251,30 @@ async fn execute_local_job(
 ) {
     state.job_registry.record_start(&job.name);
 
-    let (handler, max_attempts, backoff_ms) = {
-        let guard = jobs_by_name.read().expect("job registry lock poisoned");
-        let Some(info) = guard.get(&job.name) else {
-            state.job_registry.record_failure(
-                &job.name,
-                format!("unknown job '{}'", job.name),
-                true,
-            );
-            return;
-        };
-
-        let max_attempts = if job.max_attempts != 0 {
-            job.max_attempts
-        } else if info.max_attempts != 0 {
-            info.max_attempts
-        } else {
-            5
-        };
-        let backoff_ms = if job.initial_backoff_ms != 0 {
-            job.initial_backoff_ms
-        } else if info.initial_backoff_ms != 0 {
-            info.initial_backoff_ms
-        } else {
-            250
-        };
-
-        (info.handler, max_attempts, backoff_ms)
+    let Some((handler, info_max_attempts, info_backoff_ms)) = jobs_by_name
+        .read()
+        .expect("job registry lock poisoned")
+        .get(&job.name)
+        .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+    else {
+        state
+            .job_registry
+            .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
+        return;
+    };
+    let max_attempts = if job.max_attempts != 0 {
+        job.max_attempts
+    } else if info_max_attempts != 0 {
+        info_max_attempts
+    } else {
+        5
+    };
+    let backoff_ms = if job.initial_backoff_ms != 0 {
+        job.initial_backoff_ms
+    } else if info_backoff_ms != 0 {
+        info_backoff_ms
+    } else {
+        250
     };
 
     match (handler)(state.clone(), job.payload.clone()).await {
@@ -522,10 +532,6 @@ mod tests {
 
     #[tokio::test]
     async fn local_enqueue_p99_is_under_5ms() {
-        async fn noop(_state: AppState, _payload: Value) -> AutumnResult<()> {
-            Ok(())
-        }
-
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
@@ -533,10 +539,10 @@ mod tests {
                 name: "noop".to_string(),
                 max_attempts: 3,
                 initial_backoff_ms: 10,
-                handler: |state, payload| Box::pin(noop(state, payload)),
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &state,
-            shutdown,
+            &shutdown,
             1,
             5,
             250,
@@ -552,8 +558,7 @@ mod tests {
         let p99 = samples[(samples.len() * 99) / 100];
         assert!(
             p99 < std::time::Duration::from_millis(5),
-            "expected p99 enqueue latency < 5ms, got {:?}",
-            p99
+            "expected p99 enqueue latency < 5ms, got {p99:?}",
         );
     }
 }

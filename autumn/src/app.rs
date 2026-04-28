@@ -1191,7 +1191,7 @@ impl AppBuilder {
                 start_task_scheduler(tasks, &state, server_shutdown.clone());
             }
             if !jobs.is_empty() {
-                crate::job::start_runtime(jobs, &state, server_shutdown.clone(), &config.jobs);
+                crate::job::start_runtime(jobs, &state, &server_shutdown, &config.jobs);
             }
             state.probes().mark_startup_complete();
         }
