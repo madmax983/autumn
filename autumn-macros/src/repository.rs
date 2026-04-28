@@ -651,6 +651,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! { ::core::option::Option::None }
         };
+        // Companion probe for `scope = ...`. The generated list
+        // handler resolves the scope from the registry per request,
+        // so without startup validation a missing
+        // `.scope::<R, _>(...)` call would 500 every list response.
+        let scope_check_fn = if config.scope_type.is_some() {
+            quote! {
+                ::core::option::Option::Some(
+                    (|registry: &::autumn_web::authorization::PolicyRegistry| {
+                        registry.scope::<#model_name>().is_some()
+                    }) as fn(&::autumn_web::authorization::PolicyRegistry) -> bool
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
         let scope_type_assertion = if let Some(ref scope_type) = config.scope_type {
             quote! {
                 const _: fn() = || {
@@ -705,6 +720,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
+                        scope_check: #scope_check_fn,
                     }),
                 }
             }
@@ -746,6 +762,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
+                        scope_check: #scope_check_fn,
                     }),
                 }
             }
@@ -791,6 +808,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
+                        scope_check: #scope_check_fn,
                     }),
                 }
             }
@@ -838,6 +856,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
+                        scope_check: #scope_check_fn,
                     }),
                 }
             }
@@ -872,6 +891,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
                         policy_check: #policy_check_fn,
+                        scope_check: #scope_check_fn,
                     }),
                 }
             }

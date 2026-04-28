@@ -50,6 +50,17 @@ pub struct RepositoryApiMeta {
     /// registered" instead of failing fast at boot. `None` when
     /// the macro form omits `policy = ...`.
     pub policy_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
+
+    /// Type-erased registry probe emitted by the macro when
+    /// `scope = ...` is set. Returns `true` if a [`Scope`] is
+    /// registered for the resource type. Companion to
+    /// [`Self::policy_check`] for the scope-list code path: the
+    /// generated `GET /<api>` handler resolves the scope from the
+    /// registry on every request, so a missing
+    /// `.scope::<R, _>(...)` registration would 500 every list
+    /// call. The startup guard fails fast instead. `None` when
+    /// the macro form omits `scope = ...`.
+    pub scope_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
 }
 
 /// A single route binding an HTTP method + path to an Axum handler.

@@ -2054,7 +2054,8 @@ fn validate_repository_api_policies(
     config: &AutumnConfig,
 ) {
     let profile = config.profile.as_deref().unwrap_or("default");
-    let strict = profile == "prod" && !config.security.allow_unauthorized_repository_api;
+    let strict =
+        is_production_profile(profile) && !config.security.allow_unauthorized_repository_api;
 
     let mut offenders: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
@@ -2135,17 +2136,30 @@ fn validate_repository_policies_registered(
     config: &AutumnConfig,
 ) {
     let profile = config.profile.as_deref().unwrap_or("default");
-    let strict = profile == "prod";
+    let strict = is_production_profile(profile);
 
     let registry = state.policy_registry();
-    let mut missing: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+    let mut missing_policies: Vec<(String, String)> = Vec::new();
+    let mut missing_scopes: Vec<(String, String)> = Vec::new();
+    let mut seen_policies: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut seen_scopes: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
         if let Some(meta) = route.repository {
             if let Some(check) = meta.policy_check {
-                if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
-                    missing.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                if !check(registry)
+                    && seen_policies.insert((meta.resource_type_name, meta.api_path))
+                {
+                    missing_policies
+                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                }
+            }
+            if let Some(check) = meta.scope_check {
+                if !check(registry) && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+                {
+                    missing_scopes
+                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
                 }
             }
         }
@@ -2159,28 +2173,54 @@ fn validate_repository_policies_registered(
         }
     }
 
-    if missing.is_empty() {
+    if missing_policies.is_empty() && missing_scopes.is_empty() {
         return;
     }
 
-    let listing = missing
-        .iter()
-        .map(|(name, path)| {
-            format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    if !missing_policies.is_empty() {
+        let listing = missing_policies
+            .iter()
+            .map(|(name, path)| {
+                format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `policy = ...` argument, but no policy is registered for the resource type. Without registration, every protected request would fail at runtime with `500 no policy registered`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `policy = ...` but no matching `.policy::<R, _>(...)` registration is on the app builder. Protected requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
+
+    if !missing_scopes.is_empty() {
+        let listing = missing_scopes
+            .iter()
+            .map(|(name, path)| {
+                format!("  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `scope = ...` argument, but no scope is registered for the resource type. Without registration, every list request would fail at runtime with `500 missing scope registration`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `scope = ...` but no matching `.scope::<R, _>(...)` registration is on the app builder. List requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
 
     if strict {
-        tracing::error!(
-            "refusing to start: the following #[repository] routes declare a `policy = ...` argument, but no policy is registered for the resource type. Without registration, every protected request would fail at runtime with `500 no policy registered`:\n{listing}"
-        );
         std::process::exit(1);
-    } else {
-        tracing::warn!(
-            "the following #[repository] routes declare `policy = ...` but no matching `.policy::<R, _>(...)` registration is on the app builder. Protected requests will 500 at runtime:\n{listing}\n\
-             This will become a startup-time error in `prod` profile builds."
-        );
     }
 }
 
@@ -2189,6 +2229,15 @@ const fn is_mutating_method(method: &http::Method) -> bool {
         *method,
         http::Method::POST | http::Method::PUT | http::Method::PATCH | http::Method::DELETE
     )
+}
+
+/// Returns `true` for the framework's accepted production profile
+/// names. Mirrors the `prod | production` matching used elsewhere
+/// (`app.rs::run_build_mode`, `migrate.rs::should_auto_apply`,
+/// etc.) so the repository startup guards don't silently weaken in
+/// deployments that pick the long-form alias.
+fn is_production_profile(profile: &str) -> bool {
+    matches!(profile, "prod" | "production")
 }
 
 #[cfg(test)]
@@ -2217,6 +2266,7 @@ mod validate_repository_api_policies_tests {
             api_path: path,
             has_policy: false,
             policy_check: None,
+            scope_check: None,
         }
     }
 
@@ -2327,6 +2377,7 @@ mod validate_repository_api_policies_tests {
             api_path: path,
             has_policy: true,
             policy_check: Some(|registry: &PolicyRegistry| registry.has_policy::<TestPost>()),
+            scope_check: None,
         }
     }
 
@@ -2414,6 +2465,107 @@ mod validate_repository_api_policies_tests {
         ];
         let missing = collect_missing(&routes, &registry);
         assert_eq!(missing.len(), 1);
+    }
+
+    // ── Scope registration validation ─────────────────────────────
+
+    use crate::authorization::{BoxFuture, PolicyContext, Scope};
+
+    #[derive(Default)]
+    struct TestPostScope;
+    impl Scope<TestPost> for TestPostScope {
+        fn list<'a>(
+            &'a self,
+            _ctx: &'a PolicyContext,
+            _conn: &'a mut diesel_async::AsyncPgConnection,
+        ) -> BoxFuture<'a, crate::AutumnResult<Vec<TestPost>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn scope_only_meta(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+            policy_check: None,
+            scope_check: Some(|registry: &PolicyRegistry| registry.scope::<TestPost>().is_some()),
+        }
+    }
+
+    fn collect_missing_scopes(
+        routes: &[Route],
+        registry: &PolicyRegistry,
+    ) -> Vec<(String, String)> {
+        let mut missing: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+            std::collections::HashSet::new();
+        for route in routes {
+            if let Some(meta) = route.repository {
+                if let Some(check) = meta.scope_check {
+                    if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
+                        missing
+                            .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                    }
+                }
+            }
+        }
+        missing
+    }
+
+    #[test]
+    fn scope_check_flags_unregistered_scope() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+    }
+
+    #[test]
+    fn scope_check_passes_when_scope_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_scope::<TestPost, _>(TestPostScope);
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn scope_check_skips_routes_without_scope_check_fn() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    // ── prod / production profile parity ────────────────────────
+
+    #[test]
+    fn is_production_profile_matches_both_aliases() {
+        assert!(is_production_profile("prod"));
+        assert!(is_production_profile("production"));
+        assert!(!is_production_profile("dev"));
+        assert!(!is_production_profile("staging"));
+        assert!(!is_production_profile("test"));
+        assert!(!is_production_profile("default"));
+        // Case-sensitive (matches the framework's elsewhere
+        // matching pattern in app.rs::run_build_mode and
+        // migrate.rs).
+        assert!(!is_production_profile("Prod"));
+        assert!(!is_production_profile("Production"));
     }
 }
 
