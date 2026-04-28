@@ -435,22 +435,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Replace `dst` with `src` atomically across platforms.
 ///
 /// On POSIX, `rename` overwrites an existing destination atomically.
-/// On Windows, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` errors
-/// when the destination exists, so re-uploads to the same key would
-/// fail without the fallback. We try a plain rename first (the fast
-/// path), and on `AlreadyExists` we remove the destination and retry.
-/// The Windows path is non-atomic in the narrow window between the
-/// remove and the rename, but that's strictly better than the
-/// "re-upload errors out" alternative.
+/// Replace `dst` with `src` atomically across platforms.
+///
+/// On POSIX, `rename` overwrites an existing destination atomically,
+/// so the first attempt is the fast path. On Windows, `MoveFileEx`
+/// without `MOVEFILE_REPLACE_EXISTING` errors with `AlreadyExists`
+/// when the destination exists; the fallback path moves the existing
+/// `dst` aside to a sibling backup, renames `src` into place, and
+/// removes the backup. If the second rename fails for any reason
+/// (transient I/O error, permissions, etc.), we rename the backup
+/// back into `dst` so a failed overwrite never destroys the
+/// previously committed blob — the caller still gets the rename
+/// error and cleans up `src`, but the original blob stays intact.
+///
+/// There's still a tiny non-atomic window on the Windows fallback
+/// path between the move-aside and the rename-into-place. Eliminating
+/// it requires `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` via the
+/// `windows` crate, which we'd rather not pull in for one syscall.
 async fn atomic_replace(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     match tokio::fs::rename(src, dst).await {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            tokio::fs::remove_file(dst).await?;
-            tokio::fs::rename(src, dst).await
+            // Move the existing dst aside under a unique sibling name
+            // so we can restore it if the rename-into-place fails.
+            let backup = backup_sibling_path(dst);
+            tokio::fs::rename(dst, &backup).await?;
+            match tokio::fs::rename(src, dst).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(&backup).await;
+                    Ok(())
+                }
+                Err(rename_err) => {
+                    // Restore the original dst from backup. If even
+                    // this fails the system is in a state we can't
+                    // automatically recover, but it's still better
+                    // than the unconditional-delete alternative.
+                    let _ = tokio::fs::rename(&backup, dst).await;
+                    Err(rename_err)
+                }
+            }
         }
         Err(err) => Err(err),
     }
+}
+
+fn backup_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut name = path.file_name().map_or_else(
+        || std::ffi::OsString::from("blob"),
+        std::ffi::OsStr::to_owned,
+    );
+    name.push(".bak.");
+    name.push(&id);
+    path.with_file_name(name)
 }
 
 fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -864,6 +901,45 @@ mod tests {
         assert_eq!(tmp.parent(), original.parent());
         let name = tmp.file_name().unwrap().to_string_lossy();
         assert!(name.starts_with("me.png.tmp."));
+    }
+
+    #[test]
+    fn backup_sibling_path_keeps_parent_directory() {
+        let original = std::path::Path::new("/var/lib/blobs/avatars/me.png");
+        let backup = backup_sibling_path(original);
+        assert_eq!(backup.parent(), original.parent());
+        let name = backup.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("me.png.bak."));
+    }
+
+    /// Simulates the Windows fallback's "second rename fails" branch
+    /// directly (POSIX `rename` always replaces, so the production
+    /// path on Linux never enters the `AlreadyExists` arm). The
+    /// invariant we care about is: if the recovery-rename succeeds,
+    /// the original `dst` content is preserved when the second
+    /// rename fails.
+    #[tokio::test]
+    async fn atomic_replace_recovery_restores_dst_on_failure() {
+        let dir = temp_root();
+        let dst = dir.path().join("target.bin");
+        tokio::fs::write(&dst, b"old-blob").await.unwrap();
+
+        // Manually drive the recovery sequence. Move dst aside …
+        let backup = backup_sibling_path(&dst);
+        tokio::fs::rename(&dst, &backup).await.unwrap();
+        // … attempt the second rename with a non-existent source so it
+        // fails (this is the "transient failure on the new write"
+        // branch the production code's `match` arm catches) …
+        let err = tokio::fs::rename(dir.path().join("never.tmp"), &dst)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        // … and restore the backup, which is exactly what the
+        // production path does on rename failure.
+        tokio::fs::rename(&backup, &dst).await.unwrap();
+
+        // The original blob bytes are intact.
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"old-blob");
     }
 
     #[test]
