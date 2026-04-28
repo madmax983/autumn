@@ -632,7 +632,7 @@ impl ConfigProperties {
 
 /// Enhanced health response for the actuator health endpoint.
 #[derive(Serialize)]
-struct ActuatorHealth {
+pub(crate) struct ActuatorHealth {
     status: &'static str,
     version: &'static str,
     profile: String,
@@ -706,6 +706,112 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(body))
+}
+
+
+/// Unified diagnostic snapshot containing health, metrics, tasks, and loggers.
+#[derive(Serialize)]
+pub(crate) struct ExportSnapshot {
+    pub timestamp: u64,
+    pub url: String,
+    pub health: ActuatorHealth,
+    pub metrics: serde_json::Value,
+    pub tasks: serde_json::Value,
+    pub loggers: LoggersResponse,
+}
+
+pub(crate) async fn export_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<ExportSnapshot> {
+    // 1. Health
+    let (overall_healthy, db_check) = {
+        #[cfg(feature = "db")]
+        {
+            #[allow(clippy::option_if_let_else)]
+            if let Some(pool) = state.pool() {
+                let status = pool.status();
+                let available = status.available as u64;
+                let size = status.max_size as u64;
+                let waiting = status.waiting as u64;
+                let idle = available;
+                let active = size.saturating_sub(available);
+
+                let overall_healthy = available > 0 || waiting == 0;
+                let db_check = Some(DatabaseCheck {
+                    status: if overall_healthy { "ok" } else { "down" },
+                    pool_size: size,
+                    active_connections: active,
+                    idle_connections: idle,
+                });
+                (overall_healthy, db_check)
+            } else {
+                (true, None)
+            }
+        }
+
+        #[cfg(not(feature = "db"))]
+        {
+            (true, None)
+        }
+    };
+
+    let checks = db_check.map(|db| HealthChecks { database: Some(db) });
+
+    let health = ActuatorHealth {
+        status: if overall_healthy { "ok" } else { "degraded" },
+        version: env!("CARGO_PKG_VERSION"),
+        profile: state.profile().to_owned(),
+        uptime: state.uptime_display(),
+        checks,
+    };
+
+    // 2. Metrics
+    let metrics_snapshot = state.metrics().snapshot();
+    let mut metrics_val = serde_json::to_value(&metrics_snapshot).unwrap_or_default();
+    #[cfg(feature = "db")]
+    {
+        if let Some(pool) = state.pool() {
+            let status = pool.status();
+            if let Some(obj) = metrics_val.as_object_mut() {
+                obj.insert(
+                    "database".to_owned(),
+                    serde_json::json!({
+                        "pool_size": status.max_size,
+                        "active_connections": status.max_size.saturating_sub(status.available),
+                        "idle_connections": status.available,
+                        "waiting_tasks": status.waiting,
+                    }),
+                );
+            }
+        }
+    }
+
+    // 3. Tasks
+    let tasks = serde_json::json!({
+        "scheduled_tasks": state.task_registry().snapshot(),
+    });
+
+    // 4. Loggers
+    let loggers = LoggersResponse {
+        current_level: state.log_levels().current_level(),
+        available_levels: AVAILABLE_LEVELS.to_vec(),
+        loggers: state.log_levels().logger_overrides(),
+    };
+
+    // Use std::time for a simple timestamp as chrono is not available
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    Json(ExportSnapshot {
+        timestamp,
+        url: String::new(), // Set by the CLI
+        health,
+        metrics: metrics_val,
+        tasks,
+        loggers,
+    })
 }
 
 // ── Info ────────────────────────────────────────────────────────
@@ -1093,6 +1199,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
         paths.push(actuator_route_path(prefix, "/tasks"));
+        paths.push(actuator_route_path(prefix, "/export"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
@@ -1159,6 +1266,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/loggers/{name}"),
                 axum::routing::put(loggers_put::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/export"),
+                axum::routing::get(export_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/tasks"),
@@ -1932,6 +2043,53 @@ mod tests {
         } else {
             assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
         }
+    }
+
+
+    #[tokio::test]
+    async fn actuator_export_returns_combined_snapshot() {
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(json.get("timestamp").is_some());
+        assert!(json.get("url").is_some());
+        assert!(json.get("health").is_some());
+        assert!(json.get("metrics").is_some());
+        assert!(json.get("tasks").is_some());
+        assert!(json.get("loggers").is_some());
+        assert_eq!(json["health"]["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn actuator_export_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

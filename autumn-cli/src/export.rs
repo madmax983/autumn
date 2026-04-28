@@ -22,41 +22,19 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
-    let health = fetch_endpoint(&client, base_url, "/actuator/health");
-    let metrics = fetch_endpoint(&client, base_url, "/actuator/metrics");
-    let tasks = fetch_endpoint(&client, base_url, "/actuator/tasks");
-    let loggers = fetch_endpoint(&client, base_url, "/actuator/loggers");
+    let mut snapshot = fetch_endpoint(&client, base_url, "/actuator/export");
 
-    // If any endpoint returns an error, fail the export
-    for (name, val) in [
-        ("health", &health),
-        ("metrics", &metrics),
-        ("tasks", &tasks),
-        ("loggers", &loggers),
-    ] {
-        if let Some(err) = val.get("error") {
-            return Err(format!(
-                "Failed to fetch {} from {base_url}: {}",
-                name,
-                err.as_str().unwrap_or("Unknown error")
-            ));
-        }
+    if let Some(err) = snapshot.get("error") {
+        return Err(format!(
+            "Failed to fetch export from {base_url}: {}",
+            err.as_str().unwrap_or("Unknown error")
+        ));
     }
 
-    // Use std::time for a simple timestamp as chrono is not available
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let snapshot = json!({
-        "timestamp": timestamp,
-        "url": base_url,
-        "health": health,
-        "metrics": metrics,
-        "tasks": tasks,
-        "loggers": loggers,
-    });
+    // The server leaves url empty so we set it here
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert("url".to_owned(), json!(base_url));
+    }
 
     match File::create(output) {
         Ok(mut file) => {
@@ -173,7 +151,8 @@ mod tests {
 
     #[test]
     fn test_run_inner_success() {
-        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
+        let mock_body = r#"{"timestamp": 12345, "url": "", "health": {"status": "ok"}, "metrics": {"status": "ok"}, "tasks": {"status": "ok"}, "loggers": {"status": "ok"}}"#;
+        let url = spawn_mock_server("HTTP/1.1 200 OK", mock_body, 1);
 
         let output_file = tempfile::NamedTempFile::new().unwrap();
         let output_path = output_file.path().to_str().unwrap();
@@ -207,7 +186,8 @@ mod tests {
 
     #[test]
     fn test_run_inner_file_creation_error() {
-        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
+        let mock_body = r#"{"timestamp": 12345, "url": "", "health": {"status": "ok"}, "metrics": {"status": "ok"}, "tasks": {"status": "ok"}, "loggers": {"status": "ok"}}"#;
+        let url = spawn_mock_server("HTTP/1.1 200 OK", mock_body, 1);
 
         // Use an invalid path that cannot be created
         let result = run_inner(&url, "/invalid/path/that/does/not/exist/diag.json");
