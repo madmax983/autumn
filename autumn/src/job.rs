@@ -30,6 +30,8 @@ pub struct JobClient {
     #[cfg(feature = "redis")]
     redis: Option<RedisClient>,
     registry: crate::actuator::JobRegistry,
+    default_max_attempts: u32,
+    default_initial_backoff_ms: u64,
 }
 
 #[derive(Debug)]
@@ -80,8 +82,8 @@ impl JobClient {
                     name: name.to_string(),
                     payload,
                     attempt: 1,
-                    max_attempts: 0,
-                    initial_backoff_ms: 0,
+                    max_attempts: self.default_max_attempts,
+                    initial_backoff_ms: self.default_initial_backoff_ms,
                 })
                 .await
                 .map_err(|e| {
@@ -93,7 +95,14 @@ impl JobClient {
             #[cfg(feature = "redis")]
             {
                 if let Some(redis) = &self.redis {
-                    return redis.enqueue(name, payload).await;
+                    return redis
+                        .enqueue(
+                            name,
+                            payload,
+                            self.default_max_attempts,
+                            self.default_initial_backoff_ms,
+                        )
+                        .await;
                 }
             }
             Err(AutumnError::internal_server_error(std::io::Error::other(
@@ -110,7 +119,14 @@ pub(crate) fn start_runtime(
     config: &crate::config::JobConfig,
 ) {
     match config.backend.as_str() {
-        "local" => start_local_runtime(jobs, state, shutdown, config.workers),
+        "local" => start_local_runtime(
+            jobs,
+            state,
+            shutdown,
+            config.workers,
+            config.max_attempts,
+            config.initial_backoff_ms,
+        ),
         "redis" => {
             #[cfg(feature = "redis")]
             {
@@ -118,7 +134,14 @@ pub(crate) fn start_runtime(
                     start_redis_runtime(jobs.clone(), state, shutdown.clone(), config)
                 {
                     tracing::error!(error = %error, "failed to start redis jobs backend; falling back to local backend");
-                    start_local_runtime(jobs, state, shutdown, config.workers);
+                    start_local_runtime(
+                        jobs,
+                        state,
+                        shutdown,
+                        config.workers,
+                        config.max_attempts,
+                        config.initial_backoff_ms,
+                    );
                 }
             }
             #[cfg(not(feature = "redis"))]
@@ -126,12 +149,26 @@ pub(crate) fn start_runtime(
                 tracing::warn!(
                     "jobs.backend=redis requested but redis feature is disabled; falling back to local backend"
                 );
-                start_local_runtime(jobs, state, shutdown, config.workers);
+                start_local_runtime(
+                    jobs,
+                    state,
+                    shutdown,
+                    config.workers,
+                    config.max_attempts,
+                    config.initial_backoff_ms,
+                );
             }
         }
         other => {
             tracing::warn!(backend = %other, "unknown jobs backend; falling back to local backend");
-            start_local_runtime(jobs, state, shutdown, config.workers);
+            start_local_runtime(
+                jobs,
+                state,
+                shutdown,
+                config.workers,
+                config.max_attempts,
+                config.initial_backoff_ms,
+            );
         }
     }
 }
@@ -141,6 +178,8 @@ pub(crate) fn start_local_runtime(
     state: &AppState,
     shutdown: tokio_util::sync::CancellationToken,
     workers: usize,
+    default_max_attempts: u32,
+    default_initial_backoff_ms: u64,
 ) {
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
@@ -162,6 +201,8 @@ pub(crate) fn start_local_runtime(
         #[cfg(feature = "redis")]
         redis: None,
         registry: state.job_registry.clone(),
+        default_max_attempts,
+        default_initial_backoff_ms,
     };
     init_global_job_client(client);
 
@@ -208,15 +249,19 @@ async fn execute_local_job(
             return;
         };
 
-        let max_attempts = if job.max_attempts == 0 {
+        let max_attempts = if job.max_attempts != 0 {
+            job.max_attempts
+        } else if info.max_attempts != 0 {
             info.max_attempts
         } else {
-            job.max_attempts
+            5
         };
-        let backoff_ms = if job.initial_backoff_ms == 0 {
+        let backoff_ms = if job.initial_backoff_ms != 0 {
+            job.initial_backoff_ms
+        } else if info.initial_backoff_ms != 0 {
             info.initial_backoff_ms
         } else {
-            job.initial_backoff_ms
+            250
         };
 
         (info.handler, max_attempts, backoff_ms)
@@ -263,7 +308,13 @@ struct RedisClient {
 
 #[cfg(feature = "redis")]
 impl RedisClient {
-    async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
+    async fn enqueue(
+        &self,
+        name: &str,
+        payload: Value,
+        default_max_attempts: u32,
+        default_initial_backoff_ms: u64,
+    ) -> AutumnResult<()> {
         use redis::AsyncCommands as _;
 
         let mut connection = self.connection.clone();
@@ -271,8 +322,8 @@ impl RedisClient {
             name: name.to_string(),
             payload,
             attempt: 1,
-            max_attempts: 0,
-            initial_backoff_ms: 0,
+            max_attempts: default_max_attempts,
+            initial_backoff_ms: default_initial_backoff_ms,
         };
         let encoded = serde_json::to_string(&msg).map_err(|e| {
             AutumnError::internal_server_error(std::io::Error::other(format!(
@@ -345,6 +396,8 @@ fn start_redis_runtime(
             queue_key: queue_key.clone(),
         }),
         registry: state.job_registry.clone(),
+        default_max_attempts: config.max_attempts,
+        default_initial_backoff_ms: config.initial_backoff_ms,
     });
 
     let worker_count = config.workers.max(1);
@@ -405,15 +458,19 @@ fn start_redis_runtime(
 
                     (
                         info.handler,
-                        if parsed.max_attempts == 0 {
-                            info.max_attempts.max(default_attempts)
-                        } else {
+                        if parsed.max_attempts != 0 {
                             parsed.max_attempts
-                        },
-                        if parsed.initial_backoff_ms == 0 {
-                            info.initial_backoff_ms.max(default_backoff)
+                        } else if info.max_attempts != 0 {
+                            info.max_attempts
                         } else {
+                            default_attempts
+                        },
+                        if parsed.initial_backoff_ms != 0 {
                             parsed.initial_backoff_ms
+                        } else if info.initial_backoff_ms != 0 {
+                            info.initial_backoff_ms
+                        } else {
+                            default_backoff
                         },
                     )
                 };
@@ -481,6 +538,8 @@ mod tests {
             &state,
             shutdown,
             1,
+            5,
+            250,
         );
 
         let mut samples = Vec::new();
