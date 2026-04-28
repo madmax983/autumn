@@ -12,18 +12,38 @@ struct MailMethod {
     args: Vec<(syn::Ident, Type)>,
 }
 
+fn returns_mail(method: &ImplItemFn) -> bool {
+    let ReturnType::Type(_, ty) = &method.sig.output else {
+        return false;
+    };
+    let Type::Path(type_path) = ty.as_ref() else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Mail")
+}
+
 fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
-    if method.sig.receiver().is_none() {
+    if !returns_mail(method) {
         return Ok(None);
+    }
+    let Some(receiver) = method.sig.receiver() else {
+        return Ok(None);
+    };
+    if receiver.reference.is_none() || receiver.mutability.is_some() {
+        return Err(syn::Error::new_spanned(
+            receiver,
+            "#[mailer] template methods must use an `&self` receiver",
+        ));
     }
     if method.sig.asyncness.is_some() {
         return Err(syn::Error::new_spanned(
             &method.sig.ident,
             "#[mailer] template methods must be synchronous and return Mail",
         ));
-    }
-    if matches!(method.sig.output, ReturnType::Default) {
-        return Ok(None);
     }
 
     let mut args = Vec::new();
@@ -226,5 +246,55 @@ mod tests {
         );
         let rendered = out.to_string();
         assert!(rendered.contains("self . welcome :: < T >"));
+    }
+
+    #[test]
+    fn skips_non_mail_returning_methods() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn helper(&self) -> String {
+                        String::new()
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(!rendered.contains("send_helper"));
+        assert!(!rendered.contains("deliver_later_helper"));
+    }
+
+    #[test]
+    fn rejects_mutable_self_mail_templates() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn reset(&mut self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("template methods must use an `&self` receiver"));
+    }
+
+    #[test]
+    fn ignores_async_non_mail_methods() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    async fn helper(&self) -> String {
+                        String::new()
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(!rendered.contains("send_helper"));
+        assert!(!rendered.contains("deliver_later_helper"));
     }
 }
