@@ -1197,6 +1197,57 @@ pub(crate) fn actuator_router_with_prefix<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_track_property_source_resolution() {
+        let mut props = std::collections::HashMap::new();
+
+        // Test 2: Profile default (value != default && (dev|prod))
+        ConfigProperties::track_property(&mut props, "test.profile", "val", "default", "dev");
+        let prop = props.get("test.profile").unwrap().clone();
+        assert_eq!(prop.source, "profile_default:dev");
+
+        ConfigProperties::track_property(&mut props, "test.profile_prod", "val", "default", "prod");
+        let prop = props.get("test.profile_prod").unwrap().clone();
+        assert_eq!(prop.source, "profile_default:prod");
+
+        // Test 3: autumn.toml (value != default && not dev/prod)
+        ConfigProperties::track_property(&mut props, "test.toml", "val", "default", "custom");
+        let prop = props.get("test.toml").unwrap().clone();
+        assert_eq!(prop.source, "autumn.toml");
+
+        // Test 4: Default (value == default)
+        ConfigProperties::track_property(&mut props, "test.default", "val", "val", "dev");
+        let prop = props.get("test.default").unwrap().clone();
+        assert_eq!(prop.source, "default");
+    }
+
+    #[test]
+    fn test_task_registry_snapshot() {
+        let registry = TaskRegistry::new();
+        registry.register("task1", "* * * * *");
+        registry.record_start("task1");
+
+        let snapshot1 = registry.snapshot();
+        assert_eq!(snapshot1.get("task1").unwrap().status, "running");
+
+        registry.record_success("task1", 100);
+        let snapshot2 = registry.snapshot();
+        let status2 = snapshot2.get("task1").unwrap();
+        assert_eq!(status2.status, "idle");
+        assert_eq!(status2.total_runs, 1);
+        assert_eq!(status2.last_result.as_deref(), Some("ok"));
+
+        registry.record_start("task1");
+        registry.record_failure("task1", 50, "failed error");
+        let snapshot3 = registry.snapshot();
+        let status3 = snapshot3.get("task1").unwrap();
+        assert_eq!(status3.status, "idle");
+        assert_eq!(status3.total_runs, 2);
+        assert_eq!(status3.total_failures, 1);
+        assert_eq!(status3.last_result.as_deref(), Some("failed"));
+        assert_eq!(status3.last_error.as_deref(), Some("failed error"));
+    }
+
     use super::*;
     use crate::config::AutumnConfig;
     use crate::state::AppState;

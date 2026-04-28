@@ -1775,3 +1775,32 @@ mod tests {
         assert!(result2.is_err() || !result2.unwrap());
     }
 }
+
+#[cfg(feature = "oauth2")]
+#[tokio::test]
+async fn test_load_identity_claims_no_id_token_no_userinfo() {
+    let provider = OAuth2ProviderConfig {
+        client_id: "cid".into(),
+        client_secret: "secret".into(),
+        authorize_url: "url".into(),
+        token_url: "url".into(),
+        userinfo_url: None, // Missing userinfo
+        redirect_uri: "url".into(),
+        scope: "scope".into(),
+        issuer: None,
+        jwks_url: None,
+    };
+    let token = OAuth2TokenResponse {
+        access_token: "access".into(),
+        token_type: Some("Bearer".into()),
+        id_token: None, // Missing id_token
+    };
+    let result = load_identity_claims(&provider, &token).await;
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("provider must return id_token or configure userinfo_url")
+    );
+}
