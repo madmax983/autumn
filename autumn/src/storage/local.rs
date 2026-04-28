@@ -256,18 +256,25 @@ impl BlobStore for LocalBlobStore {
             }
             // Persist the content_type + etag in a sibling sidecar so
             // `head`, `get_with_meta`, and the serving route can return
-            // the right MIME instead of `application/octet-stream`. A
-            // sidecar write failure after the bytes commit is logged
-            // (but doesn't unwind the put) — the bytes are still
-            // there, just without metadata.
-            write_meta_sidecar(
+            // the right MIME instead of `application/octet-stream`. If
+            // the sidecar write fails on an overwrite, clear any
+            // pre-existing sidecar so future `head`/serve calls fall
+            // back to `application/octet-stream` rather than reporting
+            // stale `content_type` from the previous put. The bytes
+            // themselves are committed and correct; we'd rather serve
+            // "unknown MIME" than misrepresent the MIME.
+            if write_meta_sidecar(
                 &path,
                 &StoredBlobMeta {
                     content_type: content_type.to_owned(),
                     etag: Some(etag.clone()),
                 },
             )
-            .await;
+            .await
+            .is_err()
+            {
+                drop_stale_sidecar(&path).await;
+            }
             Ok(Blob {
                 provider_id: self.inner.provider_id.clone(),
                 key: key.to_owned(),
@@ -323,14 +330,22 @@ impl BlobStore for LocalBlobStore {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         return Err(BlobStoreError::io(err));
                     }
-                    write_meta_sidecar(
+                    if write_meta_sidecar(
                         &path,
                         &StoredBlobMeta {
                             content_type: content_type.to_owned(),
                             etag: Some(etag.clone()),
                         },
                     )
-                    .await;
+                    .await
+                    .is_err()
+                    {
+                        // Same rationale as `put`: clear any
+                        // pre-existing sidecar so future `head`/serve
+                        // requests don't report stale MIME for the
+                        // freshly committed bytes.
+                        drop_stale_sidecar(&path).await;
+                    }
                     Ok(Blob {
                         provider_id: self.inner.provider_id.clone(),
                         key: key.to_owned(),
@@ -599,10 +614,12 @@ fn meta_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
 /// the dirent atomically without following whatever was at the
 /// destination.
 ///
-/// Failure is logged but not surfaced — losing the sidecar reduces a
-/// future `get` to `application/octet-stream`, which is exactly the
-/// pre-sidecar behavior.
-async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
+/// Returns `Ok(())` on success and `Err(())` on any logged failure
+/// (already-logged inside, callers don't need to log again). On
+/// failure callers should delete any pre-existing sidecar so
+/// `head` / serving don't return stale `content_type` for the freshly
+/// committed bytes.
+async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) -> Result<(), ()> {
     use tokio::io::AsyncWriteExt as _;
 
     let path = meta_sidecar_path(blob_path);
@@ -610,7 +627,7 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
         Ok(b) => b,
         Err(err) => {
             tracing::warn!(error = %err, "failed to serialize blob metadata sidecar");
-            return;
+            return Err(());
         }
     };
 
@@ -628,18 +645,18 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
                 tmp = %tmp.display(),
                 "failed to create blob metadata sidecar temp file"
             );
-            return;
+            return Err(());
         }
     };
     if let Err(err) = file.write_all(&bytes).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         tracing::warn!(error = %err, "failed to write blob metadata sidecar bytes");
-        return;
+        return Err(());
     }
     if let Err(err) = file.flush().await {
         let _ = tokio::fs::remove_file(&tmp).await;
         tracing::warn!(error = %err, "failed to flush blob metadata sidecar");
-        return;
+        return Err(());
     }
     drop(file);
     if let Err(err) = atomic_replace(&tmp, &path).await {
@@ -647,8 +664,28 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
         tracing::warn!(
             error = %err,
             sidecar = %path.display(),
-            "failed to commit blob metadata sidecar; serving will default to octet-stream"
+            "failed to commit blob metadata sidecar"
         );
+        return Err(());
+    }
+    Ok(())
+}
+
+/// On a failed sidecar write, remove any pre-existing sidecar so a
+/// future `head`/serve request returns the `application/octet-stream`
+/// fallback rather than stale `content_type` from the previous put.
+/// The bytes are already committed; we'd rather serve "I don't know"
+/// than misrepresent the MIME.
+async fn drop_stale_sidecar(blob_path: &std::path::Path) {
+    let path = meta_sidecar_path(blob_path);
+    if let Err(err) = tokio::fs::remove_file(&path).await {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error = %err,
+                sidecar = %path.display(),
+                "failed to clear stale blob metadata sidecar after sidecar-write failure"
+            );
+        }
     }
 }
 
@@ -1158,6 +1195,29 @@ mod tests {
         assert_eq!(meta.content_type, "application/octet-stream");
         assert_eq!(meta.byte_size, 3);
         assert!(meta.etag.is_none());
+    }
+
+    #[tokio::test]
+    async fn drop_stale_sidecar_removes_existing_metadata() {
+        // The recovery path used by `put` / `put_stream` when a sidecar
+        // write fails after the bytes commit: we delete the old
+        // sidecar so future `head`/serve calls fall back to
+        // octet-stream rather than reporting stale MIME for the new
+        // bytes.
+        let dir = temp_root();
+        let blob = dir.path().join("victim.bin");
+        let sidecar = meta_sidecar_path(&blob);
+        tokio::fs::write(&sidecar, br#"{"content_type":"image/png"}"#)
+            .await
+            .unwrap();
+        assert!(sidecar.exists());
+
+        drop_stale_sidecar(&blob).await;
+        assert!(!sidecar.exists());
+
+        // Idempotent — calling again on a missing sidecar is a no-op,
+        // not an error.
+        drop_stale_sidecar(&blob).await;
     }
 
     #[tokio::test]
