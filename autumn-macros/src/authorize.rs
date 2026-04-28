@@ -121,29 +121,7 @@ fn expect_ident(expr: &Expr, hint: &str) -> syn::Result<Ident> {
     }
 }
 
-/// Return `true` when `func` already has a parameter bound to a
-/// pattern with the given identifier name. Used to detect cases
-/// like `#[secured]` having already injected `__autumn_session`,
-/// so `#[authorize]` doesn't double-inject and trigger a duplicate-
-/// parameter compile error.
-fn has_input_named(func: &ItemFn, name: &str) -> bool {
-    func.sig.inputs.iter().any(|arg| match arg {
-        syn::FnArg::Typed(pt) => pat_binds_name(&pt.pat, name),
-        syn::FnArg::Receiver(_) => false,
-    })
-}
-
-fn pat_binds_name(pat: &syn::Pat, name: &str) -> bool {
-    match pat {
-        syn::Pat::Ident(i) => i.ident == name,
-        // `State(__autumn_state)`: walk the inner pattern.
-        syn::Pat::TupleStruct(ts) => ts.elems.iter().any(|p| pat_binds_name(p, name)),
-        syn::Pat::Tuple(t) => t.elems.iter().any(|p| pat_binds_name(p, name)),
-        syn::Pat::Struct(s) => s.fields.iter().any(|fp| pat_binds_name(&fp.pat, name)),
-        syn::Pat::Reference(r) => pat_binds_name(&r.pat, name),
-        _ => false,
-    }
-}
+use crate::param_helpers::has_input_named;
 
 fn snake_case(name: &str) -> String {
     let mut out = String::new();

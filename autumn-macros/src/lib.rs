@@ -18,6 +18,7 @@ mod collect;
 mod main_macro;
 mod model;
 mod oauth2_callback;
+mod param_helpers;
 mod parse;
 mod repository;
 mod route;
