@@ -36,11 +36,11 @@ pub enum Transport {
 
 impl Transport {
     pub(crate) fn from_env_value(value: &str) -> Option<Self> {
-        match value {
-            "log" | "Log" => Some(Self::Log),
-            "file" | "File" => Some(Self::File),
-            "smtp" | "Smtp" => Some(Self::Smtp),
-            "disabled" | "Disabled" => Some(Self::Disabled),
+        match value.trim().to_ascii_lowercase().as_str() {
+            "log" => Some(Self::Log),
+            "file" => Some(Self::File),
+            "smtp" => Some(Self::Smtp),
+            "disabled" => Some(Self::Disabled),
             _ => None,
         }
     }
@@ -600,11 +600,17 @@ impl SmtpTransport {
             builder = builder.port(port);
         }
         if let Some(username) = config.username {
-            let password = config
-                .password_env
-                .as_deref()
-                .and_then(|key| std::env::var(key).ok())
-                .unwrap_or_default();
+            let password_env = config.password_env.ok_or_else(|| {
+                MailError::InvalidMessage(
+                    "mail.smtp.password_env is required when mail.smtp.username is set"
+                        .to_owned(),
+                )
+            })?;
+            let password = std::env::var(&password_env).map_err(|error| {
+                MailError::InvalidMessage(format!(
+                    "mail.smtp.password_env={password_env:?} could not be resolved: {error}"
+                ))
+            })?;
             builder = builder.credentials(Credentials::new(username, password));
         }
         Ok(Self {
@@ -774,6 +780,12 @@ mod tests {
     }
 
     #[test]
+    fn transport_env_value_is_trimmed_and_case_insensitive() {
+        assert_eq!(Transport::from_env_value(" SMTP "), Some(Transport::Smtp));
+        assert_eq!(Transport::from_env_value(" LoG "), Some(Transport::Log));
+    }
+
+    #[test]
     fn file_transport_filename_is_unique_for_same_recipient() {
         let mail = Mail::builder()
             .to("Ada Lovelace <ada@example.com>")
@@ -796,5 +808,42 @@ mod tests {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
         );
+    }
+
+    #[test]
+    fn smtp_transport_rejects_missing_password_env_when_username_is_set() {
+        let missing_key = format!(
+            "AUTUMN_TEST_MISSING_SMTP_PASSWORD_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let error = match SmtpTransport::new(SmtpConfig {
+            host: Some("smtp.example.com".to_owned()),
+            port: Some(587),
+            username: Some("mailer".to_owned()),
+            password_env: Some(missing_key.clone()),
+            tls: TlsMode::StartTls,
+        }) {
+            Ok(_) => panic!("missing password env should fail at startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains(&missing_key));
+    }
+
+    #[test]
+    fn smtp_transport_rejects_missing_password_env_key_when_username_is_set() {
+        let error = match SmtpTransport::new(SmtpConfig {
+            host: Some("smtp.example.com".to_owned()),
+            port: Some(587),
+            username: Some("mailer".to_owned()),
+            password_env: None,
+            tls: TlsMode::StartTls,
+        }) {
+            Ok(_) => panic!("missing password_env setting should fail at startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("mail.smtp.password_env"));
     }
 }
