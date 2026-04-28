@@ -87,6 +87,7 @@ mod tests {
             user_id: user_id.map(str::to_owned),
             roles: role.into_iter().map(str::to_owned).collect(),
             pool: None,
+            policy_registry: autumn_web::authorization::PolicyRegistry::default(),
         }
     }
 

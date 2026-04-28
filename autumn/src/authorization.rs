@@ -70,9 +70,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// Per-request context handed to every policy and scope check.
 ///
 /// Carries the resolved [`Session`], the authenticated user id (when
-/// present), the active role set, and a clone of the database pool
-/// so policies can consult related rows. The struct is `Clone +
-/// Send + Sync` so it can flow freely across `.await` points.
+/// present), the active role set, the [`PolicyRegistry`] (so
+/// `Post::scope(&ctx)` can resolve a registered scope without
+/// re-threading state), and a clone of the database pool so
+/// policies can consult related rows. `Clone + Send + Sync` — flows
+/// freely across `.await` points.
 #[derive(Clone)]
 pub struct PolicyContext {
     /// The full per-request [`Session`]. Read raw values via
@@ -95,14 +97,23 @@ pub struct PolicyContext {
     pub pool: Option<
         diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     >,
+
+    /// Registered [`Policy`] / [`Scope`] map, cloned from
+    /// `AppState`. Lets the [`Scoped`] blanket trait resolve a
+    /// registered scope from `&ctx` alone — the
+    /// `Post::scope(&ctx).load(&mut db).await?` ergonomic the
+    /// authorization guide documents.
+    pub policy_registry: PolicyRegistry,
 }
 
 impl PolicyContext {
-    /// Build a [`PolicyContext`] from request parts.
+    /// Build a [`PolicyContext`] from a session alone.
     ///
-    /// Reads the session keys named in the supplied
-    /// [`AuthConfig`](crate::auth::AuthConfig) (`session_key`,
-    /// default `"user_id"`) plus the conventional `"role"` key.
+    /// The resulting context has an empty [`PolicyRegistry`] and no
+    /// pool — sufficient for hand-rolled policy unit tests that
+    /// don't go through `AppState`. Production code paths construct
+    /// a [`PolicyContext`] via [`from_request`](Self::from_request)
+    /// instead.
     pub async fn from_session(session: &Session, auth_session_key: &str) -> Self {
         let user_id = session.get(auth_session_key).await;
         let role = session.get("role").await;
@@ -113,7 +124,26 @@ impl PolicyContext {
             roles,
             #[cfg(feature = "db")]
             pool: None,
+            policy_registry: PolicyRegistry::default(),
         }
+    }
+
+    /// Build a fully-populated [`PolicyContext`] from `AppState` +
+    /// `Session`. Used by the `#[authorize]` macro and
+    /// `#[repository(policy = ...)]`-generated handlers.
+    pub async fn from_request(
+        state: &crate::AppState,
+        session: &Session,
+    ) -> Self {
+        let mut ctx = Self::from_session(session, state.auth_session_key()).await;
+        ctx.policy_registry = state.policy_registry().clone();
+        #[cfg(feature = "db")]
+        {
+            if let Some(pool) = state.pool() {
+                ctx.pool = Some(pool.clone());
+            }
+        }
+        ctx
     }
 
     /// Returns `true` when the request has a resolved authenticated user.
@@ -251,15 +281,36 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
 /// current user is allowed to read.
 ///
 /// Default implementations return an **empty** list — fail closed.
-/// `#[repository(policy = ...)]`-generated `GET /<api>` index
+/// `#[repository(scope = ...)]`-generated `GET /<api>` index
 /// endpoints invoke the registered scope automatically; hand-
-/// written list handlers can pull `Arc<dyn Scope<R>>` from
-/// `AppState` and call `.list(&ctx).await`.
+/// written list handlers can use the [`Scoped`] blanket trait to
+/// invoke `Post::scope(&ctx).load(&mut db).await?`.
+///
+/// The `db` feature gates the connection parameter — without it,
+/// the trait still exists but `list` takes no connection (use
+/// `ctx.pool` to acquire one if needed).
+#[cfg(feature = "db")]
 pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     /// Return the records the current user is allowed to read.
     ///
     /// The default impl returns `Ok(Vec::new())` so a missing
-    /// scope opt-in fails closed.
+    /// scope opt-in fails closed. Implementations typically run a
+    /// Diesel query through `conn`, applying whatever filters the
+    /// active `ctx.user_id` / `ctx.roles` warrant.
+    fn list<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _conn: &'a mut diesel_async::AsyncPgConnection,
+    ) -> BoxFuture<'a, crate::AutumnResult<Vec<R>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// `Scope` companion that compiles when the `db` feature is off.
+/// The `db`-gated form takes `&mut AsyncPgConnection`; this one
+/// has no connection arg.
+#[cfg(not(feature = "db"))]
+pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
     fn list<'a>(
         &'a self,
         _ctx: &'a PolicyContext,
@@ -267,6 +318,88 @@ pub trait Scope<R: Send + Sync + 'static>: Send + Sync + 'static {
         Box::pin(async { Ok(Vec::new()) })
     }
 }
+
+// ── `Post::scope(&ctx).load(&mut db).await?` ergonomics ─────────
+
+/// Deferred query handle returned by [`Scoped::scope`].
+///
+/// Holds a borrow on the [`PolicyContext`] so the registered
+/// [`Scope`] for `R` can be resolved at `.load()` time. The
+/// pattern mirrors Pundit's `policy_scope(Post)` and Phoenix's
+/// `Bodyguard.scope/4`: a query you can run when the connection
+/// is available.
+pub struct ScopeQuery<'a, R: Send + Sync + 'static> {
+    ctx: &'a PolicyContext,
+    _marker: std::marker::PhantomData<fn() -> R>,
+}
+
+#[cfg(feature = "db")]
+impl<'a, R: Send + Sync + 'static> ScopeQuery<'a, R> {
+    /// Load the records the current user is allowed to read.
+    ///
+    /// Resolves the [`Scope`] registered on the app's
+    /// [`PolicyRegistry`] (carried in [`PolicyContext`]) and runs
+    /// its `list` method against `conn`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `500` when no scope is registered for `R`; the
+    /// scope's own errors otherwise.
+    pub async fn load(
+        self,
+        conn: &mut diesel_async::AsyncPgConnection,
+    ) -> crate::AutumnResult<Vec<R>> {
+        let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
+            crate::AutumnError::from(std::io::Error::other(format!(
+                "no scope registered for resource type {}",
+                std::any::type_name::<R>()
+            )))
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+        scope.list(self.ctx, conn).await
+    }
+}
+
+#[cfg(not(feature = "db"))]
+impl<'a, R: Send + Sync + 'static> ScopeQuery<'a, R> {
+    pub async fn load(self) -> crate::AutumnResult<Vec<R>> {
+        let scope = self.ctx.policy_registry.scope::<R>().ok_or_else(|| {
+            crate::AutumnError::from(std::io::Error::other(format!(
+                "no scope registered for resource type {}",
+                std::any::type_name::<R>()
+            )))
+            .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+        scope.list(self.ctx).await
+    }
+}
+
+/// Blanket trait that adds `T::scope(&ctx)` to every type, so
+/// hand-written list handlers can mirror the
+/// `#[repository(scope = ...)]`-generated path:
+///
+/// ```rust,ignore
+/// use autumn_web::authorization::Scoped;
+///
+/// let posts = Post::scope(&ctx).load(&mut db).await?;
+/// ```
+///
+/// Auto-implemented for every `Send + Sync + 'static` type. Bring
+/// the trait into scope with `use autumn_web::authorization::Scoped;`
+/// (or via `autumn_web::prelude::*`) to use the syntax.
+pub trait Scoped: Send + Sync + Sized + 'static {
+    /// Open a deferred [`ScopeQuery`] for this type. Resolves the
+    /// registered scope at `.load()` time, not here.
+    #[must_use]
+    fn scope<'a>(ctx: &'a PolicyContext) -> ScopeQuery<'a, Self> {
+        ScopeQuery {
+            ctx,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Send + Sync + 'static> Scoped for T {}
 
 // ── PolicyRegistry ──────────────────────────────────────────────
 
@@ -514,8 +647,7 @@ pub async fn authorize<R>(
 where
     R: Send + Sync + 'static,
 {
-    let registry = state.policy_registry();
-    let policy = registry.policy::<R>().ok_or_else(|| {
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
         crate::AutumnError::from(std::io::Error::other(format!(
             "no policy registered for resource type {}",
             std::any::type_name::<R>()
@@ -523,14 +655,7 @@ where
         .with_status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
 
-    let auth_key = state.auth_session_key();
-    let mut ctx = PolicyContext::from_session(session, auth_key).await;
-    #[cfg(feature = "db")]
-    {
-        if let Some(pool) = state.pool() {
-            ctx.pool = Some(pool.clone());
-        }
-    }
+    let ctx = PolicyContext::from_request(state, session).await;
 
     if policy.can(action, &ctx, resource).await {
         Ok(())
@@ -602,6 +727,7 @@ mod tests {
             roles: role.into_iter().map(str::to_owned).collect(),
             #[cfg(feature = "db")]
             pool: None,
+            policy_registry: PolicyRegistry::default(),
         }
     }
 

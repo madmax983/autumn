@@ -11,13 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **authorization:** First-class record-level authorization — `Policy` /
   `Scope` traits, `PolicyContext` carrying the resolved `Session` /
-  user / role set / `Db` handle, an `#[authorize("action", resource = Type)]`
-  attribute macro that resolves the registered policy and short-circuits
-  with the configured deny response before the handler body runs, a
-  `policy = SomePolicy` argument on `#[repository(api = "...")]` that
-  wires the same checks into every auto-generated POST/PATCH/PUT/DELETE
-  endpoint plus `GET /<api>/{id}` for read scoping, a `scope = SomeScope`
-  companion that constrains list endpoints, and a `[security]
+  user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
+  resource = Type)]` attribute macro that resolves the registered policy
+  and short-circuits with the configured deny response before the
+  handler body runs, a `policy = SomePolicy` argument on
+  `#[repository(api = "...")]` that wires the same checks into every
+  auto-generated POST/PUT/DELETE endpoint plus `GET /<api>/{id}` for
+  read scoping, a `scope = SomeScope` companion that constrains list
+  endpoints, a `Scoped` blanket trait that adds
+  `Post::scope(&ctx).load(&mut db).await?` ergonomics to every type
+  (mirroring Pundit's `policy_scope`), and a `[security]
   forbidden_response = "404" | "403"` knob (default `"404"` to mirror
   Rails / Phoenix and avoid leaking record existence). Register on the
   app builder via `.policy::<R, _>(...)` / `.scope::<R, _>(...)`.

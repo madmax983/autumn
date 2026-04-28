@@ -95,7 +95,7 @@ pub use crate::session::Session;
 // ── Authorization ────────────────────────────────────────────────
 /// Record-level authorization primitives. See
 /// [`crate::authorization`] for the full surface.
-pub use crate::authorization::{Policy, PolicyContext, Scope};
+pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped};
 
 // ── Security ───────────────────────────────────────────────────
 /// CSRF token extractor for embedding in forms.

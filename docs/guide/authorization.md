@@ -84,19 +84,30 @@ closed.
 
 ```rust,ignore
 use autumn_web::authorization::{BoxFuture, PolicyContext, Scope};
+use autumn_web::reexports::diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel::prelude::*;
 
 #[derive(Default)]
 pub struct PostScope;
 
 impl Scope<Post> for PostScope {
-    fn list<'a>(&'a self, ctx: &'a PolicyContext)
-        -> BoxFuture<'a, autumn_web::AutumnResult<Vec<Post>>>
-    {
+    fn list<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        conn: &'a mut AsyncPgConnection,
+    ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<Post>>> {
         Box::pin(async move {
-            // Load via Db / repository, filtered by the user's id.
-            let pool = ctx.pool.as_ref().expect("scope needs a pool");
-            // ... your query here ...
-            Ok(Vec::new())
+            if ctx.has_role("admin") {
+                posts::table.load(conn).await.map_err(Into::into)
+            } else if let Some(uid) = ctx.user_id_i64() {
+                posts::table
+                    .filter(posts::author_id.eq(uid))
+                    .load(conn)
+                    .await
+                    .map_err(Into::into)
+            } else {
+                Ok(Vec::new()) // anon -> empty
+            }
         })
     }
 }
@@ -105,6 +116,32 @@ impl Scope<Post> for PostScope {
 Register alongside the policy: `.scope::<Post, _>(PostScope)`. When a
 `#[repository(api = "/posts", scope = PostScope)]` repository is mounted,
 its `GET /posts` endpoint invokes the registered scope automatically.
+
+### `Post::scope(&ctx).load(&mut db).await?` in hand-written handlers
+
+The `Scoped` blanket trait adds a `T::scope(&ctx)` method to every
+type, mirroring Pundit's `policy_scope(Post)` and Phoenix
+Bodyguard's `Bodyguard.scope/4`:
+
+```rust,ignore
+use autumn_web::prelude::*;
+use autumn_web::authorization::{PolicyContext, Scoped};
+
+#[get("/posts/mine")]
+async fn list_my_posts(
+    State(state): State<AppState>,
+    session: Session,
+    mut db: Db,
+) -> AutumnResult<Json<Vec<Post>>> {
+    let ctx = PolicyContext::from_request(&state, &session).await;
+    let posts = Post::scope(&ctx).load(&mut *db).await?;
+    Ok(Json(posts))
+}
+```
+
+The same `PostScope` impl backs both the auto-generated
+`#[repository(scope = PostScope)]` index endpoint and the hand-written
+list above — one filter, two call sites.
 
 ## The `#[authorize]` attribute macro
 

@@ -558,11 +558,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg(
                         "missing scope registration"
                     ))?;
-                let __ctx = ::autumn_web::authorization::PolicyContext::from_session(
+                let __ctx = ::autumn_web::authorization::PolicyContext::from_request(
+                    &__autumn_state,
                     &__autumn_session,
-                    __autumn_state.auth_session_key(),
                 ).await;
-                let records = __scope.list(&__ctx).await?;
+                let mut __conn = repo.__autumn_acquire_conn().await?;
+                let records = __scope.list(&__ctx, &mut __conn).await?;
                 Ok(::autumn_web::prelude::Json(records))
             }
         } else {
@@ -878,6 +879,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #(#derived_impl_methods)*
+        }
+
+        impl #pg_name {
+            /// Acquire a database connection from the repository's
+            /// pool. Used by `#[repository(scope = ...)]`-generated
+            /// list endpoints; not part of the public surface.
+            #[doc(hidden)]
+            pub async fn __autumn_acquire_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            > {
+                self.pool.get().await.map_err(::autumn_web::AutumnError::from)
+            }
         }
 
         // Extractor: pull pool from AppState (same pattern as Db extractor)
