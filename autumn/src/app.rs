@@ -3605,4 +3605,65 @@ mod tests {
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("test error"));
     }
+
+    #[cfg(feature = "storage")]
+    mod storage_preflight {
+        use super::super::{StorageBootstrap, preflight_storage};
+        use crate::AppState;
+        use crate::config::AutumnConfig;
+        use crate::storage::{BlobStoreState, StorageBackend, StorageConfig, StorageLocalConfig};
+
+        fn config_with_storage(storage: StorageConfig) -> AutumnConfig {
+            AutumnConfig {
+                profile: Some("dev".into()),
+                storage,
+                ..AutumnConfig::default()
+            }
+        }
+
+        #[test]
+        fn preflight_returns_none_when_disabled() {
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Disabled,
+                ..StorageConfig::default()
+            });
+            assert!(preflight_storage(&cfg).is_none());
+        }
+
+        #[test]
+        fn preflight_provisions_local_backend_against_tempdir() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap = preflight_storage(&cfg).expect("local backend should provision");
+            assert_eq!(bootstrap.store.provider_id(), "default");
+            assert!(bootstrap.serving.is_some(), "local backend mounts a route");
+        }
+
+        #[tokio::test]
+        async fn install_registers_blob_store_on_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap: StorageBootstrap = preflight_storage(&cfg).unwrap();
+
+            let state = AppState::for_test();
+            assert!(state.extension::<BlobStoreState>().is_none());
+            let serving = bootstrap.install(&state);
+            assert!(serving.is_some());
+            assert!(state.extension::<BlobStoreState>().is_some());
+        }
+    }
 }

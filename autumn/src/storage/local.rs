@@ -1086,6 +1086,41 @@ mod tests {
         assert!(meta.etag.is_none());
     }
 
+    #[tokio::test]
+    async fn read_meta_sidecar_handles_missing_and_malformed() {
+        let dir = temp_root();
+        // Missing sidecar → None (file at the blob path doesn't matter
+        // for this helper; we're only testing sidecar read behavior).
+        let blob_path = dir.path().join("absent.bin");
+        assert!(read_meta_sidecar(&blob_path).await.is_none());
+
+        // Malformed JSON in the sidecar → None (graceful degradation;
+        // the serving route falls back to octet-stream).
+        let blob_path = dir.path().join("malformed.bin");
+        tokio::fs::write(meta_sidecar_path(&blob_path), b"not json")
+            .await
+            .unwrap();
+        assert!(read_meta_sidecar(&blob_path).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_with_meta_returns_bytes_plus_sidecar_metadata() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        s.put(
+            "doc.pdf",
+            "application/pdf",
+            Bytes::from_static(b"%PDF-1.4"),
+        )
+        .await
+        .unwrap();
+        let (bytes, meta) = s.get_with_meta("doc.pdf").await.unwrap();
+        assert_eq!(&bytes[..], b"%PDF-1.4");
+        let m = meta.expect("sidecar should be present");
+        assert_eq!(m.content_type, "application/pdf");
+        assert!(m.etag.is_some());
+    }
+
     /// Simulates the Windows fallback's "second rename fails" branch
     /// directly (POSIX `rename` always replaces, so the production
     /// path on Linux never enters the `AlreadyExists` arm). The
