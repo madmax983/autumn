@@ -378,15 +378,22 @@ impl BlobStore for LocalBlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             let path = self.safe_path_for_key(key).await?;
-            // Clean up the metadata sidecar too. Best-effort: a stray
-            // sidecar without bytes is harmless (it just gets ignored
-            // on the next put or get).
-            let _ = tokio::fs::remove_file(meta_sidecar_path(&path)).await;
+            // Delete the blob bytes first, then the sidecar. If the
+            // blob delete fails (permissions, transient I/O, …) the
+            // sidecar stays in place, so a failed delete is
+            // side-effect-free as far as `head`/serve are concerned.
+            // If the blob delete succeeds but the sidecar delete fails,
+            // the orphan sidecar is harmless: a future `head` on the
+            // (now-missing) key returns `None` from the metadata-stat
+            // call before the sidecar is even read, and a future `put`
+            // overwrites the sidecar atomically.
             match tokio::fs::remove_file(&path).await {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(BlobStoreError::io(err)),
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(BlobStoreError::io(err)),
             }
+            let _ = tokio::fs::remove_file(meta_sidecar_path(&path)).await;
+            Ok(())
         })
     }
 
@@ -1182,6 +1189,43 @@ mod tests {
 
         s.delete("k.png").await.unwrap();
         assert!(!meta_sidecar_path(&resolved).exists());
+    }
+
+    /// When the blob removal fails, the sidecar must stay in place so
+    /// the failed delete is side-effect-free as far as `head` / serve
+    /// are concerned. Force the failure by making the blob path itself
+    /// a directory (POSIX `unlink` errors on directories with
+    /// `IsADirectory` / `EISDIR`); permissions-based forcings don't
+    /// work uniformly when tests run as root.
+    #[tokio::test]
+    async fn delete_keeps_sidecar_when_blob_remove_fails() {
+        let dir = temp_root();
+        let s = store(dir.path());
+
+        // Put `pinned.bin` as a *directory* so `remove_file` errors,
+        // and pre-stage a sidecar so we can verify it survives.
+        let blob_path = dir.path().join("pinned.bin");
+        tokio::fs::create_dir(&blob_path).await.unwrap();
+        let sidecar = meta_sidecar_path(&blob_path);
+        tokio::fs::write(&sidecar, br#"{"content_type":"image/png"}"#)
+            .await
+            .unwrap();
+        assert!(blob_path.is_dir());
+        assert!(sidecar.is_file());
+
+        let result = s.delete("pinned.bin").await;
+        assert!(
+            result.is_err(),
+            "expected error: blob path is a directory, remove_file should fail"
+        );
+        // The new ordering propagates the blob-delete error before
+        // touching the sidecar, so the sidecar stays behind.
+        assert!(
+            sidecar.exists(),
+            "sidecar must survive a failed blob delete"
+        );
+        // And the (directory) blob is also still there.
+        assert!(blob_path.is_dir());
     }
 
     #[tokio::test]
