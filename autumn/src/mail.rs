@@ -155,7 +155,9 @@ impl MailConfig {
             ));
         }
 
-        if self.transport == Transport::Smtp && self.smtp.host.as_deref().unwrap_or("").is_empty() {
+        if self.transport == Transport::Smtp
+            && self.smtp.host.as_deref().map_or("", str::trim).is_empty()
+        {
             return Err(crate::config::ConfigError::Validation(
                 "mail.smtp.host is required when mail.transport = \"smtp\"".to_owned(),
             ));
@@ -797,6 +799,24 @@ mod tests {
     #[test]
     fn transport_default_is_disabled() {
         assert_eq!(Transport::default(), Transport::Disabled);
+    }
+
+    #[test]
+    fn smtp_config_validation_rejects_whitespace_only_host() {
+        let config = MailConfig {
+            transport: Transport::Smtp,
+            smtp: SmtpConfig {
+                host: Some("   ".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = config
+            .validate(Some("dev"))
+            .expect_err("whitespace SMTP host should be rejected");
+
+        assert!(error.to_string().contains("mail.smtp.host is required"));
     }
 
     #[test]

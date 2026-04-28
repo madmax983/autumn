@@ -19,11 +19,25 @@ fn returns_mail(method: &ImplItemFn) -> bool {
     let Type::Path(type_path) = ty.as_ref() else {
         return false;
     };
-    type_path
+    if type_path.qself.is_some() {
+        return false;
+    }
+
+    let segments = type_path
         .path
         .segments
-        .last()
-        .is_some_and(|segment| segment.ident == "Mail")
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>();
+
+    match segments.as_slice() {
+        [mail] => mail == "Mail",
+        [autumn_web, mail] => autumn_web == "autumn_web" && mail == "Mail",
+        [autumn_web, module, mail] => {
+            autumn_web == "autumn_web" && module == "mail" && mail == "Mail"
+        }
+        _ => false,
+    }
 }
 
 fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
@@ -279,6 +293,40 @@ mod tests {
         let rendered = out.to_string();
         assert!(!rendered.contains("send_helper"));
         assert!(!rendered.contains("deliver_later_helper"));
+    }
+
+    #[test]
+    fn skips_foreign_mail_returning_methods() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn helper(&self) -> other_crate::Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(!rendered.contains("send_helper"));
+        assert!(!rendered.contains("deliver_later_helper"));
+    }
+
+    #[test]
+    fn supports_fully_qualified_autumn_mail_return_type() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn reset(&self, to: String) -> autumn_web::mail::Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("send_reset"));
+        assert!(rendered.contains("deliver_later_reset"));
     }
 
     #[test]
