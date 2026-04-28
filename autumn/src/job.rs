@@ -33,6 +33,7 @@ pub struct JobClient {
     registry: crate::actuator::JobRegistry,
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
+    per_job_defaults: HashMap<String, (u32, u64)>,
 }
 
 #[derive(Debug)]
@@ -54,15 +55,23 @@ struct DurableQueuedJob {
     initial_backoff_ms: u64,
 }
 
-static GLOBAL_JOB_CLIENT: OnceLock<JobClient> = OnceLock::new();
+static GLOBAL_JOB_CLIENT: OnceLock<RwLock<JobClient>> = OnceLock::new();
 
 #[must_use]
 pub fn global_job_client() -> Option<JobClient> {
-    GLOBAL_JOB_CLIENT.get().cloned()
+    GLOBAL_JOB_CLIENT
+        .get()
+        .and_then(|lock| lock.read().ok().map(|guard| guard.clone()))
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
-    let _ = GLOBAL_JOB_CLIENT.set(client);
+    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = client;
+        }
+        return;
+    }
+    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(client));
 }
 
 /// Enqueue a job payload on the configured runtime backend.
@@ -88,6 +97,11 @@ impl JobClient {
     /// Returns an internal error when enqueueing fails in the active backend.
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
         self.registry.record_enqueue(name);
+        let (job_max_attempts, job_backoff_ms) = self
+            .per_job_defaults
+            .get(name)
+            .copied()
+            .unwrap_or((self.default_max_attempts, self.default_initial_backoff_ms));
 
         if let Some(sender) = &self.local_sender {
             sender
@@ -95,8 +109,8 @@ impl JobClient {
                     name: name.to_string(),
                     payload,
                     attempt: 1,
-                    max_attempts: self.default_max_attempts,
-                    initial_backoff_ms: self.default_initial_backoff_ms,
+                    max_attempts: job_max_attempts,
+                    initial_backoff_ms: job_backoff_ms,
                 })
                 .await
                 .map_err(|e| {
@@ -109,12 +123,7 @@ impl JobClient {
             {
                 if let Some(redis) = &self.redis {
                     return redis
-                        .enqueue(
-                            name,
-                            payload,
-                            self.default_max_attempts,
-                            self.default_initial_backoff_ms,
-                        )
+                        .enqueue(name, payload, job_max_attempts, job_backoff_ms)
                         .await;
                 }
             }
@@ -131,6 +140,10 @@ pub(crate) fn start_runtime(
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
 ) {
+    validate_unique_job_names(&jobs).unwrap_or_else(|error| {
+        panic!("invalid jobs configuration: {error}");
+    });
+
     match config.backend.as_str() {
         "local" => start_local_runtime(
             jobs,
@@ -194,6 +207,7 @@ pub(crate) fn start_local_runtime(
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
 ) {
+    let per_job_defaults = build_per_job_defaults(&jobs);
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
     ));
@@ -216,6 +230,7 @@ pub(crate) fn start_local_runtime(
         registry: state.job_registry.clone(),
         default_max_attempts,
         default_initial_backoff_ms,
+        per_job_defaults,
     };
     init_global_job_client(client);
 
@@ -388,6 +403,7 @@ fn start_redis_runtime(
     let queue_key = format!("{}:queue", config.redis.key_prefix);
     let dead_key = format!("{}:dead", config.redis.key_prefix);
 
+    let per_job_defaults = build_per_job_defaults(&jobs);
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
     ));
@@ -408,6 +424,7 @@ fn start_redis_runtime(
         registry: state.job_registry.clone(),
         default_max_attempts: config.max_attempts,
         default_initial_backoff_ms: config.initial_backoff_ms,
+        per_job_defaults,
     });
 
     let worker_count = config.workers.max(1);
@@ -523,6 +540,22 @@ fn start_redis_runtime(
         });
     }
 
+    Ok(())
+}
+
+fn build_per_job_defaults(jobs: &[JobInfo]) -> HashMap<String, (u32, u64)> {
+    jobs.iter()
+        .map(|job| (job.name.clone(), (job.max_attempts, job.initial_backoff_ms)))
+        .collect()
+}
+
+fn validate_unique_job_names(jobs: &[JobInfo]) -> Result<(), String> {
+    let mut names = std::collections::HashSet::new();
+    for job in jobs {
+        if !names.insert(job.name.clone()) {
+            return Err(format!("duplicate job name '{}'", job.name));
+        }
+    }
     Ok(())
 }
 
