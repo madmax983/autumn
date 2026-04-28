@@ -1142,6 +1142,87 @@ impl AutumnConfig {
         );
     }
 
+    #[cfg(feature = "storage")]
+    fn apply_storage_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_STORAGE__BACKEND") {
+            match crate::storage::StorageBackend::from_env_value(&val) {
+                Some(backend) => self.storage.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_STORAGE__BACKEND={val:?} is not valid \
+                     (expected disabled, local, or s3), ignoring"
+                ),
+            }
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__DEFAULT_PROVIDER",
+            &mut self.storage.default_provider,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION",
+            &mut self.storage.allow_local_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_STORAGE__LOCAL__ROOT") {
+            self.storage.local.root = PathBuf::from(val);
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__MOUNT_PATH",
+            &mut self.storage.local.mount_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.local.default_url_expiry_secs,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__SIGNING_KEY",
+            &mut self.storage.local.signing_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__BUCKET",
+            &mut self.storage.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__REGION",
+            &mut self.storage.s3.region,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ENDPOINT",
+            &mut self.storage.s3.endpoint,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
+            &mut self.storage.s3.public_base_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV",
+            &mut self.storage.s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
+            &mut self.storage.s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__S3__FORCE_PATH_STYLE",
+            &mut self.storage.s3.force_path_style,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.s3.default_url_expiry_secs,
+        );
+    }
+
     #[cfg(feature = "mail")]
     fn apply_mail_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_MAIL__TRANSPORT") {
@@ -2264,6 +2345,64 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn env_override_storage_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_STORAGE__BACKEND", "s3")
+            .with("AUTUMN_STORAGE__DEFAULT_PROVIDER", "media")
+            .with("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION", "true")
+            .with("AUTUMN_STORAGE__LOCAL__ROOT", "var/blobs")
+            .with("AUTUMN_STORAGE__LOCAL__MOUNT_PATH", "/files")
+            .with("AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS", "42")
+            .with("AUTUMN_STORAGE__LOCAL__SIGNING_KEY", "secret")
+            .with("AUTUMN_STORAGE__S3__BUCKET", "uploads")
+            .with("AUTUMN_STORAGE__S3__REGION", "us-east-1")
+            .with("AUTUMN_STORAGE__S3__ENDPOINT", "https://s3.example.test")
+            .with(
+                "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
+                "https://cdn.example.test",
+            )
+            .with("AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV", "AWS_ACCESS_KEY_ID")
+            .with(
+                "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
+                "AWS_SECRET_ACCESS_KEY",
+            )
+            .with("AUTUMN_STORAGE__S3__FORCE_PATH_STYLE", "true")
+            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.storage.backend, crate::storage::StorageBackend::S3);
+        assert_eq!(config.storage.default_provider, "media");
+        assert!(config.storage.allow_local_in_production);
+        assert_eq!(config.storage.local.root, PathBuf::from("var/blobs"));
+        assert_eq!(config.storage.local.mount_path, "/files");
+        assert_eq!(config.storage.local.default_url_expiry_secs, 42);
+        assert_eq!(config.storage.local.signing_key.as_deref(), Some("secret"));
+        assert_eq!(config.storage.s3.bucket.as_deref(), Some("uploads"));
+        assert_eq!(config.storage.s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            config.storage.s3.endpoint.as_deref(),
+            Some("https://s3.example.test")
+        );
+        assert_eq!(
+            config.storage.s3.public_base_url.as_deref(),
+            Some("https://cdn.example.test")
+        );
+        assert_eq!(
+            config.storage.s3.access_key_id_env.as_deref(),
+            Some("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            config.storage.s3.secret_access_key_env.as_deref(),
+            Some("AWS_SECRET_ACCESS_KEY")
+        );
+        assert!(config.storage.s3.force_path_style);
+        assert_eq!(config.storage.s3.default_url_expiry_secs, 99);
     }
 
     #[test]

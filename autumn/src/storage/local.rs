@@ -685,14 +685,14 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
 /// than misrepresent the MIME.
 async fn drop_stale_sidecar(blob_path: &std::path::Path) {
     let path = meta_sidecar_path(blob_path);
-    if let Err(err) = tokio::fs::remove_file(&path).await {
-        if err.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(
-                error = %err,
-                sidecar = %path.display(),
-                "failed to clear stale blob metadata sidecar after sidecar-write failure"
-            );
-        }
+    if let Err(err) = tokio::fs::remove_file(&path).await
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            error = %err,
+            sidecar = %path.display(),
+            "failed to clear stale blob metadata sidecar after sidecar-write failure"
+        );
     }
 }
 
