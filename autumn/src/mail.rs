@@ -61,10 +61,10 @@ pub enum TlsMode {
 
 impl TlsMode {
     pub(crate) fn from_env_value(value: &str) -> Option<Self> {
-        match value {
-            "disabled" | "Disabled" => Some(Self::Disabled),
-            "starttls" | "start_tls" | "StartTls" => Some(Self::StartTls),
-            "tls" | "Tls" => Some(Self::Tls),
+        match value.trim().to_ascii_lowercase().as_str() {
+            "disabled" => Some(Self::Disabled),
+            "starttls" | "start_tls" => Some(Self::StartTls),
+            "tls" => Some(Self::Tls),
             _ => None,
         }
     }
@@ -783,6 +783,19 @@ mod tests {
     fn transport_env_value_is_trimmed_and_case_insensitive() {
         assert_eq!(Transport::from_env_value(" SMTP "), Some(Transport::Smtp));
         assert_eq!(Transport::from_env_value(" LoG "), Some(Transport::Log));
+    }
+
+    #[test]
+    fn tls_mode_env_value_is_trimmed_and_case_insensitive() {
+        assert_eq!(TlsMode::from_env_value(" TLS "), Some(TlsMode::Tls));
+        assert_eq!(
+            TlsMode::from_env_value(" START_TLS "),
+            Some(TlsMode::StartTls)
+        );
+        assert_eq!(
+            TlsMode::from_env_value(" disabled "),
+            Some(TlsMode::Disabled)
+        );
     }
 
     #[test]

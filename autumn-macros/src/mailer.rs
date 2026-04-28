@@ -8,6 +8,7 @@ struct MailMethod {
     method: syn::Ident,
     send_method: syn::Ident,
     later_method: syn::Ident,
+    generics: syn::Generics,
     args: Vec<(syn::Ident, Type)>,
 }
 
@@ -46,6 +47,7 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
         method: method_name.clone(),
         send_method: format_ident!("send_{method_name}"),
         later_method: format_ident!("deliver_later_{method_name}"),
+        generics: method.sig.generics.clone(),
         args,
     }))
 }
@@ -74,25 +76,36 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let original = &method.method;
         let send_method = &method.send_method;
         let later_method = &method.later_method;
+        let method_generic_params = &method.generics.params;
+        let method_generic_args = if method_generic_params.is_empty() {
+            quote! {}
+        } else {
+            quote! { <#method_generic_params> }
+        };
+        let method_where_clause = &method.generics.where_clause;
         let arg_defs = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
         let arg_defs_later = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
         let arg_names = method.args.iter().map(|(name, _)| quote! { #name });
         let arg_names_later = method.args.iter().map(|(name, _)| quote! { #name });
         quote! {
-            pub async fn #send_method(
+            pub async fn #send_method #method_generic_args (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
                 #( #arg_defs, )*
-            ) -> ::autumn_web::AutumnResult<()> {
+            ) -> ::autumn_web::AutumnResult<()>
+            #method_where_clause
+            {
                 let mail = self.#original( #( #arg_names, )* );
                 mailer.send(mail).await.map_err(::autumn_web::AutumnError::internal_server_error)
             }
 
-            pub fn #later_method(
+            pub fn #later_method #method_generic_args (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
                 #( #arg_defs_later, )*
-            ) {
+            )
+            #method_where_clause
+            {
                 let mail = self.#original( #( #arg_names_later, )* );
                 mailer.deliver_later(mail);
             }
@@ -148,5 +161,26 @@ mod tests {
         let rendered = out.to_string();
         assert!(rendered.contains("impl < T > AccountMailer < T > where T : Clone"));
         assert!(rendered.contains("send_reset"));
+    }
+
+    #[test]
+    fn preserves_method_generics_and_where_clause() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn welcome<T>(&self, to: T) -> Mail
+                    where
+                        T: std::fmt::Display,
+                    {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("pub async fn send_welcome < T >"));
+        assert!(rendered.contains("where T : std :: fmt :: Display"));
+        assert!(rendered.contains("pub fn deliver_later_welcome < T >"));
     }
 }
