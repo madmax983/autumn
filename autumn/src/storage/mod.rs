@@ -344,6 +344,24 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             ));
         }
     }
+    // Case-insensitive filesystems (Windows NTFS default, macOS APFS
+    // default) collapse `Avatars/Me.png` and `avatars/me.png` to the
+    // same on-disk file, so two distinct logical keys would silently
+    // overwrite each other on the local backend while staying
+    // distinct in the app's data layer (different HMAC signatures,
+    // different DB rows). S3 keeps them distinct, so an app that
+    // works on local would also break on a backend swap. Reject
+    // uppercase ASCII letters in keys — lowercase ASCII is the
+    // portable subset that behaves identically on every backend +
+    // every filesystem. Apps that need case preservation should
+    // encode it (e.g. base64) before passing to the store.
+    if key.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(BlobStoreError::InvalidInput(
+            "blob keys must be lowercase ASCII (uppercase letters alias on case-insensitive \
+             filesystems and break portability between local and S3)"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -478,6 +496,27 @@ mod tests {
         // rejected (the suffix is ASCII).
         let err = validate_key("résumé.meta").unwrap_err();
         assert!(matches!(err, BlobStoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn validate_key_rejects_uppercase_ascii() {
+        // Case-insensitive filesystems (NTFS, APFS) would alias these
+        // with their lowercase counterparts on the local backend
+        // while staying distinct in app data. Reject up-front so the
+        // portable subset (lowercase ASCII) is the only valid form.
+        for k in ["Foo.png", "AVATARS/me.png", "aBc", "x/Y/z"] {
+            let err = validate_key(k).unwrap_err();
+            assert!(
+                matches!(err, BlobStoreError::InvalidInput(_)),
+                "key {k:?} should be rejected for uppercase ASCII"
+            );
+        }
+        // Lowercase ASCII + non-ASCII characters stay valid; the
+        // restriction is specifically about ASCII case-folding.
+        for k in ["foo.png", "avatars/me.png", "résumé.png", "東京/photo.jpg"] {
+            validate_key(k)
+                .unwrap_or_else(|err| panic!("key {k:?} should be accepted, got {err:?}"));
+        }
     }
 
     #[test]
