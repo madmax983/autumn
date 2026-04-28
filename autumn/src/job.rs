@@ -512,6 +512,17 @@ fn start_redis_runtime(
                 } else {
                     default_backoff
                 };
+                if parsed.attempt == 0 {
+                    state.job_registry.record_failure(
+                        &parsed.name,
+                        "invalid job payload: attempt must be >= 1".to_owned(),
+                        true,
+                    );
+                    if let Ok(encoded) = serde_json::to_string(&parsed) {
+                        let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
+                    }
+                    continue;
+                }
 
                 match (handler)(state.clone(), parsed.payload.clone()).await {
                     Ok(()) => state.job_registry.record_success(&parsed.name),
@@ -522,8 +533,8 @@ fn start_redis_runtime(
                                 &error.to_string(),
                                 parsed.attempt,
                             );
-                            let delay =
-                                backoff_ms.saturating_mul(2_u64.saturating_pow(parsed.attempt - 1));
+                            let exponent = parsed.attempt.saturating_sub(1);
+                            let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(exponent));
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             let retry = DurableQueuedJob {
                                 name: parsed.name,
