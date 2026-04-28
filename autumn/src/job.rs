@@ -574,6 +574,19 @@ fn validate_unique_job_names(jobs: &[JobInfo]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+
+    fn always_fail_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            Err(AutumnError::internal_server_error(std::io::Error::other(
+                "forced failure",
+            )))
+        })
+    }
 
     #[tokio::test]
     async fn local_enqueue_p99_is_under_5ms() {
@@ -605,5 +618,97 @@ mod tests {
             p99 < std::time::Duration::from_millis(5),
             "expected p99 enqueue latency < 5ms, got {p99:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn local_retry_records_enqueue_before_requeue() {
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("flaky");
+        state.job_registry().record_enqueue("flaky");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "flaky".to_string(),
+            JobInfo {
+                name: "flaky".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+                handler: always_fail_handler,
+            },
+        );
+        let jobs_by_name = Arc::new(RwLock::new(jobs));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        execute_local_job(
+            QueuedJob {
+                name: "flaky".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 2,
+                initial_backoff_ms: 1,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+        )
+        .await;
+
+        let retried = timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("retry should be scheduled")
+            .expect("retry payload should be sent");
+        assert_eq!(retried.name, "flaky");
+        assert_eq!(retried.attempt, 2);
+
+        let snapshot = state.job_registry().snapshot();
+        let status = snapshot.get("flaky").expect("job should be registered");
+        assert_eq!(status.queued, 1);
+        assert_eq!(status.in_flight, 0);
+        assert_eq!(status.total_failures, 0);
+        assert!(status.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn local_terminal_failure_does_not_requeue() {
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("flaky");
+        state.job_registry().record_enqueue("flaky");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "flaky".to_string(),
+            JobInfo {
+                name: "flaky".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: always_fail_handler,
+            },
+        );
+        let jobs_by_name = Arc::new(RwLock::new(jobs));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        execute_local_job(
+            QueuedJob {
+                name: "flaky".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+        )
+        .await;
+
+        assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+
+        let snapshot = state.job_registry().snapshot();
+        let status = snapshot.get("flaky").expect("job should be registered");
+        assert_eq!(status.queued, 0);
+        assert_eq!(status.in_flight, 0);
+        assert_eq!(status.total_failures, 1);
+        assert_eq!(status.dead_letters, 1);
+        assert!(status.last_error.is_some());
     }
 }
