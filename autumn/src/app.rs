@@ -1804,45 +1804,40 @@ fn setup_storage(config: &AutumnConfig, state: &AppState) -> Option<axum::Router
             force_path_style,
             default_url_expiry_secs,
         } => {
+            // The `storage-s3` shell ships the trait surface and config
+            // story but no on-the-wire SDK — every op returns
+            // `Unsupported`. Booting "successfully" here would let an
+            // app with `storage.backend = "s3"` reach production and
+            // only fail on first upload. Fail-fast instead, the same
+            // way `local`-without-acknowledgement does. Tracked in
+            // https://github.com/madmax983/autumn/issues/530.
+            let _ = (
+                provider_id,
+                bucket,
+                region,
+                endpoint,
+                public_base_url,
+                force_path_style,
+                default_url_expiry_secs,
+            );
             #[cfg(feature = "storage-s3")]
             {
-                use crate::storage::s3::{S3BlobStore, S3Options};
-                let options = S3Options {
-                    provider_id: provider_id.clone(),
-                    bucket: bucket.clone(),
-                    region: region.clone(),
-                    endpoint: endpoint.clone(),
-                    public_base_url,
-                    force_path_style,
-                    default_expiry: std::time::Duration::from_secs(default_url_expiry_secs),
-                };
-                let arc: SharedBlobStore = std::sync::Arc::new(S3BlobStore::new(options));
-                state.insert_extension::<BlobStoreState>(BlobStoreState::new(arc));
-                tracing::info!(
-                    provider = %provider_id,
-                    bucket = %bucket,
-                    region = %region,
-                    endpoint = ?endpoint,
-                    "S3 blob store configured"
+                tracing::error!(
+                    "storage.backend=s3 is not yet implemented in autumn-web — \
+                     the storage-s3 stub returns Unsupported on every operation. \
+                     Wait for the autumn-storage-s3 plugin (issue #530), or pick \
+                     storage.backend=local with allow_local_in_production=true \
+                     for single-replica deployments. Aborting startup."
                 );
-                None
             }
             #[cfg(not(feature = "storage-s3"))]
             {
-                let _ = (
-                    provider_id,
-                    bucket,
-                    region,
-                    endpoint,
-                    public_base_url,
-                    force_path_style,
-                    default_url_expiry_secs,
-                );
                 tracing::error!(
-                    "storage.backend=s3 selected but the `storage-s3` cargo feature is not enabled"
+                    "storage.backend=s3 selected but the `storage-s3` cargo feature \
+                     is not enabled. Aborting startup."
                 );
-                None
             }
+            std::process::exit(1);
         }
     }
 }
