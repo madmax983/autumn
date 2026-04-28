@@ -2061,28 +2061,29 @@ async fn setup_database(
 /// auto-generated CRUD endpoints with no record-level authz is a
 /// security regression. The escape hatch is
 /// `[security] allow_unauthorized_repository_api = true`.
-fn validate_repository_api_policies(
+/// Pure offender-collection logic for
+/// [`validate_repository_api_policies`].
+///
+/// Walks both top-level routes and routes registered under
+/// `.scoped(prefix, layer, routes)` groups, returning every
+/// `#[repository(api = ...)]`-mounted *mutating* route that has no
+/// paired `policy = ...` argument. Read-only mounts (GET
+/// `*_api_list` / `*_api_get`) are intentionally excluded — they
+/// don't fit the "any authenticated user can write to any record"
+/// footgun the issue calls out. Read-leak concerns are handled
+/// separately by `scope = ...`.
+///
+/// Returned in (resource type name, api path) form, deduped per
+/// `(type, path)` pair so a repository with multiple unguarded
+/// methods only shows up once.
+fn collect_unguarded_repository_writes(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
-    config: &AutumnConfig,
-) {
-    let profile = config.profile.as_deref().unwrap_or("default");
-    let strict =
-        is_production_profile(profile) && !config.security.allow_unauthorized_repository_api;
-
+) -> Vec<(String, String)> {
     let mut offenders: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
-        // Only mutating verbs (POST / PUT / PATCH / DELETE) trigger the
-        // unauthorized-repository guard. Read-only mounts
-        // (`*_api_list`, `*_api_get`) without a policy are *not* the
-        // footgun the issue calls out — that footgun is "a developer
-        // who flips the `api =` switch on a `#[repository]` exposes
-        // mutate endpoints that any authenticated user can call
-        // against any record." A repository mounted with only the
-        // GET routes is safe to start without a policy. Read-leak
-        // concerns are handled separately by `scope = ...`.
         if let Some(meta) = route.repository {
             if !meta.has_policy
                 && is_mutating_method(&route.method)
@@ -2092,10 +2093,6 @@ fn validate_repository_api_policies(
             }
         }
     };
-    // Both top-level routes (registered via `.routes(...)`) and routes
-    // mounted under a `.scoped(prefix, layer, routes)` group need the
-    // same fail-fast check — otherwise a `#[repository(api = ...)]`
-    // inside a scoped group would bypass the guard.
     for route in routes {
         record_route(route);
     }
@@ -2104,16 +2101,35 @@ fn validate_repository_api_policies(
             record_route(route);
         }
     }
+    offenders
+}
 
+/// Format a list of `(type, path)` offenders into the bulleted
+/// listing the startup tracing emits. Pure so the format string
+/// can be unit-tested without going through `tracing` machinery.
+fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
+    offenders
+        .iter()
+        .map(|(name, path)| format!("  - #[repository({name}, api = \"{path}\")]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_repository_api_policies(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict =
+        is_production_profile(profile) && !config.security.allow_unauthorized_repository_api;
+
+    let offenders = collect_unguarded_repository_writes(routes, scoped_groups);
     if offenders.is_empty() {
         return;
     }
 
-    let listing = offenders
-        .iter()
-        .map(|(name, path)| format!("  - #[repository({name}, api = \"{path}\")]"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let listing = format_unguarded_repository_listing(&offenders);
 
     if strict {
         tracing::error!(
@@ -2142,16 +2158,27 @@ fn validate_repository_api_policies(
 /// policy is really there. Without this, forgetting the
 /// `.policy::<R, _>(...)` builder call would compile, boot, and
 /// then 500 on every protected request.
-fn validate_repository_policies_registered(
+/// `(resource_type_name, api_path)` pair identifying a repository
+/// route that's missing its required runtime registration.
+type MissingRepositoryRegistration = (String, String);
+
+/// Pure offender-collection logic for
+/// [`validate_repository_policies_registered`].
+///
+/// Walks the same routes + scoped groups and invokes the macro-
+/// emitted `policy_check` / `scope_check` probes against the live
+/// registry, returning `(missing_policies, missing_scopes)` deduped
+/// per `(type, path)` pair. Pure so the listing logic can be unit-
+/// tested without going through the actual `tracing::error!` +
+/// `std::process::exit(1)` strict path.
+fn collect_unregistered_repository_handlers(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],
-    state: &AppState,
-    config: &AutumnConfig,
+    registry: &crate::authorization::PolicyRegistry,
+) -> (
+    Vec<MissingRepositoryRegistration>,
+    Vec<MissingRepositoryRegistration>,
 ) {
-    let profile = config.profile.as_deref().unwrap_or("default");
-    let strict = is_production_profile(profile);
-
-    let registry = state.policy_registry();
     let mut missing_policies: Vec<(String, String)> = Vec::new();
     let mut missing_scopes: Vec<(String, String)> = Vec::new();
     let mut seen_policies: std::collections::HashSet<(&'static str, &'static str)> =
@@ -2185,19 +2212,51 @@ fn validate_repository_policies_registered(
             record_route(route);
         }
     }
+    (missing_policies, missing_scopes)
+}
+
+/// Format a `(type, path)` listing for missing-policy startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
+    missing
+        .iter()
+        .map(|(name, path)| {
+            format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a `(type, path)` listing for missing-scope startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
+    missing
+        .iter()
+        .map(|(name, path)| {
+            format!("  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_repository_policies_registered(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    state: &AppState,
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict = is_production_profile(profile);
+
+    let (missing_policies, missing_scopes) =
+        collect_unregistered_repository_handlers(routes, scoped_groups, state.policy_registry());
 
     if missing_policies.is_empty() && missing_scopes.is_empty() {
         return;
     }
 
     if !missing_policies.is_empty() {
-        let listing = missing_policies
-            .iter()
-            .map(|(name, path)| {
-                format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let listing = format_missing_policy_listing(&missing_policies);
 
         if strict {
             tracing::error!(
@@ -2212,13 +2271,7 @@ fn validate_repository_policies_registered(
     }
 
     if !missing_scopes.is_empty() {
-        let listing = missing_scopes
-            .iter()
-            .map(|(name, path)| {
-                format!("  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let listing = format_missing_scope_listing(&missing_scopes);
 
         if strict {
             tracing::error!(
@@ -2283,21 +2336,11 @@ mod validate_repository_api_policies_tests {
         }
     }
 
+    /// Tests in this module historically used a duplicated copy of
+    /// the offender-collection logic. Now they call the production
+    /// helper directly so coverage tracks the real code path.
     fn collect_offenders(routes: &[Route]) -> Vec<(String, String)> {
-        let mut offenders: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
-            std::collections::HashSet::new();
-        for route in routes {
-            if let Some(meta) = route.repository {
-                if !meta.has_policy
-                    && is_mutating_method(&route.method)
-                    && seen.insert((meta.resource_type_name, meta.api_path))
-                {
-                    offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                }
-            }
-        }
-        offenders
+        collect_unguarded_repository_writes(routes, &[])
     }
 
     #[test]
@@ -2395,20 +2438,8 @@ mod validate_repository_api_policies_tests {
     }
 
     fn collect_missing(routes: &[Route], registry: &PolicyRegistry) -> Vec<(String, String)> {
-        let mut missing: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
-            std::collections::HashSet::new();
-        for route in routes {
-            if let Some(meta) = route.repository {
-                if let Some(check) = meta.policy_check {
-                    if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
-                        missing
-                            .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                    }
-                }
-            }
-        }
-        missing
+        let (missing_policies, _) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_policies
     }
 
     #[test]
@@ -2510,20 +2541,8 @@ mod validate_repository_api_policies_tests {
         routes: &[Route],
         registry: &PolicyRegistry,
     ) -> Vec<(String, String)> {
-        let mut missing: Vec<(String, String)> = Vec::new();
-        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
-            std::collections::HashSet::new();
-        for route in routes {
-            if let Some(meta) = route.repository {
-                if let Some(check) = meta.scope_check {
-                    if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
-                        missing
-                            .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                    }
-                }
-            }
-        }
-        missing
+        let (_, missing_scopes) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_scopes
     }
 
     #[test]
@@ -2579,6 +2598,90 @@ mod validate_repository_api_policies_tests {
         // migrate.rs).
         assert!(!is_production_profile("Prod"));
         assert!(!is_production_profile("Production"));
+    }
+
+    // ── Formatter helpers ─────────────────────────────────────────
+
+    #[test]
+    fn format_unguarded_listing_renders_one_bullet_per_offender() {
+        let offenders = vec![
+            ("Post".to_owned(), "/api/posts".to_owned()),
+            ("Comment".to_owned(), "/api/comments".to_owned()),
+        ];
+        let listing = format_unguarded_repository_listing(&offenders);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains("Comment"));
+        assert!(listing.contains("/api/comments"));
+        assert_eq!(listing.matches("\n  - ").count() + 1, 2);
+    }
+
+    #[test]
+    fn format_unguarded_listing_empty_input_yields_empty_string() {
+        let listing = format_unguarded_repository_listing(&[]);
+        assert!(listing.is_empty());
+    }
+
+    #[test]
+    fn format_missing_policy_listing_includes_policy_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_policy_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".policy::<Post, _>"));
+        assert!(listing.contains("policy = ..."));
+    }
+
+    #[test]
+    fn format_missing_scope_listing_includes_scope_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_scope_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".scope::<Post, _>"));
+        assert!(listing.contains("scope = ..."));
+    }
+
+    // ── Scoped-groups path coverage ──────────────────────────────
+
+    #[test]
+    fn collect_unguarded_walks_scoped_groups() {
+        // The scoped-group path catches `#[repository(api = ...)]`
+        // mounts that live inside `.scoped(prefix, layer, routes)`.
+        // Without walking them, the prod-mode guard would silently
+        // miss those routes.
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            apply_layer: Box::new(|r| r),
+        };
+        let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+    }
+
+    #[test]
+    fn collect_unregistered_walks_scoped_groups() {
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            apply_layer: Box::new(|r| r),
+        };
+        let registry = PolicyRegistry::default();
+        let (missing, _) =
+            collect_unregistered_repository_handlers(&[], std::slice::from_ref(&group), &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
     }
 }
 
