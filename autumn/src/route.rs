@@ -37,6 +37,19 @@ pub struct RepositoryApiMeta {
     /// `prod` profile builds unless
     /// `[security] allow_unauthorized_repository_api = true`.
     pub has_policy: bool,
+
+    /// Type-erased registry probe emitted by the macro when
+    /// `policy = ...` is set. Returns `true` if a [`Policy`] is
+    /// registered on the runtime
+    /// [`PolicyRegistry`](crate::authorization::PolicyRegistry) for
+    /// the resource type. Lets the app builder fail fast at
+    /// startup when a developer wires `policy = X` on the
+    /// `#[repository]` macro but forgets to call
+    /// `.policy::<R, _>(X)` on the builder — without this check,
+    /// every protected request would 500 with "no policy
+    /// registered" instead of failing fast at boot. `None` when
+    /// the macro form omits `policy = ...`.
+    pub policy_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
 }
 
 /// A single route binding an HTTP method + path to an Axum handler.

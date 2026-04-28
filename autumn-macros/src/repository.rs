@@ -635,6 +635,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // Emit a type-erased registry probe so the app builder can
+        // verify at startup that the policy was actually registered
+        // via `.policy::<R, _>(...)`. Without this, forgetting the
+        // `.policy(...)` call would compile and boot, then 500 on
+        // every protected request.
+        let policy_check_fn = if config.policy_type.is_some() {
+            quote! {
+                ::core::option::Option::Some(
+                    (|registry: &::autumn_web::authorization::PolicyRegistry| {
+                        registry.has_policy::<#model_name>()
+                    }) as fn(&::autumn_web::authorization::PolicyRegistry) -> bool
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
         let scope_type_assertion = if let Some(ref scope_type) = config.scope_type {
             quote! {
                 const _: fn() = || {
@@ -688,6 +704,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         resource_type_name: #resource_type_name_lit,
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
                     }),
                 }
             }
@@ -728,6 +745,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         resource_type_name: #resource_type_name_lit,
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
                     }),
                 }
             }
@@ -772,6 +790,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         resource_type_name: #resource_type_name_lit,
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
                     }),
                 }
             }
@@ -818,6 +837,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         resource_type_name: #resource_type_name_lit,
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
                     }),
                 }
             }
@@ -851,6 +871,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         resource_type_name: #resource_type_name_lit,
                         api_path: #api_path_lit,
                         has_policy: #has_policy,
+                        policy_check: #policy_check_fn,
                     }),
                 }
             }

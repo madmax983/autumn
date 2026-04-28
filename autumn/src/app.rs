@@ -1173,6 +1173,12 @@ impl AppBuilder {
         for register in policy_registrations {
             register(state.policy_registry());
         }
+        // Now that registrations have been applied, verify that
+        // every `#[repository(policy = X)]`-annotated route has
+        // an X actually registered on the live registry. Catches
+        // the "wired the macro arg, forgot the `.policy(...)`
+        // builder call" footgun before any 500 lands.
+        validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -2110,6 +2116,74 @@ fn validate_repository_api_policies(
     }
 }
 
+/// Refuse to start when a `#[repository(policy = X)]`-annotated
+/// route exists but the corresponding `.policy::<R, _>(X)`
+/// registration was never actually applied to the live
+/// [`PolicyRegistry`].
+///
+/// `validate_repository_api_policies` runs *before* the registry is
+/// populated and only checks the macro-set `has_policy` flag. This
+/// runs *after* registrations are applied and walks the same routes,
+/// invoking the macro-emitted `policy_check` probe to confirm the
+/// policy is really there. Without this, forgetting the
+/// `.policy::<R, _>(...)` builder call would compile, boot, and
+/// then 500 on every protected request.
+fn validate_repository_policies_registered(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    state: &AppState,
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict = profile == "prod";
+
+    let registry = state.policy_registry();
+    let mut missing: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut record_route = |route: &Route| {
+        if let Some(meta) = route.repository {
+            if let Some(check) = meta.policy_check {
+                if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
+                    missing.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                }
+            }
+        }
+    };
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
+        }
+    }
+
+    if missing.is_empty() {
+        return;
+    }
+
+    let listing = missing
+        .iter()
+        .map(|(name, path)| {
+            format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if strict {
+        tracing::error!(
+            "refusing to start: the following #[repository] routes declare a `policy = ...` argument, but no policy is registered for the resource type. Without registration, every protected request would fail at runtime with `500 no policy registered`:\n{listing}"
+        );
+        std::process::exit(1);
+    } else {
+        tracing::warn!(
+            "the following #[repository] routes declare `policy = ...` but no matching `.policy::<R, _>(...)` registration is on the app builder. Protected requests will 500 at runtime:\n{listing}\n\
+             This will become a startup-time error in `prod` profile builds."
+        );
+    }
+}
+
 const fn is_mutating_method(method: &http::Method) -> bool {
     matches!(
         *method,
@@ -2142,6 +2216,7 @@ mod validate_repository_api_policies_tests {
             resource_type_name: type_name,
             api_path: path,
             has_policy: false,
+            policy_check: None,
         }
     }
 
@@ -2233,6 +2308,112 @@ mod validate_repository_api_policies_tests {
         assert!(!is_mutating_method(&http::Method::GET));
         assert!(!is_mutating_method(&http::Method::HEAD));
         assert!(!is_mutating_method(&http::Method::OPTIONS));
+    }
+
+    // ── registry-aware validation (post-registration) ─────────────
+
+    use crate::authorization::{Policy, PolicyRegistry};
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestPost;
+
+    #[derive(Default)]
+    struct TestPostPolicy;
+    impl Policy<TestPost> for TestPostPolicy {}
+
+    fn guarded_with_check(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: true,
+            policy_check: Some(|registry: &PolicyRegistry| registry.has_policy::<TestPost>()),
+        }
+    }
+
+    fn collect_missing(routes: &[Route], registry: &PolicyRegistry) -> Vec<(String, String)> {
+        let mut missing: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+            std::collections::HashSet::new();
+        for route in routes {
+            if let Some(meta) = route.repository {
+                if let Some(check) = meta.policy_check {
+                    if !check(registry) && seen.insert((meta.resource_type_name, meta.api_path)) {
+                        missing
+                            .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+                    }
+                }
+            }
+        }
+        missing
+    }
+
+    #[test]
+    fn registry_check_flags_routes_missing_their_policy_registration() {
+        // Macro emits `policy = X` but no `.policy::<TestPost, _>(...)`
+        // call on the builder — registry has nothing.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+        assert_eq!(missing[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn registry_check_passes_when_policy_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<TestPost, _>(TestPostPolicy);
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty(), "policy is registered, no offenders");
+    }
+
+    #[test]
+    fn registry_check_skips_routes_without_policy_check_fn() {
+        // Routes mounted without `policy = ...` carry
+        // `policy_check: None` and are not subject to this check —
+        // they're handled by `validate_repository_api_policies` which
+        // looks at `has_policy` instead.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn registry_check_dedups_one_offender_per_repository() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+        ];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
     }
 }
 
