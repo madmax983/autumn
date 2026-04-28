@@ -184,7 +184,7 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
-            if let Err(err) = tokio::fs::rename(&tmp_path, &path).await {
+            if let Err(err) = atomic_replace(&tmp_path, &path).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
@@ -239,7 +239,7 @@ impl BlobStore for LocalBlobStore {
 
             match result {
                 Ok((byte_size, etag)) => {
-                    if let Err(err) = tokio::fs::rename(&tmp_path, &path).await {
+                    if let Err(err) = atomic_replace(&tmp_path, &path).await {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         return Err(BlobStoreError::io(err));
                     }
@@ -388,6 +388,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// don't collide. Same-directory placement is what makes the `rename`
 /// atomic on POSIX (cross-device renames would silently degrade to
 /// copy-and-delete).
+/// Replace `dst` with `src` atomically across platforms.
+///
+/// On POSIX, `rename` overwrites an existing destination atomically.
+/// On Windows, `MoveFileEx` without `MOVEFILE_REPLACE_EXISTING` errors
+/// when the destination exists, so re-uploads to the same key would
+/// fail without the fallback. We try a plain rename first (the fast
+/// path), and on `AlreadyExists` we remove the destination and retry.
+/// The Windows path is non-atomic in the narrow window between the
+/// remove and the rename, but that's strictly better than the
+/// "re-upload errors out" alternative.
+async fn atomic_replace(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::rename(src, dst).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(dst).await?;
+            tokio::fs::rename(src, dst).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut name = path.file_name().map_or_else(

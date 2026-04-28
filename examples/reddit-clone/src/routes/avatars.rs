@@ -1,0 +1,120 @@
+//! Profile-picture (avatar) upload routes.
+//!
+//! Demonstrates the autumn-web `[storage]` feature end-to-end: a
+//! `Blob` column on a `#[model]`, a multipart upload that streams
+//! straight into the configured `BlobStore`, and a presigned URL
+//! rendered in the user profile page. With `storage.backend = "local"`
+//! (the dev default) bytes land under `target/blobs/`; with `s3`
+//! they land in your bucket. The route is identical either way.
+
+use autumn_web::extract::{Multipart, State};
+use autumn_web::prelude::*;
+use autumn_web::storage::{Blob, BlobStoreState};
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+
+use crate::models::User;
+use crate::schema::users;
+
+use super::layout::{hx_redirect_to, layout};
+
+/// Cap avatar uploads at 2MiB regardless of the framework's configured
+/// `security.upload.max_file_size_bytes`. Routes can tighten the cap
+/// further than the global, never loosen it.
+const AVATAR_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+#[get("/settings/avatar")]
+#[secured]
+pub async fn avatar_form(session: Session, csrf: CsrfToken, mut db: Db) -> AutumnResult<Markup> {
+    let username = session
+        .get("username")
+        .await
+        .ok_or_else(|| AutumnError::unauthorized_msg("not logged in"))?;
+    let user: User = users::table
+        .filter(users::username.eq(&username))
+        .select(User::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("user record missing"))?;
+
+    Ok(layout(
+        "Profile picture",
+        Some(&username),
+        Some(csrf.token()),
+        html! {
+            div class="max-w-md mx-auto bg-white rounded-lg shadow p-6" {
+                h1 class="text-2xl font-bold mb-4" { "Profile picture" }
+                @if let Some(blob) = &user.avatar {
+                    p class="text-sm text-gray-500 mb-3" {
+                        "Current: " (blob.byte_size) " bytes"
+                        @if let Some(etag) = &blob.etag {
+                            " · etag " span class="font-mono" { (&etag[..etag.len().min(8)]) }
+                        }
+                    }
+                }
+                form action="/settings/avatar" method="post" enctype="multipart/form-data"
+                     class="space-y-3" {
+                    input type="hidden" name="_csrf" value=(csrf.token());
+                    input type="file" name="avatar" accept="image/png,image/jpeg,image/webp"
+                          required class="block w-full text-sm";
+                    button type="submit"
+                           class="bg-orange-500 text-white py-2 px-4 rounded font-medium \
+                                  hover:bg-orange-600" {
+                        "Upload"
+                    }
+                }
+                p class="text-xs text-gray-400 mt-4" {
+                    "Max " (AVATAR_MAX_BYTES / 1024) " KiB. The bytes flow through the configured \
+                     BlobStore (local in dev, S3 in prod)."
+                }
+            }
+        },
+    ))
+}
+
+#[post("/settings/avatar")]
+#[secured]
+pub async fn upload_avatar(
+    State(state): State<AppState>,
+    session: Session,
+    mut db: Db,
+    mut form: Multipart,
+) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
+    let username = session
+        .get("username")
+        .await
+        .ok_or_else(|| AutumnError::unauthorized_msg("not logged in"))?;
+    let blobs = state
+        .extension::<BlobStoreState>()
+        .ok_or_else(|| AutumnError::internal_server_error_msg("storage not configured"))?;
+
+    let user: User = users::table
+        .filter(users::username.eq(&username))
+        .select(User::as_select())
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("user record missing"))?;
+
+    // Stable per-user key. Re-uploading replaces the bytes atomically
+    // through the BlobStore's temp-file + rename path.
+    let key = format!("avatars/{}.bin", user.id);
+
+    let mut new_blob: Option<Blob> = None;
+    while let Some(field) = form.next_field().await? {
+        if field.name() == Some("avatar") {
+            let store = blobs.store().clone();
+            let blob = field.save_to_blob_store(&*store, &key).await?;
+            new_blob = Some(blob);
+            break;
+        }
+    }
+    let blob = new_blob.ok_or_else(|| AutumnError::bad_request_msg("missing avatar field"))?;
+
+    diesel::update(users::table.filter(users::id.eq(user.id)))
+        .set(users::avatar.eq(serde_json::to_value(&blob).expect("serializable")))
+        .execute(&mut *db)
+        .await
+        .map_err(|err| AutumnError::internal_server_error_msg(err.to_string()))?;
+
+    Ok(hx_redirect_to(&format!("/u/{username}")))
+}

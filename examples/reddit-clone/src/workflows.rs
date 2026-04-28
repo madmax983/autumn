@@ -453,6 +453,7 @@ mod tests {
             karma: 0,
             role: "user".to_string(),
             created_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            avatar: None,
         };
 
         assert_eq!(onboarding_workflow_id(user.id), "user-onboarding:42");

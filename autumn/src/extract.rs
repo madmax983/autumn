@@ -315,11 +315,14 @@ impl<'a> MultipartField<'a> {
                 }
                 Ok(None) => None,
                 Err(err) => {
+                    // multer/axum already classifies multipart parser
+                    // failures: 400 for malformed bodies, 413 for body
+                    // limit violations, etc. Preserve that — wrapping
+                    // every parser error as `Io` would silently turn
+                    // client errors into 500s on the way out.
                     state.errored = true;
-                    Some((
-                        Err(crate::storage::BlobStoreError::Io(err.to_string())),
-                        state,
-                    ))
+                    let mapped = blob_error_from_multipart(&err);
+                    Some((Err(mapped), state))
                 }
             }
         });
@@ -377,6 +380,29 @@ fn multipart_rejection_to_error(
     err: &axum::extract::multipart::MultipartRejection,
 ) -> crate::AutumnError {
     crate::AutumnError::bad_request_msg(err.body_text()).with_status(err.status())
+}
+
+#[cfg(feature = "multipart")]
+/// Map a multipart parser error to a `BlobStoreError` variant whose
+/// `status()` matches what the parser would have reported as an HTTP
+/// response — so a malformed-body parser failure becomes 400, a body-
+/// limit violation becomes 413, and only true server-side problems
+/// stay as 500. Without this, every parser error would wrap as
+/// `BlobStoreError::Io` and `into_autumn_error` would surface them all
+/// as 500s.
+#[cfg(all(feature = "multipart", feature = "storage"))]
+fn blob_error_from_multipart(
+    err: &axum::extract::multipart::MultipartError,
+) -> crate::storage::BlobStoreError {
+    let status = err.status();
+    let body = err.body_text();
+    if status == http::StatusCode::PAYLOAD_TOO_LARGE {
+        crate::storage::BlobStoreError::PayloadTooLarge(body)
+    } else if status.is_client_error() {
+        crate::storage::BlobStoreError::InvalidInput(body)
+    } else {
+        crate::storage::BlobStoreError::Io(body)
+    }
 }
 
 #[cfg(feature = "multipart")]

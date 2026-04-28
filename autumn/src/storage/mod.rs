@@ -61,6 +61,7 @@ use thiserror::Error;
 pub mod blob;
 pub mod config;
 pub mod local;
+pub mod migrations;
 #[cfg(feature = "storage-s3")]
 pub mod s3;
 

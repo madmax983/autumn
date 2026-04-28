@@ -44,6 +44,8 @@ async fn main() {
             routes::auth::login,
             routes::auth::logout,
             routes::auth::profile,
+            routes::avatars::avatar_form,
+            routes::avatars::upload_avatar,
             routes::subreddits::list,
             routes::subreddits::create_form,
             routes::subreddits::create,

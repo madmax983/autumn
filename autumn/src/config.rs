@@ -374,6 +374,15 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             );
             table.insert("cors".into(), toml::Value::Table(cors));
 
+            // Dev: enable the local-disk blob store rooted at
+            // `target/blobs/` automatically when the `storage` feature
+            // is on. `prod` deliberately leaves `backend = "disabled"`
+            // so the operator has to opt into either `local` (with
+            // `allow_local_in_production = true`) or `s3`.
+            let mut storage = toml::map::Map::new();
+            storage.insert("backend".into(), "local".into());
+            table.insert("storage".into(), toml::Value::Table(storage));
+
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {

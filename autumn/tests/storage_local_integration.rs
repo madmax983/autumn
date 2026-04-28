@@ -1,9 +1,18 @@
-//! Integration tests for the avatars example.
+//! Framework-level integration tests for the `Local` blob store.
 //!
 //! `survives_process_restart` is the headline test the storage spec
-//! cares about: write a blob through one [`LocalBlobStore`], drop it,
-//! point a fresh store at the same root, and confirm the bytes are
-//! still there.
+//! ([issue #494](https://github.com/madmax983/autumn/issues/494)) cares
+//! about: write a blob through one [`LocalBlobStore`], drop it, point a
+//! fresh store at the same root + same signing key, and confirm the
+//! bytes are still there. This proves the on-disk format outlives a
+//! process restart on the dev / single-replica path.
+//!
+//! These tests deliberately don't depend on a database — they exercise
+//! the framework primitive in isolation. The `examples/reddit-clone`
+//! crate carries the database-and-UI demo for a `Blob` column on a
+//! `#[model]`.
+
+#![cfg(feature = "storage")]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +91,6 @@ async fn presigned_url_round_trip_via_serving_route() {
         .await
         .unwrap();
 
-    // Mount the serving router and dispatch the signed URL through it.
     let arc: SharedBlobStore = Arc::new(store.clone());
     let state = autumn_web::AppState::for_test().with_extension(BlobStoreState::new(arc));
     let router = autumn_web::storage::local::serve_router(&store).with_state(state);
@@ -118,12 +126,11 @@ async fn tampered_signature_is_rejected() {
         .presigned_url("a.txt", Duration::from_secs(120))
         .await
         .unwrap();
-    // Flip a hex digit in the signature.
+    // Flip a hex digit in the signature so verification fails.
+    let len = url.len();
     let tampered = if url.ends_with('0') {
-        let len = url.len();
         format!("{}1", &url[..len - 1])
     } else {
-        let len = url.len();
         format!("{}0", &url[..len - 1])
     };
 
