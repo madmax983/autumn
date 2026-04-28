@@ -45,10 +45,9 @@ fn pascal_case(name: &str) -> String {
         .filter(|s| !s.is_empty())
         .map(|seg| {
             let mut chars = seg.chars();
-            match chars.next() {
-                Some(c) => format!("{}{}", c.to_ascii_uppercase(), chars.as_str()),
-                None => String::new(),
-            }
+            chars.next().map_or_else(String::new, |c| {
+                format!("{}{}", c.to_ascii_uppercase(), chars.as_str())
+            })
         })
         .collect::<String>()
 }
