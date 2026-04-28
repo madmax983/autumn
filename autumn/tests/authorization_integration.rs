@@ -316,3 +316,60 @@ async fn stacked_secured_and_authorize_owner_passes_both() {
     let response = post_with_session(&client, "/notes-stacked/1", "sess-owner").await;
     assert_eq!(response.status, StatusCode::OK);
 }
+
+// ── Reverse attribute order: #[authorize] above #[secured] ───
+//
+// Codex review noted that the collision check originally only worked
+// when `#[secured]` ran first. Both orderings must compile; reaching
+// these tests is the assertion. (`#[secured]` now also skips
+// re-injection when `__autumn_session` already exists.)
+
+#[autumn_web::post("/notes-reversed/{id}")]
+#[autumn_web::authorize("update", resource = Note)]
+#[autumn_web::secured]
+async fn update_note_reversed_attribute_order(
+    autumn_web::extract::Path(id): autumn_web::extract::Path<i64>,
+    LoadedNote(note): LoadedNote,
+) -> AutumnResult<&'static str> {
+    let _ = id;
+    let _ = note;
+    Ok("ok")
+}
+
+fn build_reversed_app(
+    store: MemoryStore,
+    forbidden_response: ForbiddenResponse,
+) -> autumn_web::test::TestClient {
+    TestApp::new()
+        .routes(routes![update_note_reversed_attribute_order])
+        .policy::<Note, _>(AdminOrOwnerPolicy)
+        .forbidden_response(forbidden_response)
+        .layer(SessionLayer::new(store, SessionConfig::default()))
+        .build()
+}
+
+#[tokio::test]
+async fn reversed_attribute_order_compiles_and_runs_both_checks() {
+    // Without the symmetric collision guard in `#[secured]`, the
+    // function above wouldn't compile at all — duplicate
+    // `__autumn_session` bindings.
+    let store = MemoryStore::new();
+    let client = build_reversed_app(store, ForbiddenResponse::default());
+    let response = client.post("/notes-reversed/1").send().await;
+    assert!(
+        response.status == StatusCode::UNAUTHORIZED
+            || response.status == StatusCode::NOT_FOUND
+            || response.status == StatusCode::FORBIDDEN,
+        "expected an auth-related rejection, got {}",
+        response.status
+    );
+}
+
+#[tokio::test]
+async fn reversed_attribute_order_owner_passes_both() {
+    let store = MemoryStore::new();
+    seed_session(&store, "sess-owner", "42", None).await;
+    let client = build_reversed_app(store, ForbiddenResponse::default());
+    let response = post_with_session(&client, "/notes-reversed/1", "sess-owner").await;
+    assert_eq!(response.status, StatusCode::OK);
+}
