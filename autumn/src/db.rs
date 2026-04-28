@@ -405,7 +405,26 @@ mod tests {
 
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
-        use crate::state::AppState;
+        #[derive(Clone)]
+        struct MockState {
+            pool: Option<
+                deadpool::managed::Pool<
+                    AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
+                >,
+            >,
+        }
+        impl DbState for MockState {
+            fn pool(
+                &self,
+            ) -> Option<
+                &deadpool::managed::Pool<
+                    AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>,
+                >,
+            > {
+                self.pool.as_ref()
+            }
+        }
+
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -416,24 +435,9 @@ mod tests {
             "ok"
         }
 
-        let app = Router::new().route("/", get(handler)).with_state(AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let app = Router::new()
+            .route("/", get(handler))
+            .with_state(MockState { pool: None });
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

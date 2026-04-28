@@ -1199,36 +1199,79 @@ pub(crate) fn actuator_router_with_prefix<
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
-    use crate::state::AppState;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
 
-    fn test_state() -> AppState {
+    #[derive(Clone)]
+    struct MockState {
+        metrics: crate::middleware::MetricsCollector,
+        log_levels: LogLevels,
+        task_registry: TaskRegistry,
+        config_props: ConfigProperties,
+        profile: String,
+        #[cfg(feature = "ws")]
+        channels: crate::channels::Channels,
+        #[cfg(feature = "db")]
+        pool: Option<
+            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        >,
+    }
+
+    impl ProvideActuatorState for MockState {
+        fn metrics(&self) -> &crate::middleware::MetricsCollector {
+            &self.metrics
+        }
+        fn log_levels(&self) -> &LogLevels {
+            &self.log_levels
+        }
+        fn task_registry(&self) -> &TaskRegistry {
+            &self.task_registry
+        }
+        fn config_props(&self) -> &ConfigProperties {
+            &self.config_props
+        }
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+        fn uptime_display(&self) -> String {
+            "0s".into()
+        }
+        #[cfg(feature = "ws")]
+        fn channels(&self) -> &crate::channels::Channels {
+            &self.channels
+        }
+        #[cfg(feature = "ws")]
+        fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+            tokio_util::sync::CancellationToken::new()
+        }
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            self.pool.as_ref()
+        }
+    }
+
+    fn test_state() -> MockState {
         test_state_with_config(&AutumnConfig::default())
     }
 
-    fn test_state_with_config(config: &AutumnConfig) -> AppState {
-        AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: config.profile.clone().or_else(|| Some("dev".into())),
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
+    fn test_state_with_config(config: &AutumnConfig) -> MockState {
+        MockState {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
             config_props: ConfigProperties::from_config(config),
+            profile: config.profile.clone().unwrap_or_else(|| "dev".to_string()),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(feature = "db")]
+            pool: None,
         }
     }
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     #[tokio::test]
     async fn actuator_health_returns_ok() {
