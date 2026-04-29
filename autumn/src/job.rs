@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use futures::FutureExt as _;
 #[cfg(feature = "redis")]
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +46,13 @@ struct QueuedJob {
     initial_backoff_ms: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum JobExecutionOutcome {
+    Succeeded,
+    Failed(String),
+    Panicked(String),
+}
+
 #[cfg(feature = "redis")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableQueuedJob {
@@ -56,6 +64,34 @@ struct DurableQueuedJob {
 }
 
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
+
+async fn run_job_handler(
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+) -> JobExecutionOutcome {
+    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (handler)(state, payload)
+    })) {
+        Ok(future) => future,
+        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic)),
+    };
+
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(())) => JobExecutionOutcome::Succeeded,
+        Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
+        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic)),
+    }
+}
+
+fn format_job_panic(panic: Box<dyn std::any::Any + Send>) -> String {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+    format!("job handler panicked: {detail}")
+}
 
 #[must_use]
 pub fn global_job_client() -> Option<Arc<JobClient>> {
@@ -302,13 +338,13 @@ async fn execute_local_job(
         250
     };
 
-    match (handler)(state.clone(), job.payload.clone()).await {
-        Ok(()) => state.job_registry.record_success(&job.name),
-        Err(e) => {
+    match run_job_handler(handler, state.clone(), job.payload.clone()).await {
+        JobExecutionOutcome::Succeeded => state.job_registry.record_success(&job.name),
+        JobExecutionOutcome::Failed(error) => {
             if job.attempt < max_attempts {
                 state
                     .job_registry
-                    .record_retry(&job.name, &e.to_string(), job.attempt);
+                    .record_retry(&job.name, &error, job.attempt);
                 let sender = tx.clone();
                 let registry = state.job_registry.clone();
                 let name = job.name.clone();
@@ -328,10 +364,12 @@ async fn execute_local_job(
                         .await;
                 });
             } else {
-                state
-                    .job_registry
-                    .record_failure(&job.name, e.to_string(), true);
+                state.job_registry.record_failure(&job.name, error, true);
             }
+        }
+        JobExecutionOutcome::Panicked(error) => {
+            tracing::error!(job = %job.name, error = %error, "local job handler panicked");
+            state.job_registry.record_failure(&job.name, error, true);
         }
     }
 }
@@ -544,15 +582,15 @@ fn start_redis_runtime(
                     continue;
                 }
 
-                match (handler)(state.clone(), parsed.payload.clone()).await {
-                    Ok(()) => state.job_registry.record_success(&parsed.name),
-                    Err(error) => {
+                match run_job_handler(handler, state.clone(), parsed.payload.clone()).await {
+                    JobExecutionOutcome::Succeeded => {
+                        state.job_registry.record_success(&parsed.name)
+                    }
+                    JobExecutionOutcome::Failed(error) => {
                         if parsed.attempt < max_attempts {
-                            state.job_registry.record_retry(
-                                &parsed.name,
-                                &error.to_string(),
-                                parsed.attempt,
-                            );
+                            state
+                                .job_registry
+                                .record_retry(&parsed.name, &error, parsed.attempt);
                             let exponent = parsed.attempt.saturating_sub(1);
                             let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(exponent));
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -568,14 +606,17 @@ fn start_redis_runtime(
                                 let _ = connection.lpush::<_, _, ()>(&queue_key, encoded).await;
                             }
                         } else {
-                            state.job_registry.record_failure(
-                                &parsed.name,
-                                error.to_string(),
-                                true,
-                            );
+                            state.job_registry.record_failure(&parsed.name, error, true);
                             if let Ok(encoded) = serde_json::to_string(&parsed) {
                                 let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
                             }
+                        }
+                    }
+                    JobExecutionOutcome::Panicked(error) => {
+                        tracing::error!(job = %parsed.name, error = %error, "redis job handler panicked");
+                        state.job_registry.record_failure(&parsed.name, error, true);
+                        if let Ok(encoded) = serde_json::to_string(&parsed) {
+                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
                         }
                     }
                 }
@@ -619,6 +660,33 @@ mod tests {
         })
     }
 
+    fn panicking_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move {
+            panic!("forced panic");
+        })
+    }
+
+    fn instantly_panicking_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        panic!("panic before future")
+    }
+
+    #[tokio::test]
+    async fn run_job_handler_reports_immediate_panics() {
+        let state = AppState::for_test().with_profile("dev");
+        let outcome =
+            run_job_handler(instantly_panicking_handler, state, serde_json::json!({})).await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Panicked("job handler panicked: panic before future".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn local_enqueue_p99_is_under_5ms() {
         let state = AppState::for_test().with_profile("dev");
@@ -648,6 +716,53 @@ mod tests {
         assert!(
             p99 < std::time::Duration::from_millis(5),
             "expected p99 enqueue latency < 5ms, got {p99:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn local_panicking_handler_records_terminal_failure_without_requeue() {
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("panic");
+        state.job_registry().record_enqueue("panic");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "panic".to_string(),
+            JobInfo {
+                name: "panic".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 1,
+                handler: panicking_handler,
+            },
+        );
+        let jobs_by_name = Arc::new(RwLock::new(jobs));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        execute_local_job(
+            QueuedJob {
+                name: "panic".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 3,
+                initial_backoff_ms: 1,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+        )
+        .await;
+
+        assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+
+        let snapshot = state.job_registry().snapshot();
+        let status = snapshot.get("panic").expect("job should be registered");
+        assert_eq!(status.queued, 0);
+        assert_eq!(status.in_flight, 0);
+        assert_eq!(status.total_failures, 1);
+        assert_eq!(status.dead_letters, 1);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("job handler panicked: forced panic")
         );
     }
 
