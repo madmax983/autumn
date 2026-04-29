@@ -1293,6 +1293,8 @@ impl AppBuilder {
             shutdown_signal_token.cancel();
         });
 
+        initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs);
+
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
             server_shutdown.cancel();
@@ -1303,11 +1305,6 @@ impl AppBuilder {
         if !state.probes().is_shutting_down() {
             if !tasks.is_empty() {
                 start_task_scheduler(tasks, &state, server_shutdown.clone());
-            }
-            if jobs.is_empty() {
-                crate::job::clear_global_job_client();
-            } else {
-                crate::job::start_runtime(jobs, &state, &server_shutdown, &config.jobs);
             }
             state.probes().mark_startup_complete();
         }
@@ -1789,6 +1786,19 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
         hook(state.clone()).await?;
     }
     Ok(())
+}
+
+fn initialize_job_runtime(
+    jobs: Vec<crate::job::JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+) {
+    if jobs.is_empty() {
+        crate::job::clear_global_job_client();
+    } else {
+        crate::job::start_runtime(jobs, state, shutdown, config);
+    }
 }
 
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
@@ -3043,6 +3053,61 @@ mod tests {
 
         let recorded_events = events.lock().expect("events lock poisoned").clone();
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
+    }
+
+    fn startup_noop_job_handler(
+        _state: AppState,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        crate::job::clear_global_job_client();
+
+        let builder = app()
+            .jobs(vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }])
+            .on_startup(|_state| async {
+                crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
+            });
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        initialize_job_runtime(
+            builder.jobs.clone(),
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        );
+
+        run_startup_hooks(&builder.startup_hooks, state.clone())
+            .await
+            .expect("startup hook should be able to enqueue jobs");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.job_registry().snapshot();
+                let status = snapshot
+                    .get("startup-seed")
+                    .expect("job should be registered before startup hooks run");
+                if status.total_successes == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup-enqueued job should complete");
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
     }
 
     #[tokio::test]
