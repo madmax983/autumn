@@ -9,6 +9,7 @@ struct MailMethod {
     send_method: syn::Ident,
     later_method: syn::Ident,
     generics: syn::Generics,
+    cfg_attrs: Vec<syn::Attribute>,
     args: Vec<(syn::Ident, Type)>,
 }
 
@@ -82,6 +83,12 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
         send_method: format_ident!("send_{method_name}"),
         later_method: format_ident!("deliver_later_{method_name}"),
         generics: method.sig.generics.clone(),
+        cfg_attrs: method
+            .attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+            .cloned()
+            .collect(),
         args,
     }))
 }
@@ -110,6 +117,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let original = &method.method;
         let send_method = &method.send_method;
         let later_method = &method.later_method;
+        let cfg_attrs = &method.cfg_attrs;
         let method_generic_params = &method.generics.params;
         let method_generic_decl = if method_generic_params.is_empty() {
             quote! {}
@@ -143,6 +151,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let arg_names = method.args.iter().map(|(name, _)| quote! { #name });
         let arg_names_later = method.args.iter().map(|(name, _)| quote! { #name });
         quote! {
+            #( #cfg_attrs )*
             pub async fn #send_method #method_generic_decl (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
@@ -154,6 +163,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 mailer.send(mail).await.map_err(::autumn_web::AutumnError::internal_server_error)
             }
 
+            #( #cfg_attrs )*
             pub fn #later_method #method_generic_decl (
                 &self,
                 mailer: &::autumn_web::mail::Mailer,
@@ -327,6 +337,29 @@ mod tests {
         let rendered = out.to_string();
         assert!(rendered.contains("send_reset"));
         assert!(rendered.contains("deliver_later_reset"));
+    }
+
+    #[test]
+    fn preserves_cfg_attributes_on_generated_helpers() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    #[cfg(feature = "welcome-mail")]
+                    fn welcome(&self, to: String) -> Mail {
+                        let _ = to;
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(
+            rendered.contains("# [cfg (feature = \"welcome-mail\")] pub async fn send_welcome")
+        );
+        assert!(
+            rendered.contains("# [cfg (feature = \"welcome-mail\")] pub fn deliver_later_welcome")
+        );
     }
 
     #[test]
