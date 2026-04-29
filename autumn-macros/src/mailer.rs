@@ -146,6 +146,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { ::<#(#method_generic_call_args),*> }
         };
         let method_where_clause = &method.generics.where_clause;
+        let helper_mailer_arg = format_ident!("__autumn_mailer");
         let arg_defs = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
         let arg_defs_later = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
         let arg_names = method.args.iter().map(|(name, _)| quote! { #name });
@@ -154,25 +155,28 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #( #cfg_attrs )*
             pub async fn #send_method #method_generic_decl (
                 &self,
-                mailer: &::autumn_web::mail::Mailer,
+                #helper_mailer_arg: &::autumn_web::mail::Mailer,
                 #( #arg_defs, )*
             ) -> ::autumn_web::AutumnResult<()>
             #method_where_clause
             {
                 let mail = self.#original #method_generic_call ( #( #arg_names, )* );
-                mailer.send(mail).await.map_err(::autumn_web::AutumnError::internal_server_error)
+                #helper_mailer_arg
+                    .send(mail)
+                    .await
+                    .map_err(::autumn_web::AutumnError::internal_server_error)
             }
 
             #( #cfg_attrs )*
             pub fn #later_method #method_generic_decl (
                 &self,
-                mailer: &::autumn_web::mail::Mailer,
+                #helper_mailer_arg: &::autumn_web::mail::Mailer,
                 #( #arg_defs_later, )*
             )
             #method_where_clause
             {
                 let mail = self.#original #method_generic_call ( #( #arg_names_later, )* );
-                mailer.deliver_later(mail);
+                #helper_mailer_arg.deliver_later(mail);
             }
         }
     });
@@ -286,6 +290,25 @@ mod tests {
         assert!(rendered.contains("pub async fn send_welcome < 'a >"));
         assert!(rendered.contains("self . welcome"));
         assert!(!rendered.contains("self . welcome :: < 'a >"));
+    }
+
+    #[test]
+    fn uses_non_conflicting_generated_mailer_argument_name() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    fn welcome(&self, mailer: String) -> Mail {
+                        let _ = mailer;
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("__autumn_mailer : & :: autumn_web :: mail :: Mailer"));
+        assert!(rendered.contains("self . welcome (mailer ,)"));
+        assert!(!rendered.contains("pub async fn send_welcome (& self , mailer : & :: autumn_web :: mail :: Mailer , mailer : String ,)"));
     }
 
     #[test]
