@@ -243,45 +243,45 @@ impl JobRegistry {
 
     /// Record that a queued job started execution.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(status) = guard.get_mut(name) {
-                status.queued = status.queued.saturating_sub(1);
-                status.in_flight = status.in_flight.saturating_add(1);
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
         }
     }
 
     /// Record a successful execution.
     pub fn record_success(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(status) = guard.get_mut(name) {
-                status.in_flight = status.in_flight.saturating_sub(1);
-                status.total_successes = status.total_successes.saturating_add(1);
-                status.last_error = None;
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.total_successes = status.total_successes.saturating_add(1);
+            status.last_error = None;
         }
     }
 
     /// Record a retriable failure.
     pub fn record_retry(&self, name: &str, error: &str, _attempt: u32) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(status) = guard.get_mut(name) {
-                status.in_flight = status.in_flight.saturating_sub(1);
-                status.last_error = Some(error.to_string());
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.last_error = Some(error.to_string());
         }
     }
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(status) = guard.get_mut(name) {
-                status.in_flight = status.in_flight.saturating_sub(1);
-                status.total_failures = status.total_failures.saturating_add(1);
-                status.last_error = Some(error);
-                if dead_lettered {
-                    status.dead_letters = status.dead_letters.saturating_add(1);
-                }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.total_failures = status.total_failures.saturating_add(1);
+            status.last_error = Some(error);
+            if dead_lettered {
+                status.dead_letters = status.dead_letters.saturating_add(1);
             }
         }
     }

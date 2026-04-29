@@ -63,6 +63,15 @@ struct DurableQueuedJob {
     initial_backoff_ms: u64,
 }
 
+#[cfg(feature = "redis")]
+#[derive(Clone)]
+struct RedisWorkerConfig {
+    queue_key: String,
+    dead_key: String,
+    default_attempts: u32,
+    default_backoff: u64,
+}
+
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
 
 async fn run_job_handler(
@@ -74,17 +83,17 @@ async fn run_job_handler(
         (handler)(state, payload)
     })) {
         Ok(future) => future,
-        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic)),
+        Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
     match std::panic::AssertUnwindSafe(future).catch_unwind().await {
         Ok(Ok(())) => JobExecutionOutcome::Succeeded,
         Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
-        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic)),
+        Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     }
 }
 
-fn format_job_panic(panic: Box<dyn std::any::Any + Send>) -> String {
+fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
     let detail = panic
         .downcast_ref::<String>()
         .map(String::as_str)
@@ -202,9 +211,7 @@ pub(crate) fn start_runtime(
         "redis" => {
             #[cfg(feature = "redis")]
             {
-                if let Err(error) =
-                    start_redis_runtime(jobs.clone(), state, shutdown.clone(), config)
-                {
+                if let Err(error) = start_redis_runtime(jobs.clone(), state, shutdown, config) {
                     tracing::error!(error = %error, "failed to start redis jobs backend; falling back to local backend");
                     start_local_runtime(
                         jobs,
@@ -418,14 +425,182 @@ impl RedisClient {
 }
 
 #[cfg(feature = "redis")]
+fn new_redis_connection_manager(
+    client: &redis::Client,
+    label: &str,
+) -> Result<redis::aio::ConnectionManager, AutumnError> {
+    use redis::aio::ConnectionManagerConfig;
+
+    redis::aio::ConnectionManager::new_lazy_with_config(
+        client.clone(),
+        ConnectionManagerConfig::new(),
+    )
+    .map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "failed to create {label}: {e}"
+        )))
+    })
+}
+
+#[cfg(feature = "redis")]
+async fn push_json_list_item<T: ?Sized + Serialize + Sync>(
+    connection: &mut redis::aio::ConnectionManager,
+    key: &str,
+    value: &T,
+) {
+    use redis::AsyncCommands as _;
+
+    if let Ok(encoded) = serde_json::to_string(value) {
+        let _ = connection.lpush::<_, _, ()>(key, encoded).await;
+    }
+}
+
+#[cfg(feature = "redis")]
+fn spawn_redis_worker(
+    client: &redis::Client,
+    jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>>,
+    state: AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+    worker_config: RedisWorkerConfig,
+) -> Result<(), AutumnError> {
+    let mut connection =
+        new_redis_connection_manager(client, "jobs redis worker connection manager")?;
+
+    tokio::spawn(async move {
+        use redis::AsyncCommands as _;
+
+        loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let popped = match connection
+                .brpop::<_, Option<[String; 2]>>(&worker_config.queue_key, 1.0)
+                .await
+            {
+                Ok(v) => v,
+                Err(error) => {
+                    tracing::warn!(error = %error, "redis job worker brpop failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+
+            let Some([_, body]) = popped else {
+                continue;
+            };
+
+            process_redis_job_message(&mut connection, body, &jobs_by_name, &state, &worker_config)
+                .await;
+        }
+    });
+
+    Ok(())
+}
+
+#[cfg(feature = "redis")]
+async fn process_redis_job_message(
+    connection: &mut redis::aio::ConnectionManager,
+    body: String,
+    jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
+    state: &AppState,
+    worker_config: &RedisWorkerConfig,
+) {
+    let parsed: DurableQueuedJob = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(error = %error, "invalid durable job payload");
+            let malformed = serde_json::json!({
+                "error": error.to_string(),
+                "raw_payload": body,
+            });
+            push_json_list_item(connection, &worker_config.dead_key, &malformed).await;
+            return;
+        }
+    };
+
+    state.job_registry.record_start(&parsed.name);
+
+    let maybe_info = {
+        let guard = jobs_by_name.read().expect("job registry lock poisoned");
+        guard
+            .get(&parsed.name)
+            .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+    };
+    let Some((handler, info_max_attempts, info_backoff_ms)) = maybe_info else {
+        state
+            .job_registry
+            .record_failure(&parsed.name, "unknown job type".to_owned(), true);
+        push_json_list_item(connection, &worker_config.dead_key, &parsed).await;
+        return;
+    };
+
+    let max_attempts = if parsed.max_attempts != 0 {
+        parsed.max_attempts
+    } else if info_max_attempts != 0 {
+        info_max_attempts
+    } else {
+        worker_config.default_attempts
+    };
+    let backoff_ms = if parsed.initial_backoff_ms != 0 {
+        parsed.initial_backoff_ms
+    } else if info_backoff_ms != 0 {
+        info_backoff_ms
+    } else {
+        worker_config.default_backoff
+    };
+
+    if parsed.attempt == 0 {
+        state.job_registry.record_failure(
+            &parsed.name,
+            "invalid job payload: attempt must be >= 1".to_owned(),
+            true,
+        );
+        push_json_list_item(connection, &worker_config.dead_key, &parsed).await;
+        return;
+    }
+
+    match run_job_handler(handler, state.clone(), parsed.payload.clone()).await {
+        JobExecutionOutcome::Succeeded => {
+            state.job_registry.record_success(&parsed.name);
+        }
+        JobExecutionOutcome::Failed(error) => {
+            if parsed.attempt < max_attempts {
+                state
+                    .job_registry
+                    .record_retry(&parsed.name, &error, parsed.attempt);
+                let exponent = parsed.attempt.saturating_sub(1);
+                let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(exponent));
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                let retry = DurableQueuedJob {
+                    name: parsed.name,
+                    payload: parsed.payload,
+                    attempt: parsed.attempt + 1,
+                    max_attempts,
+                    initial_backoff_ms: backoff_ms,
+                };
+                state.job_registry.record_enqueue(&retry.name);
+                push_json_list_item(connection, &worker_config.queue_key, &retry).await;
+            } else {
+                state.job_registry.record_failure(&parsed.name, error, true);
+                push_json_list_item(connection, &worker_config.dead_key, &parsed).await;
+            }
+        }
+        JobExecutionOutcome::Panicked(error) => {
+            tracing::error!(job = %parsed.name, error = %error, "redis job handler panicked");
+            state.job_registry.record_failure(&parsed.name, error, true);
+            push_json_list_item(connection, &worker_config.dead_key, &parsed).await;
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
 fn start_redis_runtime(
     jobs: Vec<JobInfo>,
     state: &AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
 ) -> Result<(), AutumnError> {
-    use redis::aio::ConnectionManagerConfig;
-
     let url = config
         .redis
         .url
@@ -442,15 +617,8 @@ fn start_redis_runtime(
             "invalid jobs redis url: {e}"
         )))
     })?;
-    let producer_connection = redis::aio::ConnectionManager::new_lazy_with_config(
-        client.clone(),
-        ConnectionManagerConfig::new(),
-    )
-    .map_err(|e| {
-        AutumnError::internal_server_error(std::io::Error::other(format!(
-            "failed to create jobs redis connection manager: {e}"
-        )))
-    })?;
+    let producer_connection =
+        new_redis_connection_manager(&client, "jobs redis connection manager")?;
 
     let queue_key = format!("{}:queue", config.redis.key_prefix);
     let dead_key = format!("{}:dead", config.redis.key_prefix);
@@ -481,147 +649,18 @@ fn start_redis_runtime(
 
     let worker_count = config.workers.max(1);
     for _ in 0..worker_count {
-        let state = state.clone();
-        let jobs_by_name = Arc::clone(&jobs_by_name);
-        let mut connection = redis::aio::ConnectionManager::new_lazy_with_config(
-            client.clone(),
-            ConnectionManagerConfig::new(),
-        )
-        .map_err(|e| {
-            AutumnError::internal_server_error(std::io::Error::other(format!(
-                "failed to create jobs redis worker connection manager: {e}"
-            )))
-        })?;
-        let queue_key = queue_key.clone();
-        let dead_key = dead_key.clone();
-        let shutdown = shutdown.clone();
-        let default_attempts = config.max_attempts;
-        let default_backoff = config.initial_backoff_ms;
-
-        tokio::spawn(async move {
-            use redis::AsyncCommands as _;
-
-            loop {
-                if shutdown.is_cancelled() {
-                    break;
-                }
-
-                let popped = match connection
-                    .brpop::<_, Option<[String; 2]>>(&queue_key, 1.0)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker brpop failed");
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
-                };
-
-                let Some([_, body]) = popped else {
-                    continue;
-                };
-
-                let parsed: DurableQueuedJob = match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "invalid durable job payload");
-                        let malformed = serde_json::json!({
-                            "error": error.to_string(),
-                            "raw_payload": body,
-                        });
-                        if let Ok(encoded) = serde_json::to_string(&malformed) {
-                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                        }
-                        continue;
-                    }
-                };
-
-                state.job_registry.record_start(&parsed.name);
-
-                let maybe_info = {
-                    let guard = jobs_by_name.read().expect("job registry lock poisoned");
-                    guard
-                        .get(&parsed.name)
-                        .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
-                };
-                let Some((handler, info_max_attempts, info_backoff_ms)) = maybe_info else {
-                    state.job_registry.record_failure(
-                        &parsed.name,
-                        "unknown job type".to_owned(),
-                        true,
-                    );
-                    if let Ok(encoded) = serde_json::to_string(&parsed) {
-                        let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                    }
-                    continue;
-                };
-                let max_attempts = if parsed.max_attempts != 0 {
-                    parsed.max_attempts
-                } else if info_max_attempts != 0 {
-                    info_max_attempts
-                } else {
-                    default_attempts
-                };
-                let backoff_ms = if parsed.initial_backoff_ms != 0 {
-                    parsed.initial_backoff_ms
-                } else if info_backoff_ms != 0 {
-                    info_backoff_ms
-                } else {
-                    default_backoff
-                };
-                if parsed.attempt == 0 {
-                    state.job_registry.record_failure(
-                        &parsed.name,
-                        "invalid job payload: attempt must be >= 1".to_owned(),
-                        true,
-                    );
-                    if let Ok(encoded) = serde_json::to_string(&parsed) {
-                        let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                    }
-                    continue;
-                }
-
-                match run_job_handler(handler, state.clone(), parsed.payload.clone()).await {
-                    JobExecutionOutcome::Succeeded => {
-                        state.job_registry.record_success(&parsed.name)
-                    }
-                    JobExecutionOutcome::Failed(error) => {
-                        if parsed.attempt < max_attempts {
-                            state
-                                .job_registry
-                                .record_retry(&parsed.name, &error, parsed.attempt);
-                            let exponent = parsed.attempt.saturating_sub(1);
-                            let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(exponent));
-                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                            let retry = DurableQueuedJob {
-                                name: parsed.name,
-                                payload: parsed.payload,
-                                attempt: parsed.attempt + 1,
-                                max_attempts,
-                                initial_backoff_ms: backoff_ms,
-                            };
-                            if let Ok(encoded) = serde_json::to_string(&retry) {
-                                state.job_registry.record_enqueue(&retry.name);
-                                let _ = connection.lpush::<_, _, ()>(&queue_key, encoded).await;
-                            }
-                        } else {
-                            state.job_registry.record_failure(&parsed.name, error, true);
-                            if let Ok(encoded) = serde_json::to_string(&parsed) {
-                                let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                            }
-                        }
-                    }
-                    JobExecutionOutcome::Panicked(error) => {
-                        tracing::error!(job = %parsed.name, error = %error, "redis job handler panicked");
-                        state.job_registry.record_failure(&parsed.name, error, true);
-                        if let Ok(encoded) = serde_json::to_string(&parsed) {
-                            let _ = connection.lpush::<_, _, ()>(&dead_key, encoded).await;
-                        }
-                    }
-                }
-            }
-        });
+        spawn_redis_worker(
+            &client,
+            Arc::clone(&jobs_by_name),
+            state.clone(),
+            shutdown.clone(),
+            RedisWorkerConfig {
+                queue_key: queue_key.clone(),
+                dead_key: dead_key.clone(),
+                default_attempts: config.max_attempts,
+                default_backoff: config.initial_backoff_ms,
+            },
+        )?;
     }
 
     Ok(())
