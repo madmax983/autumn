@@ -434,7 +434,11 @@ fn has_mail_transport_source(merged: &toml::Value, env: &dyn Env) -> bool {
         .get("mail")
         .and_then(toml::Value::as_table)
         .is_some_and(|mail| mail.contains_key("transport"))
-        || env.var("AUTUMN_MAIL__TRANSPORT").is_ok()
+        || env
+            .var("AUTUMN_MAIL__TRANSPORT")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| crate::mail::Transport::from_env_value(value).is_some())
 }
 
 /// Maximum recursion depth for merging TOML tables.

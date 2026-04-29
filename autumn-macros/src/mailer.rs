@@ -8,6 +8,7 @@ struct MailMethod {
     method: syn::Ident,
     send_method: syn::Ident,
     later_method: syn::Ident,
+    vis: syn::Visibility,
     generics: syn::Generics,
     cfg_attrs: Vec<syn::Attribute>,
     args: Vec<(syn::Ident, Type)>,
@@ -82,6 +83,7 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
         method: method_name.clone(),
         send_method: format_ident!("send_{method_name}"),
         later_method: format_ident!("deliver_later_{method_name}"),
+        vis: method.vis.clone(),
         generics: method.sig.generics.clone(),
         cfg_attrs: method
             .attrs
@@ -117,6 +119,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let original = &method.method;
         let send_method = &method.send_method;
         let later_method = &method.later_method;
+        let vis = &method.vis;
         let cfg_attrs = &method.cfg_attrs;
         let method_generic_params = &method.generics.params;
         let method_generic_decl = if method_generic_params.is_empty() {
@@ -153,7 +156,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let arg_names_later = method.args.iter().map(|(name, _)| quote! { #name });
         quote! {
             #( #cfg_attrs )*
-            pub async fn #send_method #method_generic_decl (
+            #vis async fn #send_method #method_generic_decl (
                 &self,
                 #helper_mailer_arg: &::autumn_web::mail::Mailer,
                 #( #arg_defs, )*
@@ -168,7 +171,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #( #cfg_attrs )*
-            pub fn #later_method #method_generic_decl (
+            #vis fn #later_method #method_generic_decl (
                 &self,
                 #helper_mailer_arg: &::autumn_web::mail::Mailer,
                 #( #arg_defs_later, )*
@@ -248,9 +251,9 @@ mod tests {
             },
         );
         let rendered = out.to_string();
-        assert!(rendered.contains("pub async fn send_welcome < T >"));
+        assert!(rendered.contains("async fn send_welcome < T >"));
         assert!(rendered.contains("where T : std :: fmt :: Display"));
-        assert!(rendered.contains("pub fn deliver_later_welcome < T >"));
+        assert!(rendered.contains("fn deliver_later_welcome < T >"));
     }
 
     #[test]
@@ -287,7 +290,7 @@ mod tests {
             },
         );
         let rendered = out.to_string();
-        assert!(rendered.contains("pub async fn send_welcome < 'a >"));
+        assert!(rendered.contains("async fn send_welcome < 'a >"));
         assert!(rendered.contains("self . welcome"));
         assert!(!rendered.contains("self . welcome :: < 'a >"));
     }
@@ -309,6 +312,25 @@ mod tests {
         assert!(rendered.contains("__autumn_mailer : & :: autumn_web :: mail :: Mailer"));
         assert!(rendered.contains("self . welcome (mailer ,)"));
         assert!(!rendered.contains("pub async fn send_welcome (& self , mailer : & :: autumn_web :: mail :: Mailer , mailer : String ,)"));
+    }
+
+    #[test]
+    fn preserves_method_visibility_on_generated_helpers() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl AccountMailer {
+                    pub(crate) fn welcome(&self, to: String) -> Mail {
+                        let _ = to;
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("pub (crate) async fn send_welcome"));
+        assert!(rendered.contains("pub (crate) fn deliver_later_welcome"));
+        assert!(!rendered.contains("pub async fn send_welcome"));
     }
 
     #[test]
@@ -377,12 +399,8 @@ mod tests {
             },
         );
         let rendered = out.to_string();
-        assert!(
-            rendered.contains("# [cfg (feature = \"welcome-mail\")] pub async fn send_welcome")
-        );
-        assert!(
-            rendered.contains("# [cfg (feature = \"welcome-mail\")] pub fn deliver_later_welcome")
-        );
+        assert!(rendered.contains("# [cfg (feature = \"welcome-mail\")] async fn send_welcome"));
+        assert!(rendered.contains("# [cfg (feature = \"welcome-mail\")] fn deliver_later_welcome"));
     }
 
     #[test]

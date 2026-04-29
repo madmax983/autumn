@@ -73,6 +73,19 @@ fn dev_mail_env_defaults_to_log_without_explicit_transport() {
     assert_eq!(config.mail.from.as_deref(), Some("noreply@example.com"));
 }
 
+#[test]
+fn dev_mail_env_invalid_transport_still_defaults_to_log() {
+    let env = MockEnv::new()
+        .with("AUTUMN_PROFILE", "dev")
+        .with("AUTUMN_MAIL__FROM", "noreply@example.com")
+        .with("AUTUMN_MAIL__TRANSPORT", "smtpp");
+
+    let config = AutumnConfig::load_with_env(&env).expect("config should load");
+
+    assert_eq!(config.mail.transport, Transport::Log);
+    assert_eq!(config.mail.from.as_deref(), Some("noreply@example.com"));
+}
+
 #[tokio::test]
 async fn file_transport_writes_rfc822_message_for_inspection() {
     let dir = tempfile::tempdir().expect("tempdir");
