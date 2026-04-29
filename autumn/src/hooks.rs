@@ -207,6 +207,7 @@ where
 /// trait so compile-fail diagnostics stay deterministic across toolchains.
 pub trait RepositoryHooksClone: Sized {
     /// Clone hook state for generated repository values.
+    #[must_use]
     fn autumn_clone(&self) -> Self;
 }
 
