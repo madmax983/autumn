@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **authorization:** First-class record-level authorization — `Policy` /
+  `Scope` traits, `PolicyContext` carrying the resolved `Session` /
+  user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
+  resource = Type)]` attribute macro that resolves the registered policy
+  and short-circuits with the configured deny response before the
+  handler body runs, a `policy = SomePolicy` argument on
+  `#[repository(api = "...")]` that wires the same checks into every
+  auto-generated POST/PUT/DELETE endpoint plus `GET /<api>/{id}` for
+  read scoping, a `scope = SomeScope` companion that constrains list
+  endpoints, a `Scoped` blanket trait that adds
+  `Post::scope(&ctx).load(&mut db).await?` ergonomics to every type
+  (mirroring Pundit's `policy_scope`), and a `[security]
+  forbidden_response = "404" | "403"` knob (default `"404"` to mirror
+  Rails / Phoenix and avoid leaking record existence). Register on the
+  app builder via `.policy::<R, _>(...)` / `.scope::<R, _>(...)`.
+  `examples/reddit-clone`'s `PostPolicy` replaces every hand-rolled
+  `if post.author_id != user_id` check; `git grep -n "author_id != user_id"
+  examples/reddit-clone/` now returns empty (#496).
+  - **Behavior change:** `#[repository(api = "...")]` without a paired
+    `policy = ...` argument is now a startup-time error in `prod`
+    profile builds. The escape hatch is `[security]
+    allow_unauthorized_repository_api = true`. Downstream apps using the
+    `api =` switch must add `policy = SomePolicy` (or opt out
+    explicitly) — this is the one behavior change downstream apps have
+    to address.
+- **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), the `add_blob_column!` migration helper macro, and a feature-gated `S3BlobStore` shell behind `storage-s3` (real SDK wiring tracked as #530). `MultipartField::save_to_blob_store` streams uploads straight through to `BlobStore::put_stream` without buffering, with multipart parser errors preserving their client-facing 4xx status. Profile-aware defaults mirror sessions: `dev` auto-defaults to `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. The local backend uses temp-file + cross-platform atomic-replace semantics so partial writes never leave corrupted blobs and re-uploads work on Windows as well as POSIX. `examples/reddit-clone` carries the database-backed UI demo (`Blob` column on the user model + upload form + presigned-URL profile picture); framework-level integration tests pin restart survival on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
 - **cli:** `autumn generate model | migration | scaffold` for one-command
   resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
   `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route

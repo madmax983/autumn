@@ -27,6 +27,8 @@
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+use reddit_clone::models::Post;
+use reddit_clone::policies::PostPolicy;
 use reddit_clone::{harvest_runtime, live_events, repositories, routes, tasks};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -44,6 +46,8 @@ async fn main() {
             routes::auth::login,
             routes::auth::logout,
             routes::auth::profile,
+            routes::avatars::avatar_form,
+            routes::avatars::upload_avatar,
             routes::subreddits::list,
             routes::subreddits::create_form,
             routes::subreddits::create,
@@ -67,6 +71,7 @@ async fn main() {
             repositories::post_api_list,
             repositories::post_api_get,
         ])
+        .policy::<Post, _>(PostPolicy)
         .static_routes(static_routes![routes::about::about])
         .tasks(tasks![
             tasks::recalculate_hot_ranks,

@@ -12,6 +12,7 @@
 //! which re-exports everything.
 
 mod api_doc;
+mod authorize;
 mod cached;
 mod collect;
 mod job;
@@ -19,6 +20,7 @@ mod jobs_macro;
 mod main_macro;
 mod model;
 mod oauth2_callback;
+mod param_helpers;
 mod parse;
 mod repository;
 mod route;
@@ -329,6 +331,32 @@ pub fn jobs(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
+}
+
+/// Enforce a record-level authorization policy on a route handler.
+///
+/// Resolves the [`Policy`](autumn_web::authorization::Policy)
+/// registered for the named resource type and calls the matching
+/// action method. Short-circuits with the configured deny response
+/// (default `404`, optionally `403`) before the handler body runs.
+///
+/// Coexists with `#[secured]`: `#[secured]` answers "are you in?",
+/// `#[authorize]` answers "are you allowed to act on *this record*?"
+///
+/// # Forms
+///
+/// ```ignore
+/// // Resource arg is auto-detected by snake-cased type name (Post -> `post`).
+/// #[authorize("update", resource = Post)]
+/// async fn update_post(post: Post) -> AutumnResult<...> { ... }
+///
+/// // Explicit binding name (overrides the snake-case default).
+/// #[authorize("delete", resource = Post, from = target)]
+/// async fn destroy(target: Post) -> AutumnResult<...> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
+    authorize::authorize_macro(attr.into(), item.into()).into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.

@@ -1,5 +1,6 @@
 pub mod about;
 pub mod auth;
+pub mod avatars;
 pub mod comments;
 pub mod layout;
 pub mod live;

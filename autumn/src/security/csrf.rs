@@ -213,21 +213,28 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
     let mut found_token = None;
 
     for cookie_header in &req_headers.get_all(http::header::COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((name, value)) = pair.split_once('=') {
-                    if name.trim() == cookie_name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(value.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if name.trim() != cookie_name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(value.trim().to_owned());
         }
     }
 

@@ -146,6 +146,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     hidden: true,
                     register_schemas: ::core::option::Option::None,
                 },
+                repository: ::core::option::Option::None,
             }
         }
     }

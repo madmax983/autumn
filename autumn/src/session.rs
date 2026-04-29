@@ -559,21 +559,28 @@ fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     let mut found_token = None;
 
     for cookie_header in headers.get_all(COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k.trim() == name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(v.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if k.trim() != name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(v.trim().to_owned());
         }
     }
     found_token
@@ -1092,6 +1099,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1134,6 +1144,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 

@@ -111,7 +111,16 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
+    /// Deferred policy / scope registrations applied during
+    /// [`TestApp::build`].
+    policy_registrations: Vec<TestPolicyRegistration>,
+    /// Override for [`AppState::forbidden_response`]. Defaults to
+    /// the value derived from
+    /// [`SecurityConfig::forbidden_response`](crate::security::SecurityConfig::forbidden_response).
+    forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
 }
+
+type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
 impl TestApp {
     /// Create a new test app builder with default configuration.
@@ -132,7 +141,51 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "db")]
             pool: None,
+            policy_registrations: Vec::new(),
+            forbidden_response_override: None,
         }
+    }
+
+    /// Register a [`Policy`](crate::authorization::Policy) for
+    /// resource type `R`. Mirrors
+    /// [`AppBuilder::policy`](crate::app::AppBuilder::policy).
+    #[must_use]
+    pub fn policy<R, P>(mut self, policy: P) -> Self
+    where
+        R: Send + Sync + 'static,
+        P: crate::authorization::Policy<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_policy::<R, _>(policy);
+        }));
+        self
+    }
+
+    /// Register a [`Scope`](crate::authorization::Scope) for resource
+    /// type `R`. Mirrors
+    /// [`AppBuilder::scope`](crate::app::AppBuilder::scope).
+    #[must_use]
+    pub fn scope<R, S>(mut self, scope: S) -> Self
+    where
+        R: Send + Sync + 'static,
+        S: crate::authorization::Scope<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_scope::<R, _>(scope);
+        }));
+        self
+    }
+
+    /// Override the deny-response shape used by `#[authorize]` and
+    /// `#[repository(policy = ...)]` handlers. Useful for
+    /// round-tripping the `403`-vs-`404` decision in tests.
+    #[must_use]
+    pub const fn forbidden_response(
+        mut self,
+        value: crate::authorization::ForbiddenResponse,
+    ) -> Self {
+        self.forbidden_response_override = Some(value);
+        self
     }
 
     /// Enable `OpenAPI` spec generation for the test app.
@@ -245,7 +298,16 @@ impl TestApp {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: self
+                .forbidden_response_override
+                .unwrap_or(self.config.security.forbidden_response),
+            auth_session_key: self.config.auth.session_key.clone(),
         };
+
+        for register in self.policy_registrations {
+            register(state.policy_registry());
+        }
 
         let router = crate::router::try_build_router_inner(
             self.routes,
@@ -769,6 +831,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: Method::POST,
@@ -782,6 +845,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: Method::POST,
@@ -795,6 +859,7 @@ mod tests {
                     success_status: 201,
                     ..Default::default()
                 },
+                repository: None,
             },
         ]
     }

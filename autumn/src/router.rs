@@ -303,22 +303,23 @@ pub fn try_build_router_inner(
 #[cfg(feature = "openapi")]
 fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
-                let inner = &path[i + 1..i + 1 + end_rel];
-                let name = inner.split(':').next().unwrap_or(inner).trim();
-                if !name.is_empty() {
-                    out.push(name.to_owned());
-                }
-                i += 1 + end_rel + 1;
-                continue;
-            }
+    let mut remaining = path;
+
+    while let Some(start) = remaining.find('{') {
+        let after_brace = &remaining[start + 1..];
+        let Some(end_rel) = after_brace.find('}') else {
+            break;
+        };
+
+        let inner = &after_brace[..end_rel];
+        let name = inner.split(':').next().unwrap_or(inner).trim();
+        if !name.is_empty() {
+            out.push(name.to_owned());
         }
-        i += 1;
+
+        remaining = &after_brace[end_rel + 1..];
     }
+
     out
 }
 
@@ -1460,6 +1461,9 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 
@@ -1803,6 +1807,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             }],
             apply_layer: Box::new(|r| r),
         };
@@ -1869,6 +1874,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -2041,6 +2047,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {
@@ -2106,6 +2113,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {

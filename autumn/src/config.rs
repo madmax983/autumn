@@ -89,6 +89,8 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
+//! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -380,6 +382,15 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             );
             table.insert("cors".into(), toml::Value::Table(cors));
 
+            // Dev: enable the local-disk blob store rooted at
+            // `target/blobs/` automatically when the `storage` feature
+            // is on. `prod` deliberately leaves `backend = "disabled"`
+            // so the operator has to opt into either `local` (with
+            // `allow_local_in_production = true`) or `s3`.
+            let mut storage = toml::map::Map::new();
+            storage.insert("backend".into(), "local".into());
+            table.insert("storage".into(), toml::Value::Table(storage));
+
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -620,6 +631,12 @@ pub struct AutumnConfig {
     /// Security settings (headers, CSRF).
     #[serde(default)]
     pub security: crate::security::config::SecurityConfig,
+
+    /// Pluggable file storage configuration. Honored only when the
+    /// `storage` cargo feature is enabled.
+    #[cfg(feature = "storage")]
+    #[serde(default)]
+    pub storage: crate::storage::StorageConfig,
 }
 
 /// Background job runtime configuration.
@@ -885,6 +902,89 @@ impl AutumnConfig {
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        #[cfg(feature = "storage")]
+        self.apply_storage_env_overrides_with_env(env);
+    }
+
+    #[cfg(feature = "storage")]
+    fn apply_storage_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_STORAGE__BACKEND") {
+            match crate::storage::StorageBackend::from_env_value(&val) {
+                Some(backend) => self.storage.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_STORAGE__BACKEND={val:?} is not valid \
+                     (expected disabled, local, or s3), ignoring"
+                ),
+            }
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__DEFAULT_PROVIDER",
+            &mut self.storage.default_provider,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION",
+            &mut self.storage.allow_local_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_STORAGE__LOCAL__ROOT") {
+            self.storage.local.root = std::path::PathBuf::from(val);
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__MOUNT_PATH",
+            &mut self.storage.local.mount_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.local.default_url_expiry_secs,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__SIGNING_KEY",
+            &mut self.storage.local.signing_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__BUCKET",
+            &mut self.storage.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__REGION",
+            &mut self.storage.s3.region,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ENDPOINT",
+            &mut self.storage.s3.endpoint,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
+            &mut self.storage.s3.public_base_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV",
+            &mut self.storage.s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
+            &mut self.storage.s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__S3__FORCE_PATH_STYLE",
+            &mut self.storage.s3.force_path_style,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.s3.default_url_expiry_secs,
+        );
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -1188,6 +1288,21 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
             &mut self.security.upload.allowed_mime_types,
+        );
+
+        // Authorization deny shape + repository-API escape hatch.
+        if let Ok(value) = env.var("AUTUMN_SECURITY__FORBIDDEN_RESPONSE") {
+            match value.parse::<crate::authorization::ForbiddenResponse>() {
+                Ok(parsed) => self.security.forbidden_response = parsed,
+                Err(err) => tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__FORBIDDEN_RESPONSE={value:?}: {err}"
+                ),
+            }
+        }
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            &mut self.security.allow_unauthorized_repository_api,
         );
     }
 
@@ -3363,5 +3478,65 @@ path = "/healthz"
         } else {
             panic!("Expected a table");
         }
+    }
+
+    // ── AUTUMN_SECURITY__FORBIDDEN_RESPONSE / __ALLOW_UNAUTHORIZED_REPOSITORY_API ──
+
+    #[test]
+    fn env_override_forbidden_response_403() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "403");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_404() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "404");
+        let mut config = AutumnConfig::default();
+        // Pre-set to 403 to confirm env actually flips it back to 404.
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::NotFound404
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_invalid_keeps_existing() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "418");
+        let mut config = AutumnConfig::default();
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        // Invalid value warns and leaves the existing setting alone.
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.security.allow_unauthorized_repository_api);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.security.allow_unauthorized_repository_api);
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api_false_overrides_toml_true() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            "false",
+        );
+        let mut config = AutumnConfig::default();
+        config.security.allow_unauthorized_repository_api = true;
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.security.allow_unauthorized_repository_api);
     }
 }

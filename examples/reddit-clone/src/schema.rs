@@ -6,6 +6,7 @@ diesel::table! {
         karma -> Int8,
         role -> Text,
         created_at -> Timestamp,
+        avatar -> Nullable<Jsonb>,
     }
 }
 

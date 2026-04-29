@@ -572,17 +572,12 @@ pub async fn show(
 #[get("/r/{sub_slug}/posts/{post_slug}/edit")]
 pub async fn edit_form(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
 
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
@@ -593,11 +588,7 @@ pub async fn edit_form(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only edit your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
 
     Ok(layout(
         &format!("Edit: {}", post.title),
@@ -654,17 +645,11 @@ pub struct EditPostForm {
 #[post("/r/{sub_slug}/posts/{post_slug}")]
 pub async fn update(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<EditPostForm>,
 ) -> AutumnResult<Markup> {
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
-
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
         .filter(subreddits::slug.eq(&sub_slug))
@@ -674,11 +659,7 @@ pub async fn update(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only edit your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -715,16 +696,10 @@ pub async fn update(
 #[delete("/r/{sub_slug}/posts/{post_slug}")]
 pub async fn delete_post(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
-
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
         .filter(subreddits::slug.eq(&sub_slug))
@@ -734,11 +709,7 @@ pub async fn delete_post(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only delete your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
 
     diesel::delete(posts::table.find(post.id))
         .execute(&mut *db)
