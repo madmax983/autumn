@@ -1,0 +1,11 @@
+[package]
+name = "openapi-explorer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+autumn-web = { version = "0.3.0", path = "../../autumn", features = ["openapi"] }
+autumn-openapi-plugin = { version = "0.3.0", path = "../../autumn-openapi-plugin" }
+serde = { workspace = true }
+serde_json = "1"

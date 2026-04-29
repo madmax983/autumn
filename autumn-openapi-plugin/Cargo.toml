@@ -1,0 +1,14 @@
+[package]
+name = "autumn-openapi-plugin"
+description = "Swagger UI and OpenAPI explorer plugin for autumn-web"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-web = { version = "0.3.0", path = "../autumn", features = ["openapi"] }
+
+[lints]
+workspace = true
