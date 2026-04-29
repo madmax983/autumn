@@ -55,10 +55,10 @@ struct DurableQueuedJob {
     initial_backoff_ms: u64,
 }
 
-static GLOBAL_JOB_CLIENT: OnceLock<RwLock<JobClient>> = OnceLock::new();
+static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Arc<JobClient>>> = OnceLock::new();
 
 #[must_use]
-pub fn global_job_client() -> Option<JobClient> {
+pub fn global_job_client() -> Option<Arc<JobClient>> {
     GLOBAL_JOB_CLIENT
         .get()
         .and_then(|lock| lock.read().ok().map(|guard| guard.clone()))
@@ -67,11 +67,11 @@ pub fn global_job_client() -> Option<JobClient> {
 pub(crate) fn init_global_job_client(client: JobClient) {
     if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
         if let Ok(mut guard) = lock.write() {
-            *guard = client;
+            *guard = Arc::new(client);
         }
         return;
     }
-    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(client));
+    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Arc::new(client)));
 }
 
 /// Enqueue a job payload on the configured runtime backend.
