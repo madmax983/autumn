@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
@@ -22,6 +21,34 @@ use http::StatusCode;
 use thiserror::Error;
 
 pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
+
+/// A group of routes sharing a common path prefix and middleware layer.
+///
+/// Created by [`AppBuilder::scoped`]. The routes are mounted under the
+/// prefix with the middleware applied only to this group.
+pub struct ScopedGroup {
+    pub(crate) prefix: String,
+    pub(crate) routes: Vec<Route>,
+    /// Closure that applies the layer to a sub-router.
+    pub(crate) apply_layer:
+        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+}
+
+/// A deferred router mutator that applies a user-registered
+/// [`tower::Layer`] to the app-wide router.
+///
+/// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
+/// `apply_middleware` where the final layer stack is assembled.
+pub type CustomLayerApplier =
+    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
+/// Metadata and deferred application closure for a user-registered layer.
+pub struct CustomLayerRegistration {
+    /// Concrete type for the registered layer.
+    pub(crate) type_id: std::any::TypeId,
+    /// Deferred router mutation that applies the layer.
+    pub(crate) apply: CustomLayerApplier,
+}
 
 /// Errors that can occur during the router build process.
 ///
@@ -113,7 +140,7 @@ pub struct RouterContext {
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`] on the ingress
     /// path so user middleware observes the generated request ID.
-    pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    pub custom_layers: Vec<CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -995,7 +1022,7 @@ fn apply_middleware(
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    custom_layers: Vec<CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -1792,7 +1819,7 @@ mod tests {
         async fn child() -> &'static str {
             "inner"
         }
-        let group = crate::app::ScopedGroup {
+        let group = ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![Route {
                 method: http::Method::GET,
@@ -1875,7 +1902,7 @@ mod tests {
             },
             repository: None,
         };
-        let group = crate::app::ScopedGroup {
+        let group = ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
             apply_layer: Box::new(|r| r),
