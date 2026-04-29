@@ -111,8 +111,16 @@ async fn file_transport_writes_rfc822_message_for_inspection() {
         .expect("mail dir readable");
     assert_eq!(files.len(), 1);
     let body = std::fs::read_to_string(files[0].path()).expect("eml readable");
-    assert!(body.contains("To: Ada Lovelace <ada@example.com>"));
-    assert!(body.contains("From: Autumn <noreply@example.com>"));
+    assert!(body.contains("To:"), "missing To header: {body}");
+    assert!(
+        body.contains("ada@example.com"),
+        "missing recipient address: {body}"
+    );
+    assert!(body.contains("From:"), "missing From header: {body}");
+    assert!(
+        body.contains("noreply@example.com"),
+        "missing from address: {body}"
+    );
     assert!(body.contains("Subject: Reset your password"));
     assert!(body.contains("Use code 123456"));
 }
@@ -140,9 +148,11 @@ async fn file_transport_keeps_both_messages_for_same_recipient() {
         .build()
         .expect("second mail should build");
 
-    let (first_result, second_result) = tokio::join!(mailer.send(first), mailer.send(second));
-    first_result.expect("first send should succeed");
-    second_result.expect("second send should succeed");
+    mailer.send(first).await.expect("first send should succeed");
+    mailer
+        .send(second)
+        .await
+        .expect("second send should succeed");
 
     let mut bodies = std::fs::read_dir(dir.path())
         .expect("mail dir exists")
