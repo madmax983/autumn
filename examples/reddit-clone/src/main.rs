@@ -7,6 +7,7 @@
 //   Repository macro    -> #[autumn_web::repository] with derived queries & REST API generation
 //   Mutation hooks      -> before_create / before_update lifecycle hooks
 //   Authentication      -> Session cookies, bcrypt hashing, session.rotate_id()
+//   Transactional Email -> Mailer extractor + #[mailer] welcome email template
 //   Authorization       -> #[secured] macro for route protection
 //   CSRF protection     -> CsrfToken extractor in forms
 //   Validation          -> #[validate(length(min, max))] on model fields

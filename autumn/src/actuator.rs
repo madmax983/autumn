@@ -329,39 +329,39 @@ impl TaskRegistry {
 
     /// Record that a task started running.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "running".to_string();
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(task) = guard.get_mut(name)
+        {
+            task.status = "running".to_string();
         }
     }
 
     /// Record that a task completed successfully.
     pub fn record_success(&self, name: &str, duration_ms: u64) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "idle".to_string();
-                task.last_run = Some(chrono::Utc::now().to_rfc3339());
-                task.last_duration_ms = Some(duration_ms);
-                task.last_result = Some("ok".to_string());
-                task.last_error = None;
-                task.total_runs += 1;
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(task) = guard.get_mut(name)
+        {
+            task.status = "idle".to_string();
+            task.last_run = Some(chrono::Utc::now().to_rfc3339());
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("ok".to_string());
+            task.last_error = None;
+            task.total_runs += 1;
         }
     }
 
     /// Record that a task failed.
     pub fn record_failure(&self, name: &str, duration_ms: u64, error: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "idle".to_string();
-                task.last_run = Some(chrono::Utc::now().to_rfc3339());
-                task.last_duration_ms = Some(duration_ms);
-                task.last_result = Some("failed".to_string());
-                task.last_error = Some(error.to_string());
-                task.total_runs += 1;
-                task.total_failures += 1;
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(task) = guard.get_mut(name)
+        {
+            task.status = "idle".to_string();
+            task.last_run = Some(chrono::Utc::now().to_rfc3339());
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("failed".to_string());
+            task.last_error = Some(error.to_string());
+            task.total_runs += 1;
+            task.total_failures += 1;
         }
     }
 

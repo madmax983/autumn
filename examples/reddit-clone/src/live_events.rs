@@ -294,13 +294,13 @@ impl LiveFeedRelayHealth {
                 .replayed_events
                 .fetch_add(replayed as u64, Ordering::Relaxed);
             self.inner.last_seen_id.store(cursor, Ordering::Relaxed);
-            if let Some(created_at) = last_created_at {
-                if let Ok(mut last_replayed_at) = self.inner.last_replayed_at.write() {
-                    *last_replayed_at = Some(
-                        chrono::DateTime::<Utc>::from_naive_utc_and_offset(created_at, Utc)
-                            .to_rfc3339(),
-                    );
-                }
+            if let Some(created_at) = last_created_at
+                && let Ok(mut last_replayed_at) = self.inner.last_replayed_at.write()
+            {
+                *last_replayed_at = Some(
+                    chrono::DateTime::<Utc>::from_naive_utc_and_offset(created_at, Utc)
+                        .to_rfc3339(),
+                );
             }
         }
     }

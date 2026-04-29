@@ -1189,6 +1189,11 @@ impl AppBuilder {
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1325,6 +1330,7 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
+    #[allow(clippy::too_many_lines)]
     async fn run_build_mode(self) {
         let Self {
             routes,
@@ -1393,6 +1399,11 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -2054,16 +2065,16 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some() {
-        if let Some(url) = &config.database.url {
-            for mig in migrations {
-                crate::migrate::auto_migrate(
-                    url,
-                    config.profile.as_deref(),
-                    config.database.auto_migrate_in_production,
-                    mig,
-                );
-            }
+    if pool.is_some()
+        && let Some(url) = &config.database.url
+    {
+        for mig in migrations {
+            crate::migrate::auto_migrate(
+                url,
+                config.profile.as_deref(),
+                config.database.auto_migrate_in_production,
+                mig,
+            );
         }
     }
 
@@ -2100,13 +2111,12 @@ fn collect_unguarded_repository_writes(
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
-        if let Some(meta) = route.repository {
-            if !meta.has_policy
-                && is_mutating_method(&route.method)
-                && seen.insert((meta.resource_type_name, meta.api_path))
-            {
-                offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-            }
+        if let Some(meta) = route.repository
+            && !meta.has_policy
+            && is_mutating_method(&route.method)
+            && seen.insert((meta.resource_type_name, meta.api_path))
+        {
+            offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
         }
     };
     for route in routes {
@@ -2203,20 +2213,18 @@ fn collect_unregistered_repository_handlers(
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
         if let Some(meta) = route.repository {
-            if let Some(check) = meta.policy_check {
-                if !check(registry)
-                    && seen_policies.insert((meta.resource_type_name, meta.api_path))
-                {
-                    missing_policies
-                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                }
+            if let Some(check) = meta.policy_check
+                && !check(registry)
+                && seen_policies.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_policies
+                    .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
-            if let Some(check) = meta.scope_check {
-                if !check(registry) && seen_scopes.insert((meta.resource_type_name, meta.api_path))
-                {
-                    missing_scopes
-                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                }
+            if let Some(check) = meta.scope_check
+                && !check(registry)
+                && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
         }
     };

@@ -60,33 +60,31 @@ where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
     // Check env overrides first
-    if let Ok(url) = env_var("AUTUMN_DATABASE__URL") {
-        if !url.is_empty() {
-            return url;
-        }
+    if let Ok(url) = env_var("AUTUMN_DATABASE__URL")
+        && !url.is_empty()
+    {
+        return url;
     }
-    if let Ok(url) = env_var("DATABASE_URL") {
-        if !url.is_empty() {
-            return url;
-        }
+    if let Ok(url) = env_var("DATABASE_URL")
+        && !url.is_empty()
+    {
+        return url;
     }
 
     // Try loading from autumn.toml
     let config_path = Path::new("autumn.toml");
-    if config_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(config_path) {
-            if let Ok(table) = toml::from_str::<toml::Table>(&contents) {
-                let value = toml::Value::Table(table);
-                if let Some(url) = value
-                    .get("database")
-                    .and_then(|db: &toml::Value| db.get("url"))
-                    .and_then(|u: &toml::Value| u.as_str())
-                {
-                    if !url.is_empty() {
-                        return url.to_string();
-                    }
-                }
-            }
+    if config_path.exists()
+        && let Ok(contents) = std::fs::read_to_string(config_path)
+        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
+    {
+        let value = toml::Value::Table(table);
+        if let Some(url) = value
+            .get("database")
+            .and_then(|db: &toml::Value| db.get("url"))
+            .and_then(|u: &toml::Value| u.as_str())
+            && !url.is_empty()
+        {
+            return url.to_string();
         }
     }
 

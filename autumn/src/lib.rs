@@ -83,6 +83,8 @@ pub mod extract;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
+#[cfg(feature = "mail")]
+pub mod mail;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;
@@ -203,6 +205,10 @@ pub use validation::Validated;
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+#[cfg(feature = "mail")]
+pub use mail::{
+    Mail, MailConfig, MailError, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
@@ -263,6 +269,9 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Generate ergonomic `send_*` and `deliver_later_*` helpers for mailer impls.
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer;
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup
@@ -710,6 +719,8 @@ pub mod reexports {
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
+    #[cfg(feature = "mail")]
+    pub use lettre;
     pub use serde_json;
     pub use tokio;
     pub use tokio_util;

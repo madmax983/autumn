@@ -271,36 +271,35 @@ impl DashboardState {
         if let Ok(resp) = client
             .get(format!("{}/actuator/metrics", self.base_url))
             .send()
+            && let Ok(m) = resp.json::<MetricsResponse>()
         {
-            if let Ok(m) = resp.json::<MetricsResponse>() {
-                // Compute throughput delta
-                let delta = m
-                    .http
-                    .requests_total
-                    .saturating_sub(self.prev_requests_total);
-                if self.prev_requests_total > 0 || !self.throughput_history.is_empty() {
-                    self.throughput_history.push_back(delta);
-                    if self.throughput_history.len() > SPARKLINE_DEPTH {
-                        self.throughput_history.pop_front();
-                    }
-                    self.throughput_history.make_contiguous();
+            // Compute throughput delta
+            let delta = m
+                .http
+                .requests_total
+                .saturating_sub(self.prev_requests_total);
+            if self.prev_requests_total > 0 || !self.throughput_history.is_empty() {
+                self.throughput_history.push_back(delta);
+                if self.throughput_history.len() > SPARKLINE_DEPTH {
+                    self.throughput_history.pop_front();
                 }
-                self.prev_requests_total = m.http.requests_total;
-
-                // Track latency history
-                self.latency_p50_history.push_back(m.http.latency_ms.p50);
-                if self.latency_p50_history.len() > SPARKLINE_DEPTH {
-                    self.latency_p50_history.pop_front();
-                }
-                self.latency_p50_history.make_contiguous();
-                self.latency_p99_history.push_back(m.http.latency_ms.p99);
-                if self.latency_p99_history.len() > SPARKLINE_DEPTH {
-                    self.latency_p99_history.pop_front();
-                }
-                self.latency_p99_history.make_contiguous();
-
-                self.metrics = m;
+                self.throughput_history.make_contiguous();
             }
+            self.prev_requests_total = m.http.requests_total;
+
+            // Track latency history
+            self.latency_p50_history.push_back(m.http.latency_ms.p50);
+            if self.latency_p50_history.len() > SPARKLINE_DEPTH {
+                self.latency_p50_history.pop_front();
+            }
+            self.latency_p50_history.make_contiguous();
+            self.latency_p99_history.push_back(m.http.latency_ms.p99);
+            if self.latency_p99_history.len() > SPARKLINE_DEPTH {
+                self.latency_p99_history.pop_front();
+            }
+            self.latency_p99_history.make_contiguous();
+
+            self.metrics = m;
         }
     }
 
@@ -308,10 +307,9 @@ impl DashboardState {
         if let Ok(resp) = client
             .get(format!("{}/actuator/tasks", self.base_url))
             .send()
+            && let Ok(t) = resp.json::<TasksResponse>()
         {
-            if let Ok(t) = resp.json::<TasksResponse>() {
-                self.tasks = t;
-            }
+            self.tasks = t;
         }
     }
 
@@ -319,10 +317,9 @@ impl DashboardState {
         if let Ok(resp) = client
             .get(format!("{}/actuator/loggers", self.base_url))
             .send()
+            && let Ok(l) = resp.json::<LoggersResponse>()
         {
-            if let Ok(l) = resp.json::<LoggersResponse>() {
-                self.loggers = l;
-            }
+            self.loggers = l;
         }
     }
 
@@ -330,10 +327,9 @@ impl DashboardState {
         if let Ok(resp) = client
             .get(format!("{}/actuator/channels", self.base_url))
             .send()
+            && let Ok(c) = resp.json::<ChannelsResponse>()
         {
-            if let Ok(c) = resp.json::<ChannelsResponse>() {
-                self.channels = c;
-            }
+            self.channels = c;
         }
     }
 }
@@ -378,36 +374,35 @@ fn run_loop(
         terminal.draw(|frame| draw(frame, state))?;
 
         // Poll for input with short timeout for smooth animations
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
-                        }
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Tab => {
-                            state.active_tab = (state.active_tab + 1) % 4;
-                        }
-                        KeyCode::BackTab => {
-                            if state.active_tab == 0 {
-                                state.active_tab = 3;
-                            } else {
-                                state.active_tab -= 1;
-                            }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            state.route_scroll = state.route_scroll.saturating_add(1);
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            state.route_scroll = state.route_scroll.saturating_sub(1);
-                        }
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            state.route_scroll = 0;
-                        }
-                        _ => {}
+        if event::poll(Duration::from_millis(100))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Tab => {
+                    state.active_tab = (state.active_tab + 1) % 4;
+                }
+                KeyCode::BackTab => {
+                    if state.active_tab == 0 {
+                        state.active_tab = 3;
+                    } else {
+                        state.active_tab -= 1;
                     }
                 }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    state.route_scroll = state.route_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    state.route_scroll = state.route_scroll.saturating_sub(1);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    state.route_scroll = 0;
+                }
+                _ => {}
             }
         }
 
@@ -774,16 +769,16 @@ fn draw_health_panel(frame: &mut ratatui::Frame, area: Rect, state: &DashboardSt
             db.active_connections,
             db.idle_connections,
         );
-    } else if let Some(checks) = &state.health.checks {
-        if let Some(db) = &checks.database {
-            push_db_pool_lines(
-                &mut lines,
-                Some(&db.status),
-                db.pool_size,
-                db.active_connections,
-                db.idle_connections,
-            );
-        }
+    } else if let Some(checks) = &state.health.checks
+        && let Some(db) = &checks.database
+    {
+        push_db_pool_lines(
+            &mut lines,
+            Some(&db.status),
+            db.pool_size,
+            db.active_connections,
+            db.idle_connections,
+        );
     }
 
     let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });

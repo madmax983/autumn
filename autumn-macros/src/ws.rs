@@ -12,13 +12,13 @@ use crate::parse;
 
 /// Check if a type pattern looks like `AppState` (bare identifier).
 fn is_app_state_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Path(type_path) = ty {
-        if type_path.qself.is_none() {
-            let segments: Vec<_> = type_path.path.segments.iter().collect();
-            // Match `AppState` or `autumn_web::AppState` etc.
-            if let Some(last) = segments.last() {
-                return last.ident == "AppState" && last.arguments.is_none();
-            }
+    if let syn::Type::Path(type_path) = ty
+        && type_path.qself.is_none()
+    {
+        let segments: Vec<_> = type_path.path.segments.iter().collect();
+        // Match `AppState` or `autumn_web::AppState` etc.
+        if let Some(last) = segments.last() {
+            return last.ident == "AppState" && last.arguments.is_none();
         }
     }
     false

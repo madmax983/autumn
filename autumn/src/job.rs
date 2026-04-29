@@ -404,13 +404,15 @@ fn start_redis_runtime(
             "invalid jobs redis url: {e}"
         )))
     })?;
-    let producer_connection =
-        redis::aio::ConnectionManager::new_lazy_with_config(client.clone(), ConnectionManagerConfig::new())
-            .map_err(|e| {
-                AutumnError::internal_server_error(std::io::Error::other(format!(
-                    "failed to create jobs redis connection manager: {e}"
-                )))
-            })?;
+    let producer_connection = redis::aio::ConnectionManager::new_lazy_with_config(
+        client.clone(),
+        ConnectionManagerConfig::new(),
+    )
+    .map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "failed to create jobs redis connection manager: {e}"
+        )))
+    })?;
 
     let queue_key = format!("{}:queue", config.redis.key_prefix);
     let dead_key = format!("{}:dead", config.redis.key_prefix);
