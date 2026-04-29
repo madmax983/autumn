@@ -22,6 +22,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
 - **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
 - **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
@@ -134,12 +135,13 @@ async fn main() {
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, real autumn-harvest onboarding and post-publication workflows, htmx voting, and profiles |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, transactional email, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, real autumn-harvest onboarding and post-publication workflows, htmx voting, and profiles |
 
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
 - [API Reference](https://docs.rs/autumn-web)

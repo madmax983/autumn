@@ -1,12 +1,11 @@
-//! Compile-pass test: `#[repository(api = ..., policy = T, scope = S)]`
-//! with valid `Policy<Model>` / `Scope<Model>` impls compiles cleanly.
+//! Compile-pass test: `#[repository(api = ..., policy = T)]`
+//! with a valid `Policy<Model>` impl compiles cleanly.
 //!
 //! Companion to `compile-fail/repository_invalid_policy_type.rs`,
 //! which pins that a typo in `policy = ...` is rejected at compile
 //! time.
 
-use autumn_web::authorization::{BoxFuture, Policy, PolicyContext, Scope};
-use autumn_web::reexports::diesel_async::AsyncPgConnection;
+use autumn_web::authorization::Policy;
 
 mod schema {
     autumn_web::reexports::diesel::table! {
@@ -31,24 +30,10 @@ pub struct WidgetPolicy;
 
 impl Policy<Widget> for WidgetPolicy {}
 
-#[derive(Default, Clone)]
-pub struct WidgetScope;
-
-impl Scope<Widget> for WidgetScope {
-    fn list<'a>(
-        &'a self,
-        _ctx: &'a PolicyContext,
-        _conn: &'a mut AsyncPgConnection,
-    ) -> BoxFuture<'a, autumn_web::AutumnResult<Vec<Widget>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-}
-
 #[autumn_web::repository(
     Widget,
     api = "/api/widgets",
     policy = WidgetPolicy,
-    scope = WidgetScope,
 )]
 pub trait WidgetRepository {}
 

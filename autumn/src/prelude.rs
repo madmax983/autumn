@@ -22,6 +22,8 @@
 //! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
@@ -60,6 +62,11 @@ pub use crate::htmx::HxResponseExt;
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+/// Transactional email types and extractor.
+#[cfg(feature = "mail")]
+pub use crate::mail::{
+    Mail, MailConfig, MailError, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// State extractor.

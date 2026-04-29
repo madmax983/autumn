@@ -332,10 +332,10 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
     if let Some(inner) = unwrap_single_generic(ty, "Json") {
         return Some(inner);
     }
-    if let Some(inner) = unwrap_single_generic(ty, "Valid") {
-        if let Some(payload) = unwrap_single_generic(&inner, "Json") {
-            return Some(payload);
-        }
+    if let Some(inner) = unwrap_single_generic(ty, "Valid")
+        && let Some(payload) = unwrap_single_generic(&inner, "Json")
+    {
+        return Some(payload);
     }
     None
 }

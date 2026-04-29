@@ -182,6 +182,44 @@ pub trait MutationHooks: Send + Sync + 'static {
     }
 }
 
+/// Stable hook-construction contract used by generated repositories.
+///
+/// This indirection keeps compile-time diagnostics anchored on Autumn-owned
+/// trait names instead of compiler-rendered `Default` wording, which is more
+/// brittle across platforms and environments.
+pub trait RepositoryHooksDefault: Sized {
+    /// Construct a hook instance for generated repository state.
+    fn autumn_default() -> Self;
+}
+
+impl<T> RepositoryHooksDefault for T
+where
+    T: Default,
+{
+    fn autumn_default() -> Self {
+        Self::default()
+    }
+}
+
+/// Stable hook-cloning contract used by generated repositories.
+///
+/// Generated repository implementations clone their hook state through this
+/// trait so compile-fail diagnostics stay deterministic across toolchains.
+pub trait RepositoryHooksClone: Sized {
+    /// Clone hook state for generated repository values.
+    #[must_use]
+    fn autumn_clone(&self) -> Self;
+}
+
+impl<T> RepositoryHooksClone for T
+where
+    T: Clone,
+{
+    fn autumn_clone(&self) -> Self {
+        self.clone()
+    }
+}
+
 // ── Default no-op hooks ──────────────────────────────────────────────
 
 /// Zero-cost no-op implementation of [`MutationHooks`].

@@ -7,6 +7,7 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
 
 - Public blog listing and slug-based post pages
 - Admin UI for create, edit, publish, and delete
+- First-party `autumn-admin-plugin` mounted at `/backoffice`
 - JSON endpoints alongside server-rendered HTML
 - Validation before insert/update
 - `#[static_get]` + `static_routes![]` for build-time rendering
@@ -57,6 +58,7 @@ static routes get written to `dist/` for deployment or CDN serving.
 | GET | `/admin/{id}/edit` | Edit post form |
 | POST | `/admin/{id}` | Update a post |
 | DELETE | `/admin/{id}` | Delete a post with htmx |
+| GET | `/backoffice/posts` | Admin plugin list view for posts |
 
 ### JSON API
 

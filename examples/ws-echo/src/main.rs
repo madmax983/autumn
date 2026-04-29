@@ -22,10 +22,10 @@ use tokio_util::sync::CancellationToken;
 async fn echo() -> impl WsHandler {
     |mut socket: WebSocket| async move {
         while let Some(Ok(msg)) = socket.recv().await {
-            if let Message::Text(text) = msg {
-                if socket.send(Message::Text(text)).await.is_err() {
-                    break;
-                }
+            if let Message::Text(text) = msg
+                && socket.send(Message::Text(text)).await.is_err()
+            {
+                break;
             }
         }
     }
@@ -55,10 +55,10 @@ async fn chat(state: AppState) -> impl WsHandler {
                         }
                     }
                     broadcast = rx.recv() => {
-                        if let Ok(msg) = broadcast {
-                            if socket.send(Message::Text(msg.into_string().into())).await.is_err() {
-                                break;
-                            }
+                        if let Ok(msg) = broadcast
+                            && socket.send(Message::Text(msg.into_string().into())).await.is_err()
+                        {
+                            break;
                         }
                     }
                     () = shutdown.cancelled() => {
