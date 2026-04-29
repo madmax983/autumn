@@ -1299,10 +1299,10 @@ impl AppBuilder {
             if !tasks.is_empty() {
                 start_task_scheduler(tasks, &state, server_shutdown.clone());
             }
-            if !jobs.is_empty() {
-                crate::job::start_runtime(jobs, &state, &server_shutdown, &config.jobs);
-            } else {
+            if jobs.is_empty() {
                 crate::job::clear_global_job_client();
+            } else {
+                crate::job::start_runtime(jobs, &state, &server_shutdown, &config.jobs);
             }
             state.probes().mark_startup_complete();
         }
