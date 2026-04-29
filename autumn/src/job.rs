@@ -55,23 +55,33 @@ struct DurableQueuedJob {
     initial_backoff_ms: u64,
 }
 
-static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Arc<JobClient>>> = OnceLock::new();
+static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
 
 #[must_use]
 pub fn global_job_client() -> Option<Arc<JobClient>> {
     GLOBAL_JOB_CLIENT
         .get()
-        .and_then(|lock| lock.read().ok().map(|guard| guard.clone()))
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
     if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
         if let Ok(mut guard) = lock.write() {
-            *guard = Arc::new(client);
+            *guard = Some(Arc::new(client));
         }
         return;
     }
-    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Arc::new(client)));
+    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Some(Arc::new(client))));
+}
+
+pub(crate) fn clear_global_job_client() {
+    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    } else {
+        let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(None));
+    }
 }
 
 /// Enqueue a job payload on the configured runtime backend.
@@ -729,5 +739,25 @@ mod tests {
         assert_eq!(status.total_failures, 1);
         assert_eq!(status.dead_letters, 1);
         assert!(status.last_error.is_some());
+    }
+
+    #[test]
+    fn clear_global_job_client_resets_client() {
+        clear_global_job_client();
+        assert!(global_job_client().is_none());
+
+        init_global_job_client(JobClient {
+            local_sender: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            registry: crate::actuator::JobRegistry::new(),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 250,
+            per_job_defaults: HashMap::new(),
+        });
+        assert!(global_job_client().is_some());
+
+        clear_global_job_client();
+        assert!(global_job_client().is_none());
     }
 }

@@ -1192,6 +1192,8 @@ impl AppBuilder {
             }
             if !jobs.is_empty() {
                 crate::job::start_runtime(jobs, &state, &server_shutdown, &config.jobs);
+            } else {
+                crate::job::clear_global_job_client();
             }
             state.probes().mark_startup_complete();
         }
