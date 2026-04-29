@@ -726,16 +726,27 @@ fn parse_oauth2_token_response(
         });
     }
 
-    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect();
-    let access_token = form.get("access_token").cloned().ok_or_else(|| {
+    let mut access_token = None;
+    let mut token_type = None;
+    let mut id_token = None;
+
+    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+        match k.as_ref() {
+            "access_token" => access_token = Some(v.into_owned()),
+            "token_type" => token_type = Some(v.into_owned()),
+            "id_token" => id_token = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+
+    let access_token = access_token.ok_or_else(|| {
         crate::AutumnError::bad_request_msg("token response missing access_token")
     })?;
+
     Ok(OAuth2TokenResponse {
         access_token,
-        token_type: form.get("token_type").cloned(),
-        id_token: form.get("id_token").cloned(),
+        token_type,
+        id_token,
     })
 }
 
