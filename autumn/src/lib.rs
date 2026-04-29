@@ -521,8 +521,6 @@ pub use autumn_macros::scheduled;
 /// ```
 pub use autumn_macros::secured;
 
-/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
-pub use autumn_macros::jobs;
 /// Enforce a record-level [`Policy`](crate::authorization::Policy)
 /// before a handler runs. Coexists with [`secured`](macro@secured):
 /// `#[secured]` answers "are you in?", `#[authorize]` answers
@@ -540,6 +538,8 @@ pub use autumn_macros::jobs;
 /// }
 /// ```
 pub use autumn_macros::authorize;
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+pub use autumn_macros::jobs;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
