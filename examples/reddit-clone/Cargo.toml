@@ -10,7 +10,7 @@ name = "reddit-clone-harvest-runner"
 path = "src/bin/harvest-runner.rs"
 
 [dependencies]
-autumn-harvest = "0.1"
+autumn-harvest = "0.2"
 autumn-harvest-plugin = "0.1"
 autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart"] }
 bytes = "1"
