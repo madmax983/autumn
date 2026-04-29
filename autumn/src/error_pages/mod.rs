@@ -73,3 +73,86 @@ pub(crate) type SharedRenderer = Arc<dyn ErrorPageRenderer>;
 pub(crate) fn default_renderer() -> SharedRenderer {
     Arc::new(DefaultErrorPages)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maud::html;
+
+    struct TestRenderer;
+
+    impl ErrorPageRenderer for TestRenderer {
+        fn render_error(&self, ctx: &ErrorContext) -> Markup {
+            html! { "Custom " (ctx.status.as_u16()) }
+        }
+
+        fn render_404(&self, _ctx: &ErrorContext) -> Markup {
+            html! { "Custom 404" }
+        }
+
+        fn render_422(&self, _ctx: &ErrorContext) -> Markup {
+            html! { "Custom 422" }
+        }
+
+        fn render_500(&self, _ctx: &ErrorContext) -> Markup {
+            html! { "Custom 500" }
+        }
+    }
+
+    #[test]
+    fn render_error_page_delegates_correctly() {
+        let renderer = TestRenderer;
+        let ctx = ErrorContext {
+            status: StatusCode::OK,
+            path: "/".to_string(),
+            message: "Test message".to_string(),
+            request_id: None,
+            details: None,
+            is_dev: false,
+        };
+
+        assert_eq!(
+            render_error_page(&renderer, StatusCode::NOT_FOUND, &ctx).into_string(),
+            "Custom 404"
+        );
+        assert_eq!(
+            render_error_page(&renderer, StatusCode::UNPROCESSABLE_ENTITY, &ctx).into_string(),
+            "Custom 422"
+        );
+        assert_eq!(
+            render_error_page(&renderer, StatusCode::INTERNAL_SERVER_ERROR, &ctx).into_string(),
+            "Custom 500"
+        );
+
+        let ctx_400 = ErrorContext {
+            status: StatusCode::BAD_REQUEST,
+            path: "/".to_string(),
+            message: "Test message".to_string(),
+            request_id: None,
+            details: None,
+            is_dev: false,
+        };
+        assert_eq!(
+            render_error_page(&renderer, StatusCode::BAD_REQUEST, &ctx_400).into_string(),
+            "Custom 400"
+        );
+    }
+
+    #[test]
+    fn default_renderer_creates_default_error_pages() {
+        let renderer = default_renderer();
+        let ctx = ErrorContext {
+            status: StatusCode::BAD_REQUEST,
+            path: "/".to_string(),
+            message: "Test message".to_string(),
+            request_id: None,
+            details: None,
+            is_dev: false,
+        };
+
+        // Just verify we can call it without a panic and it produces HTML
+        let html = render_error_page(&*renderer, StatusCode::BAD_REQUEST, &ctx).into_string();
+        assert!(html.contains("html"));
+        assert!(html.contains("400"));
+    }
+}
