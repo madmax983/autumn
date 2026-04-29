@@ -113,26 +113,25 @@ impl LogLevels {
     /// Set the level for a specific logger. Returns the previous level if any.
     #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
-        if let Ok(mut guard) = self.inner.write() {
-            // Prevent unbounded memory growth from arbitrary logger names
-            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-                return None;
-            }
-
-            let previous = guard.logger_overrides.get(name).cloned();
-            guard
-                .logger_overrides
-                .insert(name.to_string(), level.to_string());
-            // If setting the root level, update current_level too
-            if name == "root" || name.is_empty() {
-                let prev = Some(guard.current_level.clone());
-                guard.current_level = level.to_string();
-                return prev;
-            }
-            previous
-        } else {
-            None
+        let Ok(mut guard) = self.inner.write() else {
+            return None;
+        };
+        // Prevent unbounded memory growth from arbitrary logger names
+        if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+            return None;
         }
+
+        let previous = guard.logger_overrides.get(name).cloned();
+        guard
+            .logger_overrides
+            .insert(name.to_string(), level.to_string());
+        // If setting the root level, update current_level too
+        if name == "root" || name.is_empty() {
+            let prev = Some(guard.current_level.clone());
+            guard.current_level = level.to_string();
+            return prev;
+        }
+        previous
     }
 }
 
@@ -186,59 +185,66 @@ impl TaskRegistry {
 
     /// Register a task with its schedule description.
     pub fn register(&self, name: &str, schedule: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.insert(
-                name.to_string(),
-                TaskStatus {
-                    schedule: schedule.to_string(),
-                    status: "idle".to_string(),
-                    last_run: None,
-                    last_duration_ms: None,
-                    last_result: None,
-                    last_error: None,
-                    total_runs: 0,
-                    total_failures: 0,
-                },
-            );
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        guard.insert(
+            name.to_string(),
+            TaskStatus {
+                schedule: schedule.to_string(),
+                status: "idle".to_string(),
+                last_run: None,
+                last_duration_ms: None,
+                last_result: None,
+                last_error: None,
+                total_runs: 0,
+                total_failures: 0,
+            },
+        );
     }
 
     /// Record that a task started running.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(task) = guard.get_mut(name)
-        {
-            task.status = "running".to_string();
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "running".to_string();
     }
 
     /// Record that a task completed successfully.
     pub fn record_success(&self, name: &str, duration_ms: u64) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(task) = guard.get_mut(name)
-        {
-            task.status = "idle".to_string();
-            task.last_run = Some(chrono::Utc::now().to_rfc3339());
-            task.last_duration_ms = Some(duration_ms);
-            task.last_result = Some("ok".to_string());
-            task.last_error = None;
-            task.total_runs += 1;
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "idle".to_string();
+        task.last_run = Some(chrono::Utc::now().to_rfc3339());
+        task.last_duration_ms = Some(duration_ms);
+        task.last_result = Some("ok".to_string());
+        task.last_error = None;
+        task.total_runs += 1;
     }
 
     /// Record that a task failed.
     pub fn record_failure(&self, name: &str, duration_ms: u64, error: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(task) = guard.get_mut(name)
-        {
-            task.status = "idle".to_string();
-            task.last_run = Some(chrono::Utc::now().to_rfc3339());
-            task.last_duration_ms = Some(duration_ms);
-            task.last_result = Some("failed".to_string());
-            task.last_error = Some(error.to_string());
-            task.total_runs += 1;
-            task.total_failures += 1;
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "idle".to_string();
+        task.last_run = Some(chrono::Utc::now().to_rfc3339());
+        task.last_duration_ms = Some(duration_ms);
+        task.last_result = Some("failed".to_string());
+        task.last_error = Some(error.to_string());
+        task.total_runs += 1;
+        task.total_failures += 1;
     }
 
     /// Get a snapshot of all task statuses.
