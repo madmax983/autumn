@@ -310,7 +310,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let extractor_init = quote! {
             Ok(#pg_name {
                 pool,
-                hooks: Default::default(),
+                hooks: <#hooks_ident as ::std::default::Default>::default(),
             })
         };
 
