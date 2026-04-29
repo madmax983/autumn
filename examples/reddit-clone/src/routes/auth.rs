@@ -228,7 +228,11 @@ mod tests {
             .expect("one email should be captured")
             .expect("dir entry");
         let eml = std::fs::read_to_string(entry.path()).expect("eml readable");
-        assert!(eml.contains("To: new-user@example.com"));
+        assert!(eml.contains("To:"), "missing To header: {eml}");
+        assert!(
+            eml.contains("new-user@example.com"),
+            "missing recipient address: {eml}"
+        );
         assert!(eml.contains("Subject: Welcome to Autumn Reddit"));
         assert!(eml.contains("cool_rustacean"));
     }

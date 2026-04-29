@@ -606,6 +606,8 @@ impl MailTransport for FileTransport {
                 .await?;
             let eml = render_eml(&mail);
             tokio::io::AsyncWriteExt::write_all(&mut file, eml.as_bytes()).await?;
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
+            file.sync_all().await?;
             Ok(())
         })
     }
