@@ -41,7 +41,7 @@ from = "noreply@example.com"
 }
 
 #[test]
-fn mail_table_without_transport_stays_disabled() {
+fn dev_mail_table_without_transport_defaults_to_log() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("autumn.toml"),
@@ -51,11 +51,25 @@ from = "noreply@example.com"
 "#,
     )
     .expect("write config");
-    let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+    let env = MockEnv::new()
+        .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+        .with("AUTUMN_PROFILE", "dev");
 
     let config = AutumnConfig::load_with_env(&env).expect("config should load");
 
-    assert_eq!(config.mail.transport, Transport::Disabled);
+    assert_eq!(config.mail.transport, Transport::Log);
+    assert_eq!(config.mail.from.as_deref(), Some("noreply@example.com"));
+}
+
+#[test]
+fn dev_mail_env_defaults_to_log_without_explicit_transport() {
+    let env = MockEnv::new()
+        .with("AUTUMN_PROFILE", "dev")
+        .with("AUTUMN_MAIL__FROM", "noreply@example.com");
+
+    let config = AutumnConfig::load_with_env(&env).expect("config should load");
+
+    assert_eq!(config.mail.transport, Transport::Log);
     assert_eq!(config.mail.from.as_deref(), Some("noreply@example.com"));
 }
 

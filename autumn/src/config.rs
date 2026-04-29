@@ -429,22 +429,12 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
 }
 
 #[cfg(feature = "mail")]
-fn has_mail_config_source(merged: &toml::Value, env: &dyn Env) -> bool {
-    merged.get("mail").is_some()
-        || [
-            "AUTUMN_MAIL__TRANSPORT",
-            "AUTUMN_MAIL__FROM",
-            "AUTUMN_MAIL__REPLY_TO",
-            "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
-            "AUTUMN_MAIL__FILE_DIR",
-            "AUTUMN_MAIL__SMTP__HOST",
-            "AUTUMN_MAIL__SMTP__PORT",
-            "AUTUMN_MAIL__SMTP__USERNAME",
-            "AUTUMN_MAIL__SMTP__PASSWORD_ENV",
-            "AUTUMN_MAIL__SMTP__TLS",
-        ]
-        .into_iter()
-        .any(|key| env.var(key).is_ok())
+fn has_mail_transport_source(merged: &toml::Value, env: &dyn Env) -> bool {
+    merged
+        .get("mail")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|mail| mail.contains_key("transport"))
+        || env.var("AUTUMN_MAIL__TRANSPORT").is_ok()
 }
 
 /// Maximum recursion depth for merging TOML tables.
@@ -735,7 +725,7 @@ impl AutumnConfig {
         config.apply_env_overrides_with_env(env);
 
         #[cfg(feature = "mail")]
-        if config.profile.as_deref() == Some("dev") && !has_mail_config_source(&merged, env) {
+        if config.profile.as_deref() == Some("dev") && !has_mail_transport_source(&merged, env) {
             config.mail.transport = crate::mail::Transport::Log;
         }
 

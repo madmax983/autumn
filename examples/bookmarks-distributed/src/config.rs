@@ -171,15 +171,15 @@ pub fn resolve_runtime_profile(
     }
 
     for (index, arg) in args.iter().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = args.get(index + 1).filter(|value| !value.is_empty()) {
-                return Some(profile.clone());
-            }
+        if arg == "--profile"
+            && let Some(profile) = args.get(index + 1).filter(|value| !value.is_empty())
+        {
+            return Some(profile.clone());
         }
-        if let Some(profile) = arg.strip_prefix("--profile=") {
-            if !profile.is_empty() {
-                return Some(profile.to_owned());
-            }
+        if let Some(profile) = arg.strip_prefix("--profile=")
+            && !profile.is_empty()
+        {
+            return Some(profile.to_owned());
         }
     }
 

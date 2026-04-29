@@ -44,7 +44,7 @@ impl AccountMailer {
             .expect("valid mail")
     }
 
-    fn welcome_borrowed<'a>(&self, to: &'a str) -> Mail {
+    fn welcome_borrowed(&self, to: &str) -> Mail {
         let _ = std::mem::size_of_val(self);
         Mail::builder()
             .to(to)
@@ -62,7 +62,7 @@ struct GenericAccountMailer<T> {
 #[mailer]
 impl<T> GenericAccountMailer<T>
 where
-    T: Clone,
+    T: Clone + Sync,
 {
     fn welcome(&self, to: String) -> Mail {
         let _ = std::mem::size_of_val(self);
