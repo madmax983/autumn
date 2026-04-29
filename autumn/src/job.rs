@@ -394,7 +394,7 @@ fn start_redis_runtime(
             "invalid jobs redis url: {e}"
         )))
     })?;
-    let connection =
+    let producer_connection =
         redis::aio::ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
             .map_err(|e| {
                 AutumnError::internal_server_error(std::io::Error::other(format!(
@@ -420,7 +420,7 @@ fn start_redis_runtime(
     init_global_job_client(JobClient {
         local_sender: None,
         redis: Some(RedisClient {
-            connection: connection.clone(),
+            connection: producer_connection,
             queue_key: queue_key.clone(),
         }),
         registry: state.job_registry.clone(),
@@ -433,7 +433,15 @@ fn start_redis_runtime(
     for _ in 0..worker_count {
         let state = state.clone();
         let jobs_by_name = Arc::clone(&jobs_by_name);
-        let mut connection = connection.clone();
+        let mut connection = redis::aio::ConnectionManager::new_lazy_with_config(
+            client.clone(),
+            ConnectionManagerConfig::new(),
+        )
+        .map_err(|e| {
+            AutumnError::internal_server_error(std::io::Error::other(format!(
+                "failed to create jobs redis worker connection manager: {e}"
+            )))
+        })?;
         let queue_key = queue_key.clone();
         let dead_key = dead_key.clone();
         let shutdown = shutdown.clone();
