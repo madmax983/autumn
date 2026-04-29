@@ -1000,11 +1000,23 @@ mod tests {
     fn parse_oauth2_token_response_supports_form_encoded_payload() {
         let token = parse_oauth2_token_response(
             Some("application/x-www-form-urlencoded"),
-            "access_token=abc123&token_type=bearer",
+            "access_token=abc123&token_type=bearer&id_token=xyz789&extra_field=ignored",
         )
         .unwrap();
         assert_eq!(token.access_token, "abc123");
         assert_eq!(token.token_type.as_deref(), Some("bearer"));
+        assert_eq!(token.id_token.as_deref(), Some("xyz789"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn parse_oauth2_token_response_fails_without_access_token() {
+        let err = parse_oauth2_token_response(
+            Some("application/x-www-form-urlencoded"),
+            "token_type=bearer&id_token=xyz789",
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "token response missing access_token");
     }
 
     #[cfg(feature = "oauth2")]
