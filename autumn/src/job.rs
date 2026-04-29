@@ -405,7 +405,7 @@ fn start_redis_runtime(
         )))
     })?;
     let producer_connection =
-        redis::aio::ConnectionManager::new_lazy_with_config(client, ConnectionManagerConfig::new())
+        redis::aio::ConnectionManager::new_lazy_with_config(client.clone(), ConnectionManagerConfig::new())
             .map_err(|e| {
                 AutumnError::internal_server_error(std::io::Error::other(format!(
                     "failed to create jobs redis connection manager: {e}"
