@@ -104,6 +104,12 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let self_ty = input_impl.self_ty.clone();
     let input_generics = input_impl.generics.clone();
     let (impl_generics, _ty_generics, where_clause) = input_generics.split_for_impl();
+    let impl_cfg_attrs = input_impl
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut methods = Vec::new();
     for item in &input_impl.items {
         if let ImplItem::Fn(method) = item {
@@ -187,6 +193,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
     quote! {
         #input_impl
 
+        #( #impl_cfg_attrs )*
         impl #impl_generics #self_ty #where_clause {
             #( #generated )*
         }
@@ -401,6 +408,24 @@ mod tests {
         let rendered = out.to_string();
         assert!(rendered.contains("# [cfg (feature = \"welcome-mail\")] async fn send_welcome"));
         assert!(rendered.contains("# [cfg (feature = \"welcome-mail\")] fn deliver_later_welcome"));
+    }
+
+    #[test]
+    fn preserves_impl_cfg_attributes_on_generated_helper_impl() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                #[cfg(feature = "welcome-mail")]
+                impl AccountMailer {
+                    fn welcome(&self, to: String) -> Mail {
+                        let _ = to;
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(rendered.contains("# [cfg (feature = \"welcome-mail\")] impl AccountMailer"));
     }
 
     #[test]
