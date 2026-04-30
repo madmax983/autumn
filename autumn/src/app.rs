@@ -1239,8 +1239,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and serve. We start listening before startup hooks finish so
-        // `/startup` can honestly report startup progress.
+        // 7. Bind and initialize pre-serve runtime dependencies. Once those
+        // are ready, start listening before startup hooks finish so `/startup`
+        // can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1248,10 +1249,17 @@ impl AppBuilder {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
-        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
+        tracing::info!(addr = %addr, "Listening");
+
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
             axum::serve(
@@ -1292,13 +1300,6 @@ impl AppBuilder {
             run_shutdown_hooks(&shutdown_hooks).await;
             shutdown_signal_token.cancel();
         });
-
-        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
-            tracing::error!(error = %error, "job runtime initialization failed");
-            server_shutdown.cancel();
-            server_task.abort();
-            std::process::exit(1);
-        }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");

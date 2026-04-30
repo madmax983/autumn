@@ -214,9 +214,11 @@ pub(crate) fn start_runtime(
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
 ) -> AutumnResult<()> {
-    validate_unique_job_names(&jobs).unwrap_or_else(|error| {
-        panic!("invalid jobs configuration: {error}");
-    });
+    validate_unique_job_names(&jobs).map_err(|error| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "invalid jobs configuration: {error}"
+        )))
+    })?;
 
     match config.backend.as_str() {
         "local" => {
@@ -956,6 +958,43 @@ mod tests {
 
         shutdown.cancel();
         clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn start_runtime_rejects_duplicate_job_names() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let error = start_runtime(
+            vec![
+                JobInfo {
+                    name: "dupe".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 1,
+                    handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                },
+                JobInfo {
+                    name: "dupe".to_string(),
+                    max_attempts: 1,
+                    initial_backoff_ms: 1,
+                    handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                },
+            ],
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect_err("duplicate job names should surface as init errors");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid jobs configuration: duplicate job name 'dupe'"),
+            "unexpected error: {error}"
+        );
+        assert!(global_job_client().is_none());
     }
 
     #[tokio::test]
