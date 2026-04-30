@@ -74,6 +74,7 @@ fn load_manifest() -> &'static Option<AssetManifest> {
 /// // debug:   /static/css/autumn.css
 /// // release: /static/css/autumn.a1b2c3d4.css
 /// ```
+#[must_use]
 pub fn asset_url(path: &str) -> String {
     #[cfg(debug_assertions)]
     {

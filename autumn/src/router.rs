@@ -1419,7 +1419,7 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
 /// returning visitors always fetch the latest file after a deploy, while the
 /// long `immutable` policy for fingerprinted files lets browsers skip the
 /// network entirely for assets whose content will never change.
-pub(crate) async fn asset_cache_control(
+pub async fn asset_cache_control(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
