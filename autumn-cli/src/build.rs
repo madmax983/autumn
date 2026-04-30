@@ -65,19 +65,25 @@ pub fn run(debug: bool, package: Option<&str>) {
 
 /// Fingerprint every file under `static/`, write content-hashed copies, and
 /// emit `static/.autumn-manifest.json`.
+fn fingerprint_static_assets() {
+    fingerprint_assets_in(Path::new("static"));
+}
+
+/// Core fingerprinting implementation.
 ///
-/// For each file `static/css/autumn.css` the function:
+/// Accepts an explicit `static_dir` so both production code (which passes
+/// `Path::new("static")` relative to CWD) and tests (which pass an absolute
+/// temp-dir path) can exercise the same logic without changing the process CWD.
+///
+/// For each file `<static_dir>/css/autumn.css` the function:
 /// 1. Computes the SHA-256 digest of its contents.
 /// 2. Truncates the digest to 8 lowercase hex characters.
-/// 3. Writes a copy named `static/css/autumn.<hash8>.css`.
+/// 3. Writes a copy named `<static_dir>/css/autumn.<hash8>.css`.
 /// 4. Records `"css/autumn.css" -> "css/autumn.<hash8>.css"` in the manifest.
 ///
-/// Existing fingerprinted copies are removed before new ones are written so
-/// stale hashes don't accumulate across builds.
-///
-/// The manifest is written to `static/.autumn-manifest.json`.
-fn fingerprint_static_assets() {
-    let static_dir = Path::new("static");
+/// Existing fingerprinted copies recorded in the previous manifest are removed
+/// first so stale hashes don't accumulate across builds.
+fn fingerprint_assets_in(static_dir: &Path) {
     if !static_dir.exists() {
         return;
     }
@@ -209,6 +215,12 @@ fn remove_previous_fingerprints(static_dir: &Path) {
     };
     for fingerprinted_rel in files.values() {
         if let Some(rel) = fingerprinted_rel.as_str() {
+            // Reject any path that tries to escape the static directory.
+            // The manifest is written by this tool and should never contain
+            // traversal components, but guard against tampered manifests.
+            if rel.contains("..") || Path::new(rel).is_absolute() {
+                continue;
+            }
             let fp_path = static_dir.join(rel);
             if fp_path.exists() {
                 let _ = std::fs::remove_file(&fp_path);
@@ -431,13 +443,10 @@ mod tests {
         let css_content = b"body { color: red; }";
         std::fs::write(css_dir.join("autumn.css"), css_content).unwrap();
 
-        // Change cwd to tmp so fingerprint_static_assets() finds `static/`.
-        let original_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-
-        fingerprint_static_assets();
-
-        std::env::set_current_dir(original_cwd).unwrap();
+        // Call the inner function directly with an absolute path so the test
+        // never touches the process-global CWD (which is racy on all platforms
+        // and causes failures on Windows where CWD is a per-process lock).
+        fingerprint_assets_in(&static_dir);
 
         // Manifest must exist.
         let manifest_path = static_dir.join(".autumn-manifest.json");

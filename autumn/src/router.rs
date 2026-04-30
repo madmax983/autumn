@@ -1426,7 +1426,13 @@ pub async fn asset_cache_control(
     let path = req.uri().path().to_owned();
     let mut resp = next.run(req).await;
     if path.starts_with("/static/") && resp.status().is_success() {
-        let header = if crate::assets::is_fingerprinted_path(&path) {
+        // Use manifest membership rather than filename pattern so that
+        // user-authored assets like `vendor.deadbeef.js` are never given an
+        // immutable cache lifetime.
+        let is_immutable = path
+            .strip_prefix("/static/")
+            .is_some_and(crate::assets::is_manifest_asset);
+        let header = if is_immutable {
             "public, max-age=31536000, immutable"
         } else {
             "public, max-age=0, must-revalidate"

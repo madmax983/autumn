@@ -91,12 +91,33 @@ pub fn asset_url(path: &str) -> String {
     }
 }
 
-/// Returns `true` if the URI path segment looks like a fingerprinted asset.
+/// Returns `true` if `rel_path` (the portion of the URL after `/static/`) is
+/// listed as a fingerprinted value in the release asset manifest.
 ///
-/// Fingerprinted files follow the naming convention
-/// `<stem>.<8-hex-chars>.<ext>` (e.g. `autumn.a1b2c3d4.css`).
-/// This is used by the static-file middleware to decide whether to emit
-/// a long-lived immutable cache header.
+/// Gating the `immutable` cache header on manifest membership rather than
+/// filename pattern alone ensures that user-authored assets whose names
+/// happen to match `<stem>.<8hex>.<ext>` (e.g. `vendor.deadbeef.js`) are
+/// never given a year-long cache lifetime.
+///
+/// Always returns `false` in debug builds — the manifest does not exist there.
+#[cfg(not(debug_assertions))]
+pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
+    load_manifest()
+        .as_ref()
+        .is_some_and(|m| m.files.values().any(|v| v == rel_path))
+}
+
+#[cfg(debug_assertions)]
+pub(crate) const fn is_manifest_asset(_rel_path: &str) -> bool {
+    false
+}
+
+/// Returns `true` if the URI path segment looks like a fingerprinted asset
+/// by filename convention (`<stem>.<8-hex-chars>.<ext>`).
+///
+/// Only used in tests; the cache middleware uses [`is_manifest_asset`] for
+/// production cache decisions.
+#[cfg(test)]
 pub(crate) fn is_fingerprinted_path(uri_path: &str) -> bool {
     let filename = uri_path.rsplit('/').next().unwrap_or("");
     let parts: Vec<&str> = filename.split('.').collect();
