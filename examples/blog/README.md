@@ -43,6 +43,64 @@ cargo run -p autumn-cli -- build -p blog
 Dynamic routes like `/` and `/posts/{slug}` still render through the server;
 static routes get written to `dist/` for deployment or CDN serving.
 
+## Fingerprinted assets (production cache-busting)
+
+Autumn ships a zero-config asset fingerprinting pipeline.  When you run a
+release build the CLI hashes every file under `static/`, writes a
+content-hashed copy alongside the original, and records the mapping in
+`static/.autumn-manifest.json`:
+
+```
+static/css/autumn.css            ← original (kept for dev)
+static/css/autumn.a1b2c3d4.css  ← fingerprinted copy (served in production)
+static/.autumn-manifest.json    ← logical → fingerprinted path map
+```
+
+### End-to-end production deploy story
+
+```bash
+# 1. Build a release binary and fingerprint all static assets in one step
+cargo run -p autumn-cli -- build -p blog
+
+# 2. Start the server (reads static/.autumn-manifest.json at runtime)
+./target/release/blog
+```
+
+Templates call `asset_url("css/autumn.css")` instead of a hard-coded path:
+
+```rust
+// In src/routes/posts.rs — unchanged across environments
+link rel="stylesheet" href=(asset_url("css/autumn.css"));
+```
+
+| Build mode | Resolved URL |
+|-----------|--------------|
+| `cargo run` (debug) | `/static/css/autumn.css` |
+| `cargo build --release` | `/static/css/autumn.a1b2c3d4.css` |
+
+The fingerprinted URL is served with `Cache-Control: public, max-age=31536000,
+immutable`, so browsers cache it forever.  On the next deploy the hash changes
+automatically — the old URL is gone, the browser fetches the new one, and no
+CDN or cache purge is needed.
+
+Non-fingerprinted static paths (`/static/css/autumn.css`) are served with
+`Cache-Control: public, max-age=0, must-revalidate` so development and fallback
+paths always stay fresh.
+
+### How `asset_url` works
+
+```rust
+use autumn_web::prelude::*;   // asset_url is in the prelude
+
+// debug build  → "/static/css/autumn.css"
+// release build → "/static/css/autumn.a1b2c3d4.css"
+let url = asset_url("css/autumn.css");
+```
+
+If `static/.autumn-manifest.json` is absent (e.g. on a dev machine that never
+ran `autumn build --release`), `asset_url` falls back to the plain
+`/static/...` URL — so the app keeps running without any manual configuration.
+
 ## Routes
 
 ### HTML
@@ -75,5 +133,5 @@ static routes get written to `dist/` for deployment or CDN serving.
 | GET | `/actuator/health` | Detailed health view |
 | GET | `/actuator/info` | Build and runtime metadata |
 | GET | `/actuator/metrics` | Request and pool metrics |
-| GET | `/static/js/htmx.min.js` | Bundled htmx |
-| GET | `/static/css/autumn.css` | Compiled Tailwind output |
+| GET | `/static/js/htmx.min.js` | Bundled htmx (plain) or `/static/js/htmx.min.<hash>.js` (release) |
+| GET | `/static/css/autumn.css` | Compiled Tailwind output (plain) or `/static/css/autumn.<hash>.css` (release) |

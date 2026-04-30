@@ -3,6 +3,7 @@
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive publish/delete behaviour.
 
+use autumn_web::assets::asset_url;
 use autumn_web::extract::{Form, Path};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
 use diesel::prelude::*;
@@ -34,8 +35,8 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 meta name="description" content="A blog built with the Autumn web framework for Rust.";
-                link rel="stylesheet" href="/static/css/autumn.css";
-                script src="/static/js/htmx.min.js" {}
+                link rel="stylesheet" href=(asset_url("css/autumn.css"));
+                script src=(asset_url("js/htmx.min.js")) {}
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
                 // Navigation

@@ -268,9 +268,13 @@ pub fn try_build_router_inner(
     }
 
     // Static file serving from project's static/ directory.
+    // Fingerprinted assets (e.g. `autumn.a1b2c3d4.css`) are served with
+    // `Cache-Control: public, max-age=31536000, immutable`; all other static
+    // files use the default browser policy.
     let env = crate::config::OsEnv;
     let static_dir = crate::app::project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+    router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
     router = mount_scoped_groups(router, ctx.scoped_groups);
 
@@ -1401,6 +1405,45 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .allow_headers(headers)
         .allow_credentials(cors.allow_credentials)
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
+}
+
+/// Set `Cache-Control` headers for static assets based on whether the path is
+/// fingerprinted.
+///
+/// | Path | Header |
+/// |------|--------|
+/// | `/static/**.<8hex>.*` | `public, max-age=31536000, immutable` |
+/// | `/static/**` (other) | `public, max-age=0, must-revalidate` |
+/// | Everything else | unchanged |
+///
+/// The short `must-revalidate` policy for plain static paths ensures that
+/// returning visitors always fetch the latest file after a deploy, while the
+/// long `immutable` policy for fingerprinted files lets browsers skip the
+/// network entirely for assets whose content will never change.
+pub async fn asset_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let mut resp = next.run(req).await;
+    if path.starts_with("/static/") && resp.status().is_success() {
+        // Use manifest membership rather than filename pattern so that
+        // user-authored assets like `vendor.deadbeef.js` are never given an
+        // immutable cache lifetime.
+        let is_immutable = path
+            .strip_prefix("/static/")
+            .is_some_and(crate::assets::is_manifest_asset);
+        let header = if is_immutable {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=0, must-revalidate"
+        };
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static(header),
+        );
+    }
+    resp
 }
 
 #[cfg(feature = "htmx")]
