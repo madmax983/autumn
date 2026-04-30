@@ -2,11 +2,12 @@
 //!
 //! Orchestrates three steps:
 //! 1. `cargo build [--release] [-p <package>]` to compile the user's binary.
-//! 2. Run the binary with `AUTUMN_BUILD_STATIC=1` so the runtime renders
-//!    static routes to `dist/` instead of starting the HTTP server.
-//! 3. In release mode: fingerprint every file under `static/`, write
+//! 2. In release mode: fingerprint every file under `static/`, write
 //!    content-hashed copies alongside the originals, and emit
-//!    `static/.autumn-manifest.json` mapping logical → fingerprinted paths.
+//!    `static/.autumn-manifest.json` so the static renderer can resolve
+//!    fingerprinted URLs when pre-rendering HTML pages.
+//! 3. Run the binary with `AUTUMN_BUILD_STATIC=1` so the runtime renders
+//!    static routes to `dist/` instead of starting the HTTP server.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,14 @@ pub fn run(debug: bool, package: Option<&str>) {
         std::process::exit(1);
     }
 
+    // Fingerprint before the static renderer so that `asset_url()` inside
+    // pre-rendered templates resolves to the new hashed URLs rather than
+    // plain paths or stale hashes from a previous build.
+    if !debug {
+        eprintln!("\nFingerprinting static assets...");
+        fingerprint_static_assets();
+    }
+
     let binary = find_binary(debug, package);
     eprintln!("\nRunning static renderer...\n");
 
@@ -49,11 +58,6 @@ pub fn run(debug: bool, package: Option<&str>) {
     if !status.success() {
         eprintln!("\n\u{2717} Static build failed");
         std::process::exit(1);
-    }
-
-    if !debug {
-        eprintln!("\nFingerprinting static assets...");
-        fingerprint_static_assets();
     }
 
     eprintln!("\n\u{1F342} Build complete!");
@@ -78,8 +82,10 @@ fn fingerprint_static_assets() {
         return;
     }
 
-    // Remove stale fingerprinted copies from previous builds.
-    remove_stale_fingerprints(static_dir);
+    // Remove only the fingerprinted copies recorded in the previous manifest
+    // so we never accidentally delete user-authored assets whose names happen
+    // to match the `<stem>.<8hex>.<ext>` pattern (e.g. vendor.deadbeef.js).
+    remove_previous_fingerprints(static_dir);
 
     let mut manifest_files: HashMap<String, String> = HashMap::new();
     collect_and_fingerprint(static_dir, static_dir, &mut manifest_files);
@@ -108,11 +114,7 @@ fn fingerprint_static_assets() {
 
 /// Walk `dir` recursively, hash each regular file, write a fingerprinted copy,
 /// and record the mapping in `out`.
-fn collect_and_fingerprint(
-    root: &Path,
-    dir: &Path,
-    out: &mut HashMap<String, String>,
-) {
+fn collect_and_fingerprint(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -157,8 +159,14 @@ fn collect_and_fingerprint(
         };
 
         // Build the fingerprinted filename: stem + hash + extension.
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let fp_name = if ext.is_empty() {
             format!("{stem}.{hash}")
         } else {
@@ -172,10 +180,9 @@ fn collect_and_fingerprint(
         }
 
         // Record logical path -> fingerprinted path (both relative to static/).
-        if let (Ok(logical), Ok(fingerprinted)) = (
-            path.strip_prefix(root),
-            fp_path.strip_prefix(root),
-        ) {
+        if let (Ok(logical), Ok(fingerprinted)) =
+            (path.strip_prefix(root), fp_path.strip_prefix(root))
+        {
             out.insert(
                 logical.to_string_lossy().replace('\\', "/"),
                 fingerprinted.to_string_lossy().replace('\\', "/"),
@@ -184,22 +191,28 @@ fn collect_and_fingerprint(
     }
 }
 
-/// Delete fingerprinted copies from a previous build run so stale hashes
-/// don't accumulate.
-fn remove_stale_fingerprints(dir: &Path) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+/// Delete only the fingerprinted copies that were written by the previous
+/// build, identified by the values listed in `static/.autumn-manifest.json`.
+///
+/// This avoids accidentally removing user-authored assets whose filenames
+/// happen to match the `<stem>.<8hex>.<ext>` pattern (e.g. `vendor.deadbeef.js`).
+fn remove_previous_fingerprints(static_dir: &Path) {
+    let manifest_path = static_dir.join(".autumn-manifest.json");
+    let Ok(contents) = std::fs::read_to_string(&manifest_path) else {
+        return; // No previous manifest — nothing to clean up.
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            remove_stale_fingerprints(&path);
-            continue;
-        }
-        let name = entry.file_name();
-        if is_fingerprinted_filename(&name.to_string_lossy()) {
-            let _ = std::fs::remove_file(&path);
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return;
+    };
+    let Some(files) = manifest["files"].as_object() else {
+        return;
+    };
+    for fingerprinted_rel in files.values() {
+        if let Some(rel) = fingerprinted_rel.as_str() {
+            let fp_path = static_dir.join(rel);
+            if fp_path.exists() {
+                let _ = std::fs::remove_file(&fp_path);
+            }
         }
     }
 }
@@ -437,8 +450,14 @@ mod tests {
         assert_eq!(files.len(), 1, "one asset fingerprinted");
 
         let fp = files["css/autumn.css"].as_str().unwrap();
-        assert!(fp.starts_with("css/autumn."), "fingerprinted path has correct prefix");
-        assert!(fp.ends_with(".css"), "fingerprinted path has correct extension");
+        assert!(
+            fp.starts_with("css/autumn."),
+            "fingerprinted path has correct prefix"
+        );
+        assert!(
+            fp.ends_with(".css"),
+            "fingerprinted path has correct extension"
+        );
 
         // The fingerprinted copy must exist.
         assert!(

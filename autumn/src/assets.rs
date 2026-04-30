@@ -116,8 +116,14 @@ mod tests {
     #[test]
     fn asset_url_returns_static_prefix() {
         let url = asset_url("css/autumn.css");
-        assert!(url.starts_with("/static/"), "url must have /static/ prefix: {url}");
-        assert!(url.contains("autumn.css"), "url must contain asset name: {url}");
+        assert!(
+            url.starts_with("/static/"),
+            "url must have /static/ prefix: {url}"
+        );
+        assert!(
+            url.contains("autumn.css"),
+            "url must contain asset name: {url}"
+        );
     }
 
     #[test]
