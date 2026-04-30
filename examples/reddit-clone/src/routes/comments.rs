@@ -104,7 +104,9 @@ pub async fn create(
         .await?;
     publish_stored_live_event_best_effort(&state, event_id).await;
 
-    Ok(redirect_to(&*super::posts::__autumn_path_show(&sub_slug, &post_slug)))
+    Ok(redirect_to(&*super::posts::__autumn_path_show(
+        &sub_slug, &post_slug,
+    )))
 }
 
 /// htmx endpoint: load comments for a post (for lazy loading).

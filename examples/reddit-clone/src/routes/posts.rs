@@ -397,7 +397,9 @@ pub async fn submit(
         );
     }
 
-    Ok(redirect_to(&*super::subreddits::__autumn_path_show(&sub.slug)))
+    Ok(redirect_to(&*super::subreddits::__autumn_path_show(
+        &sub.slug,
+    )))
 }
 
 // ── View single post with comments ─────────────────────────────
@@ -715,7 +717,9 @@ pub async fn delete_post(
         .execute(&mut *db)
         .await?;
 
-    Ok(super::layout::hx_redirect_to(&*super::subreddits::__autumn_path_show(&sub_slug)))
+    Ok(super::layout::hx_redirect_to(
+        &*super::subreddits::__autumn_path_show(&sub_slug),
+    ))
 }
 
 // ── Helpers ────────────────────────────────────────────────────

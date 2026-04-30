@@ -6,8 +6,8 @@
 // `paths` is intentionally NOT imported directly — calling `autumn_web::paths![]`
 // generates `pub mod paths { ... }` in this scope, and importing the macro by
 // name would conflict with the generated module (both land in the same namespace).
-use autumn_web::{delete, get, post, put};
 use autumn_web::extract::Path;
+use autumn_web::{delete, get, post, put};
 
 // ── Test handlers ─────────────────────────────────────────────────────
 
@@ -180,7 +180,9 @@ fn with_query_percent_encodes_ampersand_in_value() {
 #[test]
 fn with_query_on_path_with_param() {
     assert_eq!(
-        paths::show_post(42i64).with_query("format", "json").to_string(),
+        paths::show_post(42i64)
+            .with_query("format", "json")
+            .to_string(),
         "/posts/42?format=json"
     );
 }

@@ -127,12 +127,8 @@ pub fn route_macro(
     let http_method_lit = syn::LitStr::new(http_method, proc_macro2::Span::call_site());
 
     // ── Path helper companion ────────────────────────────────────
-    let path_helper_fn = emit_path_helper(
-        &path_helper_name,
-        &path.value(),
-        &path_params,
-        &input_fn,
-    );
+    let path_helper_fn =
+        emit_path_helper(&path_helper_name, &path.value(), &path_params, &input_fn);
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -298,11 +294,8 @@ fn extract_path_param_types(path_params: &[String], input_fn: &syn::ItemFn) -> V
         match inner {
             Type::Tuple(tuple) => {
                 // Path<(T1, T2, ...)> — zip element types with param names.
-                let types: Vec<TokenStream> = tuple
-                    .elems
-                    .iter()
-                    .map(|t| display_friendly_ty(t))
-                    .collect();
+                let types: Vec<TokenStream> =
+                    tuple.elems.iter().map(|t| display_friendly_ty(t)).collect();
                 // If the tuple has fewer elements than params, fall back for extras.
                 let mut result = Vec::with_capacity(path_params.len());
                 for i in 0..path_params.len() {
@@ -343,9 +336,7 @@ fn display_friendly_ty(ty: &Type) -> TokenStream {
     if let Type::Path(type_path) = ty {
         if type_path.qself.is_none() {
             if let Some(last) = type_path.path.segments.last() {
-                if last.ident == "String"
-                    && matches!(last.arguments, PathArguments::None)
-                {
+                if last.ident == "String" && matches!(last.arguments, PathArguments::None) {
                     return quote! { impl ::std::fmt::Display };
                 }
             }
@@ -436,10 +427,7 @@ mod tests {
 
     #[test]
     fn build_path_format_string_regex_param() {
-        assert_eq!(
-            build_path_format_string("/items/{id:[0-9]+}"),
-            "/items/{}"
-        );
+        assert_eq!(build_path_format_string("/items/{id:[0-9]+}"), "/items/{}");
     }
 
     #[test]
@@ -451,5 +439,4 @@ mod tests {
     fn build_path_format_string_root() {
         assert_eq!(build_path_format_string("/"), "/");
     }
-
 }

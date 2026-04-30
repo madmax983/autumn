@@ -509,7 +509,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let update_path_helper = format_ident!("__autumn_path_{prefix}_api_update");
         let delete_path_helper = format_ident!("__autumn_path_{prefix}_api_delete");
         // Runtime format string for `{api_path}/{id}` paths.
-        let id_path_fmt = format!("{}/{{}}",api_path);
+        let id_path_fmt = format!("{}/{{}}", api_path);
 
         let id_path = format!("{api_path}/{{id}}");
 
