@@ -9,4 +9,5 @@ pub mod csrf_length_timing;
 pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
+pub mod fallback_middleware_bypass;
 pub mod session_fixation;
