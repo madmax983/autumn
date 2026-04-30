@@ -1,0 +1,40 @@
+//! Database seed binary for {{project_name}}.
+//!
+//! Run with: `autumn seed`
+//!
+//! The active profile is available as the `AUTUMN_ENV` environment variable
+//! (default: `dev`). Use it to branch on environment when needed.
+//!
+//! Re-running this seed against an already-seeded database is safe because
+//! every insert uses `ON CONFLICT DO NOTHING` (upsert-by-natural-key).
+use autumn_web::seed::SeedContext;
+
+#[tokio::main]
+async fn main() {
+    let ctx = SeedContext::build()
+        .await
+        .expect("failed to build seed context — is the database running?");
+
+    println!("Seeding database (profile: {})...", ctx.profile());
+
+    let mut db = ctx
+        .conn()
+        .await
+        .expect("failed to acquire database connection");
+
+    // TODO: insert representative data here using your project's models.
+    //
+    // Example (requires `diesel` and your schema in scope):
+    //
+    //   use crate::schema::todos::dsl::*;
+    //   diesel::insert_into(todos)
+    //       .values(...)
+    //       .on_conflict(id)
+    //       .do_nothing()
+    //       .execute(&mut db)
+    //       .await
+    //       .expect("seed insert failed");
+
+    drop(db);
+    println!("Seed complete.");
+}

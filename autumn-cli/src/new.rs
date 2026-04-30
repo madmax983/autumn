@@ -15,6 +15,8 @@ mod templates {
     pub const INPUT_CSS: &str = include_str!("templates/input.css.tmpl");
     pub const TAILWIND_CONFIG: &str = include_str!("templates/tailwind.config.js.tmpl");
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
+    pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
+    pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
 }
 
 /// Errors that can occur during project generation.
@@ -34,19 +36,22 @@ pub enum NewError {
 }
 
 /// Entry point called from `main.rs` and delegates to [`generate`].
-pub fn run(name: &str) {
+pub fn run(name: &str, with_seed: bool) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("Error: cannot determine current directory: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = generate(name, &cwd) {
+    if let Err(e) = generate(name, &cwd, with_seed) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
 /// Generate a new Autumn project under `parent_dir/name`.
-pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
+///
+/// When `with_seed` is `true`, scaffolds `src/bin/seed.rs` and adds the
+/// `[[bin]]` entry to `Cargo.toml`.
+pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), NewError> {
     validate_name(name)?;
 
     let project_dir = parent_dir.join(name);
@@ -68,10 +73,18 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
             .replace("{{autumn_version}}", autumn_version)
     };
 
-    fs::write(
-        project_dir.join("Cargo.toml"),
-        render(templates::CARGO_TOML),
-    )?;
+    // Build Cargo.toml: base + optional seed [[bin]] entry.
+    let cargo_toml = if with_seed {
+        format!(
+            "{}\n{}",
+            render(templates::CARGO_TOML),
+            render(templates::SEED_CARGO_TOML)
+        )
+    } else {
+        render(templates::CARGO_TOML)
+    };
+    fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
+
     fs::write(project_dir.join("src/main.rs"), render(templates::MAIN_RS))?;
     fs::write(
         project_dir.join("autumn.toml"),
@@ -97,6 +110,14 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
+    if with_seed {
+        fs::create_dir_all(project_dir.join("src/bin"))?;
+        fs::write(
+            project_dir.join("src/bin/seed.rs"),
+            render(templates::SEED_RS),
+        )?;
+    }
+
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
@@ -104,6 +125,9 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     println!("  Created {name}/.dockerignore");
     println!("  Created {name}/build.rs");
     println!("  Created {name}/src/main.rs");
+    if with_seed {
+        println!("  Created {name}/src/bin/seed.rs");
+    }
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
@@ -114,6 +138,11 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     println!("  cargo run");
     println!();
     println!("Your app will be available at http://localhost:3000");
+    if with_seed {
+        println!();
+        println!("Seed your database:");
+        println!("  autumn migrate && autumn seed");
+    }
 
     Ok(())
 }
@@ -229,7 +258,7 @@ mod tests {
     #[test]
     fn generates_all_expected_files() {
         let tmp = TempDir::new().unwrap();
-        generate("test-app", tmp.path()).unwrap();
+        generate("test-app", tmp.path(), false).unwrap();
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
@@ -249,7 +278,7 @@ mod tests {
     #[test]
     fn cargo_toml_has_project_name() {
         let tmp = TempDir::new().unwrap();
-        generate("my-cool-app", tmp.path()).unwrap();
+        generate("my-cool-app", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml")).unwrap();
         assert!(content.contains(r#"name = "my-cool-app""#));
@@ -259,7 +288,7 @@ mod tests {
     #[test]
     fn cargo_toml_has_autumn_version() {
         let tmp = TempDir::new().unwrap();
-        generate("ver-check", tmp.path()).unwrap();
+        generate("ver-check", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml")).unwrap();
         let expected = format!(r#"autumn-web = "{}""#, env!("CARGO_PKG_VERSION"));
@@ -269,7 +298,7 @@ mod tests {
     #[test]
     fn main_rs_has_sample_routes() {
         let tmp = TempDir::new().unwrap();
-        generate("route-check", tmp.path()).unwrap();
+        generate("route-check", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("route-check/src/main.rs")).unwrap();
         assert!(content.contains(r#"#[get("/")]"#));
@@ -282,7 +311,7 @@ mod tests {
     #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();
-        generate("cfg-check", tmp.path()).unwrap();
+        generate("cfg-check", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("cfg-check/autumn.toml")).unwrap();
         assert!(content.contains("port = 3000"));
@@ -294,7 +323,7 @@ mod tests {
     #[test]
     fn autumn_toml_has_crate_name_in_db_url() {
         let tmp = TempDir::new().unwrap();
-        generate("my-db-app", tmp.path()).unwrap();
+        generate("my-db-app", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml")).unwrap();
         assert!(content.contains("my_db_app"));
@@ -303,7 +332,7 @@ mod tests {
     #[test]
     fn gitignore_excludes_target_and_css() {
         let tmp = TempDir::new().unwrap();
-        generate("gi-check", tmp.path()).unwrap();
+        generate("gi-check", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore")).unwrap();
         assert!(content.contains("/target"));
@@ -314,7 +343,7 @@ mod tests {
     #[test]
     fn generated_build_rs_reruns_on_css_input_changes() {
         let tmp = TempDir::new().unwrap();
-        generate("css-watch-check", tmp.path()).unwrap();
+        generate("css-watch-check", tmp.path(), false).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
@@ -325,7 +354,7 @@ mod tests {
     #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
-        generate("placeholder-check", tmp.path()).unwrap();
+        generate("placeholder-check", tmp.path(), false).unwrap();
 
         let p = tmp.path().join("placeholder-check");
         for entry in walkdir(&p) {
@@ -341,8 +370,8 @@ mod tests {
     #[test]
     fn already_exists_error() {
         let tmp = TempDir::new().unwrap();
-        generate("dupe-check", tmp.path()).unwrap();
-        let err = generate("dupe-check", tmp.path()).unwrap_err();
+        generate("dupe-check", tmp.path(), false).unwrap();
+        let err = generate("dupe-check", tmp.path(), false).unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
         assert!(err.to_string().contains("already exists"));
     }
@@ -350,7 +379,7 @@ mod tests {
     #[test]
     fn invalid_name_error() {
         let tmp = TempDir::new().unwrap();
-        let err = generate("123bad", tmp.path()).unwrap_err();
+        let err = generate("123bad", tmp.path(), false).unwrap_err();
         assert!(matches!(err, NewError::InvalidName(_, _)));
     }
 
@@ -367,5 +396,62 @@ mod tests {
             }
         }
         files
+    }
+
+    // ── --with-seed tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn no_seed_bin_without_flag() {
+        let tmp = TempDir::new().unwrap();
+        generate("no-seed-app", tmp.path(), false).unwrap();
+        assert!(!tmp.path().join("no-seed-app/src/bin/seed.rs").exists());
+    }
+
+    #[test]
+    fn generates_seed_bin_when_with_seed() {
+        let tmp = TempDir::new().unwrap();
+        generate("seed-app", tmp.path(), true).unwrap();
+        assert!(tmp.path().join("seed-app/src/bin/seed.rs").is_file());
+    }
+
+    #[test]
+    fn with_seed_cargo_toml_has_bin_entry() {
+        let tmp = TempDir::new().unwrap();
+        generate("seed-cargo", tmp.path(), true).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("seed-cargo/Cargo.toml")).unwrap();
+        assert!(content.contains("[[bin]]"), "Cargo.toml should have [[bin]]");
+        assert!(
+            content.contains("seed"),
+            "Cargo.toml [[bin]] entry should mention 'seed'"
+        );
+    }
+
+    #[test]
+    fn no_bin_entry_in_cargo_toml_without_flag() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-cargo", tmp.path(), false).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("plain-cargo/Cargo.toml")).unwrap();
+        assert!(
+            !content.contains("[[bin]]"),
+            "Cargo.toml should not have [[bin]] when --with-seed is off"
+        );
+    }
+
+    #[test]
+    fn with_seed_no_unsubstituted_placeholders() {
+        let tmp = TempDir::new().unwrap();
+        generate("seed-placeholder-check", tmp.path(), true).unwrap();
+
+        let p = tmp.path().join("seed-placeholder-check");
+        for entry in walkdir(&p) {
+            let content = fs::read_to_string(&entry).unwrap();
+            assert!(
+                !content.contains("{{"),
+                "unsubstituted placeholder in {}",
+                entry.display()
+            );
+        }
     }
 }
