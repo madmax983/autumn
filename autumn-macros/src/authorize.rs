@@ -2,7 +2,7 @@
 //!
 //! Generates a record-level authorization guard that runs as the
 //! first statement of the handler body. Resolves the
-//! [`Policy`](autumn_web::authorization::Policy) registered for the
+//! `Policy` registered for the
 //! resource type, calls the matching action method, and returns
 //! the configured deny response (`403` or `404`) on failure.
 //!
