@@ -42,43 +42,8 @@ pub use layer::{CacheResponseLayer, CacheResponseService};
 pub use moka_impl::MokaCache;
 
 use std::any::Any;
-use std::hash::{Hash, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-
-/// Inline FNV-1a hash implementation for fast, non-cryptographic hashing.
-///
-/// ⚡ Bolt Optimization:
-/// FNV-1a is significantly faster than `DefaultHasher` (`SipHash`) for
-/// hashing small data (like function arguments to form a cache key)
-/// where `HashDoS` resistance is not required. It avoids the overhead
-/// of `SipHash`'s cryptographic operations.
-struct Fnv1aHasher {
-    hash: u64,
-}
-
-impl Fnv1aHasher {
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            hash: 0xcbf2_9ce4_8422_2325,
-        }
-    }
-}
-
-impl Hasher for Fnv1aHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.hash ^= u64::from(byte);
-            self.hash = self.hash.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-}
 
 // ── Cache trait ──────────────────────────────────────────────────────
 
@@ -165,11 +130,11 @@ impl<T: Clone, E> CacheableResult for Result<T, E> {
 /// Build a cache key from a function name and its hashable arguments.
 ///
 /// Used by `#[cached]` macro-generated code. The key is
-/// `"{fn_name}:{hash_hex}"` where the hash is a fast, 64-bit FNV-1a
+/// `"{fn_name}:{hash_hex}"` where the hash is a 64-bit `DefaultHasher`
 /// digest of the argument tuple.
 #[must_use]
 pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
-    let mut hasher = Fnv1aHasher::new();
+    let mut hasher = DefaultHasher::new();
     args.hash(&mut hasher);
     format!("{}:{:x}", fn_name, hasher.finish())
 }
