@@ -27,10 +27,10 @@ pub use autumn_macros::mailer;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
-/// HTTP method route macros, main macro, and route collection.
+/// HTTP method route macros, main macro, route collection, and path helpers.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, post, put, routes,
-    scheduled, secured, service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, paths, post, put,
+    routes, scheduled, secured, service, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────

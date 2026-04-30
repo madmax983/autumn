@@ -486,6 +486,56 @@ async fn edit_post(
 - Coexists with `#[secured]`: stack both attributes when a route should
   require both authentication/role gating and a record-level check.
 
+### `#[get]` / `#[post]` / … — path helper companion
+
+Every HTTP-method route macro also emits a **path helper** companion alongside
+the route-info companion. The helper produces a [`PathBuilder`] for use with
+`paths::*` call sites.
+
+**You write:**
+
+```rust
+#[get("/posts/{id}")]
+async fn show_post(Path(id): Path<i64>, db: Db) -> Markup { /* … */ }
+```
+
+**Generates (in addition to the route companion):**
+
+```rust
+// Path helper — accepts typed params inferred from Path<T> extractor.
+pub fn __autumn_path_show_post(id: i64) -> autumn_web::PathBuilder {
+    autumn_web::PathBuilder::new(format!("/posts/{}", id))
+}
+
+// Route companion (unchanged)
+pub fn __autumn_route_info_show_post() -> Route { /* … */ }
+```
+
+The `paths![]` collection macro re-exports these under clean names:
+
+```rust
+autumn_web::paths![show_post, list_posts];
+// Expands to:
+// pub mod paths {
+//     pub use super::__autumn_path_show_post as show_post;
+//     pub use super::__autumn_path_list_posts as list_posts;
+// }
+```
+
+The optional `#[name = "custom"]` attribute on the handler overrides the
+generated helper name:
+
+```rust
+#[get("/posts/{id}")]
+#[name = "article_url"]
+async fn show_post(Path(id): Path<i64>) -> Markup { /* … */ }
+// generated: pub fn __autumn_path_article_url(id: i64) -> PathBuilder { … }
+```
+
+See [`docs/guide/path-helpers.md`](path-helpers.md) for the full guide.
+
+---
+
 ### `#[static_get("/path")]`
 
 Generates both a route companion (same as `#[get]`) and a static metadata

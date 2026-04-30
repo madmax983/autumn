@@ -605,6 +605,7 @@ workflows with retries and complex DAGs, see `autumn-harvest`.
 | Update struct naming  | N/A (same model)           | `Post` → `UpdatePost`        |
 | Repo struct naming    | N/A (Active Record)        | `Post` → `PgPostRepository`  |
 | Service struct naming | N/A                        | `OrderService` → `OrderServiceImpl` |
+| URL path helpers      | `user_path(@user)`, `users_path` | `paths::show_user(id)`, `paths::list_users()` |
 | Config file           | `config/database.yml`      | `autumn.toml`                 |
 | Profile config        | `config/environments/`     | `autumn-{profile}.toml`       |
 
@@ -624,6 +625,7 @@ workflows with retries and complex DAGs, see `autumn-harvest`.
 | Service layer          | `@Service`             | Service class         | Service object         | `#[service]`                    |
 | Validation             | `@Valid`               | `Form.is_valid()`     | `validates`            | `Valid<T>` + `validator`        |
 | Error handling         | `@ExceptionHandler`    | Middleware             | `rescue_from`          | `AutumnResult` + `?`            |
+| Typed URL helpers      | `MvcUriComponentsBuilder` | None               | `user_path(@user)`     | `paths::show_post(id)`          |
 | Auth annotation        | `@PreAuthorize`        | `@login_required`     | `before_action`        | `#[secured("role")]`            |
 | Config file            | `application.yml`      | `settings.py`         | `config/*.yml`         | `autumn.toml`                   |
 | Profiles               | `spring.profiles`      | `DJANGO_SETTINGS`     | `RAILS_ENV`            | `AUTUMN_PROFILE`                |

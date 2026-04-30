@@ -44,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Option<…>` for any of them) and `--dry-run` / `--force` flags. New
   `docs/guide/generators.md` walks through the five-commands-to-CRUD flow.
   Non-breaking; no runtime surface changes.
+- **path-helpers:** Typed URL path helpers generated from route macros (#499).
+  Every `#[get]`, `#[post]`, `#[put]`, `#[delete]`, and `#[patch]` macro now
+  emits a `pub fn __autumn_path_{name}(params...) -> PathBuilder` companion
+  alongside the route handler. The `paths![]` collection macro gathers these
+  into a `pub mod paths { ... }` block so callers write
+  `paths::show_post(post.id)` instead of `format!("/posts/{}", post.id)`.
+  Path parameter types are inferred from the handler's `Path<T>` extractor
+  (single type or tuple for multiple params); untyped params fall back to
+  `impl Display`. `PathBuilder` supports fluent query-string construction via
+  `.with_query("key", value)` with RFC 3986–compliant percent-encoding, and
+  `.into_redirect()` for zero-boilerplate `axum::response::Redirect` returns.
+  An optional `#[name = "custom_name"]` attribute on any route handler
+  overrides the generated helper name to avoid collisions across modules or
+  improve call-site readability. Non-breaking: existing `format!("/…", …)`
+  call sites continue to compile; helpers are purely additive.
+  See [`docs/guide/path-helpers.md`](docs/guide/path-helpers.md).
 
 ## [0.3.0] - 2026-04-27
 

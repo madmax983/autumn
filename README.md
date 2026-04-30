@@ -15,6 +15,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 ## Features
 
 - **Route and app macros** - `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `routes![]`, `#[autumn_web::main]`
+- **Typed path helpers** - `paths::show_post(id)` generated at compile time from route declarations; `PathBuilder` with fluent `.with_query()` and `.into_redirect()` (see [path helpers guide](docs/guide/path-helpers.md))
 - **Pre-rendering pages to static HTML** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
 - **Application builder** - `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides

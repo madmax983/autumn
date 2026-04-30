@@ -24,6 +24,7 @@ mod oauth2_callback;
 mod param_helpers;
 mod parse;
 mod repository;
+mod paths_macro;
 mod route;
 mod routes_macro;
 mod scheduled;
@@ -159,6 +160,37 @@ pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
+}
+
+/// Generate a `pub mod paths { ... }` block from a list of route handlers.
+///
+/// Each handler listed must be annotated with a route macro (`#[get]`,
+/// `#[post]`, etc.).  The macro re-exports the generated
+/// `__autumn_path_{name}` companion functions under their original names so
+/// callers can write `paths::show_post(id)` instead of
+/// `format!("/posts/{}", id)`.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::{get, paths, routes};
+///
+/// #[get("/posts/{id}")]
+/// async fn show_post(_id: Path<i64>) -> &'static str { "post" }
+///
+/// paths![show_post];
+///
+/// // Generates:
+/// // pub mod paths {
+/// //     pub use super::__autumn_path_show_post as show_post;
+/// // }
+///
+/// // Usage:
+/// let url = paths::show_post(42i64).to_string(); // "/posts/42"
+/// ```
+#[proc_macro]
+pub fn paths(input: TokenStream) -> TokenStream {
+    paths_macro::paths_macro(input.into()).into()
 }
 
 /// Set up the async runtime for an Autumn application.

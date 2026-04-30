@@ -111,6 +111,8 @@ pub(crate) mod logging;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
+pub mod paths;
+pub use paths::PathBuilder;
 pub mod prelude;
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route};
@@ -430,6 +432,27 @@ pub use autumn_macros::put;
 /// # }
 /// ```
 pub use autumn_macros::routes;
+
+/// Generate a `pub mod paths { ... }` block for type-safe URL path helpers.
+///
+/// Takes the same comma-separated handler list as [`routes![]`](routes), and
+/// expands into a `paths` module that re-exports each handler's
+/// `__autumn_path_{name}` companion under its clean name.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::{get, paths};
+/// use autumn_web::extract::Path;
+///
+/// #[get("/posts/{id}")]
+/// async fn show_post(_id: Path<i64>) -> &'static str { "post" }
+///
+/// paths![show_post];
+///
+/// let url = paths::show_post(42i64).to_string(); // "/posts/42"
+/// ```
+pub use autumn_macros::paths;
 
 /// Cache the return value of a function based on its arguments.
 ///
