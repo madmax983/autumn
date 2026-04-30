@@ -133,8 +133,8 @@ type PoolProviderFactory = Box<
 
 /// Builder for configuring and launching an Autumn application.
 ///
-/// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
-/// then call [`.run()`](Self::run) to start the HTTP server.
+/// Created by [`app()`]. Collect routes with [`.routes()`](AppBuilder::routes),
+/// then call [`.run()`](AppBuilder::run) to start the HTTP server.
 ///
 /// The builder follows the **builder pattern**: each method consumes `self`
 /// and returns a new `AppBuilder`, allowing chained calls.
@@ -1051,7 +1051,7 @@ impl AppBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if no routes have been registered via [`.routes()`](Self::routes).
+    /// Panics if no routes have been registered via [`.routes()`](AppBuilder::routes).
     /// This is intentional -- an application with no routes is always a
     /// developer error.
     #[allow(clippy::too_many_lines)]
@@ -2159,7 +2159,7 @@ fn validate_repository_api_policies(
 /// Refuse to start when a `#[repository(policy = X)]`-annotated
 /// route exists but the corresponding `.policy::<R, _>(X)`
 /// registration was never actually applied to the live
-/// [`PolicyRegistry`].
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
 ///
 /// `validate_repository_api_policies` runs *before* the registry is
 /// populated and only checks the macro-set `has_policy` flag. This

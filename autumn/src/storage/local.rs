@@ -1,4 +1,4 @@
-//! Local-disk implementation of [`BlobStore`](super::BlobStore).
+//! Local-disk implementation of [`BlobStore`].
 //!
 //! Bytes land under a configurable `root` directory; URLs are
 //! HMAC-SHA256-signed and time-bounded, served by an axum router mounted

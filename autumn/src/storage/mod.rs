@@ -7,7 +7,7 @@
 //!   directory and serves bytes through an autumn-mounted route at
 //!   `[storage.local].mount_path` (default `/_blobs`). URLs are signed
 //!   with HMAC-SHA256 and time-bounded.
-//! - **[`S3`](s3::S3BlobStore)** (gated behind `storage-s3`) — talks to
+//! - **`S3`** (gated behind `storage-s3`) — talks to
 //!   any S3-compatible endpoint (AWS S3, Cloudflare R2, `MinIO`,
 //!   `DigitalOcean` Spaces, Wasabi) and emits real S3 presigned URLs.
 //!
@@ -176,7 +176,7 @@ impl BlobStoreError {
 ///
 /// Implement this trait to add new backends. Two are provided
 /// out of the box: [`LocalBlobStore`] and (with feature `storage-s3`)
-/// [`s3::S3BlobStore`].
+/// `S3BlobStore`.
 ///
 /// The trait is **dyn-safe** so apps can hold `Arc<dyn BlobStore>` and
 /// swap backends at runtime — for example, choosing local in tests and

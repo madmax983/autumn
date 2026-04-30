@@ -39,7 +39,7 @@ pub struct RepositoryApiMeta {
     pub has_policy: bool,
 
     /// Type-erased registry probe emitted by the macro when
-    /// `policy = ...` is set. Returns `true` if a [`Policy`] is
+    /// `policy = ...` is set. Returns `true` if a [`Policy`](crate::authorization::Policy) is
     /// registered on the runtime
     /// [`PolicyRegistry`](crate::authorization::PolicyRegistry) for
     /// the resource type. Lets the app builder fail fast at
@@ -52,7 +52,7 @@ pub struct RepositoryApiMeta {
     pub policy_check: Option<fn(&crate::authorization::PolicyRegistry) -> bool>,
 
     /// Type-erased registry probe emitted by the macro when
-    /// `scope = ...` is set. Returns `true` if a [`Scope`] is
+    /// `scope = ...` is set. Returns `true` if a [`Scope`](crate::authorization::Scope) is
     /// registered for the resource type. Companion to
     /// [`Self::policy_check`] for the scope-list code path: the
     /// generated `GET /<api>` handler resolves the scope from the
