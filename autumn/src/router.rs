@@ -1406,25 +1406,34 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
 }
 
-/// Attach `Cache-Control: public, max-age=31536000, immutable` to successful
-/// responses for fingerprinted static assets.
+/// Set `Cache-Control` headers for static assets based on whether the path is
+/// fingerprinted.
 ///
-/// A path is considered fingerprinted when its filename contains an
-/// 8-character lowercase hex hash between two dots (e.g.
-/// `autumn.a1b2c3d4.css`). All other requests pass through unchanged.
+/// | Path | Header |
+/// |------|--------|
+/// | `/static/**.<8hex>.*` | `public, max-age=31536000, immutable` |
+/// | `/static/**` (other) | `public, max-age=0, must-revalidate` |
+/// | Everything else | unchanged |
+///
+/// The short `must-revalidate` policy for plain static paths ensures that
+/// returning visitors always fetch the latest file after a deploy, while the
+/// long `immutable` policy for fingerprinted files lets browsers skip the
+/// network entirely for assets whose content will never change.
 pub(crate) async fn asset_cache_control(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_owned();
     let mut resp = next.run(req).await;
-    if path.starts_with("/static/")
-        && crate::assets::is_fingerprinted_path(&path)
-        && resp.status().is_success()
-    {
+    if path.starts_with("/static/") && resp.status().is_success() {
+        let header = if crate::assets::is_fingerprinted_path(&path) {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=0, must-revalidate"
+        };
         resp.headers_mut().insert(
             http::header::CACHE_CONTROL,
-            http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+            http::HeaderValue::from_static(header),
         );
     }
     resp
