@@ -508,8 +508,18 @@ pub fn model_list_page(
                         "(" (result.total) ")"
                     }
                 }
-                a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
-                    "+ Add " (model_slug.trim_end_matches('s'))
+
+                div style="display: flex; gap: 0.5rem;" {
+                    a href={ (prefix) "/" (model_slug) "/export?dir=" (sort_dir.as_str())
+                        @if let Some(s) = sort_by { "&sort=" (s) }
+                        @if !search_enc.is_empty() { "&q=" (search_enc) }
+                        (filters_enc)
+                    } class="btn" {
+                        "Export to CSV"
+                    }
+                    a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
+                        "+ Add " (model_slug.trim_end_matches('s'))
+                    }
                 }
             }
 
@@ -1953,6 +1963,45 @@ mod tests {
         assert!(
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
+        );
+    }
+
+    #[test]
+    fn list_page_renders_export_csv_button() {
+        use crate::traits::ListResult;
+        let r = dummy_registry();
+        let fields = vec![AdminField::new("name", AdminFieldKind::Text)];
+        let result = ListResult {
+            records: vec![],
+            total: 0,
+            page: 1,
+            per_page: 25,
+        };
+        let html = model_list_page(
+            &r,
+            "widgets",
+            "Widgets",
+            &fields,
+            &[],
+            &result,
+            "search_query_test",
+            Some("name"),
+            SortDirection::Desc,
+            &[("status".to_string(), "active".to_string())],
+            &[],
+            "tok",
+            "/admin",
+            "/actuator",
+        )
+        .into_string();
+
+        assert!(
+            html.contains("Export to CSV"),
+            "list view must render an Export to CSV button: {html}"
+        );
+        assert!(
+            html.contains(r#"href="/admin/widgets/export?dir=desc&amp;sort=name&amp;q=search_query_test&amp;filter.status=active""#),
+            "export link must preserve search, sort, and filters: {html}"
         );
     }
 }

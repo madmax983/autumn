@@ -106,6 +106,7 @@ pub fn admin_router(
         .route("/", routing::get(dashboard))
         // Model routes (dynamic dispatch via slug)
         .route("/{slug}", routing::get(model_list).post(model_create))
+        .route("/{slug}/export", routing::get(model_export))
         .route("/{slug}/new", routing::get(model_new_form))
         .route(
             "/{slug}/{id}",
@@ -357,6 +358,90 @@ async fn model_list(
         &prefix,
         &actuator_prefix,
     )))
+}
+
+/// `GET /admin/{slug}/export` — Export model list as CSV.
+#[allow(clippy::too_many_arguments)]
+async fn model_export(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    Path(slug): Path<String>,
+    Query(query): Query<ListQuery>,
+    Query(raw_query): Query<HashMap<String, String>>,
+) -> AutumnResult<Response> {
+    let (pool, model) = resolve(&state, &registry, &slug)?;
+
+    let ListQuery { q, sort, dir, .. } = query;
+    let fields = model.fields();
+    let sort = validate_sort_key(sort, &fields);
+    let filters = extract_filters(&raw_query, &fields);
+
+    let params = ListParams {
+        page: 1,
+        // hard limit for export to avoid blowing up memory
+        per_page: 10_000,
+        search: (!q.is_empty()).then_some(q),
+        sort_by: sort,
+        sort_dir: dir,
+        filters,
+    };
+
+    let result = model.list(&pool, params).await?;
+
+    // Determine which fields should be exported.
+    let export_fields: Vec<_> = fields
+        .iter()
+        .filter(|f| {
+            f.list_display && !matches!(f.kind, AdminFieldKind::Password | AdminFieldKind::Hidden)
+        })
+        .collect();
+
+    let mut wtr = csv::Writer::from_writer(vec![]);
+
+    // Write headers
+    let headers: Vec<&str> = export_fields.iter().map(|f| f.label.as_str()).collect();
+    if let Err(e) = wtr.write_record(&headers) {
+        return Err(AutumnError::internal_server_error_msg(format!(
+            "CSV header error: {e}"
+        )));
+    }
+
+    // Write rows
+    for record in &result.records {
+        let mut row = Vec::new();
+        for field in &export_fields {
+            let val_str = match record.get(field.name) {
+                Some(Value::Null) | None => String::new(),
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                Some(Value::Bool(b)) => b.to_string(),
+                Some(v) => v.to_string(), // Arrays or objects as JSON string
+            };
+            row.push(val_str);
+        }
+        if let Err(e) = wtr.write_record(&row) {
+            return Err(AutumnError::internal_server_error_msg(format!(
+                "CSV row error: {e}"
+            )));
+        }
+    }
+
+    let csv_data = wtr
+        .into_inner()
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("CSV finish error: {e}")))?;
+
+    let filename = format!("{slug}.csv");
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(axum::body::Body::from(csv_data))
+        .unwrap();
+
+    Ok(response)
 }
 
 /// `GET /admin/{slug}/new` — Create form.
