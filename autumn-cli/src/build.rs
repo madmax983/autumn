@@ -455,7 +455,9 @@ mod tests {
             "fingerprinted path has correct prefix"
         );
         assert!(
-            fp.ends_with(".css"),
+            std::path::Path::new(fp)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("css")),
             "fingerprinted path has correct extension"
         );
 
