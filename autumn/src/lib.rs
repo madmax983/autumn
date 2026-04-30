@@ -123,6 +123,7 @@ pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
 
+pub mod job;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
@@ -480,6 +481,8 @@ pub use autumn_macros::cached;
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 
+/// Declare an on-demand background job. See [`job`] module.
+pub use autumn_macros::job;
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
 
@@ -544,6 +547,8 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::authorize;
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+pub use autumn_macros::jobs;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
@@ -716,6 +721,7 @@ pub mod reexports {
     pub use http;
     #[cfg(feature = "mail")]
     pub use lettre;
+    pub use serde_json;
     pub use tokio;
     pub use tokio_util;
     pub use tracing;

@@ -74,6 +74,12 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `redis` |
+//! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
+//! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
+//! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
+//! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
@@ -626,6 +632,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub session: crate::session::SessionConfig,
 
+    /// Background job backend and runtime settings.
+    #[serde(default)]
+    pub jobs: JobConfig,
+
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -643,6 +653,80 @@ pub struct AutumnConfig {
     #[cfg(feature = "mail")]
     #[serde(default)]
     pub mail: crate::mail::MailConfig,
+}
+
+/// Background job runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobConfig {
+    /// Runtime backend selection.
+    ///
+    /// - `local` (default): in-process Tokio queue
+    /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    #[serde(default = "default_job_backend")]
+    pub backend: String,
+    /// Number of concurrent worker loops to spawn.
+    #[serde(default = "default_job_workers")]
+    pub workers: usize,
+    /// Default max attempts when `#[job(max_attempts = ...)]` is not set.
+    #[serde(default = "default_job_max_attempts")]
+    pub max_attempts: u32,
+    /// Default initial retry backoff in milliseconds.
+    #[serde(default = "default_job_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Redis backend options.
+    #[serde(default)]
+    pub redis: JobRedisConfig,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_job_backend(),
+            workers: default_job_workers(),
+            max_attempts: default_job_max_attempts(),
+            initial_backoff_ms: default_job_backoff_ms(),
+            redis: JobRedisConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobRedisConfig {
+    /// Redis URL used when `jobs.backend = "redis"`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Key prefix for all queue keys.
+    #[serde(default = "default_jobs_redis_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for JobRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_jobs_redis_prefix(),
+        }
+    }
+}
+
+fn default_job_backend() -> String {
+    "local".to_owned()
+}
+
+const fn default_job_workers() -> usize {
+    1
+}
+
+const fn default_job_max_attempts() -> u32 {
+    5
+}
+
+const fn default_job_backoff_ms() -> u64 {
+    250
+}
+
+fn default_jobs_redis_prefix() -> String {
+    "autumn:jobs".to_owned()
 }
 
 impl AutumnConfig {
@@ -817,6 +901,14 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
+    ///
+    /// # Jobs
+    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
+    /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
+    /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
+    /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
+    /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -830,6 +922,7 @@ impl AutumnConfig {
         self.apply_health_env_overrides_with_env(env);
         self.apply_cors_env_overrides_with_env(env);
         self.apply_session_env_overrides_with_env(env);
+        self.apply_jobs_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
@@ -1018,6 +1111,27 @@ impl AutumnConfig {
             env,
             "AUTUMN_SESSION__REDIS__KEY_PREFIX",
             &mut self.session.redis.key_prefix,
+        );
+    }
+
+    fn apply_jobs_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_JOBS__BACKEND", &mut self.jobs.backend);
+        parse_env(env, "AUTUMN_JOBS__WORKERS", &mut self.jobs.workers);
+        parse_env(
+            env,
+            "AUTUMN_JOBS__MAX_ATTEMPTS",
+            &mut self.jobs.max_attempts,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__INITIAL_BACKOFF_MS",
+            &mut self.jobs.initial_backoff_ms,
+        );
+        parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
+        parse_env_string(
+            env,
+            "AUTUMN_JOBS__REDIS__KEY_PREFIX",
+            &mut self.jobs.redis.key_prefix,
         );
     }
 
@@ -2405,6 +2519,43 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.database.auto_migrate_in_production);
+    }
+
+    #[test]
+    fn env_override_jobs_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__BACKEND", "redis")
+            .with("AUTUMN_JOBS__WORKERS", "8")
+            .with("AUTUMN_JOBS__MAX_ATTEMPTS", "12")
+            .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
+            .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
+            .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.backend, "redis");
+        assert_eq!(config.jobs.workers, 8);
+        assert_eq!(config.jobs.max_attempts, 12);
+        assert_eq!(config.jobs.initial_backoff_ms, 750);
+        assert_eq!(
+            config.jobs.redis.url.as_deref(),
+            Some("redis://jobs:6379/2")
+        );
+        assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
+    }
+
+    #[test]
+    fn env_override_invalid_jobs_numeric_values_ignored() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__WORKERS", "many")
+            .with("AUTUMN_JOBS__MAX_ATTEMPTS", "a_lot")
+            .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "soon");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.workers, 1);
+        assert_eq!(config.jobs.max_attempts, 5);
+        assert_eq!(config.jobs.initial_backoff_ms, 250);
     }
 
     // ── Server env override tests ────────────────────────────────

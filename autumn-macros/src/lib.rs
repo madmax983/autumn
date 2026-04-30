@@ -15,6 +15,8 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod job;
+mod jobs_macro;
 mod mailer;
 mod main_macro;
 mod model;
@@ -260,6 +262,12 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     scheduled::scheduled_macro(attr.into(), item.into()).into()
 }
 
+/// Declare an on-demand background job.
+#[proc_macro_attribute]
+pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
+    job::job_macro(attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a statically pre-rendered GET route.
 ///
 /// Like `#[get]`, this generates a route companion function. Additionally,
@@ -292,6 +300,12 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
     tasks_macro::tasks_macro(input.into()).into()
+}
+
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+#[proc_macro]
+pub fn jobs(input: TokenStream) -> TokenStream {
+    jobs_macro::jobs_macro(input.into()).into()
 }
 
 /// Secure a route handler with authentication and optional role checks.

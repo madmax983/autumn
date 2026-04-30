@@ -3,9 +3,10 @@
 //! These endpoints provide a REST-style API alongside the HTML routes,
 //! demonstrating that Autumn handlers can return either HTML or JSON.
 
-use autumn_web::{AutumnResult, Db, Json, get, post};
+use autumn_web::{AppState, AutumnResult, Db, Json, Path, get, job, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use serde::{Deserialize, Serialize};
 
 use crate::models::{NewPost, Post};
 use crate::schema::posts;
@@ -29,4 +30,27 @@ pub async fn create_json(mut db: Db, body: Json<NewPost>) -> AutumnResult<Json<P
         .await?;
 
     Ok(Json(created))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishWebhookArgs {
+    pub post_id: i64,
+}
+
+/// Demonstration ad-hoc background job.
+#[job(name = "publish_webhook")]
+pub async fn publish_webhook(_state: AppState, args: PublishWebhookArgs) -> AutumnResult<()> {
+    eprintln!("publish_webhook job fired for post_id={}", args.post_id);
+    Ok(())
+}
+
+/// Enqueue a background webhook publish job and return immediately.
+#[post("/api/posts/{id}/enqueue-publish-webhook")]
+pub async fn enqueue_publish_webhook(id: Path<i64>) -> AutumnResult<Json<serde_json::Value>> {
+    PublishWebhookJob::enqueue(PublishWebhookArgs { post_id: *id }).await?;
+    Ok(Json(serde_json::json!({
+        "status": "queued",
+        "job": "publish_webhook",
+        "post_id": *id
+    })))
 }

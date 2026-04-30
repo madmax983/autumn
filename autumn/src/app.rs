@@ -69,6 +69,7 @@ pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
         tasks: Vec::new(),
+        jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -166,6 +167,7 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
@@ -342,6 +344,13 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register ad-hoc background jobs with the application.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
         self
     }
 
@@ -1068,6 +1077,7 @@ impl AppBuilder {
         let Self {
             routes,
             tasks,
+            jobs,
             static_metas: _,
             exception_filters,
             scoped_groups,
@@ -1229,8 +1239,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and serve. We start listening before startup hooks finish so
-        // `/startup` can honestly report startup progress.
+        // 7. Bind and initialize pre-serve runtime dependencies. Once those
+        // are ready, start listening before startup hooks finish so `/startup`
+        // can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1238,10 +1249,17 @@ impl AppBuilder {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
-        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
+        tracing::info!(addr = %addr, "Listening");
+
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
             axum::serve(
@@ -1320,6 +1338,7 @@ impl AppBuilder {
         let Self {
             routes,
             tasks: _,
+            jobs: _,
             static_metas,
             exception_filters: _,
             scoped_groups: _,
@@ -1773,6 +1792,20 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
         hook(state.clone()).await?;
     }
     Ok(())
+}
+
+fn initialize_job_runtime(
+    jobs: Vec<crate::job::JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+) -> crate::AutumnResult<()> {
+    crate::job::clear_global_job_client();
+    if jobs.is_empty() {
+        Ok(())
+    } else {
+        crate::job::start_runtime(jobs, state, shutdown, config)
+    }
 }
 
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
@@ -2710,6 +2743,7 @@ fn build_state(
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
+        job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels::new(32),
@@ -2921,6 +2955,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3027,6 +3062,105 @@ mod tests {
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
     }
 
+    fn startup_noop_job_handler(
+        _state: AppState,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let builder = app()
+            .jobs(vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }])
+            .on_startup(|_state| async {
+                crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
+            });
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        initialize_job_runtime(
+            builder.jobs.clone(),
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should initialize before startup hooks");
+
+        run_startup_hooks(&builder.startup_hooks, state.clone())
+            .await
+            .expect("startup hook should be able to enqueue jobs");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.job_registry().snapshot();
+                let status = snapshot
+                    .get("startup-seed")
+                    .expect("job should be registered before startup hooks run");
+                if status.total_successes == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup-enqueued job should complete");
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn initialize_job_runtime_propagates_redis_init_errors() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
+
+        let error = initialize_job_runtime(
+            vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis init errors should abort startup");
+
+        #[cfg(feature = "redis")]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+
+        #[cfg(not(feature = "redis"))]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn startup_hook_errors_propagate() {
         let builder = app().on_startup(|_state| async {
@@ -3096,6 +3230,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3193,6 +3328,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3264,6 +3400,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3548,6 +3685,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3846,6 +3984,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3988,6 +4127,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -4028,6 +4168,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -4275,6 +4416,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -4338,6 +4480,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),

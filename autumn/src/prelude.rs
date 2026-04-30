@@ -29,8 +29,8 @@ pub use autumn_macros::mailer;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled,
-    secured, service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, post, put, routes,
+    scheduled, secured, service, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -131,6 +131,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -152,6 +153,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
