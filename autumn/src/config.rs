@@ -1735,10 +1735,14 @@ mod tests {
 
     #[test]
     fn test_set_macro_context() {
-        // Can't run this concurrently well since it mutates global OnceLock,
-        // but it's okay because we are just writing a test to kill the mutant.
-        // We will just verify it sets without crashing.
-        __set_macro_context("/some/path".to_string(), true);
+        rusty_fork::rusty_fork_test! {
+            #![rusty_fork(timeout_ms = 5000)]
+            fn test_set_macro_context_forked() {
+                __set_macro_context("/some/path".to_string(), true);
+                assert_eq!(MACRO_MANIFEST_DIR.get().unwrap(), "/some/path");
+                assert_eq!(*MACRO_IS_DEBUG.get().unwrap(), true);
+            }
+        }
     }
     #[test]
     fn test_mock_env_with_returns_self() {
