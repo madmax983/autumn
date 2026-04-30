@@ -3064,6 +3064,7 @@ mod tests {
 
     #[tokio::test]
     async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
         crate::job::clear_global_job_client();
 
         let builder = app()

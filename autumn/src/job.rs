@@ -74,6 +74,12 @@ struct RedisWorkerConfig {
 
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
 
+#[cfg(test)]
+pub(crate) fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn run_job_handler(
     handler: JobHandler,
     state: AppState,
@@ -133,8 +139,9 @@ pub(crate) fn clear_global_job_client() {
 ///
 /// # Errors
 ///
-/// Returns an internal error when the jobs runtime is not initialized or when
-/// the active backend rejects the enqueue operation.
+/// Returns an internal error when the jobs runtime is not initialized, when
+/// `name` does not match a registered job, or when the active backend rejects
+/// the enqueue operation.
 pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     let Some(client) = global_job_client() else {
         return Err(AutumnError::internal_server_error(std::io::Error::other(
@@ -149,14 +156,26 @@ impl JobClient {
     ///
     /// # Errors
     ///
-    /// Returns an internal error when enqueueing fails in the active backend.
+    /// Returns an internal error when `name` does not match a registered job
+    /// or enqueueing fails in the active backend.
     pub async fn enqueue(&self, name: &str, payload: Value) -> AutumnResult<()> {
+        let Some((job_max_attempts, job_backoff_ms)) = self.per_job_defaults.get(name).copied()
+        else {
+            return Err(AutumnError::internal_server_error(std::io::Error::other(
+                format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
+            )));
+        };
+        let job_max_attempts = if job_max_attempts != 0 {
+            job_max_attempts
+        } else {
+            self.default_max_attempts
+        };
+        let job_backoff_ms = if job_backoff_ms != 0 {
+            job_backoff_ms
+        } else {
+            self.default_initial_backoff_ms
+        };
         self.registry.record_enqueue(name);
-        let (job_max_attempts, job_backoff_ms) = self
-            .per_job_defaults
-            .get(name)
-            .copied()
-            .unwrap_or((self.default_max_attempts, self.default_initial_backoff_ms));
 
         if let Some(sender) = &self.local_sender {
             sender
@@ -728,6 +747,9 @@ mod tests {
 
     #[tokio::test]
     async fn local_enqueue_p99_is_under_5ms() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
@@ -756,6 +778,9 @@ mod tests {
             p99 < std::time::Duration::from_millis(5),
             "expected p99 enqueue latency < 5ms, got {p99:?}",
         );
+
+        shutdown.cancel();
+        clear_global_job_client();
     }
 
     #[tokio::test]
@@ -897,8 +922,55 @@ mod tests {
         assert!(status.last_error.is_some());
     }
 
-    #[test]
-    fn clear_global_job_client_resets_client() {
+    #[tokio::test]
+    async fn enqueue_rejects_unregistered_job_name_before_queueing() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "known".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let error = enqueue("typoed-job", serde_json::json!({}))
+            .await
+            .expect_err("unknown job names should be rejected before queueing");
+        assert!(
+            error
+                .to_string()
+                .contains("job 'typoed-job' is not registered"),
+            "unexpected error: {error}"
+        );
+
+        let snapshot = state.job_registry().snapshot();
+        assert!(
+            !snapshot.contains_key("typoed-job"),
+            "unknown jobs must not be recorded as queued"
+        );
+        let known = snapshot
+            .get("known")
+            .expect("registered job should remain in the registry");
+        assert_eq!(known.queued, 0);
+        assert_eq!(known.in_flight, 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn clear_global_job_client_resets_client() {
+        let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
         assert!(global_job_client().is_none());
 
