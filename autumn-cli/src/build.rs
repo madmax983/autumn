@@ -229,13 +229,16 @@ fn remove_previous_fingerprints(static_dir: &Path) {
     }
 }
 
-/// Returns `true` when `filename` matches the `<stem>.<8hex>.<ext>` pattern.
+/// Returns `true` when `filename` matches either fingerprinted pattern:
+/// - `<stem>.<8hex>.<ext>` for files with an extension
+/// - `<stem>.<8hex>` for extensionless files (e.g. `CNAME`)
 fn is_fingerprinted_filename(filename: &str) -> bool {
     let parts: Vec<&str> = filename.split('.').collect();
-    if parts.len() < 3 {
-        return false;
-    }
-    let hash_candidate = parts[parts.len() - 2];
+    let hash_candidate = match parts.len() {
+        n if n >= 3 => parts[n - 2],
+        2 => parts[1],
+        _ => return false,
+    };
     hash_candidate.len() == 8
         && hash_candidate
             .bytes()
@@ -415,6 +418,9 @@ mod tests {
         assert!(is_fingerprinted_filename("autumn.a1b2c3d4.css"));
         assert!(is_fingerprinted_filename("app.00000000.js"));
         assert!(is_fingerprinted_filename("logo.deadbeef.png"));
+        // extensionless fingerprinted files (e.g. CNAME -> CNAME.<hash>)
+        assert!(is_fingerprinted_filename("CNAME.a1b2c3d4"));
+        assert!(is_fingerprinted_filename("robots.deadbeef"));
     }
 
     #[test]
@@ -429,6 +435,8 @@ mod tests {
         assert!(!is_fingerprinted_filename("autumn.A1B2C3D4.css"));
         // non-hex chars
         assert!(!is_fingerprinted_filename("autumn.zzzzzzzz.css"));
+        // bare name with no dot
+        assert!(!is_fingerprinted_filename("CNAME"));
     }
 
     #[test]
