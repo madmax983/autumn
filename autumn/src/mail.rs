@@ -448,23 +448,17 @@ impl Mailer {
     }
 }
 
-/// State provider for the Mailer extractor.
-pub trait ProvideMailState {
-    fn mailer(&self) -> Option<Mailer>;
-}
-
-impl<S> FromRequestParts<S> for Mailer
-where
-    S: ProvideMailState + Send + Sync,
-{
+impl FromRequestParts<AppState> for Mailer {
     type Rejection = AutumnError;
 
     async fn from_request_parts(
         _parts: &mut http::request::Parts,
-        state: &S,
+        state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         state
-            .mailer()
+            .extension::<Self>()
+            .as_deref()
+            .cloned()
             .ok_or_else(|| AutumnError::service_unavailable_msg("Mailer is not configured"))
     }
 }

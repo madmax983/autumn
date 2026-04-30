@@ -512,14 +512,6 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-
-#[cfg(feature = "mail")]
-impl crate::mail::ProvideMailState for AppState {
-    fn mailer(&self) -> Option<crate::mail::Mailer> {
-        self.extension::<crate::mail::Mailer>().as_deref().cloned()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
