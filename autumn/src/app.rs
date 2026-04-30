@@ -1293,7 +1293,12 @@ impl AppBuilder {
             shutdown_signal_token.cancel();
         });
 
-        initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs);
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            server_shutdown.cancel();
+            server_task.abort();
+            std::process::exit(1);
+        }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
@@ -1793,11 +1798,12 @@ fn initialize_job_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
-) {
+) -> crate::AutumnResult<()> {
+    crate::job::clear_global_job_client();
     if jobs.is_empty() {
-        crate::job::clear_global_job_client();
+        Ok(())
     } else {
-        crate::job::start_runtime(jobs, state, shutdown, config);
+        crate::job::start_runtime(jobs, state, shutdown, config)
     }
 }
 
@@ -3086,7 +3092,8 @@ mod tests {
             &state,
             &shutdown,
             &crate::config::JobConfig::default(),
-        );
+        )
+        .expect("job runtime should initialize before startup hooks");
 
         run_startup_hooks(&builder.startup_hooks, state.clone())
             .await
@@ -3109,6 +3116,46 @@ mod tests {
 
         shutdown.cancel();
         crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn initialize_job_runtime_propagates_redis_init_errors() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut config = crate::config::JobConfig::default();
+        config.backend = "redis".to_string();
+
+        let error = initialize_job_runtime(
+            vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis init errors should abort startup");
+
+        #[cfg(feature = "redis")]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+
+        #[cfg(not(feature = "redis"))]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]

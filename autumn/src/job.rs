@@ -213,48 +213,37 @@ pub(crate) fn start_runtime(
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
     config: &crate::config::JobConfig,
-) {
+) -> AutumnResult<()> {
     validate_unique_job_names(&jobs).unwrap_or_else(|error| {
         panic!("invalid jobs configuration: {error}");
     });
 
     match config.backend.as_str() {
-        "local" => start_local_runtime(
-            jobs,
-            state,
-            shutdown,
-            config.workers,
-            config.max_attempts,
-            config.initial_backoff_ms,
-        ),
+        "local" => {
+            start_local_runtime(
+                jobs,
+                state,
+                shutdown,
+                config.workers,
+                config.max_attempts,
+                config.initial_backoff_ms,
+            );
+            Ok(())
+        }
         "redis" => {
             #[cfg(feature = "redis")]
             {
-                if let Err(error) = start_redis_runtime(jobs.clone(), state, shutdown, config) {
-                    tracing::error!(error = %error, "failed to start redis jobs backend; falling back to local backend");
-                    start_local_runtime(
-                        jobs,
-                        state,
-                        shutdown,
-                        config.workers,
-                        config.max_attempts,
-                        config.initial_backoff_ms,
-                    );
-                }
+                start_redis_runtime(jobs, state, shutdown, config)
             }
             #[cfg(not(feature = "redis"))]
             {
-                tracing::warn!(
-                    "jobs.backend=redis requested but redis feature is disabled; falling back to local backend"
-                );
-                start_local_runtime(
-                    jobs,
-                    state,
-                    shutdown,
-                    config.workers,
-                    config.max_attempts,
-                    config.initial_backoff_ms,
-                );
+                let _ = jobs;
+                let _ = state;
+                let _ = shutdown;
+                let _ = config;
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "jobs.backend=redis requested but redis feature is disabled",
+                )))
             }
         }
         other => {
@@ -267,6 +256,7 @@ pub(crate) fn start_runtime(
                 config.max_attempts,
                 config.initial_backoff_ms,
             );
+            Ok(())
         }
     }
 }
@@ -966,6 +956,73 @@ mod tests {
 
         shutdown.cancel();
         clear_global_job_client();
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "redis"))]
+    async fn start_runtime_rejects_redis_backend_when_feature_disabled() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut config = crate::config::JobConfig::default();
+        config.backend = "redis".to_string();
+
+        let error = start_runtime(
+            vec![JobInfo {
+                name: "known".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis backend must fail without the redis feature");
+
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
+        assert!(global_job_client().is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "redis")]
+    async fn start_runtime_rejects_redis_backend_without_url() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut config = crate::config::JobConfig::default();
+        config.backend = "redis".to_string();
+        config.redis.url = None;
+
+        let error = start_runtime(
+            vec![JobInfo {
+                name: "known".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis backend must fail when its url is missing");
+
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+        assert!(global_job_client().is_none());
     }
 
     #[tokio::test]
