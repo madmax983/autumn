@@ -268,9 +268,13 @@ pub fn try_build_router_inner(
     }
 
     // Static file serving from project's static/ directory.
+    // Fingerprinted assets (e.g. `autumn.a1b2c3d4.css`) are served with
+    // `Cache-Control: public, max-age=31536000, immutable`; all other static
+    // files use the default browser policy.
     let env = crate::config::OsEnv;
     let static_dir = crate::app::project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+    router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
     router = mount_scoped_groups(router, ctx.scoped_groups);
 
@@ -1400,6 +1404,30 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .allow_headers(headers)
         .allow_credentials(cors.allow_credentials)
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
+}
+
+/// Attach `Cache-Control: public, max-age=31536000, immutable` to successful
+/// responses for fingerprinted static assets.
+///
+/// A path is considered fingerprinted when its filename contains an
+/// 8-character lowercase hex hash between two dots (e.g.
+/// `autumn.a1b2c3d4.css`). All other requests pass through unchanged.
+pub(crate) async fn asset_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let mut resp = next.run(req).await;
+    if path.starts_with("/static/")
+        && crate::assets::is_fingerprinted_path(&path)
+        && resp.status().is_success()
+    {
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    resp
 }
 
 #[cfg(feature = "htmx")]

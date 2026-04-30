@@ -37,6 +37,8 @@ pub use autumn_macros::{
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
+/// Resolve a logical static asset path to a fingerprinted URL in release builds.
+pub use crate::assets::asset_url;
 
 // ── Extractors ───────────────────────────────────────────────────
 /// Database connection extractor.

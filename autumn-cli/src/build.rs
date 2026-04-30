@@ -1,12 +1,18 @@
 //! `autumn build` -- compile the app and pre-render static routes.
 //!
-//! Orchestrates two steps:
+//! Orchestrates three steps:
 //! 1. `cargo build [--release] [-p <package>]` to compile the user's binary.
 //! 2. Run the binary with `AUTUMN_BUILD_STATIC=1` so the runtime renders
 //!    static routes to `dist/` instead of starting the HTTP server.
+//! 3. In release mode: fingerprint every file under `static/`, write
+//!    content-hashed copies alongside the originals, and emit
+//!    `static/.autumn-manifest.json` mapping logical → fingerprinted paths.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use sha2::{Digest, Sha256};
 
 /// Run the static build pipeline.
 pub fn run(debug: bool, package: Option<&str>) {
@@ -45,7 +51,170 @@ pub fn run(debug: bool, package: Option<&str>) {
         std::process::exit(1);
     }
 
+    if !debug {
+        eprintln!("\nFingerprinting static assets...");
+        fingerprint_static_assets();
+    }
+
     eprintln!("\n\u{1F342} Build complete!");
+}
+
+/// Fingerprint every file under `static/`, write content-hashed copies, and
+/// emit `static/.autumn-manifest.json`.
+///
+/// For each file `static/css/autumn.css` the function:
+/// 1. Computes the SHA-256 digest of its contents.
+/// 2. Truncates the digest to 8 lowercase hex characters.
+/// 3. Writes a copy named `static/css/autumn.<hash8>.css`.
+/// 4. Records `"css/autumn.css" -> "css/autumn.<hash8>.css"` in the manifest.
+///
+/// Existing fingerprinted copies are removed before new ones are written so
+/// stale hashes don't accumulate across builds.
+///
+/// The manifest is written to `static/.autumn-manifest.json`.
+fn fingerprint_static_assets() {
+    let static_dir = Path::new("static");
+    if !static_dir.exists() {
+        return;
+    }
+
+    // Remove stale fingerprinted copies from previous builds.
+    remove_stale_fingerprints(static_dir);
+
+    let mut manifest_files: HashMap<String, String> = HashMap::new();
+    collect_and_fingerprint(static_dir, static_dir, &mut manifest_files);
+
+    let manifest = serde_json::json!({
+        "version": "1",
+        "files": manifest_files,
+    });
+
+    let manifest_path = static_dir.join(".autumn-manifest.json");
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&manifest_path, json) {
+                eprintln!("\u{2717} Failed to write asset manifest: {e}");
+            } else {
+                eprintln!(
+                    "  \u{2713} Fingerprinted {} asset(s) \u{2192} {}",
+                    manifest_files.len(),
+                    manifest_path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("\u{2717} Failed to serialize asset manifest: {e}"),
+    }
+}
+
+/// Walk `dir` recursively, hash each regular file, write a fingerprinted copy,
+/// and record the mapping in `out`.
+fn collect_and_fingerprint(
+    root: &Path,
+    dir: &Path,
+    out: &mut HashMap<String, String>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("  \u{26A0} Could not read {}: {e}", dir.display());
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        // Skip hidden files (the manifest itself, .DS_Store, etc.).
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        if path.is_dir() {
+            collect_and_fingerprint(root, &path, out);
+            continue;
+        }
+
+        // Skip files that already look fingerprinted (safety guard).
+        if is_fingerprinted_filename(&name_str) {
+            continue;
+        }
+
+        let contents = match std::fs::read(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  \u{26A0} Could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        let hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(&contents);
+            let result = hasher.finalize();
+            hex::encode(&result[..4]) // 4 bytes = 8 hex chars
+        };
+
+        // Build the fingerprinted filename: stem + hash + extension.
+        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path.extension().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let fp_name = if ext.is_empty() {
+            format!("{stem}.{hash}")
+        } else {
+            format!("{stem}.{hash}.{ext}")
+        };
+        let fp_path = path.with_file_name(&fp_name);
+
+        if let Err(e) = std::fs::write(&fp_path, &contents) {
+            eprintln!("  \u{26A0} Could not write {}: {e}", fp_path.display());
+            continue;
+        }
+
+        // Record logical path -> fingerprinted path (both relative to static/).
+        if let (Ok(logical), Ok(fingerprinted)) = (
+            path.strip_prefix(root),
+            fp_path.strip_prefix(root),
+        ) {
+            out.insert(
+                logical.to_string_lossy().replace('\\', "/"),
+                fingerprinted.to_string_lossy().replace('\\', "/"),
+            );
+        }
+    }
+}
+
+/// Delete fingerprinted copies from a previous build run so stale hashes
+/// don't accumulate.
+fn remove_stale_fingerprints(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            remove_stale_fingerprints(&path);
+            continue;
+        }
+        let name = entry.file_name();
+        if is_fingerprinted_filename(&name.to_string_lossy()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Returns `true` when `filename` matches the `<stem>.<8hex>.<ext>` pattern.
+fn is_fingerprinted_filename(filename: &str) -> bool {
+    let parts: Vec<&str> = filename.split('.').collect();
+    if parts.len() < 3 {
+        return false;
+    }
+    let hash_candidate = parts[parts.len() - 2];
+    hash_candidate.len() == 8
+        && hash_candidate
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Locate the compiled binary using `cargo metadata`.
@@ -214,5 +383,67 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"));
         assert!(result.unwrap_err().contains("package 'hello'"));
+    }
+
+    #[test]
+    fn fingerprint_detection_positive() {
+        assert!(is_fingerprinted_filename("autumn.a1b2c3d4.css"));
+        assert!(is_fingerprinted_filename("app.00000000.js"));
+        assert!(is_fingerprinted_filename("logo.deadbeef.png"));
+    }
+
+    #[test]
+    fn fingerprint_detection_negative() {
+        assert!(!is_fingerprinted_filename("autumn.css"));
+        assert!(!is_fingerprinted_filename("htmx.min.js"));
+        // hash too short
+        assert!(!is_fingerprinted_filename("autumn.abc.css"));
+        // hash too long
+        assert!(!is_fingerprinted_filename("autumn.a1b2c3d4e5.css"));
+        // uppercase hex not accepted
+        assert!(!is_fingerprinted_filename("autumn.A1B2C3D4.css"));
+        // non-hex chars
+        assert!(!is_fingerprinted_filename("autumn.zzzzzzzz.css"));
+    }
+
+    #[test]
+    fn fingerprint_static_assets_writes_manifest_and_copies() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let static_dir = tmp.path().join("static");
+        let css_dir = static_dir.join("css");
+        std::fs::create_dir_all(&css_dir).unwrap();
+
+        let css_content = b"body { color: red; }";
+        std::fs::write(css_dir.join("autumn.css"), css_content).unwrap();
+
+        // Change cwd to tmp so fingerprint_static_assets() finds `static/`.
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        fingerprint_static_assets();
+
+        std::env::set_current_dir(original_cwd).unwrap();
+
+        // Manifest must exist.
+        let manifest_path = static_dir.join(".autumn-manifest.json");
+        assert!(manifest_path.exists(), "manifest must be written");
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+
+        let files = manifest["files"].as_object().unwrap();
+        assert_eq!(files.len(), 1, "one asset fingerprinted");
+
+        let fp = files["css/autumn.css"].as_str().unwrap();
+        assert!(fp.starts_with("css/autumn."), "fingerprinted path has correct prefix");
+        assert!(fp.ends_with(".css"), "fingerprinted path has correct extension");
+
+        // The fingerprinted copy must exist.
+        assert!(
+            static_dir.join(fp).exists(),
+            "fingerprinted copy must be written: {fp}"
+        );
     }
 }
