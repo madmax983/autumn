@@ -342,7 +342,7 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Enforce a record-level authorization policy on a route handler.
 ///
-/// Resolves the [`Policy`](autumn_web::authorization::Policy)
+/// Resolves the `Policy`
 /// registered for the named resource type and calls the matching
 /// action method. Short-circuits with the configured deny response
 /// (default `404`, optionally `403`) before the handler body runs.

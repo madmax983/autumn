@@ -88,7 +88,7 @@ enum Commands {
     ///   f32, f64                     (REAL, DOUBLE PRECISION)
     ///   Uuid                         (UUID)
     ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
-    ///   Vec<u8>, Bytea               (BYTEA)
+    ///   `Vec<u8>`, Bytea               (BYTEA)
     ///   Option<...>                  (any of the above, nullable)
     ///
     /// # Example

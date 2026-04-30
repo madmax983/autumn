@@ -132,6 +132,10 @@ type PoolProviderFactory = Box<
         > + Send,
 >;
 
+/// Closure that registers a policy or scope on the runtime
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -160,10 +164,6 @@ type PoolProviderFactory = Box<
 ///         .await;
 /// }
 /// ```
-/// Closure that registers a policy or scope on the runtime
-/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
-type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
-
 pub struct AppBuilder {
     routes: Vec<Route>,
     tasks: Vec<crate::task::TaskInfo>,
@@ -2192,7 +2192,7 @@ fn validate_repository_api_policies(
 /// Refuse to start when a `#[repository(policy = X)]`-annotated
 /// route exists but the corresponding `.policy::<R, _>(X)`
 /// registration was never actually applied to the live
-/// [`PolicyRegistry`].
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
 ///
 /// `validate_repository_api_policies` runs *before* the registry is
 /// populated and only checks the macro-set `has_policy` flag. This
