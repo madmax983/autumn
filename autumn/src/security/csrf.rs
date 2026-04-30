@@ -359,21 +359,26 @@ async fn verify_csrf_token(
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
-    if let Ok(body_str) = std::str::from_utf8(&bytes) {
-        for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=')
-                && key == settings.form_field
-            {
-                if let Some(c) = cookie_token
-                    && !c.is_empty()
-                    && !value.is_empty()
-                    && constant_time_eq(c, value)
-                {
-                    token_found = true;
-                }
-                break;
-            }
+    let Ok(body_str) = std::str::from_utf8(&bytes) else {
+        *req.body_mut() = axum::body::Body::from(bytes);
+        return false;
+    };
+
+    for pair in body_str.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key != settings.form_field {
+            continue;
         }
+
+        let Some(c) = cookie_token else {
+            break;
+        };
+        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
+            token_found = true;
+        }
+        break;
     }
 
     // Restore request body

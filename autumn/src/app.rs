@@ -2128,8 +2128,10 @@ fn collect_unguarded_repository_writes(
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
-        if let Some(meta) = route.repository
-            && !meta.has_policy
+        let Some(meta) = route.repository else {
+            return;
+        };
+        if !meta.has_policy
             && is_mutating_method(&route.method)
             && seen.insert((meta.resource_type_name, meta.api_path))
         {
@@ -2229,20 +2231,22 @@ fn collect_unregistered_repository_handlers(
     let mut seen_scopes: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
-        if let Some(meta) = route.repository {
-            if let Some(check) = meta.policy_check
-                && !check(registry)
-                && seen_policies.insert((meta.resource_type_name, meta.api_path))
-            {
-                missing_policies
-                    .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-            }
-            if let Some(check) = meta.scope_check
-                && !check(registry)
-                && seen_scopes.insert((meta.resource_type_name, meta.api_path))
-            {
-                missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-            }
+        let Some(meta) = route.repository else {
+            return;
+        };
+
+        if let Some(check) = meta.policy_check
+            && !check(registry)
+            && seen_policies.insert((meta.resource_type_name, meta.api_path))
+        {
+            missing_policies.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+        }
+
+        if let Some(check) = meta.scope_check
+            && !check(registry)
+            && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+        {
+            missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
         }
     };
     for route in routes {

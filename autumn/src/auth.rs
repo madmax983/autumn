@@ -338,30 +338,29 @@ where
             // Check if session has the required key
             let session = req.extensions().get::<crate::session::Session>().cloned();
 
-            let is_authenticated = if let Some(ref session) = session {
-                session.contains_key(&session_key).await
-            } else {
-                false
+            let is_authenticated = match session {
+                Some(ref s) => s.contains_key(&session_key).await,
+                None => false,
             };
 
             if is_authenticated {
-                inner.call(req).await
-            } else {
-                let body = serde_json::json!({
-                    "error": {
-                        "status": 401,
-                        "message": "authentication required"
-                    }
-                });
-                let response = Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(ResBody::from(
-                        serde_json::to_string(&body).unwrap_or_default(),
-                    ))
-                    .unwrap_or_default();
-                Ok(response)
+                return inner.call(req).await;
             }
+
+            let body = serde_json::json!({
+                "error": {
+                    "status": 401,
+                    "message": "authentication required"
+                }
+            });
+            let response = Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(ResBody::from(
+                    serde_json::to_string(&body).unwrap_or_default(),
+                ))
+                .unwrap_or_default();
+            Ok(response)
         })
     }
 }
