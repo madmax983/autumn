@@ -3125,8 +3125,10 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let mut config = crate::config::JobConfig::default();
-        config.backend = "redis".to_string();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
 
         let error = initialize_job_runtime(
             vec![crate::job::JobInfo {

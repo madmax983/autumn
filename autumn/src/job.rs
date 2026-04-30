@@ -966,8 +966,10 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let mut config = crate::config::JobConfig::default();
-        config.backend = "redis".to_string();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
 
         let error = start_runtime(
             vec![JobInfo {
@@ -999,9 +1001,14 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let mut config = crate::config::JobConfig::default();
-        config.backend = "redis".to_string();
-        config.redis.url = None;
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            redis: crate::config::JobRedisConfig {
+                url: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let error = start_runtime(
             vec![JobInfo {
