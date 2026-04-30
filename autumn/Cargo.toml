@@ -46,6 +46,9 @@ redis = ["dep:redis"]
 storage = ["diesel?/serde_json"]
 storage-s3 = ["storage"]
 mail = ["dep:lettre", "maud"]
+# Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
+# Depends on `db`; off by default so apps that don't seed pay zero compile cost.
+seed = ["db"]
 
 [dependencies]
 autumn-macros = { version = "0.3.0", path = "../autumn-macros" }
