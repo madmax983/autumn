@@ -116,3 +116,21 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# DX Audit Report: Error Handling and JSON Responses
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+I started by copying the quickstart example from the README into a new project and running it. The basic example compiled.
+
+## 2. 🚧 STUMBLE - The Friction Points
+1. **The README Example:** The README snippet imports `autumn_web::prelude::*`. However, when trying to build typical route handlers returning JSON, I discovered `serde` is not included in the framework prelude or re-exports. I had to manually add `serde` with `derive` to `Cargo.toml`.
+2. **The "Error Check":** When I triggered errors deliberately by trying to return `Result<String, std::io::Error>`, it fails to compile because standard `std::io::Error` does not map to Axum's `IntoResponse` unless wrapped. The framework's `AutumnError` is available in the prelude but returning `Result<T, AutumnError>` (or `AutumnResult<T>`) doesn't magically implement `From<std::io::Error>`, so using the `?` operator on standard file operations fails.
+3. **The "Import Scan":** I have to import `serde::Serialize` externally. The error types are somewhat non-obvious if coming from other frameworks (e.g., people look for `AppError`, but it's `AutumnError`). `Json` is exposed correctly, but requires the manual `serde` scaffolding.
+
+## 3. 📢 REPORT - The Complaint
+- Returning JSON means I have to manually add `serde` to my `Cargo.toml` and import `Serialize`/`Deserialize`. Since Autumn is a web framework, shouldn't `serde` be readily available or at least part of the framework's re-exports so I don't have to manage the dependency myself?
+- If I want to return a standard error (like reading a file) from a route handler, I'm forced to hunt down `AutumnResult` and map standard errors manually. Using the `?` operator on `std::io::Error` within an `AutumnResult` handler does not compile out of the box.
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- The framework needs to expose `serde::{Serialize, Deserialize}` in the `prelude` to make JSON endpoints seamless.
+- `AutumnError` should implement `From<std::io::Error>` (and other common `std` errors) so that the `?` operator works intuitively in route handlers.
