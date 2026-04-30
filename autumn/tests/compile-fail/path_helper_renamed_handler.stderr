@@ -1,0 +1,14 @@
+error[E0425]: cannot find function `__autumn_path_get_post` in this scope
+  --> tests/compile-fail/path_helper_renamed_handler.rs:13:16
+   |
+ 6 | #[get("/posts/{id}")]
+   | -------------- similarly named function `__autumn_path_show_post` defined here
+...
+13 |     let _url = __autumn_path_get_post(42i64);
+   |                ^^^^^^^^^^^^^^^^^^^^^^
+   |
+help: a function with a similar name exists
+   |
+13 -     let _url = __autumn_path_get_post(42i64);
+13 +     let _url = __autumn_path_show_post(42i64);
+   |

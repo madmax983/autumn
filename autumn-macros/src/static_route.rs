@@ -125,6 +125,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let static_meta_name = format_ident!("__autumn_static_meta_{}", fn_name);
+    let path_helper_name = format_ident!("__autumn_path_{}", fn_name);
     let vis = &input_fn.vis;
 
     // Build the revalidate expression
@@ -154,8 +155,17 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let path_params = crate::api_doc::extract_path_params(&path_value);
     let path_params_tokens = crate::api_doc::emit_path_param_slice(&path_params);
 
+    // Build path helper the same way route.rs does.
+    let path_helper_fn = crate::route::emit_path_helper_pub(
+        &path_helper_name,
+        &path_value,
+        &path_params,
+        &input_fn,
+    );
+
     quote! {
         #input_fn
+        #path_helper_fn
 
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {

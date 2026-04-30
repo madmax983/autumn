@@ -81,22 +81,22 @@ pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> Autumn
                         div class="flex items-start gap-3 p-4" {
                             (vote_controls(*post_id, *score))
                             div class="flex-1 min-w-0" {
-                                a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                                a href=(__autumn_path_show(sub_slug, post_slug))
                                    class="text-lg font-medium text-gray-900 hover:text-orange-600 \
                                           line-clamp-2" {
                                     (title)
                                 }
                                 div class="text-xs text-gray-400 mt-1" {
-                                    a href=(format!("/r/{sub_slug}"))
+                                    a href=(super::subreddits::__autumn_path_show(sub_slug))
                                        class="font-medium text-gray-600 hover:underline" {
                                         "r/" (sub_name)
                                     }
                                     " \u{2022} posted by "
-                                    a href=(format!("/u/{author}"))
+                                    a href=(super::auth::__autumn_path_profile(author))
                                        class="text-gray-500 hover:underline" { "u/" (author) }
                                     " " (time_ago(created_at))
                                     " \u{2022} "
-                                    a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                                    a href=(__autumn_path_show(sub_slug, post_slug))
                                        class="text-gray-500 hover:text-orange-600" {
                                         (comment_count) " comments"
                                     }
@@ -397,7 +397,7 @@ pub async fn submit(
         );
     }
 
-    Ok(redirect_to(&format!("/r/{}", sub.slug)))
+    Ok(redirect_to(&*super::subreddits::__autumn_path_show(&sub.slug)))
 }
 
 // ── View single post with comments ─────────────────────────────
@@ -456,7 +456,7 @@ pub async fn show(
         html! {
             // Breadcrumbs
             div class="text-sm text-gray-500 mb-4" {
-                a href=(format!("/r/{}", sub.slug)) class="hover:text-orange-600" {
+                a href=(super::subreddits::__autumn_path_show(&sub.slug)) class="hover:text-orange-600" {
                     "r/" (sub.name)
                 }
                 " \u{203A} Post"
@@ -470,7 +470,7 @@ pub async fn show(
                         h1 class="text-2xl font-bold text-gray-900 mb-2" { (post.title) }
                         div class="text-xs text-gray-400 mb-4" {
                             "posted by "
-                            a href=(format!("/u/{}", author.username))
+                            a href=(super::auth::__autumn_path_profile(&author.username))
                                class="text-gray-500 hover:underline" {
                                 "u/" (author.username)
                             }
@@ -494,10 +494,10 @@ pub async fn show(
                         }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
-                                a href=(format!("/r/{}/posts/{}/edit", sub.slug, post.slug))
+                                a href=(__autumn_path_edit_form(&sub.slug, &post.slug))
                                    class="text-gray-500 hover:text-orange-600" { "Edit" }
                                 button
-                                    hx-delete=(format!("/r/{}/posts/{}", sub.slug, post.slug))
+                                    hx-delete=(__autumn_path_delete_post(&sub.slug, &post.slug))
                                     hx-confirm="Delete this post? This cannot be undone."
                                     class="text-red-500 hover:text-red-700 cursor-pointer" {
                                     "Delete"
@@ -510,7 +510,7 @@ pub async fn show(
 
             // Comment form
             @if current_user.is_some() {
-                form action=(format!("/r/{}/posts/{}/comments", sub.slug, post.slug))
+                form action=(super::comments::__autumn_path_create(&sub.slug, &post.slug))
                      method="post"
                      class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
@@ -540,7 +540,7 @@ pub async fn show(
                 @for (comment, comment_author) in &post_comments {
                     div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
                         div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                            a href=(format!("/u/{comment_author}"))
+                            a href=(super::auth::__autumn_path_profile(comment_author))
                                class="font-medium text-gray-600 hover:underline" {
                                 "u/" (comment_author)
                             }
@@ -597,7 +597,7 @@ pub async fn edit_form(
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Edit Post" }
-                form action=(format!("/r/{sub_slug}/posts/{post_slug}")) method="post"
+                form action=(__autumn_path_update(&sub_slug, &post_slug)) method="post"
                      class="space-y-4 bg-white rounded-lg shadow p-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     div {
@@ -625,7 +625,7 @@ pub async fn edit_form(
                                       hover:bg-orange-600 transition-colors" {
                             "Save"
                         }
-                        a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                        a href=(__autumn_path_show(&sub_slug, &post_slug))
                            class="px-6 py-2 text-gray-500 hover:text-gray-700" { "Cancel" }
                     }
                 }
@@ -687,7 +687,7 @@ pub async fn update(
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to(&format!("/r/{sub_slug}/posts/{new_slug}")))
+    Ok(redirect_to(&*__autumn_path_show(&sub_slug, &new_slug)))
 }
 
 // ── Delete post (htmx) ────────────────────────────────────────
@@ -715,7 +715,7 @@ pub async fn delete_post(
         .execute(&mut *db)
         .await?;
 
-    Ok(super::layout::hx_redirect_to(&format!("/r/{sub_slug}")))
+    Ok(super::layout::hx_redirect_to(&*super::subreddits::__autumn_path_show(&sub_slug)))
 }
 
 // ── Helpers ────────────────────────────────────────────────────

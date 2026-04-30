@@ -48,7 +48,7 @@ fn bookmark_card(b: &Bookmark) -> Markup {
                 }
             }
             button
-                hx-delete=(format!("/api/bookmarks/{}", b.id))
+                hx-delete=(crate::repositories::__autumn_path_bookmark_api_delete(b.id))
                 hx-target=(format!("#bookmark-{}", b.id))
                 hx-swap="delete"
                 hx-confirm="Delete this bookmark?"

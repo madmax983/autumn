@@ -5,23 +5,13 @@
 
 use autumn_web::assets::asset_url;
 use autumn_web::extract::{Form, Path};
+use autumn_web::reexports::axum::response::Redirect;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{NewPost, Post, UpdatePost};
 use crate::schema::posts;
-
-/// Render a meta-refresh redirect page targeting the given URL.
-fn redirect_to(url: &str) -> Markup {
-    html! {
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
 
 // ── Layout ──────────────────────────────────────────────────────
 
@@ -90,7 +80,7 @@ fn post_card(post: &Post) -> Markup {
 
     html! {
         article class="group" {
-            a href=(format!("/posts/{}", post.slug))
+            a href=(__autumn_path_show(&post.slug))
                class="block bg-white rounded-xl border border-stone-200 \
                       hover:border-amber-300 shadow-sm hover:shadow-md \
                       transition-all p-6" {
@@ -317,7 +307,7 @@ pub async fn admin_list(mut db: Db) -> AutumnResult<Markup> {
                                    shadow-sm transition-colors px-5 py-4" {
                             div class="flex-1 min-w-0" {
                                 div class="flex items-center gap-2" {
-                                    a href=(format!("/admin/{}/edit", p.id))
+                                    a href=(__autumn_path_edit_form(p.id))
                                        class="text-sm font-medium text-stone-900 hover:text-amber-700 \
                                               transition-colors truncate" {
                                         (p.title)
@@ -340,16 +330,16 @@ pub async fn admin_list(mut db: Db) -> AutumnResult<Markup> {
                             }
                             div class="flex items-center gap-2 ml-4 shrink-0" {
                                 @if p.published {
-                                    a href=(format!("/posts/{}", p.slug))
+                                    a href=(__autumn_path_show(&p.slug))
                                        class="text-xs text-amber-700 underline hover:text-amber-800 transition-colors" {
                                         "View"
                                     }
                                 }
-                                a href=(format!("/admin/{}/edit", p.id))
+                                a href=(__autumn_path_edit_form(p.id))
                                    class="text-xs text-amber-700 underline hover:text-amber-800 transition-colors" {
                                     "Edit"
                                 }
-                                button hx-delete=(format!("/admin/{}", p.id))
+                                button hx-delete=(__autumn_path_delete_post(p.id))
                                        hx-target=(format!("#post-{}", p.id))
                                        hx-swap="outerHTML"
                                        hx-confirm="Delete this post? This cannot be undone."
@@ -387,7 +377,7 @@ pub async fn new_form() -> Markup {
 
 /// Create a new post from a form submission.
 #[post("/admin")]
-pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
+pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
     let new_post = form.0.validated()?;
 
     diesel::insert_into(posts::table)
@@ -395,7 +385,7 @@ pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to("/admin"))
+    Ok(__autumn_path_admin_list().into_redirect())
 }
 
 /// Show the edit form for a post.
@@ -414,14 +404,14 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "Edit Post"
             }
-            (post_form(&format!("/admin/{}", p.id), Some(&p)))
+            (post_form(&*__autumn_path_update(p.id), Some(&p)))
         },
     ))
 }
 
 /// Update a post from a form submission.
 #[post("/admin/{id}")]
-pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
+pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
     // Validate
     let validated = form.0.validated()?;
 
@@ -444,7 +434,7 @@ pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnRes
         )));
     }
 
-    Ok(redirect_to("/admin"))
+    Ok(__autumn_path_admin_list().into_redirect())
 }
 
 /// Delete a post by ID (htmx endpoint).

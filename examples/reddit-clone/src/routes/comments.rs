@@ -104,7 +104,7 @@ pub async fn create(
         .await?;
     publish_stored_live_event_best_effort(&state, event_id).await;
 
-    Ok(redirect_to(&format!("/r/{sub_slug}/posts/{post_slug}")))
+    Ok(redirect_to(&*super::posts::__autumn_path_show(&sub_slug, &post_slug)))
 }
 
 /// htmx endpoint: load comments for a post (for lazy loading).
@@ -135,7 +135,7 @@ pub async fn list_comments(
         @for (comment, author) in &post_comments {
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
                 div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                    a href=(format!("/u/{author}"))
+                    a href=(super::auth::__autumn_path_profile(author))
                        class="font-medium text-gray-600 hover:underline" {
                         "u/" (author)
                     }

@@ -159,6 +159,17 @@ impl AsRef<str> for PathBuilder {
     }
 }
 
+/// Allow `PathBuilder` to be used directly inside `html! { }` Maud templates.
+///
+/// The value is HTML-escaped exactly like a `&str` would be, so special
+/// characters in query-string values (e.g. `<`, `>`, `&`) are safe.
+#[cfg(feature = "maud")]
+impl maud::Render for PathBuilder {
+    fn render_to(&self, buffer: &mut String) {
+        maud::Render::render_to(self.0.as_str(), buffer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

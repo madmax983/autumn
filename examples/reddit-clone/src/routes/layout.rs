@@ -118,7 +118,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
         div id=(format!("votes-{post_id}"))
             class="flex flex-col items-center gap-0.5 text-sm select-none" {
             button
-                hx-post=(format!("/posts/{post_id}/upvote"))
+                hx-post=(super::votes::__autumn_path_upvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-orange-500 cursor-pointer text-lg leading-none" {
@@ -126,7 +126,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
             }
             span class="font-semibold text-gray-700" { (score) }
             button
-                hx-post=(format!("/posts/{post_id}/downvote"))
+                hx-post=(super::votes::__autumn_path_downvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-blue-500 cursor-pointer text-lg leading-none" {

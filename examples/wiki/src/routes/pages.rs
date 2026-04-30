@@ -73,7 +73,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
                 @for p in &pages {
                     li class="p-4 bg-white rounded shadow flex justify-between items-center" {
                         div {
-                            a href=(format!("/pages/{}", p.slug))
+                            a href=(__autumn_path_show(&p.slug))
                               class="text-emerald-700 font-medium hover:underline" {
                                 (p.title)
                             }
@@ -117,9 +117,9 @@ pub async fn show(
                     h1 class="text-3xl font-bold" { (page.title) }
                     div class="space-x-2 flex items-center" {
                         (status_badge(&page.status))
-                        a href=(format!("/pages/{}/edit", page.slug))
+                        a href=(__autumn_path_edit_form(&page.slug))
                           class="text-sm text-emerald-600 hover:underline" { "Edit" }
-                        a href=(format!("/pages/{}/history", page.slug))
+                        a href=(__autumn_path_history(&page.slug))
                           class="text-sm text-gray-500 hover:underline" { "History" }
                     }
                 }
@@ -149,7 +149,7 @@ pub async fn show(
                                 }
                             }
                         }
-                        a href=(format!("/pages/{}/history", page.slug))
+                        a href=(__autumn_path_history(&page.slug))
                           class="text-sm text-emerald-600 hover:underline" { "View full history" }
                     }
                 }
@@ -201,7 +201,7 @@ pub async fn new_form() -> Markup {
 pub async fn create(repo: PgPageRepository, form: Form<PageForm>) -> AutumnResult<Markup> {
     let new_page = form.0.into_new();
     let page = repo.save(&new_page).await?;
-    Ok(redirect_to(&format!("/pages/{}", page.slug)))
+    Ok(redirect_to(&*__autumn_path_show(page.slug)))
 }
 
 #[get("/pages/{slug}/edit")]
@@ -212,7 +212,7 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
         &format!("Edit: {}", page.title),
         html! {
             h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
-            form action=(format!("/pages/{}", page.slug)) method="post"
+            form action=(__autumn_path_update(&page.slug)) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
                 div {
                     label for="title" class="block text-sm font-medium" { "Title" }
@@ -281,7 +281,7 @@ pub async fn update(
     let page = find_page_by_slug(&repo, &slug).await?;
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
-    Ok(redirect_to(&format!("/pages/{}", updated.slug)))
+    Ok(redirect_to(&*__autumn_path_show(updated.slug)))
 }
 
 #[get("/pages/{slug}/history")]
@@ -304,7 +304,7 @@ pub async fn history(
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "History: " (page.title) }
-                a href=(format!("/pages/{}", page.slug))
+                a href=(__autumn_path_show(&page.slug))
                   class="text-sm text-emerald-600 hover:underline" { "Back to page" }
             }
             @if revs.is_empty() {

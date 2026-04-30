@@ -503,6 +503,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let update_info = format_ident!("__autumn_route_info_{prefix}_api_update");
         let delete_info = format_ident!("__autumn_route_info_{prefix}_api_delete");
 
+        let list_path_helper = format_ident!("__autumn_path_{prefix}_api_list");
+        let get_path_helper = format_ident!("__autumn_path_{prefix}_api_get");
+        let create_path_helper = format_ident!("__autumn_path_{prefix}_api_create");
+        let update_path_helper = format_ident!("__autumn_path_{prefix}_api_update");
+        let delete_path_helper = format_ident!("__autumn_path_{prefix}_api_delete");
+        // Runtime format string for `{api_path}/{id}` paths.
+        let id_path_fmt = format!("{}/{{}}",api_path);
+
         let id_path = format!("{api_path}/{{id}}");
 
         let has_policy = config.policy_type.is_some();
@@ -707,6 +715,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         quote! {
             // ── Auto-generated REST API handlers ─────────────────
+
+            // ── Path helpers ─────────────────────────────────────
+            #[doc(hidden)]
+            pub fn #list_path_helper() -> ::autumn_web::PathBuilder {
+                ::autumn_web::PathBuilder::new(::std::string::String::from(#api_path))
+            }
+            #[doc(hidden)]
+            pub fn #get_path_helper(id: i64) -> ::autumn_web::PathBuilder {
+                ::autumn_web::PathBuilder::new(::std::format!(#id_path_fmt, id))
+            }
+            #[doc(hidden)]
+            pub fn #create_path_helper() -> ::autumn_web::PathBuilder {
+                ::autumn_web::PathBuilder::new(::std::string::String::from(#api_path))
+            }
+            #[doc(hidden)]
+            pub fn #update_path_helper(id: i64) -> ::autumn_web::PathBuilder {
+                ::autumn_web::PathBuilder::new(::std::format!(#id_path_fmt, id))
+            }
+            #[doc(hidden)]
+            pub fn #delete_path_helper(id: i64) -> ::autumn_web::PathBuilder {
+                ::autumn_web::PathBuilder::new(::std::format!(#id_path_fmt, id))
+            }
 
             #policy_type_assertion
             #scope_type_assertion

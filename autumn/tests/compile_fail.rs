@@ -26,6 +26,12 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     compile_repository_hooks_not_default(&t);
 
+    // Path helper arity errors
+    t.compile_fail("tests/compile-fail/path_helper_wrong_arity.rs");
+
+    // Path helper rename detection
+    t.compile_fail("tests/compile-fail/path_helper_renamed_handler.rs");
+
     // Cached macro failures
     t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
 

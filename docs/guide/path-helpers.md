@@ -77,12 +77,12 @@ Helper signatures inherit the type from the handler's `Path<T>` extractor.
 |-------------------|-----------------|
 | `async fn show(Path(id): Path<i64>)` | `pub fn show(id: i64) -> PathBuilder` |
 | `async fn get_comment(Path((post, cmt)): Path<(i64, i64)>)` | `pub fn get_comment(post: i64, cmt: i64) -> PathBuilder` |
-| `async fn by_slug(_slug: Path<String>)` | `pub fn by_slug(slug: String) -> PathBuilder` |
+| `async fn by_slug(_slug: Path<String>)` | `pub fn by_slug(slug: impl Display) -> PathBuilder` |
 | `async fn list()` (no Path param) | `pub fn list() -> PathBuilder` |
 
-For parameters without a `Path<T>` extractor — custom types, wildcard
-segments, or `String` — the helper accepts `impl Display`, which keeps the
-interface open while still catching obvious type mismatches.
+`String` path params are promoted to `impl Display` so callers can pass
+`&str` without allocating.  Other concrete types (e.g. `i64`, `u32`, custom
+newtypes) are kept exact so typos are caught at the call site.
 
 ## Overriding the helper name
 
@@ -210,6 +210,38 @@ a href=(format!("/pages/{}/edit", slug))
 paths::show_page(&slug).into_redirect()
 a href=(paths::edit_page(&slug))
 ```
+
+## `#[repository]` REST helpers
+
+When you enable the auto-generated REST API with
+`#[repository(Model, api = "/api/items")]`, Autumn also emits five typed path
+helpers — one per CRUD verb — alongside the route-info companions:
+
+| Helper | Signature | Resolves to |
+|--------|-----------|-------------|
+| `__autumn_path_{prefix}_api_list()` | `() -> PathBuilder` | `/api/items` |
+| `__autumn_path_{prefix}_api_get(id)` | `(i64) -> PathBuilder` | `/api/items/{id}` |
+| `__autumn_path_{prefix}_api_create()` | `() -> PathBuilder` | `/api/items` |
+| `__autumn_path_{prefix}_api_update(id)` | `(i64) -> PathBuilder` | `/api/items/{id}` |
+| `__autumn_path_{prefix}_api_delete(id)` | `(i64) -> PathBuilder` | `/api/items/{id}` |
+
+`{prefix}` is the snake_case model name derived from the struct name (e.g.
+`Bookmark` → `bookmark`).
+
+```rust
+// repositories.rs
+#[autumn_web::repository(Bookmark, api = "/api/bookmarks")]
+pub trait BookmarkRepository { /* … */ }
+
+// bookmarks.rs  — use in Maud templates
+html! {
+    button hx-delete=(crate::repositories::__autumn_path_bookmark_api_delete(b.id))
+           hx-confirm="Delete?" { "Delete" }
+}
+```
+
+The helpers live in the same module as the `#[repository]` attribute, so use
+the full crate path or a `use` import when calling them from a different module.
 
 ## Verification
 

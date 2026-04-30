@@ -164,6 +164,16 @@ pub fn route_macro(
     }
 }
 
+/// Public entry point used by `static_route.rs` — delegates to the shared helper.
+pub fn emit_path_helper_pub(
+    helper_name: &proc_macro2::Ident,
+    path_str: &str,
+    path_params: &[String],
+    input_fn: &syn::ItemFn,
+) -> TokenStream {
+    emit_path_helper(helper_name, path_str, path_params, input_fn)
+}
+
 /// Emit the `__autumn_path_{name}(params...) -> PathBuilder` companion.
 ///
 /// Uses `impl Display` for each param in the Green Phase. The Refactor Phase
@@ -288,7 +298,11 @@ fn extract_path_param_types(path_params: &[String], input_fn: &syn::ItemFn) -> V
         match inner {
             Type::Tuple(tuple) => {
                 // Path<(T1, T2, ...)> — zip element types with param names.
-                let types: Vec<TokenStream> = tuple.elems.iter().map(|t| quote! { #t }).collect();
+                let types: Vec<TokenStream> = tuple
+                    .elems
+                    .iter()
+                    .map(|t| display_friendly_ty(t))
+                    .collect();
                 // If the tuple has fewer elements than params, fall back for extras.
                 let mut result = Vec::with_capacity(path_params.len());
                 for i in 0..path_params.len() {
@@ -302,7 +316,7 @@ fn extract_path_param_types(path_params: &[String], input_fn: &syn::ItemFn) -> V
             }
             single_ty => {
                 // Path<T> — single param.
-                let ty_tokens = quote! { #single_ty };
+                let ty_tokens = display_friendly_ty(single_ty);
                 let mut result = Vec::with_capacity(path_params.len());
                 result.push(ty_tokens);
                 for _ in 1..path_params.len() {
@@ -318,6 +332,26 @@ fn extract_path_param_types(path_params: &[String], input_fn: &syn::ItemFn) -> V
         .iter()
         .map(|_| quote! { impl ::std::fmt::Display })
         .collect()
+}
+
+/// Map a path-param type to its helper-function parameter type.
+///
+/// For `String` we emit `impl ::std::fmt::Display` so callers can pass `&str`
+/// without allocating a new `String`. All other types (e.g. `i64`, `u32`,
+/// custom newtypes) are passed through unchanged.
+fn display_friendly_ty(ty: &Type) -> TokenStream {
+    if let Type::Path(type_path) = ty {
+        if type_path.qself.is_none() {
+            if let Some(last) = type_path.path.segments.last() {
+                if last.ident == "String"
+                    && matches!(last.arguments, PathArguments::None)
+                {
+                    return quote! { impl ::std::fmt::Display };
+                }
+            }
+        }
+    }
+    quote! { #ty }
 }
 
 /// Strip an optional `#[name = "custom"]` attribute from the handler,

@@ -4,23 +4,13 @@
 //! use htmx attributes for interactive toggle/delete behaviour.
 
 use autumn_web::extract::{Form, Path};
+use autumn_web::reexports::axum::response::Redirect;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
-
-/// Render a meta-refresh redirect page targeting the given URL.
-fn redirect_to(url: &str) -> Markup {
-    html! {
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -82,7 +72,7 @@ fn todo_item(todo: &Todo) -> Markup {
            class="group flex items-center gap-3 px-4 py-3 bg-white rounded-lg \
                   border border-stone-200 hover:border-stone-300 \
                   shadow-sm transition-colors" {
-            button hx-post=(format!("/todos/{}/toggle", todo.id))
+            button hx-post=(__autumn_path_toggle(todo.id))
                    hx-target=(format!("#todo-{}", todo.id))
                    hx-swap="outerHTML"
                    class=(check_classes) {
@@ -90,11 +80,11 @@ fn todo_item(todo: &Todo) -> Markup {
                     span class="text-xs font-bold" { (check_icon) }
                 }
             }
-            a href=(format!("/todos/{}", todo.id))
+            a href=(__autumn_path_detail(todo.id))
                class=(title_classes) {
                 (todo.title)
             }
-            button hx-delete=(format!("/todos/{}", todo.id))
+            button hx-delete=(__autumn_path_delete_todo(todo.id))
                    hx-target=(format!("#todo-{}", todo.id))
                    hx-swap="outerHTML"
                    hx-confirm="Delete this todo?"
@@ -111,10 +101,8 @@ fn todo_item(todo: &Todo) -> Markup {
 
 /// Redirect the root path to `/todos`.
 #[get("/")]
-pub async fn index() -> Markup {
-    // We avoid importing axum::response::Redirect to keep the example
-    // focused on Autumn's own API surface.
-    redirect_to("/todos")
+pub async fn index() -> Redirect {
+    __autumn_path_list().into_redirect()
 }
 
 /// List all todos.
@@ -222,7 +210,7 @@ pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 
 /// Create a new todo from a form submission, then redirect to the list.
 #[post("/todos")]
-pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {
+pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Redirect> {
     let new_todo = form.0.validated()?;
 
     diesel::insert_into(todos::table)
@@ -230,7 +218,7 @@ pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Markup> {
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to("/todos"))
+    Ok(__autumn_path_list().into_redirect())
 }
 
 /// Toggle the completion status of a todo (htmx endpoint).
@@ -273,19 +261,10 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
 
-    #[test]
-    fn test_redirect_to_generates_html() {
-        let markup = redirect_to("/test-url");
-        let html = markup.into_string();
-        assert!(html.contains("url=/test-url"));
-        assert!(html.contains("Redirecting to"));
-    }
-
     #[tokio::test]
-    async fn test_index_generates_redirect_to_todos() {
-        let markup = index().await;
-        let html = markup.into_string();
-        assert!(html.contains("url=/todos"));
+    async fn test_index_redirects_to_todos() {
+        let redirect = index().await;
+        let _: autumn_web::reexports::axum::response::Redirect = redirect;
     }
 
     #[test]
