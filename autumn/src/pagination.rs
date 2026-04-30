@@ -916,7 +916,6 @@ mod tests {
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.limit(), i64::from(MAX_PAGE_SIZE));
 
-        // Mutants check: off-by-one boundary
         let exact = PageRequest::new(1, MAX_PAGE_SIZE);
         assert_eq!(exact.size(), MAX_PAGE_SIZE);
 
@@ -1252,6 +1251,15 @@ mod tests {
         let r = CursorRequest::new(None, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
+
+        let exact = CursorRequest::new(None, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = CursorRequest::new(None, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = CursorRequest::new(None, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
     }
 
     #[test]
