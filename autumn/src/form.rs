@@ -117,27 +117,30 @@ pub struct Changeset<T> {
 impl<T> Changeset<T> {
     /// Create a changeset with no errors (valid state).
     pub fn new(data: T) -> Self {
-        todo!("red phase")
+        Self {
+            data,
+            errors: HashMap::new(),
+        }
     }
 
     /// Create a changeset pre-loaded with field-level errors.
     pub fn from_errors(data: T, errors: HashMap<String, Vec<String>>) -> Self {
-        todo!("red phase")
+        Self { data, errors }
     }
 
     /// Returns `true` when there are no field-level errors.
     pub fn is_valid(&self) -> bool {
-        todo!("red phase")
+        self.errors.is_empty()
     }
 
     /// Returns the validation messages for `field`, or an empty slice.
     pub fn errors_for(&self, field: &str) -> &[String] {
-        todo!("red phase")
+        self.errors.get(field).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Unwrap the inner data regardless of validity.
     pub fn into_inner(self) -> T {
-        todo!("red phase")
+        self.data
     }
 
     /// Consume the changeset, returning `Ok(T)` if valid or `Err(self)` if not.
@@ -145,17 +148,21 @@ impl<T> Changeset<T> {
     /// The `Err` branch gives back the changeset so the handler can pass it
     /// to a Maud rendering function.
     pub fn into_valid(self) -> Result<T, Self> {
-        todo!("red phase")
+        if self.is_valid() {
+            Ok(self.data)
+        } else {
+            Err(self)
+        }
     }
 
     /// Shared reference to the inner data.
     pub fn data(&self) -> &T {
-        todo!("red phase")
+        &self.data
     }
 
     /// All field errors as a map (field name → list of messages).
     pub fn errors(&self) -> &HashMap<String, Vec<String>> {
-        todo!("red phase")
+        &self.errors
     }
 }
 
@@ -168,7 +175,13 @@ impl<T: Serialize> Changeset<T> {
     /// Returns `None` when the field does not exist or cannot be represented
     /// as a plain string (e.g., nested objects, arrays).
     pub fn field_value(&self, field: &str) -> Option<String> {
-        todo!("red phase")
+        let json = serde_json::to_value(&self.data).ok()?;
+        match json.get(field)? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
     }
 }
 
@@ -187,7 +200,10 @@ pub trait IntoChangeset: Sized {
 
 impl<T: validator::Validate> IntoChangeset for T {
     fn into_changeset(self) -> Changeset<Self> {
-        todo!("red phase")
+        match validator::Validate::validate(&self) {
+            Ok(()) => Changeset::new(self),
+            Err(errors) => Changeset::from_errors(self, validation_errors_to_map(&errors)),
+        }
     }
 }
 
@@ -229,7 +245,11 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        todo!("red phase")
+        let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+
+        Ok(Self(data.into_changeset()))
     }
 }
 
@@ -238,7 +258,22 @@ where
 fn validation_errors_to_map(
     errors: &validator::ValidationErrors,
 ) -> HashMap<String, Vec<String>> {
-    todo!("red phase")
+    errors
+        .field_errors()
+        .into_iter()
+        .map(|(field, errs)| {
+            let messages = errs
+                .iter()
+                .map(|e| {
+                    e.message.as_ref().map_or_else(
+                        || format!("validation failed: {}", e.code),
+                        ToString::to_string,
+                    )
+                })
+                .collect();
+            (field.to_string(), messages)
+        })
+        .collect()
 }
 
 // ── Maud rendering helpers ──────────────────────────────────────────
@@ -264,7 +299,14 @@ pub fn form_tag(
     csrf_token: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
-    todo!("red phase")
+    maud::html! {
+        form action=(action) method=(method) {
+            @if let Some(token) = csrf_token {
+                input type="hidden" name="_csrf" value=(token);
+            }
+            (content)
+        }
+    }
 }
 
 /// Render a labeled `<input type="text">` tied to a changeset field.
@@ -287,13 +329,38 @@ pub fn text_input<T: Serialize>(
     field: &str,
     label: &str,
 ) -> maud::Markup {
-    todo!("red phase")
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+
+    maud::html! {
+        div {
+            label for=(field) { (label) }
+            input
+                type="text"
+                id=(field)
+                name=(field)
+                value=(value)
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" {
+                    @for error in errors {
+                        p { (error) }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Render a `<button type="submit">` with `label`.
 #[cfg(feature = "maud")]
 pub fn submit_button(label: &str) -> maud::Markup {
-    todo!("red phase")
+    maud::html! {
+        button type="submit" { (label) }
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
