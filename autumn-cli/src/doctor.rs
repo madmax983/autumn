@@ -431,8 +431,7 @@ fn check_stale_artifacts() -> CheckResult {
         };
         dir.metadata()
             .and_then(|m| m.modified())
-            .map(|dir_t| dir_t < lock_t)
-            .unwrap_or(false)
+            .is_ok_and(|dir_t| dir_t < lock_t)
     };
 
     let dist_stale = dist.exists() && dir_older_than_lock(dist);
