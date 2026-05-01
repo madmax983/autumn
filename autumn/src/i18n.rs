@@ -745,11 +745,38 @@ pub async fn set_locale_in_session(session: &crate::session::Session, locale: &s
 /// Produce a value for the `Set-Cookie` response header that persists the
 /// chosen locale across requests. The cookie is `Path=/` and lives a year.
 ///
+/// The locale is percent-encoded before formatting so cookie delimiters
+/// cannot inject additional attributes.
+///
 /// This is unsigned; signing requires session integration. Apps that don't
 /// trust their own UI should keep relying on `Accept-Language`.
 #[must_use]
 pub fn set_locale_cookie(locale: &str) -> String {
+    let locale = encode_locale_cookie_value(locale);
     format!("autumn_locale={locale}; Path=/; Max-Age=31536000; SameSite=Lax")
+}
+
+fn encode_locale_cookie_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if is_locale_cookie_value_byte(byte) {
+            encoded.push(char::from(byte));
+        } else {
+            push_percent_encoded(&mut encoded, byte);
+        }
+    }
+    encoded
+}
+
+const fn is_locale_cookie_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+}
+
+fn push_percent_encoded(output: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    output.push('%');
+    output.push(char::from(HEX[(byte >> 4) as usize]));
+    output.push(char::from(HEX[(byte & 0x0f) as usize]));
 }
 
 /// Translate a key in the active locale, with **compile-time validation**
@@ -1133,6 +1160,14 @@ mod tests {
         assert!(cookie.starts_with("autumn_locale=es"));
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("SameSite=Lax"));
+    }
+
+    #[test]
+    fn set_locale_cookie_percent_encodes_cookie_delimiters() {
+        let cookie = set_locale_cookie("es; Secure; SameSite=None");
+
+        assert!(cookie.starts_with("autumn_locale=es%3B%20Secure%3B%20SameSite%3DNone;"));
+        assert!(!cookie.starts_with("autumn_locale=es; Secure;"));
     }
 
     // ── Session integration ─────────────────────────────────────
