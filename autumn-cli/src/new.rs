@@ -35,23 +35,40 @@ pub enum NewError {
     Io(#[from] std::io::Error),
 }
 
-/// Entry point called from `main.rs` and delegates to [`generate`].
-pub fn run(name: &str, with_seed: bool) {
+/// Entry point called from `main.rs` and delegates to [`generate_with`].
+pub fn run(name: &str, opts: GenerateOptions) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("Error: cannot determine current directory: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = generate(name, &cwd, with_seed) {
+    let result = if opts == GenerateOptions::default() {
+        generate(name, &cwd)
+    } else {
+        generate_with(name, &cwd, opts)
+    };
+    if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-/// Generate a new Autumn project under `parent_dir/name`.
-///
-/// When `with_seed` is `true`, scaffolds `src/bin/seed.rs` and adds the
-/// `[[bin]]` entry to `Cargo.toml`.
-pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), NewError> {
+/// Optional toggles applied to project generation.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct GenerateOptions {
+    /// Scaffold the optional i18n module (`i18n/en.ftl`, `[i18n]` block,
+    /// `i18n` feature flag on `autumn-web`).
+    pub with_i18n: bool,
+    /// Scaffold the optional seed binary and enable `autumn-web/seed`.
+    pub with_seed: bool,
+}
+
+/// Generate a new Autumn project under `parent_dir/name` with default options.
+pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
+    generate_with(name, parent_dir, GenerateOptions::default())
+}
+
+/// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
+pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
     validate_name(name)?;
 
     let project_dir = parent_dir.join(name);
@@ -65,6 +82,9 @@ pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), Ne
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
+    if opts.with_i18n {
+        fs::create_dir_all(project_dir.join("i18n"))?;
+    }
 
     let render = |template: &str| -> String {
         template
@@ -73,26 +93,32 @@ pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), Ne
             .replace("{{autumn_version}}", autumn_version)
     };
 
-    // Build Cargo.toml: base + optional seed [[bin]] entry.
-    // When --with-seed is on, upgrade the plain `autumn-web = "x"` dependency
-    // to a table form that enables the `seed` feature so `src/bin/seed.rs`
-    // can import `autumn_web::seed::SeedContext` without manual edits.
-    let cargo_toml = if with_seed {
-        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
-        let seed_dep =
-            format!(r#"autumn-web = {{ version = "{autumn_version}", features = ["seed"] }}"#);
-        let base = render(templates::CARGO_TOML).replace(&plain_dep, &seed_dep);
-        format!("{base}\n{}", render(templates::SEED_CARGO_TOML))
-    } else {
-        render(templates::CARGO_TOML)
-    };
+    let cargo_toml = render_cargo_toml(
+        opts,
+        autumn_version,
+        render(templates::CARGO_TOML),
+        &render(templates::SEED_CARGO_TOML),
+    );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
-    fs::write(project_dir.join("src/main.rs"), render(templates::MAIN_RS))?;
-    fs::write(
-        project_dir.join("autumn.toml"),
-        render(templates::AUTUMN_TOML),
-    )?;
+    let main_rs = if opts.with_i18n {
+        render(templates::MAIN_RS).replace(
+            "        .routes(routes![index, hello, hello_name])",
+            "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        )
+    } else {
+        render(templates::MAIN_RS)
+    };
+    fs::write(project_dir.join("src/main.rs"), main_rs)?;
+
+    let autumn_toml = if opts.with_i18n {
+        let mut s = render(templates::AUTUMN_TOML);
+        s.push_str("\n[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\"]\n");
+        s
+    } else {
+        render(templates::AUTUMN_TOML)
+    };
+    fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
     fs::write(
         project_dir.join("Dockerfile"),
         render(templates::DOCKERFILE),
@@ -113,13 +139,7 @@ pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), Ne
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
-    if with_seed {
-        fs::create_dir_all(project_dir.join("src/bin"))?;
-        fs::write(
-            project_dir.join("src/bin/seed.rs"),
-            render(templates::SEED_RS),
-        )?;
-    }
+    write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
@@ -128,23 +148,90 @@ pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), Ne
     println!("  Created {name}/.dockerignore");
     println!("  Created {name}/build.rs");
     println!("  Created {name}/src/main.rs");
-    if with_seed {
+    if opts.with_seed {
         println!("  Created {name}/src/bin/seed.rs");
     }
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/migrations/");
+    if opts.with_i18n {
+        println!("  Created {name}/i18n/en.ftl");
+    }
     println!();
     println!("Get started:");
     println!("  cd {name}");
     println!("  cargo run");
     println!();
     println!("Your app will be available at http://localhost:3000");
-    if with_seed {
+    if opts.with_i18n {
+        println!();
+        println!("i18n: edit i18n/en.ftl, add more locales as i18n/<tag>.ftl,");
+        println!("      and use the t!() macro in handlers — see docs/guide/i18n.md.");
+    }
+    if opts.with_seed {
         println!();
         println!("Seed your database:");
         println!("  autumn migrate && autumn seed");
+    }
+
+    Ok(())
+}
+
+fn render_cargo_toml(
+    opts: GenerateOptions,
+    autumn_version: &str,
+    mut cargo_toml: String,
+    seed_bin_toml: &str,
+) -> String {
+    let mut features = Vec::new();
+    if opts.with_i18n {
+        features.push("i18n");
+    }
+    if opts.with_seed {
+        features.push("seed");
+    }
+    if !features.is_empty() {
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let features = features
+            .iter()
+            .map(|feature| format!(r#""{feature}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let feature_dep =
+            format!(r#"autumn-web = {{ version = "{autumn_version}", features = [{features}] }}"#);
+        cargo_toml = cargo_toml.replace(&plain_dep, &feature_dep);
+    }
+    if opts.with_seed {
+        cargo_toml.push('\n');
+        cargo_toml.push_str(seed_bin_toml);
+    }
+    cargo_toml
+}
+
+fn write_optional_scaffold_files(
+    project_dir: &Path,
+    name: &str,
+    opts: GenerateOptions,
+    render: &impl Fn(&str) -> String,
+) -> Result<(), NewError> {
+    if opts.with_i18n {
+        fs::write(
+            project_dir.join("i18n/en.ftl"),
+            "# Default-locale translations for {{project_name}}.\n\
+             # Add more locales by dropping additional files like `i18n/es.ftl`.\n\
+             welcome.title = Welcome to Autumn!\n\
+             welcome.greeting = Hello, { $name }!\n"
+                .replace("{{project_name}}", name),
+        )?;
+    }
+
+    if opts.with_seed {
+        fs::create_dir_all(project_dir.join("src/bin"))?;
+        fs::write(
+            project_dir.join("src/bin/seed.rs"),
+            render(templates::SEED_RS),
+        )?;
     }
 
     Ok(())
@@ -261,7 +348,7 @@ mod tests {
     #[test]
     fn generates_all_expected_files() {
         let tmp = TempDir::new().unwrap();
-        generate("test-app", tmp.path(), false).unwrap();
+        generate("test-app", tmp.path()).unwrap();
 
         let p = tmp.path().join("test-app");
         assert!(p.join("Cargo.toml").is_file());
@@ -281,7 +368,7 @@ mod tests {
     #[test]
     fn cargo_toml_has_project_name() {
         let tmp = TempDir::new().unwrap();
-        generate("my-cool-app", tmp.path(), false).unwrap();
+        generate("my-cool-app", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-cool-app/Cargo.toml")).unwrap();
         assert!(content.contains(r#"name = "my-cool-app""#));
@@ -291,7 +378,7 @@ mod tests {
     #[test]
     fn cargo_toml_has_autumn_version() {
         let tmp = TempDir::new().unwrap();
-        generate("ver-check", tmp.path(), false).unwrap();
+        generate("ver-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("ver-check/Cargo.toml")).unwrap();
         let expected = format!(r#"autumn-web = "{}""#, env!("CARGO_PKG_VERSION"));
@@ -301,7 +388,7 @@ mod tests {
     #[test]
     fn main_rs_has_sample_routes() {
         let tmp = TempDir::new().unwrap();
-        generate("route-check", tmp.path(), false).unwrap();
+        generate("route-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("route-check/src/main.rs")).unwrap();
         assert!(content.contains(r#"#[get("/")]"#));
@@ -314,7 +401,7 @@ mod tests {
     #[test]
     fn autumn_toml_has_defaults() {
         let tmp = TempDir::new().unwrap();
-        generate("cfg-check", tmp.path(), false).unwrap();
+        generate("cfg-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("cfg-check/autumn.toml")).unwrap();
         assert!(content.contains("port = 3000"));
@@ -326,7 +413,7 @@ mod tests {
     #[test]
     fn autumn_toml_has_crate_name_in_db_url() {
         let tmp = TempDir::new().unwrap();
-        generate("my-db-app", tmp.path(), false).unwrap();
+        generate("my-db-app", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("my-db-app/autumn.toml")).unwrap();
         assert!(content.contains("my_db_app"));
@@ -335,7 +422,7 @@ mod tests {
     #[test]
     fn gitignore_excludes_target_and_css() {
         let tmp = TempDir::new().unwrap();
-        generate("gi-check", tmp.path(), false).unwrap();
+        generate("gi-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("gi-check/.gitignore")).unwrap();
         assert!(content.contains("/target"));
@@ -346,7 +433,7 @@ mod tests {
     #[test]
     fn generated_build_rs_reruns_on_css_input_changes() {
         let tmp = TempDir::new().unwrap();
-        generate("css-watch-check", tmp.path(), false).unwrap();
+        generate("css-watch-check", tmp.path()).unwrap();
 
         let content = fs::read_to_string(tmp.path().join("css-watch-check/build.rs")).unwrap();
         assert!(content.contains("cargo:rerun-if-changed=static/css/input.css"));
@@ -357,7 +444,7 @@ mod tests {
     #[test]
     fn no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
-        generate("placeholder-check", tmp.path(), false).unwrap();
+        generate("placeholder-check", tmp.path()).unwrap();
 
         let p = tmp.path().join("placeholder-check");
         for entry in walkdir(&p) {
@@ -373,8 +460,8 @@ mod tests {
     #[test]
     fn already_exists_error() {
         let tmp = TempDir::new().unwrap();
-        generate("dupe-check", tmp.path(), false).unwrap();
-        let err = generate("dupe-check", tmp.path(), false).unwrap_err();
+        generate("dupe-check", tmp.path()).unwrap();
+        let err = generate("dupe-check", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
         assert!(err.to_string().contains("already exists"));
     }
@@ -382,8 +469,103 @@ mod tests {
     #[test]
     fn invalid_name_error() {
         let tmp = TempDir::new().unwrap();
-        let err = generate("123bad", tmp.path(), false).unwrap_err();
+        let err = generate("123bad", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::InvalidName(_, _)));
+    }
+
+    // ── --with-i18n scaffold ─────────────────────────────────────
+
+    #[test]
+    fn default_does_not_scaffold_i18n() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("plain-app");
+        assert!(!p.join("i18n").exists());
+        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
+        assert!(!cargo.contains("features = [\"i18n\"]"));
+        let toml = fs::read_to_string(p.join("autumn.toml")).unwrap();
+        assert!(!toml.contains("[i18n]"));
+        let main = fs::read_to_string(p.join("src/main.rs")).unwrap();
+        assert!(!main.contains(".i18n_auto()"));
+    }
+
+    #[test]
+    fn with_i18n_scaffolds_translation_dir_and_stub_file() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "i18n-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let p = tmp.path().join("i18n-app");
+        assert!(p.join("i18n").is_dir(), "i18n/ dir not created");
+        assert!(
+            p.join("i18n/en.ftl").is_file(),
+            "i18n/en.ftl stub not created"
+        );
+        let stub = fs::read_to_string(p.join("i18n/en.ftl")).unwrap();
+        assert!(stub.contains("welcome.title"));
+        assert!(stub.contains("welcome.greeting"));
+    }
+
+    #[test]
+    fn with_i18n_enables_feature_flag_in_cargo_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "feat-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("feat-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains(r#"features = ["i18n"]"#),
+            "Cargo.toml should enable i18n feature: {cargo}"
+        );
+    }
+
+    #[test]
+    fn with_i18n_adds_block_to_autumn_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "cfg-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let cfg = fs::read_to_string(tmp.path().join("cfg-app/autumn.toml")).unwrap();
+        assert!(cfg.contains("[i18n]"));
+        assert!(cfg.contains("default_locale = \"en\""));
+        assert!(cfg.contains("supported_locales = [\"en\"]"));
+    }
+
+    #[test]
+    fn with_i18n_calls_i18n_auto_in_main() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "main-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("main-app/src/main.rs")).unwrap();
+        assert!(
+            main.contains(".i18n_auto()"),
+            "main.rs should call .i18n_auto(): {main}"
+        );
     }
 
     fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
@@ -406,21 +588,37 @@ mod tests {
     #[test]
     fn no_seed_bin_without_flag() {
         let tmp = TempDir::new().unwrap();
-        generate("no-seed-app", tmp.path(), false).unwrap();
+        generate("no-seed-app", tmp.path()).unwrap();
         assert!(!tmp.path().join("no-seed-app/src/bin/seed.rs").exists());
     }
 
     #[test]
     fn generates_seed_bin_when_with_seed() {
         let tmp = TempDir::new().unwrap();
-        generate("seed-app", tmp.path(), true).unwrap();
+        generate_with(
+            "seed-app",
+            tmp.path(),
+            GenerateOptions {
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
         assert!(tmp.path().join("seed-app/src/bin/seed.rs").is_file());
     }
 
     #[test]
     fn with_seed_cargo_toml_has_bin_entry_and_seed_feature() {
         let tmp = TempDir::new().unwrap();
-        generate("seed-cargo", tmp.path(), true).unwrap();
+        generate_with(
+            "seed-cargo",
+            tmp.path(),
+            GenerateOptions {
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
         let content = fs::read_to_string(tmp.path().join("seed-cargo/Cargo.toml")).unwrap();
         assert!(
             content.contains("[[bin]]"),
@@ -439,9 +637,32 @@ mod tests {
     }
 
     #[test]
+    fn with_i18n_and_seed_combines_feature_flags() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "combo-app",
+            tmp.path(),
+            GenerateOptions {
+                with_i18n: true,
+                with_seed: true,
+            },
+        )
+        .unwrap();
+
+        let p = tmp.path().join("combo-app");
+        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains(r#"features = ["i18n", "seed"]"#),
+            "Cargo.toml should preserve both optional features: {cargo}"
+        );
+        assert!(p.join("i18n/en.ftl").is_file());
+        assert!(p.join("src/bin/seed.rs").is_file());
+    }
+
+    #[test]
     fn no_bin_entry_in_cargo_toml_without_flag() {
         let tmp = TempDir::new().unwrap();
-        generate("plain-cargo", tmp.path(), false).unwrap();
+        generate("plain-cargo", tmp.path()).unwrap();
         let content = fs::read_to_string(tmp.path().join("plain-cargo/Cargo.toml")).unwrap();
         assert!(
             !content.contains("[[bin]]"),
@@ -452,7 +673,15 @@ mod tests {
     #[test]
     fn with_seed_no_unsubstituted_placeholders() {
         let tmp = TempDir::new().unwrap();
-        generate("seed-placeholder-check", tmp.path(), true).unwrap();
+        generate_with(
+            "seed-placeholder-check",
+            tmp.path(),
+            GenerateOptions {
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap();
 
         let p = tmp.path().join("seed-placeholder-check");
         for entry in walkdir(&p) {

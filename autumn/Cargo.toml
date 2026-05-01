@@ -38,6 +38,7 @@ telemetry-otlp = [
     "dep:tracing-opentelemetry",
 ]
 redis = ["dep:redis"]
+i18n = []
 # Pluggable file storage backends (Local always-on under `storage`,
 # S3 gated behind `storage-s3`). Off by default; enabling adds the
 # `BlobStore` trait, the `Blob` value type, and a Local backend.

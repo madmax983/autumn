@@ -13,6 +13,10 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        // Auto-load i18n bundle from `i18n/<locale>.ftl` according to the
+        // `[i18n]` block in `autumn.toml`. Visit `/greet` to see it work
+        // end-to-end with a locale switcher.
+        .i18n_auto()
         .plugin(
             AdminPlugin::new()
                 .prefix("/backoffice")
@@ -24,6 +28,7 @@ async fn main() {
             routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
+            routes::greet::greet, // i18n demo
             // Admin routes
             routes::posts::admin_list,
             routes::posts::new_form,
@@ -102,5 +107,23 @@ mod tests {
             }),
             "expected readonly created_at field in admin schema"
         );
+    }
+
+    #[tokio::test]
+    async fn static_about_page_renders_translated_layout_labels() {
+        let bundle = autumn_web::i18n::Bundle::load_from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n"),
+            &autumn_web::i18n::I18nConfig {
+                supported_locales: vec!["en".to_owned(), "es".to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect("blog i18n bundle");
+        let locale = autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle));
+
+        let html = super::routes::about::about(locale).await.into_string();
+
+        assert!(html.contains("Autumn Blog"), "html: {html}");
+        assert!(!html.contains("nav.brand"), "html: {html}");
     }
 }

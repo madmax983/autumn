@@ -644,6 +644,12 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub security: crate::security::config::SecurityConfig,
 
+    /// Internationalization settings (default locale, supported locales,
+    /// fallback chain). Populated from the `[i18n]` block in
+    /// `autumn.toml`.
+    #[cfg(feature = "i18n")]
+    #[serde(default)]
+    pub i18n: crate::i18n::I18nConfig,
     /// Pluggable file storage configuration. Honored only when the
     /// `storage` cargo feature is enabled.
     #[cfg(feature = "storage")]

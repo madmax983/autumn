@@ -152,7 +152,10 @@ fn resolve_database_url(profile: &str) -> Option<String> {
         return Some(url);
     }
 
-    let config_path = Path::new("autumn.toml");
+    resolve_database_url_from_toml(profile, Path::new("autumn.toml"))
+}
+
+fn resolve_database_url_from_toml(profile: &str, config_path: &Path) -> Option<String> {
     if config_path.exists()
         && let Ok(contents) = std::fs::read_to_string(config_path)
         && let Ok(table) = toml::from_str::<toml::Table>(&contents)
@@ -314,19 +317,14 @@ url = "postgres://demo:5432/demo_db"
 "#;
         std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
 
-        // Change working directory to tmp so resolve_database_url reads it.
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-
         let result = temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", None::<&str>),
             ],
-            || resolve_database_url("demo"),
+            || resolve_database_url_from_toml("demo", &tmp.path().join("autumn.toml")),
         );
 
-        std::env::set_current_dir(original).unwrap();
         assert_eq!(result.as_deref(), Some("postgres://demo:5432/demo_db"));
     }
 
@@ -340,18 +338,14 @@ url = "postgres://default:5432/db"
 "#;
         std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
 
-        let original = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-
         let result = temp_env::with_vars(
             [
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", None::<&str>),
             ],
-            || resolve_database_url("demo"),
+            || resolve_database_url_from_toml("demo", &tmp.path().join("autumn.toml")),
         );
 
-        std::env::set_current_dir(original).unwrap();
         assert_eq!(result.as_deref(), Some("postgres://default:5432/db"));
     }
 

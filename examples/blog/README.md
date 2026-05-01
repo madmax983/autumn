@@ -13,6 +13,10 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
 - `#[static_get]` + `static_routes![]` for build-time rendering
 - Automatic migrations on startup
 - Framework health and actuator endpoints
+- **i18n end-to-end** — opt-in `i18n` feature, `i18n/{en,es}.ftl`
+  translations, the request-scoped `Locale` extractor, the `t!()` macro
+  with **compile-time key validation**, automatic fallback, and a
+  locale switcher in the layout (visit `/greet`)
 
 ## Quick start
 
@@ -42,6 +46,25 @@ cargo run -p autumn-cli -- build -p blog
 
 Dynamic routes like `/` and `/posts/{slug}` still render through the server;
 static routes get written to `dist/` for deployment or CDN serving.
+
+## Try the i18n flow
+
+The blog enables the `i18n` Cargo feature on `autumn-web` and ships
+two translation bundles at `i18n/en.ftl` and `i18n/es.ftl`. The shared
+`layout()` is fully translated through the `t!()` macro, the nav has
+a built-in language switcher, and `/greet` renders an end-to-end demo:
+
+```text
+http://localhost:3000/greet              # default (Accept-Language)
+http://localhost:3000/greet?locale=es    # Spanish via query override
+http://localhost:3000/greet?locale=en    # English via query override
+```
+
+Resolution order is documented in [`docs/guide/i18n.md`](../../docs/guide/i18n.md):
+query → signed session cookie → plain `autumn_locale` cookie →
+`Accept-Language` → default. Try editing a key in `i18n/en.ftl` or
+introducing a typo in a `t!()` call — the build fails with a
+"did you mean" hint thanks to the proc-macro's compile-time check.
 
 ## Fingerprinted assets (production cache-busting)
 
@@ -157,6 +180,7 @@ git diff routes.txt
 |--------|------|-------------|
 | GET | `/` | Public blog listing |
 | GET | `/about` | Static page rendered via `#[static_get]` |
+| GET | `/greet` | i18n demo with locale switcher |
 | GET | `/posts/{slug}` | View a published post |
 | GET | `/admin` | Admin post dashboard |
 | GET | `/admin/new` | New post form |

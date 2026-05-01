@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class
+  locale-aware text resolution (#503). Translations live at
+  `i18n/<locale>.ftl` (Project Fluent format), discovered from the project
+  root at startup. Adds an `[i18n]` config block (`default_locale`,
+  `supported_locales`, `fallback_chain`, `dir`), a request-scoped `Locale`
+  extractor with stable resolution order
+  (query → signed session cookie → plain cookie → `Accept-Language` →
+  default), a `t!()` **proc-macro** with **compile-time key validation**
+  (reads the default locale's `.ftl` at expansion time and emits
+  `compile_error!` with a "did you mean" suggestion on typos),
+  `set_locale_in_session()` for HMAC-signed session-backed persistence,
+  automatic runtime fallback to the default locale on miss with a
+  rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
+  convenience that fail-fasts at startup when the default locale's `.ftl`
+  file is absent. The feature is **off by default**; apps that don't enable
+  it pay zero compile cost and see no behaviour change. `autumn new
+  --with-i18n` scaffolds a new project with the `i18n/` directory, stub
+  `en.ftl`, the `[i18n]` block, the feature flag, and the `.i18n_auto()`
+  call wired into `main.rs`. `examples/blog` is fully migrated — its
+  shared `layout()` is translated through `t!()`, the nav contains a
+  locale switcher, and `/greet` is an end-to-end demo with English and
+  Spanish bundles. New `docs/guide/i18n.md` documents the convention,
+  extractor order, the compile-time check, validation localization
+  pattern, and a "migrating from monolingual" section.
 - **typed path helpers:** Route macros (`#[get]`, `#[post]`, `#[put]`,
   `#[delete]`, `#[patch]`) now emit a companion
   `pub fn __autumn_path_{name}(params…) -> String` helper alongside every
