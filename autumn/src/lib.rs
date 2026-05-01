@@ -143,6 +143,12 @@ pub mod task;
 pub mod telemetry;
 pub mod ui;
 pub mod form;
+/// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
+pub use form::ChangesetForm;
+/// Changeset type carrying submitted values + per-field errors.
+pub use form::Changeset;
+/// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
+pub use form::IntoChangeset;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;

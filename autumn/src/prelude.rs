@@ -92,6 +92,12 @@ pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
 
+// ── Form ─────────────────────────────────────────────────────────
+/// Changeset-style form helpers: [`Changeset`], [`ChangesetForm`], [`IntoChangeset`].
+///
+/// See [`crate::form`] for the full surface including Maud rendering helpers.
+pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
+
 // ── Hooks ───────────────────────────────────────────────────────
 /// Mutation hook types for repository lifecycle callbacks.
 #[cfg(feature = "db")]
