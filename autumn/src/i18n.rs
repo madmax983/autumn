@@ -272,6 +272,9 @@ pub fn parse_accept_language<'a>(header: &str, supported: &'a [String]) -> Optio
                     p.strip_prefix("q=").and_then(|v| v.parse::<f32>().ok())
                 })
                 .unwrap_or(1.0);
+            if q.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                return None;
+            }
             Some((q, tag))
         })
         .collect();
@@ -1050,6 +1053,12 @@ mod tests {
     fn parse_accept_language_skips_wildcard() {
         let supported = vec!["en".to_owned(), "es".to_owned()];
         assert_eq!(parse_accept_language("*", &supported), None);
+    }
+
+    #[test]
+    fn parse_accept_language_ignores_zero_quality_entries() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        assert_eq!(parse_accept_language("es;q=0, en;q=0", &supported), None);
     }
 
     #[tokio::test]

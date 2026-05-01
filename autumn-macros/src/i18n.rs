@@ -16,13 +16,15 @@
 //!    `<default_locale>` is the value of the `AUTUMN_I18N_DEFAULT_LOCALE`
 //!    env var, defaulting to `"en"`.
 //!
-//! Both env vars are read at proc-macro expansion time. Because they are
-//! `cargo:rerun-if-env-changed`-friendly, a `build.rs` change will
-//! correctly invalidate the macro's cached parse on the next build.
+//! Both env vars are read at proc-macro expansion time. The in-process cache is
+//! scoped to those lookup inputs so workspace builds do not reuse one crate's
+//! bundle for another crate. Because the env vars are
+//! `cargo:rerun-if-env-changed`-friendly, a `build.rs` change will correctly
+//! invalidate the macro's cached parse on the next build.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
@@ -129,37 +131,65 @@ fn validate_key(key_lit: &LitStr) -> Option<TokenStream> {
 }
 
 enum BundleLookup {
-    Loaded(&'static HashMap<String, String>),
+    Loaded(Arc<HashMap<String, String>>),
     NoFile,
 }
 
-fn load_default_bundle() -> BundleLookup {
-    static CACHE: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
-    let cached = CACHE.get_or_init(read_and_parse_default_bundle);
-    cached
-        .as_ref()
-        .map_or(BundleLookup::NoFile, BundleLookup::Loaded)
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct BundleLookupInputs {
+    explicit_file: Option<PathBuf>,
+    manifest_dir: Option<PathBuf>,
+    default_locale: String,
 }
 
-fn read_and_parse_default_bundle() -> Option<HashMap<String, String>> {
-    let path = locate_default_bundle()?;
+impl BundleLookupInputs {
+    fn from_env() -> Self {
+        Self {
+            explicit_file: std::env::var_os("AUTUMN_I18N_FILE").map(PathBuf::from),
+            manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+            default_locale: std::env::var("AUTUMN_I18N_DEFAULT_LOCALE")
+                .unwrap_or_else(|_| "en".to_owned()),
+        }
+    }
+}
+
+type BundleCache = HashMap<BundleLookupInputs, Option<Arc<HashMap<String, String>>>>;
+
+fn load_default_bundle() -> BundleLookup {
+    load_default_bundle_for_inputs(&BundleLookupInputs::from_env())
+}
+
+fn load_default_bundle_for_inputs(inputs: &BundleLookupInputs) -> BundleLookup {
+    static CACHE: OnceLock<Mutex<BundleCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(inputs.clone())
+            .or_insert_with(|| read_and_parse_default_bundle(inputs).map(Arc::new))
+            .clone()
+    };
+    cached.map_or(BundleLookup::NoFile, BundleLookup::Loaded)
+}
+
+fn read_and_parse_default_bundle(inputs: &BundleLookupInputs) -> Option<HashMap<String, String>> {
+    let path = locate_default_bundle(inputs)?;
     let raw = std::fs::read_to_string(&path).ok()?;
     Some(parse_keys(&raw))
 }
 
-fn locate_default_bundle() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("AUTUMN_I18N_FILE") {
-        let path = PathBuf::from(explicit);
-        if path.is_file() {
-            return Some(path);
-        }
+fn locate_default_bundle(inputs: &BundleLookupInputs) -> Option<PathBuf> {
+    if let Some(path) = &inputs.explicit_file
+        && path.is_file()
+    {
+        return Some(path.clone());
     }
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-    let default_locale =
-        std::env::var("AUTUMN_I18N_DEFAULT_LOCALE").unwrap_or_else(|_| "en".to_owned());
-    let candidate = PathBuf::from(manifest)
+    let manifest = inputs.manifest_dir.as_ref()?;
+    let candidate = manifest
         .join("i18n")
-        .join(format!("{default_locale}.ftl"));
+        .join(format!("{}.ftl", inputs.default_locale));
     if candidate.is_file() {
         Some(candidate)
     } else {
@@ -264,5 +294,41 @@ mod tests {
         let candidates = ["hi".to_owned()];
         let got = closest_key("completely.unrelated.key", candidates.iter());
         assert!(got.is_none());
+    }
+
+    #[test]
+    fn default_bundle_cache_is_scoped_to_lookup_inputs() {
+        let root =
+            std::env::temp_dir().join(format!("autumn-macros-i18n-cache-{}", std::process::id()));
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(first.join("i18n")).expect("first i18n dir");
+        std::fs::create_dir_all(second.join("i18n")).expect("second i18n dir");
+        std::fs::write(first.join("i18n/en.ftl"), "first.only = First\n").expect("first ftl");
+        std::fs::write(second.join("i18n/en.ftl"), "second.only = Second\n").expect("second ftl");
+
+        let first_lookup = load_default_bundle_for_inputs(&BundleLookupInputs {
+            explicit_file: None,
+            manifest_dir: Some(first),
+            default_locale: "en".to_owned(),
+        });
+        let second_lookup = load_default_bundle_for_inputs(&BundleLookupInputs {
+            explicit_file: None,
+            manifest_dir: Some(second),
+            default_locale: "en".to_owned(),
+        });
+
+        let BundleLookup::Loaded(first_bundle) = first_lookup else {
+            panic!("first bundle should load");
+        };
+        let BundleLookup::Loaded(second_bundle) = second_lookup else {
+            panic!("second bundle should load");
+        };
+        assert!(first_bundle.contains_key("first.only"));
+        assert!(!first_bundle.contains_key("second.only"));
+        assert!(second_bundle.contains_key("second.only"));
+        assert!(!second_bundle.contains_key("first.only"));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
