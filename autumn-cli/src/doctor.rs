@@ -57,6 +57,7 @@ pub struct Summary {
 }
 
 /// Options parsed from CLI flags.
+#[derive(Clone, Copy)]
 pub struct DoctorOptions {
     /// Emit machine-readable JSON instead of human text.
     pub json: bool,
@@ -65,13 +66,14 @@ pub struct DoctorOptions {
 }
 
 /// Extension point: implement this trait to add custom checks.
+#[allow(dead_code)]
 pub trait Check {
     fn run(&self) -> CheckResult;
 }
 
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
-pub fn glyph(status: &CheckStatus) -> &'static str {
+pub const fn glyph(status: &CheckStatus) -> &'static str {
     match status {
         CheckStatus::Pass => "✅",
         CheckStatus::Warn => "⚠️ ",
@@ -93,24 +95,21 @@ pub fn compute_summary(results: &[CheckResult]) -> Summary {
     Summary { passed, warned, failed }
 }
 
-pub fn exit_code(summary: &Summary, strict: bool) -> i32 {
-    if summary.failed > 0 || (strict && summary.warned > 0) {
-        1
-    } else {
-        0
-    }
+pub const fn exit_code(summary: &Summary, strict: bool) -> i32 {
+    if summary.failed > 0 || (strict && summary.warned > 0) { 1 } else { 0 }
 }
 
 pub fn format_check_line(result: &CheckResult) -> String {
+    use std::fmt::Write as _;
     let g = glyph(&result.status);
     let mut line = format!("{g} {}", result.name);
     if let Some(ref detail) = result.detail {
-        line.push_str(&format!(" — {detail}"));
+        let _ = write!(line, " — {detail}");
     }
-    if let Some(hint) = result.hint {
-        if result.status != CheckStatus::Pass {
-            line.push_str(&format!("\n   hint: {hint}"));
-        }
+    if let Some(hint) = result.hint
+        && result.status != CheckStatus::Pass
+    {
+        let _ = write!(line, "\n   hint: {hint}");
     }
     line
 }
@@ -381,8 +380,6 @@ fn check_tailwind_binary() -> CheckResult {
 }
 
 fn check_stale_artifacts() -> CheckResult {
-    use std::fs;
-
     let cargo_lock = std::path::Path::new("Cargo.lock");
     let dist = std::path::Path::new("dist");
     let target = std::path::Path::new("target");
@@ -449,7 +446,7 @@ fn read_msrv() -> Option<String> {
         .get("package")
         .and_then(|p| p.get("rust-version"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_owned())
+        .map(std::borrow::ToOwned::to_owned)
 }
 
 /// Read the `autumn-web` version requirement from the project's `Cargo.toml`.
@@ -461,28 +458,23 @@ fn read_autumn_web_version() -> Option<String> {
         let entry = deps.get("autumn-web")?;
         match entry {
             toml::Value::String(v) => Some(v.clone()),
-            toml::Value::Table(t) => t.get("version")?.as_str().map(|s| s.to_owned()),
+            toml::Value::Table(t) => {
+                t.get("version")?.as_str().map(std::borrow::ToOwned::to_owned)
+            }
             _ => None,
         }
     };
 
-    // [dependencies]
-    if let Some(deps) = table.get("dependencies") {
-        if let Some(v) = find_in_deps(deps) {
-            return Some(v);
-        }
-    }
-
-    // [workspace.dependencies]
-    if let Some(v) = table
-        .get("workspace")
-        .and_then(|w| w.get("dependencies"))
-        .and_then(|d| find_in_deps(d))
-    {
-        return Some(v);
-    }
-
-    None
+    // [dependencies] then [workspace.dependencies]
+    table
+        .get("dependencies")
+        .and_then(find_in_deps)
+        .or_else(|| {
+            table
+                .get("workspace")
+                .and_then(|w| w.get("dependencies"))
+                .and_then(find_in_deps)
+        })
 }
 
 /// Try to TCP-connect to a host:port within a short timeout.
@@ -493,9 +485,9 @@ fn tcp_reachable(host: &str, port: u16) -> bool {
         Ok(a) => a.collect(),
         Err(_) => return false,
     };
-    addrs.iter().any(|addr| {
-        std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok()
-    })
+    addrs
+        .iter()
+        .any(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok())
 }
 
 fn check_db_connectivity(database_url: &str) -> CheckResult {
@@ -585,11 +577,9 @@ pub fn parse_db_host_port(url: &str) -> Option<(String, u16)> {
     let authority = without_scheme.split('/').next()?;
 
     // Drop user:pass@ prefix if present.
-    let host_port = if let Some(at) = authority.rfind('@') {
-        &authority[at + 1..]
-    } else {
-        authority
-    };
+    let host_port = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..]);
 
     // Split host:port.
     if let Some(colon) = host_port.rfind(':') {
@@ -609,7 +599,7 @@ fn resolve_server_port() -> u16 {
         .and_then(|t| {
             t.get("server")
                 .and_then(|s| s.get("port"))
-                .and_then(|p| p.as_integer())
+                .and_then(toml::Value::as_integer)
                 .and_then(|p| u16::try_from(p).ok())
         })
         .unwrap_or(3000)
@@ -617,13 +607,10 @@ fn resolve_server_port() -> u16 {
 
 /// Resolve the optional database URL from env and `autumn.toml`.
 fn resolve_optional_db_url() -> Option<String> {
-    if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL") {
-        if !url.is_empty() {
-            return Some(url);
-        }
-    }
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        if !url.is_empty() {
+    for var in ["AUTUMN_DATABASE__URL", "DATABASE_URL"] {
+        if let Ok(url) = std::env::var(var)
+            && !url.is_empty()
+        {
             return Some(url);
         }
     }
@@ -634,29 +621,22 @@ fn resolve_optional_db_url() -> Option<String> {
         .and_then(|t| {
             t.get("database")
                 .and_then(|db| db.get("url"))
-                .and_then(|u| u.as_str())
+                .and_then(toml::Value::as_str)
                 .filter(|u| !u.is_empty())
-                .map(|s| s.to_owned())
+                .map(std::borrow::ToOwned::to_owned)
         })
 }
 
 /// Check whether Tailwind is enabled in `autumn.toml`.
+///
+/// Falls back to a heuristic: if `build.rs` exists the project is assumed to
+/// use the Tailwind build pipeline.
 fn tailwind_enabled() -> bool {
     std::fs::read_to_string("autumn.toml")
         .ok()
         .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
-        .and_then(|t| {
-            t.get("tailwind")
-                .and_then(|v| v.as_bool())
-                .or_else(|| {
-                    // Tailwind is considered enabled when build.rs + tailwind.config.js exist.
-                    None
-                })
-        })
-        .unwrap_or_else(|| {
-            // Heuristic: if build.rs exists we assume Tailwind is in use.
-            std::path::Path::new("build.rs").exists()
-        })
+        .and_then(|t| t.get("tailwind").and_then(toml::Value::as_bool))
+        .unwrap_or_else(|| std::path::Path::new("build.rs").exists())
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
