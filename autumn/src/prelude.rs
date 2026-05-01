@@ -100,6 +100,15 @@ pub use crate::security::CsrfToken;
 /// Shared application state (for custom extractors).
 pub use crate::state::AppState;
 
+// ── Internationalization ───────────────────────────────────────
+/// Request-scoped locale extractor (resolves from query, cookie,
+/// `Accept-Language`, and default in that order).
+#[cfg(feature = "i18n")]
+pub use crate::i18n::Locale;
+/// Translation lookup macro — see [`crate::i18n`] for usage.
+#[cfg(feature = "i18n")]
+pub use crate::t;
+
 #[cfg(test)]
 mod tests {
     use super::*;

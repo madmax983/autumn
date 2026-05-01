@@ -11,11 +11,16 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        // Auto-load i18n bundle from `i18n/<locale>.ftl` according to the
+        // `[i18n]` block in `autumn.toml`. Visit `/greet` to see it work
+        // end-to-end with a locale switcher.
+        .i18n_auto()
         .routes(routes![
             // Public routes
             routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
+            routes::greet::greet, // i18n demo
             // Admin routes
             routes::posts::admin_list,
             routes::posts::new_form,

@@ -90,6 +90,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
+        #[cfg(feature = "i18n")]
+        i18n_bundle: None,
     }
 }
 
@@ -204,6 +206,11 @@ pub struct AppBuilder {
     openapi: Option<crate::openapi::OpenApiConfig>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
+    /// layer publishing this bundle is added at `run()` time so the
+    /// [`Locale`](crate::i18n::Locale) extractor can resolve translations.
+    #[cfg(feature = "i18n")]
+    i18n_bundle: Option<Arc<crate::i18n::Bundle>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -785,6 +792,64 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Register a pre-loaded i18n translation bundle.
+    ///
+    /// Most apps prefer [`Self::i18n_auto`] which loads from the
+    /// `i18n/` directory using the configured `[i18n]` block. Use this
+    /// directly when you need to construct a [`Bundle`](crate::i18n::Bundle)
+    /// from non-filesystem sources (in-memory tests, embedded `.ftl` files,
+    /// translation-management-system clients, etc.).
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n(mut self, bundle: crate::i18n::Bundle) -> Self {
+        self.i18n_bundle = Some(Arc::new(bundle));
+        self
+    }
+
+    /// Auto-load the i18n translation bundle from the configured directory
+    /// (`i18n/` by default), reading the `[i18n]` block from the active
+    /// [`AutumnConfig`](crate::config::AutumnConfig).
+    ///
+    /// Fails fast at startup if the configured default locale's file is
+    /// missing — the spec calls out this as the desired behaviour: a
+    /// half-localized app is worse than a clearly-broken one. The error
+    /// path here panics with the typed [`LoadError`](crate::i18n::LoadError)
+    /// formatted as a string so it surfaces in the same banner as other
+    /// fatal startup errors.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    ///
+    /// #[get("/")]
+    /// async fn index() -> &'static str { "ok" }
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     # #[cfg(feature = "i18n")]
+    ///     autumn_web::app()
+    ///         .i18n_auto()
+    ///         .routes(routes![index])
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n_auto(self) -> Self {
+        // The actual filesystem read happens here so failures surface
+        // immediately — before run() goes off and binds a TCP port to a
+        // doomed application.
+        let env = crate::config::OsEnv;
+        let config = crate::config::AutumnConfig::load_with_env(&env)
+            .unwrap_or_else(|e| panic!("i18n_auto: failed to load AutumnConfig: {e}"));
+        let dir = project_dir(&config.i18n.dir, &env);
+        let bundle = crate::i18n::Bundle::load_from_dir(&dir, &config.i18n)
+            .unwrap_or_else(|e| panic!("i18n_auto: {e}"));
+        self.i18n(bundle)
+    }
+
     // ── Tier-1 subsystem replacement hooks ─────────────────────
     //
     // Each `with_*` method swaps a framework-default subsystem for a
@@ -1025,6 +1090,8 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
         } = self;
 
         let all_routes = routes;
@@ -1086,6 +1153,28 @@ impl AppBuilder {
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+        #[cfg(feature = "i18n")]
+        let custom_layers = if let Some(bundle) = i18n_bundle {
+            tracing::info!(
+                locales = ?bundle.locales(),
+                default = bundle.default_locale(),
+                "i18n bundle loaded"
+            );
+            state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
+            let mut custom_layers = custom_layers;
+            // Use the existing IntoAppLayer plumbing so the Extension is
+            // visible to every request. axum::Extension<T> is itself a
+            // tower::Layer when T: Clone + Send + Sync + 'static.
+            let ext_layer = axum::Extension(bundle);
+            let registration = CustomLayerRegistration {
+                type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+                apply: Box::new(move |router| router.layer(ext_layer)),
+            };
+            custom_layers.push(registration);
+            custom_layers
+        } else {
+            custom_layers
+        };
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1226,6 +1315,8 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
                 openapi: _,
             audit_logger: _,
+            #[cfg(feature = "i18n")]
+                i18n_bundle: _,
         } = self;
 
         let all_routes = routes;

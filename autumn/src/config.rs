@@ -610,6 +610,13 @@ pub struct AutumnConfig {
     /// Security settings (headers, CSRF).
     #[serde(default)]
     pub security: crate::security::config::SecurityConfig,
+
+    /// Internationalization settings (default locale, supported locales,
+    /// fallback chain). Populated from the `[i18n]` block in
+    /// `autumn.toml`.
+    #[cfg(feature = "i18n")]
+    #[serde(default)]
+    pub i18n: crate::i18n::I18nConfig,
 }
 
 impl AutumnConfig {

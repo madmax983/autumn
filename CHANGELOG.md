@@ -5,6 +5,27 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class
+  locale-aware text resolution (#503). Translations live at
+  `i18n/<locale>.ftl` (Project Fluent format), discovered from the project
+  root at startup. Adds an `[i18n]` config block (`default_locale`,
+  `supported_locales`, `fallback_chain`, `dir`), a request-scoped `Locale`
+  extractor with stable resolution order
+  (query → cookie → `Accept-Language` → default), a `t!()` macro for key
+  lookup with named arguments, automatic fallback to the default locale on
+  miss with a rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
+  convenience that fail-fasts at startup when the default locale's `.ftl`
+  file is absent. The feature is **off by default**; apps that don't enable
+  it pay zero compile cost and see no behaviour change. `examples/blog`
+  ships an end-to-end demo at `/greet` with English + Spanish locales and a
+  locale switcher. New `docs/guide/i18n.md` documents the convention,
+  extractor order, validation localization pattern, and a
+  "migrating from monolingual" section.
+
 ## [0.3.0] - 2026-04-27
 
 ### Added
