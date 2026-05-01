@@ -90,16 +90,14 @@ impl SeedContext {
     /// constructed.
     pub fn build() -> Result<Self, SeedContextError> {
         let profile = resolve_profile();
-        let db_url =
-            resolve_database_url().ok_or(SeedContextError::NoDatabaseUrl)?;
+        let db_url = resolve_database_url(&profile).ok_or(SeedContextError::NoDatabaseUrl)?;
 
         let config = DatabaseConfig {
             url: Some(db_url),
             ..DatabaseConfig::default()
         };
 
-        let pool = create_pool(&config)?
-            .ok_or(SeedContextError::NoDatabaseUrl)?;
+        let pool = create_pool(&config)?.ok_or(SeedContextError::NoDatabaseUrl)?;
 
         Ok(Self { pool, profile })
     }
@@ -136,7 +134,13 @@ fn resolve_profile() -> String {
 }
 
 /// Resolve the database URL from environment variables and `autumn.toml`.
-fn resolve_database_url() -> Option<String> {
+///
+/// Resolution order (first non-empty value wins):
+/// 1. `AUTUMN_DATABASE__URL` env var
+/// 2. `DATABASE_URL` env var
+/// 3. `[profile.<profile>.database.url]` in `autumn.toml`
+/// 4. `[database.url]` in `autumn.toml`
+fn resolve_database_url(profile: &str) -> Option<String> {
     if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL")
         && !url.is_empty()
     {
@@ -154,6 +158,20 @@ fn resolve_database_url() -> Option<String> {
         && let Ok(table) = toml::from_str::<toml::Table>(&contents)
     {
         let value = toml::Value::Table(table);
+
+        // Profile-specific override: [profile.<name>.database.url]
+        if let Some(url) = value
+            .get("profile")
+            .and_then(|p| p.get(profile))
+            .and_then(|p| p.get("database"))
+            .and_then(|db| db.get("url"))
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+        {
+            return Some(url.to_string());
+        }
+
+        // Top-level fallback: [database.url]
         if let Some(url) = value
             .get("database")
             .and_then(|db: &toml::Value| db.get("url"))
@@ -224,7 +242,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    resolve_database_url().as_deref(),
+                    resolve_database_url("dev").as_deref(),
                     Some("postgres://primary:5432/db")
                 );
             },
@@ -240,7 +258,7 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    resolve_database_url().as_deref(),
+                    resolve_database_url("dev").as_deref(),
                     Some("postgres://fallback:5432/db")
                 );
             },
@@ -257,7 +275,7 @@ mod tests {
             || {
                 // No autumn.toml in the test runner's cwd (we rely on that
                 // directory not having one; if it does, this test is a no-op).
-                let url = resolve_database_url();
+                let url = resolve_database_url("dev");
                 // Either None (no autumn.toml) or Some (if autumn.toml exists
                 // with a database.url in the test runner cwd). We can't assert
                 // None unconditionally, so we just assert the function returns
@@ -276,11 +294,65 @@ mod tests {
             ],
             || {
                 assert_eq!(
-                    resolve_database_url().as_deref(),
+                    resolve_database_url("dev").as_deref(),
                     Some("postgres://real:5432/db")
                 );
             },
         );
+    }
+
+    #[test]
+    fn resolve_database_url_uses_profile_specific_section_from_toml() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let toml_content = r#"
+[database]
+url = "postgres://default:5432/db"
+
+[profile.demo.database]
+url = "postgres://demo:5432/demo_db"
+"#;
+        std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
+
+        // Change working directory to tmp so resolve_database_url reads it.
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || resolve_database_url("demo"),
+        );
+
+        std::env::set_current_dir(original).unwrap();
+        assert_eq!(result.as_deref(), Some("postgres://demo:5432/demo_db"));
+    }
+
+    #[test]
+    fn resolve_database_url_falls_back_to_top_level_when_profile_section_absent() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let toml_content = r#"
+[database]
+url = "postgres://default:5432/db"
+"#;
+        std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
+
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || resolve_database_url("demo"),
+        );
+
+        std::env::set_current_dir(original).unwrap();
+        assert_eq!(result.as_deref(), Some("postgres://default:5432/db"));
     }
 
     // ── SeedContextError messages ──────────────────────────────────────────

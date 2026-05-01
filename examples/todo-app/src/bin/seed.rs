@@ -32,8 +32,9 @@ struct NewTodo<'a> {
 
 #[tokio::main]
 async fn main() {
-    let ctx = SeedContext::build()
-        .expect("failed to build seed context — is the database running and AUTUMN_DATABASE__URL set?");
+    let ctx = SeedContext::build().expect(
+        "failed to build seed context — is the database running and AUTUMN_DATABASE__URL set?",
+    );
 
     println!("Seeding todo-app (profile: {})...", ctx.profile());
 
@@ -43,11 +44,7 @@ async fn main() {
         .expect("failed to acquire database connection");
 
     // Idempotency guard: skip if the table is already populated.
-    let existing_count: i64 = todos::table
-        .count()
-        .get_result(&mut *db)
-        .await
-        .unwrap_or(0);
+    let existing_count: i64 = todos::table.count().get_result(&mut *db).await.unwrap_or(0);
 
     if existing_count > 0 {
         println!(
@@ -86,8 +83,5 @@ async fn main() {
         .await
         .expect("failed to insert seed todos");
 
-    println!(
-        "Seeded {} todo(s) successfully.",
-        seed_todos.len()
-    );
+    println!("Seeded {} todo(s) successfully.", seed_todos.len());
 }

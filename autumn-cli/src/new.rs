@@ -74,12 +74,15 @@ pub fn generate(name: &str, parent_dir: &Path, with_seed: bool) -> Result<(), Ne
     };
 
     // Build Cargo.toml: base + optional seed [[bin]] entry.
+    // When --with-seed is on, upgrade the plain `autumn-web = "x"` dependency
+    // to a table form that enables the `seed` feature so `src/bin/seed.rs`
+    // can import `autumn_web::seed::SeedContext` without manual edits.
     let cargo_toml = if with_seed {
-        format!(
-            "{}\n{}",
-            render(templates::CARGO_TOML),
-            render(templates::SEED_CARGO_TOML)
-        )
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let seed_dep =
+            format!(r#"autumn-web = {{ version = "{autumn_version}", features = ["seed"] }}"#);
+        let base = render(templates::CARGO_TOML).replace(&plain_dep, &seed_dep);
+        format!("{base}\n{}", render(templates::SEED_CARGO_TOML))
     } else {
         render(templates::CARGO_TOML)
     };
@@ -415,15 +418,23 @@ mod tests {
     }
 
     #[test]
-    fn with_seed_cargo_toml_has_bin_entry() {
+    fn with_seed_cargo_toml_has_bin_entry_and_seed_feature() {
         let tmp = TempDir::new().unwrap();
         generate("seed-cargo", tmp.path(), true).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("seed-cargo/Cargo.toml")).unwrap();
-        assert!(content.contains("[[bin]]"), "Cargo.toml should have [[bin]]");
+        let content = fs::read_to_string(tmp.path().join("seed-cargo/Cargo.toml")).unwrap();
+        assert!(
+            content.contains("[[bin]]"),
+            "Cargo.toml should have [[bin]]"
+        );
         assert!(
             content.contains("seed"),
             "Cargo.toml [[bin]] entry should mention 'seed'"
+        );
+        // The seed feature must be enabled on autumn-web so src/bin/seed.rs
+        // can import autumn_web::seed::SeedContext without manual edits.
+        assert!(
+            content.contains(r#"features = ["seed"]"#),
+            "autumn-web dependency should include the seed feature, got:\n{content}"
         );
     }
 
@@ -431,8 +442,7 @@ mod tests {
     fn no_bin_entry_in_cargo_toml_without_flag() {
         let tmp = TempDir::new().unwrap();
         generate("plain-cargo", tmp.path(), false).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("plain-cargo/Cargo.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("plain-cargo/Cargo.toml")).unwrap();
         assert!(
             !content.contains("[[bin]]"),
             "Cargo.toml should not have [[bin]] when --with-seed is off"
