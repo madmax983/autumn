@@ -40,7 +40,14 @@ const WATCH_FILES: &[&str] = &[
 ];
 
 /// Directories that are always watched recursively, regardless of config.
-const DEFAULT_WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations", "views", "locales"];
+const DEFAULT_WATCH_DIRS: &[&str] = &[
+    "src",
+    "static",
+    "templates",
+    "migrations",
+    "views",
+    "locales",
+];
 
 /// Path of the project config file relative to the dev server's working directory.
 const AUTUMN_TOML: &str = "autumn.toml";
