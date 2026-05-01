@@ -101,7 +101,7 @@ impl MailState {
         }
     }
 
-    fn next(&mut self) {
+    const fn next(&mut self) {
         if self.messages.is_empty() {
             return;
         }
@@ -118,7 +118,7 @@ impl MailState {
         self.list_state.select(Some(i));
     }
 
-    fn previous(&mut self) {
+    const fn previous(&mut self) {
         if self.messages.is_empty() {
             return;
         }
@@ -167,25 +167,24 @@ fn run_loop(
         terminal.draw(|frame| draw(frame, state))?;
 
         if event::poll(Duration::from_millis(500))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            return Ok(());
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            state.next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            state.previous();
-                        }
-                        KeyCode::Char('r') => {
-                            state.refresh();
-                        }
-                        _ => {}
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
                     }
-                }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        state.next();
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        state.previous();
+                    }
+                    KeyCode::Char('r') => {
+                        state.refresh();
+                    }
+                    _ => {}
+                },
+                _ => {}
             }
         }
         // Removed auto-refresh here to improve performance
@@ -253,13 +252,15 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &MailState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
 
-    if let Some(selected_idx) = state.list_state.selected() {
-        if let Some(msg) = state.messages.get(selected_idx) {
-            let text = Text::raw(&msg.content);
-            let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
-            frame.render_widget(paragraph, area);
-            return;
-        }
+    if let Some(msg) = state
+        .list_state
+        .selected()
+        .and_then(|idx| state.messages.get(idx))
+    {
+        let text = Text::raw(&msg.content);
+        let paragraph = Paragraph::new(text).block(block).wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+        return;
     }
 
     let empty = Paragraph::new(Text::styled(
@@ -273,16 +274,17 @@ fn draw_detail(frame: &mut ratatui::Frame, area: Rect, state: &MailState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use std::fs::File;
     use std::io::Write;
+    use tempfile::tempdir;
 
     #[test]
     fn test_mail_message_load() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("test.eml");
         let mut file = File::create(&file_path).unwrap();
-        file.write_all(b"To: admin@example.com\nSubject: Hello TUI\n\nBody of message").unwrap();
+        file.write_all(b"To: admin@example.com\nSubject: Hello TUI\n\nBody of message")
+            .unwrap();
 
         let msg = MailMessage::load(&file_path).unwrap();
         assert_eq!(msg.to, "admin@example.com");
