@@ -1016,9 +1016,11 @@ impl AppBuilder {
         }
         let name_str = name.into_owned();
         self.registered_plugins.insert(name_str.clone());
-        self.current_plugin = Some(name_str);
+        // Save outer plugin context so nested plugin() calls don't permanently
+        // clear it; restore it after this plugin's build() returns.
+        let outer_plugin = self.current_plugin.replace(name_str);
         let mut result = plugin.build(self);
-        result.current_plugin = None;
+        result.current_plugin = outer_plugin;
         result
     }
 
@@ -1530,12 +1532,25 @@ impl AppBuilder {
             routes,
             route_sources,
             scoped_groups,
+            merge_routers,
+            nest_routers,
             config_loader_factory,
             telemetry_provider,
             #[cfg(feature = "openapi")]
             openapi,
             ..
         } = self;
+
+        // Raw Axum routers registered via .merge()/.nest() are opaque: there is
+        // no public API to enumerate their routes. Warn so callers know the
+        // snapshot may be incomplete.
+        let hidden = merge_routers.len() + nest_routers.len();
+        if hidden > 0 {
+            eprintln!(
+                "[autumn routes] warning: {hidden} raw router(s) added via \
+                 .merge()/.nest() are not enumerable and are omitted from this listing"
+            );
+        }
 
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;

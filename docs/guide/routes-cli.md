@@ -157,3 +157,19 @@ This means:
   prefix) are read from `autumn.toml`, so the output mirrors production.
 - **Plugin routes attributed** — routes registered by plugins show
   `source = "plugin:<name>"` rather than `"user"`.
+
+## Known limitations
+
+Routes added via `.merge(router)` or `.nest(prefix, router)` with a raw
+`axum::Router` are **not included** in the listing. Axum provides no public API
+to enumerate a router's registered routes. `autumn routes` prints a warning to
+stderr when such routers are detected:
+
+```
+[autumn routes] warning: 1 raw router(s) added via .merge()/.nest() are not
+enumerable and are omitted from this listing
+```
+
+If your application relies heavily on merged/nested raw routers, use `autumn
+routes` output as a partial snapshot and supplement it with manual
+documentation for those routes.
