@@ -359,20 +359,16 @@ async fn verify_csrf_token(
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
-    if let Ok(body_str) = std::str::from_utf8(&bytes) {
-        for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=')
-                && key == settings.form_field
+    for (key, value) in url::form_urlencoded::parse(&bytes) {
+        if key == settings.form_field {
+            if let Some(c) = cookie_token
+                && !c.is_empty()
+                && !value.is_empty()
+                && constant_time_eq(c, value.as_ref())
             {
-                if let Some(c) = cookie_token
-                    && !c.is_empty()
-                    && !value.is_empty()
-                    && constant_time_eq(c, value)
-                {
-                    token_found = true;
-                }
-                break;
+                token_found = true;
             }
+            break;
         }
     }
 
@@ -384,6 +380,30 @@ async fn verify_csrf_token(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn post_with_url_encoded_token_passes() {
+        let raw_token = "abc+123/xyz=456";
+        let encoded_token = "abc%2B123%2Fxyz%3D456";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={encoded_token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     use super::*;
     use axum::Router;
     use axum::body::Body;
