@@ -455,11 +455,10 @@ mod tests {
     fn filter_user_only_keeps_plugin_routes() {
         let routes = sample_routes();
         let result = apply_filters(routes, None, &[], true);
-        let plugin_routes: Vec<_> = result
-            .iter()
-            .filter(|r| r.source.starts_with("plugin:"))
-            .collect();
-        assert!(!plugin_routes.is_empty(), "plugin routes should be kept with --user-only");
+        assert!(
+            result.iter().any(|r| r.source.starts_with("plugin:")),
+            "plugin routes should be kept with --user-only"
+        );
     }
 
     #[test]

@@ -1853,6 +1853,7 @@ mod tests {
                 },
                 repository: None,
             }],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
@@ -1923,6 +1924,7 @@ mod tests {
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 

@@ -169,7 +169,7 @@ pub(crate) fn append_framework_routes(
     }
 }
 
-/// Append OpenAPI documentation routes (`/v3/api-docs`, `/swagger-ui`).
+/// Append `OpenAPI` documentation routes (`/v3/api-docs`, `/swagger-ui`).
 ///
 /// Only compiled when the `openapi` feature is enabled.
 #[cfg(feature = "openapi")]
@@ -265,7 +265,7 @@ mod tests {
         Route {
             method,
             path,
-            handler: get(handler).into(),
+            handler: get(handler),
             name,
             api_doc: dummy_api_doc(),
             repository: None,
