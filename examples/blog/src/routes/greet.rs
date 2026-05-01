@@ -54,5 +54,5 @@ pub async fn greet(locale: Locale) -> Markup {
             }
         }
     };
-    layout(&title, body)
+    layout(&locale, &title, body)
 }

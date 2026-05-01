@@ -2,7 +2,7 @@
 
 use autumn_web::{Markup, html, static_get};
 
-use super::posts::layout;
+use super::posts::{default_locale, layout};
 
 /// A static about page rendered at build time.
 ///
@@ -12,6 +12,7 @@ use super::posts::layout;
 #[static_get("/about")]
 pub async fn about() -> Markup {
     layout(
+        &default_locale(),
         "About \u{2022} Autumn Blog",
         html! {
             article {

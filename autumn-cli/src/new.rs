@@ -33,20 +33,37 @@ pub enum NewError {
     Io(#[from] std::io::Error),
 }
 
-/// Entry point called from `main.rs` and delegates to [`generate`].
-pub fn run(name: &str) {
+/// Entry point called from `main.rs` and delegates to [`generate_with`].
+pub fn run(name: &str, with_i18n: bool) {
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("Error: cannot determine current directory: {e}");
         std::process::exit(1);
     });
-    if let Err(e) = generate(name, &cwd) {
+    if let Err(e) = generate_with(name, &cwd, GenerateOptions { with_i18n }) {
         eprintln!("Error: {e}");
         std::process::exit(1);
     }
 }
 
-/// Generate a new Autumn project under `parent_dir/name`.
+/// Optional toggles applied to project generation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenerateOptions {
+    /// Scaffold the optional i18n module (`i18n/en.ftl`, `[i18n]` block,
+    /// `i18n` feature flag on `autumn-web`).
+    pub with_i18n: bool,
+}
+
+/// Generate a new Autumn project under `parent_dir/name` with default options.
 pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
+    generate_with(name, parent_dir, GenerateOptions::default())
+}
+
+/// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
+pub fn generate_with(
+    name: &str,
+    parent_dir: &Path,
+    opts: GenerateOptions,
+) -> Result<(), NewError> {
     validate_name(name)?;
 
     let project_dir = parent_dir.join(name);
@@ -60,6 +77,9 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
+    if opts.with_i18n {
+        fs::create_dir_all(project_dir.join("i18n"))?;
+    }
 
     let render = |template: &str| -> String {
         template
@@ -68,15 +88,36 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
             .replace("{{autumn_version}}", autumn_version)
     };
 
-    fs::write(
-        project_dir.join("Cargo.toml"),
-        render(templates::CARGO_TOML),
-    )?;
-    fs::write(project_dir.join("src/main.rs"), render(templates::MAIN_RS))?;
-    fs::write(
-        project_dir.join("autumn.toml"),
-        render(templates::AUTUMN_TOML),
-    )?;
+    let cargo_toml = if opts.with_i18n {
+        render(templates::CARGO_TOML).replace(
+            r#"autumn-web = "{{autumn_version}}""#
+                .replace("{{autumn_version}}", autumn_version)
+                .as_str(),
+            &format!(r#"autumn-web = {{ version = "{autumn_version}", features = ["i18n"] }}"#),
+        )
+    } else {
+        render(templates::CARGO_TOML)
+    };
+    fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
+
+    let main_rs = if opts.with_i18n {
+        render(templates::MAIN_RS).replace(
+            "    autumn_web::app()\n        .routes(routes![index, hello, hello_name])",
+            "    autumn_web::app()\n        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        )
+    } else {
+        render(templates::MAIN_RS)
+    };
+    fs::write(project_dir.join("src/main.rs"), main_rs)?;
+
+    let autumn_toml = if opts.with_i18n {
+        let mut s = render(templates::AUTUMN_TOML);
+        s.push_str("\n[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\"]\n");
+        s
+    } else {
+        render(templates::AUTUMN_TOML)
+    };
+    fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
     fs::write(
         project_dir.join("Dockerfile"),
         render(templates::DOCKERFILE),
@@ -97,6 +138,17 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
+    if opts.with_i18n {
+        fs::write(
+            project_dir.join("i18n/en.ftl"),
+            "# Default-locale translations for {{project_name}}.\n\
+             # Add more locales by dropping additional files like `i18n/es.ftl`.\n\
+             welcome.title = Welcome to Autumn!\n\
+             welcome.greeting = Hello, { $name }!\n"
+                .replace("{{project_name}}", name),
+        )?;
+    }
+
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
@@ -108,12 +160,20 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/migrations/");
+    if opts.with_i18n {
+        println!("  Created {name}/i18n/en.ftl");
+    }
     println!();
     println!("Get started:");
     println!("  cd {name}");
     println!("  cargo run");
     println!();
     println!("Your app will be available at http://localhost:3000");
+    if opts.with_i18n {
+        println!();
+        println!("i18n: edit i18n/en.ftl, add more locales as i18n/<tag>.ftl,");
+        println!("      and use the t!() macro in handlers — see docs/guide/i18n.md.");
+    }
 
     Ok(())
 }
@@ -352,6 +412,89 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let err = generate("123bad", tmp.path()).unwrap_err();
         assert!(matches!(err, NewError::InvalidName(_, _)));
+    }
+
+    // ── --with-i18n scaffold ─────────────────────────────────────
+
+    #[test]
+    fn default_does_not_scaffold_i18n() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("plain-app");
+        assert!(!p.join("i18n").exists());
+        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
+        assert!(!cargo.contains("features = [\"i18n\"]"));
+        let toml = fs::read_to_string(p.join("autumn.toml")).unwrap();
+        assert!(!toml.contains("[i18n]"));
+        let main = fs::read_to_string(p.join("src/main.rs")).unwrap();
+        assert!(!main.contains(".i18n_auto()"));
+    }
+
+    #[test]
+    fn with_i18n_scaffolds_translation_dir_and_stub_file() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "i18n-app",
+            tmp.path(),
+            GenerateOptions { with_i18n: true },
+        )
+        .unwrap();
+        let p = tmp.path().join("i18n-app");
+        assert!(p.join("i18n").is_dir(), "i18n/ dir not created");
+        assert!(
+            p.join("i18n/en.ftl").is_file(),
+            "i18n/en.ftl stub not created"
+        );
+        let stub = fs::read_to_string(p.join("i18n/en.ftl")).unwrap();
+        assert!(stub.contains("welcome.title"));
+        assert!(stub.contains("welcome.greeting"));
+    }
+
+    #[test]
+    fn with_i18n_enables_feature_flag_in_cargo_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "feat-app",
+            tmp.path(),
+            GenerateOptions { with_i18n: true },
+        )
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("feat-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains(r#"features = ["i18n"]"#),
+            "Cargo.toml should enable i18n feature: {cargo}"
+        );
+    }
+
+    #[test]
+    fn with_i18n_adds_block_to_autumn_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "cfg-app",
+            tmp.path(),
+            GenerateOptions { with_i18n: true },
+        )
+        .unwrap();
+        let cfg = fs::read_to_string(tmp.path().join("cfg-app/autumn.toml")).unwrap();
+        assert!(cfg.contains("[i18n]"));
+        assert!(cfg.contains("default_locale = \"en\""));
+        assert!(cfg.contains("supported_locales = [\"en\"]"));
+    }
+
+    #[test]
+    fn with_i18n_calls_i18n_auto_in_main() {
+        let tmp = TempDir::new().unwrap();
+        generate_with(
+            "main-app",
+            tmp.path(),
+            GenerateOptions { with_i18n: true },
+        )
+        .unwrap();
+        let main = fs::read_to_string(tmp.path().join("main-app/src/main.rs")).unwrap();
+        assert!(
+            main.contains(".i18n_auto()"),
+            "main.rs should call .i18n_auto(): {main}"
+        );
     }
 
     fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {

@@ -105,9 +105,10 @@ pub use crate::state::AppState;
 /// `Accept-Language`, and default in that order).
 #[cfg(feature = "i18n")]
 pub use crate::i18n::Locale;
-/// Translation lookup macro — see [`crate::i18n`] for usage.
+/// Translation lookup macro with compile-time key validation — see
+/// [`crate::i18n`] for usage.
 #[cfg(feature = "i18n")]
-pub use crate::t;
+pub use crate::i18n::t;
 
 #[cfg(test)]
 mod tests {

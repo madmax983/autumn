@@ -4,7 +4,8 @@
 //! use htmx attributes for interactive publish/delete behaviour.
 
 use autumn_web::extract::{Form, Path};
-use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post};
+use autumn_web::i18n::Locale;
+use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -25,10 +26,15 @@ fn redirect_to(url: &str) -> Markup {
 // ── Layout ──────────────────────────────────────────────────────
 
 /// Base HTML layout wrapping page content.
-pub fn layout(title: &str, content: Markup) -> Markup {
+///
+/// Takes the request [`Locale`] so nav, footer, and locale-switcher labels
+/// are translated through the [`t!`] macro. Pages reachable via
+/// `#[static_get]` (e.g. `about.rs`) pass [`default_locale()`] so the
+/// pre-rendered HTML is in the configured default language.
+pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang="en" {
+        html lang=(locale.tag()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -42,13 +48,20 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                 nav class="border-b border-stone-200 bg-white/80 backdrop-blur-sm sticky top-0 z-10" {
                     div class="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between" {
                         a href="/" class="text-lg font-semibold text-stone-900 hover:text-amber-700 transition-colors" {
-                            "\u{1F342} Autumn Blog"
+                            "\u{1F342} " (t!(locale, "nav.brand"))
                         }
                         div class="flex items-center gap-4" {
-                            a href="/" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Home" }
-                            a href="/about" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "About" }
-                            a href="/admin" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Admin" }
-                            a href="/admin/new" class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { "New Post" }
+                            a href="/" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.home")) }
+                            a href="/about" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.about")) }
+                            a href="/greet" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.greet")) }
+                            a href="/admin" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.admin")) }
+                            a href="/admin/new" class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { (t!(locale, "nav.new_post")) }
+                            // Lightweight locale switcher — `?locale=` query
+                            // overrides the resolved locale per the documented
+                            // resolution order.
+                            span class="text-xs text-stone-400 ml-2" { (t!(locale, "nav.locale.label")) ":" }
+                            a href="?locale=en" class="text-xs text-stone-600 hover:text-amber-700" { (t!(locale, "nav.locale.en")) }
+                            a href="?locale=es" class="text-xs text-stone-600 hover:text-amber-700" { (t!(locale, "nav.locale.es")) }
                         }
                     }
                 }
@@ -61,7 +74,8 @@ pub fn layout(title: &str, content: Markup) -> Markup {
                 // Footer
                 footer class="border-t border-stone-200 mt-16" {
                     div class="max-w-3xl mx-auto text-center text-xs text-stone-500 py-8" {
-                        "Built with "
+                        (t!(locale, "footer.tagline"))
+                        " \u{2022} "
                         a href="https://github.com/madmax983/autumn"
                           class="text-amber-700 underline hover:text-amber-800" {
                             "Autumn"
@@ -72,6 +86,15 @@ pub fn layout(title: &str, content: Markup) -> Markup {
             }
         }
     }
+}
+
+/// Locale used for `#[static_get]` pre-rendering — the build-time render
+/// has no request, so it falls back to the configured default. Apps that
+/// want pre-rendered pages for multiple locales would generate one URL per
+/// locale; for the demo we only pre-render English.
+#[must_use]
+pub fn default_locale() -> Locale {
+    Locale::new("en")
 }
 
 // ── Components ──────────────────────────────────────────────────
@@ -198,10 +221,11 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
 
 /// Home page — list published posts.
 #[get("/")]
-pub async fn index(mut db: Db) -> AutumnResult<Markup> {
+pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
     let published_posts = Post::published(&mut db).await?;
 
     Ok(layout(
+        &locale,
         "Autumn Blog",
         html! {
             header class="mb-10" {
@@ -231,7 +255,7 @@ pub async fn index(mut db: Db) -> AutumnResult<Markup> {
 
 /// View a single published post by slug.
 #[get("/posts/{slug}")]
-pub async fn show(slug: Path<String>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResult<Markup> {
     let p = Post::find_by_slug(&slug, &mut db).await?;
     let date = p.created_at.format("%B %d, %Y");
 
@@ -239,6 +263,7 @@ pub async fn show(slug: Path<String>, mut db: Db) -> AutumnResult<Markup> {
     let paragraphs: Vec<&str> = p.body.split("\n\n").collect();
 
     Ok(layout(
+        &locale,
         &p.title,
         html! {
             article {
@@ -276,12 +301,13 @@ pub async fn show(slug: Path<String>, mut db: Db) -> AutumnResult<Markup> {
 
 /// Admin dashboard — list all posts (published and drafts).
 #[get("/admin")]
-pub async fn admin_list(mut db: Db) -> AutumnResult<Markup> {
+pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
     let all_posts = Post::all(&mut db).await?;
     let published_count = all_posts.iter().filter(|p| p.published).count();
     let draft_count = all_posts.len() - published_count;
 
     Ok(layout(
+        &locale,
         "Admin \u{2022} Autumn Blog",
         html! {
             header class="mb-8" {
@@ -366,8 +392,9 @@ pub async fn admin_list(mut db: Db) -> AutumnResult<Markup> {
 
 /// Show the new post form.
 #[get("/admin/new")]
-pub async fn new_form() -> Markup {
+pub async fn new_form(locale: Locale) -> Markup {
     layout(
+        &locale,
         "New Post \u{2022} Autumn Blog",
         html! {
             a href="/admin"
@@ -398,10 +425,11 @@ pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
 
 /// Show the edit form for a post.
 #[get("/admin/{id}/edit")]
-pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     let p = Post::find(*id, &mut db).await?;
 
     Ok(layout(
+        &locale,
         &format!("Edit: {} \u{2022} Autumn Blog", p.title),
         html! {
             a href="/admin"

@@ -14,6 +14,7 @@
 mod api_doc;
 mod cached;
 mod collect;
+mod i18n;
 mod main_macro;
 mod model;
 mod oauth2_callback;
@@ -561,4 +562,37 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
     ws::ws_macro(attr.into(), item.into()).into()
+}
+
+/// Translate an i18n key, with **compile-time validation** that the key
+/// exists in the default locale's `.ftl` file.
+///
+/// Re-exported as `autumn_web::t!` (and `autumn_web::prelude::t!`) when the
+/// `i18n` feature is enabled on `autumn-web`.
+///
+/// # Forms
+///
+/// ```ignore
+/// // Without args:
+/// t!(locale, "welcome.title")
+/// // With named args (Project Fluent's `{ $name }` placeable syntax):
+/// t!(locale, "welcome.greeting", name = "Ada")
+/// ```
+///
+/// # Compile-time behaviour
+///
+/// At expansion time the macro reads `$CARGO_MANIFEST_DIR/i18n/<default>.ftl`
+/// (where `<default>` is the value of the `AUTUMN_I18N_DEFAULT_LOCALE`
+/// environment variable, defaulting to `"en"`). If the key is not present,
+/// the macro emits a `compile_error!` pointing at the literal so the build
+/// fails with a clear diagnostic — including a "did you mean" suggestion
+/// for typos within Levenshtein distance 3.
+///
+/// If the file does not exist (e.g. an app that just enabled the feature
+/// flag and has not yet authored translations), the macro degrades to a
+/// pure runtime call so the build still succeeds. The runtime path will
+/// produce the visible `{$key}` marker on miss.
+#[proc_macro]
+pub fn t(input: TokenStream) -> TokenStream {
+    i18n::t_macro(input.into()).into()
 }

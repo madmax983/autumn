@@ -22,6 +22,11 @@ enum Commands {
     New {
         /// Project name (must be a valid Rust package name)
         name: String,
+        /// Scaffold the optional i18n module (Project Fluent translations
+        /// at `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the
+        /// `i18n` feature flag on `autumn-web`).
+        #[arg(long)]
+        with_i18n: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -96,7 +101,7 @@ fn main() {
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
-        Commands::New { name } => new::run(&name),
+        Commands::New { name, with_i18n } => new::run(&name, with_i18n),
         Commands::Setup { force } => setup::run(force),
     }
 }
@@ -109,7 +114,7 @@ mod tests {
     fn parse_new_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my-app");
             }
             _ => panic!("expected New command"),
@@ -120,9 +125,33 @@ mod tests {
     fn parse_new_with_underscores() {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my_app");
             }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_with_i18n_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app", "--with-i18n"]).unwrap();
+        match cli.command {
+            Commands::New {
+                ref name,
+                with_i18n,
+            } => {
+                assert_eq!(name, "my-app");
+                assert!(with_i18n);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_without_i18n_flag_defaults_off() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
+        match cli.command {
+            Commands::New { with_i18n, .. } => assert!(!with_i18n),
             _ => panic!("expected New command"),
         }
     }

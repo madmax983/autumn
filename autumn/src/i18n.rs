@@ -641,7 +641,20 @@ where
             .as_ref()
             .map_or_else(|| "en".to_owned(), |b| b.default_locale.clone());
 
-        let resolved = resolve_locale(parts, &supported).unwrap_or(default);
+        // Resolution order: query → session (signed cookie) → plain cookie
+        // (legacy / sessions-off) → Accept-Language → default.
+        let mut resolved = resolve_query_override(parts, &supported);
+        if resolved.is_none() {
+            resolved = resolve_from_session(parts, &supported).await;
+        }
+        if resolved.is_none() {
+            resolved = resolve_from_plain_cookie(parts, &supported);
+        }
+        if resolved.is_none() {
+            resolved = resolve_from_accept_language(parts, &supported);
+        }
+        let resolved = resolved.unwrap_or(default);
+
         let mut locale = Self::new(resolved);
         if let Some(bundle) = bundle {
             locale = locale.with_bundle(bundle);
@@ -650,46 +663,85 @@ where
     }
 }
 
-fn resolve_locale(parts: &Parts, supported: &[String]) -> Option<String> {
-    // 1. ?locale= query override.
-    if let Some(query) = parts.uri.query() {
-        for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("locale=") {
-                if let Some(matched) = negotiate(value, supported) {
-                    return Some(matched.to_owned());
-                }
+/// Session key used for the persisted locale.
+///
+/// Apps that want the locale switcher to persist via the framework's
+/// signed session cookie write to this key (see
+/// [`set_locale_in_session`]). The [`Locale`] extractor reads it
+/// automatically when a [`Session`](crate::session::Session) is in
+/// request extensions.
+pub const LOCALE_SESSION_KEY: &str = "autumn_locale";
+
+fn resolve_query_override(parts: &Parts, supported: &[String]) -> Option<String> {
+    let query = parts.uri.query()?;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("locale=") {
+            if let Some(matched) = negotiate(value, supported) {
+                return Some(matched.to_owned());
             }
         }
     }
+    None
+}
 
-    // 2. autumn_locale cookie.
-    if let Some(cookie_header) = parts
+async fn resolve_from_session(parts: &Parts, supported: &[String]) -> Option<String> {
+    // Session is published into request extensions by SessionLayer. When it
+    // isn't (e.g. session feature disabled or layer not installed), this
+    // simply falls through. Reading is async because the session uses an
+    // RwLock under the hood — but no I/O happens here.
+    let session = parts
+        .extensions
+        .get::<crate::session::Session>()
+        .cloned()?;
+    let value = session.get(LOCALE_SESSION_KEY).await?;
+    negotiate(&value, supported).map(str::to_owned)
+}
+
+fn resolve_from_plain_cookie(parts: &Parts, supported: &[String]) -> Option<String> {
+    let cookie_header = parts
         .headers
         .get(axum::http::header::COOKIE)
-        .and_then(|h| h.to_str().ok())
-    {
-        for cookie in cookie_header.split(';') {
-            let cookie = cookie.trim();
-            if let Some(value) = cookie.strip_prefix("autumn_locale=") {
-                if let Some(matched) = negotiate(value, supported) {
-                    return Some(matched.to_owned());
-                }
+        .and_then(|h| h.to_str().ok())?;
+    for cookie in cookie_header.split(';') {
+        let cookie = cookie.trim();
+        if let Some(value) = cookie.strip_prefix("autumn_locale=") {
+            if let Some(matched) = negotiate(value, supported) {
+                return Some(matched.to_owned());
             }
         }
     }
+    None
+}
 
-    // 3. Accept-Language header.
-    if let Some(header) = parts
+fn resolve_from_accept_language(parts: &Parts, supported: &[String]) -> Option<String> {
+    let header = parts
         .headers
         .get(axum::http::header::ACCEPT_LANGUAGE)
-        .and_then(|h| h.to_str().ok())
-    {
-        if let Some(matched) = parse_accept_language(header, supported) {
-            return Some(matched.to_owned());
-        }
-    }
+        .and_then(|h| h.to_str().ok())?;
+    parse_accept_language(header, supported).map(str::to_owned)
+}
 
-    None
+/// Persist a locale choice into the signed session cookie.
+///
+/// This is the recommended way to remember a user's language switch —
+/// the value rides on the framework's HMAC-signed session cookie so a
+/// hostile client cannot forge it. Apps that don't use sessions can
+/// fall back to the unsigned [`set_locale_cookie`] helper.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::i18n::set_locale_in_session;
+///
+/// #[post("/locale/{locale}")]
+/// async fn switch(session: Session, Path(locale): Path<String>) -> impl IntoResponse {
+///     set_locale_in_session(&session, &locale).await;
+///     axum::response::Redirect::to("/")
+/// }
+/// ```
+pub async fn set_locale_in_session(session: &crate::session::Session, locale: &str) {
+    session.insert(LOCALE_SESSION_KEY, locale).await;
 }
 
 /// Produce a value for the `Set-Cookie` response header that persists the
@@ -704,29 +756,26 @@ pub fn set_locale_cookie(locale: &str) -> String {
     )
 }
 
-/// Translate a key with optional `key = value` arguments.
+/// Translate a key in the active locale, with **compile-time validation**
+/// that the key exists in the default locale's `.ftl` file.
 ///
-/// Two forms:
+/// The macro itself lives in [`autumn_macros`] (the proc-macro crate). See
+/// its [`t`](autumn_macros::t) docs for the compile-time check semantics
+/// and the env-var contract used to locate the default-locale bundle.
+///
+/// # Forms
 ///
 /// ```ignore
-/// // Without args:
 /// t!(locale, "welcome.title")
-/// // With args:
 /// t!(locale, "welcome.greeting", name = "Ada")
 /// ```
 ///
-/// Always returns a [`String`]. On miss, returns `{$key}` so the surface
-/// is visible in dev.
-#[macro_export]
-macro_rules! t {
-    ($locale:expr, $key:expr) => {
-        $crate::i18n::Locale::t(&$locale, $key)
-    };
-    ($locale:expr, $key:expr, $($arg:ident = $val:expr),+ $(,)?) => {{
-        let args: &[(&str, &str)] = &[$((stringify!($arg), $val)),+];
-        $crate::i18n::Locale::t_with(&$locale, $key, args)
-    }};
-}
+/// # Runtime behaviour
+///
+/// Always returns a [`String`]. On a runtime miss (key not present in any
+/// fallback locale), returns `{$key}` and emits a rate-limited
+/// `tracing::warn!` so the omission is visible without flooding logs.
+pub use autumn_macros::t;
 
 #[cfg(test)]
 mod tests {
@@ -1100,6 +1149,85 @@ mod tests {
         assert!(cookie.starts_with("autumn_locale=es"));
         assert!(cookie.contains("Path=/"));
         assert!(cookie.contains("SameSite=Lax"));
+    }
+
+    // ── Session integration ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn locale_extractor_reads_signed_session_cookie() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let session = crate::session::Session::new_for_test(
+            "test-id".to_owned(),
+            std::collections::HashMap::new(),
+        );
+        crate::i18n::set_locale_in_session(&session, "es").await;
+
+        let mut parts = build_parts(
+            "/",
+            &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "en")],
+        );
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(session);
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+    }
+
+    #[tokio::test]
+    async fn signed_session_locale_overrides_plain_cookie() {
+        let cfg = cfg("en", &["en", "es", "fr"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[]), ("fr", &[])], &cfg));
+        let session = crate::session::Session::new_for_test(
+            "test-id".to_owned(),
+            std::collections::HashMap::new(),
+        );
+        crate::i18n::set_locale_in_session(&session, "fr").await;
+
+        let mut parts = build_parts(
+            "/",
+            &[(axum::http::header::COOKIE.as_str(), "autumn_locale=es")],
+        );
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(session);
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "fr");
+    }
+
+    #[tokio::test]
+    async fn query_still_overrides_session() {
+        let cfg = cfg("en", &["en", "es", "fr"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[]), ("fr", &[])], &cfg));
+        let session = crate::session::Session::new_for_test(
+            "test-id".to_owned(),
+            std::collections::HashMap::new(),
+        );
+        crate::i18n::set_locale_in_session(&session, "fr").await;
+
+        let mut parts = build_parts("/?locale=es", &[]);
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(session);
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+    }
+
+    #[tokio::test]
+    async fn unsupported_session_locale_falls_through() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let session = crate::session::Session::new_for_test(
+            "test-id".to_owned(),
+            std::collections::HashMap::new(),
+        );
+        crate::i18n::set_locale_in_session(&session, "ja").await;
+
+        let mut parts = build_parts(
+            "/",
+            &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "es")],
+        );
+        parts.extensions.insert(bundle.clone());
+        parts.extensions.insert(session);
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
     }
 
     // ── t! macro ─────────────────────────────────────────────────

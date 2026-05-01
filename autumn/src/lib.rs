@@ -84,6 +84,12 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+/// Translation lookup macro with compile-time key validation.
+///
+/// Re-exported from [`crate::i18n::t`] for ergonomic
+/// `autumn_web::t!(locale, "key")` usage.
+#[cfg(feature = "i18n")]
+pub use crate::i18n::t;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;

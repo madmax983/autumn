@@ -15,16 +15,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   root at startup. Adds an `[i18n]` config block (`default_locale`,
   `supported_locales`, `fallback_chain`, `dir`), a request-scoped `Locale`
   extractor with stable resolution order
-  (query → cookie → `Accept-Language` → default), a `t!()` macro for key
-  lookup with named arguments, automatic fallback to the default locale on
-  miss with a rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
+  (query → signed session cookie → plain cookie → `Accept-Language` →
+  default), a `t!()` **proc-macro** with **compile-time key validation**
+  (reads the default locale's `.ftl` at expansion time and emits
+  `compile_error!` with a "did you mean" suggestion on typos),
+  `set_locale_in_session()` for HMAC-signed session-backed persistence,
+  automatic runtime fallback to the default locale on miss with a
+  rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
   convenience that fail-fasts at startup when the default locale's `.ftl`
   file is absent. The feature is **off by default**; apps that don't enable
-  it pay zero compile cost and see no behaviour change. `examples/blog`
-  ships an end-to-end demo at `/greet` with English + Spanish locales and a
-  locale switcher. New `docs/guide/i18n.md` documents the convention,
-  extractor order, validation localization pattern, and a
-  "migrating from monolingual" section.
+  it pay zero compile cost and see no behaviour change. `autumn new
+  --with-i18n` scaffolds a new project with the `i18n/` directory, stub
+  `en.ftl`, the `[i18n]` block, the feature flag, and the `.i18n_auto()`
+  call wired into `main.rs`. `examples/blog` is fully migrated — its
+  shared `layout()` is translated through `t!()`, the nav contains a
+  locale switcher, and `/greet` is an end-to-end demo with English and
+  Spanish bundles. New `docs/guide/i18n.md` documents the convention,
+  extractor order, the compile-time check, validation localization
+  pattern, and a "migrating from monolingual" section.
 
 ## [0.3.0] - 2026-04-27
 
