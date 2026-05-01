@@ -19,7 +19,6 @@ const DEFAULT_CONCURRENCY: usize = 8;
 
 /// Errors that can occur during static rendering.
 #[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
 pub enum BuildError {
     /// A route handler returned a non-2xx HTTP status.
     #[error("Route {path} returned HTTP {status} (expected 2xx)")]
