@@ -1074,6 +1074,15 @@ impl AppBuilder {
             return;
         }
 
+        // ── Route dump mode ────────────────────────────────────────────
+        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
+        // This is triggered by `autumn routes` to introspect the app's
+        // route table without booting the server or connecting to a database.
+        if is_dump_routes_mode() {
+            self.run_dump_routes_mode().await;
+            return;
+        }
+
         let Self {
             routes,
             tasks,
@@ -1481,10 +1490,44 @@ impl AppBuilder {
             }
         }
     }
+
+    /// Dump the application's route listing as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
+    /// Exits with code 0 on success, code 1 on JSON serialization failure.
+    /// Does not connect to a database or bind a TCP port.
+    async fn run_dump_routes_mode(self) {
+        let Self {
+            routes,
+            scoped_groups,
+            config_loader_factory,
+            telemetry_provider,
+            ..
+        } = self;
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let mut infos =
+            crate::route_listing::collect_route_infos(&routes, &scoped_groups);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        crate::route_listing::sort_route_infos(&mut infos);
+
+        let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
 /// Start scheduled tasks in background Tokio tasks.
