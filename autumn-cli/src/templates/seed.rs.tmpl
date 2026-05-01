@@ -9,7 +9,7 @@
 //! every insert uses `ON CONFLICT DO NOTHING` (upsert-by-natural-key).
 use autumn_web::seed::SeedContext;
 
-#[tokio::main]
+#[autumn_web::main]
 async fn main() {
     let ctx = SeedContext::build()
         .expect("failed to build seed context — is the database running?");
