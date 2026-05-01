@@ -1330,6 +1330,23 @@ mod tests {
     }
 
     #[test]
+    fn cursor_page_from_overfetched_handles_encoding_failure() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1_i32, 2, 3];
+        let page = CursorPage::from_overfetched_inner(
+            items,
+            &req,
+            |&n| n,
+            |_| None::<String>, // Force encoding to fail
+        );
+
+        assert_eq!(page.content, vec![1, 2]);
+        assert_eq!(page.size, 2);
+        assert!(page.next_cursor.is_none());
+        assert!(!page.has_next);
+    }
+
+    #[test]
     fn cursor_page_empty_helper() {
         let req = CursorRequest::new(None, 10);
         let page: CursorPage<i32> = CursorPage::empty(&req);
@@ -1337,6 +1354,10 @@ mod tests {
         assert_eq!(page.size, 10);
         assert!(!page.has_next);
         assert!(page.next_cursor.is_none());
+
+        let req_diff_size = CursorRequest::new(None, 5);
+        let page_diff_size: CursorPage<i32> = CursorPage::empty(&req_diff_size);
+        assert_eq!(page_diff_size.size, 5);
     }
 
     #[test]
@@ -1344,10 +1365,13 @@ mod tests {
         let req = CursorRequest::new(None, 2);
         let items = vec![1_i32, 2, 3]; // overfetch by 1
         let page = CursorPage::from_overfetched(items, &req, |&n| serde_json::json!({"id": n}));
+
+        let original_cursor = page.next_cursor.clone();
+
         let mapped = page.map(|n| n.to_string());
         assert_eq!(mapped.content, vec!["1", "2"]);
         assert!(mapped.has_next);
-        assert!(mapped.next_cursor.is_some());
+        assert_eq!(mapped.next_cursor, original_cursor);
         assert_eq!(mapped.size, 2);
     }
 
