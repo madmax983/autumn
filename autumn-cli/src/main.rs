@@ -130,6 +130,9 @@ enum Commands {
         /// Package to inspect (for workspaces).
         #[arg(short, long)]
         package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
         /// Output format.
         #[arg(long, default_value = "table", value_name = "FORMAT")]
         format: String,
@@ -231,6 +234,7 @@ fn main() {
         Commands::Setup { force } => setup::run(force),
         Commands::Routes {
             package,
+            bin,
             format,
             prefix,
             filter,
@@ -245,6 +249,7 @@ fn main() {
             let effective_filter = prefix.as_deref().or(filter.as_deref());
             routes::run(&routes::RoutesOptions {
                 package: package.as_deref(),
+                bin: bin.as_deref(),
                 format: fmt,
                 filter: effective_filter,
                 methods: &method,
@@ -652,6 +657,7 @@ mod tests {
         match cli.command {
             Commands::Routes {
                 package,
+                bin,
                 format,
                 prefix,
                 filter,
@@ -659,6 +665,7 @@ mod tests {
                 user_only,
             } => {
                 assert!(package.is_none());
+                assert!(bin.is_none());
                 assert_eq!(format, "table");
                 assert!(prefix.is_none());
                 assert!(filter.is_none());
@@ -747,6 +754,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_routes_with_bin() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--bin", "server"]).unwrap();
+        match cli.command {
+            Commands::Routes { bin, .. } => {
+                assert_eq!(bin.as_deref(), Some("server"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
     fn parse_routes_all_options() {
         let cli = Cli::try_parse_from([
             "autumn",
@@ -765,6 +783,7 @@ mod tests {
         match cli.command {
             Commands::Routes {
                 package,
+                bin,
                 format,
                 prefix,
                 filter,
@@ -772,6 +791,7 @@ mod tests {
                 user_only,
             } => {
                 assert_eq!(package.as_deref(), Some("blog"));
+                assert!(bin.is_none());
                 assert_eq!(format, "json");
                 assert!(prefix.is_none());
                 assert_eq!(filter.as_deref(), Some("/api"));

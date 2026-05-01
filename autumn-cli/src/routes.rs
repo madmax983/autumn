@@ -44,6 +44,8 @@ pub struct RouteInfo {
 /// Options controlling `autumn routes` behaviour.
 pub struct RoutesOptions<'a> {
     pub package: Option<&'a str>,
+    /// Binary target name for packages that expose multiple bin targets.
+    pub bin: Option<&'a str>,
     pub format: OutputFormat,
     pub filter: Option<&'a str>,
     pub methods: &'a [String],
@@ -54,7 +56,7 @@ pub struct RoutesOptions<'a> {
 pub fn run(opts: &RoutesOptions<'_>) {
     eprintln!("\u{1F342} autumn routes\n");
     compile_binary(opts.package);
-    let binary = find_binary(opts.package);
+    let binary = find_binary(opts.package, opts.bin);
 
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_ROUTES", "1")
@@ -230,7 +232,7 @@ pub fn print_json(routes: &[RouteInfo]) {
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
 
-fn find_binary(package: Option<&str>) -> PathBuf {
+fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -245,7 +247,7 @@ fn find_binary(package: Option<&str>) -> PathBuf {
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|error| {
+    resolve_binary_from_metadata(&metadata, package, &cwd, bin).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     })
@@ -255,6 +257,7 @@ fn resolve_binary_from_metadata(
     metadata: &serde_json::Value,
     package: Option<&str>,
     cwd: &Path,
+    bin: Option<&str>,
 ) -> Result<PathBuf, String> {
     let target_dir = metadata["target_directory"]
         .as_str()
@@ -284,8 +287,8 @@ fn resolve_binary_from_metadata(
     );
 
     // Collect (package-name, binary-name) pairs for every matching package
-    // that has at least one `bin` target. Error if any package exposes more
-    // than one binary — the caller must disambiguate with --bin.
+    // that has at least one `bin` target.  When --bin is given, pick that
+    // specific target; otherwise error if a package exposes more than one.
     let mut candidates: Vec<(String, String)> = Vec::new();
     for pkg in &matching_packages {
         let pkg_name = match pkg["name"].as_str() {
@@ -309,15 +312,30 @@ fn resolve_binary_from_metadata(
             })
             .unwrap_or_default();
 
-        if bins.len() > 1 {
+        let chosen = if let Some(bin_name) = bin {
+            if bins.iter().any(|b| b == bin_name) {
+                Some(bin_name.to_owned())
+            } else if !bins.is_empty() {
+                return Err(format!(
+                    "package '{pkg_name}' has no binary named '{bin_name}' \
+                     (available: {})",
+                    bins.join(", ")
+                ));
+            } else {
+                None
+            }
+        } else if bins.len() > 1 {
             return Err(format!(
                 "package '{pkg_name}' has multiple binary targets ({}); \
                  use --bin to select one",
                 bins.join(", ")
             ));
-        }
-        if let Some(bin_name) = bins.into_iter().next() {
-            candidates.push((pkg_name, bin_name));
+        } else {
+            bins.into_iter().next()
+        };
+
+        if let Some(b) = chosen {
+            candidates.push((pkg_name, b));
         }
     }
 
@@ -606,7 +624,8 @@ mod tests {
                 }]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"));
+        let result =
+            resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"), None);
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -629,7 +648,8 @@ mod tests {
                 }]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
+        let result =
+            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"), None);
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -649,7 +669,7 @@ mod tests {
             }]
         });
         let result =
-            resolve_binary_from_metadata(&metadata, Some("missing"), Path::new("/projects"));
+            resolve_binary_from_metadata(&metadata, Some("missing"), Path::new("/projects"), None);
         assert!(result.unwrap_err().contains("package 'missing'"));
     }
 
@@ -670,7 +690,7 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"));
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None);
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary packages"),
@@ -700,7 +720,8 @@ mod tests {
             ]
         });
         // Narrowing cwd to /ws/alpha means only "alpha" matches.
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/alpha")).unwrap();
+        let result =
+            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/alpha"), None).unwrap();
         assert!(result.to_string_lossy().contains("alpha"));
     }
 
@@ -721,7 +742,7 @@ mod tests {
                 }
             ]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws")).unwrap();
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"), None).unwrap();
         assert!(result.to_string_lossy().contains("myapp"));
     }
 
@@ -735,7 +756,7 @@ mod tests {
                 "targets": [{"name": "mylib", "kind": ["lib"]}]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"));
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"), None);
         assert!(result.unwrap_err().contains("no binary target"));
     }
 
@@ -751,7 +772,7 @@ mod tests {
         });
         // Running from a subdirectory of the package root should still find it.
         let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello/src"));
+            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello/src"), None);
         assert!(
             result.unwrap().to_string_lossy().contains("hello"),
             "should resolve binary from subdirectory"
@@ -771,7 +792,7 @@ mod tests {
                 ]
             }]
         });
-        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"));
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), None);
         let err = result.unwrap_err();
         assert!(
             err.contains("multiple binary targets"),
@@ -780,6 +801,51 @@ mod tests {
         assert!(
             err.contains("--bin"),
             "should hint at --bin flag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_bin_flag_selects_named_target() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "myapp",
+                "manifest_path": "/ws/myapp/Cargo.toml",
+                "targets": [
+                    {"name": "server", "kind": ["bin"]},
+                    {"name": "migrate", "kind": ["bin"]}
+                ]
+            }]
+        });
+        let result =
+            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("migrate"))
+                .unwrap();
+        assert!(
+            result.to_string_lossy().contains("migrate"),
+            "should resolve to the named binary"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_bin_flag_wrong_name_errors() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "myapp",
+                "manifest_path": "/ws/myapp/Cargo.toml",
+                "targets": [{"name": "server", "kind": ["bin"]}]
+            }]
+        });
+        let result =
+            resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"), Some("missing"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("no binary named 'missing'"),
+            "expected named-binary error, got: {err}"
+        );
+        assert!(
+            err.contains("server"),
+            "should list available binaries, got: {err}"
         );
     }
 }

@@ -167,6 +167,15 @@ pub(crate) fn append_framework_routes(
             middleware: Vec::new(),
         });
     }
+
+    // Static file serving is unconditionally mounted at /static.
+    infos.push(RouteInfo {
+        method: "GET".to_owned(),
+        path: "/static/{*path}".to_owned(),
+        handler: "static_files".to_owned(),
+        source: RouteSource::Framework,
+        middleware: Vec::new(),
+    });
 }
 
 /// Append `OpenAPI` documentation routes (`/v3/api-docs`, `/swagger-ui`).
@@ -623,6 +632,24 @@ mod tests {
         // Only the JSON endpoint; no swagger-ui entry.
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/v3/api-docs");
+    }
+
+    // ── append_framework_routes static ────────────────────────────────────
+
+    #[test]
+    fn append_framework_routes_includes_static_catch_all() {
+        let config = AutumnConfig::default();
+        let mut infos = Vec::new();
+        append_framework_routes(&mut infos, &config);
+        let static_route = infos.iter().find(|r| r.path == "/static/{*path}");
+        assert!(
+            static_route.is_some(),
+            "framework routes should include /static/{{*path}}"
+        );
+        let r = static_route.unwrap();
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.handler, "static_files");
+        assert_eq!(r.source, RouteSource::Framework);
     }
 
     // ── append_dev_reload_routes ───────────────────────────────────────────
