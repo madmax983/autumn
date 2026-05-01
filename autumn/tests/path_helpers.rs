@@ -5,6 +5,8 @@
 //! They compile and run against `__autumn_path_*` companion functions
 //! that the route macros must emit alongside `__autumn_route_info_*`.
 
+#![allow(dead_code)]
+
 use autumn_web::paths::PathExt;
 use autumn_web::{delete, get, patch, post, put};
 
@@ -33,12 +35,12 @@ async fn show_post(autumn_web::Path(id): autumn_web::Path<i64>) -> String {
 }
 
 #[delete("/posts/{id}")]
-async fn delete_post(autumn_web::Path(id): autumn_web::Path<i64>) -> &'static str {
+async fn delete_post(autumn_web::Path(_id): autumn_web::Path<i64>) -> &'static str {
     "deleted"
 }
 
 #[put("/posts/{id}")]
-async fn update_post(autumn_web::Path(id): autumn_web::Path<i64>) -> &'static str {
+async fn update_post(autumn_web::Path(_id): autumn_web::Path<i64>) -> &'static str {
     "updated"
 }
 
@@ -73,7 +75,7 @@ async fn with_slash() -> &'static str {
 // ── Handlers: patch method ───────────────────────────────────────────
 
 #[patch("/posts/{id}")]
-async fn patch_post(autumn_web::Path(id): autumn_web::Path<i64>) -> &'static str {
+async fn patch_post(autumn_web::Path(_id): autumn_web::Path<i64>) -> &'static str {
     "patched"
 }
 
