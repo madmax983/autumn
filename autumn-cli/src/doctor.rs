@@ -355,28 +355,57 @@ fn check_port_bindable(port: u16) -> CheckResult {
     })
 }
 
-fn check_tailwind_binary() -> CheckResult {
-    let path = if cfg!(windows) {
-        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
-    } else {
-        std::path::PathBuf::from("target/autumn/tailwindcss")
-    };
-
-    if path.exists() {
+/// Check whether the Tailwind binary is present and runnable (injectable for tests).
+///
+/// `exists` and `can_run` are separate so that `can_run` is never invoked when
+/// the file is absent — avoiding a spurious "permission denied" OS error.
+pub fn check_tailwind_binary_impl(
+    path: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+    can_run: impl Fn(&std::path::Path) -> bool,
+) -> CheckResult {
+    if !exists(path) {
+        return CheckResult {
+            name: "tailwind_binary",
+            status: CheckStatus::Fail,
+            detail: Some(format!("{} not found", path.display())),
+            hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+        };
+    }
+    if can_run(path) {
         CheckResult {
             name: "tailwind_binary",
             status: CheckStatus::Pass,
-            detail: Some(format!("{} is present", path.display())),
+            detail: Some(format!("{} is present and runnable", path.display())),
             hint: None,
         }
     } else {
         CheckResult {
             name: "tailwind_binary",
             status: CheckStatus::Fail,
-            detail: Some(format!("{} not found", path.display())),
-            hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+            detail: Some(format!("{} exists but is not runnable", path.display())),
+            hint: Some(
+                "Run `autumn setup --force` to re-download the Tailwind CSS binary",
+            ),
         }
     }
+}
+
+fn check_tailwind_binary() -> CheckResult {
+    let path = if cfg!(windows) {
+        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
+    } else {
+        std::path::PathBuf::from("target/autumn/tailwindcss")
+    };
+    check_tailwind_binary_impl(
+        &path,
+        |p| p.exists(),
+        |p| {
+            // Try to invoke the binary; Ok(_) means the OS could execute it
+            // regardless of exit code (--help may return 0 or 1 depending on version).
+            std::process::Command::new(p).arg("--help").output().is_ok()
+        },
+    )
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -642,52 +671,86 @@ fn tailwind_enabled() -> bool {
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 /// Run all doctor checks and report results.
+///
+/// Checks are organised in two phases:
+/// 1. **Config phase** (serial, fast) — file/env reads to decide which checks
+///    to run and what data to pass them.
+/// 2. **Check phase** (parallel) — every applicable check is spawned on its own
+///    thread so that slow operations (TCP connect, subprocess calls) overlap.
+///    Results are joined back in display order.
 pub fn run(opts: DoctorOptions) {
+    use std::thread;
+
     let cli_version = env!("CARGO_PKG_VERSION");
 
     if !opts.json {
         println!("\u{1F342} autumn doctor\n");
     }
 
-    let mut results: Vec<CheckResult> = Vec::new();
+    // ── Phase 1: config reads (serial, cheap) ────────────────────────────────
+    let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
+    let web_ver = read_autumn_web_version();
+    let toml_result = std::fs::read_to_string("autumn.toml");
+    let db_url = resolve_optional_db_url();
+    let port = resolve_server_port();
+    let tailwind = tailwind_enabled();
+
+    // ── Phase 2: build tasks in display order ────────────────────────────────
+    type Task = Box<dyn FnOnce() -> CheckResult + Send>;
+    let mut tasks: Vec<Task> = Vec::new();
 
     // 1. Rust toolchain
-    let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
-    results.push(check_rust_toolchain(&msrv));
+    tasks.push(Box::new(move || check_rust_toolchain(&msrv)));
 
-    // 2. Version skew (autumn-cli vs autumn-web in project)
-    if let Some(web_ver) = read_autumn_web_version() {
-        results.push(check_version_compat(cli_version, &web_ver));
+    // 2. Version skew (only when autumn-web appears in the project's Cargo.toml)
+    if let Some(web) = web_ver {
+        tasks.push(Box::new(move || check_version_compat(cli_version, &web)));
     }
 
     // 3. autumn.toml
-    match std::fs::read_to_string("autumn.toml") {
-        Ok(content) => results.push(check_toml_content(&content)),
-        Err(_) => results.push(CheckResult {
+    match toml_result {
+        Ok(content) => tasks.push(Box::new(move || check_toml_content(&content))),
+        Err(_) => tasks.push(Box::new(|| CheckResult {
             name: "autumn_toml",
             status: CheckStatus::Warn,
             detail: Some("autumn.toml not found in current directory".into()),
             hint: Some("Run `autumn doctor` from your project root (where autumn.toml lives)"),
-        }),
+        })),
     }
 
-    // 4 & 5. Database (optional)
-    if let Some(db_url) = resolve_optional_db_url() {
-        results.push(check_db_connectivity(&db_url));
-        results.push(check_pending_migrations());
+    // 4 & 5. Database (only when configured)
+    if let Some(url) = db_url {
+        tasks.push(Box::new(move || check_db_connectivity(&url)));
+        tasks.push(Box::new(check_pending_migrations));
     }
 
     // 6. Port bindable
-    let port = resolve_server_port();
-    results.push(check_port_bindable(port));
+    tasks.push(Box::new(move || check_port_bindable(port)));
 
-    // 7. Tailwind binary (only if Tailwind is in use)
-    if tailwind_enabled() {
-        results.push(check_tailwind_binary());
+    // 7. Tailwind binary (only when build pipeline is present)
+    if tailwind {
+        tasks.push(Box::new(check_tailwind_binary));
     }
 
-    // 8. Stale artifacts (warn only)
-    results.push(check_stale_artifacts());
+    // 8. Stale artifacts (warn only, never fail)
+    tasks.push(Box::new(check_stale_artifacts));
+
+    // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
+    let handles: Vec<thread::JoinHandle<CheckResult>> =
+        tasks.into_iter().map(thread::spawn).collect();
+
+    // ── Phase 4: join in order (preserves display ordering) ──────────────────
+    let results: Vec<CheckResult> = handles
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or_else(|_| CheckResult {
+                name: "internal_error",
+                status: CheckStatus::Fail,
+                detail: Some("a check panicked unexpectedly".into()),
+                hint: None,
+            })
+        })
+        .collect();
 
     let summary = compute_summary(&results);
     let code = exit_code(&summary, opts.strict);
