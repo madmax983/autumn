@@ -924,8 +924,7 @@ mod tests {
 
     #[test]
     fn parse_doctor_json_and_strict() {
-        let cli =
-            Cli::try_parse_from(["autumn", "doctor", "--json", "--strict"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "doctor", "--json", "--strict"]).unwrap();
         assert!(matches!(
             cli.command,
             Commands::Doctor {

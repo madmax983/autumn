@@ -92,11 +92,19 @@ pub fn compute_summary(results: &[CheckResult]) -> Summary {
             CheckStatus::Fail => failed += 1,
         }
     }
-    Summary { passed, warned, failed }
+    Summary {
+        passed,
+        warned,
+        failed,
+    }
 }
 
 pub const fn exit_code(summary: &Summary, strict: bool) -> i32 {
-    if summary.failed > 0 || (strict && summary.warned > 0) { 1 } else { 0 }
+    if summary.failed > 0 || (strict && summary.warned > 0) {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn format_check_line(result: &CheckResult) -> String {
@@ -115,8 +123,16 @@ pub fn format_check_line(result: &CheckResult) -> String {
 }
 
 pub fn format_summary_line(summary: &Summary, code: i32) -> String {
-    let verdict = if code == 0 { "all clear" } else { "problems found" };
-    let w_label = if summary.warned == 1 { "warning" } else { "warnings" };
+    let verdict = if code == 0 {
+        "all clear"
+    } else {
+        "problems found"
+    };
+    let w_label = if summary.warned == 1 {
+        "warning"
+    } else {
+        "warnings"
+    };
     format!(
         "{} passed, {} {}, {} failed — {verdict}",
         summary.passed, summary.warned, w_label, summary.failed
@@ -129,8 +145,11 @@ pub fn to_json_output(results: &[CheckResult], summary: &Summary) -> String {
         checks: &'a [CheckResult],
         summary: &'a Summary,
     }
-    serde_json::to_string_pretty(&Output { checks: results, summary })
-        .unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&Output {
+        checks: results,
+        summary,
+    })
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 // ─── Check implementations ────────────────────────────────────────────────────
@@ -231,9 +250,7 @@ pub fn check_version_compat(cli_version: &str, web_version: &str) -> CheckResult
             detail: Some(format!(
                 "autumn-cli {cli_version} vs autumn-web {web_version} (patch skew)"
             )),
-            hint: Some(
-                "Consider updating either the CLI or your project's autumn-web dependency",
-            ),
+            hint: Some("Consider updating either the CLI or your project's autumn-web dependency"),
         }
     } else {
         CheckResult {
@@ -261,9 +278,7 @@ pub fn check_port_bindable_impl(port: u16, try_bind: impl Fn(u16) -> bool) -> Ch
             name: "port_bindable",
             status: CheckStatus::Fail,
             detail: Some(format!("port {port} is already in use")),
-            hint: Some(
-                "Kill the process using that port, or change server.port in autumn.toml",
-            ),
+            hint: Some("Kill the process using that port, or change server.port in autumn.toml"),
         }
     }
 }
@@ -272,9 +287,9 @@ pub fn check_port_bindable_impl(port: u16, try_bind: impl Fn(u16) -> bool) -> Ch
 pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckResult {
     let parse_ver = |s: &str| -> Option<(u64, u64, u64)> {
         let s = s.trim();
-        let s = s.strip_prefix("rustc ").map_or(s, |rest| {
-            rest.split_whitespace().next().unwrap_or(rest)
-        });
+        let s = s
+            .strip_prefix("rustc ")
+            .map_or(s, |rest| rest.split_whitespace().next().unwrap_or(rest));
         let parts: Vec<&str> = s.split('.').collect();
         if parts.len() < 3 {
             return None;
@@ -294,9 +309,7 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
         return CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Warn,
-            detail: Some(format!(
-                "cannot parse rustc version: {current_output}"
-            )),
+            detail: Some(format!("cannot parse rustc version: {current_output}")),
             hint: Some("Run `rustup update` to ensure a known Rust version"),
         };
     };
@@ -335,7 +348,10 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    match std::process::Command::new("rustc").arg("--version").output() {
+    match std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
@@ -384,9 +400,7 @@ pub fn check_tailwind_binary_impl(
             name: "tailwind_binary",
             status: CheckStatus::Fail,
             detail: Some(format!("{} exists but is not runnable", path.display())),
-            hint: Some(
-                "Run `autumn setup --force` to re-download the Tailwind CSS binary",
-            ),
+            hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
         }
     }
 }
@@ -397,15 +411,11 @@ fn check_tailwind_binary() -> CheckResult {
     } else {
         std::path::PathBuf::from("target/autumn/tailwindcss")
     };
-    check_tailwind_binary_impl(
-        &path,
-        std::path::Path::exists,
-        |p| {
-            // Try to invoke the binary; Ok(_) means the OS could execute it
-            // regardless of exit code (--help may return 0 or 1 depending on version).
-            std::process::Command::new(p).arg("--help").output().is_ok()
-        },
-    )
+    check_tailwind_binary_impl(&path, std::path::Path::exists, |p| {
+        // Try to invoke the binary; Ok(_) means the OS could execute it
+        // regardless of exit code (--help may return 0 or 1 depending on version).
+        std::process::Command::new(p).arg("--help").output().is_ok()
+    })
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -413,10 +423,7 @@ fn check_stale_artifacts() -> CheckResult {
     let dist = std::path::Path::new("dist");
     let target = std::path::Path::new("target");
 
-    let lock_mtime = cargo_lock
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok();
+    let lock_mtime = cargo_lock.metadata().and_then(|m| m.modified()).ok();
 
     let dir_older_than_lock = |dir: &std::path::Path| -> bool {
         let Some(lock_t) = lock_mtime else {
@@ -432,10 +439,13 @@ fn check_stale_artifacts() -> CheckResult {
     let target_stale = target.exists() && dir_older_than_lock(target);
 
     if dist_stale || target_stale {
-        let which: Vec<&str> = [dist_stale.then_some("dist/"), target_stale.then_some("target/")]
-            .into_iter()
-            .flatten()
-            .collect();
+        let which: Vec<&str> = [
+            dist_stale.then_some("dist/"),
+            target_stale.then_some("target/"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         CheckResult {
             name: "stale_artifacts",
             status: CheckStatus::Warn,
@@ -487,9 +497,10 @@ fn read_autumn_web_version() -> Option<String> {
         let entry = deps.get("autumn-web")?;
         match entry {
             toml::Value::String(v) => Some(v.clone()),
-            toml::Value::Table(t) => {
-                t.get("version")?.as_str().map(std::borrow::ToOwned::to_owned)
-            }
+            toml::Value::Table(t) => t
+                .get("version")?
+                .as_str()
+                .map(std::borrow::ToOwned::to_owned),
             _ => None,
         }
     };
@@ -542,9 +553,7 @@ fn check_db_connectivity(database_url: &str) -> CheckResult {
                     name: "db_connectivity",
                     status: CheckStatus::Fail,
                     detail: Some(format!("cannot connect to Postgres at {host}:{port}")),
-                    hint: Some(
-                        "Start Postgres and verify database.url in autumn.toml",
-                    ),
+                    hint: Some("Start Postgres and verify database.url in autumn.toml"),
                 }
             }
         }
@@ -566,10 +575,7 @@ fn check_pending_migrations() -> CheckResult {
         },
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let pending = stdout
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .count();
+            let pending = stdout.lines().filter(|l| !l.trim().is_empty()).count();
             if pending == 0 {
                 CheckResult {
                     name: "pending_migrations",
@@ -796,8 +802,18 @@ mod tests {
     #[test]
     fn compute_summary_all_pass() {
         let results = vec![
-            CheckResult { name: "a", status: CheckStatus::Pass, detail: None, hint: None },
-            CheckResult { name: "b", status: CheckStatus::Pass, detail: None, hint: None },
+            CheckResult {
+                name: "a",
+                status: CheckStatus::Pass,
+                detail: None,
+                hint: None,
+            },
+            CheckResult {
+                name: "b",
+                status: CheckStatus::Pass,
+                detail: None,
+                hint: None,
+            },
         ];
         let s = compute_summary(&results);
         assert_eq!(s.passed, 2);
@@ -808,9 +824,24 @@ mod tests {
     #[test]
     fn compute_summary_mixed() {
         let results = vec![
-            CheckResult { name: "a", status: CheckStatus::Pass, detail: None, hint: None },
-            CheckResult { name: "b", status: CheckStatus::Warn, detail: None, hint: None },
-            CheckResult { name: "c", status: CheckStatus::Fail, detail: None, hint: None },
+            CheckResult {
+                name: "a",
+                status: CheckStatus::Pass,
+                detail: None,
+                hint: None,
+            },
+            CheckResult {
+                name: "b",
+                status: CheckStatus::Warn,
+                detail: None,
+                hint: None,
+            },
+            CheckResult {
+                name: "c",
+                status: CheckStatus::Fail,
+                detail: None,
+                hint: None,
+            },
         ];
         let s = compute_summary(&results);
         assert_eq!(s.passed, 1);
@@ -830,31 +861,51 @@ mod tests {
 
     #[test]
     fn exit_code_no_failures() {
-        let s = Summary { passed: 3, warned: 0, failed: 0 };
+        let s = Summary {
+            passed: 3,
+            warned: 0,
+            failed: 0,
+        };
         assert_eq!(exit_code(&s, false), 0);
     }
 
     #[test]
     fn exit_code_with_failure() {
-        let s = Summary { passed: 2, warned: 0, failed: 1 };
+        let s = Summary {
+            passed: 2,
+            warned: 0,
+            failed: 1,
+        };
         assert_eq!(exit_code(&s, false), 1);
     }
 
     #[test]
     fn exit_code_warn_non_strict() {
-        let s = Summary { passed: 2, warned: 1, failed: 0 };
+        let s = Summary {
+            passed: 2,
+            warned: 1,
+            failed: 0,
+        };
         assert_eq!(exit_code(&s, false), 0);
     }
 
     #[test]
     fn exit_code_warn_strict() {
-        let s = Summary { passed: 2, warned: 1, failed: 0 };
+        let s = Summary {
+            passed: 2,
+            warned: 1,
+            failed: 0,
+        };
         assert_eq!(exit_code(&s, true), 1);
     }
 
     #[test]
     fn exit_code_zero_when_all_pass_strict() {
-        let s = Summary { passed: 5, warned: 0, failed: 0 };
+        let s = Summary {
+            passed: 5,
+            warned: 0,
+            failed: 0,
+        };
         assert_eq!(exit_code(&s, true), 0);
     }
 
@@ -916,7 +967,11 @@ mod tests {
 
     #[test]
     fn format_summary_all_pass() {
-        let s = Summary { passed: 7, warned: 0, failed: 0 };
+        let s = Summary {
+            passed: 7,
+            warned: 0,
+            failed: 0,
+        };
         let line = format_summary_line(&s, 0);
         assert!(line.contains("7 passed"));
         assert!(line.contains("0 warnings"));
@@ -926,7 +981,11 @@ mod tests {
 
     #[test]
     fn format_summary_with_failure() {
-        let s = Summary { passed: 5, warned: 1, failed: 1 };
+        let s = Summary {
+            passed: 5,
+            warned: 1,
+            failed: 1,
+        };
         let line = format_summary_line(&s, 1);
         assert!(line.contains("5 passed"));
         assert!(line.contains("1 warning"));
@@ -936,14 +995,22 @@ mod tests {
 
     #[test]
     fn format_summary_singular_warning_label() {
-        let s = Summary { passed: 3, warned: 1, failed: 0 };
+        let s = Summary {
+            passed: 3,
+            warned: 1,
+            failed: 0,
+        };
         let line = format_summary_line(&s, 0);
         assert!(line.contains("1 warning,"));
     }
 
     #[test]
     fn format_summary_plural_warning_label() {
-        let s = Summary { passed: 1, warned: 2, failed: 0 };
+        let s = Summary {
+            passed: 1,
+            warned: 2,
+            failed: 0,
+        };
         let line = format_summary_line(&s, 0);
         assert!(line.contains("2 warnings,"));
     }
@@ -1106,8 +1173,7 @@ foo = "bar"
 
     #[test]
     fn parse_db_host_port_full_url() {
-        let (host, port) =
-            parse_db_host_port("postgres://user:pass@localhost:5432/mydb").unwrap();
+        let (host, port) = parse_db_host_port("postgres://user:pass@localhost:5432/mydb").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5432);
     }
@@ -1121,8 +1187,7 @@ foo = "bar"
 
     #[test]
     fn parse_db_host_port_default_port() {
-        let (host, port) =
-            parse_db_host_port("postgres://user:pass@db.example.com/mydb").unwrap();
+        let (host, port) = parse_db_host_port("postgres://user:pass@db.example.com/mydb").unwrap();
         assert_eq!(host, "db.example.com");
         assert_eq!(port, 5432);
     }
@@ -1189,9 +1254,15 @@ foo = "bar"
         let _ = check_tailwind_binary_impl(
             std::path::Path::new("target/autumn/tailwindcss"),
             |_| false,
-            |_| { run_called.set(true); false },
+            |_| {
+                run_called.set(true);
+                false
+            },
         );
-        assert!(!run_called.get(), "run_fn must not be called when path doesn't exist");
+        assert!(
+            !run_called.get(),
+            "run_fn must not be called when path doesn't exist"
+        );
     }
 
     // ── to_json_output ───────────────────────────────────────────────────────
