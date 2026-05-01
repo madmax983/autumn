@@ -271,7 +271,7 @@ fn resolve_binary_from_metadata(
                     pkg["manifest_path"]
                         .as_str()
                         .and_then(|manifest| Path::new(manifest).parent())
-                        .is_some_and(|dir| dir.starts_with(cwd))
+                        .is_some_and(|dir| cwd.starts_with(dir) || dir.starts_with(cwd))
                 })
                 .collect()
         },
@@ -284,22 +284,42 @@ fn resolve_binary_from_metadata(
     );
 
     // Collect (package-name, binary-name) pairs for every matching package
-    // that has at least one `bin` target.
-    let mut candidates: Vec<(String, String)> = matching_packages
-        .iter()
-        .filter_map(|pkg| {
-            let pkg_name = pkg["name"].as_str()?.to_owned();
-            let bin_name = pkg["targets"].as_array()?.iter().find_map(|t| {
-                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
-                if is_bin {
-                    t["name"].as_str().map(String::from)
-                } else {
-                    None
-                }
-            })?;
-            Some((pkg_name, bin_name))
-        })
-        .collect();
+    // that has at least one `bin` target. Error if any package exposes more
+    // than one binary — the caller must disambiguate with --bin.
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    for pkg in &matching_packages {
+        let pkg_name = match pkg["name"].as_str() {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        let bins: Vec<String> = pkg["targets"]
+            .as_array()
+            .map(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|t| {
+                        let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+                        if is_bin {
+                            t["name"].as_str().map(String::from)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if bins.len() > 1 {
+            return Err(format!(
+                "package '{pkg_name}' has multiple binary targets ({}); \
+                 use --bin to select one",
+                bins.join(", ")
+            ));
+        }
+        if let Some(bin_name) = bins.into_iter().next() {
+            candidates.push((pkg_name, bin_name));
+        }
+    }
 
     // When no explicit --package was given and multiple workspace members each
     // have a binary, we can't pick one safely — ask the user to be explicit.
@@ -717,5 +737,49 @@ mod tests {
         });
         let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"));
         assert!(result.unwrap_err().contains("no binary target"));
+    }
+
+    #[test]
+    fn resolve_binary_from_subdirectory_finds_parent_package() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "hello",
+                "manifest_path": "/projects/hello/Cargo.toml",
+                "targets": [{"name": "hello", "kind": ["bin"]}]
+            }]
+        });
+        // Running from a subdirectory of the package root should still find it.
+        let result =
+            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello/src"));
+        assert!(
+            result.unwrap().to_string_lossy().contains("hello"),
+            "should resolve binary from subdirectory"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_errors_on_multi_bin_package() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "myapp",
+                "manifest_path": "/ws/myapp/Cargo.toml",
+                "targets": [
+                    {"name": "server", "kind": ["bin"]},
+                    {"name": "migrate", "kind": ["bin"]}
+                ]
+            }]
+        });
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/myapp"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("multiple binary targets"),
+            "expected multi-bin error, got: {err}"
+        );
+        assert!(
+            err.contains("--bin"),
+            "should hint at --bin flag, got: {err}"
+        );
     }
 }
