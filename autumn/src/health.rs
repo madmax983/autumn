@@ -27,7 +27,7 @@
 //! Returns the same response as the readiness probe.
 
 use crate::extract::State;
-use crate::state::AppState;
+use crate::probe::ProvideProbeState;
 use axum::response::IntoResponse;
 
 /// Health check handler.
@@ -42,7 +42,9 @@ use axum::response::IntoResponse;
 /// - `200 OK` -- application is healthy.
 /// - `503 Service Unavailable` -- database pool is exhausted (all
 ///   connections in use and requests are queuing).
-pub async fn handler(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn handler<S: ProvideProbeState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
     crate::probe::readiness_response(&state)
 }
 
@@ -53,36 +55,53 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn test_state() -> AppState {
-        AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
+    #[derive(Clone)]
+    struct TestProbeState {
+        #[cfg(feature = "db")]
+        pool: Option<
+            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        >,
+        profile: String,
+        health_detailed: bool,
+        probes: crate::probe::ProbeState,
+    }
+
+    impl ProvideProbeState for TestProbeState {
+        fn probes(&self) -> &crate::probe::ProbeState {
+            &self.probes
+        }
+        fn health_detailed(&self) -> bool {
+            self.health_detailed
+        }
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+        fn uptime_display(&self) -> String {
+            "test_uptime".to_string()
+        }
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            self.pool.as_ref()
+        }
+    }
+
+    fn test_state() -> TestProbeState {
+        TestProbeState {
             #[cfg(feature = "db")]
             pool: None,
-            profile: Some("dev".into()),
-            started_at: std::time::Instant::now(),
+            profile: "dev".into(),
             health_detailed: true,
             probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
         }
     }
 
     #[tokio::test]
     async fn health_no_database_returns_ok() -> Result<(), Box<dyn std::error::Error>> {
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(handler))
+            .route("/health", axum::routing::get(handler::<TestProbeState>))
             .with_state(test_state());
 
         let response = app
@@ -106,7 +125,7 @@ mod tests {
     async fn health_no_database_returns_json_content_type() -> Result<(), Box<dyn std::error::Error>>
     {
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(handler))
+            .route("/health", axum::routing::get(handler::<TestProbeState>))
             .with_state(test_state());
 
         let response = app
@@ -136,28 +155,13 @@ mod tests {
         let pool = crate::db::create_pool(&config)?.ok_or("no pool created")?;
 
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(handler))
-            .with_state(AppState {
-                extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                    std::collections::HashMap::new(),
-                )),
+            .route("/health", axum::routing::get(handler::<TestProbeState>))
+            .with_state(TestProbeState {
+                #[cfg(feature = "db")]
                 pool: Some(pool),
-                profile: Some("prod".into()),
-                started_at: std::time::Instant::now(),
+                profile: "prod".into(),
                 health_detailed: true,
                 probes: crate::probe::ProbeState::ready_for_test(),
-                metrics: crate::middleware::MetricsCollector::new(),
-                log_levels: crate::actuator::LogLevels::new("info"),
-                task_registry: crate::actuator::TaskRegistry::new(),
-                job_registry: crate::actuator::JobRegistry::new(),
-                config_props: crate::actuator::ConfigProperties::default(),
-                #[cfg(feature = "ws")]
-                channels: crate::channels::Channels::new(32),
-                #[cfg(feature = "ws")]
-                shutdown: tokio_util::sync::CancellationToken::new(),
-                policy_registry: crate::authorization::PolicyRegistry::default(),
-                forbidden_response: crate::authorization::ForbiddenResponse::default(),
-                auth_session_key: "user_id".to_owned(),
             });
 
         let response = app
@@ -179,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn health_response_includes_version() -> Result<(), Box<dyn std::error::Error>> {
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(handler))
+            .route("/health", axum::routing::get(handler::<TestProbeState>))
             .with_state(test_state());
 
         let response = app
@@ -199,7 +203,7 @@ mod tests {
         state.health_detailed = false;
 
         let app = axum::Router::new()
-            .route("/health", axum::routing::get(handler))
+            .route("/health", axum::routing::get(handler::<TestProbeState>))
             .with_state(state);
 
         let response = app
