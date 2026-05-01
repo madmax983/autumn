@@ -59,6 +59,11 @@ pub fn route_macro(
     // otherwise default to the handler function name.
     let helper_ident = route_args.helper_ident(fn_name);
     let path_helper_name = format_ident!("__autumn_path_{}", helper_ident);
+    let fn_name_alias = emit_fn_name_alias(
+        route_args.name_override.as_ref(),
+        fn_name,
+        &path_helper_name,
+    );
 
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
@@ -100,22 +105,7 @@ pub fn route_macro(
         || fn_name.clone(),
         |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
     );
-
-    // Build the handler expression, chaining .layer() for each interceptor.
-    // Interceptors are applied in reverse attribute order so that the first
-    // #[intercept(...)] listed is the outermost layer (runs first).
-    let mut handler_expr: TokenStream =
-        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
-
-    for interceptor in interceptors.iter().rev() {
-        // Explicit error type annotation avoids inference ambiguity when
-        // multiple .layer() calls are chained on MethodRouter.
-        handler_expr = quote! {
-            ::autumn_web::reexports::axum::routing::MethodRouter::<
-                ::autumn_web::AppState, ::core::convert::Infallible
-            >::layer(#handler_expr, #interceptor)
-        };
-    }
+    let handler_expr = build_handler_expr(&routing_fn, &handler_name, &interceptors);
 
     // ── OpenAPI metadata ────────────────────────────────────────
     let path_params = api_doc::extract_path_params(&path.value());
@@ -126,7 +116,7 @@ pub fn route_macro(
     let http_method_lit = LitStr::new(http_method, Span::call_site());
 
     // ── Path helper ─────────────────────────────────────────────
-    let path_helper = emit_path_helper(vis, &path_helper_name, &path, &path_params);
+    let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -156,6 +146,45 @@ pub fn route_macro(
         }
 
         #path_helper
+        #fn_name_alias
+    }
+}
+
+/// Build the axum handler expression, applying interceptor layers in reverse
+/// attribute order so the first `#[intercept(...)]` is the outermost layer.
+fn build_handler_expr(
+    routing_fn: &proc_macro2::Ident,
+    handler_name: &proc_macro2::Ident,
+    interceptors: &[syn::Path],
+) -> TokenStream {
+    let mut expr = quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
+    for interceptor in interceptors.iter().rev() {
+        // Explicit type annotation avoids inference ambiguity with chained .layer() calls.
+        expr = quote! {
+            ::autumn_web::reexports::axum::routing::MethodRouter::<
+                ::autumn_web::AppState, ::core::convert::Infallible
+            >::layer(#expr, #interceptor)
+        };
+    }
+    expr
+}
+
+/// When a `name = "..."` override is active, emit a `pub use` alias for the
+/// handler's own function name so that `paths![fn_name]` resolves alongside
+/// the override's `paths![custom_name]`.
+fn emit_fn_name_alias(
+    name_override: Option<&syn::LitStr>,
+    fn_name: &proc_macro2::Ident,
+    path_helper_name: &proc_macro2::Ident,
+) -> TokenStream {
+    let fn_path_helper_name = format_ident!("__autumn_path_{}", fn_name);
+    if name_override.is_some() && fn_path_helper_name != *path_helper_name {
+        quote! {
+            #[doc(hidden)]
+            pub use self::#path_helper_name as #fn_path_helper_name;
+        }
+    } else {
+        quote! {}
     }
 }
 
@@ -168,12 +197,14 @@ pub fn route_macro(
 /// }
 /// ```
 ///
+/// Helpers are always emitted as `pub` regardless of handler visibility so
+/// that `paths![]` can re-export them without hitting E0364.
+///
 /// Positional `{}` placeholders are used (rather than named captures) so that
 /// route params whose names are Rust keywords — e.g. `/{type}` or `/{match}` —
 /// do not produce invalid `format!` invocations. Parameter idents are emitted
 /// as raw identifiers (`r#type`) so they are valid in the function signature.
 fn emit_path_helper(
-    vis: &syn::Visibility,
     helper_name: &proc_macro2::Ident,
     path: &LitStr,
     params: &[String],
@@ -196,7 +227,7 @@ fn emit_path_helper(
 
     quote! {
         #[doc(hidden)]
-        #vis fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
+        pub fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
             format!(#format_lit, #(#param_idents),*)
         }
     }

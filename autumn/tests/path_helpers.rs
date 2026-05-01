@@ -238,6 +238,54 @@ fn paths_module_exposes_param_helper() {
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Tests: paths![] works with private handlers (P1 fix)
+// ════════════════════════════════════════════════════════════════════
+
+mod private_handlers {
+    use autumn_web::get;
+
+    // No `pub` — private handler.
+    #[get("/private/{id}")]
+    async fn private_show(autumn_web::Path(_id): autumn_web::Path<i64>) -> &'static str {
+        "private"
+    }
+
+    autumn_web::paths![private_show];
+}
+
+#[test]
+fn paths_module_works_with_private_handler() {
+    assert_eq!(private_handlers::paths::private_show(7), "/private/7");
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Tests: paths![] works with name = override via fn name alias (P2 fix)
+// ════════════════════════════════════════════════════════════════════
+
+mod named_override {
+    use autumn_web::get;
+
+    #[get("/items/{id}", name = "item")]
+    pub async fn show_item(autumn_web::Path(_id): autumn_web::Path<i64>) -> &'static str {
+        "item"
+    }
+
+    // Both `paths![show_item]` (fn name) and `paths![item]` (override) work.
+    autumn_web::paths![show_item, item];
+}
+
+#[test]
+fn paths_module_fn_name_alias_resolves_with_override() {
+    // `show_item` resolves via the alias emitted alongside `__autumn_path_item`.
+    assert_eq!(named_override::paths::show_item(3), "/items/3");
+}
+
+#[test]
+fn paths_module_override_name_also_resolves() {
+    assert_eq!(named_override::paths::item(3), "/items/3");
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Tests: Redirect re-export
 // ════════════════════════════════════════════════════════════════════
 
