@@ -265,24 +265,31 @@ fn slice_str(items: &[LitStr]) -> TokenStream {
 ///
 /// Closing braces without an opening brace are ignored. Segments that
 /// contain regex (`{id:[0-9]+}`) take only the name before the colon.
+/// Escaped braces (`{{` / `}}`) are treated as literal characters and skipped.
 pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
-                let inner = &path[i + 1..i + 1 + end_rel];
-                let name = inner.split(':').next().unwrap_or(inner).trim();
-                if !name.is_empty() {
-                    out.push(name.to_owned());
-                }
-                i += 1 + end_rel + 1;
-                continue;
-            }
+    let mut remaining = path;
+
+    while let Some(start) = remaining.find('{') {
+        let after_brace = &remaining[start + 1..];
+        // `{{` is an escaped literal brace — skip both characters and continue.
+        if let Some(rest) = after_brace.strip_prefix('{') {
+            remaining = rest;
+            continue;
         }
-        i += 1;
+        let Some(end_rel) = after_brace.find('}') else {
+            break;
+        };
+
+        let inner = &after_brace[..end_rel];
+        let name = inner.split(':').next().unwrap_or(inner).trim();
+        if !name.is_empty() {
+            out.push(name.to_owned());
+        }
+
+        remaining = &after_brace[end_rel + 1..];
     }
+
     out
 }
 
@@ -331,10 +338,10 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
     if let Some(inner) = unwrap_single_generic(ty, "Json") {
         return Some(inner);
     }
-    if let Some(inner) = unwrap_single_generic(ty, "Valid") {
-        if let Some(payload) = unwrap_single_generic(&inner, "Json") {
-            return Some(payload);
-        }
+    if let Some(inner) = unwrap_single_generic(ty, "Valid")
+        && let Some(payload) = unwrap_single_generic(&inner, "Json")
+    {
+        return Some(payload);
     }
     None
 }
@@ -533,6 +540,17 @@ mod tests {
     #[test]
     fn extract_path_params_ignores_unclosed_braces() {
         assert!(extract_path_params("/oops/{broken").is_empty());
+    }
+
+    #[test]
+    fn extract_path_params_skips_escaped_braces() {
+        // `{{hello}}` is a static route segment, not a path parameter.
+        assert!(extract_path_params("/{{hello}}").is_empty());
+        // Escaped brace followed by a real param.
+        assert_eq!(
+            extract_path_params("/{{literal}}/{id}"),
+            vec!["id".to_owned()]
+        );
     }
 
     #[test]

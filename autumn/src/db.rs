@@ -428,11 +428,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         });
 
         let response = app

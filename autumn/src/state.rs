@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::actuator;
+use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
 #[cfg(feature = "db")]
@@ -75,6 +76,8 @@ pub struct AppState {
 
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
     pub(crate) task_registry: actuator::TaskRegistry,
+    /// Job registry for the `/actuator/jobs` endpoint.
+    pub(crate) job_registry: actuator::JobRegistry,
 
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
@@ -92,6 +95,21 @@ pub struct AppState {
     /// when the server is stopping.
     #[cfg(feature = "ws")]
     pub(crate) shutdown: CancellationToken,
+
+    /// Per-resource policy + scope registry used by `#[authorize]`
+    /// and `#[repository(policy = ...)]`-generated handlers.
+    pub(crate) policy_registry: PolicyRegistry,
+
+    /// HTTP status returned when a [`Policy`] denies a record-level
+    /// action. Defaults to `404 Not Found` to mirror Rails / Phoenix
+    /// posture and avoid leaking record existence.
+    pub(crate) forbidden_response: ForbiddenResponse,
+
+    /// Session key the `#[authorize]` machinery reads to resolve the
+    /// authenticated user id for the
+    /// [`PolicyContext`](crate::authorization::PolicyContext).
+    /// Mirrors `[auth] session_key` (default: `"user_id"`).
+    pub(crate) auth_session_key: String,
 }
 
 impl AppState {
@@ -162,6 +180,12 @@ impl AppState {
         &self.task_registry
     }
 
+    /// Returns the job registry.
+    #[must_use]
+    pub const fn job_registry(&self) -> &actuator::JobRegistry {
+        &self.job_registry
+    }
+
     /// Returns the config properties.
     #[must_use]
     pub const fn config_props(&self) -> &actuator::ConfigProperties {
@@ -209,6 +233,55 @@ impl AppState {
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = Some(profile.into());
+        self
+    }
+
+    /// Returns a reference to the [`PolicyRegistry`].
+    #[must_use]
+    pub const fn policy_registry(&self) -> &PolicyRegistry {
+        &self.policy_registry
+    }
+
+    /// Resolve the registered [`Policy`] for resource `R`, if any.
+    #[must_use]
+    pub fn policy<R: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<dyn Policy<R>>> {
+        self.policy_registry.policy::<R>()
+    }
+
+    /// Resolve the registered [`Scope`] for resource `R`, if any.
+    #[must_use]
+    pub fn scope<R: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<dyn Scope<R>>> {
+        self.policy_registry.scope::<R>()
+    }
+
+    /// Configured deny-response shape. See
+    /// [`ForbiddenResponse`] for the trade-off between `403` and
+    /// `404` defaults.
+    #[must_use]
+    pub const fn forbidden_response(&self) -> ForbiddenResponse {
+        self.forbidden_response
+    }
+
+    /// Session key used to resolve the authenticated user id for
+    /// [`PolicyContext`](crate::authorization::PolicyContext).
+    #[must_use]
+    pub fn auth_session_key(&self) -> &str {
+        &self.auth_session_key
+    }
+
+    /// Override the configured deny response (test helper).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
+        self.forbidden_response = value;
+        self
+    }
+
+    /// Override the auth session key (test helper).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_auth_session_key(mut self, value: impl Into<String>) -> Self {
+        self.auth_session_key = value.into();
         self
     }
 
@@ -318,11 +391,15 @@ impl AppState {
             metrics: middleware::MetricsCollector::new(),
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
+            job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
+            policy_registry: PolicyRegistry::default(),
+            forbidden_response: ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 
@@ -382,6 +459,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn task_registry(&self) -> &crate::actuator::TaskRegistry {
         &self.task_registry
+    }
+
+    fn job_registry(&self) -> &crate::actuator::JobRegistry {
+        &self.job_registry
     }
 
     fn config_props(&self) -> &crate::actuator::ConfigProperties {

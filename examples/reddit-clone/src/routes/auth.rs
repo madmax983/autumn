@@ -17,7 +17,27 @@ use tracing::warn;
 use crate::models::{NewUser, User};
 use crate::schema::users;
 
-use super::layout::{layout, redirect_to};
+use super::layout::layout;
+
+struct AccountMailer;
+
+#[mailer]
+impl AccountMailer {
+    fn welcome(&self, to: String, username: String) -> Mail {
+        Mail::builder()
+            .to(to)
+            .subject("Welcome to Autumn Reddit")
+            .html(html! {
+                p { "Welcome, " strong { (username) } "!" }
+                p { "Your account is ready. Go find something worth arguing about." }
+            })
+            .text(format!(
+                "Welcome, {username}! Your account is ready. Go find something worth arguing about."
+            ))
+            .build()
+            .expect("static welcome template should be valid")
+    }
+}
 
 // ── Register ───────────────────────────────────────────────────
 
@@ -39,6 +59,16 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
                         input type="text" id="username" name="username" required
                               autocomplete="username"
                               placeholder="cool_rustacean"
+                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
+                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
+                    }
+                    div {
+                        label for="email" class="block text-sm font-medium text-gray-700 mb-1" {
+                            "Email"
+                        }
+                        input type="email" id="email" name="email" required
+                              autocomplete="email"
+                              placeholder="you@example.com"
                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
                                      focus:outline-none focus:ring-2 focus:ring-orange-400";
                     }
@@ -70,6 +100,7 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
 #[derive(serde::Deserialize)]
 pub struct RegisterForm {
     pub username: String,
+    pub email: String,
     pub password: String,
 }
 
@@ -77,10 +108,12 @@ pub struct RegisterForm {
 pub async fn register(
     State(state): State<AppState>,
     mut db: Db,
+    mailer: Mailer,
     session: Session,
     form: Form<RegisterForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
+    let email = form.0.email.trim().to_owned();
     let password = form.0.password;
 
     if username.len() < 2 || username.len() > 32 {
@@ -100,6 +133,9 @@ pub async fn register(
         return Err(AutumnError::unprocessable_msg(
             "Password must be at least 6 characters",
         ));
+    }
+    if !email.contains('@') {
+        return Err(AutumnError::unprocessable_msg("Email address is invalid"));
     }
 
     // Check if username already taken
@@ -156,10 +192,51 @@ pub async fn register(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    Ok(redirect_to("/"))
+    AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
+
+    Ok(Redirect::to("/"))
 }
 
 // ── Login ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn welcome_email_is_captured_as_eml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mailer = Mailer::builder()
+            .transport(Transport::File)
+            .from("Autumn <noreply@example.com>")
+            .file_dir(dir.path())
+            .build()
+            .expect("file mailer should build");
+
+        AccountMailer
+            .send_welcome(
+                &mailer,
+                "new-user@example.com".to_owned(),
+                "cool_rustacean".to_owned(),
+            )
+            .await
+            .expect("send should succeed");
+
+        let entry = std::fs::read_dir(dir.path())
+            .expect("mail dir exists")
+            .next()
+            .expect("one email should be captured")
+            .expect("dir entry");
+        let eml = std::fs::read_to_string(entry.path()).expect("eml readable");
+        assert!(eml.contains("To:"), "missing To header: {eml}");
+        assert!(
+            eml.contains("new-user@example.com"),
+            "missing recipient address: {eml}"
+        );
+        assert!(eml.contains("Subject: Welcome to Autumn Reddit"));
+        assert!(eml.contains("cool_rustacean"));
+    }
+}
 
 #[get("/login")]
 pub async fn login_form(csrf: CsrfToken) -> Markup {
@@ -212,7 +289,7 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Markup> {
+pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table
@@ -232,7 +309,7 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    Ok(redirect_to("/"))
+    Ok(Redirect::to("/"))
 }
 
 // ── Logout ─────────────────────────────────────────────────────
@@ -247,6 +324,7 @@ pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::
 
 #[get("/u/{username}")]
 pub async fn profile(
+    State(state): State<AppState>,
     Path(name): Path<String>,
     session: Session,
     csrf: CsrfToken,
@@ -261,6 +339,24 @@ pub async fn profile(
         .await
         .map_err(|_| AutumnError::not_found_msg(format!("User u/{name} not found")))?;
 
+    // Mint a presigned URL for the user's avatar (if any) through the
+    // configured BlobStore. In dev that's an HMAC-signed link served by
+    // the framework's mounted `/_blobs` route; in prod it's a real S3
+    // presigned URL.
+    let avatar_url = match (
+        user.avatar.as_ref(),
+        state.extension::<autumn_web::storage::BlobStoreState>(),
+    ) {
+        (Some(blob), Some(blobs)) => blobs
+            .store()
+            .clone()
+            .presigned_url(&blob.key, std::time::Duration::from_secs(300))
+            .await
+            .ok(),
+        _ => None,
+    };
+    let is_self = current_user.as_deref() == Some(user.username.as_str());
+
     Ok(layout(
         &format!("u/{}", user.username),
         current_user.as_deref(),
@@ -268,9 +364,14 @@ pub async fn profile(
         html! {
             div class="bg-white rounded-lg shadow p-6" {
                 div class="flex items-center gap-4 mb-4" {
-                    div class="w-16 h-16 bg-orange-100 text-orange-600 rounded-full \
-                               flex items-center justify-center text-2xl font-bold" {
-                        (user.username.chars().next().unwrap_or('?').to_uppercase().to_string())
+                    @if let Some(url) = &avatar_url {
+                        img src=(url) alt=(format!("u/{} avatar", user.username))
+                            class="w-16 h-16 rounded-full object-cover";
+                    } @else {
+                        div class="w-16 h-16 bg-orange-100 text-orange-600 rounded-full \
+                                   flex items-center justify-center text-2xl font-bold" {
+                            (user.username.chars().next().unwrap_or('?').to_uppercase().to_string())
+                        }
                     }
                     div {
                         h1 class="text-2xl font-bold" { "u/" (user.username) }
@@ -279,9 +380,17 @@ pub async fn profile(
                             " \u{2022} joined "
                             (user.created_at.format("%b %d, %Y"))
                         }
+                        @if is_self {
+                            p class="text-xs mt-1" {
+                                a href="/settings/avatar"
+                                  class="text-orange-600 hover:underline" { "Change picture" }
+                            }
+                        }
                     }
                 }
             }
         },
     ))
 }
+
+autumn_web::paths![register_form, register, login_form, login, logout, profile];

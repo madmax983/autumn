@@ -559,21 +559,28 @@ fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     let mut found_token = None;
 
     for cookie_header in headers.get_all(COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k.trim() == name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(v.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if k.trim() != name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(v.trim().to_owned());
         }
     }
     found_token
@@ -714,10 +721,10 @@ where
             } else if inner_guard.dirty || generated_new_id {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
-                if let Some(ref old_id) = inner_guard.old_id {
-                    if let Err(error) = store.destroy(old_id).await {
-                        return Ok(session_store_unavailable_response(&error));
-                    }
+                if let Some(ref old_id) = inner_guard.old_id
+                    && let Err(error) = store.destroy(old_id).await
+                {
+                    return Ok(session_store_unavailable_response(&error));
                 }
                 drop(inner_guard);
                 if let Err(error) = store.save(&sid, data).await {
@@ -1086,11 +1093,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1127,11 +1138,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         }
     }
 

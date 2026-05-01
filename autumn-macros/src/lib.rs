@@ -12,13 +12,19 @@
 //! which re-exports everything.
 
 mod api_doc;
+mod authorize;
 mod cached;
 mod collect;
 mod i18n;
+mod job;
+mod jobs_macro;
+mod mailer;
 mod main_macro;
 mod model;
 mod oauth2_callback;
+mod param_helpers;
 mod parse;
+mod paths_macro;
 mod repository;
 mod route;
 mod routes_macro;
@@ -101,6 +107,26 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("PUT", "put", attr.into(), item.into()).into()
 }
 
+/// Annotate an async function as a PATCH route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function and a typed
+/// `__autumn_path_{name}(…) -> String` path helper.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::patch;
+///
+/// #[patch("/items/{id}")]
+/// async fn patch_item() -> &'static str {
+///     "patched"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("PATCH", "patch", attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a DELETE route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
@@ -157,6 +183,29 @@ pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
 }
 
+/// Emit a `pub mod paths { … }` that re-exports each handler's typed path helper.
+///
+/// Takes the same comma-separated handler list as [`routes!`]. Each entry
+/// exposes its `__autumn_path_{name}` companion under the short name:
+///
+/// ```ignore
+/// autumn_web::paths![show_post, create_post, posts::index];
+/// // expands to:
+/// pub mod paths {
+///     pub use super::__autumn_path_show_post as show_post;
+///     pub use super::__autumn_path_create_post as create_post;
+///     pub use super::posts::__autumn_path_index as index;
+/// }
+/// ```
+///
+/// Call this once at the top of the module where your handlers live (or a
+/// sibling module) so consumers can write `use crate::routes::paths;` and
+/// then `paths::show_post(id)`.
+#[proc_macro]
+pub fn paths(input: TokenStream) -> TokenStream {
+    paths_macro::paths_macro(input.into()).into()
+}
+
 /// Set up the async runtime for an Autumn application.
 ///
 /// This is a thin wrapper around `#[tokio::main]`. The real
@@ -176,6 +225,12 @@ pub fn routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
+#[proc_macro_attribute]
+pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
+    mailer::mailer_macro(attr.into(), item.into()).into()
 }
 
 /// Attribute macro for Autumn database models.
@@ -252,6 +307,12 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     scheduled::scheduled_macro(attr.into(), item.into()).into()
 }
 
+/// Declare an on-demand background job.
+#[proc_macro_attribute]
+pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
+    job::job_macro(attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a statically pre-rendered GET route.
 ///
 /// Like `#[get]`, this generates a route companion function. Additionally,
@@ -286,6 +347,12 @@ pub fn tasks(input: TokenStream) -> TokenStream {
     tasks_macro::tasks_macro(input.into()).into()
 }
 
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+#[proc_macro]
+pub fn jobs(input: TokenStream) -> TokenStream {
+    jobs_macro::jobs_macro(input.into()).into()
+}
+
 /// Secure a route handler with authentication and optional role checks.
 ///
 /// Applied before a route macro (`#[get]`, `#[post]`, etc.), this macro
@@ -316,6 +383,32 @@ pub fn tasks(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
     secured::secured_macro(attr.into(), item.into()).into()
+}
+
+/// Enforce a record-level authorization policy on a route handler.
+///
+/// Resolves the `Policy`
+/// registered for the named resource type and calls the matching
+/// action method. Short-circuits with the configured deny response
+/// (default `404`, optionally `403`) before the handler body runs.
+///
+/// Coexists with `#[secured]`: `#[secured]` answers "are you in?",
+/// `#[authorize]` answers "are you allowed to act on *this record*?"
+///
+/// # Forms
+///
+/// ```ignore
+/// // Resource arg is auto-detected by snake-cased type name (Post -> `post`).
+/// #[authorize("update", resource = Post)]
+/// async fn update_post(post: Post) -> AutumnResult<...> { ... }
+///
+/// // Explicit binding name (overrides the snake-case default).
+/// #[authorize("delete", resource = Post, from = target)]
+/// async fn destroy(target: Post) -> AutumnResult<...> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
+    authorize::authorize_macro(attr.into(), item.into()).into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.

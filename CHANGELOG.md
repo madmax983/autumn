@@ -33,6 +33,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Spanish bundles. New `docs/guide/i18n.md` documents the convention,
   extractor order, the compile-time check, validation localization
   pattern, and a "migrating from monolingual" section.
+- **typed path helpers:** Route macros (`#[get]`, `#[post]`, `#[put]`,
+  `#[delete]`, `#[patch]`) now emit a companion
+  `pub fn __autumn_path_{name}(params…) -> String` helper alongside every
+  handler (#499). The `paths![show, create, …]` macro expands into a
+  `pub mod paths { pub use super::__autumn_path_show as show; … }` so
+  templates write `paths::show(post.id)` instead of
+  `format!("/posts/{}", post.id)`. A `name = "custom_name"` attribute
+  argument overrides the helper's short name. The `PathExt` trait
+  (re-exported from `autumn_web::prelude`) adds `.with_query("key",
+  value)` for building query strings with RFC 3986 percent-encoding.
+  `axum::response::Redirect` is re-exported as `autumn_web::Redirect` and
+  added to the prelude, replacing every hand-rolled meta-refresh HTML
+  redirect in the examples. `#[repository(api = "…")]` now also emits
+  path helpers (`__autumn_path_{prefix}_api_list()`,
+  `__autumn_path_{prefix}_api_delete(id)`, etc.) for its generated REST
+  endpoints. All five examples migrated: `git grep 'format!("/'
+  examples/` and `git grep 'fn redirect_to' examples/` both return zero
+  hits.
+
+- **authorization:** First-class record-level authorization — `Policy` /
+  `Scope` traits, `PolicyContext` carrying the resolved `Session` /
+  user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
+  resource = Type)]` attribute macro that resolves the registered policy
+  and short-circuits with the configured deny response before the
+  handler body runs, a `policy = SomePolicy` argument on
+  `#[repository(api = "...")]` that wires the same checks into every
+  auto-generated POST/PUT/DELETE endpoint plus `GET /<api>/{id}` for
+  read scoping, a `scope = SomeScope` companion that constrains list
+  endpoints, a `Scoped` blanket trait that adds
+  `Post::scope(&ctx).load(&mut db).await?` ergonomics to every type
+  (mirroring Pundit's `policy_scope`), and a `[security]
+  forbidden_response = "404" | "403"` knob (default `"404"` to mirror
+  Rails / Phoenix and avoid leaking record existence). Register on the
+  app builder via `.policy::<R, _>(...)` / `.scope::<R, _>(...)`.
+  `examples/reddit-clone`'s `PostPolicy` replaces every hand-rolled
+  `if post.author_id != user_id` check; `git grep -n "author_id != user_id"
+  examples/reddit-clone/` now returns empty (#496).
+  - **Behavior change:** `#[repository(api = "...")]` without a paired
+    `policy = ...` argument is now a startup-time error in `prod`
+    profile builds. The escape hatch is `[security]
+    allow_unauthorized_repository_api = true`. Downstream apps using the
+    `api =` switch must add `policy = SomePolicy` (or opt out
+    explicitly) — this is the one behavior change downstream apps have
+    to address.
+- **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), the `add_blob_column!` migration helper macro, and a feature-gated `S3BlobStore` shell behind `storage-s3` (real SDK wiring tracked as #530). `MultipartField::save_to_blob_store` streams uploads straight through to `BlobStore::put_stream` without buffering, with multipart parser errors preserving their client-facing 4xx status. Profile-aware defaults mirror sessions: `dev` auto-defaults to `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. The local backend uses temp-file + cross-platform atomic-replace semantics so partial writes never leave corrupted blobs and re-uploads work on Windows as well as POSIX. `examples/reddit-clone` carries the database-backed UI demo (`Blob` column on the user model + upload form + presigned-URL profile picture); framework-level integration tests pin restart survival on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
+- **seed:** New `autumn seed` CLI subcommand and `autumn_web::seed::SeedContext`
+  library surface for project-defined database seeding (#501). Convention:
+  seed code lives in `src/bin/seed.rs`; `autumn seed` runs it via
+  `cargo run --bin seed` after verifying the file exists and checking for
+  pending migrations (errors with an actionable message if either check
+  fails). Accepts `--profile <name>` (default `dev`) forwarded as
+  `AUTUMN_ENV` so seed binaries can branch on environment. New opt-in
+  `seed` cargo feature on `autumn-web` (enables `autumn_web::seed::SeedContext`
+  which wires database URL + profile resolution in one `.build().await` call)
+  — apps that don't seed pay zero compile cost. `autumn new --with-seed`
+  (default off) scaffolds a stub `src/bin/seed.rs` and the matching `[[bin]]`
+  entry. `examples/todo-app` ships a reference seed demonstrating the
+  count-based idempotency guard. New `docs/guide/seeding.md` documents the
+  full story. Non-breaking: existing apps without `src/bin/seed.rs` see no
+  behavior change.
+- **cli:** `autumn generate model | migration | scaffold` for one-command
+  resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
+  `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route
+  handlers, smoke tests, and updates `routes![]` in `src/main.rs`. Supports
+  the documented field-type DSL (`String`, `Text`, `i32`, `i64`, `bool`,
+  `f32`, `f64`, `Uuid`, `NaiveDateTime`, `DateTime`, `Vec<u8>`/`Bytea`, plus
+  `Option<…>` for any of them) and `--dry-run` / `--force` flags. New
+  `docs/guide/generators.md` walks through the five-commands-to-CRUD flow.
+  Non-breaking; no runtime surface changes.
 
 ## [0.3.0] - 2026-04-27
 

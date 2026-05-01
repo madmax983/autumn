@@ -74,6 +74,12 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
+//! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `redis` |
+//! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
+//! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
+//! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
+//! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
+//! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
@@ -83,6 +89,8 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
+//! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -134,14 +142,14 @@ impl Env for OsEnv {
             if let Some(dir) = MACRO_MANIFEST_DIR.get() {
                 return Ok(dir.clone());
             }
-        } else if key == "AUTUMN_IS_DEBUG" {
-            if let Some(is_debug) = MACRO_IS_DEBUG.get() {
-                return Ok(if *is_debug {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                });
-            }
+        } else if key == "AUTUMN_IS_DEBUG"
+            && let Some(is_debug) = MACRO_IS_DEBUG.get()
+        {
+            return Ok(if *is_debug {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            });
         }
         std::env::var(key)
     }
@@ -243,12 +251,12 @@ fn resolve_profile_input(env: &dyn Env) -> String {
     // 3. CLI flag
     let args: Vec<String> = std::env::args().collect();
     for (i, arg) in args.iter().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = args.get(i + 1) {
-                let trimmed = profile.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_owned();
-                }
+        if arg == "--profile"
+            && let Some(profile) = args.get(i + 1)
+        {
+            let trimmed = profile.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
             }
         }
         if let Some(profile) = arg.strip_prefix("--profile=") {
@@ -374,6 +382,14 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
             );
             table.insert("cors".into(), toml::Value::Table(cors));
 
+            // Dev: enable the local-disk blob store rooted at
+            // `target/blobs/` automatically when the `storage` feature
+            // is on. `prod` deliberately leaves `backend = "disabled"`
+            // so the operator has to opt into either `local` (with
+            // `allow_local_in_production = true`) or `s3`.
+            let mut storage = toml::map::Map::new();
+            storage.insert("backend".into(), "local".into());
+            table.insert("storage".into(), toml::Value::Table(storage));
             // Dev: CSRF disabled (default), HSTS off (default)
         }
         "prod" => {
@@ -416,6 +432,19 @@ fn profile_defaults_as_toml(profile: &str) -> toml::Value {
     }
 
     toml::Value::Table(table)
+}
+
+#[cfg(feature = "mail")]
+fn has_mail_transport_source(merged: &toml::Value, env: &dyn Env) -> bool {
+    merged
+        .get("mail")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|mail| mail.contains_key("transport"))
+        || env
+            .var("AUTUMN_MAIL__TRANSPORT")
+            .ok()
+            .as_deref()
+            .is_some_and(|value| crate::mail::Transport::from_env_value(value).is_some())
 }
 
 /// Maximum recursion depth for merging TOML tables.
@@ -603,6 +632,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub session: crate::session::SessionConfig,
 
+    /// Background job backend and runtime settings.
+    #[serde(default)]
+    pub jobs: JobConfig,
+
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -617,6 +650,89 @@ pub struct AutumnConfig {
     #[cfg(feature = "i18n")]
     #[serde(default)]
     pub i18n: crate::i18n::I18nConfig,
+    /// Pluggable file storage configuration. Honored only when the
+    /// `storage` cargo feature is enabled.
+    #[cfg(feature = "storage")]
+    #[serde(default)]
+    pub storage: crate::storage::StorageConfig,
+    /// Transactional email settings.
+    #[cfg(feature = "mail")]
+    #[serde(default)]
+    pub mail: crate::mail::MailConfig,
+}
+
+/// Background job runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobConfig {
+    /// Runtime backend selection.
+    ///
+    /// - `local` (default): in-process Tokio queue
+    /// - `redis`: Redis-backed durable queue (requires `redis` feature)
+    #[serde(default = "default_job_backend")]
+    pub backend: String,
+    /// Number of concurrent worker loops to spawn.
+    #[serde(default = "default_job_workers")]
+    pub workers: usize,
+    /// Default max attempts when `#[job(max_attempts = ...)]` is not set.
+    #[serde(default = "default_job_max_attempts")]
+    pub max_attempts: u32,
+    /// Default initial retry backoff in milliseconds.
+    #[serde(default = "default_job_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Redis backend options.
+    #[serde(default)]
+    pub redis: JobRedisConfig,
+}
+
+impl Default for JobConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_job_backend(),
+            workers: default_job_workers(),
+            max_attempts: default_job_max_attempts(),
+            initial_backoff_ms: default_job_backoff_ms(),
+            redis: JobRedisConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobRedisConfig {
+    /// Redis URL used when `jobs.backend = "redis"`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Key prefix for all queue keys.
+    #[serde(default = "default_jobs_redis_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for JobRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_jobs_redis_prefix(),
+        }
+    }
+}
+
+fn default_job_backend() -> String {
+    "local".to_owned()
+}
+
+const fn default_job_workers() -> usize {
+    1
+}
+
+const fn default_job_max_attempts() -> u32 {
+    5
+}
+
+const fn default_job_backoff_ms() -> u64 {
+    250
+}
+
+fn default_jobs_redis_prefix() -> String {
+    "autumn:jobs".to_owned()
 }
 
 impl AutumnConfig {
@@ -702,6 +818,11 @@ impl AutumnConfig {
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
 
+        #[cfg(feature = "mail")]
+        if config.profile.as_deref() == Some("dev") && !has_mail_transport_source(&merged, env) {
+            config.mail.transport = crate::mail::Transport::Log;
+        }
+
         config.validate()?;
         Ok(config)
     }
@@ -736,6 +857,8 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        #[cfg(feature = "mail")]
+        self.mail.validate(self.profile.as_deref())?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
@@ -784,6 +907,14 @@ impl AutumnConfig {
     /// - `AUTUMN_HEALTH__READY_PATH` → `health.ready_path` (String)
     /// - `AUTUMN_HEALTH__STARTUP_PATH` → `health.startup_path` (String)
     /// - `AUTUMN_HEALTH__DETAILED` → `health.detailed` (bool)
+    ///
+    /// # Jobs
+    /// - `AUTUMN_JOBS__BACKEND` → `jobs.backend` (`local` / `redis`)
+    /// - `AUTUMN_JOBS__WORKERS` → `jobs.workers` (`usize`)
+    /// - `AUTUMN_JOBS__MAX_ATTEMPTS` → `jobs.max_attempts` (`u32`)
+    /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
+    /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
+    /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -797,8 +928,13 @@ impl AutumnConfig {
         self.apply_health_env_overrides_with_env(env);
         self.apply_cors_env_overrides_with_env(env);
         self.apply_session_env_overrides_with_env(env);
+        self.apply_jobs_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
+        #[cfg(feature = "storage")]
+        self.apply_storage_env_overrides_with_env(env);
+        #[cfg(feature = "mail")]
+        self.apply_mail_env_overrides_with_env(env);
     }
 
     fn apply_server_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -984,6 +1120,27 @@ impl AutumnConfig {
         );
     }
 
+    fn apply_jobs_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(env, "AUTUMN_JOBS__BACKEND", &mut self.jobs.backend);
+        parse_env(env, "AUTUMN_JOBS__WORKERS", &mut self.jobs.workers);
+        parse_env(
+            env,
+            "AUTUMN_JOBS__MAX_ATTEMPTS",
+            &mut self.jobs.max_attempts,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__INITIAL_BACKOFF_MS",
+            &mut self.jobs.initial_backoff_ms,
+        );
+        parse_env_option_string(env, "AUTUMN_JOBS__REDIS__URL", &mut self.jobs.redis.url);
+        parse_env_string(
+            env,
+            "AUTUMN_JOBS__REDIS__KEY_PREFIX",
+            &mut self.jobs.redis.key_prefix,
+        );
+    }
+
     fn apply_auth_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env(env, "AUTUMN_AUTH__BCRYPT_COST", &mut self.auth.bcrypt_cost);
         parse_env_string(env, "AUTUMN_AUTH__SESSION_KEY", &mut self.auth.session_key);
@@ -1082,6 +1239,153 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES",
             &mut self.security.upload.allowed_mime_types,
         );
+
+        // Authorization deny shape + repository-API escape hatch.
+        if let Ok(value) = env.var("AUTUMN_SECURITY__FORBIDDEN_RESPONSE") {
+            match value.parse::<crate::authorization::ForbiddenResponse>() {
+                Ok(parsed) => self.security.forbidden_response = parsed,
+                Err(err) => tracing::warn!(
+                    "ignoring invalid AUTUMN_SECURITY__FORBIDDEN_RESPONSE={value:?}: {err}"
+                ),
+            }
+        }
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            &mut self.security.allow_unauthorized_repository_api,
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    fn apply_storage_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_STORAGE__BACKEND") {
+            match crate::storage::StorageBackend::from_env_value(&val) {
+                Some(backend) => self.storage.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_STORAGE__BACKEND={val:?} is not valid \
+                     (expected disabled, local, or s3), ignoring"
+                ),
+            }
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__DEFAULT_PROVIDER",
+            &mut self.storage.default_provider,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION",
+            &mut self.storage.allow_local_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_STORAGE__LOCAL__ROOT") {
+            self.storage.local.root = PathBuf::from(val);
+        }
+        parse_env_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__MOUNT_PATH",
+            &mut self.storage.local.mount_path,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.local.default_url_expiry_secs,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__LOCAL__SIGNING_KEY",
+            &mut self.storage.local.signing_key,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__BUCKET",
+            &mut self.storage.s3.bucket,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__REGION",
+            &mut self.storage.s3.region,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ENDPOINT",
+            &mut self.storage.s3.endpoint,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
+            &mut self.storage.s3.public_base_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV",
+            &mut self.storage.s3.access_key_id_env,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
+            &mut self.storage.s3.secret_access_key_env,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_STORAGE__S3__FORCE_PATH_STYLE",
+            &mut self.storage.s3.force_path_style,
+        );
+        parse_env(
+            env,
+            "AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS",
+            &mut self.storage.s3.default_url_expiry_secs,
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    fn apply_mail_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_MAIL__TRANSPORT") {
+            match crate::mail::Transport::from_env_value(&val) {
+                Some(transport) => self.mail.transport = transport,
+                None => eprintln!(
+                    "Warning: AUTUMN_MAIL__TRANSPORT={val:?} is not valid \
+                     (expected log, file, smtp, or disabled), ignoring"
+                ),
+            }
+        }
+        parse_env_option_string(env, "AUTUMN_MAIL__FROM", &mut self.mail.from);
+        parse_env_option_string(env, "AUTUMN_MAIL__REPLY_TO", &mut self.mail.reply_to);
+        parse_env_bool(
+            env,
+            "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
+            &mut self.mail.allow_log_in_production,
+        );
+        if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
+            self.mail.file_dir = PathBuf::from(val);
+        }
+        parse_env_option_string(env, "AUTUMN_MAIL__SMTP__HOST", &mut self.mail.smtp.host);
+        if let Ok(val) = env.var("AUTUMN_MAIL__SMTP__PORT") {
+            match val.parse::<u16>() {
+                Ok(port) => self.mail.smtp.port = Some(port),
+                Err(_) => {
+                    eprintln!("Warning: AUTUMN_MAIL__SMTP__PORT={val:?} is not valid, ignoring");
+                }
+            }
+        }
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__USERNAME",
+            &mut self.mail.smtp.username,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__SMTP__PASSWORD_ENV",
+            &mut self.mail.smtp.password_env,
+        );
+        if let Ok(val) = env.var("AUTUMN_MAIL__SMTP__TLS") {
+            match crate::mail::TlsMode::from_env_value(&val) {
+                Some(tls) => self.mail.smtp.tls = tls,
+                None => eprintln!(
+                    "Warning: AUTUMN_MAIL__SMTP__TLS={val:?} is not valid \
+                     (expected disabled, starttls, or tls), ignoring"
+                ),
+            }
+        }
     }
 
     /// Returns the active profile name, if any.
@@ -1195,12 +1499,13 @@ impl DatabaseConfig {
     ///
     /// Returns a validation error if the URL has an invalid scheme.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref url) = self.url {
-            if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
-                return Err(ConfigError::Validation(format!(
-                    "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
-                )));
-            }
+        if let Some(ref url) = self.url
+            && !url.starts_with("postgres://")
+            && !url.starts_with("postgresql://")
+        {
+            return Err(ConfigError::Validation(format!(
+                "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
+            )));
         }
         Ok(())
     }
@@ -2156,12 +2461,107 @@ path = "/healthz"
         assert_eq!(config.database.pool_size, 10);
     }
 
+    #[cfg(feature = "storage")]
+    #[test]
+    fn env_override_storage_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_STORAGE__BACKEND", "s3")
+            .with("AUTUMN_STORAGE__DEFAULT_PROVIDER", "media")
+            .with("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION", "true")
+            .with("AUTUMN_STORAGE__LOCAL__ROOT", "var/blobs")
+            .with("AUTUMN_STORAGE__LOCAL__MOUNT_PATH", "/files")
+            .with("AUTUMN_STORAGE__LOCAL__DEFAULT_URL_EXPIRY_SECS", "42")
+            .with("AUTUMN_STORAGE__LOCAL__SIGNING_KEY", "secret")
+            .with("AUTUMN_STORAGE__S3__BUCKET", "uploads")
+            .with("AUTUMN_STORAGE__S3__REGION", "us-east-1")
+            .with("AUTUMN_STORAGE__S3__ENDPOINT", "https://s3.example.test")
+            .with(
+                "AUTUMN_STORAGE__S3__PUBLIC_BASE_URL",
+                "https://cdn.example.test",
+            )
+            .with("AUTUMN_STORAGE__S3__ACCESS_KEY_ID_ENV", "AWS_ACCESS_KEY_ID")
+            .with(
+                "AUTUMN_STORAGE__S3__SECRET_ACCESS_KEY_ENV",
+                "AWS_SECRET_ACCESS_KEY",
+            )
+            .with("AUTUMN_STORAGE__S3__FORCE_PATH_STYLE", "true")
+            .with("AUTUMN_STORAGE__S3__DEFAULT_URL_EXPIRY_SECS", "99");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.storage.backend, crate::storage::StorageBackend::S3);
+        assert_eq!(config.storage.default_provider, "media");
+        assert!(config.storage.allow_local_in_production);
+        assert_eq!(config.storage.local.root, PathBuf::from("var/blobs"));
+        assert_eq!(config.storage.local.mount_path, "/files");
+        assert_eq!(config.storage.local.default_url_expiry_secs, 42);
+        assert_eq!(config.storage.local.signing_key.as_deref(), Some("secret"));
+        assert_eq!(config.storage.s3.bucket.as_deref(), Some("uploads"));
+        assert_eq!(config.storage.s3.region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            config.storage.s3.endpoint.as_deref(),
+            Some("https://s3.example.test")
+        );
+        assert_eq!(
+            config.storage.s3.public_base_url.as_deref(),
+            Some("https://cdn.example.test")
+        );
+        assert_eq!(
+            config.storage.s3.access_key_id_env.as_deref(),
+            Some("AWS_ACCESS_KEY_ID")
+        );
+        assert_eq!(
+            config.storage.s3.secret_access_key_env.as_deref(),
+            Some("AWS_SECRET_ACCESS_KEY")
+        );
+        assert!(config.storage.s3.force_path_style);
+        assert_eq!(config.storage.s3.default_url_expiry_secs, 99);
+    }
+
     #[test]
     fn env_override_database_auto_migrate_in_production() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert!(config.database.auto_migrate_in_production);
+    }
+
+    #[test]
+    fn env_override_jobs_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__BACKEND", "redis")
+            .with("AUTUMN_JOBS__WORKERS", "8")
+            .with("AUTUMN_JOBS__MAX_ATTEMPTS", "12")
+            .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
+            .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
+            .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.backend, "redis");
+        assert_eq!(config.jobs.workers, 8);
+        assert_eq!(config.jobs.max_attempts, 12);
+        assert_eq!(config.jobs.initial_backoff_ms, 750);
+        assert_eq!(
+            config.jobs.redis.url.as_deref(),
+            Some("redis://jobs:6379/2")
+        );
+        assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
+    }
+
+    #[test]
+    fn env_override_invalid_jobs_numeric_values_ignored() {
+        let env = MockEnv::new()
+            .with("AUTUMN_JOBS__WORKERS", "many")
+            .with("AUTUMN_JOBS__MAX_ATTEMPTS", "a_lot")
+            .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "soon");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.jobs.workers, 1);
+        assert_eq!(config.jobs.max_attempts, 5);
+        assert_eq!(config.jobs.initial_backoff_ms, 250);
     }
 
     // ── Server env override tests ────────────────────────────────
@@ -3219,5 +3619,65 @@ path = "/healthz"
         } else {
             panic!("Expected a table");
         }
+    }
+
+    // ── AUTUMN_SECURITY__FORBIDDEN_RESPONSE / __ALLOW_UNAUTHORIZED_REPOSITORY_API ──
+
+    #[test]
+    fn env_override_forbidden_response_403() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "403");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_404() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "404");
+        let mut config = AutumnConfig::default();
+        // Pre-set to 403 to confirm env actually flips it back to 404.
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::NotFound404
+        );
+    }
+
+    #[test]
+    fn env_override_forbidden_response_invalid_keeps_existing() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__FORBIDDEN_RESPONSE", "418");
+        let mut config = AutumnConfig::default();
+        config.security.forbidden_response = crate::authorization::ForbiddenResponse::Forbidden403;
+        config.apply_env_overrides_with_env(&env);
+        // Invalid value warns and leaves the existing setting alone.
+        assert_eq!(
+            config.security.forbidden_response,
+            crate::authorization::ForbiddenResponse::Forbidden403
+        );
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API", "true");
+        let mut config = AutumnConfig::default();
+        assert!(!config.security.allow_unauthorized_repository_api);
+        config.apply_env_overrides_with_env(&env);
+        assert!(config.security.allow_unauthorized_repository_api);
+    }
+
+    #[test]
+    fn env_override_allow_unauthorized_repository_api_false_overrides_toml_true() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
+            "false",
+        );
+        let mut config = AutumnConfig::default();
+        config.security.allow_unauthorized_repository_api = true;
+        config.apply_env_overrides_with_env(&env);
+        assert!(!config.security.allow_unauthorized_repository_api);
     }
 }

@@ -59,7 +59,12 @@ async fn body_string(resp: axum::response::Response) -> String {
 async fn english_default_when_no_headers() {
     let app = router();
     let resp = app
-        .oneshot(Request::builder().uri("/greet").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/greet")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

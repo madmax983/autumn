@@ -119,13 +119,10 @@ fn validate_key(key_lit: &LitStr) -> Option<TokenStream> {
     if bundle.contains_key(&key) {
         return None;
     }
-    let mut suggestion = String::new();
-    if let Some(closest) = closest_key(&key, bundle.keys()) {
-        suggestion = format!("\n  hint: did you mean `{closest}`?");
-    }
-    let msg = format!(
-        "i18n key `{key}` is not defined in the default locale bundle{suggestion}"
-    );
+    let suggestion = closest_key(&key, bundle.keys()).map_or_else(String::new, |closest| {
+        format!("\n  hint: did you mean `{closest}`?")
+    });
+    let msg = format!("i18n key `{key}` is not defined in the default locale bundle{suggestion}");
     Some(quote_spanned! { key_lit.span() =>
         compile_error!(#msg)
     })
@@ -139,10 +136,9 @@ enum BundleLookup {
 fn load_default_bundle() -> BundleLookup {
     static CACHE: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
     let cached = CACHE.get_or_init(read_and_parse_default_bundle);
-    match cached {
-        Some(map) => BundleLookup::Loaded(map),
-        None => BundleLookup::NoFile,
-    }
+    cached
+        .as_ref()
+        .map_or(BundleLookup::NoFile, BundleLookup::Loaded)
 }
 
 fn read_and_parse_default_bundle() -> Option<HashMap<String, String>> {
@@ -159,8 +155,8 @@ fn locate_default_bundle() -> Option<PathBuf> {
         }
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-    let default_locale = std::env::var("AUTUMN_I18N_DEFAULT_LOCALE")
-        .unwrap_or_else(|_| "en".to_owned());
+    let default_locale =
+        std::env::var("AUTUMN_I18N_DEFAULT_LOCALE").unwrap_or_else(|_| "en".to_owned());
     let candidate = PathBuf::from(manifest)
         .join("i18n")
         .join(format!("{default_locale}.ftl"));
@@ -204,7 +200,7 @@ where
     let mut best: Option<(&'a str, usize)> = None;
     for cand in candidates {
         let d = levenshtein(target, cand);
-        if d <= 3 && best.map_or(true, |(_, current)| d < current) {
+        if d <= 3 && best.is_none_or(|(_, current)| d < current) {
             best = Some((cand.as_str(), d));
         }
     }
@@ -220,9 +216,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i + 1;
         for (j, bc) in b.iter().enumerate() {
             let cost = usize::from(ac != bc);
-            curr[j + 1] = (curr[j] + 1)
-                .min(prev[j + 1] + 1)
-                .min(prev[j] + cost);
+            curr[j + 1] = (curr[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -260,17 +254,14 @@ mod tests {
 
     #[test]
     fn closest_key_finds_typo() {
-        let candidates = vec![
-            "welcome.title".to_owned(),
-            "welcome.greeting".to_owned(),
-        ];
+        let candidates = ["welcome.title".to_owned(), "welcome.greeting".to_owned()];
         let got = closest_key("welcome.tite", candidates.iter());
         assert_eq!(got, Some("welcome.title"));
     }
 
     #[test]
     fn closest_key_returns_none_when_nothing_close() {
-        let candidates = vec!["hi".to_owned()];
+        let candidates = ["hi".to_owned()];
         let got = closest_key("completely.unrelated.key", candidates.iter());
         assert!(got.is_none());
     }

@@ -13,8 +13,9 @@ place:
 2. `/live`, `/ready`, and `/startup` connected to platform probes
 3. OTLP telemetry enabled, or at minimum JSON logs
 4. Redis-backed sessions if more than one web replica will serve the same users
-5. an explicit migration job before web replicas start
-6. a clear choice between `#[scheduled]` and Harvest for background work
+5. SMTP-backed mail if the app sends account or notification email
+6. an explicit migration job before web replicas start
+7. a clear choice between `#[scheduled]` and Harvest for background work
 
 ## What `autumn new` Gives You
 
@@ -80,6 +81,30 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
 
+## File Uploads
+
+The `Multipart` extractor's `save_to(path)` primitive writes to the local
+disk of whichever pod handled the request — invisible to the next replica
+and gone on the next deploy. For multi-replica deployments that accept
+user-uploaded files (avatars, attachments, generated reports), enable the
+`storage` feature and pick the `S3` backend:
+
+```toml
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-app-uploads"
+region = "us-east-1"
+```
+
+In `prod`, `backend = "local"` fails fast at startup unless you set
+`storage.allow_local_in_production = true` — same pattern as the session
+backend's memory-in-prod check.
+
+See [storage.md](storage.md) for the full backend, configuration, and
+production-checklist story.
+
 ## Sessions
 
 In-memory sessions are fine for local development and single-process demos.
@@ -98,6 +123,33 @@ key_prefix = "my-app:sessions"
 
 The `prod` profile warns when you keep `backend = "memory"` without explicitly
 acknowledging it via `session.allow_memory_in_production = true`.
+
+## Mail
+
+The `mail` cargo feature gives apps a `Mailer` extractor and log/file/SMTP
+transports. Development defaults to `transport = "log"` so password-reset and
+signup flows can be built before SMTP exists. Production rejects log transport
+unless `mail.allow_log_in_production = true` is set.
+
+Use SMTP in production:
+
+```toml
+[mail]
+transport = "smtp"
+from = "Acme <noreply@example.com>"
+
+[mail.smtp]
+host = "smtp.example.com"
+port = 587
+username = "apikey"
+password_env = "SMTP_PASSWORD"
+tls = "starttls"
+```
+
+For durable retries across replicas, prefer a Harvest-backed delivery path once
+your app already uses Harvest. Without that, `deliver_later` falls back to an
+in-process Tokio task, which is fine for local development and small single
+process deployments but not a durable queue.
 
 ## Background Work
 
@@ -129,6 +181,8 @@ Before calling an Autumn app "cloud ready", verify:
 - probes target `/live`, `/ready`, and `/startup`
 - logs or traces land in your collector
 - sessions are externalized if replicas > 1
+- file uploads use the `S3` blob store if replicas > 1
+- mail uses SMTP, not log/file transport
 - migrations run before web rollout
 - background jobs use the right runtime model
 - the generated container image builds without manual template surgery

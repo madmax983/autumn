@@ -22,16 +22,24 @@
 //! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
+/// HTTP redirect response.
+pub use crate::Redirect;
+/// Typed path helper extension trait (`.with_query()`).
+pub use crate::paths::PathExt;
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, patch, paths, post,
+    put, routes, scheduled, secured, service, static_get, static_routes, tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
+/// Resolve a logical static asset path to a fingerprinted URL in release builds.
+pub use crate::assets::asset_url;
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
@@ -60,6 +68,11 @@ pub use crate::htmx::HxResponseExt;
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+/// Transactional email types and extractor.
+#[cfg(feature = "mail")]
+pub use crate::mail::{
+    Mail, MailConfig, MailError, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// State extractor.
@@ -91,6 +104,11 @@ pub use crate::hooks::{
 pub use crate::auth::Auth;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
+
+// ── Authorization ────────────────────────────────────────────────
+/// Record-level authorization primitives. See
+/// [`crate::authorization`] for the full surface.
+pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped};
 
 // ── Security ───────────────────────────────────────────────────
 /// CSRF token extractor for embedding in forms.
@@ -129,11 +147,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -147,11 +169,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let _err: AutumnResult<()> = Ok(());
     }

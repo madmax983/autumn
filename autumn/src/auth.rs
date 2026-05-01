@@ -726,16 +726,27 @@ fn parse_oauth2_token_response(
         });
     }
 
-    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect();
-    let access_token = form.get("access_token").cloned().ok_or_else(|| {
+    let mut access_token = None;
+    let mut token_type = None;
+    let mut id_token = None;
+
+    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+        match k.as_ref() {
+            "access_token" => access_token = Some(v.into_owned()),
+            "token_type" => token_type = Some(v.into_owned()),
+            "id_token" => id_token = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+
+    let access_token = access_token.ok_or_else(|| {
         crate::AutumnError::bad_request_msg("token response missing access_token")
     })?;
+
     Ok(OAuth2TokenResponse {
         access_token,
-        token_type: form.get("token_type").cloned(),
-        id_token: form.get("id_token").cloned(),
+        token_type,
+        id_token,
     })
 }
 
@@ -989,11 +1000,23 @@ mod tests {
     fn parse_oauth2_token_response_supports_form_encoded_payload() {
         let token = parse_oauth2_token_response(
             Some("application/x-www-form-urlencoded"),
-            "access_token=abc123&token_type=bearer",
+            "access_token=abc123&token_type=bearer&id_token=xyz789&extra_field=ignored",
         )
         .unwrap();
         assert_eq!(token.access_token, "abc123");
         assert_eq!(token.token_type.as_deref(), Some("bearer"));
+        assert_eq!(token.id_token.as_deref(), Some("xyz789"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn parse_oauth2_token_response_fails_without_access_token() {
+        let err = parse_oauth2_token_response(
+            Some("application/x-www-form-urlencoded"),
+            "token_type=bearer&id_token=xyz789",
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "token response missing access_token");
     }
 
     #[cfg(feature = "oauth2")]
@@ -1093,11 +1116,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1145,11 +1172,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         // Middleware that inserts a user into extensions
@@ -1205,11 +1236,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1321,11 +1356,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1387,11 +1426,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1458,11 +1501,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1525,11 +1572,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()
@@ -1585,11 +1636,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let app = Router::new()

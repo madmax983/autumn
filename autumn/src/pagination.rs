@@ -915,6 +915,15 @@ mod tests {
         let r = PageRequest::new(1, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.limit(), i64::from(MAX_PAGE_SIZE));
+
+        let exact = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = PageRequest::new(1, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
     }
 
     #[test]
@@ -1242,6 +1251,15 @@ mod tests {
         let r = CursorRequest::new(None, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
+
+        let exact = CursorRequest::new(None, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = CursorRequest::new(None, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = CursorRequest::new(None, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
     }
 
     #[test]
@@ -1399,6 +1417,17 @@ mod tests {
     #[tokio::test]
     async fn cursor_extractor_clamps_size_over_max() {
         let (status, body) = fetch_cursor("/feed?cursor=t&size=9999").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
+
+        // Exact MAX_PAGE_SIZE
+        let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={MAX_PAGE_SIZE}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
+
+        // MAX_PAGE_SIZE + 1
+        let size = MAX_PAGE_SIZE + 1;
+        let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={size}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
     }

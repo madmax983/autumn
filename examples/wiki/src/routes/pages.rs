@@ -21,9 +21,9 @@ pub fn layout(title: &str, content: Markup) -> Markup {
             body class="bg-gray-50 min-h-screen" {
                 nav class="bg-emerald-700 text-white p-4" {
                     div class="max-w-4xl mx-auto flex justify-between items-center" {
-                        a href="/" class="text-xl font-bold" { "Wiki" }
+                        a href=(paths::list()) class="text-xl font-bold" { "Wiki" }
                         div class="space-x-4 text-sm" {
-                            a href="/new" class="opacity-75 hover:opacity-100" { "+ New Page" }
+                            a href=(paths::new_form()) class="opacity-75 hover:opacity-100" { "+ New Page" }
                             a href="/actuator/health" class="opacity-75 hover:opacity-100" { "Health" }
                         }
                     }
@@ -46,16 +46,6 @@ pub fn status_badge(status: &str) -> Markup {
     }
 }
 
-pub fn redirect_to(url: &str) -> Markup {
-    html! {
-        (PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
-
 #[get("/")]
 pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
     let pages = repo.find_all().await?;
@@ -64,7 +54,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "All Pages" }
-                a href="/new"
+                a href=(paths::new_form())
                   class="bg-emerald-600 text-white px-4 py-2 rounded hover:bg-emerald-700" {
                     "+ New Page"
                 }
@@ -73,7 +63,7 @@ pub async fn list(repo: PgPageRepository) -> AutumnResult<Markup> {
                 @for p in &pages {
                     li class="p-4 bg-white rounded shadow flex justify-between items-center" {
                         div {
-                            a href=(format!("/pages/{}", p.slug))
+                            a href=(paths::show(p.slug.clone()))
                               class="text-emerald-700 font-medium hover:underline" {
                                 (p.title)
                             }
@@ -117,9 +107,9 @@ pub async fn show(
                     h1 class="text-3xl font-bold" { (page.title) }
                     div class="space-x-2 flex items-center" {
                         (status_badge(&page.status))
-                        a href=(format!("/pages/{}/edit", page.slug))
+                        a href=(paths::edit_form(page.slug.clone()))
                           class="text-sm text-emerald-600 hover:underline" { "Edit" }
-                        a href=(format!("/pages/{}/history", page.slug))
+                        a href=(paths::history(page.slug.clone()))
                           class="text-sm text-gray-500 hover:underline" { "History" }
                     }
                 }
@@ -149,7 +139,7 @@ pub async fn show(
                                 }
                             }
                         }
-                        a href=(format!("/pages/{}/history", page.slug))
+                        a href=(paths::history(page.slug.clone()))
                           class="text-sm text-emerald-600 hover:underline" { "View full history" }
                     }
                 }
@@ -167,7 +157,7 @@ pub async fn new_form() -> Markup {
         "New Page",
         html! {
             h1 class="text-2xl font-bold mb-6" { "New Page" }
-            form action="/pages" method="post"
+            form action=(paths::create()) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
                 div {
                     label for="title" class="block text-sm font-medium" { "Title" }
@@ -198,10 +188,10 @@ pub async fn new_form() -> Markup {
 }
 
 #[post("/pages")]
-pub async fn create(repo: PgPageRepository, form: Form<PageForm>) -> AutumnResult<Markup> {
+pub async fn create(repo: PgPageRepository, form: Form<PageForm>) -> AutumnResult<Redirect> {
     let new_page = form.0.into_new();
     let page = repo.save(&new_page).await?;
-    Ok(redirect_to(&format!("/pages/{}", page.slug)))
+    Ok(Redirect::to(&paths::show(page.slug)))
 }
 
 #[get("/pages/{slug}/edit")]
@@ -212,7 +202,7 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
         &format!("Edit: {}", page.title),
         html! {
             h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
-            form action=(format!("/pages/{}", page.slug)) method="post"
+            form action=(paths::update(page.slug.clone())) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
                 div {
                     label for="title" class="block text-sm font-medium" { "Title" }
@@ -277,11 +267,11 @@ pub async fn update(
     Path(slug): Path<String>,
     repo: PgPageRepository,
     form: Form<PageForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let page = find_page_by_slug(&repo, &slug).await?;
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
-    Ok(redirect_to(&format!("/pages/{}", updated.slug)))
+    Ok(Redirect::to(&paths::show(updated.slug)))
 }
 
 #[get("/pages/{slug}/history")]
@@ -304,7 +294,7 @@ pub async fn history(
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "History: " (page.title) }
-                a href=(format!("/pages/{}", page.slug))
+                a href=(paths::show(page.slug.clone()))
                   class="text-sm text-emerald-600 hover:underline" { "Back to page" }
             }
             @if revs.is_empty() {
@@ -347,6 +337,8 @@ pub async fn history(
         },
     ))
 }
+
+autumn_web::paths![list, show, new_form, create, edit_form, update, history];
 
 /// Look up a page by slug, returning 404 if not found.
 async fn find_page_by_slug(repo: &PgPageRepository, slug: &str) -> AutumnResult<Page> {

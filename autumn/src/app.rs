@@ -68,7 +68,10 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        route_sources: Vec::new(),
+        current_plugin: None,
         tasks: Vec::new(),
+        jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -92,6 +95,7 @@ pub fn app() -> AppBuilder {
         audit_logger: None,
         #[cfg(feature = "i18n")]
         i18n_bundle: None,
+        policy_registrations: Vec::new(),
     }
 }
 
@@ -132,6 +136,10 @@ type PoolProviderFactory = Box<
         > + Send,
 >;
 
+/// Closure that registers a policy or scope on the runtime
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -162,7 +170,13 @@ type PoolProviderFactory = Box<
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    /// Parallel to `routes`: registration origin for each route.
+    route_sources: Vec<crate::route_listing::RouteSource>,
+    /// Non-None while a plugin's `build()` is executing; routes and scoped
+    /// groups added during that window are attributed to this plugin.
+    current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
@@ -211,6 +225,12 @@ pub struct AppBuilder {
     /// [`Locale`](crate::i18n::Locale) extractor can resolve translations.
     #[cfg(feature = "i18n")]
     i18n_bundle: Option<Arc<crate::i18n::Bundle>>,
+    /// Deferred [`Policy`](crate::authorization::Policy) and
+    /// [`Scope`](crate::authorization::Scope) registrations applied
+    /// to [`AppState::policy_registry`] just before the router is
+    /// built. Stored as boxed closures so we can carry the
+    /// generic type parameters across the builder boundary.
+    policy_registrations: Vec<PolicyRegistration>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -220,6 +240,8 @@ pub struct AppBuilder {
 pub(crate) struct ScopedGroup {
     pub(crate) prefix: String,
     pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
@@ -326,6 +348,15 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
+        for _ in &routes {
+            self.route_sources.push(source.clone());
+        }
         self.routes.extend(routes);
         self
     }
@@ -338,6 +369,13 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register ad-hoc background jobs with the application.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
         self
     }
 
@@ -521,9 +559,16 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
+            source,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -817,6 +862,12 @@ impl AppBuilder {
     /// formatted as a string so it surfaces in the same banner as other
     /// fatal startup errors.
     ///
+    /// # Panics
+    ///
+    /// Panics when configuration cannot be loaded, the configured i18n
+    /// directory is unreadable, or the default locale bundle is missing or
+    /// invalid.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -964,6 +1015,59 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`Policy`](crate::authorization::Policy)
+    /// implementation for resource type `R`.
+    ///
+    /// Multiple policies per resource are not supported: registering
+    /// `R` twice causes a startup-time panic with a clear error
+    /// message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::authorization::{Policy, PolicyContext};
+    ///
+    /// #[derive(Default)]
+    /// struct PostPolicy;
+    /// impl Policy<Post> for PostPolicy { /* ... */ }
+    ///
+    /// autumn_web::app()
+    ///     .routes(routes![...])
+    ///     .policy::<Post, _>(PostPolicy)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn policy<R, P>(mut self, policy: P) -> Self
+    where
+        R: Send + Sync + 'static,
+        P: crate::authorization::Policy<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_policy::<R, _>(policy);
+        }));
+        self
+    }
+
+    /// Register a [`Scope`](crate::authorization::Scope) implementation
+    /// for resource type `R`. The scope filters list endpoints
+    /// (`GET /<api>` for `#[repository(api = "...", scope = ...)]`)
+    /// to records the current user is allowed to read.
+    ///
+    /// Default impls return an empty list so a missing scope opt-in
+    /// fails closed.
+    #[must_use]
+    pub fn scope<R, S>(mut self, scope: S) -> Self
+    where
+        R: Send + Sync + 'static,
+        S: crate::authorization::Scope<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_scope::<R, _>(scope);
+        }));
+        self
+    }
+
     /// Apply a [`Plugin`](crate::plugin::Plugin) to the builder.
     ///
     /// The plugin's [`build`](crate::plugin::Plugin::build) runs exactly once
@@ -985,8 +1089,14 @@ impl AppBuilder {
             );
             return self;
         }
-        self.registered_plugins.insert(name.into_owned());
-        plugin.build(self)
+        let name_str = name.into_owned();
+        self.registered_plugins.insert(name_str.clone());
+        // Save outer plugin context so nested plugin() calls don't permanently
+        // clear it; restore it after this plugin's build() returns.
+        let outer_plugin = self.current_plugin.replace(name_str);
+        let mut result = plugin.build(self);
+        result.current_plugin = outer_plugin;
+        result
     }
 
     /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
@@ -1066,9 +1176,21 @@ impl AppBuilder {
             return;
         }
 
+        // ── Route dump mode ────────────────────────────────────────────
+        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
+        // This is triggered by `autumn routes` to introspect the app's
+        // route table without booting the server or connecting to a database.
+        if is_dump_routes_mode() {
+            self.run_dump_routes_mode().await;
+            return;
+        }
+
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks,
+            jobs,
             static_metas: _,
             exception_filters,
             scoped_groups,
@@ -1092,6 +1214,7 @@ impl AppBuilder {
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
+            policy_registrations,
         } = self;
 
         let all_routes = routes;
@@ -1125,6 +1248,15 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
+        // 4d. Provision the configured BlobStore *before* `setup_database`.
+        // `LocalBlobStore::new` does real IO (creates + canonicalizes the
+        // root) and the storage code may `process::exit(1)` on failure
+        // (unwritable root, or `storage.backend = "s3"` while the SDK
+        // wiring is still tracked in #530). Doing it before migrations
+        // means a doomed boot can't mutate the DB schema first.
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = preflight_storage(&config);
+
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
         let pool = setup_database(&config, migrations, pool_provider_factory)
@@ -1144,12 +1276,39 @@ impl AppBuilder {
             tracing::info!("Database not configured");
         }
 
+        // 5b. Fail-fast on `#[repository(api = ...)]` endpoints that
+        // were mounted without a paired `policy = ...` argument when
+        // running in `prod` profile and the explicit escape hatch is
+        // off. Hides exactly the footgun called out in the issue:
+        // "a developer who flips the `api =` switch on a
+        // `#[repository]` exposes mutate endpoints that any
+        // authenticated user can call against any record."
+        validate_repository_api_policies(&all_routes, &scoped_groups, &config);
+
         // 6. Build the router (with optional static-file layer)
         let state = build_state(
             &config,
             #[cfg(feature = "db")]
             pool,
         );
+        // Apply deferred policy / scope registrations onto the live
+        // app state. Done before the router is built so any panic
+        // from double-registration surfaces during startup, not
+        // mid-request.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+        // Now that registrations have been applied, verify that
+        // every `#[repository(policy = X)]`-annotated route has
+        // an X actually registered on the live registry. Catches
+        // the "wired the macro arg, forgot the `.policy(...)`
+        // builder call" footgun before any 500 lands.
+        validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1175,6 +1334,13 @@ impl AppBuilder {
         } else {
             custom_layers
         };
+
+        // Install the preflighted blob store on the freshly-built
+        // AppState, and remember the serving router so it gets merged
+        // into the user's router below.
+        #[cfg(feature = "storage")]
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1182,6 +1348,12 @@ impl AppBuilder {
         } else {
             None
         };
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers = merge_routers;
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_with_static_inner(
             all_routes,
             &config,
@@ -1204,8 +1376,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and serve. We start listening before startup hooks finish so
-        // `/startup` can honestly report startup progress.
+        // 7. Bind and initialize pre-serve runtime dependencies. Once those
+        // are ready, start listening before startup hooks finish so `/startup`
+        // can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1213,10 +1386,17 @@ impl AppBuilder {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
-        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
+        tracing::info!(addr = %addr, "Listening");
+
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
             axum::serve(
@@ -1290,10 +1470,14 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
+    #[allow(clippy::too_many_lines)]
     async fn run_build_mode(self) {
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks: _,
+            jobs: _,
             static_metas,
             exception_filters: _,
             scoped_groups: _,
@@ -1317,6 +1501,7 @@ impl AppBuilder {
             audit_logger: _,
             #[cfg(feature = "i18n")]
                 i18n_bundle: _,
+            policy_registrations,
         } = self;
 
         let all_routes = routes;
@@ -1336,6 +1521,14 @@ impl AppBuilder {
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
+        // Preflight the configured BlobStore the same way `run()` does.
+        // Static routes can read presigned URLs out of `BlobStoreState`
+        // during pre-rendering (e.g. `<img src=blob.url()>`); without
+        // the bootstrap they'd 500 during `autumn build` even though
+        // the server path works.
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = preflight_storage(&config);
+
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
         let pool = setup_database(&config, vec![], pool_provider_factory)
@@ -1350,8 +1543,32 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+
+        // Apply deferred policy / scope registrations onto the live
+        // app state — same as `run()`. Static routes can carry
+        // `#[authorize]` checks or live behind `#[repository(policy =
+        // ..., scope = ...)]` index endpoints; without registering
+        // here, every such pre-render call would 500 at build time
+        // with `no policy/scope registered`, and `render_static_routes`
+        // would treat that as a build failure even though
+        // `.policy(...)` / `.scope(...)` was configured on the
+        // builder.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+
+        // Install the preflighted storage and remember the serving
+        // router so static generation hits the same `/_blobs/...`
+        // routes the server path serves.
+        #[cfg(feature = "storage")]
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -1360,6 +1577,12 @@ impl AppBuilder {
         // would otherwise silently fall back to the config-driven backend.
         // Custom Tower layers registered via .layer(...) are likewise
         // applied so static output matches the production response pipeline.
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -1367,7 +1590,7 @@ impl AppBuilder {
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
                 scoped_groups: Vec::new(),
-                merge_routers: Vec::new(),
+                merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
                 error_page_renderer: None,
@@ -1399,10 +1622,65 @@ impl AppBuilder {
             }
         }
     }
+
+    /// Dump the application's route listing as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
+    /// Exits with code 0 on success, code 1 on JSON serialization failure.
+    /// Does not connect to a database or bind a TCP port.
+    async fn run_dump_routes_mode(self) {
+        let Self {
+            routes,
+            route_sources,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            config_loader_factory,
+            telemetry_provider,
+            #[cfg(feature = "openapi")]
+            openapi,
+            ..
+        } = self;
+
+        // Raw Axum routers registered via .merge()/.nest() are opaque: there is
+        // no public API to enumerate their routes. Warn so callers know the
+        // snapshot may be incomplete.
+        let hidden = merge_routers.len() + nest_routers.len();
+        if hidden > 0 {
+            eprintln!(
+                "[autumn routes] warning: {hidden} raw router(s) added via \
+                 .merge()/.nest() are not enumerable and are omitted from this listing"
+            );
+        }
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let mut infos =
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
+        crate::route_listing::sort_route_infos(&mut infos);
+
+        let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -1712,6 +1990,20 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
     Ok(())
 }
 
+fn initialize_job_runtime(
+    jobs: Vec<crate::job::JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+) -> crate::AutumnResult<()> {
+    crate::job::clear_global_job_client();
+    if jobs.is_empty() {
+        Ok(())
+    } else {
+        crate::job::start_runtime(jobs, state, shutdown, config)
+    }
+}
+
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
     for hook in hooks.iter().rev() {
         hook().await;
@@ -1767,6 +2059,173 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
+/// Constructed [`BlobStore`](crate::storage::BlobStore) plus the
+/// optional axum router that serves signed URLs for the Local backend.
+/// Returned by [`preflight_storage`] before any DB side effects so a
+/// doomed boot can't run migrations first; installed onto
+/// [`AppState`] later via [`StorageBootstrap::install`].
+#[cfg(feature = "storage")]
+struct StorageBootstrap {
+    store: crate::storage::SharedBlobStore,
+    serving: Option<axum::Router<AppState>>,
+}
+
+#[cfg(feature = "storage")]
+impl StorageBootstrap {
+    /// Install the preflighted store on `AppState` and return the
+    /// optional serving router so the caller can merge it into the
+    /// app router.
+    fn install(self, state: &AppState) -> Option<axum::Router<AppState>> {
+        state.insert_extension::<crate::storage::BlobStoreState>(
+            crate::storage::BlobStoreState::new(self.store),
+        );
+        self.serving
+    }
+}
+
+/// Provision the configured [`BlobStore`](crate::storage::BlobStore)
+/// before any database side effects. Construction is the side-effecting
+/// step (creates + canonicalizes the storage root, may
+/// `process::exit(1)` on a misconfiguration); we deliberately run it
+/// before `setup_database` so a doomed boot doesn't apply migrations
+/// first. Installation onto `AppState` happens later via
+/// [`StorageBootstrap::install`].
+#[cfg(feature = "storage")]
+#[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
+fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
+    use crate::storage::{LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey};
+
+    let plan = config
+        .storage
+        .backend_plan(config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            // Cover the cases `backend_plan` rejects up front:
+            // `LocalInProduction` (prod + local without ack),
+            // `MissingS3Bucket`/`MissingS3Region`/`S3FeatureDisabled`.
+            // Each is a configuration mistake — fail the boot loudly
+            // rather than running migrations and then dying.
+            tracing::error!(%error, "invalid storage backend config; aborting startup");
+            std::process::exit(1);
+        });
+
+    match plan {
+        StorageBackendPlan::Disabled => None,
+        StorageBackendPlan::Local {
+            provider_id,
+            root,
+            mount_path,
+            default_url_expiry_secs,
+            warn_in_production,
+        } => {
+            if warn_in_production {
+                tracing::warn!(
+                    "prod profile is using the local-disk blob store; \
+                     bytes won't survive replica turnover. Set \
+                     storage.backend=s3 or storage.allow_local_in_production=true \
+                     to acknowledge"
+                );
+            }
+            let signing_key = config
+                .storage
+                .local
+                .signing_key
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map_or_else(
+                    || {
+                        if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                            tracing::warn!(
+                                "no storage.local.signing_key configured in prod; \
+                                 generated URLs won't survive a process restart. \
+                                 Set [storage.local].signing_key or \
+                                 AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
+                            );
+                        }
+                        SigningKey::random()
+                    },
+                    |s| SigningKey::new(s.as_bytes().to_vec()),
+                );
+            let store = match LocalBlobStore::new(
+                provider_id.clone(),
+                root.clone(),
+                mount_path.clone(),
+                std::time::Duration::from_secs(default_url_expiry_secs),
+                signing_key,
+            ) {
+                Ok(store) => store,
+                Err(err) => {
+                    // The operator explicitly chose `storage.backend = "local"`
+                    // — a non-writable root means uploads can't possibly
+                    // work, so abort the boot rather than letting upload
+                    // handlers serve 500s after deploy.
+                    tracing::error!(
+                        error = %err,
+                        root = %root.display(),
+                        "failed to initialize local blob store; aborting startup"
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let serving = crate::storage::local::serve_router(&store);
+            let arc: SharedBlobStore = std::sync::Arc::new(store);
+            tracing::info!(
+                provider = %provider_id,
+                root = %root.display(),
+                mount = %mount_path,
+                "Local blob store mounted"
+            );
+            Some(StorageBootstrap {
+                store: arc,
+                serving: Some(serving),
+            })
+        }
+        StorageBackendPlan::S3 {
+            provider_id,
+            bucket,
+            region,
+            endpoint,
+            public_base_url,
+            force_path_style,
+            default_url_expiry_secs,
+        } => {
+            // The `storage-s3` shell ships the trait surface and config
+            // story but no on-the-wire SDK — every op returns
+            // `Unsupported`. Booting "successfully" here would let an
+            // app with `storage.backend = "s3"` reach production and
+            // only fail on first upload. Fail-fast instead, the same
+            // way `local`-without-acknowledgement does. Tracked in
+            // https://github.com/madmax983/autumn/issues/530.
+            let _ = (
+                provider_id,
+                bucket,
+                region,
+                endpoint,
+                public_base_url,
+                force_path_style,
+                default_url_expiry_secs,
+            );
+            #[cfg(feature = "storage-s3")]
+            {
+                tracing::error!(
+                    "storage.backend=s3 is not yet implemented in autumn-web — \
+                     the storage-s3 stub returns Unsupported on every operation. \
+                     Wait for the autumn-storage-s3 plugin (issue #530), or pick \
+                     storage.backend=local with allow_local_in_production=true \
+                     for single-replica deployments. Aborting startup."
+                );
+            }
+            #[cfg(not(feature = "storage-s3"))]
+            {
+                tracing::error!(
+                    "storage.backend=s3 selected but the `storage-s3` cargo feature \
+                     is not enabled. Aborting startup."
+                );
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn load_config_and_telemetry(
     config_loader: Option<ConfigLoaderFactory>,
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
@@ -1819,20 +2278,650 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some() {
-        if let Some(url) = &config.database.url {
-            for mig in migrations {
-                crate::migrate::auto_migrate(
-                    url,
-                    config.profile.as_deref(),
-                    config.database.auto_migrate_in_production,
-                    mig,
-                );
-            }
+    if pool.is_some()
+        && let Some(url) = &config.database.url
+    {
+        for mig in migrations {
+            crate::migrate::auto_migrate(
+                url,
+                config.profile.as_deref(),
+                config.database.auto_migrate_in_production,
+                mig,
+            );
         }
     }
 
     Ok(pool)
+}
+
+/// Refuse to start when a `#[repository(api = ...)]`-mounted route
+/// has no paired `policy = ...` argument in `prod` profile builds.
+///
+/// The issue text spells out the rationale: silently shipping
+/// auto-generated CRUD endpoints with no record-level authz is a
+/// security regression. The escape hatch is
+/// `[security] allow_unauthorized_repository_api = true`.
+/// Pure offender-collection logic for
+/// [`validate_repository_api_policies`].
+///
+/// Walks both top-level routes and routes registered under
+/// `.scoped(prefix, layer, routes)` groups, returning every
+/// `#[repository(api = ...)]`-mounted *mutating* route that has no
+/// paired `policy = ...` argument. Read-only mounts (GET
+/// `*_api_list` / `*_api_get`) are intentionally excluded — they
+/// don't fit the "any authenticated user can write to any record"
+/// footgun the issue calls out. Read-leak concerns are handled
+/// separately by `scope = ...`.
+///
+/// Returned in (resource type name, api path) form, deduped per
+/// `(type, path)` pair so a repository with multiple unguarded
+/// methods only shows up once.
+fn collect_unguarded_repository_writes(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<(String, String)> {
+    let mut offenders: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut record_route = |route: &Route| {
+        if let Some(meta) = route.repository
+            && !meta.has_policy
+            && is_mutating_method(&route.method)
+            && seen.insert((meta.resource_type_name, meta.api_path))
+        {
+            offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+        }
+    };
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
+        }
+    }
+    offenders
+}
+
+/// Format a list of `(type, path)` offenders into the bulleted
+/// listing the startup tracing emits. Pure so the format string
+/// can be unit-tested without going through `tracing` machinery.
+fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
+    offenders
+        .iter()
+        .map(|(name, path)| format!("  - #[repository({name}, api = \"{path}\")]"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_repository_api_policies(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict =
+        is_production_profile(profile) && !config.security.allow_unauthorized_repository_api;
+
+    let offenders = collect_unguarded_repository_writes(routes, scoped_groups);
+    if offenders.is_empty() {
+        return;
+    }
+
+    let listing = format_unguarded_repository_listing(&offenders);
+
+    if strict {
+        tracing::error!(
+            "refusing to start: the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument:\n{listing}\n\
+             Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
+        );
+        std::process::exit(1);
+    } else {
+        tracing::warn!(
+            "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
+             auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
+             This will become a startup-time error in `prod` profile builds."
+        );
+    }
+}
+
+/// Refuse to start when a `#[repository(policy = X)]`-annotated
+/// route exists but the corresponding `.policy::<R, _>(X)`
+/// registration was never actually applied to the live
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+///
+/// `validate_repository_api_policies` runs *before* the registry is
+/// populated and only checks the macro-set `has_policy` flag. This
+/// runs *after* registrations are applied and walks the same routes,
+/// invoking the macro-emitted `policy_check` probe to confirm the
+/// policy is really there. Without this, forgetting the
+/// `.policy::<R, _>(...)` builder call would compile, boot, and
+/// then 500 on every protected request.
+/// `(resource_type_name, api_path)` pair identifying a repository
+/// route that's missing its required runtime registration.
+type MissingRepositoryRegistration = (String, String);
+
+/// Pure offender-collection logic for
+/// [`validate_repository_policies_registered`].
+///
+/// Walks the same routes + scoped groups and invokes the macro-
+/// emitted `policy_check` / `scope_check` probes against the live
+/// registry, returning `(missing_policies, missing_scopes)` deduped
+/// per `(type, path)` pair. Pure so the listing logic can be unit-
+/// tested without going through the actual `tracing::error!` +
+/// `std::process::exit(1)` strict path.
+fn collect_unregistered_repository_handlers(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    registry: &crate::authorization::PolicyRegistry,
+) -> (
+    Vec<MissingRepositoryRegistration>,
+    Vec<MissingRepositoryRegistration>,
+) {
+    let mut missing_policies: Vec<(String, String)> = Vec::new();
+    let mut missing_scopes: Vec<(String, String)> = Vec::new();
+    let mut seen_policies: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut seen_scopes: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut record_route = |route: &Route| {
+        if let Some(meta) = route.repository {
+            if let Some(check) = meta.policy_check
+                && !check(registry)
+                && seen_policies.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_policies
+                    .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+            }
+            if let Some(check) = meta.scope_check
+                && !check(registry)
+                && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+            }
+        }
+    };
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
+        }
+    }
+    (missing_policies, missing_scopes)
+}
+
+/// Format a `(type, path)` listing for missing-policy startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
+    missing
+        .iter()
+        .map(|(name, path)| {
+            format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format a `(type, path)` listing for missing-scope startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
+    missing
+        .iter()
+        .map(|(name, path)| {
+            format!("  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_repository_policies_registered(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    state: &AppState,
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict = is_production_profile(profile);
+
+    let (missing_policies, missing_scopes) =
+        collect_unregistered_repository_handlers(routes, scoped_groups, state.policy_registry());
+
+    if missing_policies.is_empty() && missing_scopes.is_empty() {
+        return;
+    }
+
+    if !missing_policies.is_empty() {
+        let listing = format_missing_policy_listing(&missing_policies);
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `policy = ...` argument, but no policy is registered for the resource type. Without registration, every protected request would fail at runtime with `500 no policy registered`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `policy = ...` but no matching `.policy::<R, _>(...)` registration is on the app builder. Protected requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
+
+    if !missing_scopes.is_empty() {
+        let listing = format_missing_scope_listing(&missing_scopes);
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `scope = ...` argument, but no scope is registered for the resource type. Without registration, every list request would fail at runtime with `500 missing scope registration`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `scope = ...` but no matching `.scope::<R, _>(...)` registration is on the app builder. List requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
+
+    if strict {
+        std::process::exit(1);
+    }
+}
+
+const fn is_mutating_method(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::POST | http::Method::PUT | http::Method::PATCH | http::Method::DELETE
+    )
+}
+
+/// Returns `true` for the framework's accepted production profile
+/// names. Mirrors the `prod | production` matching used elsewhere
+/// (`app.rs::run_build_mode`, `migrate.rs::should_auto_apply`,
+/// etc.) so the repository startup guards don't silently weaken in
+/// deployments that pick the long-form alias.
+fn is_production_profile(profile: &str) -> bool {
+    matches!(profile, "prod" | "production")
+}
+
+#[cfg(test)]
+mod validate_repository_api_policies_tests {
+    use super::*;
+    use crate::RepositoryApiMeta;
+
+    fn build_route(
+        method: http::Method,
+        path: &'static str,
+        meta: Option<RepositoryApiMeta>,
+    ) -> Route {
+        Route {
+            method,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "test_route",
+            api_doc: crate::openapi::ApiDoc::default(),
+            repository: meta,
+        }
+    }
+
+    fn unguarded(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+            policy_check: None,
+            scope_check: None,
+        }
+    }
+
+    /// Tests in this module historically used a duplicated copy of
+    /// the offender-collection logic. Now they call the production
+    /// helper directly so coverage tracks the real code path.
+    fn collect_offenders(routes: &[Route]) -> Vec<(String, String)> {
+        collect_unguarded_repository_writes(routes, &[])
+    }
+
+    #[test]
+    fn read_only_mount_without_policy_is_not_an_offender() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::GET,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert!(
+            offenders.is_empty(),
+            "read-only mounts should not trigger the unauthorized-repo guard"
+        );
+    }
+
+    #[test]
+    fn write_mount_without_policy_is_an_offender() {
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        )];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+        assert_eq!(offenders[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn mixed_mount_only_dedups_one_offender_per_repository() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::PUT,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+    }
+
+    #[test]
+    fn is_mutating_method_classifies_methods() {
+        assert!(is_mutating_method(&http::Method::POST));
+        assert!(is_mutating_method(&http::Method::PUT));
+        assert!(is_mutating_method(&http::Method::PATCH));
+        assert!(is_mutating_method(&http::Method::DELETE));
+        assert!(!is_mutating_method(&http::Method::GET));
+        assert!(!is_mutating_method(&http::Method::HEAD));
+        assert!(!is_mutating_method(&http::Method::OPTIONS));
+    }
+
+    // ── registry-aware validation (post-registration) ─────────────
+
+    use crate::authorization::{Policy, PolicyRegistry};
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestPost;
+
+    #[derive(Default)]
+    struct TestPostPolicy;
+    impl Policy<TestPost> for TestPostPolicy {}
+
+    fn guarded_with_check(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: true,
+            policy_check: Some(|registry: &PolicyRegistry| registry.has_policy::<TestPost>()),
+            scope_check: None,
+        }
+    }
+
+    fn collect_missing(routes: &[Route], registry: &PolicyRegistry) -> Vec<(String, String)> {
+        let (missing_policies, _) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_policies
+    }
+
+    #[test]
+    fn registry_check_flags_routes_missing_their_policy_registration() {
+        // Macro emits `policy = X` but no `.policy::<TestPost, _>(...)`
+        // call on the builder — registry has nothing.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+        assert_eq!(missing[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn registry_check_passes_when_policy_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<TestPost, _>(TestPostPolicy);
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty(), "policy is registered, no offenders");
+    }
+
+    #[test]
+    fn registry_check_skips_routes_without_policy_check_fn() {
+        // Routes mounted without `policy = ...` carry
+        // `policy_check: None` and are not subject to this check —
+        // they're handled by `validate_repository_api_policies` which
+        // looks at `has_policy` instead.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn registry_check_dedups_one_offender_per_repository() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+        ];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+    }
+
+    // ── Scope registration validation ─────────────────────────────
+
+    use crate::authorization::{BoxFuture, PolicyContext, Scope};
+
+    #[derive(Default)]
+    struct TestPostScope;
+    impl Scope<TestPost> for TestPostScope {
+        fn list<'a>(
+            &'a self,
+            _ctx: &'a PolicyContext,
+            _conn: &'a mut diesel_async::AsyncPgConnection,
+        ) -> BoxFuture<'a, crate::AutumnResult<Vec<TestPost>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn scope_only_meta(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+            policy_check: None,
+            scope_check: Some(|registry: &PolicyRegistry| registry.scope::<TestPost>().is_some()),
+        }
+    }
+
+    fn collect_missing_scopes(
+        routes: &[Route],
+        registry: &PolicyRegistry,
+    ) -> Vec<(String, String)> {
+        let (_, missing_scopes) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_scopes
+    }
+
+    #[test]
+    fn scope_check_flags_unregistered_scope() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+    }
+
+    #[test]
+    fn scope_check_passes_when_scope_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_scope::<TestPost, _>(TestPostScope);
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn scope_check_skips_routes_without_scope_check_fn() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    // ── prod / production profile parity ────────────────────────
+
+    #[test]
+    fn is_production_profile_matches_both_aliases() {
+        assert!(is_production_profile("prod"));
+        assert!(is_production_profile("production"));
+        assert!(!is_production_profile("dev"));
+        assert!(!is_production_profile("staging"));
+        assert!(!is_production_profile("test"));
+        assert!(!is_production_profile("default"));
+        // Case-sensitive (matches the framework's elsewhere
+        // matching pattern in app.rs::run_build_mode and
+        // migrate.rs).
+        assert!(!is_production_profile("Prod"));
+        assert!(!is_production_profile("Production"));
+    }
+
+    // ── Formatter helpers ─────────────────────────────────────────
+
+    #[test]
+    fn format_unguarded_listing_renders_one_bullet_per_offender() {
+        let offenders = vec![
+            ("Post".to_owned(), "/api/posts".to_owned()),
+            ("Comment".to_owned(), "/api/comments".to_owned()),
+        ];
+        let listing = format_unguarded_repository_listing(&offenders);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains("Comment"));
+        assert!(listing.contains("/api/comments"));
+        assert_eq!(listing.matches("\n  - ").count() + 1, 2);
+    }
+
+    #[test]
+    fn format_unguarded_listing_empty_input_yields_empty_string() {
+        let listing = format_unguarded_repository_listing(&[]);
+        assert!(listing.is_empty());
+    }
+
+    #[test]
+    fn format_missing_policy_listing_includes_policy_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_policy_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".policy::<Post, _>"));
+        assert!(listing.contains("policy = ..."));
+    }
+
+    #[test]
+    fn format_missing_scope_listing_includes_scope_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_scope_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".scope::<Post, _>"));
+        assert!(listing.contains("scope = ..."));
+    }
+
+    // ── Scoped-groups path coverage ──────────────────────────────
+
+    #[test]
+    fn collect_unguarded_walks_scoped_groups() {
+        // The scoped-group path catches `#[repository(api = ...)]`
+        // mounts that live inside `.scoped(prefix, layer, routes)`.
+        // Without walking them, the prod-mode guard would silently
+        // miss those routes.
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+    }
+
+    #[test]
+    fn collect_unregistered_walks_scoped_groups() {
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let registry = PolicyRegistry::default();
+        let (missing, _) =
+            collect_unregistered_repository_handlers(&[], std::slice::from_ref(&group), &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+    }
 }
 
 fn build_state(
@@ -1852,11 +2941,15 @@ fn build_state(
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
+        job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels::new(32),
         #[cfg(feature = "ws")]
         shutdown: tokio_util::sync::CancellationToken::new(),
+        policy_registry: crate::authorization::PolicyRegistry::default(),
+        forbidden_response: config.security.forbidden_response,
+        auth_session_key: config.auth.session_key.clone(),
     }
 }
 
@@ -2060,11 +3153,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -2083,6 +3180,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }
     }
 
@@ -2162,6 +3260,105 @@ mod tests {
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
     }
 
+    fn startup_noop_job_handler(
+        _state: AppState,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let builder = app()
+            .jobs(vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }])
+            .on_startup(|_state| async {
+                crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
+            });
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        initialize_job_runtime(
+            builder.jobs.clone(),
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should initialize before startup hooks");
+
+        run_startup_hooks(&builder.startup_hooks, state.clone())
+            .await
+            .expect("startup hook should be able to enqueue jobs");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.job_registry().snapshot();
+                let status = snapshot
+                    .get("startup-seed")
+                    .expect("job should be registered before startup hooks run");
+                if status.total_successes == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup-enqueued job should complete");
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn initialize_job_runtime_propagates_redis_init_errors() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
+
+        let error = initialize_job_runtime(
+            vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis init errors should abort startup");
+
+        #[cfg(feature = "redis")]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+
+        #[cfg(not(feature = "redis"))]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn startup_hook_errors_propagate() {
         let builder = app().on_startup(|_state| async {
@@ -2231,11 +3428,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -2309,6 +3510,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -2324,11 +3526,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -2361,6 +3567,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: http::Method::POST,
@@ -2374,6 +3581,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
         ];
         let config = AutumnConfig::default();
@@ -2390,11 +3598,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -2671,11 +3883,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -2728,6 +3944,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }],
                 &config,
                 state,
@@ -2781,6 +3998,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }]);
 
                 let response = router
@@ -2964,11 +4182,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         crate::router::build_router(routes, config, state)
     }
@@ -3103,11 +4325,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3140,11 +4366,15 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3384,9 +4614,13 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -3444,9 +4678,13 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -3506,5 +4744,165 @@ mod tests {
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("test error"));
+    }
+
+    #[cfg(feature = "storage")]
+    mod storage_preflight {
+        use super::super::{StorageBootstrap, preflight_storage};
+        use crate::AppState;
+        use crate::config::AutumnConfig;
+        use crate::storage::{BlobStoreState, StorageBackend, StorageConfig, StorageLocalConfig};
+
+        fn config_with_storage(storage: StorageConfig) -> AutumnConfig {
+            AutumnConfig {
+                profile: Some("dev".into()),
+                storage,
+                ..AutumnConfig::default()
+            }
+        }
+
+        #[test]
+        fn preflight_returns_none_when_disabled() {
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Disabled,
+                ..StorageConfig::default()
+            });
+            assert!(preflight_storage(&cfg).is_none());
+        }
+
+        #[test]
+        fn preflight_provisions_local_backend_against_tempdir() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap = preflight_storage(&cfg).expect("local backend should provision");
+            assert_eq!(bootstrap.store.provider_id(), "default");
+            assert!(bootstrap.serving.is_some(), "local backend mounts a route");
+        }
+
+        #[tokio::test]
+        async fn install_registers_blob_store_on_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap: StorageBootstrap = preflight_storage(&cfg).unwrap();
+
+            let state = AppState::for_test();
+            assert!(state.extension::<BlobStoreState>().is_none());
+            let serving = bootstrap.install(&state);
+            assert!(serving.is_some());
+            assert!(state.extension::<BlobStoreState>().is_some());
+        }
+    }
+
+    // ── Route source attribution ───────────────────────────────────────────
+
+    /// A minimal plugin that registers one route with a known name.
+    struct TestPlugin {
+        name: &'static str,
+        route: Route,
+    }
+
+    impl crate::plugin::Plugin for TestPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed(self.name)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.routes(vec![self.route])
+        }
+    }
+
+    #[test]
+    fn routes_registered_before_plugin_are_user_sourced() {
+        let user_route = test_get_route("/home", "home");
+        let builder = app().routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    #[test]
+    fn routes_registered_inside_plugin_are_plugin_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_registered_after_plugin_revert_to_user_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let user_route = test_get_route("/home", "home");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin).routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    /// A plugin that registers a route and then registers a nested plugin.
+    struct OuterPlugin;
+
+    impl crate::plugin::Plugin for OuterPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "outer".into()
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            let inner = TestPlugin {
+                name: "inner",
+                route: test_get_route("/inner", "inner"),
+            };
+            app.plugin(inner)
+                .routes(vec![test_get_route("/outer-after", "outer_after")])
+        }
+    }
+
+    #[test]
+    fn outer_plugin_source_restored_after_nested_plugin() {
+        let builder = app().plugin(OuterPlugin);
+        // Routes: [/inner from "inner", /outer-after from "outer"]
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            "first route should be attributed to inner plugin"
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            "second route should be re-attributed to outer plugin after nested build"
+        );
     }
 }

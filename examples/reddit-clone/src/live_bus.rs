@@ -108,14 +108,14 @@ pub enum LiveFeedBusConfigLoadError {
 fn resolve_manifest_dir(env: &dyn Env) -> PathBuf {
     let build_manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    if let Ok(value) = env.var("AUTUMN_MANIFEST_DIR") {
-        if !value.is_empty() {
-            let manifest_dir = PathBuf::from(value);
-            if manifest_dir.is_dir() {
-                return manifest_dir;
-            }
-            return process_working_dir_or(build_manifest_dir);
+    if let Ok(value) = env.var("AUTUMN_MANIFEST_DIR")
+        && !value.is_empty()
+    {
+        let manifest_dir = PathBuf::from(value);
+        if manifest_dir.is_dir() {
+            return manifest_dir;
         }
+        return process_working_dir_or(build_manifest_dir);
     }
 
     if build_manifest_dir.is_dir() {
@@ -130,24 +130,23 @@ fn process_working_dir_or(fallback: PathBuf) -> PathBuf {
 }
 
 fn resolve_profile(env: &dyn Env) -> Option<String> {
-    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        if !profile.is_empty() {
-            return Some(profile);
-        }
+    if let Ok(profile) = env.var("AUTUMN_PROFILE")
+        && !profile.is_empty()
+    {
+        return Some(profile);
     }
 
     for (index, arg) in std::env::args().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = std::env::args().nth(index + 1) {
-                if !profile.is_empty() {
-                    return Some(profile);
-                }
-            }
+        if arg == "--profile"
+            && let Some(profile) = std::env::args().nth(index + 1)
+            && !profile.is_empty()
+        {
+            return Some(profile);
         }
-        if let Some(profile) = arg.strip_prefix("--profile=") {
-            if !profile.is_empty() {
-                return Some(profile.to_owned());
-            }
+        if let Some(profile) = arg.strip_prefix("--profile=")
+            && !profile.is_empty()
+        {
+            return Some(profile.to_owned());
         }
     }
 

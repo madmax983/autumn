@@ -135,9 +135,7 @@ pub enum LoadError {
 
     /// The default locale's `.ftl` file was missing — fail-fast at startup
     /// rather than silently shipping a broken app.
-    #[error(
-        "i18n default locale `{locale}` is missing — expected file at `{path}`"
-    )]
+    #[error("i18n default locale `{locale}` is missing — expected file at `{path}`")]
     MissingDefaultLocale {
         /// The configured default locale name.
         locale: String,
@@ -210,7 +208,7 @@ impl Locale {
 
     /// Returns the bundle attached during request extraction, if any.
     #[must_use]
-    pub fn bundle(&self) -> Option<&Arc<Bundle>> {
+    pub const fn bundle(&self) -> Option<&Arc<Bundle>> {
         self.bundle.as_ref()
     }
 
@@ -259,10 +257,7 @@ pub fn negotiate<'a>(requested: &str, supported: &'a [String]) -> Option<&'a str
 /// Parses comma-separated `lang;q=0.9` pairs, sorts by descending `q`, and
 /// negotiates each against `supported`. Returns `None` if no entry matches.
 #[must_use]
-pub fn parse_accept_language<'a>(
-    header: &str,
-    supported: &'a [String],
-) -> Option<&'a str> {
+pub fn parse_accept_language<'a>(header: &str, supported: &'a [String]) -> Option<&'a str> {
     let mut entries: Vec<(f32, &str)> = header
         .split(',')
         .filter_map(|raw| {
@@ -317,7 +312,7 @@ impl fmt::Debug for Bundle {
             .field("default_locale", &self.default_locale)
             .field("supported_locales", &self.supported_locales)
             .field("miss_count", &self.miss_count.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -365,12 +360,11 @@ impl Bundle {
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| LoadError::InvalidLocaleFilename { path: path.clone() })?
                 .to_owned();
-            let raw = std::fs::read_to_string(&path).map_err(|source| {
-                LoadError::DirectoryRead {
+            let raw =
+                std::fs::read_to_string(&path).map_err(|source| LoadError::DirectoryRead {
                     path: path.clone(),
                     source,
-                }
-            })?;
+                })?;
             let parsed = parse_ftl(&raw, &path)?;
             messages.insert(stem, parsed);
         }
@@ -473,21 +467,28 @@ impl Bundle {
     fn record_miss(&self, locale: &str, key: &str) {
         self.miss_count.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
-        let mut guard = match self.miss_warnings.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+        let should_warn = {
+            // Default a missing entry far enough in the past that the first
+            // miss warns immediately; saturating_sub guards against a
+            // hypothetical very-early Instant on platforms where the boot
+            // reference is small.
+            let stale = now
+                .checked_sub(self.warn_dedup_window + Duration::from_secs(1))
+                .unwrap_or(now);
+            let miss_key = (locale.to_owned(), key.to_owned());
+            let mut guard = match self.miss_warnings.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let last_warned = guard.get(&miss_key).copied().unwrap_or(stale);
+            if now.duration_since(last_warned) >= self.warn_dedup_window {
+                guard.insert(miss_key, now);
+                true
+            } else {
+                false
+            }
         };
-        // Default a missing entry far enough in the past that the first
-        // miss warns immediately; saturating_sub guards against a hypothetical
-        // very-early Instant on platforms where the boot reference is small.
-        let stale = now
-            .checked_sub(self.warn_dedup_window + Duration::from_secs(1))
-            .unwrap_or(now);
-        let entry = guard
-            .entry((locale.to_owned(), key.to_owned()))
-            .or_insert(stale);
-        if now.duration_since(*entry) >= self.warn_dedup_window {
-            *entry = now;
+        if should_warn {
             tracing::warn!(
                 target: "autumn::i18n",
                 locale = %locale,
@@ -512,10 +513,7 @@ impl Bundle {
 /// via the `=` separator and produce a useful (if unprocessed) value. A
 /// future enhancement can swap this for `fluent-bundle` without changing
 /// the public API.
-fn parse_ftl(
-    src: &str,
-    path: &Path,
-) -> Result<HashMap<String, String>, LoadError> {
+fn parse_ftl(src: &str, path: &Path) -> Result<HashMap<String, String>, LoadError> {
     let mut messages = HashMap::new();
     let mut current_key: Option<String> = None;
     let mut current_value = String::new();
@@ -574,7 +572,7 @@ fn parse_ftl(
             });
         }
         current_key = Some(key.to_owned());
-        current_value = raw_value.trim().to_owned();
+        raw_value.trim().clone_into(&mut current_value);
     }
 
     flush(&mut messages, &mut current_key, &mut current_value);
@@ -675,10 +673,10 @@ pub const LOCALE_SESSION_KEY: &str = "autumn_locale";
 fn resolve_query_override(parts: &Parts, supported: &[String]) -> Option<String> {
     let query = parts.uri.query()?;
     for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("locale=") {
-            if let Some(matched) = negotiate(value, supported) {
-                return Some(matched.to_owned());
-            }
+        if let Some(value) = pair.strip_prefix("locale=")
+            && let Some(matched) = negotiate(value, supported)
+        {
+            return Some(matched.to_owned());
         }
     }
     None
@@ -689,10 +687,7 @@ async fn resolve_from_session(parts: &Parts, supported: &[String]) -> Option<Str
     // isn't (e.g. session feature disabled or layer not installed), this
     // simply falls through. Reading is async because the session uses an
     // RwLock under the hood — but no I/O happens here.
-    let session = parts
-        .extensions
-        .get::<crate::session::Session>()
-        .cloned()?;
+    let session = parts.extensions.get::<crate::session::Session>().cloned()?;
     let value = session.get(LOCALE_SESSION_KEY).await?;
     negotiate(&value, supported).map(str::to_owned)
 }
@@ -704,10 +699,10 @@ fn resolve_from_plain_cookie(parts: &Parts, supported: &[String]) -> Option<Stri
         .and_then(|h| h.to_str().ok())?;
     for cookie in cookie_header.split(';') {
         let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("autumn_locale=") {
-            if let Some(matched) = negotiate(value, supported) {
-                return Some(matched.to_owned());
-            }
+        if let Some(value) = cookie.strip_prefix("autumn_locale=")
+            && let Some(matched) = negotiate(value, supported)
+        {
+            return Some(matched.to_owned());
         }
     }
     None
@@ -751,9 +746,7 @@ pub async fn set_locale_in_session(session: &crate::session::Session, locale: &s
 /// trust their own UI should keep relying on `Accept-Language`.
 #[must_use]
 pub fn set_locale_cookie(locale: &str) -> String {
-    format!(
-        "autumn_locale={locale}; Path=/; Max-Age=31536000; SameSite=Lax"
-    )
+    format!("autumn_locale={locale}; Path=/; Max-Age=31536000; SameSite=Lax")
 }
 
 /// Translate a key in the active locale, with **compile-time validation**
@@ -951,13 +944,7 @@ mod tests {
     #[test]
     fn translate_returns_translated_string() {
         let cfg = cfg("en", &["en", "es"]);
-        let bundle = bundle_with(
-            &[
-                ("en", &[("hi", "Hi")]),
-                ("es", &[("hi", "Hola")]),
-            ],
-            &cfg,
-        );
+        let bundle = bundle_with(&[("en", &[("hi", "Hi")]), ("es", &[("hi", "Hola")])], &cfg);
         assert_eq!(bundle.translate("es", "hi", &[]), "Hola");
         assert_eq!(bundle.translate("en", "hi", &[]), "Hi");
     }
@@ -972,10 +959,7 @@ mod tests {
             ],
             &cfg,
         );
-        assert_eq!(
-            bundle.translate("es", "only_in_en", &[]),
-            "english only"
-        );
+        assert_eq!(bundle.translate("es", "only_in_en", &[]), "english only");
     }
 
     #[test]
@@ -1018,10 +1002,7 @@ mod tests {
     #[test]
     fn translate_substitutes_named_args() {
         let cfg = cfg("en", &["en"]);
-        let bundle = bundle_with(
-            &[("en", &[("greeting", "Hello, { $name }!")])],
-            &cfg,
-        );
+        let bundle = bundle_with(&[("en", &[("greeting", "Hello, { $name }!")])], &cfg);
         assert_eq!(
             bundle.translate("en", "greeting", &[("name", "Ada")]),
             "Hello, Ada!"
@@ -1031,10 +1012,7 @@ mod tests {
     #[test]
     fn translate_leaves_unknown_args_visible() {
         let cfg = cfg("en", &["en"]);
-        let bundle = bundle_with(
-            &[("en", &[("greeting", "Hello, { $name }!")])],
-            &cfg,
-        );
+        let bundle = bundle_with(&[("en", &[("greeting", "Hello, { $name }!")])], &cfg);
         // No matching arg → keep template form, so the bug is loud.
         let out = bundle.translate("en", "greeting", &[]);
         assert!(out.contains("{ $name }"), "got: {out}");
@@ -1078,10 +1056,7 @@ mod tests {
     async fn locale_extractor_uses_query_override() {
         let cfg = cfg("en", &["en", "es"]);
         let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
-        let mut parts = build_parts(
-            "/?locale=es",
-            &[(header::ACCEPT_LANGUAGE.as_str(), "en")],
-        );
+        let mut parts = build_parts("/?locale=es", &[(header::ACCEPT_LANGUAGE.as_str(), "en")]);
         parts.extensions.insert(bundle.clone());
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
@@ -1163,10 +1138,7 @@ mod tests {
         );
         crate::i18n::set_locale_in_session(&session, "es").await;
 
-        let mut parts = build_parts(
-            "/",
-            &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "en")],
-        );
+        let mut parts = build_parts("/", &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "en")]);
         parts.extensions.insert(bundle.clone());
         parts.extensions.insert(session);
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
@@ -1220,10 +1192,7 @@ mod tests {
         );
         crate::i18n::set_locale_in_session(&session, "ja").await;
 
-        let mut parts = build_parts(
-            "/",
-            &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "es")],
-        );
+        let mut parts = build_parts("/", &[(axum::http::header::ACCEPT_LANGUAGE.as_str(), "es")]);
         parts.extensions.insert(bundle.clone());
         parts.extensions.insert(session);
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
@@ -1243,10 +1212,7 @@ mod tests {
     #[test]
     fn t_macro_with_named_args() {
         let cfg = cfg("en", &["en"]);
-        let bundle = Arc::new(bundle_with(
-            &[("en", &[("g", "Hello, { $name }!")])],
-            &cfg,
-        ));
+        let bundle = Arc::new(bundle_with(&[("en", &[("g", "Hello, { $name }!")])], &cfg));
         let locale = Locale::new("en").with_bundle(bundle);
         assert_eq!(t!(locale, "g", name = "Ada"), "Hello, Ada!");
     }

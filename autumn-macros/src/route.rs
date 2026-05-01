@@ -1,15 +1,20 @@
 //! Route macro implementation.
 //!
-//! Generates a companion `__autumn_route_info_{name}()` function for each
-//! annotated handler, pairing the HTTP method and path with an Axum
-//! `MethodRouter`. The companion also carries an [`ApiDoc`] describing
-//! the route for `OpenAPI` auto-generation.
+//! Generates two companion functions for each annotated handler:
+//!
+//! 1. `__autumn_route_info_{name}()` — returns a `Route` (existing behaviour).
+//! 2. `__autumn_path_{helper_name}(params…) -> String` — typed path helper
+//!    that accepts one `impl Display` argument per `{param}` segment in the URL
+//!    and returns the formatted absolute path string.
+//!
+//! The `helper_name` defaults to the handler function name but can be
+//! overridden with the `name = "custom_name"` route attribute argument.
 //!
 //! [`ApiDoc`]: ../../autumn_web/openapi/struct.ApiDoc.html
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{FnArg, ReturnType, Type};
+use syn::{FnArg, LitStr, ReturnType, Type};
 
 use crate::api_doc;
 use crate::parse;
@@ -24,10 +29,11 @@ pub fn route_macro(
     attr: TokenStream,
     item: TokenStream,
 ) -> TokenStream {
-    let path = match parse::parse_route_path(attr) {
-        Ok(p) => p,
+    let route_args = match parse::parse_route_attr(attr) {
+        Ok(a) => a,
         Err(err) => return err,
     };
+    let path = route_args.path.clone();
 
     let mut input_fn = match parse::parse_async_handler(item) {
         Ok(f) => f,
@@ -48,6 +54,16 @@ pub fn route_macro(
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let vis = &input_fn.vis;
+
+    // Determine the path-helper name: use `name = "..."` override when set,
+    // otherwise default to the handler function name.
+    let helper_ident = route_args.helper_ident(fn_name);
+    let path_helper_name = format_ident!("__autumn_path_{}", helper_ident);
+    let fn_name_alias = emit_fn_name_alias(
+        route_args.name_override.as_ref(),
+        fn_name,
+        &path_helper_name,
+    );
 
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
@@ -89,22 +105,7 @@ pub fn route_macro(
         || fn_name.clone(),
         |_| format_ident!("__autumn_primitive_handler_{}", fn_name),
     );
-
-    // Build the handler expression, chaining .layer() for each interceptor.
-    // Interceptors are applied in reverse attribute order so that the first
-    // #[intercept(...)] listed is the outermost layer (runs first).
-    let mut handler_expr: TokenStream =
-        quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
-
-    for interceptor in interceptors.iter().rev() {
-        // Explicit error type annotation avoids inference ambiguity when
-        // multiple .layer() calls are chained on MethodRouter.
-        handler_expr = quote! {
-            ::autumn_web::reexports::axum::routing::MethodRouter::<
-                ::autumn_web::AppState, ::core::convert::Infallible
-            >::layer(#handler_expr, #interceptor)
-        };
-    }
+    let handler_expr = build_handler_expr(&routing_fn, &handler_name, &interceptors);
 
     // ── OpenAPI metadata ────────────────────────────────────────
     let path_params = api_doc::extract_path_params(&path.value());
@@ -112,7 +113,10 @@ pub fn route_macro(
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
-    let http_method_lit = syn::LitStr::new(http_method, proc_macro2::Span::call_site());
+    let http_method_lit = LitStr::new(http_method, Span::call_site());
+
+    // ── Path helper ─────────────────────────────────────────────
+    let path_helper = emit_path_helper(&path_helper_name, &path, &path_params);
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -137,9 +141,140 @@ pub fn route_macro(
                     register_schemas: ::core::option::Option::None,
                     #api_doc_fields
                 },
+                repository: ::core::option::Option::None,
             }
         }
+
+        #path_helper
+        #fn_name_alias
     }
+}
+
+/// Build the axum handler expression, applying interceptor layers in reverse
+/// attribute order so the first `#[intercept(...)]` is the outermost layer.
+fn build_handler_expr(
+    routing_fn: &proc_macro2::Ident,
+    handler_name: &proc_macro2::Ident,
+    interceptors: &[syn::Path],
+) -> TokenStream {
+    let mut expr = quote! { ::autumn_web::reexports::axum::routing::#routing_fn(#handler_name) };
+    for interceptor in interceptors.iter().rev() {
+        // Explicit type annotation avoids inference ambiguity with chained .layer() calls.
+        expr = quote! {
+            ::autumn_web::reexports::axum::routing::MethodRouter::<
+                ::autumn_web::AppState, ::core::convert::Infallible
+            >::layer(#expr, #interceptor)
+        };
+    }
+    expr
+}
+
+/// When a `name = "..."` override is active, emit a `pub use` alias for the
+/// handler's own function name so that `paths![fn_name]` resolves alongside
+/// the override's `paths![custom_name]`.
+fn emit_fn_name_alias(
+    name_override: Option<&syn::LitStr>,
+    fn_name: &proc_macro2::Ident,
+    path_helper_name: &proc_macro2::Ident,
+) -> TokenStream {
+    let fn_path_helper_name = format_ident!("__autumn_path_{}", fn_name);
+    if name_override.is_some() && fn_path_helper_name != *path_helper_name {
+        quote! {
+            #[doc(hidden)]
+            pub use self::#path_helper_name as #fn_path_helper_name;
+        }
+    } else {
+        quote! {}
+    }
+}
+
+/// Emit the typed path helper function.
+///
+/// For `/posts/{id}/comments/{comment_id}` this emits:
+/// ```ignore
+/// pub fn __autumn_path_handler(id: impl Display, comment_id: impl Display) -> String {
+///     format!("/posts/{}/comments/{}", id, comment_id)
+/// }
+/// ```
+///
+/// Helpers are always emitted as `pub` regardless of handler visibility so
+/// that `paths![]` can re-export them without hitting E0364.
+///
+/// Positional `{}` placeholders are used (rather than named captures) so that
+/// route params whose names are Rust keywords — e.g. `/{type}` or `/{match}` —
+/// do not produce invalid `format!` invocations. Parameter idents are emitted
+/// as raw identifiers (`r#type`) so they are valid in the function signature.
+fn emit_path_helper(
+    helper_name: &proc_macro2::Ident,
+    path: &LitStr,
+    params: &[String],
+) -> TokenStream {
+    // Build parameter idents: strip `*` catch-all prefix, replace `-` → `_`,
+    // then emit as raw identifiers so Rust keywords are valid param names.
+    let param_idents: Vec<proc_macro2::Ident> = params
+        .iter()
+        .map(|p| {
+            let sanitized = p.trim_start_matches('*').replace('-', "_");
+            proc_macro2::Ident::new_raw(&sanitized, proc_macro2::Span::call_site())
+        })
+        .collect();
+
+    // Build a positional format string: each `{param}` / `{param:regex}` → `{}`.
+    // Positional placeholders avoid named-capture errors when param names are
+    // Rust keywords (you cannot write `format!("{type}")` in generated code).
+    let format_str = positional_format_string(&path.value());
+    let format_lit = LitStr::new(&format_str, path.span());
+
+    quote! {
+        #[doc(hidden)]
+        pub fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
+            format!(#format_lit, #(#param_idents),*)
+        }
+    }
+}
+
+/// Replace every `{...}` placeholder in a route path with `{}` (positional).
+///
+/// Handles nested braces from regex quantifiers like `{id:[0-9]{1,3}}` by
+/// tracking brace depth, so the outer `{...}` is consumed correctly.
+/// Escaped braces (`{{` / `}}`) are passed through unchanged as literal
+/// format-string escapes representing a single `{` or `}` in the output.
+fn positional_format_string(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                // Escaped literal brace `{{` — pass through for format string.
+                chars.next();
+                result.push_str("{{");
+            }
+            '{' => {
+                // Path parameter — emit positional placeholder and skip contents.
+                result.push_str("{}");
+                let mut depth: u32 = 1;
+                for inner in chars.by_ref() {
+                    match inner {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            '}' if chars.peek() == Some(&'}') => {
+                // Escaped closing brace `}}` — pass through.
+                chars.next();
+                result.push_str("}}");
+            }
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 fn should_stringify_primitive_output(output: &ReturnType) -> bool {
@@ -174,4 +309,68 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
             | "f32"
             | "f64"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positional_format_string;
+
+    #[test]
+    fn positional_plain_params() {
+        assert_eq!(positional_format_string("/posts/{id}"), "/posts/{}");
+    }
+
+    #[test]
+    fn positional_regex_constrained_params() {
+        assert_eq!(positional_format_string("/users/{id:[0-9]+}"), "/users/{}");
+    }
+
+    #[test]
+    fn positional_multiple_params() {
+        assert_eq!(
+            positional_format_string("/posts/{year}/{slug}"),
+            "/posts/{}/{}"
+        );
+    }
+
+    #[test]
+    fn positional_static_path() {
+        assert_eq!(positional_format_string("/hello"), "/hello");
+    }
+
+    #[test]
+    fn positional_catch_all_param() {
+        assert_eq!(positional_format_string("/files/{*path}"), "/files/{}");
+    }
+
+    #[test]
+    fn positional_hyphenated_param() {
+        assert_eq!(positional_format_string("/items/{item-id}"), "/items/{}");
+    }
+
+    #[test]
+    fn positional_regex_with_quantifier_braces() {
+        // Regex quantifiers like {1,3} must not end the outer capture early.
+        assert_eq!(
+            positional_format_string("/users/{id:[0-9]{1,3}}"),
+            "/users/{}"
+        );
+    }
+
+    #[test]
+    fn positional_keyword_param() {
+        // Keyword params like `type` must produce a valid positional placeholder.
+        assert_eq!(positional_format_string("/items/{type}"), "/items/{}");
+    }
+
+    #[test]
+    fn positional_escaped_braces_pass_through() {
+        // `{{` / `}}` are literal braces in the route, not parameters.
+        assert_eq!(positional_format_string("/{{hello}}"), "/{{hello}}");
+        // Escaped brace followed by a real param.
+        assert_eq!(
+            positional_format_string("/{{literal}}/{id}"),
+            "/{{literal}}/{}"
+        );
+    }
 }

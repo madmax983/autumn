@@ -1,7 +1,7 @@
 //! Runtime registry that collects admin-enabled models.
 //!
 //! The [`AdminRegistry`] is built during plugin construction and stored
-//! in [`AppState`] via `with_extension`. Route handlers retrieve it to
+//! in [`AppState`](autumn_web::AppState) via `with_extension`. Route handlers retrieve it to
 //! discover which models are available and how to render them.
 
 use std::collections::btree_map::{BTreeMap, Entry};

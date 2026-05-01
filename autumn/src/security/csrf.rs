@@ -213,21 +213,28 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
     let mut found_token = None;
 
     for cookie_header in &req_headers.get_all(http::header::COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((name, value)) = pair.split_once('=') {
-                    if name.trim() == cookie_name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(value.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if name.trim() != cookie_name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(value.trim().to_owned());
         }
     }
 
@@ -297,10 +304,10 @@ where
             // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
-            if let Some(cookie) = set_cookie {
-                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
-                    response.headers_mut().append(http::header::SET_COOKIE, val);
-                }
+            if let Some(cookie) = set_cookie
+                && let Ok(val) = http::header::HeaderValue::from_str(&cookie)
+            {
+                response.headers_mut().append(http::header::SET_COOKIE, val);
             }
 
             Ok(response)
@@ -321,10 +328,12 @@ async fn verify_csrf_token(
         .get(&settings.token_header)
         .and_then(|v| v.to_str().ok());
 
-    if let (Some(c), Some(h)) = (cookie_token, header_token) {
-        if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
-            token_found = true;
-        }
+    if let (Some(c), Some(h)) = (cookie_token, header_token)
+        && !c.is_empty()
+        && !h.is_empty()
+        && constant_time_eq(c, h)
+    {
+        token_found = true;
     }
 
     if token_found {
@@ -352,15 +361,17 @@ async fn verify_csrf_token(
 
     if let Ok(body_str) = std::str::from_utf8(&bytes) {
         for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == settings.form_field {
-                    if let Some(c) = cookie_token {
-                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
-                            token_found = true;
-                        }
-                    }
-                    break;
+            if let Some((key, value)) = pair.split_once('=')
+                && key == settings.form_field
+            {
+                if let Some(c) = cookie_token
+                    && !c.is_empty()
+                    && !value.is_empty()
+                    && constant_time_eq(c, value)
+                {
+                    token_found = true;
                 }
+                break;
             }
         }
     }

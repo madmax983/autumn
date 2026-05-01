@@ -3,25 +3,15 @@
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive publish/delete behaviour.
 
+use autumn_web::assets::asset_url;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
-use autumn_web::{AutumnError, AutumnResult, Db, Markup, delete, get, html, post, t};
+use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{NewPost, Post, UpdatePost};
 use crate::schema::posts;
-
-/// Render a meta-refresh redirect page targeting the given URL.
-fn redirect_to(url: &str) -> Markup {
-    html! {
-        (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
 
 // ── Layout ──────────────────────────────────────────────────────
 
@@ -40,22 +30,23 @@ pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
                 meta name="description" content="A blog built with the Autumn web framework for Rust.";
-                link rel="stylesheet" href="/static/css/autumn.css";
-                script src="/static/js/htmx.min.js" {}
+                link rel="stylesheet" href=(asset_url("css/autumn.css"));
+                script src=(asset_url("js/htmx.min.js")) {}
             }
             body class="bg-stone-50 min-h-screen font-sans text-stone-800 antialiased" {
                 // Navigation
                 nav class="border-b border-stone-200 bg-white/80 backdrop-blur-sm sticky top-0 z-10" {
                     div class="max-w-3xl mx-auto px-6 py-4 flex items-center justify-between" {
-                        a href="/" class="text-lg font-semibold text-stone-900 hover:text-amber-700 transition-colors" {
+                        a href=(paths::index()) class="text-lg font-semibold text-stone-900 hover:text-amber-700 transition-colors" {
                             "\u{1F342} " (t!(locale, "nav.brand"))
                         }
                         div class="flex items-center gap-4" {
-                            a href="/" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.home")) }
+                            a href=(paths::index()) class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.home")) }
                             a href="/about" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.about")) }
                             a href="/greet" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.greet")) }
-                            a href="/admin" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.admin")) }
-                            a href="/admin/new" class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { (t!(locale, "nav.new_post")) }
+                            a href=(paths::admin_list()) class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { (t!(locale, "nav.admin")) }
+                            a href="/backoffice/posts" class="text-sm text-stone-600 hover:text-amber-700 transition-colors" { "Plugin Admin" }
+                            a href=(paths::new_form()) class="text-sm px-3 py-1.5 bg-amber-700 text-white rounded-lg hover:bg-amber-800 transition-colors" { (t!(locale, "nav.new_post")) }
                             // Lightweight locale switcher — `?locale=` query
                             // overrides the resolved locale per the documented
                             // resolution order.
@@ -111,7 +102,7 @@ fn post_card(post: &Post) -> Markup {
 
     html! {
         article class="group" {
-            a href=(format!("/posts/{}", post.slug))
+            a href=(paths::show(post.slug.clone()))
                class="block bg-white rounded-xl border border-stone-200 \
                       hover:border-amber-300 shadow-sm hover:shadow-md \
                       transition-all p-6" {
@@ -208,7 +199,7 @@ fn post_form(action: &str, post: Option<&Post>) -> Markup {
                               transition-colors" {
                     @if post.is_some() { "Update Post" } @else { "Create Post" }
                 }
-                a href="/admin"
+                a href=(paths::admin_list())
                    class="px-4 py-2.5 text-sm text-stone-600 hover:text-stone-800 transition-colors" {
                     "Cancel"
                 }
@@ -268,7 +259,7 @@ pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResul
         html! {
             article {
                 // Back link
-                a href="/"
+                a href=(paths::index())
                    class="inline-flex items-center gap-1 text-sm text-stone-600 \
                           hover:text-amber-700 transition-colors mb-8" {
                     "\u{2190} Back to blog"
@@ -326,7 +317,7 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
             @if all_posts.is_empty() {
                 div class="text-center py-16" {
                     p class="text-stone-500 text-sm mb-4" { "No posts yet." }
-                    a href="/admin/new"
+                    a href=(paths::new_form())
                        class="px-5 py-2.5 bg-amber-700 text-white text-sm font-medium rounded-lg \
                               hover:bg-amber-800 transition-colors" {
                         "Write your first post"
@@ -341,7 +332,7 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
                                    shadow-sm transition-colors px-5 py-4" {
                             div class="flex-1 min-w-0" {
                                 div class="flex items-center gap-2" {
-                                    a href=(format!("/admin/{}/edit", p.id))
+                                    a href=(paths::edit_form(p.id))
                                        class="text-sm font-medium text-stone-900 hover:text-amber-700 \
                                               transition-colors truncate" {
                                         (p.title)
@@ -364,16 +355,16 @@ pub async fn admin_list(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
                             }
                             div class="flex items-center gap-2 ml-4 shrink-0" {
                                 @if p.published {
-                                    a href=(format!("/posts/{}", p.slug))
+                                    a href=(paths::show(p.slug.clone()))
                                        class="text-xs text-amber-700 underline hover:text-amber-800 transition-colors" {
                                         "View"
                                     }
                                 }
-                                a href=(format!("/admin/{}/edit", p.id))
+                                a href=(paths::edit_form(p.id))
                                    class="text-xs text-amber-700 underline hover:text-amber-800 transition-colors" {
                                     "Edit"
                                 }
-                                button hx-delete=(format!("/admin/{}", p.id))
+                                button hx-delete=(paths::delete_post(p.id))
                                        hx-target=(format!("#post-{}", p.id))
                                        hx-swap="outerHTML"
                                        hx-confirm="Delete this post? This cannot be undone."
@@ -397,7 +388,7 @@ pub async fn new_form(locale: Locale) -> Markup {
         &locale,
         "New Post \u{2022} Autumn Blog",
         html! {
-            a href="/admin"
+            a href=(paths::admin_list())
                class="inline-flex items-center gap-1 text-sm text-stone-600 \
                       hover:text-amber-700 transition-colors mb-6" {
                 "\u{2190} Back to admin"
@@ -405,14 +396,14 @@ pub async fn new_form(locale: Locale) -> Markup {
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "New Post"
             }
-            (post_form("/admin", None))
+            (post_form(&paths::create(), None))
         },
     )
 }
 
 /// Create a new post from a form submission.
 #[post("/admin")]
-pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
+pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
     let new_post = form.0.validated()?;
 
     diesel::insert_into(posts::table)
@@ -420,7 +411,7 @@ pub async fn create(mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to("/admin"))
+    Ok(Redirect::to(&paths::admin_list()))
 }
 
 /// Show the edit form for a post.
@@ -432,7 +423,7 @@ pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResul
         &locale,
         &format!("Edit: {} \u{2022} Autumn Blog", p.title),
         html! {
-            a href="/admin"
+            a href=(paths::admin_list())
                class="inline-flex items-center gap-1 text-sm text-stone-600 \
                       hover:text-amber-700 transition-colors mb-6" {
                 "\u{2190} Back to admin"
@@ -440,15 +431,14 @@ pub async fn edit_form(locale: Locale, id: Path<i64>, mut db: Db) -> AutumnResul
             h1 class="text-2xl font-semibold tracking-tight text-stone-900 mb-6" {
                 "Edit Post"
             }
-            (post_form(&format!("/admin/{}", p.id), Some(&p)))
+            (post_form(&paths::update(p.id), Some(&p)))
         },
     ))
 }
 
 /// Update a post from a form submission.
 #[post("/admin/{id}")]
-pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Markup> {
-    // Validate
+pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnResult<Redirect> {
     let validated = form.0.validated()?;
 
     let changes = UpdatePost {
@@ -470,7 +460,7 @@ pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnRes
         )));
     }
 
-    Ok(redirect_to("/admin"))
+    Ok(Redirect::to(&paths::admin_list()))
 }
 
 /// Delete a post by ID (htmx endpoint).
@@ -489,3 +479,14 @@ pub async fn delete_post(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
 
     Ok(String::new())
 }
+
+autumn_web::paths![
+    index,
+    show,
+    admin_list,
+    new_form,
+    create,
+    edit_form,
+    update,
+    delete_post
+];
