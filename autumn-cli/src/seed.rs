@@ -15,7 +15,7 @@ use std::process::Command;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SeedError {
     #[error(
-        "no seed binary found; create `src/bin/seed.rs` or run `autumn generate seed`\n\
+        "no seed binary found; create `src/bin/seed.rs`\n\
          See: https://autumn.rs/guide/seeding"
     )]
     MissingSeedBinary,
@@ -59,8 +59,13 @@ fn find_package_dir(package: &str) -> Option<PathBuf> {
 /// Precedence (highest to lowest):
 /// 1. `AUTUMN_DATABASE__URL` env var
 /// 2. `DATABASE_URL` env var
-/// 3. `database.url` in `<base_dir>/autumn.toml`
-fn resolve_database_url_with_env<F>(env_var: F, base_dir: &Path) -> Result<String, SeedError>
+/// 3. `[profile.<profile>.database.url]` in `<base_dir>/autumn.toml`
+/// 4. `[database.url]` in `<base_dir>/autumn.toml`
+fn resolve_database_url_with_env<F>(
+    env_var: F,
+    base_dir: &Path,
+    profile: &str,
+) -> Result<String, SeedError>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -81,11 +86,25 @@ where
         && let Ok(table) = toml::from_str::<toml::Table>(&contents)
     {
         let value = toml::Value::Table(table);
+
+        // Profile-specific override: [profile.<name>.database.url]
+        if let Some(url) = value
+            .get("profile")
+            .and_then(|p| p.get(profile))
+            .and_then(|p| p.get("database"))
+            .and_then(|db| db.get("url"))
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+        {
+            return Ok(url.to_string());
+        }
+
+        // Top-level fallback: [database.url]
         if let Some(url) = value
             .get("database")
             .and_then(|db: &toml::Value| db.get("url"))
             .and_then(|u: &toml::Value| u.as_str())
-            && !url.is_empty()
+            .filter(|u| !u.is_empty())
         {
             return Ok(url.to_string());
         }
@@ -94,9 +113,9 @@ where
     Err(SeedError::MissingSeedBinary)
 }
 
-/// Resolve the database URL using the real environment and a given base dir.
-fn resolve_database_url(base_dir: &Path) -> Result<String, SeedError> {
-    resolve_database_url_with_env(|key| std::env::var(key), base_dir)
+/// Resolve the database URL using the real environment, a given base dir, and profile.
+fn resolve_database_url(base_dir: &Path, profile: &str) -> Result<String, SeedError> {
+    resolve_database_url_with_env(|key| std::env::var(key), base_dir, profile)
 }
 
 /// Check whether there are pending (unapplied) migrations.
@@ -145,7 +164,7 @@ pub fn run(profile: &str, package: Option<&str>) {
 
     // Best-effort pending migration check when diesel CLI and migrations dir are available.
     let migrations_dir = project_dir.join("migrations");
-    if let Ok(db_url) = resolve_database_url(&project_dir)
+    if let Ok(db_url) = resolve_database_url(&project_dir, profile)
         && migrations_dir.is_dir()
         && let Err(e) = check_pending_migrations(&db_url, &migrations_dir.to_string_lossy())
     {
@@ -201,11 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_seed_binary_error_mentions_generate_seed() {
+    fn missing_seed_binary_error_mentions_seeding_guide_url() {
         let msg = SeedError::MissingSeedBinary.to_string();
         assert!(
-            msg.contains("generate seed"),
-            "error should mention `autumn generate seed`, got: {msg}"
+            msg.contains("autumn.rs/guide/seeding"),
+            "error should link to the seeding guide, got: {msg}"
         );
     }
 
@@ -263,7 +282,7 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://plain:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new("."), "dev").unwrap();
         assert_eq!(url, "postgres://autumn:5432/db");
     }
 
@@ -273,7 +292,7 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://fallback:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new("."), "dev").unwrap();
         assert_eq!(url, "postgres://fallback:5432/db");
     }
 
@@ -282,7 +301,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-        assert!(resolve_database_url_with_env(env, tmp.path()).is_err());
+        assert!(resolve_database_url_with_env(env, tmp.path(), "dev").is_err());
     }
 
     #[test]
@@ -292,7 +311,7 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://real:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new("."), "dev").unwrap();
         assert_eq!(url, "postgres://real:5432/db");
     }
 
@@ -306,7 +325,7 @@ mod tests {
         .unwrap();
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-        let url = resolve_database_url_with_env(env, tmp.path()).unwrap();
+        let url = resolve_database_url_with_env(env, tmp.path(), "dev").unwrap();
         assert_eq!(url, "postgres://toml:5432/db");
     }
 
@@ -323,6 +342,35 @@ mod tests {
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
         // Using tmp_empty as base_dir — no autumn.toml there, so must fail.
-        assert!(resolve_database_url_with_env(env, tmp_empty.path()).is_err());
+        assert!(resolve_database_url_with_env(env, tmp_empty.path(), "dev").is_err());
+    }
+
+    #[test]
+    fn resolve_db_url_uses_profile_specific_section_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nurl = \"postgres://default:5432/db\"\n\
+             [profile.demo.database]\nurl = \"postgres://demo:5432/demo_db\"\n",
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        let url = resolve_database_url_with_env(env, tmp.path(), "demo").unwrap();
+        assert_eq!(url, "postgres://demo:5432/demo_db");
+    }
+
+    #[test]
+    fn resolve_db_url_falls_back_to_top_level_when_profile_section_absent() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nurl = \"postgres://default:5432/db\"\n",
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        let url = resolve_database_url_with_env(env, tmp.path(), "demo").unwrap();
+        assert_eq!(url, "postgres://default:5432/db");
     }
 }
