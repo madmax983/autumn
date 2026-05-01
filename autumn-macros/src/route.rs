@@ -1,15 +1,20 @@
 //! Route macro implementation.
 //!
-//! Generates a companion `__autumn_route_info_{name}()` function for each
-//! annotated handler, pairing the HTTP method and path with an Axum
-//! `MethodRouter`. The companion also carries an [`ApiDoc`] describing
-//! the route for `OpenAPI` auto-generation.
+//! Generates two companion functions for each annotated handler:
+//!
+//! 1. `__autumn_route_info_{name}()` — returns a `Route` (existing behaviour).
+//! 2. `__autumn_path_{helper_name}(params…) -> String` — typed path helper
+//!    that accepts one `impl Display` argument per `{param}` segment in the URL
+//!    and returns the formatted absolute path string.
+//!
+//! The `helper_name` defaults to the handler function name but can be
+//! overridden with the `name = "custom_name"` route attribute argument.
 //!
 //! [`ApiDoc`]: ../../autumn_web/openapi/struct.ApiDoc.html
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{FnArg, ReturnType, Type};
+use syn::{FnArg, LitStr, ReturnType, Type};
 
 use crate::api_doc;
 use crate::parse;
@@ -24,10 +29,11 @@ pub fn route_macro(
     attr: TokenStream,
     item: TokenStream,
 ) -> TokenStream {
-    let path = match parse::parse_route_path(attr) {
-        Ok(p) => p,
+    let route_args = match parse::parse_route_attr(attr) {
+        Ok(a) => a,
         Err(err) => return err,
     };
+    let path = route_args.path.clone();
 
     let mut input_fn = match parse::parse_async_handler(item) {
         Ok(f) => f,
@@ -48,6 +54,11 @@ pub fn route_macro(
     let fn_name = &input_fn.sig.ident;
     let route_info_name = format_ident!("__autumn_route_info_{}", fn_name);
     let vis = &input_fn.vis;
+
+    // Determine the path-helper name: use `name = "..."` override when set,
+    // otherwise default to the handler function name.
+    let helper_ident = route_args.helper_ident(fn_name);
+    let path_helper_name = format_ident!("__autumn_path_{}", helper_ident);
 
     let method_const = format_ident!("{}", http_method); // e.g., GET
     let routing_fn = format_ident!("{}", axum_fn); // e.g., get
@@ -112,7 +123,10 @@ pub fn route_macro(
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
-    let http_method_lit = syn::LitStr::new(http_method, proc_macro2::Span::call_site());
+    let http_method_lit = LitStr::new(http_method, Span::call_site());
+
+    // ── Path helper ─────────────────────────────────────────────
+    let path_helper = emit_path_helper(vis, &path_helper_name, &path, &path_params);
 
     quote! {
         // ECHO-001: We want to apply #[axum::debug_handler] but without forcing the user
@@ -140,7 +154,69 @@ pub fn route_macro(
                 repository: ::core::option::Option::None,
             }
         }
+
+        #path_helper
     }
+}
+
+/// Emit the typed path helper function.
+///
+/// For `/posts/{id}/comments/{comment_id}` this emits:
+/// ```ignore
+/// pub fn __autumn_path_handler(id: impl Display, comment_id: impl Display) -> String {
+///     format!("/posts/{id}/comments/{comment_id}")
+/// }
+/// ```
+///
+/// Regex-constrained params like `{id:[0-9]+}` are normalised to `{id}` in the
+/// format string so `format!` can use the named-capture syntax.
+fn emit_path_helper(
+    vis: &syn::Visibility,
+    helper_name: &proc_macro2::Ident,
+    path: &LitStr,
+    params: &[String],
+) -> TokenStream {
+    // Build parameter list: one `name: impl Display` per path param.
+    let param_idents: Vec<proc_macro2::Ident> =
+        params.iter().map(|p| format_ident!("{}", p)).collect();
+
+    // Normalise the path string: replace `{param:regex}` → `{param}` so the
+    // format string uses named-argument syntax that Rust's `format!` understands.
+    let format_str = normalise_path_for_format(&path.value());
+    let format_lit = LitStr::new(&format_str, path.span());
+
+    quote! {
+        #[doc(hidden)]
+        #vis fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
+            format!(#format_lit)
+        }
+    }
+}
+
+/// Replace `{param:regex}` with `{param}` so the path can be used as a
+/// `format!` string with named-argument capture syntax (stabilised in Rust 1.58).
+fn normalise_path_for_format(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' {
+            result.push('{');
+            let mut param = String::new();
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+                param.push(inner);
+            }
+            // Strip any `:regex` suffix — keep only the param name.
+            let name = param.split(':').next().unwrap_or(&param);
+            result.push_str(name);
+            result.push('}');
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn should_stringify_primitive_output(output: &ReturnType) -> bool {
@@ -175,4 +251,35 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
             | "f32"
             | "f64"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalise_path_for_format;
+
+    #[test]
+    fn normalise_plain_params() {
+        assert_eq!(normalise_path_for_format("/posts/{id}"), "/posts/{id}");
+    }
+
+    #[test]
+    fn normalise_regex_constrained_params() {
+        assert_eq!(
+            normalise_path_for_format("/users/{id:[0-9]+}"),
+            "/users/{id}"
+        );
+    }
+
+    #[test]
+    fn normalise_multiple_params() {
+        assert_eq!(
+            normalise_path_for_format("/posts/{year}/{slug}"),
+            "/posts/{year}/{slug}"
+        );
+    }
+
+    #[test]
+    fn normalise_static_path() {
+        assert_eq!(normalise_path_for_format("/hello"), "/hello");
+    }
 }

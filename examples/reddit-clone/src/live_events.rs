@@ -826,7 +826,7 @@ pub fn post_created_event(
         "post_slug": post_slug,
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
-        "path": format!("/r/{subreddit_slug}/posts/{post_slug}"),
+        "path": crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug),
     })
 }
 
@@ -847,7 +847,7 @@ pub fn comment_created_event(
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
         "body_preview": comment_body_preview(body),
-        "path": format!("/r/{subreddit_slug}/posts/{post_slug}#comment-{comment_id}"),
+        "path": format!("{}#comment-{comment_id}", crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)),
     })
 }
 
