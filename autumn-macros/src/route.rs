@@ -164,81 +164,67 @@ pub fn route_macro(
 /// For `/posts/{id}/comments/{comment_id}` this emits:
 /// ```ignore
 /// pub fn __autumn_path_handler(id: impl Display, comment_id: impl Display) -> String {
-///     format!("/posts/{id}/comments/{comment_id}")
+///     format!("/posts/{}/comments/{}", id, comment_id)
 /// }
 /// ```
 ///
-/// Regex-constrained params like `{id:[0-9]+}` are normalised to `{id}` in the
-/// format string so `format!` can use the named-capture syntax.
+/// Positional `{}` placeholders are used (rather than named captures) so that
+/// route params whose names are Rust keywords — e.g. `/{type}` or `/{match}` —
+/// do not produce invalid `format!` invocations. Parameter idents are emitted
+/// as raw identifiers (`r#type`) so they are valid in the function signature.
 fn emit_path_helper(
     vis: &syn::Visibility,
     helper_name: &proc_macro2::Ident,
     path: &LitStr,
     params: &[String],
 ) -> TokenStream {
-    // Build parameter list: one `name: impl Display` per path param.
-    // Sanitize param names: strip the `*` catch-all prefix and replace `-`
-    // with `_` so the result is a valid Rust identifier in both the
-    // function signature and the `format!` named-argument position.
+    // Build parameter idents: strip `*` catch-all prefix, replace `-` → `_`,
+    // then emit as raw identifiers so Rust keywords are valid param names.
     let param_idents: Vec<proc_macro2::Ident> = params
         .iter()
         .map(|p| {
             let sanitized = p.trim_start_matches('*').replace('-', "_");
-            format_ident!("{}", sanitized)
+            proc_macro2::Ident::new_raw(&sanitized, proc_macro2::Span::call_site())
         })
         .collect();
 
-    // Normalise the path string: replace `{param:regex}` → `{param}` so the
-    // format string uses named-argument syntax that Rust's `format!` understands.
-    let format_str = normalise_path_for_format(&path.value());
+    // Build a positional format string: each `{param}` / `{param:regex}` → `{}`.
+    // Positional placeholders avoid named-capture errors when param names are
+    // Rust keywords (you cannot write `format!("{type}")` in generated code).
+    let format_str = positional_format_string(&path.value());
     let format_lit = LitStr::new(&format_str, path.span());
 
     quote! {
         #[doc(hidden)]
         #vis fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
-            format!(#format_lit)
+            format!(#format_lit, #(#param_idents),*)
         }
     }
 }
 
-/// Replace `{param:regex}` with `{param}` so the path can be used as a
-/// `format!` string with named-argument capture syntax (stabilised in Rust 1.58).
+/// Replace every `{...}` placeholder in a route path with `{}` (positional).
 ///
-/// Also normalises catch-all and hyphenated params to valid Rust identifiers:
-/// - `{*rest}` → `{rest}` (strip catch-all `*` prefix)
-/// - `{param-name}` → `{param_name}` (replace `-` with `_`)
-fn normalise_path_for_format(path: &str) -> String {
+/// Handles nested braces from regex quantifiers like `{id:[0-9]{1,3}}` by
+/// tracking brace depth, so the outer `{...}` is consumed correctly.
+fn positional_format_string(path: &str) -> String {
     let mut result = String::with_capacity(path.len());
     let mut chars = path.chars();
     while let Some(c) = chars.next() {
         if c == '{' {
-            result.push('{');
-            let mut param = String::new();
-            // Track depth so quantifiers like `{id:[0-9]{1,3}}` don't end
-            // the capture at the first inner `}`.
+            result.push_str("{}");
             let mut depth: u32 = 1;
             for inner in chars.by_ref() {
                 match inner {
-                    '{' => {
-                        depth += 1;
-                        param.push(inner);
-                    }
+                    '{' => depth += 1,
                     '}' => {
                         depth -= 1;
                         if depth == 0 {
                             break;
                         }
-                        param.push(inner);
                     }
-                    _ => param.push(inner),
+                    _ => {}
                 }
             }
-            // Strip `:regex` suffix (everything after the first `:`), then
-            // strip `*` catch-all prefix, then replace `-` → `_`.
-            let name = param.split(':').next().unwrap_or(&param);
-            let name = name.trim_start_matches('*').replace('-', "_");
-            result.push_str(&name);
-            result.push('}');
         } else {
             result.push(c);
         }
@@ -282,53 +268,53 @@ fn should_stringify_primitive_output(output: &ReturnType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::normalise_path_for_format;
+    use super::positional_format_string;
 
     #[test]
-    fn normalise_plain_params() {
-        assert_eq!(normalise_path_for_format("/posts/{id}"), "/posts/{id}");
+    fn positional_plain_params() {
+        assert_eq!(positional_format_string("/posts/{id}"), "/posts/{}");
     }
 
     #[test]
-    fn normalise_regex_constrained_params() {
+    fn positional_regex_constrained_params() {
+        assert_eq!(positional_format_string("/users/{id:[0-9]+}"), "/users/{}");
+    }
+
+    #[test]
+    fn positional_multiple_params() {
         assert_eq!(
-            normalise_path_for_format("/users/{id:[0-9]+}"),
-            "/users/{id}"
+            positional_format_string("/posts/{year}/{slug}"),
+            "/posts/{}/{}"
         );
     }
 
     #[test]
-    fn normalise_multiple_params() {
-        assert_eq!(
-            normalise_path_for_format("/posts/{year}/{slug}"),
-            "/posts/{year}/{slug}"
-        );
+    fn positional_static_path() {
+        assert_eq!(positional_format_string("/hello"), "/hello");
     }
 
     #[test]
-    fn normalise_static_path() {
-        assert_eq!(normalise_path_for_format("/hello"), "/hello");
+    fn positional_catch_all_param() {
+        assert_eq!(positional_format_string("/files/{*path}"), "/files/{}");
     }
 
     #[test]
-    fn normalise_catch_all_param() {
-        assert_eq!(normalise_path_for_format("/files/{*path}"), "/files/{path}");
+    fn positional_hyphenated_param() {
+        assert_eq!(positional_format_string("/items/{item-id}"), "/items/{}");
     }
 
     #[test]
-    fn normalise_hyphenated_param() {
-        assert_eq!(
-            normalise_path_for_format("/items/{item-id}"),
-            "/items/{item_id}"
-        );
-    }
-
-    #[test]
-    fn normalise_regex_with_quantifier_braces() {
+    fn positional_regex_with_quantifier_braces() {
         // Regex quantifiers like {1,3} must not end the outer capture early.
         assert_eq!(
-            normalise_path_for_format("/users/{id:[0-9]{1,3}}"),
-            "/users/{id}"
+            positional_format_string("/users/{id:[0-9]{1,3}}"),
+            "/users/{}"
         );
+    }
+
+    #[test]
+    fn positional_keyword_param() {
+        // Keyword params like `type` must produce a valid positional placeholder.
+        assert_eq!(positional_format_string("/items/{type}"), "/items/{}");
     }
 }
