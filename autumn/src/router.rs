@@ -837,7 +837,7 @@ fn mount_probe_endpoints(
     if mounted_probe_paths.insert(config.health.path.clone()) {
         router = router.route(
             &config.health.path,
-            axum::routing::get(crate::health::handler),
+            axum::routing::get(crate::health::handler::<AppState>),
         );
     }
     tracing::debug!(
