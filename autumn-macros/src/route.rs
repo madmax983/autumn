@@ -177,8 +177,16 @@ fn emit_path_helper(
     params: &[String],
 ) -> TokenStream {
     // Build parameter list: one `name: impl Display` per path param.
-    let param_idents: Vec<proc_macro2::Ident> =
-        params.iter().map(|p| format_ident!("{}", p)).collect();
+    // Sanitize param names: strip the `*` catch-all prefix and replace `-`
+    // with `_` so the result is a valid Rust identifier in both the
+    // function signature and the `format!` named-argument position.
+    let param_idents: Vec<proc_macro2::Ident> = params
+        .iter()
+        .map(|p| {
+            let sanitized = p.trim_start_matches('*').replace('-', "_");
+            format_ident!("{}", sanitized)
+        })
+        .collect();
 
     // Normalise the path string: replace `{param:regex}` → `{param}` so the
     // format string uses named-argument syntax that Rust's `format!` understands.
@@ -195,9 +203,13 @@ fn emit_path_helper(
 
 /// Replace `{param:regex}` with `{param}` so the path can be used as a
 /// `format!` string with named-argument capture syntax (stabilised in Rust 1.58).
+///
+/// Also normalises catch-all and hyphenated params to valid Rust identifiers:
+/// - `{*rest}` → `{rest}` (strip catch-all `*` prefix)
+/// - `{param-name}` → `{param_name}` (replace `-` with `_`)
 fn normalise_path_for_format(path: &str) -> String {
     let mut result = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
+    let mut chars = path.chars();
     while let Some(c) = chars.next() {
         if c == '{' {
             result.push('{');
@@ -208,9 +220,10 @@ fn normalise_path_for_format(path: &str) -> String {
                 }
                 param.push(inner);
             }
-            // Strip any `:regex` suffix — keep only the param name.
+            // Strip `:regex` suffix, then `*` catch-all prefix, then replace `-` → `_`.
             let name = param.split(':').next().unwrap_or(&param);
-            result.push_str(name);
+            let name = name.trim_start_matches('*').replace('-', "_");
+            result.push_str(&name);
             result.push('}');
         } else {
             result.push(c);
@@ -281,5 +294,18 @@ mod tests {
     #[test]
     fn normalise_static_path() {
         assert_eq!(normalise_path_for_format("/hello"), "/hello");
+    }
+
+    #[test]
+    fn normalise_catch_all_param() {
+        assert_eq!(normalise_path_for_format("/files/{*path}"), "/files/{path}");
+    }
+
+    #[test]
+    fn normalise_hyphenated_param() {
+        assert_eq!(
+            normalise_path_for_format("/items/{item-id}"),
+            "/items/{item_id}"
+        );
     }
 }
