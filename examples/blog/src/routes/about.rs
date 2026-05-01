@@ -1,8 +1,9 @@
 //! Static about page — demonstrates `#[static_get]` for pre-rendered content.
 
+use autumn_web::i18n::Locale;
 use autumn_web::{Markup, html, static_get};
 
-use super::posts::{default_locale, layout};
+use super::posts::layout;
 
 /// A static about page rendered at build time.
 ///
@@ -10,9 +11,9 @@ use super::posts::{default_locale, layout};
 /// by `autumn build`. At runtime, the pre-rendered HTML is served from disk
 /// without touching the application.
 #[static_get("/about")]
-pub async fn about() -> Markup {
+pub async fn about(locale: Locale) -> Markup {
     layout(
-        &default_locale(),
+        &locale,
         "About \u{2022} Autumn Blog",
         html! {
             article {

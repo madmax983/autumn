@@ -19,8 +19,8 @@ use crate::schema::posts;
 ///
 /// Takes the request [`Locale`] so nav, footer, and locale-switcher labels
 /// are translated through the [`t!`] macro. Pages reachable via
-/// `#[static_get]` (e.g. `about.rs`) pass [`default_locale()`] so the
-/// pre-rendered HTML is in the configured default language.
+/// `#[static_get]` (e.g. `about.rs`) use the same extractor during static
+/// rendering, so pre-rendered HTML receives the configured bundle too.
 pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
@@ -77,15 +77,6 @@ pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
             }
         }
     }
-}
-
-/// Locale used for `#[static_get]` pre-rendering — the build-time render
-/// has no request, so it falls back to the configured default. Apps that
-/// want pre-rendered pages for multiple locales would generate one URL per
-/// locale; for the demo we only pre-render English.
-#[must_use]
-pub fn default_locale() -> Locale {
-    Locale::new("en")
 }
 
 // ── Components ──────────────────────────────────────────────────

@@ -95,6 +95,8 @@ pub fn app() -> AppBuilder {
         audit_logger: None,
         #[cfg(feature = "i18n")]
         i18n_bundle: None,
+        #[cfg(feature = "i18n")]
+        i18n_auto_load: false,
         policy_registrations: Vec::new(),
     }
 }
@@ -225,6 +227,11 @@ pub struct AppBuilder {
     /// [`Locale`](crate::i18n::Locale) extractor can resolve translations.
     #[cfg(feature = "i18n")]
     i18n_bundle: Option<Arc<crate::i18n::Bundle>>,
+    /// Whether to load the i18n bundle after the active config loader resolves
+    /// [`AutumnConfig`]. This keeps `.i18n_auto()` aligned with
+    /// `.with_config_loader(...)`.
+    #[cfg(feature = "i18n")]
+    i18n_auto_load: bool,
     /// Deferred [`Policy`](crate::authorization::Policy) and
     /// [`Scope`](crate::authorization::Scope) registrations applied
     /// to [`AppState::policy_registry`] just before the router is
@@ -848,6 +855,7 @@ impl AppBuilder {
     #[must_use]
     pub fn i18n(mut self, bundle: crate::i18n::Bundle) -> Self {
         self.i18n_bundle = Some(Arc::new(bundle));
+        self.i18n_auto_load = false;
         self
     }
 
@@ -855,7 +863,7 @@ impl AppBuilder {
     /// (`i18n/` by default), reading the `[i18n]` block from the active
     /// [`AutumnConfig`](crate::config::AutumnConfig).
     ///
-    /// Fails fast at startup if the configured default locale's file is
+    /// Fails fast during [`Self::run`] if the configured default locale's file is
     /// missing — the spec calls out this as the desired behaviour: a
     /// half-localized app is worse than a clearly-broken one. The error
     /// path here panics with the typed [`LoadError`](crate::i18n::LoadError)
@@ -888,17 +896,10 @@ impl AppBuilder {
     /// ```
     #[cfg(feature = "i18n")]
     #[must_use]
-    pub fn i18n_auto(self) -> Self {
-        // The actual filesystem read happens here so failures surface
-        // immediately — before run() goes off and binds a TCP port to a
-        // doomed application.
-        let env = crate::config::OsEnv;
-        let config = crate::config::AutumnConfig::load_with_env(&env)
-            .unwrap_or_else(|e| panic!("i18n_auto: failed to load AutumnConfig: {e}"));
-        let dir = project_dir(&config.i18n.dir, &env);
-        let bundle = crate::i18n::Bundle::load_from_dir(&dir, &config.i18n)
-            .unwrap_or_else(|e| panic!("i18n_auto: {e}"));
-        self.i18n(bundle)
+    pub fn i18n_auto(mut self) -> Self {
+        self.i18n_bundle = None;
+        self.i18n_auto_load = true;
+        self
     }
 
     // ── Tier-1 subsystem replacement hooks ─────────────────────
@@ -1214,6 +1215,8 @@ impl AppBuilder {
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
             policy_registrations,
         } = self;
 
@@ -1222,6 +1225,10 @@ impl AppBuilder {
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         // 3. Validate routes
         assert!(
@@ -1313,27 +1320,7 @@ impl AppBuilder {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
         #[cfg(feature = "i18n")]
-        let custom_layers = if let Some(bundle) = i18n_bundle {
-            tracing::info!(
-                locales = ?bundle.locales(),
-                default = bundle.default_locale(),
-                "i18n bundle loaded"
-            );
-            state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
-            let mut custom_layers = custom_layers;
-            // Use the existing IntoAppLayer plumbing so the Extension is
-            // visible to every request. axum::Extension<T> is itself a
-            // tower::Layer when T: Clone + Send + Sync + 'static.
-            let ext_layer = axum::Extension(bundle);
-            let registration = CustomLayerRegistration {
-                type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
-                apply: Box::new(move |router| router.layer(ext_layer)),
-            };
-            custom_layers.push(registration);
-            custom_layers
-        } else {
-            custom_layers
-        };
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
 
         // Install the preflighted blob store on the freshly-built
         // AppState, and remember the serving router so it gets merged
@@ -1500,7 +1487,9 @@ impl AppBuilder {
                 openapi: _,
             audit_logger: _,
             #[cfg(feature = "i18n")]
-                i18n_bundle: _,
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
             policy_registrations,
         } = self;
 
@@ -1509,6 +1498,10 @@ impl AppBuilder {
         // Load config (same as normal startup)
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -1563,6 +1556,9 @@ impl AppBuilder {
         for register in policy_registrations {
             register(state.policy_registry());
         }
+
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
 
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
@@ -2253,6 +2249,54 @@ async fn load_config_and_telemetry(
         });
 
     (config, telemetry_guard)
+}
+
+#[cfg(feature = "i18n")]
+fn resolve_i18n_bundle(
+    explicit_bundle: Option<Arc<crate::i18n::Bundle>>,
+    auto_load: bool,
+    config: &AutumnConfig,
+    env: &dyn crate::config::Env,
+) -> Option<Arc<crate::i18n::Bundle>> {
+    if explicit_bundle.is_some() {
+        return explicit_bundle;
+    }
+    if !auto_load {
+        return None;
+    }
+
+    let dir = project_dir(&config.i18n.dir, env);
+    Some(Arc::new(
+        crate::i18n::Bundle::load_from_dir(&dir, &config.i18n)
+            .unwrap_or_else(|e| panic!("i18n_auto: {e}")),
+    ))
+}
+
+#[cfg(feature = "i18n")]
+fn install_i18n_bundle_layer(
+    mut custom_layers: Vec<CustomLayerRegistration>,
+    state: &AppState,
+    bundle: Option<Arc<crate::i18n::Bundle>>,
+) -> Vec<CustomLayerRegistration> {
+    let Some(bundle) = bundle else {
+        return custom_layers;
+    };
+
+    tracing::info!(
+        locales = ?bundle.locales(),
+        default = bundle.default_locale(),
+        "i18n bundle loaded"
+    );
+    state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
+    // Use the existing IntoAppLayer plumbing so the Extension is visible to
+    // every request. axum::Extension<T> is itself a tower::Layer when T:
+    // Clone + Send + Sync + 'static.
+    let ext_layer = axum::Extension(bundle);
+    custom_layers.push(CustomLayerRegistration {
+        type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+        apply: Box::new(move |router| router.layer(ext_layer)),
+    });
+    custom_layers
 }
 
 #[cfg(feature = "db")]
@@ -3182,6 +3226,154 @@ mod tests {
             },
             repository: None,
         }
+    }
+
+    #[cfg(feature = "i18n")]
+    fn test_i18n_bundle(key: &str, value: &str) -> Arc<crate::i18n::Bundle> {
+        let mut messages = std::collections::HashMap::new();
+        let mut en = std::collections::HashMap::new();
+        en.insert(key.to_owned(), value.to_owned());
+        messages.insert("en".to_owned(), en);
+        Arc::new(crate::i18n::Bundle::from_messages(
+            messages,
+            &crate::i18n::I18nConfig::default(),
+        ))
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn i18n_auto_defers_loading_until_runtime_config_is_available() {
+        let builder = app().i18n_auto();
+
+        assert!(builder.i18n_bundle.is_none());
+        assert!(builder.i18n_auto_load);
+    }
+
+    #[cfg(feature = "i18n")]
+    #[derive(Clone)]
+    struct StaticConfigLoader {
+        config: AutumnConfig,
+    }
+
+    #[cfg(feature = "i18n")]
+    impl crate::config::ConfigLoader for StaticConfigLoader {
+        async fn load(&self) -> Result<AutumnConfig, crate::config::ConfigError> {
+            Ok(self.config.clone())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    struct NoopTelemetryProvider;
+
+    #[cfg(feature = "i18n")]
+    impl crate::telemetry::TelemetryProvider for NoopTelemetryProvider {
+        fn init(
+            &self,
+            _log: &crate::config::LogConfig,
+            _telemetry: &crate::config::TelemetryConfig,
+            _profile: Option<&str>,
+        ) -> Result<crate::telemetry::TelemetryGuard, crate::telemetry::TelemetryInitError>
+        {
+            Ok(crate::telemetry::TelemetryGuard::disabled())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        let project = tempfile::tempdir().expect("project dir");
+        let i18n_dir = project.path().join("custom-i18n");
+        std::fs::create_dir_all(&i18n_dir).expect("i18n dir");
+        std::fs::write(i18n_dir.join("en.ftl"), "nav.home = Loader Home\n").expect("bundle");
+
+        let mut config = AutumnConfig::default();
+        config.i18n.dir = "custom-i18n".to_owned();
+        let builder = app()
+            .with_config_loader(StaticConfigLoader { config })
+            .with_telemetry_provider(NoopTelemetryProvider)
+            .i18n_auto();
+        let AppBuilder {
+            config_loader_factory,
+            telemetry_provider,
+            i18n_bundle,
+            i18n_auto_load,
+            ..
+        } = builder;
+
+        let (loaded_config, _guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let env = crate::config::MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            project.path().to_str().expect("utf-8 path"),
+        );
+        let bundle = resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &loaded_config, &env)
+            .expect("bundle loaded from configured dir");
+
+        assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_bundle_layer_is_applied_to_static_route_rendering() {
+        async fn localized(locale: crate::i18n::Locale) -> String {
+            locale.t("nav.home")
+        }
+
+        let config = AutumnConfig::default();
+        let state = AppState::for_test();
+        let custom_layers = install_i18n_bundle_layer(
+            Vec::new(),
+            &state,
+            Some(test_i18n_bundle("nav.home", "Home")),
+        );
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/about",
+                handler: axum::routing::get(localized),
+                name: "localized",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/about",
+                    operation_id: "localized",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+            },
+        )
+        .expect("router builds");
+        let tmp = tempfile::tempdir().expect("dist parent");
+        let dist = tmp.path().join("dist");
+
+        crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/about",
+                name: "localized",
+                revalidate: None,
+                params_fn: None,
+            }],
+            &dist,
+        )
+        .await
+        .expect("static render succeeds");
+
+        let html = std::fs::read_to_string(dist.join("about/index.html")).expect("rendered html");
+        assert_eq!(html, "Home");
     }
 
     #[test]
