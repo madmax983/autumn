@@ -8,6 +8,7 @@ A full-stack reference application demonstrating the classic Autumn stack:
 - **JSON API** alongside server-rendered HTML
 - **AutumnError** for consistent error handling (404, 422, 500)
 - **Embedded migrations** so the schema comes up with the app
+- **`autumn seed`** for one-command database bootstrap with representative data
 - **Framework ops endpoints** via `/health` and `/actuator/*`
 
 ## Prerequisites
@@ -26,11 +27,22 @@ cargo run -p autumn-cli -- setup
 # 2. Start Postgres
 docker compose -f examples/todo-app/docker-compose.yml up -d
 
-# 3. Run the application
+# 3. Run database migrations
+cargo run -p autumn-cli -- migrate
+
+# 4. Seed the database with representative todos (optional but recommended)
+cargo run -p autumn-cli -- seed --package todo-app
+
+# 5. Run the application
 cargo run -p todo-app
 ```
 
-The server starts at <http://localhost:3000>.
+The server starts at <http://localhost:3000>.  If you ran `autumn seed`, the
+todo list is pre-populated with five representative items so the app looks
+like a working product on first visit.
+
+**Re-seeding is safe**: the seed binary uses a count-based idempotency guard
+and skips silently if any todos already exist.
 
 ## Available routes
 

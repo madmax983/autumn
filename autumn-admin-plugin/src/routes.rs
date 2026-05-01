@@ -401,8 +401,9 @@ async fn model_create(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
     let record = model
-        .create(&pool, strip_meta_fields(form_data, &fields))
+        .create(&pool, form_data)
         .await
         .map_err(|e| admin_err("Create failed", e))?;
     // The post-create redirect needs a routable ID. Treat a missing or
@@ -508,8 +509,9 @@ async fn model_update(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
     model
-        .update(&pool, id, strip_meta_fields(form_data, &fields))
+        .update(&pool, id, form_data)
         .await
         .map_err(|e| admin_err("Update failed", e))?;
     flash
@@ -652,6 +654,70 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
     data
 }
 
+fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
+    let Some(obj) = data.as_object_mut() else {
+        return data;
+    };
+
+    for field in fields {
+        let Some(value) = obj.get_mut(field.name) else {
+            continue;
+        };
+        coerce_form_value(value, &field.kind);
+    }
+
+    data
+}
+
+fn coerce_form_value(value: &mut Value, kind: &AdminFieldKind) {
+    match kind {
+        AdminFieldKind::Boolean => {
+            if let Value::String(raw) = value
+                && let Some(parsed) = parse_form_bool(raw)
+            {
+                *value = Value::Bool(parsed);
+            }
+        }
+        AdminFieldKind::Integer => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = raw.parse::<i64>()
+            {
+                *value = Value::Number(parsed.into());
+            }
+        }
+        AdminFieldKind::Float => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = raw.parse::<f64>()
+                && let Some(number) = serde_json::Number::from_f64(parsed)
+            {
+                *value = Value::Number(number);
+            }
+        }
+        AdminFieldKind::Json => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = serde_json::from_str(raw)
+            {
+                *value = parsed;
+            }
+        }
+        AdminFieldKind::Text
+        | AdminFieldKind::TextArea
+        | AdminFieldKind::Date
+        | AdminFieldKind::DateTime
+        | AdminFieldKind::Select(_)
+        | AdminFieldKind::Hidden
+        | AdminFieldKind::Password => {}
+    }
+}
+
+fn parse_form_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +768,42 @@ mod tests {
         ]);
         let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
         assert_eq!(out, json!({"name": "", "bio": ""}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_boolean_strings() {
+        let fields = fields(&[("published", AdminFieldKind::Boolean)]);
+        let out = coerce_form_fields(json!({"published": "true"}), &fields);
+        assert_eq!(out, json!({"published": true}));
+
+        let out = coerce_form_fields(json!({"published": "false"}), &fields);
+        assert_eq!(out, json!({"published": false}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_numeric_and_json_strings() {
+        let fields = fields(&[
+            ("count", AdminFieldKind::Integer),
+            ("rating", AdminFieldKind::Float),
+            ("settings", AdminFieldKind::Json),
+        ]);
+        let out = coerce_form_fields(
+            json!({
+                "count": "42",
+                "rating": "3.5",
+                "settings": "{\"published\":true}"
+            }),
+            &fields,
+        );
+
+        assert_eq!(
+            out,
+            json!({
+                "count": 42,
+                "rating": 3.5,
+                "settings": {"published": true}
+            })
+        );
     }
 
     #[test]

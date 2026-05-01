@@ -15,11 +15,16 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod i18n;
+mod job;
+mod jobs_macro;
+mod mailer;
 mod main_macro;
 mod model;
 mod oauth2_callback;
 mod param_helpers;
 mod parse;
+mod paths_macro;
 mod repository;
 mod route;
 mod routes_macro;
@@ -102,6 +107,26 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("PUT", "put", attr.into(), item.into()).into()
 }
 
+/// Annotate an async function as a PATCH route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function and a typed
+/// `__autumn_path_{name}(…) -> String` path helper.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::patch;
+///
+/// #[patch("/items/{id}")]
+/// async fn patch_item() -> &'static str {
+///     "patched"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("PATCH", "patch", attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a DELETE route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
@@ -158,6 +183,29 @@ pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
 }
 
+/// Emit a `pub mod paths { … }` that re-exports each handler's typed path helper.
+///
+/// Takes the same comma-separated handler list as [`routes!`]. Each entry
+/// exposes its `__autumn_path_{name}` companion under the short name:
+///
+/// ```ignore
+/// autumn_web::paths![show_post, create_post, posts::index];
+/// // expands to:
+/// pub mod paths {
+///     pub use super::__autumn_path_show_post as show_post;
+///     pub use super::__autumn_path_create_post as create_post;
+///     pub use super::posts::__autumn_path_index as index;
+/// }
+/// ```
+///
+/// Call this once at the top of the module where your handlers live (or a
+/// sibling module) so consumers can write `use crate::routes::paths;` and
+/// then `paths::show_post(id)`.
+#[proc_macro]
+pub fn paths(input: TokenStream) -> TokenStream {
+    paths_macro::paths_macro(input.into()).into()
+}
+
 /// Set up the async runtime for an Autumn application.
 ///
 /// This is a thin wrapper around `#[tokio::main]`. The real
@@ -177,6 +225,12 @@ pub fn routes(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
+}
+
+/// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
+#[proc_macro_attribute]
+pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
+    mailer::mailer_macro(attr.into(), item.into()).into()
 }
 
 /// Attribute macro for Autumn database models.
@@ -253,6 +307,12 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
     scheduled::scheduled_macro(attr.into(), item.into()).into()
 }
 
+/// Declare an on-demand background job.
+#[proc_macro_attribute]
+pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
+    job::job_macro(attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a statically pre-rendered GET route.
 ///
 /// Like `#[get]`, this generates a route companion function. Additionally,
@@ -285,6 +345,12 @@ pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn tasks(input: TokenStream) -> TokenStream {
     tasks_macro::tasks_macro(input.into()).into()
+}
+
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+#[proc_macro]
+pub fn jobs(input: TokenStream) -> TokenStream {
+    jobs_macro::jobs_macro(input.into()).into()
 }
 
 /// Secure a route handler with authentication and optional role checks.
@@ -321,7 +387,7 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Enforce a record-level authorization policy on a route handler.
 ///
-/// Resolves the [`Policy`](autumn_web::authorization::Policy)
+/// Resolves the `Policy`
 /// registered for the named resource type and calls the matching
 /// action method. Short-circuits with the configured deny response
 /// (default `404`, optionally `403`) before the handler body runs.
@@ -589,4 +655,37 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
     ws::ws_macro(attr.into(), item.into()).into()
+}
+
+/// Translate an i18n key, with **compile-time validation** that the key
+/// exists in the default locale's `.ftl` file.
+///
+/// Re-exported as `autumn_web::t!` (and `autumn_web::prelude::t!`) when the
+/// `i18n` feature is enabled on `autumn-web`.
+///
+/// # Forms
+///
+/// ```ignore
+/// // Without args:
+/// t!(locale, "welcome.title")
+/// // With named args (Project Fluent's `{ $name }` placeable syntax):
+/// t!(locale, "welcome.greeting", name = "Ada")
+/// ```
+///
+/// # Compile-time behaviour
+///
+/// At expansion time the macro reads `$CARGO_MANIFEST_DIR/i18n/<default>.ftl`
+/// (where `<default>` is the value of the `AUTUMN_I18N_DEFAULT_LOCALE`
+/// environment variable, defaulting to `"en"`). If the key is not present,
+/// the macro emits a `compile_error!` pointing at the literal so the build
+/// fails with a clear diagnostic — including a "did you mean" suggestion
+/// for typos within Levenshtein distance 3.
+///
+/// If the file does not exist (e.g. an app that just enabled the feature
+/// flag and has not yet authored translations), the macro degrades to a
+/// pure runtime call so the build still succeeds. The runtime path will
+/// produce the visible `{$key}` marker on miss.
+#[proc_macro]
+pub fn t(input: TokenStream) -> TokenStream {
+    i18n::t_macro(input.into()).into()
 }

@@ -2,7 +2,7 @@
 //!
 //! Generates a record-level authorization guard that runs as the
 //! first statement of the handler body. Resolves the
-//! [`Policy`](autumn_web::authorization::Policy) registered for the
+//! `Policy` registered for the
 //! resource type, calls the matching action method, and returns
 //! the configured deny response (`403` or `404`) on failure.
 //!
@@ -42,11 +42,11 @@ fn parse_authorize_args(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
         match meta {
             Meta::Path(p) => {
                 // Bare path: treat as the action verb (after the leading literal).
-                if let Some(ident) = p.get_ident() {
-                    if args.action.is_none() {
-                        args.action = Some(ident.to_string());
-                        continue;
-                    }
+                if let Some(ident) = p.get_ident()
+                    && args.action.is_none()
+                {
+                    args.action = Some(ident.to_string());
+                    continue;
                 }
                 return Err(syn::Error::new_spanned(
                     p,
@@ -241,10 +241,10 @@ fn parse_with_leading_literal(attr: TokenStream) -> syn::Result<AuthorizeArgs> {
             leading_action = Some(s.value());
             iter.next();
             // Skip the comma that follows, if present.
-            if let Some(TokenTree::Punct(p)) = iter.peek() {
-                if p.as_char() == ',' {
-                    iter.next();
-                }
+            if let Some(TokenTree::Punct(p)) = iter.peek()
+                && p.as_char() == ','
+            {
+                iter.next();
             }
         }
     }

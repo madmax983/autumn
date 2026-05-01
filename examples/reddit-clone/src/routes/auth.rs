@@ -17,7 +17,27 @@ use tracing::warn;
 use crate::models::{NewUser, User};
 use crate::schema::users;
 
-use super::layout::{layout, redirect_to};
+use super::layout::layout;
+
+struct AccountMailer;
+
+#[mailer]
+impl AccountMailer {
+    fn welcome(&self, to: String, username: String) -> Mail {
+        Mail::builder()
+            .to(to)
+            .subject("Welcome to Autumn Reddit")
+            .html(html! {
+                p { "Welcome, " strong { (username) } "!" }
+                p { "Your account is ready. Go find something worth arguing about." }
+            })
+            .text(format!(
+                "Welcome, {username}! Your account is ready. Go find something worth arguing about."
+            ))
+            .build()
+            .expect("static welcome template should be valid")
+    }
+}
 
 // ── Register ───────────────────────────────────────────────────
 
@@ -39,6 +59,16 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
                         input type="text" id="username" name="username" required
                               autocomplete="username"
                               placeholder="cool_rustacean"
+                              class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
+                                     focus:outline-none focus:ring-2 focus:ring-orange-400";
+                    }
+                    div {
+                        label for="email" class="block text-sm font-medium text-gray-700 mb-1" {
+                            "Email"
+                        }
+                        input type="email" id="email" name="email" required
+                              autocomplete="email"
+                              placeholder="you@example.com"
                               class="w-full border border-gray-300 rounded px-3 py-2 text-sm \
                                      focus:outline-none focus:ring-2 focus:ring-orange-400";
                     }
@@ -70,6 +100,7 @@ pub async fn register_form(csrf: CsrfToken) -> Markup {
 #[derive(serde::Deserialize)]
 pub struct RegisterForm {
     pub username: String,
+    pub email: String,
     pub password: String,
 }
 
@@ -77,10 +108,12 @@ pub struct RegisterForm {
 pub async fn register(
     State(state): State<AppState>,
     mut db: Db,
+    mailer: Mailer,
     session: Session,
     form: Form<RegisterForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
+    let email = form.0.email.trim().to_owned();
     let password = form.0.password;
 
     if username.len() < 2 || username.len() > 32 {
@@ -100,6 +133,9 @@ pub async fn register(
         return Err(AutumnError::unprocessable_msg(
             "Password must be at least 6 characters",
         ));
+    }
+    if !email.contains('@') {
+        return Err(AutumnError::unprocessable_msg("Email address is invalid"));
     }
 
     // Check if username already taken
@@ -156,10 +192,51 @@ pub async fn register(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    Ok(redirect_to("/"))
+    AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
+
+    Ok(Redirect::to("/"))
 }
 
 // ── Login ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn welcome_email_is_captured_as_eml() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mailer = Mailer::builder()
+            .transport(Transport::File)
+            .from("Autumn <noreply@example.com>")
+            .file_dir(dir.path())
+            .build()
+            .expect("file mailer should build");
+
+        AccountMailer
+            .send_welcome(
+                &mailer,
+                "new-user@example.com".to_owned(),
+                "cool_rustacean".to_owned(),
+            )
+            .await
+            .expect("send should succeed");
+
+        let entry = std::fs::read_dir(dir.path())
+            .expect("mail dir exists")
+            .next()
+            .expect("one email should be captured")
+            .expect("dir entry");
+        let eml = std::fs::read_to_string(entry.path()).expect("eml readable");
+        assert!(eml.contains("To:"), "missing To header: {eml}");
+        assert!(
+            eml.contains("new-user@example.com"),
+            "missing recipient address: {eml}"
+        );
+        assert!(eml.contains("Subject: Welcome to Autumn Reddit"));
+        assert!(eml.contains("cool_rustacean"));
+    }
+}
 
 #[get("/login")]
 pub async fn login_form(csrf: CsrfToken) -> Markup {
@@ -212,7 +289,7 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Markup> {
+pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table
@@ -232,7 +309,7 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    Ok(redirect_to("/"))
+    Ok(Redirect::to("/"))
 }
 
 // ── Logout ─────────────────────────────────────────────────────
@@ -315,3 +392,5 @@ pub async fn profile(
         },
     ))
 }
+
+autumn_web::paths![register_form, register, login_form, login, logout, profile];

@@ -32,11 +32,20 @@ mod tests {
     }
 
     #[test]
-    fn test_redirect_to() {
-        let markup = pages::redirect_to("/pages/hello");
-        let html_string = markup.into_string();
-        assert!(html_string.contains("url=/pages/hello"));
-        assert!(html_string.contains("Redirecting"));
+    fn test_path_helpers() {
+        assert_eq!(pages::__autumn_path_list(), "/");
+        assert_eq!(
+            pages::__autumn_path_show("hello".to_owned()),
+            "/pages/hello"
+        );
+        assert_eq!(
+            pages::__autumn_path_edit_form("hello".to_owned()),
+            "/pages/hello/edit"
+        );
+        assert_eq!(
+            pages::__autumn_path_history("hello".to_owned()),
+            "/pages/hello/history"
+        );
     }
 
     #[test]

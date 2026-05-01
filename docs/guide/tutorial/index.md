@@ -30,6 +30,10 @@ stuck, compare your code against the example.
 10. [Configuration and Production Defaults](10-configuration.md) — `autumn.toml`, env vars, logging
 11. [What's Next](11-whats-next.md) — extending the app, further reading
 
+> **Going multilingual?** When you finish the tutorial, see the
+> [i18n guide](../i18n.md) for the opt-in Project Fluent integration —
+> file convention, `Locale` extractor, and the `t!()` macro.
+
 ## How to Use This Tutorial
 
 Each chapter builds on the previous one. Start from Chapter 1 and work

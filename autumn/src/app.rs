@@ -69,7 +69,10 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        route_sources: Vec::new(),
+        current_plugin: None,
         tasks: Vec::new(),
+        jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -91,6 +94,10 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
+        #[cfg(feature = "i18n")]
+        i18n_bundle: None,
+        #[cfg(feature = "i18n")]
+        i18n_auto_load: false,
         policy_registrations: Vec::new(),
     }
 }
@@ -132,6 +139,10 @@ type PoolProviderFactory = Box<
         > + Send,
 >;
 
+/// Closure that registers a policy or scope on the runtime
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -160,13 +171,15 @@ type PoolProviderFactory = Box<
 ///         .await;
 /// }
 /// ```
-/// Closure that registers a policy or scope on the runtime
-/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
-type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
-
 pub struct AppBuilder {
     routes: Vec<Route>,
+    /// Parallel to `routes`: registration origin for each route.
+    route_sources: Vec<crate::route_listing::RouteSource>,
+    /// Non-None while a plugin's `build()` is executing; routes and scoped
+    /// groups added during that window are attributed to this plugin.
+    current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
@@ -210,6 +223,16 @@ pub struct AppBuilder {
     openapi: Option<crate::openapi::OpenApiConfig>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
+    /// layer publishing this bundle is added at `run()` time so the
+    /// [`Locale`](crate::i18n::Locale) extractor can resolve translations.
+    #[cfg(feature = "i18n")]
+    i18n_bundle: Option<Arc<crate::i18n::Bundle>>,
+    /// Whether to load the i18n bundle after the active config loader resolves
+    /// [`AutumnConfig`]. This keeps `.i18n_auto()` aligned with
+    /// `.with_config_loader(...)`.
+    #[cfg(feature = "i18n")]
+    i18n_auto_load: bool,
     /// Deferred [`Policy`](crate::authorization::Policy) and
     /// [`Scope`](crate::authorization::Scope) registrations applied
     /// to [`AppState::policy_registry`] just before the router is
@@ -303,6 +326,15 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
+        for _ in &routes {
+            self.route_sources.push(source.clone());
+        }
         self.routes.extend(routes);
         self
     }
@@ -315,6 +347,13 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register ad-hoc background jobs with the application.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
         self
     }
 
@@ -498,9 +537,16 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
+            source,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -769,6 +815,64 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Register a pre-loaded i18n translation bundle.
+    ///
+    /// Most apps prefer [`Self::i18n_auto`] which loads from the
+    /// `i18n/` directory using the configured `[i18n]` block. Use this
+    /// directly when you need to construct a [`Bundle`](crate::i18n::Bundle)
+    /// from non-filesystem sources (in-memory tests, embedded `.ftl` files,
+    /// translation-management-system clients, etc.).
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n(mut self, bundle: crate::i18n::Bundle) -> Self {
+        self.i18n_bundle = Some(Arc::new(bundle));
+        self.i18n_auto_load = false;
+        self
+    }
+
+    /// Auto-load the i18n translation bundle from the configured directory
+    /// (`i18n/` by default), reading the `[i18n]` block from the active
+    /// [`AutumnConfig`](crate::config::AutumnConfig).
+    ///
+    /// Fails fast during [`Self::run`] if the configured default locale's file is
+    /// missing — the spec calls out this as the desired behaviour: a
+    /// half-localized app is worse than a clearly-broken one. The error
+    /// path here panics with the typed [`LoadError`](crate::i18n::LoadError)
+    /// formatted as a string so it surfaces in the same banner as other
+    /// fatal startup errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when configuration cannot be loaded, the configured i18n
+    /// directory is unreadable, or the default locale bundle is missing or
+    /// invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    ///
+    /// #[get("/")]
+    /// async fn index() -> &'static str { "ok" }
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     # #[cfg(feature = "i18n")]
+    ///     autumn_web::app()
+    ///         .i18n_auto()
+    ///         .routes(routes![index])
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n_auto(mut self) -> Self {
+        self.i18n_bundle = None;
+        self.i18n_auto_load = true;
+        self
+    }
+
     // ── Tier-1 subsystem replacement hooks ─────────────────────
     //
     // Each `with_*` method swaps a framework-default subsystem for a
@@ -957,8 +1061,14 @@ impl AppBuilder {
             );
             return self;
         }
-        self.registered_plugins.insert(name.into_owned());
-        plugin.build(self)
+        let name_str = name.into_owned();
+        self.registered_plugins.insert(name_str.clone());
+        // Save outer plugin context so nested plugin() calls don't permanently
+        // clear it; restore it after this plugin's build() returns.
+        let outer_plugin = self.current_plugin.replace(name_str);
+        let mut result = plugin.build(self);
+        result.current_plugin = outer_plugin;
+        result
     }
 
     /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
@@ -1038,9 +1148,21 @@ impl AppBuilder {
             return;
         }
 
+        // ── Route dump mode ────────────────────────────────────────────
+        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
+        // This is triggered by `autumn routes` to introspect the app's
+        // route table without booting the server or connecting to a database.
+        if is_dump_routes_mode() {
+            self.run_dump_routes_mode().await;
+            return;
+        }
+
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks,
+            jobs,
             static_metas: _,
             exception_filters,
             scoped_groups,
@@ -1062,6 +1184,10 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
             policy_registrations,
         } = self;
 
@@ -1070,6 +1196,10 @@ impl AppBuilder {
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         // 3. Validate routes
         assert!(
@@ -1152,9 +1282,16 @@ impl AppBuilder {
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
 
         // Install the preflighted blob store on the freshly-built
         // AppState, and remember the serving router so it gets merged
@@ -1197,8 +1334,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and serve. We start listening before startup hooks finish so
-        // `/startup` can honestly report startup progress.
+        // 7. Bind and initialize pre-serve runtime dependencies. Once those
+        // are ready, start listening before startup hooks finish so `/startup`
+        // can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1206,10 +1344,17 @@ impl AppBuilder {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
-        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
+        tracing::info!(addr = %addr, "Listening");
+
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
             axum::serve(
@@ -1283,10 +1428,14 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
+    #[allow(clippy::too_many_lines)]
     async fn run_build_mode(self) {
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks: _,
+            jobs: _,
             static_metas,
             exception_filters: _,
             scoped_groups: _,
@@ -1308,6 +1457,10 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
                 openapi: _,
             audit_logger: _,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
             policy_registrations,
         } = self;
 
@@ -1316,6 +1469,10 @@ impl AppBuilder {
         // Load config (same as normal startup)
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -1350,6 +1507,11 @@ impl AppBuilder {
             #[cfg(feature = "db")]
             pool,
         );
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -1365,6 +1527,9 @@ impl AppBuilder {
         for register in policy_registrations {
             register(state.policy_registry());
         }
+
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
 
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
@@ -1424,10 +1589,65 @@ impl AppBuilder {
             }
         }
     }
+
+    /// Dump the application's route listing as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
+    /// Exits with code 0 on success, code 1 on JSON serialization failure.
+    /// Does not connect to a database or bind a TCP port.
+    async fn run_dump_routes_mode(self) {
+        let Self {
+            routes,
+            route_sources,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            config_loader_factory,
+            telemetry_provider,
+            #[cfg(feature = "openapi")]
+            openapi,
+            ..
+        } = self;
+
+        // Raw Axum routers registered via .merge()/.nest() are opaque: there is
+        // no public API to enumerate their routes. Warn so callers know the
+        // snapshot may be incomplete.
+        let hidden = merge_routers.len() + nest_routers.len();
+        if hidden > 0 {
+            eprintln!(
+                "[autumn routes] warning: {hidden} raw router(s) added via \
+                 .merge()/.nest() are not enumerable and are omitted from this listing"
+            );
+        }
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let mut infos =
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
+        crate::route_listing::sort_route_infos(&mut infos);
+
+        let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -1737,6 +1957,20 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
     Ok(())
 }
 
+fn initialize_job_runtime(
+    jobs: Vec<crate::job::JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+) -> crate::AutumnResult<()> {
+    crate::job::clear_global_job_client();
+    if jobs.is_empty() {
+        Ok(())
+    } else {
+        crate::job::start_runtime(jobs, state, shutdown, config)
+    }
+}
+
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
     for hook in hooks.iter().rev() {
         hook().await;
@@ -1988,6 +2222,54 @@ async fn load_config_and_telemetry(
     (config, telemetry_guard)
 }
 
+#[cfg(feature = "i18n")]
+fn resolve_i18n_bundle(
+    explicit_bundle: Option<Arc<crate::i18n::Bundle>>,
+    auto_load: bool,
+    config: &AutumnConfig,
+    env: &dyn crate::config::Env,
+) -> Option<Arc<crate::i18n::Bundle>> {
+    if explicit_bundle.is_some() {
+        return explicit_bundle;
+    }
+    if !auto_load {
+        return None;
+    }
+
+    let dir = project_dir(&config.i18n.dir, env);
+    Some(Arc::new(
+        crate::i18n::Bundle::load_from_dir(&dir, &config.i18n)
+            .unwrap_or_else(|e| panic!("i18n_auto: {e}")),
+    ))
+}
+
+#[cfg(feature = "i18n")]
+fn install_i18n_bundle_layer(
+    mut custom_layers: Vec<CustomLayerRegistration>,
+    state: &AppState,
+    bundle: Option<Arc<crate::i18n::Bundle>>,
+) -> Vec<CustomLayerRegistration> {
+    let Some(bundle) = bundle else {
+        return custom_layers;
+    };
+
+    tracing::info!(
+        locales = ?bundle.locales(),
+        default = bundle.default_locale(),
+        "i18n bundle loaded"
+    );
+    state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
+    // Use the existing IntoAppLayer plumbing so the Extension is visible to
+    // every request. axum::Extension<T> is itself a tower::Layer when T:
+    // Clone + Send + Sync + 'static.
+    let ext_layer = axum::Extension(bundle);
+    custom_layers.push(CustomLayerRegistration {
+        type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+        apply: Box::new(move |router| router.layer(ext_layer)),
+    });
+    custom_layers
+}
+
 #[cfg(feature = "db")]
 async fn setup_database(
     config: &AutumnConfig,
@@ -2011,16 +2293,16 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some() {
-        if let Some(url) = &config.database.url {
-            for mig in migrations {
-                crate::migrate::auto_migrate(
-                    url,
-                    config.profile.as_deref(),
-                    config.database.auto_migrate_in_production,
-                    mig,
-                );
-            }
+    if pool.is_some()
+        && let Some(url) = &config.database.url
+    {
+        for mig in migrations {
+            crate::migrate::auto_migrate(
+                url,
+                config.profile.as_deref(),
+                config.database.auto_migrate_in_production,
+                mig,
+            );
         }
     }
 
@@ -2057,13 +2339,12 @@ fn collect_unguarded_repository_writes(
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
-        if let Some(meta) = route.repository {
-            if !meta.has_policy
-                && is_mutating_method(&route.method)
-                && seen.insert((meta.resource_type_name, meta.api_path))
-            {
-                offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-            }
+        if let Some(meta) = route.repository
+            && !meta.has_policy
+            && is_mutating_method(&route.method)
+            && seen.insert((meta.resource_type_name, meta.api_path))
+        {
+            offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
         }
     };
     for route in routes {
@@ -2122,7 +2403,7 @@ fn validate_repository_api_policies(
 /// Refuse to start when a `#[repository(policy = X)]`-annotated
 /// route exists but the corresponding `.policy::<R, _>(X)`
 /// registration was never actually applied to the live
-/// [`PolicyRegistry`].
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
 ///
 /// `validate_repository_api_policies` runs *before* the registry is
 /// populated and only checks the macro-set `has_policy` flag. This
@@ -2160,20 +2441,18 @@ fn collect_unregistered_repository_handlers(
         std::collections::HashSet::new();
     let mut record_route = |route: &Route| {
         if let Some(meta) = route.repository {
-            if let Some(check) = meta.policy_check {
-                if !check(registry)
-                    && seen_policies.insert((meta.resource_type_name, meta.api_path))
-                {
-                    missing_policies
-                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                }
+            if let Some(check) = meta.policy_check
+                && !check(registry)
+                && seen_policies.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_policies
+                    .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
-            if let Some(check) = meta.scope_check {
-                if !check(registry) && seen_scopes.insert((meta.resource_type_name, meta.api_path))
-                {
-                    missing_scopes
-                        .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
-                }
+            if let Some(check) = meta.scope_check
+                && !check(registry)
+                && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
             }
         }
     };
@@ -2631,6 +2910,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
@@ -2648,6 +2928,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let registry = PolicyRegistry::default();
@@ -2675,6 +2956,7 @@ fn build_state(
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
+        job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels::new(32),
@@ -2886,6 +3168,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -2914,6 +3197,154 @@ mod tests {
             },
             repository: None,
         }
+    }
+
+    #[cfg(feature = "i18n")]
+    fn test_i18n_bundle(key: &str, value: &str) -> Arc<crate::i18n::Bundle> {
+        let mut messages = std::collections::HashMap::new();
+        let mut en = std::collections::HashMap::new();
+        en.insert(key.to_owned(), value.to_owned());
+        messages.insert("en".to_owned(), en);
+        Arc::new(crate::i18n::Bundle::from_messages(
+            messages,
+            &crate::i18n::I18nConfig::default(),
+        ))
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn i18n_auto_defers_loading_until_runtime_config_is_available() {
+        let builder = app().i18n_auto();
+
+        assert!(builder.i18n_bundle.is_none());
+        assert!(builder.i18n_auto_load);
+    }
+
+    #[cfg(feature = "i18n")]
+    #[derive(Clone)]
+    struct StaticConfigLoader {
+        config: AutumnConfig,
+    }
+
+    #[cfg(feature = "i18n")]
+    impl crate::config::ConfigLoader for StaticConfigLoader {
+        async fn load(&self) -> Result<AutumnConfig, crate::config::ConfigError> {
+            Ok(self.config.clone())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    struct NoopTelemetryProvider;
+
+    #[cfg(feature = "i18n")]
+    impl crate::telemetry::TelemetryProvider for NoopTelemetryProvider {
+        fn init(
+            &self,
+            _log: &crate::config::LogConfig,
+            _telemetry: &crate::config::TelemetryConfig,
+            _profile: Option<&str>,
+        ) -> Result<crate::telemetry::TelemetryGuard, crate::telemetry::TelemetryInitError>
+        {
+            Ok(crate::telemetry::TelemetryGuard::disabled())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        let project = tempfile::tempdir().expect("project dir");
+        let i18n_dir = project.path().join("custom-i18n");
+        std::fs::create_dir_all(&i18n_dir).expect("i18n dir");
+        std::fs::write(i18n_dir.join("en.ftl"), "nav.home = Loader Home\n").expect("bundle");
+
+        let mut config = AutumnConfig::default();
+        config.i18n.dir = "custom-i18n".to_owned();
+        let builder = app()
+            .with_config_loader(StaticConfigLoader { config })
+            .with_telemetry_provider(NoopTelemetryProvider)
+            .i18n_auto();
+        let AppBuilder {
+            config_loader_factory,
+            telemetry_provider,
+            i18n_bundle,
+            i18n_auto_load,
+            ..
+        } = builder;
+
+        let (loaded_config, _guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let env = crate::config::MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            project.path().to_str().expect("utf-8 path"),
+        );
+        let bundle = resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &loaded_config, &env)
+            .expect("bundle loaded from configured dir");
+
+        assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_bundle_layer_is_applied_to_static_route_rendering() {
+        async fn localized(locale: crate::i18n::Locale) -> String {
+            locale.t("nav.home")
+        }
+
+        let config = AutumnConfig::default();
+        let state = AppState::for_test();
+        let custom_layers = install_i18n_bundle_layer(
+            Vec::new(),
+            &state,
+            Some(test_i18n_bundle("nav.home", "Home")),
+        );
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/about",
+                handler: axum::routing::get(localized),
+                name: "localized",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/about",
+                    operation_id: "localized",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+            },
+        )
+        .expect("router builds");
+        let tmp = tempfile::tempdir().expect("dist parent");
+        let dist = tmp.path().join("dist");
+
+        crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/about",
+                name: "localized",
+                revalidate: None,
+                params_fn: None,
+            }],
+            &dist,
+        )
+        .await
+        .expect("static render succeeds");
+
+        let html = std::fs::read_to_string(dist.join("about/index.html")).expect("rendered html");
+        assert_eq!(html, "Home");
     }
 
     #[test]
@@ -2992,6 +3423,105 @@ mod tests {
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
     }
 
+    fn startup_noop_job_handler(
+        _state: AppState,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let builder = app()
+            .jobs(vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }])
+            .on_startup(|_state| async {
+                crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
+            });
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        initialize_job_runtime(
+            builder.jobs.clone(),
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should initialize before startup hooks");
+
+        run_startup_hooks(&builder.startup_hooks, state.clone())
+            .await
+            .expect("startup hook should be able to enqueue jobs");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.job_registry().snapshot();
+                let status = snapshot
+                    .get("startup-seed")
+                    .expect("job should be registered before startup hooks run");
+                if status.total_successes == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup-enqueued job should complete");
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn initialize_job_runtime_propagates_redis_init_errors() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
+
+        let error = initialize_job_runtime(
+            vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis init errors should abort startup");
+
+        #[cfg(feature = "redis")]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+
+        #[cfg(not(feature = "redis"))]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn startup_hook_errors_propagate() {
         let builder = app().on_startup(|_state| async {
@@ -3061,6 +3591,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3158,6 +3689,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3229,6 +3761,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3513,6 +4046,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3811,6 +4345,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3953,6 +4488,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -3993,6 +4529,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -4240,6 +4777,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -4303,6 +4841,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -4429,5 +4968,104 @@ mod tests {
             assert!(serving.is_some());
             assert!(state.extension::<BlobStoreState>().is_some());
         }
+    }
+
+    // ── Route source attribution ───────────────────────────────────────────
+
+    /// A minimal plugin that registers one route with a known name.
+    struct TestPlugin {
+        name: &'static str,
+        route: Route,
+    }
+
+    impl crate::plugin::Plugin for TestPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed(self.name)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.routes(vec![self.route])
+        }
+    }
+
+    #[test]
+    fn routes_registered_before_plugin_are_user_sourced() {
+        let user_route = test_get_route("/home", "home");
+        let builder = app().routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    #[test]
+    fn routes_registered_inside_plugin_are_plugin_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_registered_after_plugin_revert_to_user_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let user_route = test_get_route("/home", "home");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin).routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    /// A plugin that registers a route and then registers a nested plugin.
+    struct OuterPlugin;
+
+    impl crate::plugin::Plugin for OuterPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "outer".into()
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            let inner = TestPlugin {
+                name: "inner",
+                route: test_get_route("/inner", "inner"),
+            };
+            app.plugin(inner)
+                .routes(vec![test_get_route("/outer-after", "outer_after")])
+        }
+    }
+
+    #[test]
+    fn outer_plugin_source_restored_after_nested_plugin() {
+        let builder = app().plugin(OuterPlugin);
+        // Routes: [/inner from "inner", /outer-after from "outer"]
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            "first route should be attributed to inner plugin"
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            "second route should be re-attributed to outer plugin after nested build"
+        );
     }
 }

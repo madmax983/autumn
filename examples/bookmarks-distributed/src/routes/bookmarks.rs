@@ -18,7 +18,7 @@ fn layout(title: &str, content: Markup) -> Markup {
             body class="bg-gray-50 min-h-screen" {
                 nav class="bg-indigo-600 text-white p-4" {
                     div class="max-w-3xl mx-auto flex justify-between items-center" {
-                        a href="/" class="text-xl font-bold" { "Bookmarks" }
+                        a href=(paths::list()) class="text-xl font-bold" { "Bookmarks" }
                         div class="space-x-4 text-sm" {
                             a href="/actuator/health" class="opacity-75 hover:opacity-100" { "Health" }
                             a href="/actuator/info" class="opacity-75 hover:opacity-100" { "Info" }
@@ -48,7 +48,7 @@ fn bookmark_card(b: &Bookmark) -> Markup {
                 }
             }
             button
-                hx-delete=(format!("/api/bookmarks/{}", b.id))
+                hx-delete=(crate::repositories::__autumn_path_bookmark_api_delete(b.id))
                 hx-target=(format!("#bookmark-{}", b.id))
                 hx-swap="delete"
                 hx-confirm="Delete this bookmark?"
@@ -68,7 +68,7 @@ pub async fn list() -> AutumnResult<Markup> {
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "All Bookmarks" }
-                a href="/new"
+                a href=(paths::new_form())
                   class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700" {
                     "+ Add"
                 }
@@ -106,7 +106,7 @@ pub async fn new_form() -> Markup {
         "Add Bookmark",
         html! {
             h1 class="text-2xl font-bold mb-6" { "Add Bookmark" }
-            form action="/bookmarks" method="post" class="space-y-4" {
+            form action=(paths::create()) method="post" class="space-y-4" {
                 div {
                     label for="url" class="block text-sm font-medium" { "URL" }
                     input type="url" id="url" name="url" required
@@ -134,18 +134,13 @@ pub async fn new_form() -> Markup {
 }
 
 #[post("/bookmarks")]
-pub async fn create(form: Form<NewBookmark>) -> AutumnResult<Markup> {
+pub async fn create(form: Form<NewBookmark>) -> AutumnResult<Redirect> {
     let repo = BookmarkRepository;
     repo.save(&form).await?;
-    // Redirect to listing via meta refresh (same pattern as blog example)
-    Ok(html! {
-        (PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content="0;url=/"; }
-            body { p { "Redirecting to " a href="/" { "/" } "..." } }
-        }
-    })
+    Ok(Redirect::to(&paths::list()))
 }
+
+autumn_web::paths![list, by_tag, new_form, create];
 
 #[cfg(test)]
 mod tests {

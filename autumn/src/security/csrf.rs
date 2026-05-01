@@ -304,10 +304,10 @@ where
             // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
-            if let Some(cookie) = set_cookie {
-                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
-                    response.headers_mut().append(http::header::SET_COOKIE, val);
-                }
+            if let Some(cookie) = set_cookie
+                && let Ok(val) = http::header::HeaderValue::from_str(&cookie)
+            {
+                response.headers_mut().append(http::header::SET_COOKIE, val);
             }
 
             Ok(response)
@@ -328,10 +328,12 @@ async fn verify_csrf_token(
         .get(&settings.token_header)
         .and_then(|v| v.to_str().ok());
 
-    if let (Some(c), Some(h)) = (cookie_token, header_token) {
-        if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
-            token_found = true;
-        }
+    if let (Some(c), Some(h)) = (cookie_token, header_token)
+        && !c.is_empty()
+        && !h.is_empty()
+        && constant_time_eq(c, h)
+    {
+        token_found = true;
     }
 
     if token_found {
@@ -357,18 +359,16 @@ async fn verify_csrf_token(
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
-    if let Ok(body_str) = std::str::from_utf8(&bytes) {
-        for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == settings.form_field {
-                    if let Some(c) = cookie_token {
-                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
-                            token_found = true;
-                        }
-                    }
-                    break;
-                }
+    for (key, value) in url::form_urlencoded::parse(&bytes) {
+        if key == settings.form_field {
+            if let Some(c) = cookie_token
+                && !c.is_empty()
+                && !value.is_empty()
+                && constant_time_eq(c, value.as_ref())
+            {
+                token_found = true;
             }
+            break;
         }
     }
 
@@ -380,6 +380,30 @@ async fn verify_csrf_token(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn post_with_url_encoded_token_passes() {
+        let raw_token = "abc+123/xyz=456";
+        let encoded_token = "abc%2B123%2Fxyz%3D456";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={encoded_token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     use super::*;
     use axum::Router;
     use axum::body::Body;

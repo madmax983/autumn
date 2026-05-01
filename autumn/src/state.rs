@@ -76,6 +76,8 @@ pub struct AppState {
 
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
     pub(crate) task_registry: actuator::TaskRegistry,
+    /// Job registry for the `/actuator/jobs` endpoint.
+    pub(crate) job_registry: actuator::JobRegistry,
 
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
@@ -176,6 +178,12 @@ impl AppState {
     #[must_use]
     pub const fn task_registry(&self) -> &actuator::TaskRegistry {
         &self.task_registry
+    }
+
+    /// Returns the job registry.
+    #[must_use]
+    pub const fn job_registry(&self) -> &actuator::JobRegistry {
+        &self.job_registry
     }
 
     /// Returns the config properties.
@@ -383,6 +391,7 @@ impl AppState {
             metrics: middleware::MetricsCollector::new(),
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
+            job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: Channels::new(32),
@@ -450,6 +459,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn task_registry(&self) -> &crate::actuator::TaskRegistry {
         &self.task_registry
+    }
+
+    fn job_registry(&self) -> &crate::actuator::JobRegistry {
+        &self.job_registry
     }
 
     fn config_props(&self) -> &crate::actuator::ConfigProperties {

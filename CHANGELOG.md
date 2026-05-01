@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class
+  locale-aware text resolution (#503). Translations live at
+  `i18n/<locale>.ftl` (Project Fluent format), discovered from the project
+  root at startup. Adds an `[i18n]` config block (`default_locale`,
+  `supported_locales`, `fallback_chain`, `dir`), a request-scoped `Locale`
+  extractor with stable resolution order
+  (query → signed session cookie → plain cookie → `Accept-Language` →
+  default), a `t!()` **proc-macro** with **compile-time key validation**
+  (reads the default locale's `.ftl` at expansion time and emits
+  `compile_error!` with a "did you mean" suggestion on typos),
+  `set_locale_in_session()` for HMAC-signed session-backed persistence,
+  automatic runtime fallback to the default locale on miss with a
+  rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
+  convenience that fail-fasts at startup when the default locale's `.ftl`
+  file is absent. The feature is **off by default**; apps that don't enable
+  it pay zero compile cost and see no behaviour change. `autumn new
+  --with-i18n` scaffolds a new project with the `i18n/` directory, stub
+  `en.ftl`, the `[i18n]` block, the feature flag, and the `.i18n_auto()`
+  call wired into `main.rs`. `examples/blog` is fully migrated — its
+  shared `layout()` is translated through `t!()`, the nav contains a
+  locale switcher, and `/greet` is an end-to-end demo with English and
+  Spanish bundles. New `docs/guide/i18n.md` documents the convention,
+  extractor order, the compile-time check, validation localization
+  pattern, and a "migrating from monolingual" section.
+- **typed path helpers:** Route macros (`#[get]`, `#[post]`, `#[put]`,
+  `#[delete]`, `#[patch]`) now emit a companion
+  `pub fn __autumn_path_{name}(params…) -> String` helper alongside every
+  handler (#499). The `paths![show, create, …]` macro expands into a
+  `pub mod paths { pub use super::__autumn_path_show as show; … }` so
+  templates write `paths::show(post.id)` instead of
+  `format!("/posts/{}", post.id)`. A `name = "custom_name"` attribute
+  argument overrides the helper's short name. The `PathExt` trait
+  (re-exported from `autumn_web::prelude`) adds `.with_query("key",
+  value)` for building query strings with RFC 3986 percent-encoding.
+  `axum::response::Redirect` is re-exported as `autumn_web::Redirect` and
+  added to the prelude, replacing every hand-rolled meta-refresh HTML
+  redirect in the examples. `#[repository(api = "…")]` now also emits
+  path helpers (`__autumn_path_{prefix}_api_list()`,
+  `__autumn_path_{prefix}_api_delete(id)`, etc.) for its generated REST
+  endpoints. All five examples migrated: `git grep 'format!("/'
+  examples/` and `git grep 'fn redirect_to' examples/` both return zero
+  hits.
+
 - **authorization:** First-class record-level authorization — `Policy` /
   `Scope` traits, `PolicyContext` carrying the resolved `Session` /
   user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
@@ -35,6 +78,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     explicitly) — this is the one behavior change downstream apps have
     to address.
 - **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), the `add_blob_column!` migration helper macro, and a feature-gated `S3BlobStore` shell behind `storage-s3` (real SDK wiring tracked as #530). `MultipartField::save_to_blob_store` streams uploads straight through to `BlobStore::put_stream` without buffering, with multipart parser errors preserving their client-facing 4xx status. Profile-aware defaults mirror sessions: `dev` auto-defaults to `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. The local backend uses temp-file + cross-platform atomic-replace semantics so partial writes never leave corrupted blobs and re-uploads work on Windows as well as POSIX. `examples/reddit-clone` carries the database-backed UI demo (`Blob` column on the user model + upload form + presigned-URL profile picture); framework-level integration tests pin restart survival on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
+- **seed:** New `autumn seed` CLI subcommand and `autumn_web::seed::SeedContext`
+  library surface for project-defined database seeding (#501). Convention:
+  seed code lives in `src/bin/seed.rs`; `autumn seed` runs it via
+  `cargo run --bin seed` after verifying the file exists and checking for
+  pending migrations (errors with an actionable message if either check
+  fails). Accepts `--profile <name>` (default `dev`) forwarded as
+  `AUTUMN_ENV` so seed binaries can branch on environment. New opt-in
+  `seed` cargo feature on `autumn-web` (enables `autumn_web::seed::SeedContext`
+  which wires database URL + profile resolution in one `.build().await` call)
+  — apps that don't seed pay zero compile cost. `autumn new --with-seed`
+  (default off) scaffolds a stub `src/bin/seed.rs` and the matching `[[bin]]`
+  entry. `examples/todo-app` ships a reference seed demonstrating the
+  count-based idempotency guard. New `docs/guide/seeding.md` documents the
+  full story. Non-breaking: existing apps without `src/bin/seed.rs` see no
+  behavior change.
 - **cli:** `autumn generate model | migration | scaffold` for one-command
   resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
   `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route

@@ -107,19 +107,19 @@ pub enum MigrationShape {
 /// of SQL to emit.
 #[must_use]
 pub fn detect_migration_shape(pascal_name: &str) -> MigrationShape {
-    if let Some(rest) = pascal_name.strip_prefix("Add") {
-        if let Some((_, table)) = split_on_keyword(rest, "To") {
-            return MigrationShape::AddColumns {
-                table: normalize_table_name(&table),
-            };
-        }
+    if let Some(rest) = pascal_name.strip_prefix("Add")
+        && let Some((_, table)) = split_on_keyword(rest, "To")
+    {
+        return MigrationShape::AddColumns {
+            table: normalize_table_name(&table),
+        };
     }
-    if let Some(rest) = pascal_name.strip_prefix("Remove") {
-        if let Some((_, table)) = split_on_keyword(rest, "From") {
-            return MigrationShape::RemoveColumns {
-                table: normalize_table_name(&table),
-            };
-        }
+    if let Some(rest) = pascal_name.strip_prefix("Remove")
+        && let Some((_, table)) = split_on_keyword(rest, "From")
+    {
+        return MigrationShape::RemoveColumns {
+            table: normalize_table_name(&table),
+        };
     }
     MigrationShape::Empty
 }

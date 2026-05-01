@@ -7,6 +7,8 @@ mod generate;
 mod migrate;
 mod monitor;
 mod new;
+mod routes;
+mod seed;
 mod setup;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
@@ -23,6 +25,14 @@ enum Commands {
     New {
         /// Project name (must be a valid Rust package name)
         name: String,
+        /// Scaffold the optional i18n module (Project Fluent translations
+        /// at `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the
+        /// `i18n` feature flag on `autumn-web`).
+        #[arg(long)]
+        with_i18n: bool,
+        /// Scaffold a stub `src/bin/seed.rs` for database seeding (default off)
+        #[arg(long)]
+        with_seed: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -71,6 +81,22 @@ enum Commands {
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
     },
+    /// Run the project's seed binary to populate the database with representative data.
+    ///
+    /// Requires `src/bin/seed.rs` (a Cargo binary named `seed`) to exist.
+    /// If it is missing, `autumn seed` prints an actionable error and exits 1.
+    ///
+    /// `autumn seed` checks for pending migrations before running and exits 1
+    /// if any are found — run `autumn migrate` first.
+    Seed {
+        /// Profile forwarded to the seed binary via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
+    },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
     /// Three subcommands collapse the repetitive five-file dance of adding
@@ -88,7 +114,7 @@ enum Commands {
     ///   f32, f64                     (REAL, DOUBLE PRECISION)
     ///   Uuid                         (UUID)
     ///   `NaiveDateTime`, `DateTime`      (TIMESTAMP, TIMESTAMPTZ)
-    ///   Vec<u8>, Bytea               (BYTEA)
+    ///   `Vec<u8>`, Bytea               (BYTEA)
     ///   Option<...>                  (any of the above, nullable)
     ///
     /// # Example
@@ -96,6 +122,38 @@ enum Commands {
     ///   autumn generate scaffold Post title:String body:Text published:bool
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
+
+    /// Print every mounted route — method, path, handler, source, middleware.
+    ///
+    /// Compiles the application (debug profile) and introspects its route
+    /// table without starting the HTTP server or connecting to a database.
+    ///
+    /// Rows are stable-sorted by path, then method, so the output is
+    /// diff-friendly. Redirect to a file and `git diff` two snapshots to
+    /// audit route changes between commits.
+    Routes {
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "table", value_name = "FORMAT")]
+        format: String,
+        /// Show only routes whose path starts with PREFIX (positional shorthand for --filter).
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Show only routes whose path starts with FILTER.
+        #[arg(long, value_name = "FILTER")]
+        filter: Option<String>,
+        /// Restrict to one or more HTTP methods (comma-separated, e.g. `GET,POST`).
+        #[arg(long, value_delimiter = ',', value_name = "METHOD")]
+        method: Vec<String>,
+        /// Hide framework-internal routes (`/actuator/*`, probes, htmx assets).
+        #[arg(long)]
+        user_only: bool,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -176,8 +234,43 @@ fn main() {
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
-        Commands::New { name } => new::run(&name),
+        Commands::New {
+            name,
+            with_i18n,
+            with_seed,
+        } => new::run(
+            &name,
+            new::GenerateOptions {
+                with_i18n,
+                with_seed,
+            },
+        ),
+        Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
         Commands::Setup { force } => setup::run(force),
+        Commands::Routes {
+            package,
+            bin,
+            format,
+            prefix,
+            filter,
+            method,
+            user_only,
+        } => {
+            let fmt = format.parse().unwrap_or_else(|e| {
+                eprintln!("autumn routes: {e}");
+                std::process::exit(1);
+            });
+            // Positional prefix takes precedence over --filter when both are given.
+            let effective_filter = prefix.as_deref().or(filter.as_deref());
+            routes::run(&routes::RoutesOptions {
+                package: package.as_deref(),
+                bin: bin.as_deref(),
+                format: fmt,
+                filter: effective_filter,
+                methods: &method,
+                user_only,
+            });
+        }
         Commands::Generate(cmd) => match cmd {
             GenerateCommands::Model {
                 name,
@@ -209,7 +302,7 @@ mod tests {
     fn parse_new_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my-app");
             }
             _ => panic!("expected New command"),
@@ -220,9 +313,34 @@ mod tests {
     fn parse_new_with_underscores() {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my_app");
             }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_with_i18n_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app", "--with-i18n"]).unwrap();
+        match cli.command {
+            Commands::New {
+                ref name,
+                with_i18n,
+                ..
+            } => {
+                assert_eq!(name, "my-app");
+                assert!(with_i18n);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_without_i18n_flag_defaults_off() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
+        match cli.command {
+            Commands::New { with_i18n, .. } => assert!(!with_i18n),
             _ => panic!("expected New command"),
         }
     }
@@ -515,5 +633,286 @@ mod tests {
     #[test]
     fn parse_generate_model_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "model"]).is_err());
+    }
+
+    // ── autumn seed tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_seed_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "seed"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, package } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "demo"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => {
+                assert_eq!(profile, "demo");
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "-p", "my-app"]).unwrap();
+        match cli.command {
+            Commands::Seed { package, .. } => {
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_test_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "test"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => assert_eq!(profile, "test"),
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_prod_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "prod"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => assert_eq!(profile, "prod"),
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    // ── autumn routes tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_routes_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "routes"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package,
+                bin,
+                format,
+                prefix,
+                filter,
+                method,
+                user_only,
+            } => {
+                assert!(package.is_none());
+                assert!(bin.is_none());
+                assert_eq!(format, "table");
+                assert!(prefix.is_none());
+                assert!(filter.is_none());
+                assert!(method.is_empty());
+                assert!(!user_only);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog"]).unwrap();
+        match cli.command {
+            Commands::Routes { package, .. } => {
+                assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_long_package() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--package", "my-app"]).unwrap();
+        match cli.command {
+            Commands::Routes { package, .. } => {
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_format_json() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--format", "json"]).unwrap();
+        match cli.command {
+            Commands::Routes { format, .. } => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_filter() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--filter", "/api"]).unwrap();
+        match cli.command {
+            Commands::Routes { filter, .. } => {
+                assert_eq!(filter.as_deref(), Some("/api"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_method() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--method", "GET"]).unwrap();
+        match cli.command {
+            Commands::Routes { method, .. } => {
+                assert_eq!(method, vec!["GET"]);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_multiple_methods() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--method", "GET,POST"]).unwrap();
+        match cli.command {
+            Commands::Routes { method, .. } => {
+                assert_eq!(method, vec!["GET", "POST"]);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_user_only() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--user-only"]).unwrap();
+        match cli.command {
+            Commands::Routes { user_only, .. } => {
+                assert!(user_only);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_with_bin() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--bin", "server"]).unwrap();
+        match cli.command {
+            Commands::Routes { bin, .. } => {
+                assert_eq!(bin.as_deref(), Some("server"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_all_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "-p",
+            "blog",
+            "--format",
+            "json",
+            "--filter",
+            "/api",
+            "--method",
+            "GET,POST",
+            "--user-only",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                package,
+                bin,
+                format,
+                prefix,
+                filter,
+                method,
+                user_only,
+            } => {
+                assert_eq!(package.as_deref(), Some("blog"));
+                assert!(bin.is_none());
+                assert_eq!(format, "json");
+                assert!(prefix.is_none());
+                assert_eq!(filter.as_deref(), Some("/api"));
+                assert_eq!(method, vec!["GET", "POST"]);
+                assert!(user_only);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_positional_prefix() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "/api"]).unwrap();
+        match cli.command {
+            Commands::Routes { prefix, filter, .. } => {
+                assert_eq!(prefix.as_deref(), Some("/api"));
+                assert!(filter.is_none());
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_positional_prefix_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog", "/api"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                package, prefix, ..
+            } => {
+                assert_eq!(package.as_deref(), Some("blog"));
+                assert_eq!(prefix.as_deref(), Some("/api"));
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    // ── autumn new --with-seed tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_new_without_with_seed_defaults_false() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
+        match cli.command {
+            Commands::New {
+                name, with_seed, ..
+            } => {
+                assert_eq!(name, "my-app");
+                assert!(!with_seed);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_with_with_seed_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app", "--with-seed"]).unwrap();
+        match cli.command {
+            Commands::New {
+                name, with_seed, ..
+            } => {
+                assert_eq!(name, "my-app");
+                assert!(with_seed);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_with_i18n_and_seed_flags() {
+        let cli =
+            Cli::try_parse_from(["autumn", "new", "my-app", "--with-i18n", "--with-seed"]).unwrap();
+        match cli.command {
+            Commands::New {
+                name,
+                with_i18n,
+                with_seed,
+            } => {
+                assert_eq!(name, "my-app");
+                assert!(with_i18n);
+                assert!(with_seed);
+            }
+            _ => panic!("expected New command"),
+        }
     }
 }

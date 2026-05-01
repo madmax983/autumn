@@ -68,6 +68,7 @@ extern crate self as autumn_web;
 
 pub mod actuator;
 pub mod app;
+pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
@@ -83,11 +84,23 @@ pub mod extract;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
+#[cfg(feature = "i18n")]
+pub mod i18n;
+/// Translation lookup macro with compile-time key validation.
+///
+/// Re-exported from [`crate::i18n::t`] for ergonomic
+/// `autumn_web::t!(locale, "key")` usage.
+#[cfg(feature = "i18n")]
+pub use crate::i18n::t;
+#[cfg(feature = "mail")]
+pub mod mail;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;
 pub mod probe;
 pub use plugin::{Plugin, Plugins};
+
+pub mod route_listing;
 
 /// Router construction and integration with Axum.
 ///
@@ -108,7 +121,9 @@ pub(crate) mod logging;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
+pub mod paths;
 pub mod prelude;
+pub use paths::PathExt;
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route};
 pub mod security;
@@ -121,6 +136,9 @@ pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
 
+pub mod job;
+#[cfg(feature = "seed")]
+pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
@@ -202,6 +220,10 @@ pub use validation::Validated;
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_VERSION};
+#[cfg(feature = "mail")]
+pub use mail::{
+    Mail, MailConfig, MailError, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+};
 /// Extension trait adding `.validate()` to all `validator::Validate` types.
 pub use validation::ValidateExt;
 
@@ -262,6 +284,9 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Generate ergonomic `send_*` and `deliver_later_*` helpers for mailer impls.
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer;
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup
@@ -356,6 +381,48 @@ pub use autumn_macros::repository;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::service;
+
+/// Annotate an async function as a `PATCH` route handler.
+///
+/// Generates a companion function that returns a [`crate::route::Route`]
+/// and a typed `__autumn_path_{name}(…) -> String` path helper.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::patch;
+///
+/// #[patch("/items/{id}")]
+/// async fn patch_item() -> &'static str {
+///     "patched"
+/// }
+/// ```
+pub use autumn_macros::patch;
+
+/// Emit a `pub mod paths { … }` re-exporting typed path helpers.
+///
+/// Takes the same comma-separated handler list as [`routes!`]. Invoke once
+/// in the module where your handlers live:
+///
+/// ```ignore
+/// autumn_web::paths![show_post, create_post];
+/// // callers can then: use crate::routes::paths;
+/// //                    paths::show_post(42)
+/// ```
+pub use autumn_macros::paths;
+
+/// HTTP redirect response.
+///
+/// Re-exported from [Axum](https://docs.rs/axum) so route handlers can
+/// return a redirect without a direct `axum` dependency.
+///
+/// Use [`Redirect::to`] with a path helper:
+///
+/// ```ignore
+/// use autumn_web::Redirect;
+/// Redirect::to(&paths::show_post(id))
+/// ```
+pub use axum::response::Redirect;
 
 /// Annotate an async function as a `POST` route handler.
 ///
@@ -471,6 +538,8 @@ pub use autumn_macros::cached;
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 
+/// Declare an on-demand background job. See [`job`] module.
+pub use autumn_macros::job;
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
 
@@ -535,6 +604,8 @@ pub use autumn_macros::secured;
 /// }
 /// ```
 pub use autumn_macros::authorize;
+/// Collect `#[job]` handlers into a `Vec<JobInfo>`.
+pub use autumn_macros::jobs;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
@@ -705,6 +776,9 @@ pub mod reexports {
     #[cfg(feature = "db")]
     pub use diesel_async;
     pub use http;
+    #[cfg(feature = "mail")]
+    pub use lettre;
+    pub use serde_json;
     pub use tokio;
     pub use tokio_util;
     pub use tracing;

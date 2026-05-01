@@ -295,9 +295,13 @@ pub fn try_build_router_inner(
     }
 
     // Static file serving from project's static/ directory.
+    // Fingerprinted assets (e.g. `autumn.a1b2c3d4.css`) are served with
+    // `Cache-Control: public, max-age=31536000, immutable`; all other static
+    // files use the default browser policy.
     let env = crate::config::OsEnv;
     let static_dir = crate::app::project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+    router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
     router = mount_scoped_groups(router, ctx.scoped_groups);
 
@@ -647,16 +651,17 @@ fn reject_openapi_path_collisions(
         return Ok(());
     };
 
-    // Gather every path a GET will already own by the time we merge.
+    // Gather every path a GET (or WS, which mounts as GET) will already
+    // own by the time we merge.
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for route in route_list {
-        if route.method == http::Method::GET {
+        if route.method == http::Method::GET || route.method.as_str() == "WS" {
             claimed.insert(route.path.to_owned());
         }
     }
     for group in scoped_groups {
         for route in &group.routes {
-            if route.method == http::Method::GET {
+            if route.method == http::Method::GET || route.method.as_str() == "WS" {
                 claimed.insert(join_nested_path(&group.prefix, route.path));
             }
         }
@@ -859,7 +864,7 @@ fn mount_probe_endpoints(
     if mounted_probe_paths.insert(config.health.path.clone()) {
         router = router.route(
             &config.health.path,
-            axum::routing::get(crate::health::handler),
+            axum::routing::get(crate::health::handler::<AppState>),
         );
     }
     tracing::debug!(
@@ -1026,6 +1031,10 @@ fn apply_middleware(
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
+    // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
+    // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
+    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config);
     router = apply_rate_limit_middleware(router, config);
@@ -1035,9 +1044,6 @@ fn apply_middleware(
     let security_headers =
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
-
-    // 404 fallback handler for unmatched routes
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
 
     // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
     // RequestIdLayer wraps the router, so user middleware sits INNER to
@@ -1247,19 +1253,19 @@ pub fn try_build_router_with_static_inner(
                     } else {
                         path
                     };
-                    if let Some(file_path) = static_layer.resolve(normalized) {
-                        if let Ok(contents) = tokio::fs::read(&file_path).await {
-                            let body = if is_head {
-                                axum::body::Body::empty()
-                            } else {
-                                axum::body::Body::from(contents)
-                            };
-                            return http::Response::builder()
-                                .status(http::StatusCode::OK)
-                                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                                .body(body)
-                                .expect("infallible response builder");
-                        }
+                    if let Some(file_path) = static_layer.resolve(normalized)
+                        && let Ok(contents) = tokio::fs::read(&file_path).await
+                    {
+                        let body = if is_head {
+                            axum::body::Body::empty()
+                        } else {
+                            axum::body::Body::from(contents)
+                        };
+                        return http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(body)
+                            .expect("infallible response builder");
                     }
                 }
                 next.run(req).await
@@ -1429,6 +1435,45 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
 }
 
+/// Set `Cache-Control` headers for static assets based on whether the path is
+/// fingerprinted.
+///
+/// | Path | Header |
+/// |------|--------|
+/// | `/static/**.<8hex>.*` | `public, max-age=31536000, immutable` |
+/// | `/static/**` (other) | `public, max-age=0, must-revalidate` |
+/// | Everything else | unchanged |
+///
+/// The short `must-revalidate` policy for plain static paths ensures that
+/// returning visitors always fetch the latest file after a deploy, while the
+/// long `immutable` policy for fingerprinted files lets browsers skip the
+/// network entirely for assets whose content will never change.
+pub async fn asset_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let mut resp = next.run(req).await;
+    if path.starts_with("/static/") && resp.status().is_success() {
+        // Use manifest membership rather than filename pattern so that
+        // user-authored assets like `vendor.deadbeef.js` are never given an
+        // immutable cache lifetime.
+        let is_immutable = path
+            .strip_prefix("/static/")
+            .is_some_and(crate::assets::is_manifest_asset);
+        let header = if is_immutable {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=0, must-revalidate"
+        };
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static(header),
+        );
+    }
+    resp
+}
+
 #[cfg(feature = "htmx")]
 pub async fn htmx_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1482,6 +1527,7 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
@@ -1835,6 +1881,7 @@ mod tests {
                 },
                 repository: None,
             }],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
@@ -1905,6 +1952,7 @@ mod tests {
         let group = ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 

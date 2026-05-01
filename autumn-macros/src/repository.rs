@@ -294,178 +294,198 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // When absent, the generated code is identical to the pre-hooks version
     // (zero-cost path).
 
-    let (struct_fields, extractor_init, save_body, update_body, delete_body) = if let Some(
-        ref hooks_ident,
-    ) =
-        config.hooks_type
-    {
-        // ── Struct fields with hooks ───────────────────────
-        let struct_fields = quote! {
-            pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-            >,
-            hooks: #hooks_ident,
+    let (struct_fields, clone_impl, extractor_init, save_body, update_body, delete_body) =
+        if let Some(ref hooks_ident) = config.hooks_type {
+            // ── Struct fields with hooks ───────────────────────
+            let struct_fields = quote! {
+                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+                hooks: #hooks_ident,
+            };
+
+            let clone_impl = quote! {
+                impl ::core::clone::Clone for #pg_name {
+                    fn clone(&self) -> Self {
+                        Self {
+                            pool: self.pool.clone(),
+                            hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+                        }
+                    }
+                }
+            };
+
+            let extractor_init = quote! {
+                Ok(#pg_name {
+                    pool,
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                })
+            };
+
+            // ── save (hooked) ─────────────────────────────────
+            let save_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut input = new.clone();
+                let mut ctx = MutationContext::new(MutationOp::Create);
+
+                // before_create can validate/reject/rewrite
+                self.hooks.before_create(&mut ctx, &mut input).await?;
+
+                let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(&input)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                Ok(record)
+            };
+
+            // ── update (hooked) ───────────────────────────────
+            let draft_ext_trait = format_ident!("{}DraftExt", model_name);
+            let update_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut ctx = MutationContext::new(MutationOp::Update);
+
+                // Load current record
+                let current = #table_ident::table
+                    .find(id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ))?;
+
+                // Build merged draft from current + patch
+                let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+
+                // before_update can inspect/rewrite via draft field accessors
+                self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                // Persist the proposed state
+                let proposed = draft.into_after();
+                let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(&proposed)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                Ok(record)
+            };
+
+            // ── delete (hooked) ───────────────────────────────
+            let delete_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let mut ctx = MutationContext::new(MutationOp::Delete);
+
+                // Load current record for before_delete context
+                let record = #table_ident::table
+                    .find(id)
+                    .first::<#model_name>(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(::autumn_web::AutumnError::from)?
+                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                        format!("{} with id {} not found", stringify!(#model_name), id)
+                    ))?;
+
+                self.hooks.before_delete(&mut ctx, &record).await?;
+
+                ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+
+                Ok(())
+            };
+
+            (
+                struct_fields,
+                clone_impl,
+                extractor_init,
+                save_body,
+                update_body,
+                delete_body,
+            )
+        } else {
+            // ── No hooks: existing zero-cost path ─────────────
+
+            let struct_fields = quote! {
+                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            };
+
+            let clone_impl = quote! {
+                impl ::core::clone::Clone for #pg_name {
+                    fn clone(&self) -> Self {
+                        Self {
+                            pool: self.pool.clone(),
+                        }
+                    }
+                }
+            };
+
+            let extractor_init = quote! {
+                Ok(#pg_name { pool })
+            };
+
+            let save_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                    .values(new)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            };
+
+            let update_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                let diesel_changeset = changes.__to_changeset();
+                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                    .set(&diesel_changeset)
+                    .get_result::<#model_name>(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)
+            };
+
+            let delete_body = quote! {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                Ok(())
+            };
+
+            (
+                struct_fields,
+                clone_impl,
+                extractor_init,
+                save_body,
+                update_body,
+                delete_body,
+            )
         };
-
-        let extractor_init = quote! {
-            Ok(#pg_name {
-                pool,
-                hooks: <#hooks_ident as ::std::default::Default>::default(),
-            })
-        };
-
-        // ── save (hooked) ─────────────────────────────────
-        let save_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
-
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let mut input = new.clone();
-            let mut ctx = MutationContext::new(MutationOp::Create);
-
-            // before_create can validate/reject/rewrite
-            self.hooks.before_create(&mut ctx, &mut input).await?;
-
-            let record = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                .values(&input)
-                .get_result::<#model_name>(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)?;
-
-            Ok(record)
-        };
-
-        // ── update (hooked) ───────────────────────────────
-        let draft_ext_trait = format_ident!("{}DraftExt", model_name);
-        let update_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
-
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let mut ctx = MutationContext::new(MutationOp::Update);
-
-            // Load current record
-            let current = #table_ident::table
-                .find(id)
-                .first::<#model_name>(&mut conn)
-                .await
-                .optional()
-                .map_err(::autumn_web::AutumnError::from)?
-                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
-                    format!("{} with id {} not found", stringify!(#model_name), id)
-                ))?;
-
-            // Build merged draft from current + patch
-            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
-
-            // before_update can inspect/rewrite via draft field accessors
-            self.hooks.before_update(&mut ctx, &mut draft).await?;
-
-            // Persist the proposed state
-            let proposed = draft.into_after();
-            let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                .set(&proposed)
-                .get_result::<#model_name>(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)?;
-
-            Ok(record)
-        };
-
-        // ── delete (hooked) ───────────────────────────────
-        let delete_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks};
-
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let mut ctx = MutationContext::new(MutationOp::Delete);
-
-            // Load current record for before_delete context
-            let record = #table_ident::table
-                .find(id)
-                .first::<#model_name>(&mut conn)
-                .await
-                .optional()
-                .map_err(::autumn_web::AutumnError::from)?
-                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
-                    format!("{} with id {} not found", stringify!(#model_name), id)
-                ))?;
-
-            self.hooks.before_delete(&mut ctx, &record).await?;
-
-            ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                .execute(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)?;
-
-            Ok(())
-        };
-
-        (
-            struct_fields,
-            extractor_init,
-            save_body,
-            update_body,
-            delete_body,
-        )
-    } else {
-        // ── No hooks: existing zero-cost path ─────────────
-
-        let struct_fields = quote! {
-            pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-            >,
-        };
-
-        let extractor_init = quote! {
-            Ok(#pg_name { pool })
-        };
-
-        let save_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                .values(new)
-                .get_result::<#model_name>(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)
-        };
-
-        let update_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            let diesel_changeset = changes.__to_changeset();
-            ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                .set(&diesel_changeset)
-                .get_result::<#model_name>(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)
-        };
-
-        let delete_body = quote! {
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-            let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-            ::autumn_web::reexports::diesel::delete(#table_ident::table.find(id))
-                .execute(&mut conn)
-                .await
-                .map_err(::autumn_web::AutumnError::from)?;
-            Ok(())
-        };
-
-        (
-            struct_fields,
-            extractor_init,
-            save_body,
-            update_body,
-            delete_body,
-        )
-    };
 
     // ── Build API handlers (when `api = "/path"` is present) ────────────
     let api_handlers = if let Some(ref api_path) = config.api_path {
@@ -482,6 +502,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let create_info = format_ident!("__autumn_route_info_{prefix}_api_create");
         let update_info = format_ident!("__autumn_route_info_{prefix}_api_update");
         let delete_info = format_ident!("__autumn_route_info_{prefix}_api_delete");
+
+        let list_path_fn = format_ident!("__autumn_path_{prefix}_api_list");
+        let get_path_fn = format_ident!("__autumn_path_{prefix}_api_get");
+        let create_path_fn = format_ident!("__autumn_path_{prefix}_api_create");
+        let update_path_fn = format_ident!("__autumn_path_{prefix}_api_update");
+        let delete_path_fn = format_ident!("__autumn_path_{prefix}_api_delete");
 
         let id_path = format!("{api_path}/{{id}}");
 
@@ -903,6 +929,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }),
                 }
             }
+
+            // ── Path helpers for API routes ───────────────────────
+
+            #[doc(hidden)]
+            #vis fn #list_path_fn() -> ::std::string::String {
+                #api_path.to_owned()
+            }
+
+            #[doc(hidden)]
+            #vis fn #get_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
+            }
+
+            #[doc(hidden)]
+            #vis fn #create_path_fn() -> ::std::string::String {
+                #api_path.to_owned()
+            }
+
+            #[doc(hidden)]
+            #vis fn #update_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
+            }
+
+            #[doc(hidden)]
+            #vis fn #delete_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
+            }
         }
     } else {
         quote! {}
@@ -930,10 +983,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         /// Postgres implementation of the repository.
-        #[derive(Clone)]
         #vis struct #pg_name {
             #struct_fields
         }
+
+        #clone_impl
 
         impl #trait_name for #pg_name {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {

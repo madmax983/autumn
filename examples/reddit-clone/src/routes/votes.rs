@@ -126,3 +126,5 @@ async fn cast_vote(
 
     Ok(vote_controls(post_id, score))
 }
+
+autumn_web::paths![upvote, downvote];

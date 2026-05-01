@@ -51,6 +51,7 @@ This gives you the `autumn` binary with the core workflow commands:
 | `autumn dev`    | Run the dev server with file watching        |
 | `autumn build`  | Pre-render `#[static_get]` routes into `dist/` |
 | `autumn migrate`| Run migrations or inspect migration status   |
+| `autumn seed`   | Populate the database with representative data |
 
 ---
 
@@ -904,6 +905,10 @@ Here are some things to explore:
 - **Check `/health` and `/actuator/*`** -- `/health` gives a small health
   response, while actuator adds info, metrics, env/configprops, loggers, and
   scheduled task visibility depending on the active profile.
+- **Localize your UI** -- enable the opt-in `i18n` feature flag on `autumn-web`
+  and drop translation files at `i18n/<locale>.ftl`. See
+  [the i18n guide](./i18n.md) for the convention, the `Locale` extractor, and
+  the `t!()` macro.
 - **Inspect request IDs** -- every response includes an `X-Request-Id` header
   (UUID v4) for log correlation.
 - **Look at the example apps** -- [`examples/todo-app`](../../examples/todo-app),

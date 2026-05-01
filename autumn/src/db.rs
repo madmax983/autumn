@@ -403,9 +403,17 @@ mod tests {
         assert_eq!(timeouts.create, Some(Duration::from_secs(7)));
     }
 
+    #[derive(Clone)]
+    struct TestDbState;
+
+    impl DbState for TestDbState {
+        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+            None
+        }
+    }
+
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -416,27 +424,9 @@ mod tests {
             "ok"
         }
 
-        let app = Router::new().route("/", get(handler)).with_state(AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-        });
+        let app = Router::new()
+            .route("/", get(handler))
+            .with_state(TestDbState);
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
