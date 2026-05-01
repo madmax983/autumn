@@ -92,6 +92,7 @@ chrono = { workspace = true }
 chrono-tz.workspace = true
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+serde_urlencoded = "0.7"
 subtle = "2.6.1"
 url = "2.5.8"
 percent-encoding = "2"

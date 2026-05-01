@@ -90,6 +90,11 @@ impl CsrfToken {
     pub fn token(&self) -> &str {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn new(token: String) -> Self {
+        Self(token)
+    }
 }
 
 impl std::fmt::Display for CsrfToken {

@@ -7,6 +7,11 @@
 //! in a single route handler — no manual flash-carrying, no conditional
 //! error-threading.
 //!
+//! [`ChangesetForm<T>`] is the axum extractor that decodes the request body
+//! (URL-encoded **or** multipart), runs validation, captures the CSRF token,
+//! and hands the handler a ready-to-use changeset — CSRF is emitted
+//! automatically when you call [`ChangesetForm::form_tag`].
+//!
 //! # Framework comparison
 //!
 //! | Framework | Changeset type | Rendering helper |
@@ -14,77 +19,73 @@
 //! | Phoenix (Elixir) | `Ecto.Changeset` | `<.input field={@form[:name]} />` |
 //! | Rails (Ruby) | `errors[:field]` | `f.text_field :name` |
 //! | Django (Python) | `forms.Form` | `{{ form.name.errors }}` |
-//! | Autumn (Rust) | `Changeset<T>` | `text_input(&cs, "name", "Name")` |
+//! | Autumn (Rust) | `Changeset<T>` | `form.text_input("name", "Name")` |
 //!
-//! # Happy-path + validation-failure in one handler
+//! # Happy-path + validation-failure in ≤ 40 LoC
 //!
 //! ```rust,ignore
 //! use autumn_web::prelude::*;
-//! use autumn_web::form::{ChangesetForm, Changeset, form_tag, text_input, submit_button};
+//! use autumn_web::form::{ChangesetForm, Changeset, submit_button};
 //! use serde::{Deserialize, Serialize};
 //! use validator::Validate;
 //! use axum::{http::StatusCode, response::IntoResponse};
 //!
 //! #[derive(Deserialize, Serialize, Validate)]
-//! struct CreateUser {
-//!     #[validate(length(min = 3, max = 50))]
+//! struct GreetForm {
+//!     #[validate(length(min = 3, message = "Name must be at least 3 characters"))]
 //!     name: String,
-//!     #[validate(email)]
+//!     #[validate(email(message = "Must be a valid email address"))]
 //!     email: String,
 //! }
 //!
-//! fn user_form(cs: &Changeset<CreateUser>, csrf: &str, action: &str) -> Markup {
-//!     form_tag(action, "post", Some(csrf), html! {
-//!         (text_input(cs, "name", "Full name"))
-//!         (text_input(cs, "email", "Email address"))
-//!         (submit_button("Save"))
+//! fn greet_form_partial(form: &ChangesetForm<GreetForm>, action: &str) -> Markup {
+//!     form.form_tag(action, "post", html! {
+//!         (form.text_input("name", "Full name"))
+//!         (form.text_input("email", "Email"))
+//!         (form.submit_button("Submit"))
 //!     })
 //! }
 //!
-//! #[get("/users/new")]
-//! async fn new_user(csrf: CsrfToken) -> Markup {
-//!     let blank = Changeset::new(CreateUser { name: String::new(), email: String::new() });
-//!     user_form(&blank, csrf.token(), "/users")
+//! #[get("/greet/new")]
+//! async fn new_greet(csrf: CsrfToken) -> Markup {
+//!     let blank = ChangesetForm::blank(GreetForm { name: String::new(), email: String::new() },
+//!                                     csrf.token());
+//!     greet_form_partial(&blank, "/greet")
 //! }
 //!
-//! // htmx round-trip: on failure returns 422 + the same partial.
-//! // Non-htmx: replace `(StatusCode::UNPROCESSABLE_ENTITY, ...)` with
-//! // a redirect after storing the changeset in flash.
-//! #[post("/users")]
-//! async fn create_user(
-//!     csrf: CsrfToken,
-//!     ChangesetForm(cs): ChangesetForm<CreateUser>,
-//! ) -> impl IntoResponse {
-//!     match cs.into_valid() {
-//!         Ok(_user) => Redirect::to("/users").into_response(),
-//!         Err(cs) => (
-//!             StatusCode::UNPROCESSABLE_ENTITY,
-//!             user_form(&cs, csrf.token(), "/users"),
-//!         )
-//!             .into_response(),
+//! #[post("/greet")]
+//! async fn create_greet(form: ChangesetForm<GreetForm>) -> impl IntoResponse {
+//!     match form.into_valid() {
+//!         Ok(f) => html! { p { "Hello, " (f.name) "!" } }.into_response(),
+//!         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY,
+//!                       greet_form_partial(&form, "/greet")).into_response(),
 //!     }
 //! }
 //! ```
 //!
-//! # Non-htmx / progressive-enhancement fallback
-//!
-//! When JavaScript is disabled htmx falls back to a normal form POST.  The
-//! handler above already works — it returns a full-page response with a 422
-//! status that browsers display inline.  If you prefer the classic
-//! redirect-after-post pattern to avoid double-submit on refresh, store the
-//! changeset in the session via [`crate::flash`] and redirect:
-//!
-//! ```rust,ignore
-//! // On failure: serialize errors + values into flash, redirect back.
-//! flash.error(serde_json::to_string(&cs.errors()).unwrap()).await;
-//! Redirect::to("/users/new").into_response()
-//! ```
-//!
 //! # CSRF
 //!
-//! Pass `Some(csrf.token())` to [`form_tag`] and the hidden `_csrf` input is
-//! emitted automatically.  No additional developer action is needed when the
-//! [`crate::security::CsrfLayer`] middleware is active.
+//! The CSRF token is captured automatically by the [`ChangesetForm`] extractor
+//! from the request extensions set by [`crate::security::CsrfLayer`].
+//! Calling [`ChangesetForm::form_tag`] emits the hidden `_csrf` input with no
+//! additional developer action in POST handlers.
+//!
+//! For GET handlers (new/edit forms), construct the form context via
+//! [`ChangesetForm::blank`], passing `csrf.token()` from a [`crate::security::CsrfToken`]
+//! extractor — the only extra line needed is the parameter itself.
+//!
+//! # Multipart
+//!
+//! When the `multipart` feature is enabled, [`ChangesetForm`] also decodes
+//! `multipart/form-data` bodies.  File fields are skipped; only text fields
+//! are decoded.  File upload storage is out of scope here (see issue #494).
+//!
+//! # Non-htmx fallback
+//!
+//! When JavaScript is disabled htmx falls back to a standard form POST.
+//! The handler pattern above still works: browsers display the 422 page
+//! inline.  For a redirect-after-post pattern, serialise `cs.errors()` into
+//! the flash store and redirect; restore on the next GET.
 
 use std::collections::HashMap;
 
@@ -96,18 +97,12 @@ use serde::Serialize;
 
 /// Carries submitted form values and per-field validation errors.
 ///
-/// A `Changeset` is the central type for form handling in Autumn.  It holds
-/// the decoded input (even when invalid) alongside any field-level validation
-/// messages, letting a single handler both validate *and* re-render the form
-/// with the user's previous values and inline error messages.
+/// Analogous to `Ecto.Changeset` in Phoenix or `errors[:field]` in Rails.
 ///
-/// # Obtaining a Changeset
-///
-/// | Source | When to use |
-/// |--------|-------------|
-/// | [`Changeset::new`] | Blank form (GET handler) |
-/// | [`IntoChangeset::into_changeset`] | Explicit validation after manual construction |
-/// | [`ChangesetForm`] extractor | POST handler — decodes body + validates |
+/// Obtain a `Changeset` from:
+/// - [`Changeset::new`] for a blank/valid changeset
+/// - [`IntoChangeset::into_changeset`] after manual construction
+/// - The [`ChangesetForm`] axum extractor (preferred)
 #[derive(Debug)]
 pub struct Changeset<T> {
     data: T,
@@ -144,9 +139,6 @@ impl<T> Changeset<T> {
     }
 
     /// Consume the changeset, returning `Ok(T)` if valid or `Err(self)` if not.
-    ///
-    /// The `Err` branch gives back the changeset so the handler can pass it
-    /// to a Maud rendering function.
     pub fn into_valid(self) -> Result<T, Self> {
         if self.is_valid() {
             Ok(self.data)
@@ -169,11 +161,8 @@ impl<T> Changeset<T> {
 impl<T: Serialize> Changeset<T> {
     /// Serialize the value of `field` from the inner data to a `String`.
     ///
-    /// Used by [`text_input`] to re-populate `<input value="…">` after a
-    /// failed submission so the user does not lose their typed input.
-    ///
-    /// Returns `None` when the field does not exist or cannot be represented
-    /// as a plain string (e.g., nested objects, arrays).
+    /// Used by rendering helpers to re-populate `<input value="…">` after a
+    /// failed submission.  Returns `None` for missing or non-scalar fields.
     pub fn field_value(&self, field: &str) -> Option<String> {
         let json = serde_json::to_value(&self.data).ok()?;
         match json.get(field)? {
@@ -187,14 +176,11 @@ impl<T: Serialize> Changeset<T> {
 
 // ── IntoChangeset ──────────────────────────────────────────────────
 
-/// Extension trait that validates `self` and wraps the result in a [`Changeset`].
+/// Validate `self` and wrap in a [`Changeset`].
 ///
 /// Blanket-implemented for every type that implements [`validator::Validate`].
 pub trait IntoChangeset: Sized {
     /// Run validation and produce a `Changeset<Self>`.
-    ///
-    /// On success the changeset has no errors (`is_valid() == true`).
-    /// On failure each failed field's messages appear in `errors_for(field)`.
     fn into_changeset(self) -> Changeset<Self>;
 }
 
@@ -207,35 +193,124 @@ impl<T: validator::Validate> IntoChangeset for T {
     }
 }
 
-// ── ChangesetForm<T> extractor ─────────────────────────────────────
+// ── ChangesetForm<T> ───────────────────────────────────────────────
 
-/// Axum extractor that decodes a URL-encoded form body and runs validation.
+/// Axum extractor that decodes a form body, runs validation, and captures the
+/// CSRF token — all in one step.
 ///
-/// Unlike [`crate::validation::Valid`], this extractor **never** returns a
-/// 422 on its own — validation errors are captured inside the [`Changeset`]
-/// and the decision of how to respond is left to the handler.  This enables
-/// the inline-error pattern without littering routes with custom rejection
-/// handling.
+/// Supports both `application/x-www-form-urlencoded` (always) and
+/// `multipart/form-data` (when the `multipart` feature is enabled).
 ///
-/// # Failure modes
+/// Unlike [`crate::validation::Valid`], this extractor **never** rejects with
+/// 422 — errors live in the [`Changeset`] and the handler decides how to
+/// respond.  Fails with 400 only when the body cannot be decoded into `T` at
+/// all.
 ///
-/// | Condition | HTTP status |
-/// |-----------|------------|
-/// | Body cannot be decoded into `T` | 400 Bad Request |
-/// | Validation fails | 200 — errors in `Changeset` |
+/// # CSRF — no extra developer action in POST handlers
+///
+/// The extractor reads the `CsrfToken` from request extensions (placed there
+/// by [`crate::security::CsrfLayer`]).  Calling
+/// [`ChangesetForm::form_tag`] then emits the hidden `_csrf` input
+/// automatically — no separate `CsrfToken` parameter needed.
+///
+/// For GET handlers (new/edit), use [`ChangesetForm::blank`] and pass
+/// `csrf.token()` from a `CsrfToken` extractor.
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// #[post("/users")]
-/// async fn create(ChangesetForm(cs): ChangesetForm<NewUser>) -> impl IntoResponse {
-///     match cs.into_valid() {
+/// async fn create(form: ChangesetForm<NewUser>) -> impl IntoResponse {
+///     match form.into_valid() {
 ///         Ok(user) => { /* persist & redirect */ }
-///         Err(cs)  => (StatusCode::UNPROCESSABLE_ENTITY, form_view(&cs)).into_response()
+///         Err(form) => (StatusCode::UNPROCESSABLE_ENTITY,
+///                       form.form_tag("/users", "post", html! {
+///                           (form.text_input("name", "Name"))
+///                           (form.submit_button("Save"))
+///                       })).into_response()
 ///     }
 /// }
 /// ```
-pub struct ChangesetForm<T>(pub Changeset<T>);
+pub struct ChangesetForm<T> {
+    /// The validated (or invalid) changeset.
+    pub changeset: Changeset<T>,
+    pub(crate) csrf_token: Option<String>,
+}
+
+impl<T> ChangesetForm<T> {
+    /// Build a blank form context for GET handlers (new / edit).
+    ///
+    /// Wraps `data` in a valid [`Changeset`] and stores `csrf_token` so that
+    /// [`ChangesetForm::form_tag`] can emit the hidden input automatically.
+    ///
+    /// ```rust,ignore
+    /// #[get("/users/new")]
+    /// async fn new_user(csrf: CsrfToken) -> Markup {
+    ///     let ctx = ChangesetForm::blank(UserForm::default(), csrf.token());
+    ///     ctx.form_tag("/users", "post", html! { (ctx.text_input("name", "Name")) })
+    /// }
+    /// ```
+    pub fn blank(data: T, csrf_token: &str) -> Self {
+        Self {
+            changeset: Changeset::new(data),
+            csrf_token: Some(csrf_token.to_owned()),
+        }
+    }
+
+    /// The CSRF token captured from the request, if the CSRF middleware is active.
+    pub fn csrf_token(&self) -> Option<&str> {
+        self.csrf_token.as_deref()
+    }
+
+    /// Consume and return only the inner [`Changeset`].
+    pub fn into_changeset(self) -> Changeset<T> {
+        self.changeset
+    }
+
+    /// Return `Ok(T)` if the changeset is valid, `Err(self)` if not.
+    ///
+    /// The `Err` branch returns the whole `ChangesetForm` (with its CSRF
+    /// token) so the handler can immediately call `form.form_tag()` to
+    /// re-render with inline errors.
+    pub fn into_valid(self) -> Result<T, Self> {
+        if self.changeset.is_valid() {
+            Ok(self.changeset.into_inner())
+        } else {
+            Err(self)
+        }
+    }
+}
+
+/// Dereferences to [`Changeset<T>`] so all changeset methods are available
+/// directly on `ChangesetForm<T>` — `form.is_valid()`, `form.errors_for(…)`,
+/// etc.
+impl<T> std::ops::Deref for ChangesetForm<T> {
+    type Target = Changeset<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.changeset
+    }
+}
+
+/// Maud rendering methods — emit form HTML with automatic CSRF injection.
+#[cfg(feature = "maud")]
+impl<T: Serialize> ChangesetForm<T> {
+    /// Render a `<form>` element with the stored CSRF token injected as a
+    /// hidden `<input name="_csrf">` — no extra developer action required.
+    pub fn form_tag(&self, action: &str, method: &str, content: maud::Markup) -> maud::Markup {
+        form_tag(action, method, self.csrf_token.as_deref(), content)
+    }
+
+    /// Render a labeled `<input type="text">` for `field` using the stored
+    /// changeset (value + errors).
+    pub fn text_input(&self, field: &str, label: &str) -> maud::Markup {
+        text_input(&self.changeset, field, label)
+    }
+
+    /// Render a `<button type="submit">` with `label`.
+    pub fn submit_button(&self, label: &str) -> maud::Markup {
+        submit_button(label)
+    }
+}
 
 impl<S, T> FromRequest<S> for ChangesetForm<T>
 where
@@ -245,12 +320,96 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
-            .await
-            .map_err(IntoResponse::into_response)?;
+        // Capture CSRF token before the body is consumed.
+        let csrf_token = req
+            .extensions()
+            .get::<crate::security::CsrfToken>()
+            .map(|t| t.token().to_string());
 
-        Ok(Self(data.into_changeset()))
+        let data: T = decode_form_body(req, state).await?;
+
+        Ok(Self {
+            changeset: data.into_changeset(),
+            csrf_token,
+        })
     }
+}
+
+/// Decode a form body — URL-encoded always, multipart when that feature is on.
+async fn decode_form_body<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+where
+    T: serde::de::DeserializeOwned + validator::Validate,
+    S: Send + Sync,
+{
+    let _content_type = req
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    #[cfg(feature = "multipart")]
+    if _content_type.starts_with("multipart/form-data") {
+        return decode_multipart(req, state).await;
+    }
+
+    let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    Ok(data)
+}
+
+/// Decode `multipart/form-data` text fields and deserialize into `T`.
+///
+/// File-upload fields are skipped (file storage is out of scope here).
+/// The collected text pairs are re-encoded as URL-encoded so that
+/// `serde_urlencoded` handles the same type coercions axum's `Form` does.
+#[cfg(feature = "multipart")]
+async fn decode_multipart<T, S>(req: Request, state: &S) -> Result<T, axum::response::Response>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    let mut multipart = axum::extract::Multipart::from_request(req, state)
+        .await
+        .map_err(IntoResponse::into_response)?;
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    loop {
+        let field = multipart
+            .next_field()
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+        let Some(field) = field else { break };
+
+        let name = match field.name() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Skip file-upload fields; text-only decoding is in scope.
+        if field.file_name().is_some() {
+            continue;
+        }
+
+        let value = field
+            .text()
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+
+        pairs.push((name, value));
+    }
+
+    // Re-encode as URL-encoded so serde_urlencoded handles type coercions
+    // ("30" → u32, "true" → bool, etc.) consistently with the Form extractor.
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .finish();
+
+    serde_urlencoded::from_str::<T>(&encoded)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()).into_response())
 }
 
 // ── Internal helpers ───────────────────────────────────────────────
@@ -276,22 +435,18 @@ fn validation_errors_to_map(
         .collect()
 }
 
-// ── Maud rendering helpers ──────────────────────────────────────────
+// ── Standalone Maud helpers ─────────────────────────────────────────
+//
+// These are the building blocks used by `ChangesetForm` methods.
+// They are also public so GET handlers can use them with a bare `Changeset`.
 
 /// Render a `<form>` element wrapping `content`.
 ///
 /// When `csrf_token` is `Some(token)`, a hidden `<input name="_csrf">` is
-/// emitted automatically inside the opening tag — compatible with
-/// [`crate::security::CsrfLayer`]'s form-field validation strategy.
+/// emitted automatically — compatible with [`crate::security::CsrfLayer`].
 ///
-/// # Example
-///
-/// ```rust,ignore
-/// form_tag("/users", "post", Some(csrf.token()), html! {
-///     (text_input(&cs, "name", "Full name"))
-///     (submit_button("Save"))
-/// })
-/// ```
+/// In **POST** handlers, prefer [`ChangesetForm::form_tag`] which injects
+/// the token without any extra parameter.
 #[cfg(feature = "maud")]
 pub fn form_tag(
     action: &str,
@@ -311,18 +466,10 @@ pub fn form_tag(
 
 /// Render a labeled `<input type="text">` tied to a changeset field.
 ///
-/// Automatically:
-/// - sets `name` and `id` to `field`
-/// - populates `value` from the changeset's serialized inner data
-/// - adds `aria-invalid="true"` and `aria-describedby` when errors exist
-/// - emits a sibling `<div role="alert">` with the error messages
-///
-/// # Accessibility
-///
-/// The error block carries `role="alert"` so screen readers announce the
-/// message immediately after re-render.  The `aria-describedby` on the
-/// input links the two elements so assistive technology can also discover
-/// the error via the input's description.
+/// - Sets `name` and `id` to `field`
+/// - Populates `value` from the changeset's serialized data
+/// - Adds `aria-invalid="true"` + `aria-describedby` when errors exist
+/// - Emits a `<div role="alert">` with per-message `<p>` error elements
 #[cfg(feature = "maud")]
 pub fn text_input<T: Serialize>(
     changeset: &Changeset<T>,
@@ -513,7 +660,6 @@ mod tests {
         let mut errors = HashMap::new();
         errors.insert("name".to_string(), vec!["too short".to_string()]);
         let cs = Changeset::from_errors(Form { name: "ab".into() }, errors);
-        // Even though invalid, field_value returns the submitted (bad) value
         assert_eq!(cs.field_value("name"), Some("ab".to_string()));
     }
 
@@ -526,10 +672,7 @@ mod tests {
             #[validate(length(min = 3))]
             name: String,
         }
-        let f = F {
-            name: "Alice".into(),
-        };
-        let cs = f.into_changeset();
+        let cs = F { name: "Alice".into() }.into_changeset();
         assert!(cs.is_valid());
         assert!(cs.errors_for("name").is_empty());
     }
@@ -541,8 +684,7 @@ mod tests {
             #[validate(length(min = 5))]
             name: String,
         }
-        let f = F { name: "ab".into() };
-        let cs = f.into_changeset();
+        let cs = F { name: "ab".into() }.into_changeset();
         assert!(!cs.is_valid());
         assert!(!cs.errors_for("name").is_empty());
     }
@@ -554,8 +696,7 @@ mod tests {
             #[validate(length(min = 5))]
             name: String,
         }
-        let f = F { name: "ab".into() };
-        let cs = f.into_changeset();
+        let cs = F { name: "ab".into() }.into_changeset();
         assert_eq!(cs.data().name, "ab");
     }
 
@@ -568,14 +709,74 @@ mod tests {
             #[validate(email)]
             email: String,
         }
-        let f = F {
+        let cs = F {
             name: "a".into(),
             email: "not-email".into(),
-        };
-        let cs = f.into_changeset();
+        }
+        .into_changeset();
         assert!(!cs.is_valid());
         assert!(!cs.errors_for("name").is_empty());
         assert!(!cs.errors_for("email").is_empty());
+    }
+
+    // ── ChangesetForm helpers ──────────────────────────────────────
+
+    #[test]
+    fn changeset_form_blank_is_valid() {
+        #[derive(validator::Validate, serde::Serialize)]
+        struct F {
+            #[validate(length(min = 1))]
+            name: String,
+        }
+        let form = ChangesetForm::blank(F { name: "ok".into() }, "tok");
+        assert!(form.is_valid()); // via Deref
+        assert_eq!(form.csrf_token(), Some("tok"));
+    }
+
+    #[test]
+    fn changeset_form_deref_exposes_changeset_methods() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(length(min = 3))]
+            name: String,
+        }
+        let changeset = F { name: "ab".into() }.into_changeset();
+        let form = ChangesetForm {
+            changeset,
+            csrf_token: None,
+        };
+        // Deref gives access to Changeset methods
+        assert!(!form.is_valid());
+        assert!(!form.errors_for("name").is_empty());
+    }
+
+    #[test]
+    fn changeset_form_into_valid_ok() {
+        #[derive(validator::Validate)]
+        struct F {
+            #[validate(length(min = 1))]
+            name: String,
+        }
+        let form = ChangesetForm {
+            changeset: F { name: "ok".into() }.into_changeset(),
+            csrf_token: None,
+        };
+        assert!(form.into_valid().is_ok());
+    }
+
+    #[test]
+    fn changeset_form_into_valid_err_preserves_csrf() {
+        #[derive(Debug, validator::Validate)]
+        struct F {
+            #[validate(length(min = 5))]
+            name: String,
+        }
+        let form = ChangesetForm {
+            changeset: F { name: "ab".into() }.into_changeset(),
+            csrf_token: Some("tok123".into()),
+        };
+        let err_form = form.into_valid().unwrap_err();
+        assert_eq!(err_form.csrf_token(), Some("tok123"));
     }
 
     // ── Maud helpers ───────────────────────────────────────────────
@@ -583,44 +784,46 @@ mod tests {
     #[cfg(feature = "maud")]
     #[test]
     fn form_tag_renders_action_and_method() {
-        let markup = form_tag("/users", "post", None, maud::html! { "" });
-        let html = markup.into_string();
-        assert!(html.contains(r#"action="/users""#), "missing action: {html}");
-        assert!(html.contains(r#"method="post""#), "missing method: {html}");
+        let html = form_tag("/users", "post", None, maud::html! { "" }).into_string();
+        assert!(html.contains(r#"action="/users""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
     #[test]
     fn form_tag_emits_csrf_hidden_input_when_token_provided() {
-        let markup = form_tag("/users", "post", Some("tok123"), maud::html! { "" });
-        let html = markup.into_string();
-        assert!(html.contains(r#"name="_csrf""#), "missing _csrf: {html}");
-        assert!(html.contains(r#"value="tok123""#), "missing token value: {html}");
-        assert!(
-            html.contains(r#"type="hidden""#),
-            "missing hidden type: {html}"
-        );
+        let html = form_tag("/users", "post", Some("tok123"), maud::html! { "" }).into_string();
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+        assert!(html.contains(r#"value="tok123""#), "{html}");
+        assert!(html.contains(r#"type="hidden""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
     #[test]
     fn form_tag_omits_csrf_input_when_none() {
-        let markup = form_tag("/users", "post", None, maud::html! { "" });
-        let html = markup.into_string();
-        assert!(!html.contains("_csrf"), "unexpected _csrf: {html}");
+        let html = form_tag("/users", "post", None, maud::html! { "" }).into_string();
+        assert!(!html.contains("_csrf"), "{html}");
     }
 
     #[cfg(feature = "maud")]
     #[test]
     fn form_tag_includes_content() {
-        let markup = form_tag(
-            "/x",
-            "post",
-            None,
-            maud::html! { span { "inner content" } },
-        );
-        let html = markup.into_string();
-        assert!(html.contains("inner content"), "missing content: {html}");
+        let html = form_tag("/x", "post", None, maud::html! { span { "inner" } }).into_string();
+        assert!(html.contains("inner"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn changeset_form_form_tag_injects_stored_csrf() {
+        #[derive(validator::Validate, serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let form = ChangesetForm::blank(F { name: String::new() }, "secret-token");
+        let html = form
+            .form_tag("/x", "post", maud::html! { "" })
+            .into_string();
+        assert!(html.contains(r#"value="secret-token""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
@@ -711,12 +914,11 @@ mod tests {
         assert!(html.contains("Save"), "{html}");
     }
 
-    // ── ChangesetForm extractor ────────────────────────────────────
+    // ── ChangesetForm extractor (axum integration) ─────────────────
 
-    #[cfg(test)]
     mod extractor_tests {
         use super::*;
-        use axum::{body::Body, http::Request, routing::post, Router};
+        use axum::{body::Body, routing::post, Router};
         use tower::ServiceExt;
 
         #[derive(serde::Deserialize, validator::Validate)]
@@ -727,105 +929,184 @@ mod tests {
 
         #[tokio::test]
         async fn valid_form_body_produces_valid_changeset() {
-            async fn handler(ChangesetForm(cs): ChangesetForm<TestForm>) -> String {
-                format!("valid={}", cs.is_valid())
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("valid={}", form.is_valid())
             }
-
-            let app = Router::new().route("/test", post(handler));
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/test")
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .body(Body::from("name=Alice"))
-                        .unwrap(),
-                )
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice"))
                 .await
                 .unwrap();
-
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            assert_eq!(std::str::from_utf8(&body).unwrap(), "valid=true");
+            assert_body(resp, "valid=true").await;
         }
 
         #[tokio::test]
         async fn invalid_form_body_produces_invalid_changeset() {
-            async fn handler(ChangesetForm(cs): ChangesetForm<TestForm>) -> String {
-                format!("valid={}", cs.is_valid())
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("valid={}", form.is_valid())
             }
-
-            let app = Router::new().route("/test", post(handler));
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/test")
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .body(Body::from("name=ab")) // too short
-                        .unwrap(),
-                )
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=ab"))
                 .await
                 .unwrap();
-
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            assert_eq!(std::str::from_utf8(&body).unwrap(), "valid=false");
+            assert_body(resp, "valid=false").await;
         }
 
         #[tokio::test]
-        async fn invalid_form_exposes_field_errors_via_changeset() {
-            async fn handler(ChangesetForm(cs): ChangesetForm<TestForm>) -> String {
-                cs.errors_for("name").join("|")
+        async fn invalid_form_exposes_field_errors() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                form.errors_for("name").join("|")
             }
-
-            let app = Router::new().route("/test", post(handler));
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/test")
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .body(Body::from("name=ab"))
-                        .unwrap(),
-                )
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=ab"))
                 .await
                 .unwrap();
-
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let text = std::str::from_utf8(&body).unwrap();
-            assert!(!text.is_empty(), "expected error messages, got empty string");
+            let body = body_text(resp).await;
+            assert!(!body.is_empty(), "expected errors, got empty string");
         }
 
         #[tokio::test]
         async fn missing_required_field_returns_non_200() {
-            async fn handler(ChangesetForm(cs): ChangesetForm<TestForm>) -> String {
-                format!("valid={}", cs.is_valid())
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("valid={}", form.is_valid())
             }
-
-            let app = Router::new().route("/test", post(handler));
-            // Body with no `name` key — serde deserialization fails
-            let resp = app
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/test")
-                        .header("Content-Type", "application/x-www-form-urlencoded")
-                        .body(Body::from("other=value"))
-                        .unwrap(),
-                )
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "other=value"))
                 .await
                 .unwrap();
+            assert_ne!(resp.status(), axum::http::StatusCode::OK);
+        }
 
-            assert_ne!(
-                resp.status(),
-                axum::http::StatusCode::OK,
-                "expected non-200 for failed decode"
+        #[tokio::test]
+        async fn csrf_token_is_none_without_csrf_middleware() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                form.csrf_token().unwrap_or("none").to_string()
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(urlencoded_req("/test", "name=Alice"))
+                .await
+                .unwrap();
+            assert_body(resp, "none").await;
+        }
+
+        #[tokio::test]
+        async fn csrf_token_captured_from_request_extensions() {
+            // Build a request with CsrfToken pre-inserted in extensions,
+            // simulating what CsrfLayer does, then call from_request directly.
+            use crate::security::CsrfToken;
+
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/test")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from("name=Alice"))
+                .unwrap();
+            req.extensions_mut()
+                .insert(CsrfToken::new("secret-tok".to_string()));
+
+            let form = ChangesetForm::<TestForm>::from_request(req, &())
+                .await
+                .expect("extraction should succeed");
+
+            assert_eq!(form.csrf_token(), Some("secret-tok"));
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_form_decodes_text_fields() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("valid={} name={}", form.is_valid(), form.data().name)
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req("/test", "name", "Alice"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=true name=Alice").await;
+        }
+
+        #[cfg(feature = "multipart")]
+        #[tokio::test]
+        async fn multipart_form_validates_fields() {
+            async fn handler(form: ChangesetForm<TestForm>) -> String {
+                format!("valid={}", form.is_valid())
+            }
+            let resp = Router::new()
+                .route("/test", post(handler))
+                .oneshot(multipart_req("/test", "name", "ab"))
+                .await
+                .unwrap();
+            assert_body(resp, "valid=false").await;
+        }
+
+        // ── LOC budget test ────────────────────────────────────────
+
+        #[test]
+        fn hello_example_form_section_within_forty_loc() {
+            // Count non-blank, non-comment lines from the GreetForm struct
+            // to the #[autumn_web::main] entry point, verifying the
+            // "≤ 40 LoC of route + template code" promise from issue #508.
+            let src = include_str!("../../examples/hello/src/main.rs");
+            let loc: usize = src
+                .lines()
+                .skip_while(|l| !l.contains("GreetForm"))
+                .take_while(|l| !l.contains("#[autumn_web::main]"))
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.is_empty() && !t.starts_with("//") && !t.starts_with("//!")
+                })
+                .count();
+            assert!(
+                loc <= 40,
+                "Form section of hello example exceeds 40 LoC (got {loc}). \
+                 Keep route + template code within budget."
             );
+        }
+
+        // ── Helpers ────────────────────────────────────────────────
+
+        fn urlencoded_req(uri: &str, body: &'static str) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        #[cfg(feature = "multipart")]
+        fn multipart_req(uri: &str, field: &str, value: &str) -> axum::http::Request<Body> {
+            let boundary = "----FormBoundary7MA4YWxkTrZu0gW";
+            let body = format!(
+                "--{boundary}\r\n\
+                 Content-Disposition: form-data; name=\"{field}\"\r\n\r\n\
+                 {value}\r\n\
+                 --{boundary}--\r\n"
+            );
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(
+                    "Content-Type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        async fn body_text(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+
+        async fn assert_body(resp: axum::response::Response, expected: &str) {
+            assert_eq!(body_text(resp).await, expected);
         }
     }
 }
