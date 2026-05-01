@@ -60,7 +60,7 @@ struct NewPost<'a> {
 
 #[tokio::main]
 async fn main() {
-    let ctx = SeedContext::build().await.expect("seed context");
+    let ctx = SeedContext::build().expect("seed context");
     println!("Seeding ({})...", ctx.profile());
 
     let mut db = ctx.conn().await.expect("db connection");
@@ -181,7 +181,7 @@ Re-running skips rows whose slug already exists.
 
 ```rust
 /// Build a seed context from environment + autumn.toml.
-pub async fn build() -> Result<SeedContext, SeedContextError>
+pub fn build() -> Result<SeedContext, SeedContextError>
 
 /// Active profile (e.g. "dev", "demo", "test").
 pub fn profile(&self) -> &str

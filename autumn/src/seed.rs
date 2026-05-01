@@ -14,7 +14,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let ctx = SeedContext::build().await.expect("seed context");
+//!     let ctx = SeedContext::build().expect("seed context");
 //!     let mut db = ctx.conn().await.expect("db connection");
 //!     // use db with Diesel queries ...
 //!     println!("Seed complete (profile: {})", ctx.profile());
@@ -58,7 +58,7 @@ pub enum SeedContextError {
 /// # use autumn_web::seed::SeedContext;
 /// # #[tokio::main]
 /// # async fn main() {
-/// let ctx = SeedContext::build().await.expect("seed context");
+/// let ctx = SeedContext::build().expect("seed context");
 /// println!("profile: {}", ctx.profile());
 /// let mut db = ctx.conn().await.expect("connection");
 /// // use &mut *db as &mut AsyncPgConnection with diesel_async queries
@@ -88,7 +88,7 @@ impl SeedContext {
     /// Returns [`SeedContextError::NoDatabaseUrl`] if no database URL is
     /// configured, or [`SeedContextError::PoolBuild`] if the pool cannot be
     /// constructed.
-    pub async fn build() -> Result<Self, SeedContextError> {
+    pub fn build() -> Result<Self, SeedContextError> {
         let profile = resolve_profile();
         let db_url =
             resolve_database_url().ok_or(SeedContextError::NoDatabaseUrl)?;

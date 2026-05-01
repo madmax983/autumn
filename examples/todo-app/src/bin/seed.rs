@@ -33,7 +33,6 @@ struct NewTodo<'a> {
 #[tokio::main]
 async fn main() {
     let ctx = SeedContext::build()
-        .await
         .expect("failed to build seed context — is the database running and AUTUMN_DATABASE__URL set?");
 
     println!("Seeding todo-app (profile: {})...", ctx.profile());

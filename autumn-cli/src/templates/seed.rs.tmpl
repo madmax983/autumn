@@ -12,7 +12,6 @@ use autumn_web::seed::SeedContext;
 #[tokio::main]
 async fn main() {
     let ctx = SeedContext::build()
-        .await
         .expect("failed to build seed context — is the database running?");
 
     println!("Seeding database (profile: {})...", ctx.profile());

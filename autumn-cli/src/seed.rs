@@ -20,24 +20,22 @@ pub enum SeedError {
     )]
     MissingSeedBinary,
 
-    #[error(
-        "pending migrations detected; run `autumn migrate` before `autumn seed`"
-    )]
+    #[error("pending migrations detected; run `autumn migrate` before `autumn seed`")]
     PendingMigrations,
 }
 
 /// Returns `true` if the seed binary source file exists at `path`.
-pub(crate) fn seed_binary_exists_at(path: &Path) -> bool {
+fn seed_binary_exists_at(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Resolve the database URL for the pending-migration check.
+/// Resolve the database URL from environment variables and `autumn.toml`.
 ///
 /// Precedence (highest to lowest):
 /// 1. `AUTUMN_DATABASE__URL` env var
 /// 2. `DATABASE_URL` env var
 /// 3. `database.url` in `autumn.toml`
-pub(crate) fn resolve_database_url_with_env<F>(env_var: F) -> Result<String, SeedError>
+fn resolve_database_url_with_env<F>(env_var: F) -> Result<String, SeedError>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -71,6 +69,11 @@ where
     Err(SeedError::MissingSeedBinary)
 }
 
+/// Resolve the database URL using the real environment.
+fn resolve_database_url() -> Result<String, SeedError> {
+    resolve_database_url_with_env(|key| std::env::var(key))
+}
+
 /// Check whether there are pending (unapplied) migrations.
 ///
 /// Runs `diesel migration list` and scans for `[ ]` markers that indicate
@@ -82,24 +85,20 @@ fn check_pending_migrations(database_url: &str, migrations_dir: &str) -> Result<
         .env("DATABASE_URL", database_url)
         .output();
 
-    match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let combined = format!("{stdout}{stderr}");
-            if combined.lines().any(|line| line.contains("[ ]")) {
-                return Err(SeedError::PendingMigrations);
-            }
-            Ok(())
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}{stderr}");
+        if combined.lines().any(|line| line.contains("[ ]")) {
+            return Err(SeedError::PendingMigrations);
         }
-        Err(_) => {
-            eprintln!(
-                "  \u{26a0} diesel CLI not found; skipping pending-migration check.\n  \
-                 Install with: cargo install diesel_cli --no-default-features --features postgres"
-            );
-            Ok(())
-        }
+    } else {
+        eprintln!(
+            "  \u{26a0} diesel CLI not found; skipping pending-migration check.\n  \
+             Install with: cargo install diesel_cli --no-default-features --features postgres"
+        );
     }
+    Ok(())
 }
 
 /// Entry point for `autumn seed`.
@@ -113,22 +112,13 @@ pub fn run(profile: &str, package: Option<&str>) {
         std::process::exit(1);
     }
 
-    // Best-effort pending migration check when diesel CLI is available.
-    let db_url = std::env::var("AUTUMN_DATABASE__URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_default();
-    if !db_url.is_empty() {
-        let migrations_dir = if Path::new("migrations").is_dir() {
-            "migrations"
-        } else {
-            ""
-        };
-        if !migrations_dir.is_empty() {
-            if let Err(e) = check_pending_migrations(&db_url, migrations_dir) {
-                eprintln!("\u{2717} {e}");
-                std::process::exit(1);
-            }
-        }
+    // Best-effort pending migration check when diesel CLI and migrations dir are available.
+    if let Ok(db_url) = resolve_database_url()
+        && Path::new("migrations").is_dir()
+        && let Err(e) = check_pending_migrations(&db_url, "migrations")
+    {
+        eprintln!("\u{2717} {e}");
+        std::process::exit(1);
     }
 
     eprintln!("  Running seed binary...\n");
@@ -255,7 +245,6 @@ mod tests {
     fn resolve_db_url_returns_err_when_no_env_no_toml() {
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-        // No autumn.toml in the test working directory path being injected
         assert!(resolve_database_url_with_env(env).is_err());
     }
 
