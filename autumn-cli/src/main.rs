@@ -4,6 +4,7 @@ mod build;
 mod dev;
 mod export;
 mod generate;
+mod mail;
 mod migrate;
 mod monitor;
 mod new;
@@ -57,6 +58,12 @@ enum Commands {
     Migrate {
         #[command(subcommand)]
         action: Option<MigrateCommands>,
+    },
+    /// View local transactional emails in a TUI
+    Mail {
+        /// Directory containing .eml files (default: target/mail)
+        #[arg(short, long, default_value = "target/mail")]
+        dir: String,
     },
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
@@ -227,6 +234,7 @@ fn main() {
             };
             migrate::run(action);
         }
+        Commands::Mail { dir } => mail::run(&dir),
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
         Commands::New { name, with_seed } => new::run(&name, with_seed),
@@ -439,6 +447,17 @@ mod tests {
                 action: Some(MigrateCommands::Status)
             }
         ));
+    }
+
+    #[test]
+    fn parse_mail_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "mail"]).unwrap();
+        match cli.command {
+            Commands::Mail { dir } => {
+                assert_eq!(dir, "target/mail");
+            }
+            _ => panic!("expected Mail command"),
+        }
     }
 
     #[test]
