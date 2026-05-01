@@ -594,7 +594,7 @@ autumn_web::app()
 ```
 
 No Redis or external job queue needed for simple scheduled tasks. For durable
-workflows with retries and complex DAGs, see `autumn-harvest`.
+request-triggered background work with retries, use Autumn's `#[job]` runtime.
 
 ### Convention vs. Configuration
 

@@ -6,18 +6,23 @@ Autumn integrations are packaged as **plugins**: small types that implement
 tuple-taking `.plugins((...))`, and each plugin's `build` runs exactly once.
 
 ```rust
-use autumn_harvest_plugin::HarvestPlugin;
-use autumn_harvest::prelude::*;
+use autumn_web::app::AppBuilder;
+use autumn_web::plugin::Plugin;
+
+struct LiveFeedPlugin;
+
+impl Plugin for LiveFeedPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        app.on_startup(|state| async move {
+            tracing::info!(profile = state.profile(), "live feed started");
+            Ok(())
+        })
+    }
+}
 
 autumn_web::app()
     .routes(routes![...])
-    .plugins((
-        HarvestPlugin::new()
-            .workflows(workflows![onboarding])
-            .activities(activities![send_email])
-            .api("/api/harvest"),
-        MyLiveFeedPlugin::new(),
-    ))
+    .plugin(LiveFeedPlugin)
     .run()
     .await;
 ```
@@ -31,8 +36,7 @@ autumn_web::app()
 
 Third-party crates keep the `autumn-plugin-` prefix so the ecosystem
 is easy to search on crates.io. First-party crates reverse the order so
-they cluster with the crate they extend (e.g. `autumn-harvest-plugin`
-sits next to `autumn-harvest`).
+they cluster with the crate they extend.
 
 Every plugin crate should expose its `<Name>Plugin` type at the crate
 root along with a `::new()` constructor and `#[must_use]` fluent

@@ -32,7 +32,7 @@ For deeper details, read these files from the `references/` directory next to th
 - **`references/examples.md`** — Complete main.rs and Cargo.toml from the blog,
   todo-app, and reddit-clone examples. Read this when building a full app to see
   idiomatic patterns in context. The **reddit-clone** is the most comprehensive example
-  and uses every framework feature including autumn-harvest workflows.
+  and uses every framework feature including first-class background jobs.
 
 ---
 
@@ -53,7 +53,7 @@ my-app/
 │   │   ├── mod.rs
 │   │   └── layout.rs
 │   ├── tasks.rs             # #[scheduled] background tasks
-│   └── workflows/           # autumn-harvest workflows (if using harvest)
+│   └── jobs.rs              # #[job] request-triggered background work
 ├── migrations/
 │   └── 00000000000000_init/
 │       ├── up.sql
@@ -141,7 +141,7 @@ async fn main() {
 | `.static_routes(static_routes![...])` | Pre-rendered routes (`#[static_get]`) |
 | `.tasks(tasks![...])` | Scheduled background tasks |
 | `.migrations(MIGRATIONS)` | Embedded Diesel migrations |
-| `.plugins(plugin)` | Framework plugins (e.g. `HarvestPlugin`) |
+| `.plugins(plugin)` | Framework plugins |
 | `.scoped(scope)` | Scoped sub-application |
 | `.merge(router)` | Merge an Axum router |
 | `.nest(path, router)` | Nest a sub-router at a path |
@@ -441,11 +441,10 @@ Autumn automatically serves:
 
 ## Plugins
 
-Plugins extend the `AppBuilder`. The main built-in plugin is `HarvestPlugin` for
-durable workflows (see the **autumn-harvest** skill for details).
+Plugins extend the `AppBuilder` for app-owned infrastructure such as live feed relays, telemetry exporters, and custom route bundles.
 
 ```rust
-.plugins(harvest_runtime::harvest_plugin())
+.plugin(live_events::LiveFeedPlugin::new())
 // or multiple:
 .plugins((plugin_a(), plugin_b()))
 ```
@@ -531,3 +530,4 @@ impl ErrorPageRenderer for MyErrorPages {
 - The reddit-clone example is the most comprehensive reference for a full-featured app
 - Use `[patch.crates-io]` in workspace Cargo.toml to unify autumn-web across workspace:
   `autumn-web = { path = "autumn" }`
+
