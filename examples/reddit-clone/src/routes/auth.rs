@@ -17,7 +17,7 @@ use tracing::warn;
 use crate::models::{NewUser, User};
 use crate::schema::users;
 
-use super::layout::{layout, redirect_to};
+use super::layout::layout;
 
 struct AccountMailer;
 
@@ -111,7 +111,7 @@ pub async fn register(
     mailer: Mailer,
     session: Session,
     form: Form<RegisterForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
     let email = form.0.email.trim().to_owned();
     let password = form.0.password;
@@ -194,7 +194,7 @@ pub async fn register(
 
     AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
-    Ok(redirect_to("/"))
+    Ok(Redirect::to("/"))
 }
 
 // ── Login ──────────────────────────────────────────────────────
@@ -289,7 +289,7 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Markup> {
+pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table
@@ -309,7 +309,7 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    Ok(redirect_to("/"))
+    Ok(Redirect::to("/"))
 }
 
 // ── Logout ─────────────────────────────────────────────────────
@@ -392,3 +392,5 @@ pub async fn profile(
         },
     ))
 }
+
+autumn_web::paths![register_form, register, login_form, login, logout, profile];

@@ -4,24 +4,13 @@ use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
 use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, Markup, PreEscaped, html};
 
-/// Render a meta-refresh redirect page (for regular form submissions).
-pub fn redirect_to(url: &str) -> Markup {
-    html! {
-        (PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
-
-/// Redirect that works for htmx requests.
+/// Redirect that works for both regular and htmx requests.
 ///
 /// Returns an `HX-Redirect` header so htmx performs a full-page navigation
 /// instead of swapping the response into the triggering element. Also
-/// includes a meta-refresh fallback for non-htmx clients.
+/// includes a standard HTTP redirect fallback for non-htmx clients.
 pub fn hx_redirect_to(url: &str) -> Response {
-    let mut response = redirect_to(url).into_response();
+    let mut response = autumn_web::Redirect::to(url).into_response();
     response.headers_mut().insert(
         http::header::HeaderName::from_static("hx-redirect"),
         http::header::HeaderValue::from_str(url)
@@ -118,7 +107,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
         div id=(format!("votes-{post_id}"))
             class="flex flex-col items-center gap-0.5 text-sm select-none" {
             button
-                hx-post=(format!("/posts/{post_id}/upvote"))
+                hx-post=(super::votes::__autumn_path_upvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-orange-500 cursor-pointer text-lg leading-none" {
@@ -126,7 +115,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
             }
             span class="font-semibold text-gray-700" { (score) }
             button
-                hx-post=(format!("/posts/{post_id}/downvote"))
+                hx-post=(super::votes::__autumn_path_downvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-blue-500 cursor-pointer text-lg leading-none" {

@@ -503,6 +503,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let update_info = format_ident!("__autumn_route_info_{prefix}_api_update");
         let delete_info = format_ident!("__autumn_route_info_{prefix}_api_delete");
 
+        let list_path_fn = format_ident!("__autumn_path_{prefix}_api_list");
+        let get_path_fn = format_ident!("__autumn_path_{prefix}_api_get");
+        let create_path_fn = format_ident!("__autumn_path_{prefix}_api_create");
+        let update_path_fn = format_ident!("__autumn_path_{prefix}_api_update");
+        let delete_path_fn = format_ident!("__autumn_path_{prefix}_api_delete");
+
         let id_path = format!("{api_path}/{{id}}");
 
         let has_policy = config.policy_type.is_some();
@@ -922,6 +928,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                 }
+            }
+
+            // ── Path helpers for API routes ───────────────────────
+
+            #[doc(hidden)]
+            #vis fn #list_path_fn() -> ::std::string::String {
+                #api_path.to_owned()
+            }
+
+            #[doc(hidden)]
+            #vis fn #get_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
+            }
+
+            #[doc(hidden)]
+            #vis fn #create_path_fn() -> ::std::string::String {
+                #api_path.to_owned()
+            }
+
+            #[doc(hidden)]
+            #vis fn #update_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
+            }
+
+            #[doc(hidden)]
+            #vis fn #delete_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
+                format!("{}/{id}", #api_path)
             }
         }
     } else {

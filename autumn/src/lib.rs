@@ -111,7 +111,9 @@ pub(crate) mod logging;
 pub mod middleware;
 pub mod openapi;
 pub mod pagination;
+pub mod paths;
 pub mod prelude;
+pub use paths::PathExt;
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route};
 pub mod security;
@@ -369,6 +371,48 @@ pub use autumn_macros::repository;
 /// ```
 #[cfg(feature = "db")]
 pub use autumn_macros::service;
+
+/// Annotate an async function as a `PATCH` route handler.
+///
+/// Generates a companion function that returns a [`crate::route::Route`]
+/// and a typed `__autumn_path_{name}(…) -> String` path helper.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::patch;
+///
+/// #[patch("/items/{id}")]
+/// async fn patch_item() -> &'static str {
+///     "patched"
+/// }
+/// ```
+pub use autumn_macros::patch;
+
+/// Emit a `pub mod paths { … }` re-exporting typed path helpers.
+///
+/// Takes the same comma-separated handler list as [`routes!`]. Invoke once
+/// in the module where your handlers live:
+///
+/// ```ignore
+/// autumn_web::paths![show_post, create_post];
+/// // callers can then: use crate::routes::paths;
+/// //                    paths::show_post(42)
+/// ```
+pub use autumn_macros::paths;
+
+/// HTTP redirect response.
+///
+/// Re-exported from [Axum](https://docs.rs/axum) so route handlers can
+/// return a redirect without a direct `axum` dependency.
+///
+/// Use [`Redirect::to`] with a path helper:
+///
+/// ```ignore
+/// use autumn_web::Redirect;
+/// Redirect::to(&paths::show_post(id))
+/// ```
+pub use axum::response::Redirect;
 
 /// Annotate an async function as a `POST` route handler.
 ///

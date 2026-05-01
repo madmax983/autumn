@@ -23,6 +23,7 @@ mod model;
 mod oauth2_callback;
 mod param_helpers;
 mod parse;
+mod paths_macro;
 mod repository;
 mod route;
 mod routes_macro;
@@ -105,6 +106,26 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
     route::route_macro("PUT", "put", attr.into(), item.into()).into()
 }
 
+/// Annotate an async function as a PATCH route handler.
+///
+/// Generates a companion `__autumn_route_info_{name}()` function and a typed
+/// `__autumn_path_{name}(…) -> String` path helper.
+///
+/// # Example
+///
+/// ```ignore
+/// use autumn_web::patch;
+///
+/// #[patch("/items/{id}")]
+/// async fn patch_item() -> &'static str {
+///     "patched"
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
+    route::route_macro("PATCH", "patch", attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a DELETE route handler.
 ///
 /// Generates a companion `__autumn_route_info_{name}()` function that
@@ -159,6 +180,29 @@ pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn routes(input: TokenStream) -> TokenStream {
     routes_macro::routes_macro(input.into()).into()
+}
+
+/// Emit a `pub mod paths { … }` that re-exports each handler's typed path helper.
+///
+/// Takes the same comma-separated handler list as [`routes!`]. Each entry
+/// exposes its `__autumn_path_{name}` companion under the short name:
+///
+/// ```ignore
+/// autumn_web::paths![show_post, create_post, posts::index];
+/// // expands to:
+/// pub mod paths {
+///     pub use super::__autumn_path_show_post as show_post;
+///     pub use super::__autumn_path_create_post as create_post;
+///     pub use super::posts::__autumn_path_index as index;
+/// }
+/// ```
+///
+/// Call this once at the top of the module where your handlers live (or a
+/// sibling module) so consumers can write `use crate::routes::paths;` and
+/// then `paths::show_post(id)`.
+#[proc_macro]
+pub fn paths(input: TokenStream) -> TokenStream {
+    paths_macro::paths_macro(input.into()).into()
 }
 
 /// Set up the async runtime for an Autumn application.

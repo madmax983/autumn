@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **typed path helpers:** Route macros (`#[get]`, `#[post]`, `#[put]`,
+  `#[delete]`, `#[patch]`) now emit a companion
+  `pub fn __autumn_path_{name}(params…) -> String` helper alongside every
+  handler (#499). The `paths![show, create, …]` macro expands into a
+  `pub mod paths { pub use super::__autumn_path_show as show; … }` so
+  templates write `paths::show(post.id)` instead of
+  `format!("/posts/{}", post.id)`. A `name = "custom_name"` attribute
+  argument overrides the helper's short name. The `PathExt` trait
+  (re-exported from `autumn_web::prelude`) adds `.with_query("key",
+  value)` for building query strings with RFC 3986 percent-encoding.
+  `axum::response::Redirect` is re-exported as `autumn_web::Redirect` and
+  added to the prelude, replacing every hand-rolled meta-refresh HTML
+  redirect in the examples. `#[repository(api = "…")]` now also emits
+  path helpers (`__autumn_path_{prefix}_api_list()`,
+  `__autumn_path_{prefix}_api_delete(id)`, etc.) for its generated REST
+  endpoints. All five examples migrated: `git grep 'format!("/'
+  examples/` and `git grep 'fn redirect_to' examples/` both return zero
+  hits.
+
 - **authorization:** First-class record-level authorization — `Policy` /
   `Scope` traits, `PolicyContext` carrying the resolved `Session` /
   user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
