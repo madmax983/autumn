@@ -872,4 +872,30 @@ mod tests {
         let layer = CsrfLayer::from_config(&config);
         assert_eq!(layer.settings.token_header.as_str(), "x-csrf-token");
     }
+
+    #[tokio::test]
+    async fn post_with_invalid_utf8_body_returns_403() {
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        // Construct a body with invalid UTF-8 (0xFF)
+        let mut invalid_body = b"_csrf=token123&other=".to_vec();
+        invalid_body.push(0xFF);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", "autumn-csrf=token123")
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(invalid_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
