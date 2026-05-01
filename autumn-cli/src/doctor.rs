@@ -399,7 +399,7 @@ fn check_tailwind_binary() -> CheckResult {
     };
     check_tailwind_binary_impl(
         &path,
-        |p| p.exists(),
+        std::path::Path::exists,
         |p| {
             // Try to invoke the binary; Ok(_) means the OS could execute it
             // regardless of exit code (--help may return 0 or 1 depending on version).
@@ -680,6 +680,7 @@ fn tailwind_enabled() -> bool {
 ///    Results are joined back in display order.
 pub fn run(opts: DoctorOptions) {
     use std::thread;
+    type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
 
@@ -696,7 +697,6 @@ pub fn run(opts: DoctorOptions) {
     let tailwind = tailwind_enabled();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
-    type Task = Box<dyn FnOnce() -> CheckResult + Send>;
     let mut tasks: Vec<Task> = Vec::new();
 
     // 1. Rust toolchain
