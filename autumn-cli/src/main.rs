@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod build;
 mod dev;
+mod doctor;
 mod export;
 mod generate;
 mod migrate;
@@ -122,6 +123,18 @@ enum Commands {
     ///   autumn generate scaffold Post title:String body:Text published:bool
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
+
+    /// Check the local environment and project configuration for common
+    /// first-run problems (Rust MSRV, autumn.toml validity, database
+    /// connectivity, port availability, Tailwind binary, and more).
+    Doctor {
+        /// Emit machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+        /// Treat warnings as failures (exit 1 on any ⚠️).
+        #[arg(long)]
+        strict: bool,
+    },
 
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
@@ -270,6 +283,9 @@ fn main() {
                 methods: &method,
                 user_only,
             });
+        }
+        Commands::Doctor { json, strict } => {
+            doctor::run(doctor::DoctorOptions { json, strict });
         }
         Commands::Generate(cmd) => match cmd {
             GenerateCommands::Model {
@@ -866,6 +882,56 @@ mod tests {
             }
             _ => panic!("expected Routes command"),
         }
+    }
+
+    // ── autumn doctor tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_doctor_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "doctor"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                json: false,
+                strict: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_doctor_json_flag() {
+        let cli = Cli::try_parse_from(["autumn", "doctor", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                json: true,
+                strict: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_doctor_strict_flag() {
+        let cli = Cli::try_parse_from(["autumn", "doctor", "--strict"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                json: false,
+                strict: true
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_doctor_json_and_strict() {
+        let cli = Cli::try_parse_from(["autumn", "doctor", "--json", "--strict"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Doctor {
+                json: true,
+                strict: true
+            }
+        ));
     }
 
     // ── autumn new --with-seed tests ───────────────────────────────────────
