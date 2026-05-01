@@ -34,9 +34,18 @@ mod tests {
     #[test]
     fn test_path_helpers() {
         assert_eq!(pages::__autumn_path_list(), "/");
-        assert_eq!(pages::__autumn_path_show("hello".to_owned()), "/pages/hello");
-        assert_eq!(pages::__autumn_path_edit_form("hello".to_owned()), "/pages/hello/edit");
-        assert_eq!(pages::__autumn_path_history("hello".to_owned()), "/pages/hello/history");
+        assert_eq!(
+            pages::__autumn_path_show("hello".to_owned()),
+            "/pages/hello"
+        );
+        assert_eq!(
+            pages::__autumn_path_edit_form("hello".to_owned()),
+            "/pages/hello/edit"
+        );
+        assert_eq!(
+            pages::__autumn_path_history("hello".to_owned()),
+            "/pages/hello/history"
+        );
     }
 
     #[test]

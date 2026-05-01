@@ -452,4 +452,13 @@ pub async fn delete_post(id: Path<i64>, mut db: Db) -> AutumnResult<String> {
     Ok(String::new())
 }
 
-autumn_web::paths![index, show, admin_list, new_form, create, edit_form, update, delete_post];
+autumn_web::paths![
+    index,
+    show,
+    admin_list,
+    new_form,
+    create,
+    edit_form,
+    update,
+    delete_post
+];

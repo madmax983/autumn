@@ -46,10 +46,9 @@ pub fn paths_macro(input: TokenStream) -> TokenStream {
             // `super` / `self`) are used verbatim; simple / module-qualified
             // relative paths are reached via `super::`.
             let is_absolute = companion.leading_colon.is_some()
-                || companion
-                    .segments
-                    .first()
-                    .is_some_and(|s| matches!(s.ident.to_string().as_str(), "crate" | "super" | "self"));
+                || companion.segments.first().is_some_and(|s| {
+                    matches!(s.ident.to_string().as_str(), "crate" | "super" | "self")
+                });
 
             if is_absolute {
                 quote! { pub use #companion as #alias; }

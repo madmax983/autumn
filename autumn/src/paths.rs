@@ -55,8 +55,16 @@ fn percent_encode(s: &str) -> String {
                 out.push('%');
                 let hi = b >> 4;
                 let lo = b & 0xF;
-                out.push(char::from_digit(u32::from(hi), 16).unwrap().to_ascii_uppercase());
-                out.push(char::from_digit(u32::from(lo), 16).unwrap().to_ascii_uppercase());
+                out.push(
+                    char::from_digit(u32::from(hi), 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit(u32::from(lo), 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
             }
         }
     }
@@ -74,7 +82,10 @@ mod tests {
 
     #[test]
     fn with_query_second_param() {
-        let url = "/posts".to_string().with_query("page", 1).with_query("size", 20);
+        let url = "/posts"
+            .to_string()
+            .with_query("page", 1)
+            .with_query("size", 20);
         assert_eq!(url, "/posts?page=1&size=20");
     }
 
@@ -97,7 +108,8 @@ mod tests {
     #[test]
     fn with_query_leaves_unreserved_chars_alone() {
         assert_eq!(
-            "/x".to_string().with_query("tag", "hello-world_foo.bar~baz"),
+            "/x".to_string()
+                .with_query("tag", "hello-world_foo.bar~baz"),
             "/x?tag=hello-world_foo.bar~baz"
         );
     }

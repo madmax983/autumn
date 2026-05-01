@@ -397,7 +397,9 @@ pub async fn submit(
         );
     }
 
-    Ok(Redirect::to(&super::subreddits::__autumn_path_show(&sub.slug)))
+    Ok(Redirect::to(&super::subreddits::__autumn_path_show(
+        &sub.slug,
+    )))
 }
 
 // ── View single post with comments ─────────────────────────────
@@ -715,7 +717,9 @@ pub async fn delete_post(
         .execute(&mut *db)
         .await?;
 
-    Ok(super::layout::hx_redirect_to(&super::subreddits::__autumn_path_show(&sub_slug)))
+    Ok(super::layout::hx_redirect_to(
+        &super::subreddits::__autumn_path_show(&sub_slug),
+    ))
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -768,4 +772,13 @@ async fn unique_slug_excluding(
     }
 }
 
-autumn_web::paths![front_page, submit_form, submit_to_sub_form, submit, show, edit_form, update, delete_post];
+autumn_web::paths![
+    front_page,
+    submit_form,
+    submit_to_sub_form,
+    submit,
+    show,
+    edit_form,
+    update,
+    delete_post
+];

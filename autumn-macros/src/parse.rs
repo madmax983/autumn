@@ -20,9 +20,10 @@ impl RouteAttrArgs {
     /// Return the helper name as an `Ident`, using the override if set.
     /// `handler_name` is used as the fallback.
     pub fn helper_ident(&self, handler_name: &Ident) -> Ident {
-        self.name_override
-            .as_ref()
-            .map_or_else(|| handler_name.clone(), |lit| format_ident!("{}", lit.value()))
+        self.name_override.as_ref().map_or_else(
+            || handler_name.clone(),
+            |lit| format_ident!("{}", lit.value()),
+        )
     }
 }
 
@@ -48,7 +49,10 @@ impl syn::parse::Parse for RouteAttrArgs {
             None
         };
 
-        Ok(Self { path, name_override })
+        Ok(Self {
+            path,
+            name_override,
+        })
     }
 }
 

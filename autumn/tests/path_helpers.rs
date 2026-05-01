@@ -5,8 +5,8 @@
 //! They compile and run against `__autumn_path_*` companion functions
 //! that the route macros must emit alongside `__autumn_route_info_*`.
 
-use autumn_web::{delete, get, patch, post, put};
 use autumn_web::paths::PathExt;
+use autumn_web::{delete, get, patch, post, put};
 
 // ── Handlers: no path params ─────────────────────────────────────────
 

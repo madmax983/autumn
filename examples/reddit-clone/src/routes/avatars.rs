@@ -150,7 +150,9 @@ pub async fn upload_avatar(
         .await
         .map_err(|err| AutumnError::internal_server_error_msg(err.to_string()))?;
 
-    Ok(hx_redirect_to(&super::auth::__autumn_path_profile(&username)))
+    Ok(hx_redirect_to(&super::auth::__autumn_path_profile(
+        &username,
+    )))
 }
 
 autumn_web::paths![avatar_form, upload_avatar];
