@@ -1083,6 +1083,54 @@ foo = "bar"
         assert!(parse_db_host_port("mysql://localhost/db").is_none());
     }
 
+    // ── check_tailwind_binary_impl ───────────────────────────────────────────
+
+    #[test]
+    fn check_tailwind_not_found() {
+        let r = check_tailwind_binary_impl(
+            std::path::Path::new("target/autumn/tailwindcss"),
+            |_| false,
+            |_| false,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("not found"));
+        assert!(r.hint.unwrap_or("").contains("autumn setup"));
+    }
+
+    #[test]
+    fn check_tailwind_exists_but_not_runnable() {
+        let r = check_tailwind_binary_impl(
+            std::path::Path::new("target/autumn/tailwindcss"),
+            |_| true,
+            |_| false,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("not runnable"));
+        assert!(r.hint.unwrap_or("").contains("--force"));
+    }
+
+    #[test]
+    fn check_tailwind_exists_and_runnable() {
+        let r = check_tailwind_binary_impl(
+            std::path::Path::new("target/autumn/tailwindcss"),
+            |_| true,
+            |_| true,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.as_deref().unwrap_or("").contains("runnable"));
+    }
+
+    #[test]
+    fn check_tailwind_not_found_does_not_invoke_run_fn() {
+        let run_called = std::cell::Cell::new(false);
+        let _ = check_tailwind_binary_impl(
+            std::path::Path::new("target/autumn/tailwindcss"),
+            |_| false,
+            |_| { run_called.set(true); false },
+        );
+        assert!(!run_called.get(), "run_fn must not be called when path doesn't exist");
+    }
+
     // ── to_json_output ───────────────────────────────────────────────────────
 
     #[test]
