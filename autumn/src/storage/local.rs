@@ -726,10 +726,16 @@ fn encode_key_path(key: &str) -> String {
         .add(b'}')
         .add(b'\\');
 
-    key.split('/')
-        .map(|segment| utf8_percent_encode(segment, PATH_SEGMENT).to_string())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut result = String::with_capacity(key.len() + 16);
+    let mut first = true;
+    for segment in key.split('/') {
+        if !first {
+            result.push('/');
+        }
+        first = false;
+        result.extend(utf8_percent_encode(segment, PATH_SEGMENT));
+    }
+    result
 }
 
 fn hex<B: AsRef<[u8]>>(bytes: B) -> String {
@@ -1064,6 +1070,10 @@ mod tests {
         assert_eq!(encode_key_path("a/b/c"), "a/b/c");
         assert_eq!(encode_key_path("a b/c?d"), "a%20b/c%3Fd");
         assert_eq!(encode_key_path("hash#frag/q"), "hash%23frag/q");
+        assert_eq!(encode_key_path(""), "");
+        assert_eq!(encode_key_path("a/"), "a/");
+        assert_eq!(encode_key_path("/b"), "/b");
+        assert_eq!(encode_key_path("🚀/path"), "%F0%9F%9A%80/path");
     }
 
     #[tokio::test]
