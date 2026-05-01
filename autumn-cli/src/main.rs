@@ -726,8 +726,7 @@ mod tests {
 
     #[test]
     fn parse_routes_with_multiple_methods() {
-        let cli =
-            Cli::try_parse_from(["autumn", "routes", "--method", "GET,POST"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "routes", "--method", "GET,POST"]).unwrap();
         match cli.command {
             Commands::Routes { method, .. } => {
                 assert_eq!(method, vec!["GET", "POST"]);
@@ -797,10 +796,11 @@ mod tests {
 
     #[test]
     fn parse_routes_positional_prefix_with_package() {
-        let cli =
-            Cli::try_parse_from(["autumn", "routes", "-p", "blog", "/api"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "routes", "-p", "blog", "/api"]).unwrap();
         match cli.command {
-            Commands::Routes { package, prefix, .. } => {
+            Commands::Routes {
+                package, prefix, ..
+            } => {
                 assert_eq!(package.as_deref(), Some("blog"));
                 assert_eq!(prefix.as_deref(), Some("/api"));
             }

@@ -24,7 +24,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
-            other => Err(format!("unknown format '{other}'; expected 'table' or 'json'")),
+            other => Err(format!(
+                "unknown format '{other}'; expected 'table' or 'json'"
+            )),
         }
     }
 }
@@ -102,11 +104,7 @@ pub fn apply_filters(
             if filter.is_some_and(|prefix| !r.path.starts_with(prefix)) {
                 return false;
             }
-            if !methods.is_empty()
-                && !methods
-                    .iter()
-                    .any(|m| m.eq_ignore_ascii_case(&r.method))
-            {
+            if !methods.is_empty() && !methods.iter().any(|m| m.eq_ignore_ascii_case(&r.method)) {
                 return false;
             }
             if user_only && r.source == "framework" {
@@ -225,8 +223,8 @@ fn format_row(cells: &[String; 5], widths: &[usize; 5]) -> String {
 
 /// Print routes as pretty JSON.
 pub fn print_json(routes: &[RouteInfo]) {
-    let json = serde_json::to_string_pretty(routes)
-        .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
+    let json =
+        serde_json::to_string_pretty(routes).unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
     println!("{json}");
 }
 
@@ -432,7 +430,11 @@ mod tests {
         let routes = sample_routes();
         let methods = vec!["GET".to_owned(), "POST".to_owned()];
         let result = apply_filters(routes, None, &methods, false);
-        assert!(result.iter().all(|r| r.method == "GET" || r.method == "POST"));
+        assert!(
+            result
+                .iter()
+                .all(|r| r.method == "GET" || r.method == "POST")
+        );
     }
 
     #[test]
@@ -466,7 +468,11 @@ mod tests {
         let routes = sample_routes();
         let methods = vec!["GET".to_owned()];
         let result = apply_filters(routes, Some("/posts"), &methods, false);
-        assert!(result.iter().all(|r| r.path.starts_with("/posts") && r.method == "GET"));
+        assert!(
+            result
+                .iter()
+                .all(|r| r.path.starts_with("/posts") && r.method == "GET")
+        );
         assert_eq!(result.len(), 2);
     }
 
@@ -563,8 +569,7 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"));
+        let result = resolve_binary_from_metadata(&metadata, Some("hello"), Path::new("/projects"));
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {
@@ -587,8 +592,7 @@ mod tests {
                 }]
             }]
         });
-        let result =
-            resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/projects/hello"));
         let expected = if cfg!(windows) {
             PathBuf::from("/tmp/target/debug/hello.exe")
         } else {

@@ -82,10 +82,7 @@ pub(crate) fn collect_route_infos(
     let mut infos = Vec::with_capacity(routes.len());
 
     for (i, route) in routes.iter().enumerate() {
-        let source = route_sources
-            .get(i)
-            .cloned()
-            .unwrap_or(RouteSource::User);
+        let source = route_sources.get(i).cloned().unwrap_or(RouteSource::User);
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
@@ -137,10 +134,9 @@ pub(crate) fn append_framework_routes(
         }
     }
 
-    for path in crate::actuator::actuator_endpoint_paths(
-        &config.actuator.prefix,
-        config.actuator.sensitive,
-    ) {
+    for path in
+        crate::actuator::actuator_endpoint_paths(&config.actuator.prefix, config.actuator.sensitive)
+    {
         infos.push(RouteInfo {
             method: "GET".to_owned(),
             path,
@@ -202,10 +198,7 @@ pub(crate) fn append_openapi_routes(
 pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
     if crate::middleware::dev::is_enabled_with_env(&crate::config::OsEnv) {
         for (path, handler) in [
-            (
-                crate::middleware::dev::LIVE_RELOAD_PATH,
-                "dev_live_reload",
-            ),
+            (crate::middleware::dev::LIVE_RELOAD_PATH, "dev_live_reload"),
             (
                 crate::middleware::dev::LIVE_RELOAD_SCRIPT_PATH,
                 "dev_live_reload_js",
@@ -233,7 +226,11 @@ pub(crate) fn sort_route_infos(infos: &mut [RouteInfo]) {
 fn join_scope_path(prefix: &str, path: &str) -> String {
     let prefix = prefix.trim_end_matches('/');
     if path == "/" || path.is_empty() {
-        if prefix.is_empty() { "/".to_owned() } else { prefix.to_owned() }
+        if prefix.is_empty() {
+            "/".to_owned()
+        } else {
+            prefix.to_owned()
+        }
     } else if path.starts_with('/') {
         format!("{prefix}{path}")
     } else {
@@ -519,7 +516,10 @@ mod tests {
         let mut infos = Vec::new();
         append_framework_routes(&mut infos, &config);
         let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
-        assert!(paths.contains(&"/ping"), "custom health path missing: {paths:?}");
+        assert!(
+            paths.contains(&"/ping"),
+            "custom health path missing: {paths:?}"
+        );
     }
 
     // ── join_scope_path ────────────────────────────────────────────────────

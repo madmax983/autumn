@@ -341,10 +341,12 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
-        let source = self.current_plugin.as_ref().map_or(
-            crate::route_listing::RouteSource::User,
-            |name| crate::route_listing::RouteSource::Plugin(name.clone()),
-        );
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         for _ in &routes {
             self.route_sources.push(source.clone());
         }
@@ -550,10 +552,12 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
-        let source = self.current_plugin.as_ref().map_or(
-            crate::route_listing::RouteSource::User,
-            |name| crate::route_listing::RouteSource::Plugin(name.clone()),
-        );
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
