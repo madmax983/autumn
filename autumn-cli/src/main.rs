@@ -133,6 +133,9 @@ enum Commands {
         /// Output format.
         #[arg(long, default_value = "table", value_name = "FORMAT")]
         format: String,
+        /// Show only routes whose path starts with PREFIX (positional shorthand for --filter).
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
         /// Show only routes whose path starts with FILTER.
         #[arg(long, value_name = "FILTER")]
         filter: Option<String>,
@@ -229,6 +232,7 @@ fn main() {
         Commands::Routes {
             package,
             format,
+            prefix,
             filter,
             method,
             user_only,
@@ -237,10 +241,12 @@ fn main() {
                 eprintln!("autumn routes: {e}");
                 std::process::exit(1);
             });
+            // Positional prefix takes precedence over --filter when both are given.
+            let effective_filter = prefix.as_deref().or(filter.as_deref());
             routes::run(&routes::RoutesOptions {
                 package: package.as_deref(),
                 format: fmt,
-                filter: filter.as_deref(),
+                filter: effective_filter,
                 methods: &method,
                 user_only,
             });
@@ -647,12 +653,14 @@ mod tests {
             Commands::Routes {
                 package,
                 format,
+                prefix,
                 filter,
                 method,
                 user_only,
             } => {
                 assert!(package.is_none());
                 assert_eq!(format, "table");
+                assert!(prefix.is_none());
                 assert!(filter.is_none());
                 assert!(method.is_empty());
                 assert!(!user_only);
@@ -759,15 +767,42 @@ mod tests {
             Commands::Routes {
                 package,
                 format,
+                prefix,
                 filter,
                 method,
                 user_only,
             } => {
                 assert_eq!(package.as_deref(), Some("blog"));
                 assert_eq!(format, "json");
+                assert!(prefix.is_none());
                 assert_eq!(filter.as_deref(), Some("/api"));
                 assert_eq!(method, vec!["GET", "POST"]);
                 assert!(user_only);
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_positional_prefix() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "/api"]).unwrap();
+        match cli.command {
+            Commands::Routes { prefix, filter, .. } => {
+                assert_eq!(prefix.as_deref(), Some("/api"));
+                assert!(filter.is_none());
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_positional_prefix_with_package() {
+        let cli =
+            Cli::try_parse_from(["autumn", "routes", "-p", "blog", "/api"]).unwrap();
+        match cli.command {
+            Commands::Routes { package, prefix, .. } => {
+                assert_eq!(package.as_deref(), Some("blog"));
+                assert_eq!(prefix.as_deref(), Some("/api"));
             }
             _ => panic!("expected Routes command"),
         }

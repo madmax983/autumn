@@ -68,6 +68,8 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        route_sources: Vec::new(),
+        current_plugin: None,
         tasks: Vec::new(),
         jobs: Vec::new(),
         static_metas: Vec::new(),
@@ -166,6 +168,11 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    /// Parallel to `routes`: registration origin for each route.
+    route_sources: Vec<crate::route_listing::RouteSource>,
+    /// Non-None while a plugin's `build()` is executing; routes and scoped
+    /// groups added during that window are attributed to this plugin.
+    current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
     jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
@@ -226,6 +233,8 @@ pub struct AppBuilder {
 pub(crate) struct ScopedGroup {
     pub(crate) prefix: String,
     pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
@@ -332,6 +341,13 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
+        let source = self.current_plugin.as_ref().map_or(
+            crate::route_listing::RouteSource::User,
+            |name| crate::route_listing::RouteSource::Plugin(name.clone()),
+        );
+        for _ in &routes {
+            self.route_sources.push(source.clone());
+        }
         self.routes.extend(routes);
         self
     }
@@ -534,9 +550,14 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
+        let source = self.current_plugin.as_ref().map_or(
+            crate::route_listing::RouteSource::User,
+            |name| crate::route_listing::RouteSource::Plugin(name.clone()),
+        );
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
+            source,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -993,8 +1014,12 @@ impl AppBuilder {
             );
             return self;
         }
-        self.registered_plugins.insert(name.into_owned());
-        plugin.build(self)
+        let name_str = name.into_owned();
+        self.registered_plugins.insert(name_str.clone());
+        self.current_plugin = Some(name_str);
+        let mut result = plugin.build(self);
+        result.current_plugin = None;
+        result
     }
 
     /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
@@ -1085,6 +1110,8 @@ impl AppBuilder {
 
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks,
             jobs,
             static_metas: _,
@@ -1346,6 +1373,8 @@ impl AppBuilder {
     async fn run_build_mode(self) {
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks: _,
             jobs: _,
             static_metas,
@@ -1499,9 +1528,12 @@ impl AppBuilder {
     async fn run_dump_routes_mode(self) {
         let Self {
             routes,
+            route_sources,
             scoped_groups,
             config_loader_factory,
             telemetry_provider,
+            #[cfg(feature = "openapi")]
+            openapi,
             ..
         } = self;
 
@@ -1509,8 +1541,13 @@ impl AppBuilder {
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         let mut infos =
-            crate::route_listing::collect_route_infos(&routes, &scoped_groups);
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
         crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
         crate::route_listing::sort_route_infos(&mut infos);
 
         let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
@@ -2742,6 +2779,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
@@ -2759,6 +2797,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let registry = PolicyRegistry::default();

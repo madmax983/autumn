@@ -124,7 +124,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {
             ::autumn_web::Route {
-                method: ::autumn_web::reexports::http::Method::GET,
+                method: ::autumn_web::reexports::http::Method::from_bytes(b"WS")
+                    .expect("WS is a valid method token"),
                 path: #path,
                 handler: ::autumn_web::reexports::axum::routing::get(#upgrade_name),
                 name: ::core::stringify!(#fn_name),

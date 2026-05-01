@@ -101,6 +101,54 @@ If `static/.autumn-manifest.json` is absent (e.g. on a dev machine that never
 ran `autumn build --release`), `asset_url` falls back to the plain
 `/static/...` URL — so the app keeps running without any manual configuration.
 
+## Inspecting routes with `autumn routes`
+
+Print every mounted route without starting the server:
+
+```bash
+cargo run -p autumn-cli -- routes -p blog
+```
+
+Example output:
+
+```
+METHOD    PATH                        HANDLER                  SOURCE
+DELETE    /admin/{id}                 delete_post              user
+GET       /                           list_posts               user
+GET       /about                      about                    user
+GET       /actuator/health            actuator                 framework
+GET       /actuator/info              actuator                 framework
+GET       /actuator/metrics           actuator                 framework
+GET       /admin                      admin_posts              user
+GET       /admin/new                  new_post_form            user
+GET       /admin/{id}/edit            edit_post_form           user
+GET       /api/posts                  api_list_posts           user
+GET       /backoffice/posts           backoffice_list_posts    plugin:autumn-admin
+GET       /health                     health                   framework
+GET       /posts/{slug}               show_post                user
+POST      /admin                      create_post              user
+POST      /api/posts                  api_create_post          user
+```
+
+Filter to just the JSON API routes and emit machine-readable JSON:
+
+```bash
+cargo run -p autumn-cli -- routes -p blog /api --format json
+```
+
+Hide framework-internal routes to review only application routes:
+
+```bash
+cargo run -p autumn-cli -- routes -p blog --user-only
+```
+
+Capture a snapshot for `git diff` auditing:
+
+```bash
+cargo run -p autumn-cli -- routes -p blog > routes.txt
+git diff routes.txt
+```
+
 ## Routes
 
 ### HTML

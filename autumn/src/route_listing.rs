@@ -68,17 +68,29 @@ pub struct RouteInfo {
 
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
 ///
+/// `route_sources` is a parallel slice to `routes`; each element is the
+/// [`RouteSource`] for the corresponding route. If the slice is shorter than
+/// `routes`, remaining routes are attributed to [`RouteSource::User`].
+///
 /// Does not include framework-internal routes (probes, actuator, htmx).
 /// Call [`append_framework_routes`] with a loaded config to add those.
-pub(crate) fn collect_route_infos(routes: &[Route], scoped_groups: &[ScopedGroup]) -> Vec<RouteInfo> {
+pub(crate) fn collect_route_infos(
+    routes: &[Route],
+    route_sources: &[RouteSource],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<RouteInfo> {
     let mut infos = Vec::with_capacity(routes.len());
 
-    for route in routes {
+    for (i, route) in routes.iter().enumerate() {
+        let source = route_sources
+            .get(i)
+            .cloned()
+            .unwrap_or(RouteSource::User);
         infos.push(RouteInfo {
             method: route.method.to_string(),
             path: route.path.to_owned(),
             handler: route.name.to_owned(),
-            source: RouteSource::User,
+            source,
             middleware: Vec::new(),
         });
     }
@@ -90,7 +102,7 @@ pub(crate) fn collect_route_infos(routes: &[Route], scoped_groups: &[ScopedGroup
                 method: route.method.to_string(),
                 path: full_path,
                 handler: route.name.to_owned(),
-                source: RouteSource::User,
+                source: group.source.clone(),
                 middleware: Vec::new(),
             });
         }
@@ -157,6 +169,59 @@ pub(crate) fn append_framework_routes(
     }
 }
 
+/// Append OpenAPI documentation routes (`/v3/api-docs`, `/swagger-ui`).
+///
+/// Only compiled when the `openapi` feature is enabled.
+#[cfg(feature = "openapi")]
+pub(crate) fn append_openapi_routes(
+    infos: &mut Vec<RouteInfo>,
+    openapi: &crate::openapi::OpenApiConfig,
+) {
+    infos.push(RouteInfo {
+        method: "GET".to_owned(),
+        path: openapi.openapi_json_path.clone(),
+        handler: "openapi_json".to_owned(),
+        source: RouteSource::Framework,
+        middleware: Vec::new(),
+    });
+    if let Some(ui_path) = &openapi.swagger_ui_path {
+        infos.push(RouteInfo {
+            method: "GET".to_owned(),
+            path: ui_path.clone(),
+            handler: "swagger_ui".to_owned(),
+            source: RouteSource::Framework,
+            middleware: Vec::new(),
+        });
+    }
+}
+
+/// Append dev live-reload routes (`/__autumn/live-reload`, `/__autumn/live-reload.js`).
+///
+/// Routes are only appended when the Autumn dev server is active
+/// (`AUTUMN_DEV=1` and `AUTUMN_ENV != production`).
+pub(crate) fn append_dev_reload_routes(infos: &mut Vec<RouteInfo>) {
+    if crate::middleware::dev::is_enabled_with_env(&crate::config::OsEnv) {
+        for (path, handler) in [
+            (
+                crate::middleware::dev::LIVE_RELOAD_PATH,
+                "dev_live_reload",
+            ),
+            (
+                crate::middleware::dev::LIVE_RELOAD_SCRIPT_PATH,
+                "dev_live_reload_js",
+            ),
+        ] {
+            infos.push(RouteInfo {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                handler: handler.to_owned(),
+                source: RouteSource::Framework,
+                middleware: Vec::new(),
+            });
+        }
+    }
+}
+
 /// Stable-sort route infos: primary key is path (lexicographic), secondary
 /// key is HTTP method (lexicographic). This makes output diff-friendly.
 pub(crate) fn sort_route_infos(infos: &mut [RouteInfo]) {
@@ -211,14 +276,15 @@ mod tests {
 
     #[test]
     fn collect_route_infos_empty_produces_empty() {
-        let infos = collect_route_infos(&[], &[]);
+        let infos = collect_route_infos(&[], &[], &[]);
         assert!(infos.is_empty());
     }
 
     #[test]
     fn collect_route_infos_single_user_route() {
         let routes = vec![make_route(Method::GET, "/posts", "list_posts")];
-        let infos = collect_route_infos(&routes, &[]);
+        let sources = vec![RouteSource::User];
+        let infos = collect_route_infos(&routes, &sources, &[]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].method, "GET");
         assert_eq!(infos[0].path, "/posts");
@@ -233,21 +299,20 @@ mod tests {
             make_route(Method::GET, "/posts", "list_posts"),
             make_route(Method::POST, "/posts", "create_post"),
         ];
-        let infos = collect_route_infos(&routes, &[]);
+        let sources = vec![RouteSource::User, RouteSource::User];
+        let infos = collect_route_infos(&routes, &sources, &[]);
         assert_eq!(infos.len(), 2);
     }
 
     #[test]
     fn collect_route_infos_scoped_group_prepends_prefix() {
-        async fn handler() -> &'static str {
-            "ok"
-        }
         let group = ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/posts", "api_list_posts")],
+            source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[group]);
+        let infos = collect_route_infos(&[], &[], &[group]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api/posts");
         assert_eq!(infos[0].handler, "api_list_posts");
@@ -258,9 +323,10 @@ mod tests {
         let group = ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![make_route(Method::GET, "/", "api_root")],
+            source: RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
-        let infos = collect_route_infos(&[], &[group]);
+        let infos = collect_route_infos(&[], &[], &[group]);
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].path, "/api");
     }
@@ -268,7 +334,37 @@ mod tests {
     #[test]
     fn collect_route_infos_marks_user_source() {
         let routes = vec![make_route(Method::POST, "/items", "create_item")];
-        let infos = collect_route_infos(&routes, &[]);
+        let sources = vec![RouteSource::User];
+        let infos = collect_route_infos(&routes, &sources, &[]);
+        assert_eq!(infos[0].source, RouteSource::User);
+    }
+
+    #[test]
+    fn collect_route_infos_plugin_source_from_parallel_slice() {
+        let routes = vec![make_route(Method::GET, "/admin", "admin_index")];
+        let sources = vec![RouteSource::Plugin("admin".to_owned())];
+        let infos = collect_route_infos(&routes, &sources, &[]);
+        assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
+    }
+
+    #[test]
+    fn collect_route_infos_plugin_source_on_scoped_group() {
+        let group = ScopedGroup {
+            prefix: "/admin".to_owned(),
+            routes: vec![make_route(Method::GET, "/users", "admin_users")],
+            source: RouteSource::Plugin("admin".to_owned()),
+            apply_layer: Box::new(|r| r),
+        };
+        let infos = collect_route_infos(&[], &[], &[group]);
+        assert_eq!(infos[0].source, RouteSource::Plugin("admin".to_owned()));
+        assert_eq!(infos[0].path, "/admin/users");
+    }
+
+    #[test]
+    fn collect_route_infos_missing_source_defaults_to_user() {
+        let routes = vec![make_route(Method::GET, "/x", "x")];
+        // empty sources slice — should fall back to User
+        let infos = collect_route_infos(&routes, &[], &[]);
         assert_eq!(infos[0].source, RouteSource::User);
     }
 
