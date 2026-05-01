@@ -8,7 +8,7 @@
 //! environment variable, matching how the rest of the framework resolves
 //! configuration profiles.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Errors surfaced by the seed runner.
@@ -29,13 +29,38 @@ fn seed_binary_exists_at(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Locate the directory of a Cargo package by name using `cargo metadata`.
+///
+/// Returns the directory containing the package's `Cargo.toml`, or `None` if
+/// the package cannot be found or `cargo metadata` fails.
+fn find_package_dir(package: &str) -> Option<PathBuf> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let manifest_path = metadata["packages"]
+        .as_array()?
+        .iter()
+        .find(|p| p["name"].as_str() == Some(package))?["manifest_path"]
+        .as_str()?
+        .to_owned();
+    Path::new(&manifest_path).parent().map(Path::to_path_buf)
+}
+
 /// Resolve the database URL from environment variables and `autumn.toml`.
+///
+/// Reads `autumn.toml` from `base_dir` (the project root) rather than from
+/// the process working directory so that workspace invocations are correct.
 ///
 /// Precedence (highest to lowest):
 /// 1. `AUTUMN_DATABASE__URL` env var
 /// 2. `DATABASE_URL` env var
-/// 3. `database.url` in `autumn.toml`
-fn resolve_database_url_with_env<F>(env_var: F) -> Result<String, SeedError>
+/// 3. `database.url` in `<base_dir>/autumn.toml`
+fn resolve_database_url_with_env<F>(env_var: F, base_dir: &Path) -> Result<String, SeedError>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -50,9 +75,9 @@ where
         return Ok(url);
     }
 
-    let config_path = Path::new("autumn.toml");
+    let config_path = base_dir.join("autumn.toml");
     if config_path.exists()
-        && let Ok(contents) = std::fs::read_to_string(config_path)
+        && let Ok(contents) = std::fs::read_to_string(&config_path)
         && let Ok(table) = toml::from_str::<toml::Table>(&contents)
     {
         let value = toml::Value::Table(table);
@@ -69,9 +94,9 @@ where
     Err(SeedError::MissingSeedBinary)
 }
 
-/// Resolve the database URL using the real environment.
-fn resolve_database_url() -> Result<String, SeedError> {
-    resolve_database_url_with_env(|key| std::env::var(key))
+/// Resolve the database URL using the real environment and a given base dir.
+fn resolve_database_url(base_dir: &Path) -> Result<String, SeedError> {
+    resolve_database_url_with_env(|key| std::env::var(key), base_dir)
 }
 
 /// Check whether there are pending (unapplied) migrations.
@@ -106,16 +131,23 @@ pub fn run(profile: &str, package: Option<&str>) {
     eprintln!("\u{1F342} autumn seed\n");
     eprintln!("  Profile: {profile}");
 
-    let seed_path = Path::new("src/bin/seed.rs");
-    if !seed_binary_exists_at(seed_path) {
+    // Determine the project directory: either the workspace member's root (when
+    // --package is given) or the current working directory.
+    let project_dir: PathBuf = package
+        .and_then(find_package_dir)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let seed_path = project_dir.join("src/bin/seed.rs");
+    if !seed_binary_exists_at(&seed_path) {
         eprintln!("\u{2717} {}", SeedError::MissingSeedBinary);
         std::process::exit(1);
     }
 
     // Best-effort pending migration check when diesel CLI and migrations dir are available.
-    if let Ok(db_url) = resolve_database_url()
-        && Path::new("migrations").is_dir()
-        && let Err(e) = check_pending_migrations(&db_url, "migrations")
+    let migrations_dir = project_dir.join("migrations");
+    if let Ok(db_url) = resolve_database_url(&project_dir)
+        && migrations_dir.is_dir()
+        && let Err(e) = check_pending_migrations(&db_url, &migrations_dir.to_string_lossy())
     {
         eprintln!("\u{2717} {e}");
         std::process::exit(1);
@@ -130,6 +162,10 @@ pub fn run(profile: &str, package: Option<&str>) {
     }
     cmd.env("AUTUMN_ENV", profile);
     cmd.env("AUTUMN_PROFILE", profile);
+    // Run from the project directory so the seed binary's SeedContext reads
+    // autumn.toml from the correct location (the package root, not the
+    // workspace root).
+    cmd.current_dir(&project_dir);
 
     let status = cmd.status();
     match status {
@@ -227,7 +263,7 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://plain:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
         assert_eq!(url, "postgres://autumn:5432/db");
     }
 
@@ -237,15 +273,16 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://fallback:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
         assert_eq!(url, "postgres://fallback:5432/db");
     }
 
     #[test]
     fn resolve_db_url_returns_err_when_no_env_no_toml() {
+        let tmp = TempDir::new().unwrap();
         let env =
             |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-        assert!(resolve_database_url_with_env(env).is_err());
+        assert!(resolve_database_url_with_env(env, tmp.path()).is_err());
     }
 
     #[test]
@@ -255,7 +292,37 @@ mod tests {
             "DATABASE_URL" => Ok("postgres://real:5432/db".to_string()),
             _ => Err(std::env::VarError::NotPresent),
         };
-        let url = resolve_database_url_with_env(env).unwrap();
+        let url = resolve_database_url_with_env(env, Path::new(".")).unwrap();
         assert_eq!(url, "postgres://real:5432/db");
+    }
+
+    #[test]
+    fn resolve_db_url_reads_database_url_from_base_dir_toml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nurl = \"postgres://toml:5432/db\"\n",
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        let url = resolve_database_url_with_env(env, tmp.path()).unwrap();
+        assert_eq!(url, "postgres://toml:5432/db");
+    }
+
+    #[test]
+    fn resolve_db_url_ignores_toml_in_wrong_base_dir() {
+        // autumn.toml exists only in a different directory; base_dir has none.
+        let tmp_with_toml = TempDir::new().unwrap();
+        std::fs::write(
+            tmp_with_toml.path().join("autumn.toml"),
+            "[database]\nurl = \"postgres://wrong:5432/db\"\n",
+        )
+        .unwrap();
+        let tmp_empty = TempDir::new().unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        // Using tmp_empty as base_dir — no autumn.toml there, so must fail.
+        assert!(resolve_database_url_with_env(env, tmp_empty.path()).is_err());
     }
 }
