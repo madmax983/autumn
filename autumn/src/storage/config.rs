@@ -421,4 +421,22 @@ mod tests {
             Err(StorageBackendConfigError::MissingS3Region)
         );
     }
+
+    #[test]
+    #[cfg(not(feature = "storage-s3"))]
+    fn s3_plan_yields_feature_disabled_error() {
+        let cfg = StorageConfig {
+            backend: StorageBackend::S3,
+            s3: StorageS3Config {
+                bucket: Some("b".into()),
+                region: Some("r".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.backend_plan(Some("prod")),
+            Err(StorageBackendConfigError::S3FeatureDisabled)
+        );
+    }
 }
