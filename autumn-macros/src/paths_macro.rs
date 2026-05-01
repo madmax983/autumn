@@ -41,14 +41,16 @@ pub fn paths_macro(input: TokenStream) -> TokenStream {
                 last.ident = format_ident!("__autumn_path_{}", last.ident);
             }
 
-            // Emit a `pub use` that reaches the companion. Paths that are
-            // already absolute (leading `::`, or first segment is `crate` /
-            // `super` / `self`) are used verbatim; simple / module-qualified
-            // relative paths are reached via `super::`.
+            // Emit a `pub use` that reaches the companion. Paths with a
+            // leading `::` or starting with `crate` are truly absolute and
+            // used verbatim. Simple / module-qualified relative paths (including
+            // those starting with `super` or `self`) must be reached via an
+            // additional `super::` from inside the generated `pub mod paths`.
             let is_absolute = companion.leading_colon.is_some()
-                || companion.segments.first().is_some_and(|s| {
-                    matches!(s.ident.to_string().as_str(), "crate" | "super" | "self")
-                });
+                || companion
+                    .segments
+                    .first()
+                    .is_some_and(|s| s.ident == "crate");
 
             if is_absolute {
                 quote! { pub use #companion as #alias; }

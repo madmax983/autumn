@@ -214,13 +214,27 @@ fn normalise_path_for_format(path: &str) -> String {
         if c == '{' {
             result.push('{');
             let mut param = String::new();
+            // Track depth so quantifiers like `{id:[0-9]{1,3}}` don't end
+            // the capture at the first inner `}`.
+            let mut depth: u32 = 1;
             for inner in chars.by_ref() {
-                if inner == '}' {
-                    break;
+                match inner {
+                    '{' => {
+                        depth += 1;
+                        param.push(inner);
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        param.push(inner);
+                    }
+                    _ => param.push(inner),
                 }
-                param.push(inner);
             }
-            // Strip `:regex` suffix, then `*` catch-all prefix, then replace `-` → `_`.
+            // Strip `:regex` suffix (everything after the first `:`), then
+            // strip `*` catch-all prefix, then replace `-` → `_`.
             let name = param.split(':').next().unwrap_or(&param);
             let name = name.trim_start_matches('*').replace('-', "_");
             result.push_str(&name);
@@ -306,6 +320,15 @@ mod tests {
         assert_eq!(
             normalise_path_for_format("/items/{item-id}"),
             "/items/{item_id}"
+        );
+    }
+
+    #[test]
+    fn normalise_regex_with_quantifier_braces() {
+        // Regex quantifiers like {1,3} must not end the outer capture early.
+        assert_eq!(
+            normalise_path_for_format("/users/{id:[0-9]{1,3}}"),
+            "/users/{id}"
         );
     }
 }

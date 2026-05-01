@@ -22,6 +22,7 @@ impl RouteAttrArgs {
     pub fn helper_ident(&self, handler_name: &Ident) -> Ident {
         self.name_override.as_ref().map_or_else(
             || handler_name.clone(),
+            // Safety: already validated as a valid identifier in `parse_route_attr`.
             |lit| format_ident!("{}", lit.value()),
         )
     }
@@ -62,6 +63,18 @@ impl syn::parse::Parse for RouteAttrArgs {
 pub fn parse_route_attr(attr: TokenStream) -> Result<RouteAttrArgs, TokenStream> {
     let args: RouteAttrArgs = syn::parse2(attr).map_err(|err| err.to_compile_error())?;
     validate_path(&args.path)?;
+    if let Some(ref name_lit) = args.name_override {
+        syn::parse_str::<Ident>(&name_lit.value()).map_err(|_| {
+            syn::Error::new(
+                name_lit.span(),
+                format!(
+                    "route `name` override {:?} is not a valid Rust identifier",
+                    name_lit.value()
+                ),
+            )
+            .to_compile_error()
+        })?;
+    }
     Ok(args)
 }
 
