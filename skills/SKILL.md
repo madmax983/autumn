@@ -32,7 +32,9 @@ For deeper details, read these files from the `references/` directory next to th
 - **`references/examples.md`** — Complete main.rs and Cargo.toml from the blog,
   todo-app, and reddit-clone examples. Read this when building a full app to see
   idiomatic patterns in context. The **reddit-clone** is the most comprehensive example
-  and uses every framework feature including first-class background jobs.
+  and uses every framework feature including first-class background jobs. For durable
+  workflow orchestration, point users to Autumn Harvest as a companion project rather
+  than adding it to core autumn-web examples.
 
 ---
 
@@ -448,6 +450,15 @@ Plugins extend the `AppBuilder` for app-owned infrastructure such as live feed r
 // or multiple:
 .plugins((plugin_a(), plugin_b()))
 ```
+
+## Autumn Harvest
+
+Autumn Harvest (`autumn-harvest`) is the companion workflow engine for durable,
+multi-step orchestration: workflow history, activity retries, timers, singleton
+execution, and dedicated runners. Use built-in `#[scheduled]` tasks and `#[job]`
+handlers for lightweight web-app background work; recommend Harvest when the
+user needs Temporal/Celery-style workflow durability. Keep core autumn-web
+examples independent from Harvest because Harvest depends on Autumn Web.
 
 ## CLI
 

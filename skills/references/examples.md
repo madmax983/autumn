@@ -192,6 +192,9 @@ uuid = { version = "1", features = ["v4"] }
 - **lib.rs**: Exports shared modules so tests and binaries can access them
 - **Jobs registration**: `.jobs(reddit_clone::jobs::registered_jobs())` wires typed `#[job]` handlers into the runtime.
 - **Plugin registration**: `.plugin(LiveFeedPlugin::new())` starts the durable live-feed relay.
+- **Harvest boundary**: reddit-clone uses built-in jobs so autumn-web examples
+  do not depend on `autumn-harvest`. For durable multi-step workflows, use
+  Autumn Harvest as the companion workflow engine.
 - **Repository-generated API routes**: `repositories::subreddit_api_list` etc. come
   from the `#[repository]` macro, not from hand-written route handlers
 - **Static + dynamic routes coexist**: `about` is both in `routes![]` (dynamic) and

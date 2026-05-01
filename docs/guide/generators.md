@@ -174,6 +174,9 @@ you need them):
   `#[secured]` story; bundling it here would balloon scope.
 - Generators for optional plugin crates. Those plugins ship their own
   generators on their own timeline.
+- Harvest workflow scaffolding. `autumn-harvest` is a companion workflow
+  project with its own release train, so core web generators do not depend on
+  it.
 - Custom user-provided templates / template overrides.
 - Reverse generation (database → models).
 - Test scaffolding beyond the single smoke test.

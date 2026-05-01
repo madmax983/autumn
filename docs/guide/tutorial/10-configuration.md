@@ -117,7 +117,9 @@ copy per replica or your application code can coordinate ownership explicitly.
 
 Use Harvest when the work needs durability, retries, workflow history, or clear
 singleton semantics across multiple replicas. The framework-level scheduler is
-not a distributed job system.
+not a distributed job system. Harvest is a companion project with its own
+release train because it integrates with Autumn Web rather than being part of
+the core web crate.
 
 ## Deployment Checkpoint
 

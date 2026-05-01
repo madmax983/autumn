@@ -88,6 +88,20 @@ The live WebSocket feed keeps the app database as durable truth via
   publishes still wake web nodes from the durable event log
 - Polling is the last fallback when neither wake path is available
 
+## Why This Example Uses Jobs Instead Of Harvest
+
+Autumn Harvest is still the companion workflow engine for durable, multi-step
+orchestration: workflow history, activity retries, timers, and dedicated
+runners. This example uses Autumn Web's built-in `#[job]` runtime for the
+registration and post-publication side effects because those are small
+request-triggered jobs, not long-running workflows.
+
+Keeping reddit-clone off `autumn-harvest` also keeps the release train clean.
+Harvest depends on Autumn Web integration points; Autumn Web should not require
+Harvest in a checked-in example just to publish a web release. See
+[`docs/autumn-workflow-architecture.md`](../../docs/autumn-workflow-architecture.md)
+when your app needs the heavier workflow machinery.
+
 ## Live Feed Operations
 
 `/api/live/relay/health` reports the current relay state for the local process.

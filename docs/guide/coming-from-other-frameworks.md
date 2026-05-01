@@ -593,8 +593,15 @@ autumn_web::app()
     .await;
 ```
 
-No Redis or external job queue needed for simple scheduled tasks. For durable
-request-triggered background work with retries, use Autumn's `#[job]` runtime.
+No Redis or external job queue is needed for simple scheduled tasks. For
+durable request-triggered background work with retries, use Autumn's `#[job]`
+runtime.
+
+For Temporal, Celery canvas, Sidekiq batches, Spring Batch, or Camunda-style
+orchestration, use Autumn Harvest. Harvest is the companion workflow engine for
+workflow history, long-running activities, timers, and singleton execution
+across replicas. It depends on Autumn Web integration points, so it stays on its
+own release train instead of being required by core web examples.
 
 ### Convention vs. Configuration
 
@@ -628,6 +635,7 @@ request-triggered background work with retries, use Autumn's `#[job]` runtime.
 | Config file            | `application.yml`      | `settings.py`         | `config/*.yml`         | `autumn.toml`                   |
 | Profiles               | `spring.profiles`      | `DJANGO_SETTINGS`     | `RAILS_ENV`            | `AUTUMN_PROFILE`                |
 | Background tasks       | `@Scheduled`           | Celery                | Sidekiq                | `#[scheduled(every = "5m")]`    |
+| Durable workflows      | Spring Batch / Camunda | Celery canvas         | Sidekiq batches        | Autumn Harvest (`autumn-harvest`) |
 | Template engine        | Thymeleaf              | Django templates      | ERB                    | Maud (compile-time HTML)        |
 | Middleware             | Servlet Filter         | Middleware             | Rack middleware         | Tower layers                    |
 | Health check           | Actuator               | Custom                | Custom                 | Built-in `/health`              |
