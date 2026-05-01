@@ -4709,4 +4709,103 @@ mod tests {
             assert!(state.extension::<BlobStoreState>().is_some());
         }
     }
+
+    // ── Route source attribution ───────────────────────────────────────────
+
+    /// A minimal plugin that registers one route with a known name.
+    struct TestPlugin {
+        name: &'static str,
+        route: Route,
+    }
+
+    impl crate::plugin::Plugin for TestPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed(self.name)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.routes(vec![self.route])
+        }
+    }
+
+    #[test]
+    fn routes_registered_before_plugin_are_user_sourced() {
+        let user_route = test_get_route("/home", "home");
+        let builder = app().routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    #[test]
+    fn routes_registered_inside_plugin_are_plugin_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_registered_after_plugin_revert_to_user_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let user_route = test_get_route("/home", "home");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin).routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    /// A plugin that registers a route and then registers a nested plugin.
+    struct OuterPlugin;
+
+    impl crate::plugin::Plugin for OuterPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "outer".into()
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            let inner = TestPlugin {
+                name: "inner",
+                route: test_get_route("/inner", "inner"),
+            };
+            app.plugin(inner)
+                .routes(vec![test_get_route("/outer-after", "outer_after")])
+        }
+    }
+
+    #[test]
+    fn outer_plugin_source_restored_after_nested_plugin() {
+        let builder = app().plugin(OuterPlugin);
+        // Routes: [/inner from "inner", /outer-after from "outer"]
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            "first route should be attributed to inner plugin"
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            "second route should be re-attributed to outer plugin after nested build"
+        );
+    }
 }

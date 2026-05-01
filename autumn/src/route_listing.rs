@@ -88,6 +88,10 @@ pub(crate) fn collect_route_infos(
             path: route.path.to_owned(),
             handler: route.name.to_owned(),
             source,
+            // Tower layers are opaque — there is no runtime API to enumerate
+            // which layers a MethodRouter carries. The middleware field is
+            // reserved for future population via proc-macro attributes (e.g.
+            // `#[middleware("secured")]`) on route handler functions.
             middleware: Vec::new(),
         });
     }
@@ -572,5 +576,70 @@ mod tests {
         assert_eq!(decoded.handler, "posts::show");
         assert_eq!(decoded.source, RouteSource::User);
         assert_eq!(decoded.middleware, vec!["secured"]);
+    }
+
+    // ── append_openapi_routes ──────────────────────────────────────────────
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn append_openapi_routes_adds_json_and_ui_paths() {
+        let config = crate::openapi::OpenApiConfig::new("Test", "1.0.0");
+        let mut infos = Vec::new();
+        append_openapi_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/v3/api-docs"),
+            "openapi json path missing: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"/swagger-ui"),
+            "swagger ui path missing: {paths:?}"
+        );
+        for info in &infos {
+            assert_eq!(info.source, RouteSource::Framework);
+            assert_eq!(info.method, "GET");
+        }
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn append_openapi_routes_custom_paths() {
+        let config = crate::openapi::OpenApiConfig::new("Test", "1.0.0")
+            .openapi_json_path("/docs/openapi.json")
+            .swagger_ui_path(Some("/docs/ui".to_owned()));
+        let mut infos = Vec::new();
+        append_openapi_routes(&mut infos, &config);
+        let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"/docs/openapi.json"));
+        assert!(paths.contains(&"/docs/ui"));
+    }
+
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn append_openapi_routes_no_swagger_ui_when_none() {
+        let config = crate::openapi::OpenApiConfig::new("Test", "1.0.0").swagger_ui_path(None);
+        let mut infos = Vec::new();
+        append_openapi_routes(&mut infos, &config);
+        // Only the JSON endpoint; no swagger-ui entry.
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].path, "/v3/api-docs");
+    }
+
+    // ── append_dev_reload_routes ───────────────────────────────────────────
+
+    #[test]
+    fn append_dev_reload_routes_empty_when_dev_disabled() {
+        // In the test environment AUTUMN_DEV is not set, so this should be a no-op.
+        let guard = std::env::var("AUTUMN_DEV");
+        if guard.is_ok() {
+            // Skip: dev mode is active in this test process.
+            return;
+        }
+        let mut infos = Vec::new();
+        append_dev_reload_routes(&mut infos);
+        assert!(
+            infos.is_empty(),
+            "expected no dev routes when AUTUMN_DEV unset"
+        );
     }
 }

@@ -59,7 +59,7 @@ pub fn run(opts: &RoutesOptions<'_>) {
     let output = Command::new(&binary)
         .env("AUTUMN_DUMP_ROUTES", "1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
         .output()
         .unwrap_or_else(|e| {
             eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
@@ -283,24 +283,41 @@ fn resolve_binary_from_metadata(
         },
     );
 
-    let bin_name = matching_packages
+    // Collect (package-name, binary-name) pairs for every matching package
+    // that has at least one `bin` target.
+    let mut candidates: Vec<(String, String)> = matching_packages
         .iter()
-        .find_map(|pkg| {
-            pkg["targets"].as_array()?.iter().find_map(|t| {
+        .filter_map(|pkg| {
+            let pkg_name = pkg["name"].as_str()?.to_owned();
+            let bin_name = pkg["targets"].as_array()?.iter().find_map(|t| {
                 let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
                 if is_bin {
                     t["name"].as_str().map(String::from)
                 } else {
                     None
                 }
-            })
+            })?;
+            Some((pkg_name, bin_name))
         })
-        .ok_or_else(|| {
-            package.map_or_else(
-                || "no binary target found in current package".to_owned(),
-                |pkg_name| format!("no binary target found in package '{pkg_name}'"),
-            )
-        })?;
+        .collect();
+
+    // When no explicit --package was given and multiple workspace members each
+    // have a binary, we can't pick one safely — ask the user to be explicit.
+    if package.is_none() && candidates.len() > 1 {
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+        return Err(format!(
+            "multiple binary packages found in workspace ({}); \
+             use -p / --package to select one",
+            names.join(", ")
+        ));
+    }
+
+    let bin_name = candidates.pop().map(|(_, b)| b).ok_or_else(|| {
+        package.map_or_else(
+            || "no binary target found in current package".to_owned(),
+            |pkg_name| format!("no binary target found in package '{pkg_name}'"),
+        )
+    })?;
 
     let mut path = PathBuf::from(target_dir);
     path.push("debug");
@@ -614,5 +631,91 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, Some("missing"), Path::new("/projects"));
         assert!(result.unwrap_err().contains("package 'missing'"));
+    }
+
+    #[test]
+    fn resolve_binary_errors_on_multiple_workspace_candidates() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [
+                {
+                    "name": "alpha",
+                    "manifest_path": "/ws/alpha/Cargo.toml",
+                    "targets": [{"name": "alpha", "kind": ["bin"]}]
+                },
+                {
+                    "name": "beta",
+                    "manifest_path": "/ws/beta/Cargo.toml",
+                    "targets": [{"name": "beta", "kind": ["bin"]}]
+                }
+            ]
+        });
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws"));
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("multiple binary packages"),
+            "expected ambiguity error, got: {err}"
+        );
+        assert!(
+            err.contains("-p") || err.contains("--package"),
+            "should hint at -p flag"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_cwd_with_single_match_succeeds() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [
+                {
+                    "name": "alpha",
+                    "manifest_path": "/ws/alpha/Cargo.toml",
+                    "targets": [{"name": "alpha", "kind": ["bin"]}]
+                },
+                {
+                    "name": "beta",
+                    "manifest_path": "/ws/beta/Cargo.toml",
+                    "targets": [{"name": "beta", "kind": ["bin"]}]
+                }
+            ]
+        });
+        // Narrowing cwd to /ws/alpha means only "alpha" matches.
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/alpha")).unwrap();
+        assert!(result.to_string_lossy().contains("alpha"));
+    }
+
+    #[test]
+    fn resolve_binary_lib_only_package_is_skipped() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [
+                {
+                    "name": "mylib",
+                    "manifest_path": "/ws/mylib/Cargo.toml",
+                    "targets": [{"name": "mylib", "kind": ["lib"]}]
+                },
+                {
+                    "name": "myapp",
+                    "manifest_path": "/ws/myapp/Cargo.toml",
+                    "targets": [{"name": "myapp", "kind": ["bin"]}]
+                }
+            ]
+        });
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws")).unwrap();
+        assert!(result.to_string_lossy().contains("myapp"));
+    }
+
+    #[test]
+    fn resolve_binary_no_binary_target_errors() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "mylib",
+                "manifest_path": "/ws/mylib/Cargo.toml",
+                "targets": [{"name": "mylib", "kind": ["lib"]}]
+            }]
+        });
+        let result = resolve_binary_from_metadata(&metadata, None, Path::new("/ws/mylib"));
+        assert!(result.unwrap_err().contains("no binary target"));
     }
 }
