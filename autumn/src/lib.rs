@@ -125,6 +125,8 @@ pub mod static_gen;
 pub mod storage;
 
 pub mod job;
+#[cfg(feature = "seed")]
+pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;

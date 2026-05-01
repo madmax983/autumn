@@ -51,6 +51,7 @@ This gives you the `autumn` binary with the core workflow commands:
 | `autumn dev`    | Run the dev server with file watching        |
 | `autumn build`  | Pre-render `#[static_get]` routes into `dist/` |
 | `autumn migrate`| Run migrations or inspect migration status   |
+| `autumn seed`   | Populate the database with representative data |
 
 ---
 

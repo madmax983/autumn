@@ -7,6 +7,7 @@ mod generate;
 mod migrate;
 mod monitor;
 mod new;
+mod seed;
 mod setup;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
@@ -23,6 +24,9 @@ enum Commands {
     New {
         /// Project name (must be a valid Rust package name)
         name: String,
+        /// Scaffold a stub `src/bin/seed.rs` for database seeding (default off)
+        #[arg(long)]
+        with_seed: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -70,6 +74,22 @@ enum Commands {
         /// Output file for diagnostics
         #[arg(short, long, default_value = "autumn-diag.json")]
         output: String,
+    },
+    /// Run the project's seed binary to populate the database with representative data.
+    ///
+    /// Requires `src/bin/seed.rs` (a Cargo binary named `seed`) to exist.
+    /// If it is missing, `autumn seed` prints an actionable error and exits 1.
+    ///
+    /// `autumn seed` checks for pending migrations before running and exits 1
+    /// if any are found — run `autumn migrate` first.
+    Seed {
+        /// Profile forwarded to the seed binary via `AUTUMN_ENV`
+        /// (default: `dev`).
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// Package to run (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
     },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
@@ -176,7 +196,8 @@ fn main() {
         }
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
         Commands::Export { url, output } => export::run(&url, &output),
-        Commands::New { name } => new::run(&name),
+        Commands::New { name, with_seed } => new::run(&name, with_seed),
+        Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
         Commands::Setup { force } => setup::run(force),
         Commands::Generate(cmd) => match cmd {
             GenerateCommands::Model {
@@ -209,7 +230,7 @@ mod tests {
     fn parse_new_subcommand() {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my-app");
             }
             _ => panic!("expected New command"),
@@ -220,7 +241,7 @@ mod tests {
     fn parse_new_with_underscores() {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
-            Commands::New { ref name } => {
+            Commands::New { ref name, .. } => {
                 assert_eq!(name, "my_app");
             }
             _ => panic!("expected New command"),
@@ -515,5 +536,85 @@ mod tests {
     #[test]
     fn parse_generate_model_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "model"]).is_err());
+    }
+
+    // ── autumn seed tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_seed_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "seed"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, package } => {
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "demo"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => {
+                assert_eq!(profile, "demo");
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_with_package() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "-p", "my-app"]).unwrap();
+        match cli.command {
+            Commands::Seed { package, .. } => {
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_test_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "test"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => assert_eq!(profile, "test"),
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn parse_seed_prod_profile() {
+        let cli = Cli::try_parse_from(["autumn", "seed", "--profile", "prod"]).unwrap();
+        match cli.command {
+            Commands::Seed { profile, .. } => assert_eq!(profile, "prod"),
+            _ => panic!("expected Seed command"),
+        }
+    }
+
+    // ── autumn new --with-seed tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_new_without_with_seed_defaults_false() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
+        match cli.command {
+            Commands::New { name, with_seed } => {
+                assert_eq!(name, "my-app");
+                assert!(!with_seed);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_with_with_seed_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "my-app", "--with-seed"]).unwrap();
+        match cli.command {
+            Commands::New { name, with_seed } => {
+                assert_eq!(name, "my-app");
+                assert!(with_seed);
+            }
+            _ => panic!("expected New command"),
+        }
     }
 }
