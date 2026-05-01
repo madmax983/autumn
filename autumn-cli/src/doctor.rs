@@ -1066,10 +1066,10 @@ foo = "bar"
 
     #[test]
     fn check_toml_content_all_known_sections_pass() {
-        let mut content = String::new();
-        for section in KNOWN_TOML_SECTIONS {
-            content.push_str(&format!("[{section}]\n"));
-        }
+        let content: String = KNOWN_TOML_SECTIONS
+            .iter()
+            .flat_map(|&s| ["[", s, "]\n"])
+            .collect();
         let r = check_toml_content(&content);
         assert_eq!(r.status, CheckStatus::Pass);
     }
