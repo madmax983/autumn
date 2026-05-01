@@ -206,27 +206,41 @@ fn emit_path_helper(
 ///
 /// Handles nested braces from regex quantifiers like `{id:[0-9]{1,3}}` by
 /// tracking brace depth, so the outer `{...}` is consumed correctly.
+/// Escaped braces (`{{` / `}}`) are passed through unchanged as literal
+/// format-string escapes representing a single `{` or `}` in the output.
 fn positional_format_string(path: &str) -> String {
     let mut result = String::with_capacity(path.len());
-    let mut chars = path.chars();
+    let mut chars = path.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '{' {
-            result.push_str("{}");
-            let mut depth: u32 = 1;
-            for inner in chars.by_ref() {
-                match inner {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
+        match c {
+            '{' if chars.peek() == Some(&'{') => {
+                // Escaped literal brace `{{` — pass through for format string.
+                chars.next();
+                result.push_str("{{");
+            }
+            '{' => {
+                // Path parameter — emit positional placeholder and skip contents.
+                result.push_str("{}");
+                let mut depth: u32 = 1;
+                for inner in chars.by_ref() {
+                    match inner {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
-        } else {
-            result.push(c);
+            '}' if chars.peek() == Some(&'}') => {
+                // Escaped closing brace `}}` — pass through.
+                chars.next();
+                result.push_str("}}");
+            }
+            _ => result.push(c),
         }
     }
     result
@@ -316,5 +330,16 @@ mod tests {
     fn positional_keyword_param() {
         // Keyword params like `type` must produce a valid positional placeholder.
         assert_eq!(positional_format_string("/items/{type}"), "/items/{}");
+    }
+
+    #[test]
+    fn positional_escaped_braces_pass_through() {
+        // `{{` / `}}` are literal braces in the route, not parameters.
+        assert_eq!(positional_format_string("/{{hello}}"), "/{{hello}}");
+        // Escaped brace followed by a real param.
+        assert_eq!(
+            positional_format_string("/{{literal}}/{id}"),
+            "/{{literal}}/{}"
+        );
     }
 }
