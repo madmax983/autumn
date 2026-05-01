@@ -69,59 +69,663 @@ pub trait Check {
     fn run(&self) -> CheckResult;
 }
 
-// ─── Pure helper functions ────────────────────────────────────────────────────
+// ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub fn glyph(status: &CheckStatus) -> &'static str {
-    todo!()
+    match status {
+        CheckStatus::Pass => "✅",
+        CheckStatus::Warn => "⚠️ ",
+        CheckStatus::Fail => "❌",
+    }
 }
 
 pub fn compute_summary(results: &[CheckResult]) -> Summary {
-    todo!()
+    let mut passed = 0;
+    let mut warned = 0;
+    let mut failed = 0;
+    for r in results {
+        match r.status {
+            CheckStatus::Pass => passed += 1,
+            CheckStatus::Warn => warned += 1,
+            CheckStatus::Fail => failed += 1,
+        }
+    }
+    Summary { passed, warned, failed }
 }
 
 pub fn exit_code(summary: &Summary, strict: bool) -> i32 {
-    todo!()
+    if summary.failed > 0 || (strict && summary.warned > 0) {
+        1
+    } else {
+        0
+    }
 }
 
 pub fn format_check_line(result: &CheckResult) -> String {
-    todo!()
+    let g = glyph(&result.status);
+    let mut line = format!("{g} {}", result.name);
+    if let Some(ref detail) = result.detail {
+        line.push_str(&format!(" — {detail}"));
+    }
+    if let Some(hint) = result.hint {
+        if result.status != CheckStatus::Pass {
+            line.push_str(&format!("\n   hint: {hint}"));
+        }
+    }
+    line
 }
 
 pub fn format_summary_line(summary: &Summary, code: i32) -> String {
-    todo!()
+    let verdict = if code == 0 { "all clear" } else { "problems found" };
+    let w_label = if summary.warned == 1 { "warning" } else { "warnings" };
+    format!(
+        "{} passed, {} {}, {} failed — {verdict}",
+        summary.passed, summary.warned, w_label, summary.failed
+    )
 }
 
 pub fn to_json_output(results: &[CheckResult], summary: &Summary) -> String {
-    todo!()
+    #[derive(Serialize)]
+    struct Output<'a> {
+        checks: &'a [CheckResult],
+        summary: &'a Summary,
+    }
+    serde_json::to_string_pretty(&Output { checks: results, summary })
+        .unwrap_or_else(|_| "{}".to_string())
 }
 
 // ─── Check implementations ────────────────────────────────────────────────────
 
+/// Check that `autumn.toml` content parses cleanly (pure, injectable for tests).
 pub fn check_toml_content(content: &str) -> CheckResult {
-    todo!()
+    match toml::from_str::<toml::Table>(content) {
+        Err(e) => CheckResult {
+            name: "autumn_toml",
+            status: CheckStatus::Fail,
+            detail: Some(e.to_string()),
+            hint: Some("Fix the syntax error in autumn.toml"),
+        },
+        Ok(table) => {
+            let unknown: Vec<String> = table
+                .keys()
+                .filter(|k| !KNOWN_TOML_SECTIONS.contains(&k.as_str()))
+                .cloned()
+                .collect();
+            if unknown.is_empty() {
+                CheckResult {
+                    name: "autumn_toml",
+                    status: CheckStatus::Pass,
+                    detail: Some("autumn.toml is valid".into()),
+                    hint: None,
+                }
+            } else {
+                CheckResult {
+                    name: "autumn_toml",
+                    status: CheckStatus::Warn,
+                    detail: Some(format!("unknown keys: {}", unknown.join(", "))),
+                    hint: Some("Remove or rename unrecognised keys in autumn.toml"),
+                }
+            }
+        }
+    }
 }
 
+/// Compare CLI version against the project's `autumn-web` version (pure, injectable for tests).
+///
+/// For semver < 1.0 (`0.MINOR.PATCH`), a minor-version mismatch is treated as
+/// a breaking incompatibility (Fail); a patch-only mismatch is a warning.
 pub fn check_version_compat(cli_version: &str, web_version: &str) -> CheckResult {
-    todo!()
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        // Strip leading `=`, `^`, `~` requirement operators if present.
+        let v = v.trim().trim_start_matches(['=', '^', '~', ' ']);
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let major: u64 = parts[0].parse().ok()?;
+        let minor: u64 = parts[1].parse().ok()?;
+        let patch: u64 = if parts.len() >= 3 {
+            parts[2]
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Some((major, minor, patch))
+    };
+
+    let Some(cli) = parse(cli_version) else {
+        return CheckResult {
+            name: "version_compat",
+            status: CheckStatus::Warn,
+            detail: Some(format!("cannot parse CLI version: {cli_version}")),
+            hint: Some("Reinstall autumn-cli"),
+        };
+    };
+    let Some(web) = parse(web_version) else {
+        return CheckResult {
+            name: "version_compat",
+            status: CheckStatus::Warn,
+            detail: Some(format!("cannot parse autumn-web version: {web_version}")),
+            hint: Some("Check autumn-web version in Cargo.toml"),
+        };
+    };
+
+    if cli.0 != web.0 || cli.1 != web.1 {
+        CheckResult {
+            name: "version_compat",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "autumn-cli {cli_version} is incompatible with autumn-web {web_version}"
+            )),
+            hint: Some(
+                "Run `cargo install --path autumn-cli` to match your project's autumn-web version",
+            ),
+        }
+    } else if cli.2 != web.2 {
+        CheckResult {
+            name: "version_compat",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "autumn-cli {cli_version} vs autumn-web {web_version} (patch skew)"
+            )),
+            hint: Some(
+                "Consider updating either the CLI or your project's autumn-web dependency",
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "version_compat",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "autumn-cli {cli_version} matches autumn-web {web_version}"
+            )),
+            hint: None,
+        }
+    }
 }
 
+/// Check whether a port is bindable using an injectable binding function.
 pub fn check_port_bindable_impl(port: u16, try_bind: impl Fn(u16) -> bool) -> CheckResult {
-    todo!()
+    if try_bind(port) {
+        CheckResult {
+            name: "port_bindable",
+            status: CheckStatus::Pass,
+            detail: Some(format!("port {port} is available")),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "port_bindable",
+            status: CheckStatus::Fail,
+            detail: Some(format!("port {port} is already in use")),
+            hint: Some(
+                "Kill the process using that port, or change server.port in autumn.toml",
+            ),
+        }
+    }
 }
 
+/// Compare version strings for the Rust toolchain check (pure, injectable for tests).
 pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckResult {
-    todo!()
+    let parse_ver = |s: &str| -> Option<(u64, u64, u64)> {
+        let s = s.trim();
+        let s = s.strip_prefix("rustc ").map_or(s, |rest| {
+            rest.split_whitespace().next().unwrap_or(rest)
+        });
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() < 3 {
+            return None;
+        }
+        let major: u64 = parts[0].parse().ok()?;
+        let minor: u64 = parts[1].parse().ok()?;
+        let patch: u64 = parts[2]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        Some((major, minor, patch))
+    };
+
+    let Some(cur) = parse_ver(current_output) else {
+        return CheckResult {
+            name: "rust_toolchain",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot parse rustc version: {current_output}"
+            )),
+            hint: Some("Run `rustup update` to ensure a known Rust version"),
+        };
+    };
+    let Some(req) = parse_ver(required) else {
+        return CheckResult {
+            name: "rust_toolchain",
+            status: CheckStatus::Warn,
+            detail: Some(format!("cannot parse MSRV: {required}")),
+            hint: None,
+        };
+    };
+
+    if cur >= req {
+        CheckResult {
+            name: "rust_toolchain",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "rustc {}.{}.{} ≥ MSRV {}.{}.{}",
+                cur.0, cur.1, cur.2, req.0, req.1, req.2
+            )),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "rust_toolchain",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "rustc {}.{}.{} < MSRV {}.{}.{}",
+                cur.0, cur.1, cur.2, req.0, req.1, req.2
+            )),
+            hint: Some("Run `rustup update stable` to upgrade your Rust toolchain"),
+        }
+    }
 }
 
+// ─── IO-dependent checks ──────────────────────────────────────────────────────
+
+fn check_rust_toolchain(msrv: &str) -> CheckResult {
+    match std::process::Command::new("rustc").arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            let ver = String::from_utf8_lossy(&out.stdout).into_owned();
+            check_rust_toolchain_impl(ver.trim(), msrv)
+        }
+        _ => CheckResult {
+            name: "rust_toolchain",
+            status: CheckStatus::Fail,
+            detail: Some("`rustc --version` failed".into()),
+            hint: Some("Install Rust via https://rustup.rs/"),
+        },
+    }
+}
+
+fn check_port_bindable(port: u16) -> CheckResult {
+    check_port_bindable_impl(port, |p| {
+        std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+    })
+}
+
+fn check_tailwind_binary() -> CheckResult {
+    let path = if cfg!(windows) {
+        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
+    } else {
+        std::path::PathBuf::from("target/autumn/tailwindcss")
+    };
+
+    if path.exists() {
+        CheckResult {
+            name: "tailwind_binary",
+            status: CheckStatus::Pass,
+            detail: Some(format!("{} is present", path.display())),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "tailwind_binary",
+            status: CheckStatus::Fail,
+            detail: Some(format!("{} not found", path.display())),
+            hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+        }
+    }
+}
+
+fn check_stale_artifacts() -> CheckResult {
+    use std::fs;
+
+    let cargo_lock = std::path::Path::new("Cargo.lock");
+    let dist = std::path::Path::new("dist");
+    let target = std::path::Path::new("target");
+
+    let lock_mtime = cargo_lock
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok();
+
+    let dir_older_than_lock = |dir: &std::path::Path| -> bool {
+        let Some(lock_t) = lock_mtime else {
+            return false;
+        };
+        dir.metadata()
+            .and_then(|m| m.modified())
+            .map(|dir_t| dir_t < lock_t)
+            .unwrap_or(false)
+    };
+
+    let dist_stale = dist.exists() && dir_older_than_lock(dist);
+    let target_stale = target.exists() && dir_older_than_lock(target);
+
+    if dist_stale || target_stale {
+        let which: Vec<&str> = [dist_stale.then_some("dist/"), target_stale.then_some("target/")]
+            .into_iter()
+            .flatten()
+            .collect();
+        CheckResult {
+            name: "stale_artifacts",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{} may be stale relative to Cargo.lock",
+                which.join(", ")
+            )),
+            hint: Some("Run `cargo build` or `autumn build` to refresh artifacts"),
+        }
+    } else {
+        CheckResult {
+            name: "stale_artifacts",
+            status: CheckStatus::Pass,
+            detail: Some("artifacts look fresh".into()),
+            hint: None,
+        }
+    }
+}
+
+/// Read the `rust-version` MSRV from the nearest workspace/package `Cargo.toml`.
+fn read_msrv() -> Option<String> {
+    let content = std::fs::read_to_string("Cargo.toml").ok()?;
+    let table: toml::Table = toml::from_str(&content).ok()?;
+
+    // Workspace: [workspace.package] rust-version
+    if let Some(ver) = table
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .and_then(|p| p.get("rust-version"))
+        .and_then(|v| v.as_str())
+    {
+        return Some(ver.to_owned());
+    }
+
+    // Plain package: [package] rust-version
+    table
+        .get("package")
+        .and_then(|p| p.get("rust-version"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+}
+
+/// Read the `autumn-web` version requirement from the project's `Cargo.toml`.
+fn read_autumn_web_version() -> Option<String> {
+    let content = std::fs::read_to_string("Cargo.toml").ok()?;
+    let table: toml::Table = toml::from_str(&content).ok()?;
+
+    let find_in_deps = |deps: &toml::Value| -> Option<String> {
+        let entry = deps.get("autumn-web")?;
+        match entry {
+            toml::Value::String(v) => Some(v.clone()),
+            toml::Value::Table(t) => t.get("version")?.as_str().map(|s| s.to_owned()),
+            _ => None,
+        }
+    };
+
+    // [dependencies]
+    if let Some(deps) = table.get("dependencies") {
+        if let Some(v) = find_in_deps(deps) {
+            return Some(v);
+        }
+    }
+
+    // [workspace.dependencies]
+    if let Some(v) = table
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| find_in_deps(d))
+    {
+        return Some(v);
+    }
+
+    None
+}
+
+/// Try to TCP-connect to a host:port within a short timeout.
+fn tcp_reachable(host: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    use std::time::Duration;
+    let addrs: Vec<_> = match format!("{host}:{port}").to_socket_addrs() {
+        Ok(a) => a.collect(),
+        Err(_) => return false,
+    };
+    addrs.iter().any(|addr| {
+        std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok()
+    })
+}
+
+fn check_db_connectivity(database_url: &str) -> CheckResult {
+    // Parse host and port from a Postgres URL: postgres://user:pass@host:port/db
+    let parsed = parse_db_host_port(database_url);
+    match parsed {
+        None => CheckResult {
+            name: "db_connectivity",
+            status: CheckStatus::Warn,
+            detail: Some("cannot parse database URL to extract host:port".into()),
+            hint: Some("Ensure database.url in autumn.toml is a valid PostgreSQL URL"),
+        },
+        Some((host, port)) => {
+            if tcp_reachable(&host, port) {
+                CheckResult {
+                    name: "db_connectivity",
+                    status: CheckStatus::Pass,
+                    detail: Some(format!("Postgres reachable at {host}:{port}")),
+                    hint: None,
+                }
+            } else {
+                CheckResult {
+                    name: "db_connectivity",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!("cannot connect to Postgres at {host}:{port}")),
+                    hint: Some(
+                        "Start Postgres and verify database.url in autumn.toml",
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn check_pending_migrations() -> CheckResult {
+    match std::process::Command::new("diesel")
+        .args(["migration", "pending"])
+        .output()
+    {
+        Err(_) => CheckResult {
+            name: "pending_migrations",
+            status: CheckStatus::Warn,
+            detail: Some("diesel CLI not found; cannot check pending migrations".into()),
+            hint: Some(
+                "Install diesel_cli: `cargo install diesel_cli --no-default-features --features postgres`",
+            ),
+        },
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let pending = stdout
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .count();
+            if pending == 0 {
+                CheckResult {
+                    name: "pending_migrations",
+                    status: CheckStatus::Pass,
+                    detail: Some("no pending migrations".into()),
+                    hint: None,
+                }
+            } else {
+                CheckResult {
+                    name: "pending_migrations",
+                    status: CheckStatus::Warn,
+                    detail: Some(format!("{pending} pending migration(s)")),
+                    hint: Some("Run `autumn migrate` to apply pending migrations"),
+                }
+            }
+        }
+        Ok(_) => CheckResult {
+            name: "pending_migrations",
+            status: CheckStatus::Warn,
+            detail: Some("diesel migration pending returned non-zero".into()),
+            hint: Some("Run `autumn migrate` to apply pending migrations"),
+        },
+    }
+}
+
+/// Parse (host, port) from a Postgres connection URL.
 pub fn parse_db_host_port(url: &str) -> Option<(String, u16)> {
-    todo!()
+    // Expect: postgres://[user:pass@]host[:port]/db
+    let without_scheme = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))?;
+
+    // Drop everything after the first `/` (the database name).
+    let authority = without_scheme.split('/').next()?;
+
+    // Drop user:pass@ prefix if present.
+    let host_port = if let Some(at) = authority.rfind('@') {
+        &authority[at + 1..]
+    } else {
+        authority
+    };
+
+    // Split host:port.
+    if let Some(colon) = host_port.rfind(':') {
+        let host = &host_port[..colon];
+        let port: u16 = host_port[colon + 1..].parse().ok()?;
+        Some((host.to_owned(), port))
+    } else {
+        Some((host_port.to_owned(), 5432))
+    }
 }
 
+/// Resolve the configured HTTP port from `autumn.toml` (fallback: 3000).
+fn resolve_server_port() -> u16 {
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("server")
+                .and_then(|s| s.get("port"))
+                .and_then(|p| p.as_integer())
+                .and_then(|p| u16::try_from(p).ok())
+        })
+        .unwrap_or(3000)
+}
+
+/// Resolve the optional database URL from env and `autumn.toml`.
+fn resolve_optional_db_url() -> Option<String> {
+    if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL") {
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("database")
+                .and_then(|db| db.get("url"))
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+                .map(|s| s.to_owned())
+        })
+}
+
+/// Check whether Tailwind is enabled in `autumn.toml`.
+fn tailwind_enabled() -> bool {
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("tailwind")
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    // Tailwind is considered enabled when build.rs + tailwind.config.js exist.
+                    None
+                })
+        })
+        .unwrap_or_else(|| {
+            // Heuristic: if build.rs exists we assume Tailwind is in use.
+            std::path::Path::new("build.rs").exists()
+        })
+}
+
+// ─── Main entry point ─────────────────────────────────────────────────────────
+
+/// Run all doctor checks and report results.
 pub fn run(opts: DoctorOptions) {
-    todo!()
+    let cli_version = env!("CARGO_PKG_VERSION");
+
+    if !opts.json {
+        println!("\u{1F342} autumn doctor\n");
+    }
+
+    let mut results: Vec<CheckResult> = Vec::new();
+
+    // 1. Rust toolchain
+    let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
+    results.push(check_rust_toolchain(&msrv));
+
+    // 2. Version skew (autumn-cli vs autumn-web in project)
+    if let Some(web_ver) = read_autumn_web_version() {
+        results.push(check_version_compat(cli_version, &web_ver));
+    }
+
+    // 3. autumn.toml
+    match std::fs::read_to_string("autumn.toml") {
+        Ok(content) => results.push(check_toml_content(&content)),
+        Err(_) => results.push(CheckResult {
+            name: "autumn_toml",
+            status: CheckStatus::Warn,
+            detail: Some("autumn.toml not found in current directory".into()),
+            hint: Some("Run `autumn doctor` from your project root (where autumn.toml lives)"),
+        }),
+    }
+
+    // 4 & 5. Database (optional)
+    if let Some(db_url) = resolve_optional_db_url() {
+        results.push(check_db_connectivity(&db_url));
+        results.push(check_pending_migrations());
+    }
+
+    // 6. Port bindable
+    let port = resolve_server_port();
+    results.push(check_port_bindable(port));
+
+    // 7. Tailwind binary (only if Tailwind is in use)
+    if tailwind_enabled() {
+        results.push(check_tailwind_binary());
+    }
+
+    // 8. Stale artifacts (warn only)
+    results.push(check_stale_artifacts());
+
+    let summary = compute_summary(&results);
+    let code = exit_code(&summary, opts.strict);
+
+    if opts.json {
+        println!("{}", to_json_output(&results, &summary));
+    } else {
+        for r in &results {
+            println!("{}", format_check_line(r));
+        }
+        println!();
+        println!("{}", format_summary_line(&summary, code));
+    }
+
+    std::process::exit(code);
 }
 
-// ─── Tests (RED PHASE — all will panic with todo!()) ─────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -536,6 +1140,7 @@ foo = "bar"
         }];
         let summary = compute_summary(&results);
         let json = to_json_output(&results, &summary);
+        // Should parse as valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     }
 }
