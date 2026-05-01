@@ -624,16 +624,17 @@ fn reject_openapi_path_collisions(
         return Ok(());
     };
 
-    // Gather every path a GET will already own by the time we merge.
+    // Gather every path a GET (or WS, which mounts as GET) will already
+    // own by the time we merge.
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for route in route_list {
-        if route.method == http::Method::GET {
+        if route.method == http::Method::GET || route.method.as_str() == "WS" {
             claimed.insert(route.path.to_owned());
         }
     }
     for group in scoped_groups {
         for route in &group.routes {
-            if route.method == http::Method::GET {
+            if route.method == http::Method::GET || route.method.as_str() == "WS" {
                 claimed.insert(join_nested_path(&group.prefix, route.path));
             }
         }
@@ -1853,6 +1854,7 @@ mod tests {
                 },
                 repository: None,
             }],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
@@ -1923,6 +1925,7 @@ mod tests {
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 

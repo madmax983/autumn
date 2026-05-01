@@ -68,6 +68,8 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        route_sources: Vec::new(),
+        current_plugin: None,
         tasks: Vec::new(),
         jobs: Vec::new(),
         static_metas: Vec::new(),
@@ -166,6 +168,11 @@ type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) 
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    /// Parallel to `routes`: registration origin for each route.
+    route_sources: Vec<crate::route_listing::RouteSource>,
+    /// Non-None while a plugin's `build()` is executing; routes and scoped
+    /// groups added during that window are attributed to this plugin.
+    current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
     jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
@@ -226,6 +233,8 @@ pub struct AppBuilder {
 pub(crate) struct ScopedGroup {
     pub(crate) prefix: String,
     pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
@@ -332,6 +341,15 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
+        for _ in &routes {
+            self.route_sources.push(source.clone());
+        }
         self.routes.extend(routes);
         self
     }
@@ -534,9 +552,16 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
+            source,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -993,8 +1018,14 @@ impl AppBuilder {
             );
             return self;
         }
-        self.registered_plugins.insert(name.into_owned());
-        plugin.build(self)
+        let name_str = name.into_owned();
+        self.registered_plugins.insert(name_str.clone());
+        // Save outer plugin context so nested plugin() calls don't permanently
+        // clear it; restore it after this plugin's build() returns.
+        let outer_plugin = self.current_plugin.replace(name_str);
+        let mut result = plugin.build(self);
+        result.current_plugin = outer_plugin;
+        result
     }
 
     /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
@@ -1074,8 +1105,19 @@ impl AppBuilder {
             return;
         }
 
+        // ── Route dump mode ────────────────────────────────────────────
+        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
+        // This is triggered by `autumn routes` to introspect the app's
+        // route table without booting the server or connecting to a database.
+        if is_dump_routes_mode() {
+            self.run_dump_routes_mode().await;
+            return;
+        }
+
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks,
             jobs,
             static_metas: _,
@@ -1337,6 +1379,8 @@ impl AppBuilder {
     async fn run_build_mode(self) {
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks: _,
             jobs: _,
             static_metas,
@@ -1481,10 +1525,65 @@ impl AppBuilder {
             }
         }
     }
+
+    /// Dump the application's route listing as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
+    /// Exits with code 0 on success, code 1 on JSON serialization failure.
+    /// Does not connect to a database or bind a TCP port.
+    async fn run_dump_routes_mode(self) {
+        let Self {
+            routes,
+            route_sources,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            config_loader_factory,
+            telemetry_provider,
+            #[cfg(feature = "openapi")]
+            openapi,
+            ..
+        } = self;
+
+        // Raw Axum routers registered via .merge()/.nest() are opaque: there is
+        // no public API to enumerate their routes. Warn so callers know the
+        // snapshot may be incomplete.
+        let hidden = merge_routers.len() + nest_routers.len();
+        if hidden > 0 {
+            eprintln!(
+                "[autumn routes] warning: {hidden} raw router(s) added via \
+                 .merge()/.nest() are not enumerable and are omitted from this listing"
+            );
+        }
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let mut infos =
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
+        crate::route_listing::sort_route_infos(&mut infos);
+
+        let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -2699,6 +2798,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
@@ -2716,6 +2816,7 @@ mod validate_repository_api_policies_tests {
         let group = ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
         let registry = PolicyRegistry::default();
@@ -4607,5 +4708,104 @@ mod tests {
             assert!(serving.is_some());
             assert!(state.extension::<BlobStoreState>().is_some());
         }
+    }
+
+    // ── Route source attribution ───────────────────────────────────────────
+
+    /// A minimal plugin that registers one route with a known name.
+    struct TestPlugin {
+        name: &'static str,
+        route: Route,
+    }
+
+    impl crate::plugin::Plugin for TestPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed(self.name)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.routes(vec![self.route])
+        }
+    }
+
+    #[test]
+    fn routes_registered_before_plugin_are_user_sourced() {
+        let user_route = test_get_route("/home", "home");
+        let builder = app().routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    #[test]
+    fn routes_registered_inside_plugin_are_plugin_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_registered_after_plugin_revert_to_user_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let user_route = test_get_route("/home", "home");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin).routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    /// A plugin that registers a route and then registers a nested plugin.
+    struct OuterPlugin;
+
+    impl crate::plugin::Plugin for OuterPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "outer".into()
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            let inner = TestPlugin {
+                name: "inner",
+                route: test_get_route("/inner", "inner"),
+            };
+            app.plugin(inner)
+                .routes(vec![test_get_route("/outer-after", "outer_after")])
+        }
+    }
+
+    #[test]
+    fn outer_plugin_source_restored_after_nested_plugin() {
+        let builder = app().plugin(OuterPlugin);
+        // Routes: [/inner from "inner", /outer-after from "outer"]
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            "first route should be attributed to inner plugin"
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            "second route should be re-attributed to outer plugin after nested build"
+        );
     }
 }

@@ -92,6 +92,8 @@ pub mod plugin;
 pub mod probe;
 pub use plugin::{Plugin, Plugins};
 
+pub mod route_listing;
+
 /// Router construction and integration with Axum.
 ///
 /// This module is responsible for taking the application's configuration,
