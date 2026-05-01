@@ -38,6 +38,7 @@ telemetry-otlp = [
     "dep:tracing-opentelemetry",
 ]
 redis = ["dep:redis"]
+i18n = []
 
 [dependencies]
 autumn-macros = { version = "0.3.0", path = "../autumn-macros" }

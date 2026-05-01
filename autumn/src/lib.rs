@@ -82,6 +82,8 @@ pub mod extract;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
+#[cfg(feature = "i18n")]
+pub mod i18n;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;
