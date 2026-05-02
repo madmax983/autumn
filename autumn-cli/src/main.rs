@@ -320,13 +320,12 @@ fn main() {
         }
         Commands::Release(cmd) => match cmd {
             ReleaseCommands::Init { force, target } => {
-                let t = match target.as_deref() {
-                    None => release::Target::Default,
-                    Some(s) => s.parse().unwrap_or_else(|e| {
+                let t = target.as_deref().map_or(release::Target::Default, |s| {
+                    s.parse().unwrap_or_else(|e| {
                         eprintln!("autumn release init: {e}");
                         std::process::exit(1);
-                    }),
-                };
+                    })
+                });
                 release::run(release::ReleaseAction::Init { force, target: t });
             }
         },

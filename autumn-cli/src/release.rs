@@ -38,8 +38,8 @@ impl std::str::FromStr for Target {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "fly" => Ok(Target::Fly),
-            "docker-compose" => Ok(Target::DockerCompose),
+            "fly" => Ok(Self::Fly),
+            "docker-compose" => Ok(Self::DockerCompose),
             other => Err(format!(
                 "unknown target '{other}'; expected 'fly' or 'docker-compose'"
             )),
@@ -47,6 +47,7 @@ impl std::str::FromStr for Target {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum ReleaseAction {
     Init { force: bool, target: Target },
 }
@@ -87,7 +88,7 @@ pub fn run(action: ReleaseAction) {
     }
 }
 
-pub(crate) fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
+pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
     let path = dir.join("Cargo.toml");
     let content = fs::read_to_string(&path)
         .map_err(|e| ReleaseError::CargoToml(format!("{}: {e}", path.display())))?;
@@ -107,7 +108,7 @@ pub(crate) fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
         .get("package")
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
-        .map(|s| s.to_owned())
+        .map(str::to_owned)
         .ok_or_else(|| ReleaseError::CargoToml("missing [package] name".into()))
 }
 
