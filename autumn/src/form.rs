@@ -270,6 +270,7 @@ impl<T> ChangesetForm<T> {
     /// populated by [`from_request`](Self::from_request) sets this automatically
     /// for POST handlers; use this builder on GET handlers that construct a blank
     /// form with [`blank`](Self::blank).
+    #[must_use]
     pub fn with_csrf_field(mut self, field: impl Into<String>) -> Self {
         self.csrf_field = field.into();
         self
