@@ -783,7 +783,7 @@ fn push_percent_encoded(output: &mut String, byte: u8) {
 /// that the key exists in the default locale's `.ftl` file.
 ///
 /// The macro itself lives in [`autumn_macros`] (the proc-macro crate). See
-/// its [`t`] docs for the compile-time check semantics
+/// its [`t`](autumn_macros::t) docs for the compile-time check semantics
 /// and the env-var contract used to locate the default-locale bundle.
 ///
 /// # Forms

@@ -353,6 +353,22 @@ impl AppBuilder {
     ///     .await;
     /// # }
     /// ```
+    /// Registers a collection of HTTP routes with the application.
+    ///
+    /// Why this exists: Instead of forcing developers to map routes sequentially onto a
+    /// live router, this method collects them into a staging area. This allows the framework
+    /// to automatically analyze, sort, and wrap your routes with centralized middleware
+    /// (like CSRF protection or Rate Limiting) during the final [`AppBuilder::run`] execution.
+    ///
+    /// ## Examples
+    /// ```rust
+    /// use autumn_web::prelude::*;
+    ///
+    /// let app = AppBuilder::new()
+    ///     .routes(routes![
+    ///         get("/", || async { "Hello, World!" })
+    ///     ]);
+    /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
         let source = self
@@ -861,7 +877,7 @@ impl AppBuilder {
 
     /// Auto-load the i18n translation bundle from the configured directory
     /// (`i18n/` by default), reading the `[i18n]` block from the active
-    /// [`AutumnConfig`](crate::config::AutumnConfig).
+    /// [`AutumnConfig`].
     ///
     /// Fails fast during [`Self::run`] if the configured default locale's file is
     /// missing — the spec calls out this as the desired behaviour: a
@@ -3182,6 +3198,24 @@ mod tests {
     use tower::ServiceExt;
 
     /// Helper to build a test router with default config and no database.
+    ///
+    /// Why this exists: Initializing a full [`AppBuilder`] can be heavyweight and requires
+    /// setting up database pools and logging infrastructure. This method bypasses that machinery,
+    /// providing a lightweight, pure `axum::Router` perfectly suited for rapid unit tests.
+    ///
+    /// ## Examples
+    /// ```rust
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::app::AppBuilder;
+    ///
+    /// let router = AppBuilder::test_router(routes![
+    ///     get("/ping", || async { "pong" })
+    /// ]);
+    /// ```
+    ///
+    /// ## Panics
+    /// This method initializes a default [`AppState`] which will panic if requested resources
+    /// (like an active database connection pool) are required by the route handlers under test.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
