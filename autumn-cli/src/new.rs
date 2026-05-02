@@ -17,6 +17,8 @@ mod templates {
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
+    pub const INTEGRATION_TEST: &str =
+        include_str!("templates/tests/integration_test.rs.tmpl");
 }
 
 /// Errors that can occur during project generation.
@@ -82,6 +84,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
+    fs::create_dir_all(project_dir.join("tests"))?;
     if opts.with_i18n {
         fs::create_dir_all(project_dir.join("i18n"))?;
     }
@@ -138,6 +141,10 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     )?;
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
+    fs::write(
+        project_dir.join("tests/integration_test.rs"),
+        render(templates::INTEGRATION_TEST),
+    )?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
@@ -155,6 +162,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/migrations/");
+    println!("  Created {name}/tests/integration_test.rs");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }

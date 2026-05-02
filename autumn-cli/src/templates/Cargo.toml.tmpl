@@ -8,4 +8,8 @@ edition = "2024"
 # autumn-web = { version = "{{autumn_version}}", features = ["redis", "mail"] }
 autumn-web = "{{autumn_version}}"
 
+[dev-dependencies]
+# tokio runtime macros are needed for #[tokio::test] in integration tests.
+tokio = { version = "1", features = ["rt", "macros"] }
+
 [workspace]
