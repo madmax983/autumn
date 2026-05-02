@@ -11,7 +11,6 @@ use diesel::prelude::*;
 use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
-use tracing::warn;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{Post, Subreddit, User};
@@ -331,15 +330,8 @@ pub async fn submit(
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    let url_for_insert = url.clone();
-    let title_for_insert = title.clone();
-    let slug_for_insert = slug.clone();
-    let post_id = (*db)
-        .transaction::<i64, AutumnError, _>(|conn| {
-            let title = title_for_insert.clone();
-            let slug = slug_for_insert.clone();
-            let body = body.clone();
-            let url = url_for_insert.clone();
+    (*db)
+        .transaction::<(), AutumnError, _>(move |conn| {
             async move {
                 let post_id: i64 = diesel::insert_into(posts::table)
                     .values((
@@ -364,31 +356,14 @@ pub async fn submit(
                     .execute(conn)
                     .await?;
 
-                Ok(post_id)
+                enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
+                    .await?;
+
+                Ok(())
             }
             .scope_boxed()
         })
         .await?;
-
-    if let Err(error) = PostPublicationJob::enqueue(PostPublicationArgs::new(
-        post_id,
-        title.clone(),
-        slug.clone(),
-        subreddit_slug.clone(),
-        author_username.clone(),
-    ))
-    .await
-    {
-        warn!(
-            post_id,
-            title = %title,
-            post_slug = %slug,
-            subreddit_slug = %sub.slug,
-            author_username = %author_username,
-            error = %error,
-            "failed to enqueue post publication job"
-        );
-    }
 
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
         &sub.slug,
@@ -740,6 +715,23 @@ async fn unique_slug(
     }
 }
 
+async fn enqueue_post_publication(
+    post_id: i64,
+    title: &str,
+    post_slug: &str,
+    subreddit_slug: &str,
+    author_username: &str,
+) -> AutumnResult<()> {
+    PostPublicationJob::enqueue(PostPublicationArgs::new(
+        post_id,
+        title,
+        post_slug,
+        subreddit_slug,
+        author_username,
+    ))
+    .await
+}
+
 /// Like `unique_slug`, but excludes a specific post ID (for updates).
 async fn unique_slug_excluding(
     base: &str,
@@ -775,3 +767,21 @@ autumn_web::paths![
     update,
     delete_post
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn post_publication_enqueue_failure_is_returned_to_submit() {
+        let error =
+            enqueue_post_publication(99, "Ferris arrives", "ferris-arrives", "rust", "ferris")
+                .await
+                .expect_err("missing job runtime should fail post submission");
+
+        assert!(
+            error.to_string().contains("job runtime is not initialized"),
+            "unexpected error: {error}"
+        );
+    }
+}

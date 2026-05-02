@@ -321,7 +321,9 @@ struct LiveEventBusPublisher {
 
 #[derive(Clone)]
 enum LiveEventBusPublisherInner {
-    PostgresNotify,
+    PostgresNotify {
+        channel: String,
+    },
     RedisPubSub {
         channel: String,
         client: redis::Client,
@@ -399,7 +401,9 @@ impl LiveEventBusPublisher {
         health: Arc<LiveFeedRelayHealth>,
     ) -> AutumnResult<Self> {
         let inner = match config.kind {
-            LiveFeedBusKind::PostgresNotify => LiveEventBusPublisherInner::PostgresNotify,
+            LiveFeedBusKind::PostgresNotify => LiveEventBusPublisherInner::PostgresNotify {
+                channel: config.channel.clone(),
+            },
             LiveFeedBusKind::RedisPubSub => {
                 let redis_url = config.redis_url.as_deref().ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
@@ -418,9 +422,17 @@ impl LiveEventBusPublisher {
         Ok(Self { inner, health })
     }
 
+    fn postgres_notify_channel(&self) -> String {
+        let channel = match &self.inner {
+            LiveEventBusPublisherInner::PostgresNotify { channel }
+            | LiveEventBusPublisherInner::RedisPubSub { channel, .. } => channel,
+        };
+        live_event_notify_channel(channel)
+    }
+
     async fn publish(&self, event_id: i64) -> AutumnResult<()> {
         let result = match &self.inner {
-            LiveEventBusPublisherInner::PostgresNotify => Ok(()),
+            LiveEventBusPublisherInner::PostgresNotify { .. } => Ok(()),
             LiveEventBusPublisherInner::RedisPubSub { channel, client } => {
                 let payload = serde_json::to_string(&LiveEventBusMessage { event_id })
                     .expect("live-event bus payload should serialize");
@@ -442,6 +454,13 @@ impl LiveEventBusPublisher {
         let _ = event_id;
         result
     }
+}
+
+fn live_event_notify_channel_for_state(state: &AppState) -> String {
+    state
+        .extension::<LiveEventBusPublisher>()
+        .map(|publisher| publisher.postgres_notify_channel())
+        .unwrap_or_else(|| live_event_notify_channel(LIVE_EVENT_NOTIFY_QUEUE))
 }
 
 type LiveEventConnectFuture<'a> =
@@ -796,6 +815,36 @@ pub async fn store_activity_event(
     subreddit_slug: &str,
     event: &Value,
 ) -> Result<i64, diesel::result::Error> {
+    store_activity_event_on_channel(
+        conn,
+        subreddit_slug,
+        event,
+        &live_event_notify_channel(LIVE_EVENT_NOTIFY_QUEUE),
+    )
+    .await
+}
+
+pub async fn store_activity_event_for_state(
+    state: &AppState,
+    conn: &mut AsyncPgConnection,
+    subreddit_slug: &str,
+    event: &Value,
+) -> Result<i64, diesel::result::Error> {
+    store_activity_event_on_channel(
+        conn,
+        subreddit_slug,
+        event,
+        &live_event_notify_channel_for_state(state),
+    )
+    .await
+}
+
+async fn store_activity_event_on_channel(
+    conn: &mut AsyncPgConnection,
+    subreddit_slug: &str,
+    event: &Value,
+    notify_channel: &str,
+) -> Result<i64, diesel::result::Error> {
     let event_id: i64 = diesel::insert_into(live_feed_events::table)
         .values(NewLiveFeedEventRow {
             subreddit_slug,
@@ -804,7 +853,7 @@ pub async fn store_activity_event(
         .returning(live_feed_events::id)
         .get_result(conn)
         .await?;
-    notify_live_event_stored(conn, event_id).await?;
+    notify_live_event_stored(conn, event_id, notify_channel).await?;
 
     Ok(event_id)
 }
@@ -893,8 +942,8 @@ async fn load_current_live_event_cursor(
 async fn notify_live_event_stored(
     conn: &mut AsyncPgConnection,
     event_id: i64,
+    channel: &str,
 ) -> Result<(), diesel::result::Error> {
-    let channel = live_event_notify_channel(LIVE_EVENT_NOTIFY_QUEUE);
     let payload = serde_json::to_string(&LiveEventBusMessage { event_id })
         .expect("live-feed notify payload should serialize");
 
@@ -1502,6 +1551,26 @@ mod tests {
 
         web_state.trigger_shutdown_for_test();
         relay.await.expect("relay task should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn postgres_notify_channel_uses_installed_bus_channel() {
+        let state = AppState::detached();
+        install_live_event_bus_with_config(
+            &state,
+            LiveFeedBusConfig {
+                kind: LiveFeedBusKind::PostgresNotify,
+                redis_url: None,
+                channel: "custom_live_feed".to_owned(),
+            },
+        )
+        .await
+        .expect("custom live-event bus should install");
+
+        assert_eq!(
+            live_event_notify_channel_for_state(&state),
+            "autumn_live_event_custom_live_feed"
+        );
     }
 
     #[tokio::test]

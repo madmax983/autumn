@@ -8,8 +8,9 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
+use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
-use tracing::warn;
+use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{UserOnboardingArgs, UserOnboardingJob};
 use crate::models::{NewUser, User};
@@ -152,21 +153,23 @@ pub async fn register(
         password_hash: hashed,
     };
 
-    let user: User = diesel::insert_into(users::table)
-        .values(&new_user)
-        .returning(User::as_returning())
-        .get_result(&mut *db)
-        .await
-        .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
+    let user = (*db)
+        .transaction::<User, AutumnError, _>(move |conn| {
+            async move {
+                let user: User = diesel::insert_into(users::table)
+                    .values(&new_user)
+                    .returning(User::as_returning())
+                    .get_result(conn)
+                    .await
+                    .map_err(|_| AutumnError::unprocessable_msg("Username already taken"))?;
 
-    if let Err(error) = UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(&user)).await {
-        warn!(
-            user_id = user.id,
-            username = %user.username,
-            error = %error,
-            "failed to enqueue user onboarding job"
-        );
-    }
+                enqueue_user_onboarding(&user).await?;
+
+                Ok(user)
+            }
+            .scope_boxed()
+        })
+        .await?;
 
     // Log in immediately after registration
     session.rotate_id().await;
@@ -177,6 +180,10 @@ pub async fn register(
     AccountMailer.deliver_later_welcome(&mailer, email, user.username.clone());
 
     Ok(Redirect::to("/"))
+}
+
+async fn enqueue_user_onboarding(user: &User) -> AutumnResult<()> {
+    UserOnboardingJob::enqueue(UserOnboardingArgs::from_user(user)).await
 }
 
 // ── Login ──────────────────────────────────────────────────────
@@ -217,6 +224,28 @@ mod tests {
         );
         assert!(eml.contains("Subject: Welcome to Autumn Reddit"));
         assert!(eml.contains("cool_rustacean"));
+    }
+
+    #[tokio::test]
+    async fn onboarding_enqueue_failure_is_returned_to_registration() {
+        let user = User {
+            id: 42,
+            username: "ferris".to_owned(),
+            password_hash: "hashed".to_owned(),
+            karma: 0,
+            role: "user".to_owned(),
+            created_at: chrono::DateTime::UNIX_EPOCH.naive_utc(),
+            avatar: None,
+        };
+
+        let error = enqueue_user_onboarding(&user)
+            .await
+            .expect_err("missing job runtime should fail registration");
+
+        assert!(
+            error.to_string().contains("job runtime is not initialized"),
+            "unexpected error: {error}"
+        );
     }
 }
 
