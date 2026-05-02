@@ -1434,7 +1434,43 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
         TestActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
-            routes: vec![],
+            routes: vec![
+                crate::route_listing::RouteInfo {
+                    method: "GET".to_string(),
+                    path: "/test/get".to_string(),
+                    handler: "test_get".to_string(),
+                    source: crate::route_listing::RouteSource::User,
+                    middleware: vec![],
+                },
+                crate::route_listing::RouteInfo {
+                    method: "POST".to_string(),
+                    path: "/test/post".to_string(),
+                    handler: "test_post".to_string(),
+                    source: crate::route_listing::RouteSource::Framework,
+                    middleware: vec![],
+                },
+                crate::route_listing::RouteInfo {
+                    method: "PUT".to_string(),
+                    path: "/test/put".to_string(),
+                    handler: "test_put".to_string(),
+                    source: crate::route_listing::RouteSource::Plugin("test".to_string()),
+                    middleware: vec![],
+                },
+                crate::route_listing::RouteInfo {
+                    method: "DELETE".to_string(),
+                    path: "/test/delete".to_string(),
+                    handler: "test_delete".to_string(),
+                    source: crate::route_listing::RouteSource::User,
+                    middleware: vec![],
+                },
+                crate::route_listing::RouteInfo {
+                    method: "PATCH".to_string(),
+                    path: "/test/patch".to_string(),
+                    handler: "test_patch".to_string(),
+                    source: crate::route_listing::RouteSource::User,
+                    middleware: vec![],
+                },
+            ],
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
@@ -2166,7 +2202,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2191,7 +2227,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2216,7 +2252,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
