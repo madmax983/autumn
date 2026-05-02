@@ -81,6 +81,14 @@ const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 ///     }
 /// }
 /// ```
+/// The configured CSRF form field name, placed in request extensions by [`CsrfLayer`].
+///
+/// [`ChangesetForm`](crate::form::ChangesetForm) reads this so `form_tag` emits the
+/// hidden input under the correct field name even when `security.csrf.form_field` has
+/// been customised from its default `"_csrf"`.
+#[derive(Clone, Debug)]
+pub struct CsrfFormField(pub String);
+
 #[derive(Clone, Debug)]
 pub struct CsrfToken(String);
 
@@ -89,6 +97,11 @@ impl CsrfToken {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new(token: String) -> Self {
+        Self(token)
     }
 }
 
@@ -271,8 +284,10 @@ where
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        // Insert CsrfToken into request extensions for handler access
+        // Insert CsrfToken and the configured form field name into request extensions.
         req.extensions_mut().insert(CsrfToken(token.clone()));
+        req.extensions_mut()
+            .insert(CsrfFormField(self.settings.form_field.clone()));
 
         // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {

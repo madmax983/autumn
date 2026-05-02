@@ -136,12 +136,19 @@ pub mod static_gen;
 #[cfg(feature = "storage")]
 pub mod storage;
 
+pub mod form;
 pub mod job;
 #[cfg(feature = "seed")]
 pub mod seed;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
+/// Changeset type carrying submitted values + per-field errors.
+pub use form::Changeset;
+/// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
+pub use form::ChangesetForm;
+/// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
+pub use form::IntoChangeset;
 pub mod validation;
 #[cfg(feature = "ws")]
 pub mod ws;

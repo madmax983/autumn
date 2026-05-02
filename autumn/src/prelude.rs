@@ -77,6 +77,10 @@ pub use crate::mail::{
 pub use crate::sse::{Event, Sse};
 /// State extractor.
 pub use axum::extract::State;
+/// Trait for types that can be converted into an HTTP response.
+pub use axum::response::IntoResponse;
+/// HTTP status codes.
+pub use http::StatusCode;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Structured audit event types.
@@ -91,6 +95,14 @@ pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
+/// Validation trait — derive with `#[derive(Validate)]` on form/model types.
+pub use validator::Validate;
+
+// ── Form ─────────────────────────────────────────────────────────
+/// Changeset-style form helpers: [`Changeset`], [`ChangesetForm`], [`IntoChangeset`].
+///
+/// See [`crate::form`] for the full surface including Maud rendering helpers.
+pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
 // ── Hooks ───────────────────────────────────────────────────────
 /// Mutation hook types for repository lifecycle callbacks.
