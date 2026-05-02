@@ -239,6 +239,7 @@ pub struct ChangesetForm<T> {
     /// The validated (or invalid) changeset.
     pub changeset: Changeset<T>,
     pub(crate) csrf_token: Option<String>,
+    pub(crate) csrf_field: String,
 }
 
 impl<T> ChangesetForm<T> {
@@ -258,6 +259,7 @@ impl<T> ChangesetForm<T> {
         Self {
             changeset: Changeset::new(data),
             csrf_token: Some(csrf_token.to_owned()),
+            csrf_field: "_csrf".to_owned(),
         }
     }
 
@@ -303,11 +305,18 @@ impl<T> std::ops::Deref for ChangesetForm<T> {
 #[cfg(feature = "maud")]
 impl<T: Serialize> ChangesetForm<T> {
     /// Render a `<form>` element with the stored CSRF token injected as a
-    /// hidden `<input name="_csrf">` — no extra developer action required.
+    /// hidden input — the field name honours `security.csrf.form_field` from
+    /// config, so no developer action is required even for non-default names.
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn form_tag(&self, action: &str, method: &str, content: maud::Markup) -> maud::Markup {
-        form_tag(action, method, self.csrf_token.as_deref(), content)
+        form_tag_inner(
+            action,
+            method,
+            &self.csrf_field,
+            self.csrf_token.as_deref(),
+            content,
+        )
     }
 
     /// Render a labeled `<input type="text">` for `field` using the stored
@@ -330,17 +339,22 @@ where
     type Rejection = axum::response::Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // Capture CSRF token before the body is consumed.
+        // Capture CSRF token and field name before the body is consumed.
         let csrf_token = req
             .extensions()
             .get::<crate::security::CsrfToken>()
             .map(|t| t.token().to_string());
+        let csrf_field = req
+            .extensions()
+            .get::<crate::security::csrf::CsrfFormField>()
+            .map_or_else(|| "_csrf".to_owned(), |f| f.0.clone());
 
         let data: T = decode_form_body(req, state).await?;
 
         Ok(Self {
             changeset: data.into_changeset(),
             csrf_token,
+            csrf_field,
         })
     }
 }
@@ -476,10 +490,11 @@ fn collect_errors(
 /// Render a `<form>` element wrapping `content`.
 ///
 /// When `csrf_token` is `Some(token)`, a hidden `<input name="_csrf">` is
-/// emitted automatically — compatible with [`crate::security::CsrfLayer`].
+/// emitted automatically — compatible with [`crate::security::CsrfLayer`]
+/// using the default field name `_csrf`.
 ///
 /// In **POST** handlers, prefer [`ChangesetForm::form_tag`] which injects
-/// the token without any extra parameter.
+/// the token **and** honours any custom `security.csrf.form_field` from config.
 #[cfg(feature = "maud")]
 #[must_use]
 #[allow(clippy::needless_pass_by_value)]
@@ -489,10 +504,23 @@ pub fn form_tag(
     csrf_token: Option<&str>,
     content: maud::Markup,
 ) -> maud::Markup {
+    form_tag_inner(action, method, "_csrf", csrf_token, content)
+}
+
+/// Internal: render a `<form>` element using an explicit CSRF field name.
+#[cfg(feature = "maud")]
+#[allow(clippy::needless_pass_by_value)]
+fn form_tag_inner(
+    action: &str,
+    method: &str,
+    csrf_field: &str,
+    csrf_token: Option<&str>,
+    content: maud::Markup,
+) -> maud::Markup {
     maud::html! {
         form action=(action) method=(method) {
             @if let Some(token) = csrf_token {
-                input type="hidden" name="_csrf" value=(token);
+                input type="hidden" name=(csrf_field) value=(token);
             }
             (content)
         }
@@ -811,6 +839,7 @@ mod tests {
         let form = ChangesetForm {
             changeset,
             csrf_token: None,
+            csrf_field: "_csrf".into(),
         };
         // Deref gives access to Changeset methods
         assert!(!form.is_valid());
@@ -827,6 +856,7 @@ mod tests {
         let form = ChangesetForm {
             changeset: F { name: "ok".into() }.into_changeset(),
             csrf_token: None,
+            csrf_field: "_csrf".into(),
         };
         assert!(form.into_valid().is_ok());
     }
@@ -841,6 +871,7 @@ mod tests {
         let form = ChangesetForm {
             changeset: F { name: "ab".into() }.into_changeset(),
             csrf_token: Some("tok123".into()),
+            csrf_field: "_csrf".into(),
         };
         let err_form = form.into_valid().unwrap_err();
         assert_eq!(err_form.csrf_token(), Some("tok123"));
@@ -896,6 +927,28 @@ mod tests {
             .form_tag("/x", "post", maud::html! { "" })
             .into_string();
         assert!(html.contains(r#"value="secret-token""#), "{html}");
+        assert!(html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn changeset_form_form_tag_honours_custom_csrf_field_name() {
+        #[derive(validator::Validate, serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let form = ChangesetForm {
+            changeset: Changeset::new(F {
+                name: String::new(),
+            }),
+            csrf_token: Some("tok".into()),
+            csrf_field: "authenticity_token".into(),
+        };
+        let html = form
+            .form_tag("/x", "post", maud::html! { "" })
+            .into_string();
+        assert!(html.contains(r#"name="authenticity_token""#), "{html}");
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
     }
 
     #[cfg(feature = "maud")]
