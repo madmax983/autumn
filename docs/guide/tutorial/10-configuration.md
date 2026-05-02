@@ -133,4 +133,4 @@ At this point your app should have:
 
 ---
 
-Previous: [Chapter 9 - Error Handling](09-errors.md) | Next: [Chapter 11 - What's Next](11-whats-next.md)
+Previous: [Chapter 9 - Error Handling](09-errors.md) | Next: [Chapter 11 - Writing Integration Tests](11-testing.md)
