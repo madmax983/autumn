@@ -28,7 +28,8 @@ stuck, compare your code against the example.
 8. [JSON API](08-json-api.md) — `Json<T>` for request and response
 9. [Error Handling](09-errors.md) — `AutumnResult`, status codes, validation
 10. [Configuration and Production Defaults](10-configuration.md) — `autumn.toml`, env vars, logging
-11. [What's Next](11-whats-next.md) — extending the app, further reading
+11. [Writing Integration Tests](11-testing.md) — `TestApp`, `TestDb`, smoke tests and DB round-trips
+12. [What's Next](12-whats-next.md) — extending the app, further reading
 
 > **Going multilingual?** When you finish the tutorial, see the
 > [i18n guide](../i18n.md) for the opt-in Project Fluent integration —
