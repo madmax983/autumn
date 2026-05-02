@@ -68,8 +68,8 @@ async fn create_todo(mut db: Db, Json(body): Json<NewTodo>) -> AutumnResult<Json
 
 // ── DB setup helper ────────────────────────────────────────────────────────
 
-async fn setup_todos_table(
-) -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+async fn setup_todos_table()
+-> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
     let db = TestDb::shared().await;
     db.execute_sql(
         "CREATE TABLE IF NOT EXISTS todos (

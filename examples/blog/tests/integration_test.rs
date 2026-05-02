@@ -83,8 +83,8 @@ async fn create_post(mut db: Db, Json(body): Json<NewPost>) -> AutumnResult<Json
 
 // ── DB setup helper ────────────────────────────────────────────────────────
 
-async fn setup_posts_table(
-) -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
+async fn setup_posts_table()
+-> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
     let db = TestDb::shared().await;
     db.execute_sql(
         "CREATE TABLE IF NOT EXISTS posts (

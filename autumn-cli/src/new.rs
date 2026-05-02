@@ -17,8 +17,7 @@ mod templates {
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
-    pub const INTEGRATION_TEST: &str =
-        include_str!("templates/tests/integration_test.rs.tmpl");
+    pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
 }
 
 /// Errors that can occur during project generation.
