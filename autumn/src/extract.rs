@@ -445,3 +445,218 @@ fn file_too_large_error(max_file_size_bytes: usize) -> crate::AutumnError {
 }
 
 pub use axum::extract::State;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::FromRequest;
+    use axum::http::Request;
+
+    #[tokio::test]
+    async fn test_multipart_field_bytes_limited_success() {
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nhello\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 100,
+        };
+
+        let bytes = wrapper.bytes_limited().await.unwrap();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_field_bytes_limited_too_large() {
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nhello world\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 5,
+        };
+
+        let err = wrapper.bytes_limited().await.unwrap_err();
+        assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_field_save_to_success() {
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nfile content\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 100,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("out.txt");
+
+        let written = wrapper.save_to(&file_path).await.unwrap();
+        assert_eq!(written, 12);
+
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "file content");
+    }
+
+    #[tokio::test]
+    async fn test_multipart_field_save_to_too_large() {
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\r\nfile content\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 4,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("out_large.txt");
+
+        let err = wrapper.save_to(&file_path).await.unwrap_err();
+        assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        assert!(!file_path.exists());
+    }
+
+    #[cfg(feature = "storage")]
+    #[tokio::test]
+    async fn test_multipart_field_save_to_blob_store_success() {
+        use crate::storage::{BlobStore, LocalBlobStore, local::SigningKey};
+        use std::time::Duration;
+
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\nblob content\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 100,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(
+            "local",
+            root.path(),
+            "/blobs",
+            Duration::from_secs(3600),
+            SigningKey::random(),
+        )
+        .unwrap();
+
+        let blob = wrapper.save_to_blob_store(&store, "myblob").await.unwrap();
+        assert_eq!(blob.key, "myblob");
+        assert_eq!(blob.content_type, "text/plain");
+
+        let bytes = store.get("myblob").await.unwrap();
+        assert_eq!(&bytes[..], b"blob content");
+    }
+
+    #[cfg(feature = "storage")]
+    #[tokio::test]
+    async fn test_multipart_field_save_to_blob_store_too_large() {
+        #[allow(unused_imports)]
+        use crate::storage::{BlobStore, LocalBlobStore, local::SigningKey};
+        use std::time::Duration;
+
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\nContent-Type: text/plain\r\n\r\nblob content\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 4, // "blob content" is 12 bytes
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let store = LocalBlobStore::new(
+            "local",
+            root.path(),
+            "/blobs",
+            Duration::from_secs(3600),
+            SigningKey::random(),
+        )
+        .unwrap();
+
+        let err = wrapper
+            .save_to_blob_store(&store, "myblob")
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_field_metadata() {
+        let body = "--boundary\r\nContent-Disposition: form-data; name=\"custom_name\"; filename=\"custom_file.png\"\r\nContent-Type: image/png\r\n\r\npng\r\n--boundary--\r\n";
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=boundary")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+
+        let mut multipart = axum::extract::Multipart::from_request(req, &())
+            .await
+            .unwrap();
+        let field = multipart.next_field().await.unwrap().unwrap();
+
+        let wrapper = MultipartField {
+            inner: field,
+            max_file_size_bytes: 100,
+        };
+
+        assert_eq!(wrapper.name(), Some("custom_name"));
+        assert_eq!(wrapper.file_name(), Some("custom_file.png"));
+        assert_eq!(wrapper.content_type(), Some("image/png"));
+
+        let tighter = wrapper.with_max_bytes(50);
+        assert_eq!(tighter.max_file_size_bytes, 50);
+
+        let not_tighter = tighter.with_max_bytes(200);
+        assert_eq!(not_tighter.max_file_size_bytes, 50); // should not relax
+    }
+}
