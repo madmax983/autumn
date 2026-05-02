@@ -28,14 +28,25 @@ struct GreetForm {
     email: String,
 }
 
+fn greet_partial(cs: &Changeset<GreetForm>) -> Markup {
+    form_tag(
+        "/greet",
+        "post",
+        None,
+        html! {
+            (text_input(cs, "name", "Your name"))
+            (text_input(cs, "email", "Email address"))
+            (submit_button("Say hello"))
+        },
+    )
+}
+
 #[get("/greet/new")]
 async fn new_greet() -> Markup {
-    let cs = Changeset::new(GreetForm { name: String::new(), email: String::new() });
-    form_tag("/greet", "post", None, html! {
-        (text_input(&cs, "name", "Your name"))
-        (text_input(&cs, "email", "Email address"))
-        (submit_button("Say hello"))
-    })
+    greet_partial(&Changeset::new(GreetForm {
+        name: String::new(),
+        email: String::new(),
+    }))
 }
 
 #[post("/greet")]
@@ -43,14 +54,7 @@ async fn create_greet(form: ChangesetForm<GreetForm>) -> impl axum::response::In
     use axum::http::StatusCode;
     match form.into_valid() {
         Ok(g) => (StatusCode::OK, html! { p { "Hello, " (g.name) "!" } }),
-        Err(form) => {
-            let cs = form.into_changeset();
-            (StatusCode::UNPROCESSABLE_ENTITY, form_tag("/greet", "post", None, html! {
-                (text_input(&cs, "name", "Your name"))
-                (text_input(&cs, "email", "Email address"))
-                (submit_button("Say hello"))
-            }))
-        }
+        Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, greet_partial(&form)),
     }
 }
 

@@ -21,7 +21,7 @@
 //! | Django (Python) | `forms.Form` | `{{ form.name.errors }}` |
 //! | Autumn (Rust) | `Changeset<T>` | `form.text_input("name", "Name")` |
 //!
-//! # Happy-path + validation-failure in ≤ 40 LoC
+//! # Happy-path + validation-failure in ≤ 40 `LoC`
 //!
 //! ```rust,ignore
 //! use autumn_web::prelude::*;
@@ -119,7 +119,7 @@ impl<T> Changeset<T> {
     }
 
     /// Create a changeset pre-loaded with field-level errors.
-    pub fn from_errors(data: T, errors: HashMap<String, Vec<String>>) -> Self {
+    pub const fn from_errors(data: T, errors: HashMap<String, Vec<String>>) -> Self {
         Self { data, errors }
     }
 
@@ -130,7 +130,7 @@ impl<T> Changeset<T> {
 
     /// Returns the validation messages for `field`, or an empty slice.
     pub fn errors_for(&self, field: &str) -> &[String] {
-        self.errors.get(field).map(Vec::as_slice).unwrap_or(&[])
+        self.errors.get(field).map_or(&[], Vec::as_slice)
     }
 
     /// Unwrap the inner data regardless of validity.
@@ -139,6 +139,10 @@ impl<T> Changeset<T> {
     }
 
     /// Consume the changeset, returning `Ok(T)` if valid or `Err(self)` if not.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` when there are field-level validation errors.
     pub fn into_valid(self) -> Result<T, Self> {
         if self.is_valid() {
             Ok(self.data)
@@ -148,12 +152,12 @@ impl<T> Changeset<T> {
     }
 
     /// Shared reference to the inner data.
-    pub fn data(&self) -> &T {
+    pub const fn data(&self) -> &T {
         &self.data
     }
 
     /// All field errors as a map (field name → list of messages).
-    pub fn errors(&self) -> &HashMap<String, Vec<String>> {
+    pub const fn errors(&self) -> &HashMap<String, Vec<String>> {
         &self.errors
     }
 }
@@ -272,6 +276,10 @@ impl<T> ChangesetForm<T> {
     /// The `Err` branch returns the whole `ChangesetForm` (with its CSRF
     /// token) so the handler can immediately call `form.form_tag()` to
     /// re-render with inline errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` when the inner changeset has field-level validation errors.
     pub fn into_valid(self) -> Result<T, Self> {
         if self.changeset.is_valid() {
             Ok(self.changeset.into_inner())
@@ -296,6 +304,8 @@ impl<T> std::ops::Deref for ChangesetForm<T> {
 impl<T: Serialize> ChangesetForm<T> {
     /// Render a `<form>` element with the stored CSRF token injected as a
     /// hidden `<input name="_csrf">` — no extra developer action required.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn form_tag(&self, action: &str, method: &str, content: maud::Markup) -> maud::Markup {
         form_tag(action, method, self.csrf_token.as_deref(), content)
     }
@@ -341,16 +351,17 @@ where
     T: serde::de::DeserializeOwned + validator::Validate,
     S: Send + Sync,
 {
-    let _content_type = req
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-
     #[cfg(feature = "multipart")]
-    if _content_type.starts_with("multipart/form-data") {
-        return decode_multipart(req, state).await;
+    {
+        let content_type = req
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        if content_type.starts_with("multipart/form-data") {
+            return decode_multipart(req, state).await;
+        }
     }
 
     let axum::extract::Form(data) = axum::extract::Form::<T>::from_request(req, state)
@@ -414,25 +425,47 @@ where
 
 // ── Internal helpers ───────────────────────────────────────────────
 
-fn validation_errors_to_map(
+fn validation_errors_to_map(errors: &validator::ValidationErrors) -> HashMap<String, Vec<String>> {
+    let mut map = HashMap::new();
+    collect_errors(errors, "", &mut map);
+    map
+}
+
+fn collect_errors(
     errors: &validator::ValidationErrors,
-) -> HashMap<String, Vec<String>> {
-    errors
-        .field_errors()
-        .into_iter()
-        .map(|(field, errs)| {
-            let messages = errs
-                .iter()
-                .map(|e| {
-                    e.message.as_ref().map_or_else(
-                        || format!("validation failed: {}", e.code),
-                        ToString::to_string,
-                    )
-                })
-                .collect();
-            (field.to_string(), messages)
-        })
-        .collect()
+    prefix: &str,
+    map: &mut HashMap<String, Vec<String>>,
+) {
+    for (field, kind) in errors.errors() {
+        let key = if prefix.is_empty() {
+            (*field).to_string()
+        } else {
+            format!("{prefix}.{field}")
+        };
+        match kind {
+            validator::ValidationErrorsKind::Field(errs) => {
+                let messages: Vec<String> = errs
+                    .iter()
+                    .map(|e| {
+                        e.message.as_ref().map_or_else(
+                            || format!("validation failed: {}", e.code),
+                            ToString::to_string,
+                        )
+                    })
+                    .collect();
+                map.entry(key).or_default().extend(messages);
+            }
+            validator::ValidationErrorsKind::Struct(nested) => {
+                collect_errors(nested, &key, map);
+            }
+            validator::ValidationErrorsKind::List(list) => {
+                for (idx, nested) in list {
+                    let indexed_key = format!("{key}[{idx}]");
+                    collect_errors(nested, &indexed_key, map);
+                }
+            }
+        }
+    }
 }
 
 // ── Standalone Maud helpers ─────────────────────────────────────────
@@ -448,6 +481,8 @@ fn validation_errors_to_map(
 /// In **POST** handlers, prefer [`ChangesetForm::form_tag`] which injects
 /// the token without any extra parameter.
 #[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::needless_pass_by_value)]
 pub fn form_tag(
     action: &str,
     method: &str,
@@ -471,6 +506,7 @@ pub fn form_tag(
 /// - Adds `aria-invalid="true"` + `aria-describedby` when errors exist
 /// - Emits a `<div role="alert">` with per-message `<p>` error elements
 #[cfg(feature = "maud")]
+#[must_use]
 pub fn text_input<T: Serialize>(
     changeset: &Changeset<T>,
     field: &str,
@@ -504,6 +540,7 @@ pub fn text_input<T: Serialize>(
 
 /// Render a `<button type="submit">` with `label`.
 #[cfg(feature = "maud")]
+#[must_use]
 pub fn submit_button(label: &str) -> maud::Markup {
     maud::html! {
         button type="submit" { (label) }
@@ -672,7 +709,10 @@ mod tests {
             #[validate(length(min = 3))]
             name: String,
         }
-        let cs = F { name: "Alice".into() }.into_changeset();
+        let cs = F {
+            name: "Alice".into(),
+        }
+        .into_changeset();
         assert!(cs.is_valid());
         assert!(cs.errors_for("name").is_empty());
     }
@@ -717,6 +757,33 @@ mod tests {
         assert!(!cs.is_valid());
         assert!(!cs.errors_for("name").is_empty());
         assert!(!cs.errors_for("email").is_empty());
+    }
+
+    mod nested_validation {
+        use super::*;
+        use validator::Validate as _;
+
+        #[derive(validator::Validate)]
+        struct NestedAddress {
+            #[validate(length(min = 3, message = "street too short"))]
+            street: String,
+        }
+
+        #[derive(validator::Validate)]
+        struct PersonWithAddress {
+            #[validate(nested)]
+            address: NestedAddress,
+        }
+
+        #[test]
+        fn nested_struct_errors_are_flattened_with_dot_notation() {
+            let cs = PersonWithAddress {
+                address: NestedAddress { street: "x".into() },
+            }
+            .into_changeset();
+            assert!(!cs.is_valid());
+            assert!(!cs.errors_for("address.street").is_empty());
+        }
     }
 
     // ── ChangesetForm helpers ──────────────────────────────────────
@@ -819,7 +886,12 @@ mod tests {
         struct F {
             name: String,
         }
-        let form = ChangesetForm::blank(F { name: String::new() }, "secret-token");
+        let form = ChangesetForm::blank(
+            F {
+                name: String::new(),
+            },
+            "secret-token",
+        );
         let html = form
             .form_tag("/x", "post", maud::html! { "" })
             .into_string();
@@ -900,7 +972,12 @@ mod tests {
             "password".to_string(),
             vec!["too short".to_string(), "needs digit".to_string()],
         );
-        let cs = Changeset::from_errors(F { password: "x".into() }, errors);
+        let cs = Changeset::from_errors(
+            F {
+                password: "x".into(),
+            },
+            errors,
+        );
         let html = text_input(&cs, "password", "Password").into_string();
         assert!(html.contains("too short"), "{html}");
         assert!(html.contains("needs digit"), "{html}");
@@ -918,7 +995,7 @@ mod tests {
 
     mod extractor_tests {
         use super::*;
-        use axum::{body::Body, routing::post, Router};
+        use axum::{Router, body::Body, routing::post};
         use tower::ServiceExt;
 
         #[derive(serde::Deserialize, validator::Validate)]

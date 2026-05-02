@@ -92,7 +92,7 @@ impl CsrfToken {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(token: String) -> Self {
+    pub(crate) const fn new(token: String) -> Self {
         Self(token)
     }
 }
