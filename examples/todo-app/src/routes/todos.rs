@@ -4,7 +4,7 @@
 //! use htmx attributes for interactive toggle/delete behaviour.
 
 use autumn_web::extract::Path;
-use autumn_web::form::{Changeset, ChangesetForm};
+use autumn_web::form::ChangesetForm;
 use autumn_web::prelude::{IntoResponse, StatusCode, Validate};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
 use diesel::prelude::*;
@@ -120,36 +120,36 @@ fn todo_item(todo: &Todo) -> Markup {
 }
 
 /// Render the new-todo form, re-populating the title and showing errors on failure.
-fn new_todo_form(pending: &Changeset<TodoForm>) -> Markup {
+fn new_todo_form(pending: &ChangesetForm<TodoForm>) -> Markup {
     let errors = pending.errors_for("title");
-    html! {
-        form action=(paths::create()) method="post" class="flex flex-col gap-2 mb-8" {
-            div class="flex gap-2" {
-                input type="text" name="title"
-                      value=(pending.field_value("title").unwrap_or_default())
-                      placeholder="What needs to be done?"
-                      autocomplete="off"
-                      aria-invalid=(if errors.is_empty() { "false" } else { "true" })
-                      class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
-                             text-sm placeholder-stone-400 \
-                             focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
-                             focus:border-amber-400 transition-colors";
-                button type="submit"
-                       class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
-                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
-                              transition-colors" {
-                    "Add"
-                }
-            }
-            @for msg in errors {
-                p class="text-red-600 text-xs px-1" { (msg) }
+    let inner = html! {
+        div class="flex gap-2" {
+            input type="text" name="title"
+                  value=(pending.field_value("title").unwrap_or_default())
+                  placeholder="What needs to be done?"
+                  autocomplete="off"
+                  aria-invalid=(if errors.is_empty() { "false" } else { "true" })
+                  class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
+                         text-sm placeholder-stone-400 \
+                         focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
+                         focus:border-amber-400 transition-colors";
+            button type="submit"
+                   class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
+                          shadow-sm hover:bg-amber-700 active:bg-amber-800 \
+                          transition-colors" {
+                "Add"
             }
         }
-    }
+        @for msg in errors {
+            p class="text-red-600 text-xs px-1" { (msg) }
+        }
+    };
+    let form = pending.form_tag(&paths::create(), "post", inner);
+    html! { div class="flex flex-col gap-2 mb-8" { (form) } }
 }
 
 /// Render the full list page given a todo list and an optional pending form.
-async fn list_page(mut db: Db, pending: &Changeset<TodoForm>) -> AutumnResult<Markup> {
+async fn list_page(mut db: Db, pending: &ChangesetForm<TodoForm>) -> AutumnResult<Markup> {
     let all_todos = Todo::all(&mut db).await?;
     let done_count = all_todos.iter().filter(|t| t.completed).count();
     let total = all_todos.len();
@@ -204,7 +204,7 @@ pub async fn index() -> Redirect {
 /// List all todos.
 #[get("/todos")]
 pub async fn list(db: Db) -> AutumnResult<Markup> {
-    let blank = Changeset::new(TodoForm {
+    let blank = ChangesetForm::without_csrf(TodoForm {
         title: String::new(),
     });
     list_page(db, &blank).await
@@ -381,18 +381,18 @@ mod tests {
             title: String::new(),
         }
         .into_changeset();
-        let html = new_todo_form(&cs).into_string();
+        let form = ChangesetForm::from_changeset(cs);
+        let html = new_todo_form(&form).into_string();
         assert!(html.contains("Title must be 1"));
         assert!(html.contains(r#"aria-invalid="true""#));
     }
 
     #[test]
     fn new_todo_form_clean_when_valid() {
-        let cs = TodoForm {
+        let form = ChangesetForm::without_csrf(TodoForm {
             title: "Buy milk".into(),
-        }
-        .into_changeset();
-        let html = new_todo_form(&cs).into_string();
+        });
+        let html = new_todo_form(&form).into_string();
         assert!(html.contains(r#"aria-invalid="false""#));
         assert!(html.contains(r#"value="Buy milk""#));
     }

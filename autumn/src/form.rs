@@ -263,6 +263,35 @@ impl<T> ChangesetForm<T> {
         }
     }
 
+    /// Construct a display-only `ChangesetForm` with no CSRF token.
+    ///
+    /// Use this on GET handlers where CSRF middleware is not active, or when
+    /// the form will be re-rendered purely for display (e.g. an initial blank
+    /// form on a page that does not enforce CSRF).  [`form_tag`](Self::form_tag)
+    /// will omit the hidden CSRF input when no token is stored.
+    #[must_use]
+    pub fn without_csrf(data: T) -> Self {
+        Self {
+            changeset: Changeset::new(data),
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+        }
+    }
+
+    /// Wrap a pre-built [`Changeset`] (which may already carry validation errors)
+    /// in a `ChangesetForm` without a CSRF token.
+    ///
+    /// Useful in tests and cases where a `Changeset` was produced externally
+    /// (e.g. via [`IntoChangeset`]) before constructing a form for rendering.
+    #[must_use]
+    pub fn from_changeset(changeset: Changeset<T>) -> Self {
+        Self {
+            changeset,
+            csrf_token: None,
+            csrf_field: "_csrf".to_owned(),
+        }
+    }
+
     /// Override the CSRF form-field name used by [`ChangesetForm::form_tag`].
     ///
     /// Call this when `security.csrf.form_field` is set to something other than
