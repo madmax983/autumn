@@ -133,15 +133,14 @@ impl AuditLogger {
         if errors.is_empty() {
             Ok(())
         } else {
-            use std::fmt::Write;
-            let mut details = String::new();
+            let mut details = String::with_capacity(errors.len() * 64);
             let mut first = true;
             for error in &errors {
                 if !first {
                     details.push_str(" | ");
                 }
                 first = false;
-                write!(details, "{}", error.message()).unwrap();
+                details.push_str(error.message());
             }
             Err(AuditError::new(format!(
                 "{} audit sink(s) failed: {details}",

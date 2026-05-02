@@ -2392,7 +2392,7 @@ fn collect_unguarded_repository_writes(
 /// can be unit-tested without going through `tracing` machinery.
 fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::with_capacity(offenders.len() * 64);
+    let mut s = String::new();
     let mut first = true;
     for (name, path) in offenders {
         if !first {
@@ -2506,7 +2506,7 @@ fn collect_unregistered_repository_handlers(
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::with_capacity(missing.len() * 128);
+    let mut s = String::new();
     let mut first = true;
     for (name, path) in missing {
         if !first {
@@ -2522,7 +2522,7 @@ fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::with_capacity(missing.len() * 128);
+    let mut s = String::new();
     let mut first = true;
     for (name, path) in missing {
         if !first {
