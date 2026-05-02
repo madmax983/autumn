@@ -5,8 +5,7 @@
 
 use autumn_web::extract::Path;
 use autumn_web::form::{Changeset, ChangesetForm};
-use autumn_web::prelude::{IntoResponse, StatusCode};
-use autumn_web::prelude::Validate;
+use autumn_web::prelude::{IntoResponse, StatusCode, Validate};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
