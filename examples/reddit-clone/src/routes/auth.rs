@@ -154,8 +154,7 @@ pub async fn register(
     };
 
     let user = (*db)
-        .transaction::<User, AutumnError, _>(|conn| {
-            let new_user = new_user.clone();
+        .transaction::<User, AutumnError, _>(move |conn| {
             async move {
                 let user: User = diesel::insert_into(users::table)
                     .values(&new_user)

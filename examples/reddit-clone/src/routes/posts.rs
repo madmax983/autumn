@@ -330,19 +330,8 @@ pub async fn submit(
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    let url_for_insert = url.clone();
-    let title_for_insert = title.clone();
-    let slug_for_insert = slug.clone();
-    let subreddit_slug_for_job = subreddit_slug.clone();
-    let author_username_for_job = author_username.clone();
     (*db)
-        .transaction::<(), AutumnError, _>(|conn| {
-            let title = title_for_insert.clone();
-            let slug = slug_for_insert.clone();
-            let body = body.clone();
-            let url = url_for_insert.clone();
-            let subreddit_slug = subreddit_slug_for_job.clone();
-            let author_username = author_username_for_job.clone();
+        .transaction::<(), AutumnError, _>(move |conn| {
             async move {
                 let post_id: i64 = diesel::insert_into(posts::table)
                     .values((
