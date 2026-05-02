@@ -1488,8 +1488,8 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]

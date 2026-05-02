@@ -1649,7 +1649,7 @@ impl AppBuilder {
             config_loader_factory,
             telemetry_provider,
             #[cfg(feature = "openapi")]
-            openapi,
+            ref openapi,
             ..
         } = self;
 
@@ -1671,7 +1671,7 @@ impl AppBuilder {
             crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
         crate::route_listing::append_framework_routes(&mut infos, &config);
         #[cfg(feature = "openapi")]
-        if let Some(ref oa) = openapi {
+        if let Some(oa) = openapi {
             crate::route_listing::append_openapi_routes(&mut infos, oa);
         }
         crate::route_listing::append_dev_reload_routes(&mut infos);
@@ -3201,8 +3201,8 @@ mod tests {
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3625,8 +3625,8 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.health.path = "/healthz".to_owned();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3724,8 +3724,8 @@ mod tests {
         }];
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3797,8 +3797,8 @@ mod tests {
         ];
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4083,8 +4083,8 @@ mod tests {
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4383,8 +4383,8 @@ mod tests {
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4527,8 +4527,8 @@ mod tests {
 
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4569,8 +4569,8 @@ mod tests {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4818,8 +4818,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4883,8 +4883,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]

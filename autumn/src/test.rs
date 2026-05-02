@@ -280,8 +280,8 @@ impl TestApp {
     #[must_use]
     pub fn build(self) -> TestClient {
         let state = AppState {
-        routes: std::sync::Arc::new(Vec::new()),
-        extensions: std::sync::Arc::new(std::sync::RwLock::new(
+            routes: std::sync::Arc::new(Vec::new()),
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
