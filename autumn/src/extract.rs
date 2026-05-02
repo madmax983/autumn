@@ -446,7 +446,7 @@ fn file_too_large_error(max_file_size_bytes: usize) -> crate::AutumnError {
 
 pub use axum::extract::State;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "multipart"))]
 mod tests {
     use super::*;
     use axum::extract::FromRequest;
@@ -594,7 +594,6 @@ mod tests {
     #[cfg(feature = "storage")]
     #[tokio::test]
     async fn test_multipart_field_save_to_blob_store_too_large() {
-        #[allow(unused_imports)]
         use crate::storage::{BlobStore, LocalBlobStore, local::SigningKey};
         use std::time::Duration;
 
@@ -629,6 +628,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Verify that the blob was not created/persisted
+        let get_err = store.get("myblob").await.unwrap_err();
+        assert_eq!(get_err.status(), http::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
