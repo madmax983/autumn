@@ -1,0 +1,35 @@
+# Production configuration for {{project_name}}.
+# Copy to autumn.toml (or load via AUTUMN_PROFILE=prod) and replace placeholder values.
+# WARNING: Never commit real credentials — use environment variables for secrets.
+
+[server]
+host = "0.0.0.0"
+port = 3000
+# shutdown_timeout_secs = 30
+
+[log]
+level = "info"
+format = "Json"
+
+[health]
+path = "/health"
+# live_path = "/live"
+# ready_path = "/ready"
+
+# Database: prefer DATABASE_URL environment variable in production.
+[database]
+url = "postgres://user:CHANGE_ME@localhost:5432/{{project_name}}_prod"
+pool_size = 10
+connect_timeout_secs = 5
+# Run pending migrations at startup; exit(1) on failure stops the container.
+# Requires .migrations(MIGRATIONS) to be registered in main.rs.
+auto_migrate_in_production = true
+
+# Uncomment for OpenTelemetry / OTLP tracing:
+# [telemetry]
+# enabled = true
+# service_name = "{{project_name}}"
+# service_namespace = "apps"
+# environment = "production"
+# otlp_endpoint = "http://otel-collector:4317"
+# protocol = "Grpc"

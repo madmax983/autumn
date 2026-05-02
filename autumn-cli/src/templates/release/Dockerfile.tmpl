@@ -1,0 +1,70 @@
+# ── Stage 1: cargo-chef planner ──────────────────────────────────────────────
+FROM lukemathwalker/cargo-chef:latest-rust-1.86-bookworm AS chef
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+
+ARG TAILWIND_VERSION=v4.1.4
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-build dependencies — this layer is cached unless Cargo.lock changes.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Download Tailwind CSS for asset compilation; detect arch for ARM64/x86_64 support.
+RUN mkdir -p target/autumn \
+    && arch=$(uname -m) \
+    && if [ "$arch" = "x86_64" ]; then suffix="linux-x64"; \
+       elif [ "$arch" = "aarch64" ]; then suffix="linux-arm64"; \
+       else echo "Unsupported architecture: $arch" && exit 1; fi \
+    && curl -fsSL \
+        -o target/autumn/tailwindcss \
+        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-${suffix}" \
+    && chmod +x target/autumn/tailwindcss
+
+COPY . .
+RUN cargo build --release
+
+# ── Stage 3: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libpq5 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 autumn \
+    && mkdir -p /app && chown autumn:autumn /app
+
+WORKDIR /app
+
+COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --chown=autumn:autumn --from=builder /app/static /app/static
+COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
+# Use the production config example as the runtime autumn.toml.
+# It sets host = "0.0.0.0" and auto_migrate_in_production = true.
+COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /app/autumn.toml
+
+ENV AUTUMN_PROFILE=prod
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+USER autumn
+
+# Migrations run automatically at startup via auto_migrate_in_production = true
+# in autumn.toml (or AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION=true env var).
+# On migration failure the framework calls exit(1), stopping the container.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/{{project_name}}"]

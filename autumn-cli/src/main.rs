@@ -8,6 +8,7 @@ mod generate;
 mod migrate;
 mod monitor;
 mod new;
+mod release;
 mod routes;
 mod seed;
 mod setup;
@@ -124,6 +125,21 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Generate(GenerateCommands),
 
+    /// Scaffold production deployment artifacts (Dockerfile, .dockerignore,
+    /// runtime config template, and optional target-specific files).
+    ///
+    /// Run from the project root directory. Does not overwrite existing files
+    /// unless `--force` is given.
+    ///
+    /// # Examples
+    ///
+    ///   autumn release init
+    ///   autumn release init --force
+    ///   autumn release init --target fly
+    ///   autumn release init --target docker-compose
+    #[command(subcommand, verbatim_doc_comment)]
+    Release(ReleaseCommands),
+
     /// Check the local environment and project configuration for common
     /// first-run problems (Rust MSRV, autumn.toml validity, database
     /// connectivity, port availability, Tailwind binary, and more).
@@ -174,6 +190,24 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+}
+
+/// Subcommands for `autumn release`.
+#[derive(Subcommand)]
+enum ReleaseCommands {
+    /// Emit production-ready deployment files at the project root.
+    ///
+    /// Default (no --target): Dockerfile + .dockerignore + autumn.production.toml.example.
+    /// --target fly        : also emits fly.toml.
+    /// --target docker-compose : also emits docker-compose.yml with app + Postgres.
+    Init {
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+        /// Deployment target: fly | docker-compose (omit for bare Dockerfile).
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
 }
 
 /// Subcommands for `autumn generate`.
@@ -284,6 +318,17 @@ fn main() {
                 user_only,
             });
         }
+        Commands::Release(cmd) => match cmd {
+            ReleaseCommands::Init { force, target } => {
+                let t = target.as_deref().map_or(release::Target::Default, |s| {
+                    s.parse().unwrap_or_else(|e| {
+                        eprintln!("autumn release init: {e}");
+                        std::process::exit(1);
+                    })
+                });
+                release::run(release::ReleaseAction::Init { force, target: t });
+            }
+        },
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }
@@ -932,6 +977,64 @@ mod tests {
                 strict: true
             }
         ));
+    }
+
+    // ── autumn release tests ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_release_init_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(!force);
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn parse_release_init_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--force"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(force);
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn parse_release_init_with_fly_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "fly"]).unwrap();
+        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(!force);
+        assert_eq!(target.as_deref(), Some("fly"));
+    }
+
+    #[test]
+    fn parse_release_init_with_docker_compose_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "docker-compose"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert_eq!(target.as_deref(), Some("docker-compose"));
+    }
+
+    #[test]
+    fn parse_release_init_force_and_target() {
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--force", "--target", "fly"])
+            .unwrap();
+        let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
+            panic!("expected release init");
+        };
+        assert!(force);
+        assert_eq!(target.as_deref(), Some("fly"));
+    }
+
+    #[test]
+    fn parse_release_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "release"]).is_err());
     }
 
     // ── autumn new --with-seed tests ───────────────────────────────────────
