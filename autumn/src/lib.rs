@@ -545,7 +545,7 @@ pub use autumn_macros::cached;
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 
-/// Declare an on-demand background job. See [`job`] module.
+/// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
