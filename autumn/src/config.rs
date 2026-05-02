@@ -2046,6 +2046,7 @@ pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
 }
 
+#[cfg(test)]
 mod tests {
 
     #[allow(clippy::wildcard_imports)]
