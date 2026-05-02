@@ -1434,43 +1434,7 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
         TestActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
-            routes: vec![
-                crate::route_listing::RouteInfo {
-                    method: "GET".to_string(),
-                    path: "/test/get".to_string(),
-                    handler: "test_get".to_string(),
-                    source: crate::route_listing::RouteSource::User,
-                    middleware: vec![],
-                },
-                crate::route_listing::RouteInfo {
-                    method: "POST".to_string(),
-                    path: "/test/post".to_string(),
-                    handler: "test_post".to_string(),
-                    source: crate::route_listing::RouteSource::User,
-                    middleware: vec![],
-                },
-                crate::route_listing::RouteInfo {
-                    method: "PUT".to_string(),
-                    path: "/test/put".to_string(),
-                    handler: "test_put".to_string(),
-                    source: crate::route_listing::RouteSource::Framework,
-                    middleware: vec![],
-                },
-                crate::route_listing::RouteInfo {
-                    method: "DELETE".to_string(),
-                    path: "/test/delete".to_string(),
-                    handler: "test_delete".to_string(),
-                    source: crate::route_listing::RouteSource::Plugin("test".to_string()),
-                    middleware: vec![],
-                },
-                crate::route_listing::RouteInfo {
-                    method: "PATCH".to_string(),
-                    path: "/test/patch".to_string(),
-                    handler: "test_patch".to_string(),
-                    source: crate::route_listing::RouteSource::User,
-                    middleware: vec![],
-                },
-            ],
+            routes: vec![],
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
@@ -2202,7 +2166,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(all(feature = "maud", feature = "htmx")) {
+        if cfg!(feature = "maud") {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2227,7 +2191,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(all(feature = "maud", feature = "htmx")) {
+        if cfg!(feature = "maud") {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2252,7 +2216,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(all(feature = "maud", feature = "htmx")) {
+        if cfg!(feature = "maud") {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2329,6 +2293,9 @@ async fn ui_dashboard() -> impl IntoResponse {
                     ".badge-green { background: #dcfce7; color: #166534; }"
                     ".badge-gray { background: #f3f4f6; color: #374151; }"
                     ".badge-red { background: #fee2e2; color: #991b1b; }"
+                    ".badge-blue { background: #dbeafe; color: #1e40af; }"
+                    ".badge-yellow { background: #fef08a; color: #854d0e; }"
+                    ".badge-purple { background: #ede9fe; color: #5b21b6; }"
                 }
             }
             body {
@@ -2467,8 +2434,8 @@ async fn ui_routes<S: ProvideActuatorState>(State(state): State<S>) -> impl Into
                             td style="padding: 0.5rem; font-family: monospace;" {
                                 @match route.method.as_str() {
                                     "GET" => span class="badge badge-green" { "GET" },
-                                    "POST" => span class="badge" style="background: #dbeafe; color: #1e40af;" { "POST" },
-                                    "PUT" => span class="badge" style="background: #fef08a; color: #854d0e;" { "PUT" },
+                                    "POST" => span class="badge badge-blue" { "POST" },
+                                    "PUT" => span class="badge badge-yellow" { "PUT" },
                                     "DELETE" => span class="badge badge-red" { "DELETE" },
                                     _ => span class="badge badge-gray" { (route.method) },
                                 }
@@ -2479,7 +2446,7 @@ async fn ui_routes<S: ProvideActuatorState>(State(state): State<S>) -> impl Into
                                 @match &route.source {
                                     crate::route_listing::RouteSource::User => span class="badge badge-gray" { "User" },
                                     crate::route_listing::RouteSource::Framework => span class="badge badge-green" { "Framework" },
-                                    crate::route_listing::RouteSource::Plugin(name) => span class="badge" style="background: #ede9fe; color: #5b21b6;" { "Plugin(" (name) ")" },
+                                    crate::route_listing::RouteSource::Plugin(name) => span class="badge badge-purple" { "Plugin(" (name) ")" },
                                 }
                             }
                         }

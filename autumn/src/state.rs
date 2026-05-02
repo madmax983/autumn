@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 #[non_exhaustive]
 pub struct AppState {
     /// Live registry of application routes exposed via the `/actuator/routes` endpoint.
-    pub(crate) routes: Vec<crate::route_listing::RouteInfo>,
+    pub(crate) routes: std::sync::Arc<Vec<crate::route_listing::RouteInfo>>,
 
     /// Runtime-managed typed extensions installed by integrations after the app
     /// state has been constructed.
@@ -384,7 +384,7 @@ impl AppState {
     #[must_use]
     pub fn detached() -> Self {
         Self {
-            routes: Vec::new(),
+            routes: std::sync::Arc::new(Vec::new()),
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,

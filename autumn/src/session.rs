@@ -1081,8 +1081,8 @@ mod tests {
         }
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1129,8 +1129,8 @@ mod tests {
 
     fn test_state() -> crate::state::AppState {
         crate::state::AppState {
-            routes: Vec::new(),
-            extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
             profile: None,

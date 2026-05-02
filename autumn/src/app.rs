@@ -1531,11 +1531,26 @@ impl AppBuilder {
                 std::process::exit(1);
             });
 
+        let mut route_infos = crate::route_listing::collect_route_infos(
+            &all_routes,
+            &self.route_sources,
+            &self.scoped_groups,
+        );
+        crate::route_listing::append_framework_routes(&mut route_infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = self.openapi {
+            crate::route_listing::append_openapi_routes(&mut route_infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut route_infos);
+        crate::route_listing::sort_route_infos(&mut route_infos);
+        let route_infos_arc = std::sync::Arc::new(route_infos);
+
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
             pool,
         );
+        state.routes = route_infos_arc;
         #[cfg(feature = "mail")]
         crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
@@ -1579,20 +1594,6 @@ impl AppBuilder {
         if let Some(router) = storage_router {
             merge_routers.push(router);
         }
-        let mut route_infos = crate::route_listing::collect_route_infos(
-            &all_routes,
-            &self.route_sources,
-            &self.scoped_groups,
-        );
-        crate::route_listing::append_framework_routes(&mut route_infos, &config);
-        #[cfg(feature = "openapi")]
-        if let Some(ref oa) = self.openapi {
-            crate::route_listing::append_openapi_routes(&mut route_infos, oa);
-        }
-        crate::route_listing::append_dev_reload_routes(&mut route_infos);
-        crate::route_listing::sort_route_infos(&mut route_infos);
-        state.routes = route_infos.clone();
-
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -2989,7 +2990,7 @@ fn build_state(
     >,
 ) -> AppState {
     AppState {
-        routes: Vec::new(),
+        routes: std::sync::Arc::new(Vec::new()),
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
         pool,
@@ -3200,8 +3201,8 @@ mod tests {
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3624,8 +3625,8 @@ mod tests {
         let mut config = AutumnConfig::default();
         config.health.path = "/healthz".to_owned();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3723,8 +3724,8 @@ mod tests {
         }];
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -3796,8 +3797,8 @@ mod tests {
         ];
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4082,8 +4083,8 @@ mod tests {
         // No dynamic route for /docs — only a static file.
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4382,8 +4383,8 @@ mod tests {
     /// Helper to build a test router with custom config.
     pub fn test_router_with_config(routes: Vec<Route>, config: &AutumnConfig) -> axum::Router {
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4526,8 +4527,8 @@ mod tests {
 
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4568,8 +4569,8 @@ mod tests {
         // When dist_dir is None, return the app router directly.
         let config = AutumnConfig::default();
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4817,8 +4818,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_events() {
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -4882,8 +4883,8 @@ mod tests {
     #[tokio::test]
     async fn start_task_scheduler_broadcasts_failure_events() {
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]

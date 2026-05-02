@@ -1104,8 +1104,8 @@ mod tests {
         }
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1161,8 +1161,8 @@ mod tests {
         }
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1226,8 +1226,8 @@ mod tests {
         use crate::state::AppState;
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1347,8 +1347,8 @@ mod tests {
         }
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1418,8 +1418,8 @@ mod tests {
             .unwrap();
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1494,8 +1494,8 @@ mod tests {
             .unwrap();
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1566,8 +1566,8 @@ mod tests {
             .unwrap();
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
@@ -1631,8 +1631,8 @@ mod tests {
         store.save("valid-session", session_data).await.unwrap();
 
         let state = AppState {
-            routes: Vec::new(),
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+        routes: std::sync::Arc::new(Vec::new()),
+        extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
