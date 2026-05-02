@@ -8,7 +8,6 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 

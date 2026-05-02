@@ -44,14 +44,60 @@ cargo install --path autumn-cli
 
 This gives you the `autumn` binary with the core workflow commands:
 
-| Command         | What it does                                |
-|-----------------|---------------------------------------------|
-| `autumn new`    | Scaffold a new project                      |
-| `autumn setup`  | Download Tailwind CSS (with checksum verify) |
-| `autumn dev`    | Run the dev server with file watching        |
-| `autumn build`  | Pre-render `#[static_get]` routes into `dist/` |
-| `autumn migrate`| Run migrations or inspect migration status   |
-| `autumn seed`   | Populate the database with representative data |
+| Command          | What it does                                |
+|------------------|---------------------------------------------|
+| `autumn doctor`  | Diagnose your environment before first run  |
+| `autumn new`     | Scaffold a new project                      |
+| `autumn setup`   | Download Tailwind CSS (with checksum verify) |
+| `autumn dev`     | Run the dev server with file watching        |
+| `autumn build`   | Pre-render `#[static_get]` routes into `dist/` |
+| `autumn migrate` | Run migrations or inspect migration status   |
+| `autumn seed`    | Populate the database with representative data |
+
+---
+
+## Run the Doctor
+
+After installing the CLI, the first command to run from any Autumn project
+root is `autumn doctor`. It checks your environment for common first-run
+problems and tells you exactly what to fix before you waste time chasing
+cryptic errors:
+
+```bash
+autumn doctor
+```
+
+Sample output on a healthy system:
+
+```
+🍂 autumn doctor
+
+✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
+✅ version_compat — autumn-cli 0.3.0 matches autumn-web 0.3.0
+✅ autumn_toml — autumn.toml is valid
+✅ db_connectivity — Postgres reachable at localhost:5432
+✅ pending_migrations — no pending migrations
+✅ port_bindable — port 3000 is available
+✅ tailwind_binary — target/autumn/tailwindcss is present
+✅ stale_artifacts — artifacts look fresh
+
+8 passed, 0 warnings, 0 failed — all clear
+```
+
+If anything is wrong, `autumn doctor` prints a one-line remediation hint
+beneath the failing check.
+
+**Exit codes**: `0` when all checks pass (warnings are allowed); `1` when any
+check fails. Use `--strict` to treat warnings as failures (useful in CI).
+Use `--json` for machine-readable output:
+
+```bash
+# CI pre-flight gate (fail on warnings too)
+autumn doctor --strict
+
+# Machine-readable output for scripts
+autumn doctor --json
+```
 
 ---
 
