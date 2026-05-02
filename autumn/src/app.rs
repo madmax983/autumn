@@ -2391,11 +2391,17 @@ fn collect_unguarded_repository_writes(
 /// listing the startup tracing emits. Pure so the format string
 /// can be unit-tested without going through `tracing` machinery.
 fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
-    offenders
-        .iter()
-        .map(|(name, path)| format!("  - #[repository({name}, api = \"{path}\")]"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in offenders {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\")]").unwrap();
+    }
+    s
 }
 
 fn validate_repository_api_policies(
@@ -2499,25 +2505,33 @@ fn collect_unregistered_repository_handlers(
 /// Format a `(type, path)` listing for missing-policy startup
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
-    missing
-        .iter()
-        .map(|(name, path)| {
-            format!("  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in missing {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder").unwrap();
+    }
+    s
 }
 
 /// Format a `(type, path)` listing for missing-scope startup
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
-    missing
-        .iter()
-        .map(|(name, path)| {
-            format!("  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in missing {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder").unwrap();
+    }
+    s
 }
 
 fn validate_repository_policies_registered(

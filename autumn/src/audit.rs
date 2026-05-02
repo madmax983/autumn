@@ -133,11 +133,16 @@ impl AuditLogger {
         if errors.is_empty() {
             Ok(())
         } else {
-            let details = errors
-                .iter()
-                .map(|error| error.message().to_owned())
-                .collect::<Vec<_>>()
-                .join(" | ");
+            use std::fmt::Write;
+            let mut details = String::new();
+            let mut first = true;
+            for error in &errors {
+                if !first {
+                    details.push_str(" | ");
+                }
+                first = false;
+                write!(details, "{}", error.message()).unwrap();
+            }
             Err(AuditError::new(format!(
                 "{} audit sink(s) failed: {details}",
                 errors.len()
