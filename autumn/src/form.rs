@@ -263,6 +263,18 @@ impl<T> ChangesetForm<T> {
         }
     }
 
+    /// Override the CSRF form-field name used by [`ChangesetForm::form_tag`].
+    ///
+    /// Call this when `security.csrf.form_field` is set to something other than
+    /// `"_csrf"` (e.g. `"authenticity_token"`).  The `CsrfFormField` extension
+    /// populated by [`from_request`](Self::from_request) sets this automatically
+    /// for POST handlers; use this builder on GET handlers that construct a blank
+    /// form with [`blank`](Self::blank).
+    pub fn with_csrf_field(mut self, field: impl Into<String>) -> Self {
+        self.csrf_field = field.into();
+        self
+    }
+
     /// The CSRF token captured from the request, if the CSRF middleware is active.
     pub fn csrf_token(&self) -> Option<&str> {
         self.csrf_token.as_deref()

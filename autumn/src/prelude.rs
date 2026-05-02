@@ -95,6 +95,8 @@ pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
+/// Validation trait — derive with `#[derive(Validate)]` on form/model types.
+pub use validator::Validate;
 
 // ── Form ─────────────────────────────────────────────────────────
 /// Changeset-style form helpers: [`Changeset`], [`ChangesetForm`], [`IntoChangeset`].

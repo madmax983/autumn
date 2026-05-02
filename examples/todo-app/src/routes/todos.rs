@@ -6,20 +6,32 @@
 use autumn_web::extract::Path;
 use autumn_web::form::{Changeset, ChangesetForm};
 use autumn_web::prelude::{IntoResponse, StatusCode};
+use autumn_web::prelude::Validate;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
-use validator::Validate;
 
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
 
 // ── Form type ─────────────────────────────────────────────────────
 
+fn title_not_blank(s: &str) -> Result<(), validator::ValidationError> {
+    if s.trim().is_empty() {
+        let mut e = validator::ValidationError::new("blank");
+        e.message = Some("Title must not be blank or whitespace-only".into());
+        return Err(e);
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Serialize, Validate, Clone)]
 pub struct TodoForm {
-    #[validate(length(min = 1, max = 255, message = "Title must be 1–255 characters"))]
+    #[validate(
+        length(min = 1, max = 255, message = "Title must be 1–255 characters"),
+        custom(function = "title_not_blank")
+    )]
     title: String,
 }
 
