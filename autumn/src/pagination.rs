@@ -246,15 +246,8 @@ where
 /// behaviour of `serde_urlencoded`.
 fn parse_query(query: &str) -> PageRequest {
     let mut req = PageRequest::default();
-    for pair in query.split('&').filter(|s| !s.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let Ok(key) = percent_decode(raw_key) else {
-            continue;
-        };
-        let Ok(value) = percent_decode(raw_value) else {
-            continue;
-        };
-        match key.as_str() {
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
             "page" => {
                 if let Ok(n) = value.parse::<u32>() {
                     req.page = Some(n);
@@ -269,41 +262,6 @@ fn parse_query(query: &str) -> PageRequest {
         }
     }
     req
-}
-
-/// Decode a single URL-encoded segment. `+` is treated as a space (the
-/// `application/x-www-form-urlencoded` convention used by
-/// `serde_urlencoded` and browsers).
-fn percent_decode(input: &str) -> Result<String, std::str::Utf8Error> {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    // h and l are both `0..=15` from `to_digit(16)`, so
-                    // `(h << 4) | l` fits in a u8 by construction.
-                    out.push(u8::try_from((h << 4) | l).unwrap_or(0));
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    std::str::from_utf8(&out).map(ToOwned::to_owned)
 }
 
 // ── Page<T> ─────────────────────────────────────────────────────────
@@ -710,17 +668,10 @@ where
 /// `cursor`/`size` win.
 fn parse_cursor_query(query: &str) -> CursorRequest {
     let mut req = CursorRequest::default();
-    for pair in query.split('&').filter(|s| !s.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let Ok(key) = percent_decode(raw_key) else {
-            continue;
-        };
-        let Ok(value) = percent_decode(raw_value) else {
-            continue;
-        };
-        match key.as_str() {
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
             "cursor" if !value.is_empty() => {
-                req.cursor = Some(value);
+                req.cursor = Some(value.into_owned());
             }
             "size" => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -994,32 +945,6 @@ mod tests {
         assert!(mapped.has_next);
         assert!(mapped.has_previous);
         assert_eq!(mapped.content, vec!["1", "2", "3"]);
-    }
-
-    // ── percent_decode ─────────────────────────────────────────
-
-    #[test]
-    fn percent_decode_happy_path() {
-        assert_eq!(percent_decode("hello%20world").unwrap(), "hello world");
-        assert_eq!(percent_decode("a%2Bb").unwrap(), "a+b");
-        assert_eq!(percent_decode("%32").unwrap(), "2");
-    }
-
-    #[test]
-    fn percent_decode_plus_to_space() {
-        assert_eq!(percent_decode("hello+world").unwrap(), "hello world");
-    }
-
-    #[test]
-    fn percent_decode_invalid_hex_is_ignored() {
-        assert_eq!(percent_decode("abc%3Gdef").unwrap(), "abc%3Gdef");
-        assert_eq!(percent_decode("%%%").unwrap(), "%%%");
-    }
-
-    #[test]
-    fn percent_decode_incomplete_at_eof() {
-        assert_eq!(percent_decode("abc%").unwrap(), "abc%");
-        assert_eq!(percent_decode("abc%2").unwrap(), "abc%2");
     }
 
     // ── JSON serialization ─────────────────────────────────────
