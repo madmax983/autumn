@@ -50,8 +50,8 @@ static ASSET_MANIFEST: OnceLock<Option<AssetManifest>> = OnceLock::new();
 #[cfg(not(debug_assertions))]
 fn load_manifest() -> &'static Option<AssetManifest> {
     ASSET_MANIFEST.get_or_init(|| {
-        let manifest_path =
-            crate::app::project_dir("static", &crate::config::OsEnv).join(".autumn-manifest.json");
+        let manifest_path = crate::config::project_dir("static", &crate::config::OsEnv)
+            .join(".autumn-manifest.json");
         let contents = std::fs::read_to_string(manifest_path).ok()?;
         serde_json::from_str(&contents).ok()
     })

@@ -24,6 +24,7 @@
 //! }
 //! ```
 
+use crate::config::{is_dump_routes_mode, is_static_build_mode, project_dir};
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -181,12 +182,12 @@ pub struct AppBuilder {
     jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    scoped_groups: Vec<ScopedGroup>,
+    scoped_groups: Vec<crate::router::ScopedGroup>,
     merge_routers: Vec<axum::Router<AppState>>,
     nest_routers: Vec<(String, axum::Router<AppState>)>,
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
-    custom_layers: Vec<CustomLayerRegistration>,
+    custom_layers: Vec<crate::router::CustomLayerRegistration>,
     startup_hooks: Vec<StartupHook>,
     shutdown_hooks: Vec<ShutdownHook>,
     extensions: HashMap<TypeId, Box<dyn Any + Send>>,
@@ -243,17 +244,6 @@ pub struct AppBuilder {
 /// A group of routes sharing a common path prefix and middleware layer.
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
-/// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
-    pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
-    /// Registration origin: user application or a named plugin.
-    pub(crate) source: crate::route_listing::RouteSource,
-    /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
-}
-
 /// A deferred router mutator that applies a user-registered
 /// [`tower::Layer`] to the app-wide router.
 ///
@@ -261,14 +251,6 @@ pub(crate) struct ScopedGroup {
 /// `apply_middleware` where the final layer stack is assembled.
 pub(crate) type CustomLayerApplier =
     Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
-
-/// Metadata and deferred application closure for a user-registered layer.
-pub(crate) struct CustomLayerRegistration {
-    /// Concrete type for the registered layer.
-    pub(crate) type_id: TypeId,
-    /// Deferred router mutation that applies the layer.
-    pub(crate) apply: CustomLayerApplier,
-}
 
 mod sealed {
     pub trait Sealed {}
@@ -572,11 +554,11 @@ impl AppBuilder {
             .map_or(crate::route_listing::RouteSource::User, |name| {
                 crate::route_listing::RouteSource::Plugin(name.clone())
             });
-        self.scoped_groups.push(ScopedGroup {
+        self.scoped_groups.push(crate::router::ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
             source,
-            apply_layer: Box::new(move |router| router.layer(layer)),
+            apply_layer: Box::new(move |router: axum::Router<crate::AppState>| router.layer(layer)),
         });
         self
     }
@@ -654,10 +636,13 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn layer<L: IntoAppLayer>(mut self, layer: L) -> Self {
-        self.custom_layers.push(CustomLayerRegistration {
-            type_id: TypeId::of::<L>(),
-            apply: Box::new(move |router| layer.apply_to(router)),
-        });
+        self.custom_layers
+            .push(crate::router::CustomLayerRegistration {
+                type_id: TypeId::of::<L>(),
+                apply: Box::new(move |router: axum::Router<crate::AppState>| {
+                    layer.apply_to(router)
+                }),
+            });
         self
     }
 
@@ -1671,14 +1656,6 @@ impl AppBuilder {
     }
 }
 
-pub(crate) fn is_static_build_mode() -> bool {
-    std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
-}
-
-pub(crate) fn is_dump_routes_mode() -> bool {
-    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
-}
-
 /// Start scheduled tasks in background Tokio tasks.
 ///
 /// Each task runs in its own spawned task with error logging.
@@ -2016,7 +1993,7 @@ async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
 fn log_startup_transparency(
     routes: &[Route],
     tasks: &[crate::task::TaskInfo],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
     config: &AutumnConfig,
 ) {
     tracing::info!(
@@ -2274,10 +2251,10 @@ fn resolve_i18n_bundle(
 
 #[cfg(feature = "i18n")]
 fn install_i18n_bundle_layer(
-    mut custom_layers: Vec<CustomLayerRegistration>,
+    mut custom_layers: Vec<crate::router::CustomLayerRegistration>,
     state: &AppState,
     bundle: Option<Arc<crate::i18n::Bundle>>,
-) -> Vec<CustomLayerRegistration> {
+) -> Vec<crate::router::CustomLayerRegistration> {
     let Some(bundle) = bundle else {
         return custom_layers;
     };
@@ -2292,9 +2269,9 @@ fn install_i18n_bundle_layer(
     // every request. axum::Extension<T> is itself a tower::Layer when T:
     // Clone + Send + Sync + 'static.
     let ext_layer = axum::Extension(bundle);
-    custom_layers.push(CustomLayerRegistration {
+    custom_layers.push(crate::router::CustomLayerRegistration {
         type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
-        apply: Box::new(move |router| router.layer(ext_layer)),
+        apply: Box::new(move |router: axum::Router<crate::AppState>| router.layer(ext_layer)),
     });
     custom_layers
 }
@@ -2362,7 +2339,7 @@ async fn setup_database(
 /// methods only shows up once.
 fn collect_unguarded_repository_writes(
     routes: &[Route],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
 ) -> Vec<(String, String)> {
     let mut offenders: Vec<(String, String)> = Vec::new();
     let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
@@ -2400,7 +2377,7 @@ fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String
 
 fn validate_repository_api_policies(
     routes: &[Route],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
     config: &AutumnConfig,
 ) {
     let profile = config.profile.as_deref().unwrap_or("default");
@@ -2456,7 +2433,7 @@ type MissingRepositoryRegistration = (String, String);
 /// `std::process::exit(1)` strict path.
 fn collect_unregistered_repository_handlers(
     routes: &[Route],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
     registry: &crate::authorization::PolicyRegistry,
 ) -> (
     Vec<MissingRepositoryRegistration>,
@@ -2522,7 +2499,7 @@ fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
 
 fn validate_repository_policies_registered(
     routes: &[Route],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
     state: &AppState,
     config: &AutumnConfig,
 ) {
@@ -2936,7 +2913,7 @@ mod validate_repository_api_policies_tests {
             "/api/posts",
             Some(unguarded("/api/posts", "Post")),
         );
-        let group = ScopedGroup {
+        let group = crate::router::ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
             source: crate::route_listing::RouteSource::User,
@@ -2954,7 +2931,7 @@ mod validate_repository_api_policies_tests {
             "/api/posts",
             Some(guarded_with_check("/api/posts", "TestPost")),
         );
-        let group = ScopedGroup {
+        let group = crate::router::ScopedGroup {
             prefix: "/scoped".to_owned(),
             routes: vec![group_route],
             source: crate::route_listing::RouteSource::User,
@@ -3000,7 +2977,7 @@ fn build_state(
 /// Build the route listing string for the transparency log.
 fn format_route_lines(
     routes: &[Route],
-    scoped_groups: &[ScopedGroup],
+    scoped_groups: &[crate::router::ScopedGroup],
     config: &AutumnConfig,
 ) -> String {
     use std::fmt::Write as _;
@@ -3136,14 +3113,6 @@ fn format_config_summary(config: &AutumnConfig) -> String {
 }
 
 /// Resolve a project-relative subdirectory (e.g. `"dist"` or `"static"`)
-/// against `AUTUMN_MANIFEST_DIR` if set, otherwise use it as-is.
-pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
-    env.var("AUTUMN_MANIFEST_DIR").map_or_else(
-        |_| std::path::PathBuf::from(subdir),
-        |d| std::path::PathBuf::from(d).join(subdir),
-    )
-}
-
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
 ///
 /// Returns when either signal is received. Axum's `with_graceful_shutdown`

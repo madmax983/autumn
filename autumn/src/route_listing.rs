@@ -6,8 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::app::ScopedGroup;
 use crate::route::Route;
+use crate::router::ScopedGroup;
 
 /// Where a route was registered: by the user application, by a named plugin,
 /// or by the framework itself (probes, actuator, htmx assets, dev reload).

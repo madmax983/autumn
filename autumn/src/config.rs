@@ -2042,12 +2042,17 @@ impl ConfigLoader for TomlEnvConfigLoader {
     }
 }
 
-#[cfg(test)]
+pub(crate) fn is_static_build_mode() -> bool {
+    std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
 mod tests {
 
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     /// Mock loader for tests — returns a hand-built config without touching disk.
+    #[allow(dead_code)]
     struct MockConfigLoader {
         config: AutumnConfig,
     }
@@ -3680,4 +3685,15 @@ path = "/healthz"
         config.apply_env_overrides_with_env(&env);
         assert!(!config.security.allow_unauthorized_repository_api);
     }
+}
+
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::path::PathBuf {
+    env.var("AUTUMN_MANIFEST_DIR").map_or_else(
+        |_| std::path::PathBuf::from(subdir),
+        |d| std::path::PathBuf::from(d).join(subdir),
+    )
 }

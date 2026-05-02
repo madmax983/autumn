@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
@@ -113,7 +112,7 @@ pub struct RouterContext {
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`] on the ingress
     /// path so user middleware observes the generated request ID.
-    pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    pub custom_layers: Vec<crate::router::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -272,7 +271,7 @@ pub fn try_build_router_inner(
     // `Cache-Control: public, max-age=31536000, immutable`; all other static
     // files use the default browser policy.
     let env = crate::config::OsEnv;
-    let static_dir = crate::app::project_dir("static", &env);
+    let static_dir = crate::config::project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
     router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
@@ -1000,7 +999,7 @@ fn apply_middleware(
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    custom_layers: Vec<crate::router::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -1332,7 +1331,7 @@ async fn startup_barrier(
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    if crate::app::is_static_build_mode()
+    if crate::config::is_static_build_mode()
         || state.app_state.probes().is_startup_complete()
         || state.allows_path(request.uri().path())
     {
@@ -1479,13 +1478,28 @@ pub async fn htmx_csrf_handler() -> axum::response::Response {
         .into_response()
 }
 
-#[cfg(test)]
+pub struct ScopedGroup {
+    pub(crate) prefix: String,
+    pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: crate::route_listing::RouteSource,
+    /// Closure that applies the layer to a sub-router.
+    pub(crate) apply_layer:
+        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+}
+
 mod tests {
+
+    #[allow(clippy::wildcard_imports, unused_imports)]
     use super::*;
+    #[cfg(test)]
     use axum::body::Body;
+    #[cfg(test)]
     use axum::http::{Request, StatusCode};
+    #[cfg(test)]
     use tower::ServiceExt;
 
+    #[cfg(test)]
     fn test_state() -> AppState {
         AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -1838,7 +1852,7 @@ mod tests {
         async fn child() -> &'static str {
             "inner"
         }
-        let group = crate::app::ScopedGroup {
+        let group = crate::router::ScopedGroup {
             prefix: "/api".to_owned(),
             routes: vec![Route {
                 method: http::Method::GET,
@@ -1922,7 +1936,7 @@ mod tests {
             },
             repository: None,
         };
-        let group = crate::app::ScopedGroup {
+        let group = crate::router::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
             source: crate::route_listing::RouteSource::User,
@@ -2070,6 +2084,7 @@ mod tests {
     }
 
     #[cfg(feature = "openapi")]
+    #[cfg(test)]
     async fn collision_test_handler() -> &'static str {
         "user"
     }
@@ -2278,4 +2293,14 @@ mod tests {
             },
         );
     }
+}
+
+use crate::app::CustomLayerApplier;
+use std::any::TypeId;
+
+pub struct CustomLayerRegistration {
+    /// Concrete type for the registered layer.
+    pub(crate) type_id: TypeId,
+    /// Deferred router mutation that applies the layer.
+    pub(crate) apply: CustomLayerApplier,
 }
