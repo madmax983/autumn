@@ -11,3 +11,6 @@ pub mod csrf_timing;
 pub mod ctf;
 pub mod fallback_middleware_bypass;
 pub mod session_fixation;
+pub mod htmx_crlf;
+pub mod htmx_oob_escape;
+pub mod htmx_request_spoofing;
