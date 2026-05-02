@@ -11,7 +11,7 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 
 use crate::live_events::{
-    post_created_event, publish_stored_live_event_best_effort, store_activity_event,
+    post_created_event, publish_stored_live_event_best_effort, store_activity_event_for_state,
 };
 use crate::models::User;
 use crate::schema::{posts, users};
@@ -70,10 +70,16 @@ pub async fn user_onboarding(state: AppState, args: UserOnboardingArgs) -> Autum
         .ok_or_else(|| AutumnError::service_unavailable_msg("No database pool"))?;
     let mut conn = pool.get().await.map_err(AutumnError::from)?;
 
-    diesel::update(users::table.filter(users::id.eq(args.user_id)))
+    let affected = diesel::update(users::table.filter(users::id.eq(args.user_id)))
         .set(users::karma.eq(STARTER_KARMA))
         .execute(&mut conn)
         .await?;
+    if affected != 1 {
+        return Err(AutumnError::service_unavailable_msg(format!(
+            "user {} was not visible to onboarding job",
+            args.user_id
+        )));
+    }
 
     tracing::info!(
         user_id = args.user_id,
@@ -110,7 +116,8 @@ pub async fn post_publication(state: AppState, args: PostPublicationArgs) -> Aut
         &args.subreddit_slug,
         &args.author_username,
     );
-    let event_id = store_activity_event(&mut conn, &args.subreddit_slug, &event).await?;
+    let event_id =
+        store_activity_event_for_state(&state, &mut conn, &args.subreddit_slug, &event).await?;
     publish_stored_live_event_best_effort(&state, event_id).await;
 
     tracing::info!(
