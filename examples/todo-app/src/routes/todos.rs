@@ -3,13 +3,25 @@
 //! These routes render Maud templates styled with Tailwind CSS and
 //! use htmx attributes for interactive toggle/delete behaviour.
 
-use autumn_web::extract::{Form, Path};
+use autumn_web::extract::Path;
+use autumn_web::form::{Changeset, ChangesetForm};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
+use axum::response::IntoResponse;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
+use serde::{Deserialize, Serialize};
+use validator::Validate;
 
 use crate::models::{NewTodo, Todo};
 use crate::schema::todos;
+
+// ── Form type ─────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, Validate, Clone)]
+pub struct TodoForm {
+    #[validate(length(min = 1, max = 255, message = "Title must be 1–255 characters"))]
+    title: String,
+}
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -96,19 +108,38 @@ fn todo_item(todo: &Todo) -> Markup {
     }
 }
 
-// ── Route handlers ───────────────────────────────────────────────
-
-/// Redirect the root path to `/todos`.
-#[get("/")]
-pub async fn index() -> Redirect {
-    Redirect::to(&paths::list())
+/// Render the new-todo form, re-populating the title and showing errors on failure.
+fn new_todo_form(pending: &Changeset<TodoForm>) -> Markup {
+    let errors = pending.errors_for("title");
+    html! {
+        form action=(paths::create()) method="post" class="flex flex-col gap-2 mb-8" {
+            div class="flex gap-2" {
+                input type="text" name="title"
+                      value=(pending.field_value("title").unwrap_or_default())
+                      placeholder="What needs to be done?"
+                      autocomplete="off"
+                      aria-invalid=(if errors.is_empty() { "false" } else { "true" })
+                      class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
+                             text-sm placeholder-stone-400 \
+                             focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
+                             focus:border-amber-400 transition-colors";
+                button type="submit"
+                       class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
+                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
+                              transition-colors" {
+                    "Add"
+                }
+            }
+            @for msg in errors {
+                p class="text-red-600 text-xs px-1" { (msg) }
+            }
+        }
+    }
 }
 
-/// List all todos.
-#[get("/todos")]
-pub async fn list(mut db: Db) -> AutumnResult<Markup> {
+/// Render the full list page given a todo list and an optional pending form.
+async fn list_page(mut db: Db, pending: &Changeset<TodoForm>) -> AutumnResult<Markup> {
     let all_todos = Todo::all(&mut db).await?;
-
     let done_count = all_todos.iter().filter(|t| t.completed).count();
     let total = all_todos.len();
 
@@ -124,26 +155,8 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
                 }
             }
 
-            // New-todo form
-            form action=(paths::create()) method="post"
-                 class="flex gap-2 mb-8" {
-                input type="text" name="title"
-                      placeholder="What needs to be done?"
-                      required
-                      autocomplete="off"
-                      class="flex-1 px-4 py-2.5 bg-white border border-stone-300 rounded-lg \
-                             text-sm placeholder-stone-400 \
-                             focus:outline-none focus:ring-2 focus:ring-amber-400/50 \
-                             focus:border-amber-400 transition-colors";
-                button type="submit"
-                       class="px-5 py-2.5 bg-amber-600 text-white text-sm font-medium rounded-lg \
-                              shadow-sm hover:bg-amber-700 active:bg-amber-800 \
-                              transition-colors" {
-                    "Add"
-                }
-            }
+            (new_todo_form(pending))
 
-            // Todo list
             @if all_todos.is_empty() {
                 div class="text-center py-16" {
                     p class="text-stone-400 text-sm" {
@@ -151,7 +164,6 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
                     }
                 }
             } @else {
-                // Summary bar
                 div class="flex items-center justify-between mb-3 px-1" {
                     p class="text-xs text-stone-400" {
                         (total) " item" @if total != 1 { "s" }
@@ -168,6 +180,23 @@ pub async fn list(mut db: Db) -> AutumnResult<Markup> {
             }
         },
     ))
+}
+
+// ── Route handlers ───────────────────────────────────────────────
+
+/// Redirect the root path to `/todos`.
+#[get("/")]
+pub async fn index() -> Redirect {
+    Redirect::to(&paths::list())
+}
+
+/// List all todos.
+#[get("/todos")]
+pub async fn list(db: Db) -> AutumnResult<Markup> {
+    let blank = Changeset::new(TodoForm {
+        title: String::new(),
+    });
+    list_page(db, &blank).await
 }
 
 /// Show a single todo by ID.
@@ -207,17 +236,32 @@ pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
     ))
 }
 
-/// Create a new todo from a form submission, then redirect to the list.
+/// Create a new todo from a form submission.
+///
+/// On validation failure the list page is re-rendered with inline errors (422).
+/// On success a new row is inserted and the browser redirects to the list.
 #[post("/todos")]
-pub async fn create(mut db: Db, form: Form<NewTodo>) -> AutumnResult<Redirect> {
-    let new_todo = form.0.validated()?;
-
-    diesel::insert_into(todos::table)
-        .values(&new_todo)
-        .execute(&mut *db)
-        .await?;
-
-    Ok(Redirect::to(&paths::list()))
+pub async fn create(
+    db: Db,
+    form: ChangesetForm<TodoForm>,
+) -> AutumnResult<impl axum::response::IntoResponse> {
+    use axum::http::StatusCode;
+    match form.into_valid() {
+        Ok(f) => {
+            let mut db = db;
+            diesel::insert_into(todos::table)
+                .values(NewTodo {
+                    title: f.title.trim().to_owned(),
+                })
+                .execute(&mut *db)
+                .await?;
+            Ok(Redirect::to(&paths::list()).into_response())
+        }
+        Err(form) => {
+            let markup = list_page(db, &form).await?;
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, markup).into_response())
+        }
+    }
 }
 
 /// Toggle the completion status of a todo (htmx endpoint).
@@ -261,6 +305,7 @@ autumn_web::paths![index, list, detail, create, toggle, delete_todo];
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+    use autumn_web::form::IntoChangeset;
 
     #[test]
     fn test_path_helpers_correct() {
@@ -321,6 +366,28 @@ mod tests {
         assert!(html.contains("/todos/42/toggle"));
         assert!(html.contains("href=\"/todos/42\""));
         assert!(html.contains("hx-delete=\"/todos/42\""));
+    }
+
+    #[test]
+    fn new_todo_form_shows_validation_errors() {
+        let cs = TodoForm {
+            title: String::new(),
+        }
+        .into_changeset();
+        let html = new_todo_form(&cs).into_string();
+        assert!(html.contains("Title must be 1"));
+        assert!(html.contains(r#"aria-invalid="true""#));
+    }
+
+    #[test]
+    fn new_todo_form_clean_when_valid() {
+        let cs = TodoForm {
+            title: "Buy milk".into(),
+        }
+        .into_changeset();
+        let html = new_todo_form(&cs).into_string();
+        assert!(html.contains(r#"aria-invalid="false""#));
+        assert!(html.contains(r#"value="Buy milk""#));
     }
 }
 

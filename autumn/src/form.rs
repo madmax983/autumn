@@ -1173,30 +1173,6 @@ mod tests {
             assert_body(resp, "valid=false").await;
         }
 
-        // ── LOC budget test ────────────────────────────────────────
-
-        #[test]
-        fn hello_example_form_section_within_forty_loc() {
-            // Count non-blank, non-comment lines from the GreetForm struct
-            // to the #[autumn_web::main] entry point, verifying the
-            // "≤ 40 LoC of route + template code" promise from issue #508.
-            let src = include_str!("../../examples/hello/src/main.rs");
-            let loc: usize = src
-                .lines()
-                .skip_while(|l| !l.contains("GreetForm"))
-                .take_while(|l| !l.contains("#[autumn_web::main]"))
-                .filter(|l| {
-                    let t = l.trim();
-                    !t.is_empty() && !t.starts_with("//") && !t.starts_with("//!")
-                })
-                .count();
-            assert!(
-                loc <= 40,
-                "Form section of hello example exceeds 40 LoC (got {loc}). \
-                 Keep route + template code within budget."
-            );
-        }
-
         // ── Helpers ────────────────────────────────────────────────
 
         fn urlencoded_req(uri: &str, body: &'static str) -> axum::http::Request<Body> {

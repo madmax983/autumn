@@ -6,7 +6,3 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
-axum = { version = "0.8" }
-maud = { version = "0.27", features = ["axum"] }
-serde = { version = "1", features = ["derive"] }
-validator = { version = "0.20", features = ["derive"] }
