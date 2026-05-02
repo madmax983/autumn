@@ -515,6 +515,29 @@ impl RequestBuilder {
 ///     .assert_header("content-type", "application/json")
 ///     .assert_body_contains("Alice");
 /// ```
+///
+/// Fields are public so you can construct a `TestResponse` directly in unit
+/// tests that don't need a full HTTP round-trip:
+///
+/// ```rust
+/// use autumn_web::test::TestResponse;
+/// use axum::http::StatusCode;
+///
+/// let resp = TestResponse {
+///     status: StatusCode::OK,
+///     headers: vec![
+///         ("content-type".into(), "application/json".into()),
+///         ("x-request-id".into(), "abc-123".into()),
+///     ],
+///     body: br#"{"name":"Alice"}"#.to_vec(),
+/// };
+///
+/// resp.assert_ok()
+///     .assert_header_contains("content-type", "json")
+///     .assert_body_contains("Alice");
+///
+/// assert_eq!(resp.header("x-request-id"), Some("abc-123"));
+/// ```
 pub struct TestResponse {
     /// HTTP status code.
     pub status: StatusCode,
