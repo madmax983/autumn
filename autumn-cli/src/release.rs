@@ -245,6 +245,19 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_copies_production_config_as_runtime_autumn_toml() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert!(
+            content.contains("autumn.production.toml.example"),
+            "Dockerfile must COPY autumn.production.toml.example into the runtime image so \
+             the container binds to 0.0.0.0 (not the dev 127.0.0.1) without manual edits"
+        );
+    }
+
+    #[test]
     fn dockerfile_runtime_uses_debian_slim() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
