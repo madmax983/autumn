@@ -1,4 +1,7 @@
+use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+
+const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
 #[get("/")]
 async fn index() -> &'static str {
@@ -19,6 +22,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
