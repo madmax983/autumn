@@ -1104,6 +1104,7 @@ mod tests {
         }
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1160,6 +1161,7 @@ mod tests {
         }
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1224,6 +1226,7 @@ mod tests {
         use crate::state::AppState;
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1344,6 +1347,7 @@ mod tests {
         }
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1414,6 +1418,7 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1489,6 +1494,7 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1560,6 +1566,7 @@ mod tests {
             .unwrap();
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -1624,6 +1631,7 @@ mod tests {
         store.save("valid-session", session_data).await.unwrap();
 
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),

@@ -50,6 +50,9 @@ pub trait ProvideActuatorState {
     /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns a reference to the application's registered routes.
+    fn routes(&self) -> &[crate::route_listing::RouteInfo];
+
     /// Returns a reference to the system [`crate::channels::Channels`] which
     /// broadcasts operational events to WebSocket streams.
     #[cfg(feature = "ws")]
@@ -929,6 +932,13 @@ pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static
 // ── Metrics ────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
+/// `GET <actuator-prefix>/routes` -- route listing snapshot.
+pub(crate) async fn routes_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    Json(state.routes().to_vec())
+}
+
 pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
@@ -1227,6 +1237,8 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
     ];
 
     if sensitive {
+        paths.push(actuator_route_path(prefix, "/routes"));
+        paths.push(actuator_route_path(prefix, "/ui/routes"));
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
@@ -1279,6 +1291,14 @@ pub(crate) fn actuator_router_with_prefix<
 
     if sensitive {
         router = router
+            .route(
+                &actuator_route_path(prefix, "/routes"),
+                axum::routing::get(routes_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/ui/routes"),
+                axum::routing::get(ui_routes::<S>),
+            )
             .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
@@ -1382,6 +1402,9 @@ mod tests {
         }
         fn profile(&self) -> &str {
             &self.profile
+        }
+        fn routes(&self) -> &[crate::route_listing::RouteInfo] {
+            &[]
         }
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
@@ -1889,6 +1912,49 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // ── Routes endpoint tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn actuator_routes_returns_routes() {
+        let state = test_state();
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn actuator_ui_routes_returns_html_or_unimplemented() {
+        let app = actuator_router(true).with_state(test_state());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/ui/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if cfg!(all(feature = "maud", feature = "htmx")) {
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+        } else {
+            assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+
     // ── Tasks endpoint tests ───────────────────────────────────
 
     #[tokio::test]
@@ -2098,7 +2164,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2123,7 +2189,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2148,7 +2214,7 @@ mod tests {
             .await
             .unwrap();
 
-        if cfg!(feature = "maud") {
+        if cfg!(all(feature = "maud", feature = "htmx")) {
             assert_eq!(res.status(), StatusCode::OK);
             assert_eq!(
                 res.headers().get("content-type").unwrap(),
@@ -2235,6 +2301,9 @@ async fn ui_dashboard() -> impl IntoResponse {
                     }
                     div class="card" hx-get="ui/tasks" hx-trigger="load, every 2s" {
                         "Loading tasks..."
+                    }
+                    div class="card" hx-get="ui/routes" hx-trigger="load" {
+                        "Loading routes..."
                     }
                 }
             }
@@ -2332,6 +2401,63 @@ async fn ui_tasks<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoR
 
 #[cfg(not(all(feature = "maud", feature = "htmx")))]
 async fn ui_tasks<S: ProvideActuatorState>() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Maud feature is required for the UI dashboard",
+    )
+}
+
+#[cfg(all(feature = "maud", feature = "htmx"))]
+async fn ui_routes<S: ProvideActuatorState>(State(state): State<S>) -> impl IntoResponse {
+    let routes = state.routes();
+
+    let html = maud::html! {
+        h2 { "Live Route Explorer" }
+        div class="card" {
+            table style="width: 100%; text-align: left; border-collapse: collapse;" {
+                thead {
+                    tr style="border-bottom: 2px solid var(--border);" {
+                        th style="padding: 0.5rem;" { "Method" }
+                        th style="padding: 0.5rem;" { "Path" }
+                        th style="padding: 0.5rem;" { "Handler" }
+                        th style="padding: 0.5rem;" { "Source" }
+                    }
+                }
+                tbody {
+                    @for route in routes {
+                        tr style="border-bottom: 1px solid var(--border);" {
+                            td style="padding: 0.5rem; font-family: monospace;" {
+                                @match route.method.as_str() {
+                                    "GET" => span class="badge badge-green" { "GET" },
+                                    "POST" => span class="badge" style="background: #dbeafe; color: #1e40af;" { "POST" },
+                                    "PUT" => span class="badge" style="background: #fef08a; color: #854d0e;" { "PUT" },
+                                    "DELETE" => span class="badge badge-red" { "DELETE" },
+                                    _ => span class="badge badge-gray" { (route.method) },
+                                }
+                            }
+                            td style="padding: 0.5rem; font-family: monospace; font-weight: bold;" { (route.path) }
+                            td style="padding: 0.5rem; color: var(--text-muted);" { (route.handler) }
+                            td style="padding: 0.5rem;" {
+                                @match &route.source {
+                                    crate::route_listing::RouteSource::User => span class="badge badge-gray" { "User" },
+                                    crate::route_listing::RouteSource::Framework => span class="badge badge-green" { "Framework" },
+                                    crate::route_listing::RouteSource::Plugin(name) => span class="badge" style="background: #ede9fe; color: #5b21b6;" { "Plugin(" (name) ")" },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html.into_string(),
+    )
+}
+
+#[cfg(not(all(feature = "maud", feature = "htmx")))]
+async fn ui_routes<S: ProvideActuatorState>() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         "Maud feature is required for the UI dashboard",

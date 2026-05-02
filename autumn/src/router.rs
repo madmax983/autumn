@@ -1488,6 +1488,7 @@ mod tests {
 
     fn test_state() -> AppState {
         AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),

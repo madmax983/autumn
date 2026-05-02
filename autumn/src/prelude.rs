@@ -148,6 +148,7 @@ mod tests {
     fn prelude_types_are_accessible() {
         #[cfg(feature = "db")]
         let _state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
@@ -171,6 +172,7 @@ mod tests {
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),

@@ -280,6 +280,7 @@ impl TestApp {
     #[must_use]
     pub fn build(self) -> TestClient {
         let state = AppState {
+            routes: Vec::new(),
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
