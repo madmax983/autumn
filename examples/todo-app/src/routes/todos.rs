@@ -5,8 +5,8 @@
 
 use autumn_web::extract::Path;
 use autumn_web::form::{Changeset, ChangesetForm};
+use autumn_web::prelude::{IntoResponse, StatusCode};
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post};
-use axum::response::IntoResponse;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
@@ -241,11 +241,7 @@ pub async fn detail(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 /// On validation failure the list page is re-rendered with inline errors (422).
 /// On success a new row is inserted and the browser redirects to the list.
 #[post("/todos")]
-pub async fn create(
-    db: Db,
-    form: ChangesetForm<TodoForm>,
-) -> AutumnResult<impl axum::response::IntoResponse> {
-    use axum::http::StatusCode;
+pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl IntoResponse> {
     match form.into_valid() {
         Ok(f) => {
             let mut db = db;

@@ -77,6 +77,10 @@ pub use crate::mail::{
 pub use crate::sse::{Event, Sse};
 /// State extractor.
 pub use axum::extract::State;
+/// Trait for types that can be converted into an HTTP response.
+pub use axum::response::IntoResponse;
+/// HTTP status codes.
+pub use http::StatusCode;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Structured audit event types.
