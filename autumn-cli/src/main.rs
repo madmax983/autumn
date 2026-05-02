@@ -1004,8 +1004,7 @@ mod tests {
 
     #[test]
     fn parse_release_init_with_fly_target() {
-        let cli =
-            Cli::try_parse_from(["autumn", "release", "init", "--target", "fly"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "fly"]).unwrap();
         let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
             panic!("expected release init");
         };
@@ -1015,9 +1014,8 @@ mod tests {
 
     #[test]
     fn parse_release_init_with_docker_compose_target() {
-        let cli =
-            Cli::try_parse_from(["autumn", "release", "init", "--target", "docker-compose"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--target", "docker-compose"])
+            .unwrap();
         let Commands::Release(ReleaseCommands::Init { target, .. }) = cli.command else {
             panic!("expected release init");
         };
@@ -1026,15 +1024,8 @@ mod tests {
 
     #[test]
     fn parse_release_init_force_and_target() {
-        let cli = Cli::try_parse_from([
-            "autumn",
-            "release",
-            "init",
-            "--force",
-            "--target",
-            "fly",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["autumn", "release", "init", "--force", "--target", "fly"])
+            .unwrap();
         let Commands::Release(ReleaseCommands::Init { force, target }) = cli.command else {
             panic!("expected release init");
         };

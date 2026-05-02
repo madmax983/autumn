@@ -87,10 +87,19 @@ pub fn run(action: ReleaseAction) {
     }
 }
 
-fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
+pub(crate) fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
     let path = dir.join("Cargo.toml");
     let content = fs::read_to_string(&path)
         .map_err(|e| ReleaseError::CargoToml(format!("{}: {e}", path.display())))?;
+
+    // Check for workspace root before parsing; workspace-only Cargo.toml files
+    // may not parse cleanly as a member manifest.
+    if content.contains("[workspace]") && !content.contains("[package]") {
+        return Err(ReleaseError::CargoToml(
+            "found [workspace] but no [package] — run this command from a member crate directory, not the workspace root".into(),
+        ));
+    }
+
     let parsed: toml::Value = content
         .parse()
         .map_err(|e| ReleaseError::CargoToml(format!("parse error: {e}")))?;
@@ -185,7 +194,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        assert!(dir.join(".dockerignore").is_file(), ".dockerignore not created");
+        assert!(
+            dir.join(".dockerignore").is_file(),
+            ".dockerignore not created"
+        );
     }
 
     #[test]
@@ -275,9 +287,18 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        assert!(content.contains("libpq"), "runtime must install libpq for Diesel");
-        assert!(content.contains("tini"), "runtime must install tini as init process");
-        assert!(content.contains("ca-certificates"), "runtime must install ca-certificates");
+        assert!(
+            content.contains("libpq"),
+            "runtime must install libpq for Diesel"
+        );
+        assert!(
+            content.contains("tini"),
+            "runtime must install tini as init process"
+        );
+        assert!(
+            content.contains("ca-certificates"),
+            "runtime must install ca-certificates"
+        );
     }
 
     #[test]
@@ -329,7 +350,10 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        assert!(content.contains("HEALTHCHECK"), "Dockerfile must have a HEALTHCHECK directive");
+        assert!(
+            content.contains("HEALTHCHECK"),
+            "Dockerfile must have a HEALTHCHECK directive"
+        );
         assert!(
             content.contains("/health"),
             "HEALTHCHECK must probe the /health actuator endpoint"
@@ -342,7 +366,10 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        assert!(content.contains("EXPOSE 3000"), "Dockerfile must EXPOSE 3000");
+        assert!(
+            content.contains("EXPOSE 3000"),
+            "Dockerfile must EXPOSE 3000"
+        );
     }
 
     #[test]
@@ -369,7 +396,10 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
-        assert!(content.contains("target"), ".dockerignore must exclude target/");
+        assert!(
+            content.contains("target"),
+            ".dockerignore must exclude target/"
+        );
     }
 
     #[test]
@@ -387,7 +417,10 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
-        assert!(content.contains("node_modules"), ".dockerignore must exclude node_modules");
+        assert!(
+            content.contains("node_modules"),
+            ".dockerignore must exclude node_modules"
+        );
     }
 
     #[test]
@@ -406,8 +439,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         // Must have a DB URL entry
         assert!(
             content.contains("DATABASE_URL") || content.contains("url"),
@@ -431,8 +463,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-blog");
         init(&dir, "my-blog", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("my-blog"),
             "production config must substitute project name"
@@ -448,9 +479,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
-        assert!(content.contains("port"), "production config must document the port setting");
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        assert!(
+            content.contains("port"),
+            "production config must document the port setting"
+        );
     }
 
     // ── --force flag ──────────────────────────────────────────────────────────
@@ -487,7 +520,10 @@ mod tests {
         fs::write(dir.join("Dockerfile"), "old content").unwrap();
         init(&dir, "my-app", true, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        assert_ne!(content, "old content", "Dockerfile must be overwritten with --force");
+        assert_ne!(
+            content, "old content",
+            "Dockerfile must be overwritten with --force"
+        );
     }
 
     // ── --target=fly ──────────────────────────────────────────────────────────
@@ -497,7 +533,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Fly).unwrap();
-        assert!(dir.join("fly.toml").is_file(), "fly.toml must be created for --target=fly");
+        assert!(
+            dir.join("fly.toml").is_file(),
+            "fly.toml must be created for --target=fly"
+        );
     }
 
     #[test]
@@ -518,7 +557,10 @@ mod tests {
         let dir = make_project(&tmp, "my-blog");
         init(&dir, "my-blog", false, Target::Fly).unwrap();
         let content = fs::read_to_string(dir.join("fly.toml")).unwrap();
-        assert!(content.contains("my-blog"), "fly.toml must contain the app name");
+        assert!(
+            content.contains("my-blog"),
+            "fly.toml must contain the app name"
+        );
         assert!(
             !content.contains("{{project_name}}"),
             "fly.toml must not contain unsubstituted placeholders"
@@ -567,7 +609,10 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::DockerCompose).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
-        assert!(content.contains("app:"), "docker-compose.yml must have an 'app' service");
+        assert!(
+            content.contains("app:"),
+            "docker-compose.yml must have an 'app' service"
+        );
     }
 
     #[test]
@@ -600,7 +645,10 @@ mod tests {
         let dir = make_project(&tmp, "my-blog");
         init(&dir, "my-blog", false, Target::DockerCompose).unwrap();
         let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
-        assert!(content.contains("my-blog"), "docker-compose.yml must substitute project name");
+        assert!(
+            content.contains("my-blog"),
+            "docker-compose.yml must substitute project name"
+        );
         assert!(
             !content.contains("{{project_name}}"),
             "docker-compose.yml must not contain unsubstituted placeholders"
@@ -618,6 +666,44 @@ mod tests {
         );
     }
 
+    // ── workspace root error ──────────────────────────────────────────────────
+
+    #[test]
+    fn workspace_root_gives_actionable_hint() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"my-app\"]\n",
+        )
+        .unwrap();
+        let err = read_project_name(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("workspace"),
+            "error must mention workspace: {msg}"
+        );
+        assert!(
+            msg.contains("member"),
+            "error must hint to run from a member directory: {msg}"
+        );
+    }
+
+    // ── auto-migration config ─────────────────────────────────────────────────
+
+    #[test]
+    fn production_config_enables_auto_migrate_in_production() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        assert!(
+            content.contains("auto_migrate_in_production = true"),
+            "production config must set auto_migrate_in_production = true so the \
+             framework runs migrations at startup and calls exit(1) on failure"
+        );
+    }
+
     // ── target parsing ────────────────────────────────────────────────────────
 
     #[test]
@@ -627,7 +713,10 @@ mod tests {
 
     #[test]
     fn parse_target_docker_compose() {
-        assert_eq!("docker-compose".parse::<Target>().unwrap(), Target::DockerCompose);
+        assert_eq!(
+            "docker-compose".parse::<Target>().unwrap(),
+            Target::DockerCompose
+        );
     }
 
     #[test]

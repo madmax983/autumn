@@ -21,6 +21,9 @@ path = "/health"
 url = "postgres://user:CHANGE_ME@localhost:5432/{{project_name}}_prod"
 pool_size = 10
 connect_timeout_secs = 5
+# Run pending migrations at startup; exit(1) on failure stops the container.
+# Requires .migrations(MIGRATIONS) to be registered in main.rs.
+auto_migrate_in_production = true
 
 # Uncomment for OpenTelemetry / OTLP tracing:
 # [telemetry]
