@@ -112,9 +112,22 @@ pub fn init(
     force: bool,
     target: Target,
 ) -> Result<Vec<String>, ReleaseError> {
-    // Stub: does nothing — tests will fail.
-    let _ = (dir, project_name, force, target);
-    Ok(vec![])
+    let files = planned_files(target);
+
+    if !force {
+        for (name, _) in &files {
+            if dir.join(name).exists() {
+                return Err(ReleaseError::FileExists(name.to_string()));
+            }
+        }
+    }
+
+    let mut created = Vec::new();
+    for (name, template) in files {
+        fs::write(dir.join(name), render(template, project_name))?;
+        created.push(name.to_string());
+    }
+    Ok(created)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

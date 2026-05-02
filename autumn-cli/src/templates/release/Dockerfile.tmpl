@@ -1,1 +1,61 @@
-STUB
+# ── Stage 1: cargo-chef planner ──────────────────────────────────────────────
+FROM rust:1.86-bookworm AS chef
+RUN cargo install cargo-chef --locked
+WORKDIR /app
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+
+ARG TAILWIND_VERSION=v4.1.4
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-build dependencies — this layer is cached unless Cargo.lock changes.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Download Tailwind CSS for asset compilation during the build step.
+RUN mkdir -p target/autumn \
+    && curl -fsSL \
+        -o target/autumn/tailwindcss \
+        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64" \
+    && chmod +x target/autumn/tailwindcss
+
+COPY . .
+RUN cargo build --release
+
+# ── Stage 3: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libpq5 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 autumn
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --from=builder /app/static /app/static
+COPY --from=builder /app/migrations /app/migrations
+
+ENV AUTUMN_PROFILE=prod
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+USER autumn
+
+# Run migrations before serving; migration failure aborts container start.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/bin/sh", "-c", "/usr/local/bin/{{project_name}} migrate run && exec /usr/local/bin/{{project_name}}"]
