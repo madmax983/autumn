@@ -2,13 +2,8 @@
 members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo"]
 resolver = "3"
 
-# Unify autumn-web across the workspace and any transitive consumers (e.g.
-# autumn-harvest-plugin from crates.io depends on autumn-web 0.2 — without
-# this patch the path version and the registry version would be treated as
-# different crates and types wouldn't unify across the boundary).
 [patch.crates-io]
 autumn-web = { path = "autumn" }
-autumn-harvest-plugin = { path = "patched-crates/autumn-harvest-plugin" }
 
 [workspace.package]
 edition = "2024"

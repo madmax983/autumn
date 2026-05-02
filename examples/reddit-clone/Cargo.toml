@@ -5,14 +5,8 @@ version.workspace = true
 publish = false
 default-run = "reddit-clone"
 
-[[bin]]
-name = "reddit-clone-harvest-runner"
-path = "src/bin/harvest-runner.rs"
-
 [dependencies]
-autumn-harvest = "0.1"
-autumn-harvest-plugin = "0.1"
-autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart"] }
+autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart", "redis"] }
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }

@@ -1,13 +1,15 @@
 [database]
 url = "postgres://autumn:autumn@localhost:5432/reddit"
 
-[harvest]
-mode = "split"
-worker_enabled = true
-scheduler_enabled = true
+[jobs]
+backend = "redis"
+workers = 2
+max_attempts = 5
+initial_backoff_ms = 500
 
-[harvest.database]
-url = "postgres://autumn:autumn@localhost:5432/reddit_harvest"
+[jobs.redis]
+url = "redis://127.0.0.1:6379/"
+key_prefix = "reddit-clone:jobs"
 
 [distributed.live_feed_bus]
 kind = "redis_pubsub"

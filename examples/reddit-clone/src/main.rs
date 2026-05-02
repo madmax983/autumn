@@ -13,14 +13,13 @@
 //   Validation          -> #[validate(length(min, max))] on model fields
 //   Scheduled tasks     -> #[scheduled(every = "15m")] hot-rank recalculator
 //   WebSockets          -> #[ws] live feed with Channels + durable app-db relay + pluggable bus
-//   Durable Workflows   -> autumn-harvest onboarding + post-publication workflows + management API
+//   Background Jobs     -> #[job] onboarding + post-publication side effects
 //   Profiles            -> autumn.toml + autumn-dev.toml dev overrides
 //   Actuator            -> /health, /actuator/health, /actuator/info, /actuator/tasks
 //   HTML stack          -> Maud templates, htmx interactivity, Tailwind CSS
 //
-// Run with:   cargo run -p reddit-clone   (first dev boot applies reddit + Harvest migrations;
-//                                          startup also drains pending Harvest outbox rows and
-//                                          starts the durable live-feed relay)
+// Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
+//                                          starts the job runtime + durable live-feed relay)
 // Front page: http://localhost:3000
 // WebSocket:  ws://localhost:3000/ws/feed
 // API test:   curl http://localhost:3000/api/posts
@@ -30,7 +29,7 @@ use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 use reddit_clone::models::Post;
 use reddit_clone::policies::PostPolicy;
-use reddit_clone::{harvest_runtime, live_events, repositories, routes, tasks};
+use reddit_clone::{live_events, repositories, routes, tasks};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -78,10 +77,8 @@ async fn main() {
             tasks::recalculate_hot_ranks,
             tasks::prune_live_feed_events
         ])
-        .plugins((
-            harvest_runtime::harvest_plugin(),
-            live_events::LiveFeedPlugin::new(),
-        ))
+        .jobs(reddit_clone::jobs::registered_jobs())
+        .plugin(live_events::LiveFeedPlugin::new())
         .run()
         .await;
 }

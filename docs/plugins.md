@@ -6,18 +6,23 @@ Autumn integrations are packaged as **plugins**: small types that implement
 tuple-taking `.plugins((...))`, and each plugin's `build` runs exactly once.
 
 ```rust
-use autumn_harvest_plugin::HarvestPlugin;
-use autumn_harvest::prelude::*;
+use autumn_web::app::AppBuilder;
+use autumn_web::plugin::Plugin;
+
+struct LiveFeedPlugin;
+
+impl Plugin for LiveFeedPlugin {
+    fn build(self, app: AppBuilder) -> AppBuilder {
+        app.on_startup(|state| async move {
+            tracing::info!(profile = state.profile(), "live feed started");
+            Ok(())
+        })
+    }
+}
 
 autumn_web::app()
     .routes(routes![...])
-    .plugins((
-        HarvestPlugin::new()
-            .workflows(workflows![onboarding])
-            .activities(activities![send_email])
-            .api("/api/harvest"),
-        MyLiveFeedPlugin::new(),
-    ))
+    .plugin(LiveFeedPlugin)
     .run()
     .await;
 ```
@@ -27,12 +32,18 @@ autumn_web::app()
 | Kind | Crate name | Struct name |
 |------|------------|-------------|
 | First-party (lives in this repo) | `autumn-<name>-plugin` | `<Name>Plugin` |
+| Autumn companion (separate release train) | `autumn-<name>` or `autumn-<name>-plugin` | `<Name>Plugin` |
 | Third-party (lives on crates.io) | `autumn-plugin-<name>` | `<Name>Plugin` |
 
 Third-party crates keep the `autumn-plugin-` prefix so the ecosystem
 is easy to search on crates.io. First-party crates reverse the order so
-they cluster with the crate they extend (e.g. `autumn-harvest-plugin`
-sits next to `autumn-harvest`).
+they cluster with the crate they extend.
+
+Companion crates can live outside this repository when their dependency graph
+points back at `autumn-web`. Autumn Harvest is the main example: it provides
+durable workflows and may expose an Autumn adapter/plugin, but `autumn-web`
+does not compile examples against Harvest. That keeps web releases independent
+while still giving users an obvious path to workflow orchestration.
 
 Every plugin crate should expose its `<Name>Plugin` type at the crate
 root along with a `::new()` constructor and `#[must_use]` fluent

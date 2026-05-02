@@ -22,8 +22,8 @@ showcasing the framework's major features in a single cohesive application.
 | CSRF protection (`CsrfToken` + htmx header injection) | `routes/layout.rs`, all forms |
 | Field validation (`#[validate(length(min, max))]`) | `models.rs` |
 | Scheduled background tasks (`#[scheduled(every = "15m")]`) | `tasks.rs` |
+| **Background Jobs** (`#[job]`, `jobs![]`, local/Redis runtime) | `jobs.rs`, `/actuator/jobs` |
 | **WebSockets** (`#[ws]`, `Channels`, durable app-db relay, pluggable live-event bus, `CancellationToken`, relay health JSON) | `routes/live.rs`, `live_events.rs`, `live_bus.rs` |
-| **Durable Workflows** (real autumn-harvest onboarding + post-publication flows + management API) | `workflows.rs`, `/api/harvest/*` |
 | Actuator endpoints (`/health`, `/actuator/*`) | Auto-mounted |
 | Maud HTML templates | All route files |
 | htmx interactivity (voting, deletion, logout) | `routes/votes.rs`, `routes/layout.rs` |
@@ -34,14 +34,11 @@ showcasing the framework's major features in a single cohesive application.
 
 ```bash
 # Start PostgreSQL + Redis
-# Fresh volumes are recommended if you want the split example too, because the
-# container init script creates the separate `reddit_harvest` database once.
 docker compose up -d
 
 # Run the app in dev mode
-# The first boot applies the reddit-clone schema, the framework-owned Harvest
-# workflow outbox on the app database, and the Harvest storage tables on the
-# configured Harvest database role.
+# The first boot applies the reddit-clone schema and starts the local job
+# runtime plus the durable live-feed relay.
 cargo run -p reddit-clone
 
 # Optional: watch mode from the workspace root
@@ -50,65 +47,60 @@ cargo run -p reddit-clone
 # Visit http://localhost:3000
 ```
 
-If Harvest logs errors like `relation "harvest_task_queue" does not exist`, the
-configured Harvest storage database never received its migrations. Start the
-example once in dev mode against that database before using a release or
-profile-specific run.
+The local job backend is the zero-config default. Registration enqueues
+`user_onboarding` to award starter karma. Post submission enqueues
+`post_publication` to refresh `hot_rank`, store a durable live-feed event, and
+wake connected feed relays.
 
-If app writes succeed but workflow publication stays pending, inspect the
-framework-owned `harvest_workflow_outbox` table in the app database. Delivery
-from that table into Harvest storage is intentionally at-least-once and depends
-on idempotent workflow start.
+Inspect job state through the actuator:
 
-The live-feed relay also exposes an operator-facing JSON snapshot:
+```bash
+curl http://localhost:3000/actuator/jobs
+```
+
+The live-feed relay exposes an operator-facing JSON snapshot:
 
 ```bash
 curl http://localhost:3000/api/live/relay/health
 ```
 
-## External Runner Escape Hatch
+## Redis Jobs And Live Feed
 
-`reddit-clone` stays the embedded happy path, but the Harvest topology seam is
-real now. If the app grows large enough to want a dedicated Harvest cluster and
-separate runtime ownership, the web process can keep the API and outbox while a
-different process owns worker/scheduler execution.
-
-For a local two-process demo, use the checked-in split profiles:
+For a local Redis-backed queue and cross-process wakeup demo, use the checked-in
+Redis profile:
 
 ```bash
-# Reset Postgres so the init script creates both `reddit` and `reddit_harvest`
-docker compose down -v
 docker compose up -d
-
-# Web process: app DB + Harvest API/outbox, but no local worker/scheduler
-AUTUMN_PROFILE=split-web cargo run -p reddit-clone
-
-# Separate process: owns Harvest worker/scheduler against the harvest DB
-AUTUMN_PROFILE=split-runner cargo run -p reddit-clone --bin reddit-clone-harvest-runner
+AUTUMN_PROFILE=redis cargo run -p reddit-clone
 ```
 
-Those profiles live in:
+That profile lives in `autumn-redis.toml` and configures:
 
-- `autumn-split-web.toml`
-- `autumn-split-runner.toml`
-
-The runner binary reuses the same workflow/activity registration as the web app;
-it just changes runtime ownership. For a true external deployment, keep the
-same binary and commands, but point `harvest.database.url` at a separate
-cluster instead of the local `reddit_harvest` logical database.
+- `jobs.backend = "redis"` for durable ad-hoc jobs
+- `distributed.live_feed_bus.kind = "redis_pubsub"` for live-feed wakeups
 
 The live WebSocket feed keeps the app database as durable truth via
-`live_feed_events`, but the wakeup path is now pluggable:
+`live_feed_events`, while the wakeup path is pluggable:
 
-- Default/embedded mode uses Postgres `LISTEN/NOTIFY`
-- Split profiles use Redis pub/sub for cross-process wakeups
-- Split mode also keeps Postgres `NOTIFY` as a safety-net, so missed Redis
-  publishes still wake web nodes immediately from the durable event log
-- Polling is now the last fallback only when neither wake path is available
+- Default/dev mode uses Postgres `LISTEN/NOTIFY`
+- Redis profile uses Redis pub/sub for cross-process wakeups
+- Redis mode also keeps Postgres `NOTIFY` as a safety net, so missed Redis
+  publishes still wake web nodes from the durable event log
+- Polling is the last fallback when neither wake path is available
 
-That means the database still owns replay correctness while Redis takes over
-the “please wake up now” job once you outgrow letting Postgres moonlight as a
-bus.
+## Why This Example Uses Jobs Instead Of Harvest
+
+Autumn Harvest is still the companion workflow engine for durable, multi-step
+orchestration: workflow history, activity retries, timers, and dedicated
+runners. This example uses Autumn Web's built-in `#[job]` runtime for the
+registration and post-publication side effects because those are small
+request-triggered jobs, not long-running workflows.
+
+Keeping reddit-clone off `autumn-harvest` also keeps the release train clean.
+Harvest depends on Autumn Web integration points; Autumn Web should not require
+Harvest in a checked-in example just to publish a web release. See
+[`docs/autumn-workflow-architecture.md`](../../docs/autumn-workflow-architecture.md)
+when your app needs the heavier workflow machinery.
 
 ## Live Feed Operations
 
@@ -116,8 +108,8 @@ bus.
 The important fields are:
 
 - `listener_state`: which wake path is currently active (`postgres`, `redis`, `redis+postgres`, or `polling`)
-- `reconnect_attempts` / `reconnect_successes` / `reconnect_failures`: whether the process is healing broken listeners or just taking notes about them
-- `wake_redis`, `wake_postgres`, `wake_poll`: which path is actually waking the relay
+- `reconnect_attempts` / `reconnect_successes` / `reconnect_failures`: whether the process is healing broken listeners
+- `wake_redis`, `wake_postgres`, `wake_poll`: which path is waking the relay
 - `replayed_events`, `last_seen_id`, `last_replayed_at`: whether durable rows are still flowing through replay
 - `last_error`: the last relay or publish error seen by this process
 
@@ -126,7 +118,7 @@ Operator heuristics:
 - Sustained growth in `wake_poll` means the process is living on fallback instead of a real bus.
 - Growing `reconnect_failures` with a flat `reconnect_successes` means the configured wake path is still broken.
 - A stale `last_replayed_at` while app writes continue means live updates are stuck before rebroadcast.
-- In split mode, `listener_state = "redis+postgres"` is healthy: Redis is primary and Postgres is the backup wake path.
+- In Redis mode, `listener_state = "redis+postgres"` is healthy: Redis is primary and Postgres is the backup wake path.
 
 ## WebSocket Live Feed
 
@@ -158,15 +150,15 @@ curl http://localhost:3000/api/posts/1
 
 ```
 src/
-  main.rs           # App builder, route + task + WS registration, migrations
+  main.rs           # App builder, route + task + job + WS registration, migrations
   models.rs         # #[model] structs: User, Subreddit, Post, Comment, Vote
   schema.rs         # Diesel table definitions
   repositories.rs   # #[repository] with derived queries and API generation
   hooks.rs          # MutationHooks for post lifecycle (auto-slug)
+  jobs.rs           # #[job] onboarding + post-publication side effects
   live_bus.rs       # Live-feed bus config and backend selection
   live_events.rs    # Durable app-db live-feed relay with Postgres/Redis wakeups
-  tasks.rs          # Scheduled hot-rank + live-feed retention jobs
-  workflows.rs      # real autumn-harvest onboarding + post-publication workflows and activities
+  tasks.rs          # Scheduled hot-rank + live-feed retention tasks
   slugify.rs        # URL slug generation utility
   routes/
     mod.rs          # Module exports

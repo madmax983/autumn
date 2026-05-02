@@ -4,7 +4,6 @@
 //! #[secured] for write operations, htmx for voting and deletion,
 //! Maud templates with Tailwind CSS.
 
-use autumn_harvest_plugin::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
@@ -14,6 +13,7 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 use tracing::warn;
 
+use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{Post, Subreddit, User};
 use crate::schema::{comments, posts, subreddits, users};
 use crate::slugify::slugify;
@@ -281,7 +281,6 @@ pub struct SubmitPostForm {
 #[secured]
 #[post("/submit")]
 pub async fn submit(
-    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<SubmitPostForm>,
@@ -335,15 +334,12 @@ pub async fn submit(
     let url_for_insert = url.clone();
     let title_for_insert = title.clone();
     let slug_for_insert = slug.clone();
-    let author_username_for_outbox = author_username.clone();
     let post_id = (*db)
         .transaction::<i64, AutumnError, _>(|conn| {
             let title = title_for_insert.clone();
             let slug = slug_for_insert.clone();
             let body = body.clone();
             let url = url_for_insert.clone();
-            let subreddit_slug = subreddit_slug.clone();
-            let author_username = author_username_for_outbox.clone();
             async move {
                 let post_id: i64 = diesel::insert_into(posts::table)
                     .values((
@@ -368,24 +364,21 @@ pub async fn submit(
                     .execute(conn)
                     .await?;
 
-                let request = crate::workflows::post_publication_dispatch(
-                    post_id,
-                    &title,
-                    &slug,
-                    &subreddit_slug,
-                    &author_username,
-                );
-                enqueue_workflow_start_outbox(conn, &request)
-                    .await
-                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
-
                 Ok(post_id)
             }
             .scope_boxed()
         })
         .await?;
 
-    if let Err(error) = flush_workflow_start_outbox(&state).await {
+    if let Err(error) = PostPublicationJob::enqueue(PostPublicationArgs::new(
+        post_id,
+        title.clone(),
+        slug.clone(),
+        subreddit_slug.clone(),
+        author_username.clone(),
+    ))
+    .await
+    {
         warn!(
             post_id,
             title = %title,
@@ -393,7 +386,7 @@ pub async fn submit(
             subreddit_slug = %sub.slug,
             author_username = %author_username,
             error = %error,
-            "failed to flush post publication workflow outbox"
+            "failed to enqueue post publication job"
         );
     }
 

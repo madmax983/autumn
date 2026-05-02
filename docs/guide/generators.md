@@ -172,8 +172,11 @@ you need them):
 
 - Authentication scaffolding. Auth has its own session, CSRF, and
   `#[secured]` story; bundling it here would balloon scope.
-- Generators for `autumn-admin-plugin` views or `autumn-harvest`
-  workflows. Those plugins ship their own generators on their own timeline.
+- Generators for optional plugin crates. Those plugins ship their own
+  generators on their own timeline.
+- Harvest workflow scaffolding. `autumn-harvest` is a companion workflow
+  project with its own release train, so core web generators do not depend on
+  it.
 - Custom user-provided templates / template overrides.
 - Reverse generation (database → models).
 - Test scaffolding beyond the single smoke test.
