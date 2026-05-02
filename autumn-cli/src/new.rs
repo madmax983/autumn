@@ -148,6 +148,12 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
+    print_scaffold_summary(name, opts);
+
+    Ok(())
+}
+
+fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
@@ -182,8 +188,6 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
         println!("Seed your database:");
         println!("  autumn migrate && autumn seed");
     }
-
-    Ok(())
 }
 
 fn render_cargo_toml(
