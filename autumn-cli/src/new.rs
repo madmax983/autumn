@@ -365,6 +365,40 @@ mod tests {
         assert!(!p.join("src/client.rs").exists());
     }
 
+    // RED: `autumn new` must generate a tests/ directory with a smoke test.
+    // Fails until generate_with() creates tests/integration_test.rs.
+    #[test]
+    fn generates_tests_directory_with_smoke_test() {
+        let tmp = TempDir::new().unwrap();
+        generate("smoke-test-app", tmp.path()).unwrap();
+        let p = tmp.path().join("smoke-test-app");
+        assert!(
+            p.join("tests").is_dir(),
+            "`autumn new` should create a tests/ directory"
+        );
+        assert!(
+            p.join("tests/integration_test.rs").is_file(),
+            "`autumn new` should generate tests/integration_test.rs"
+        );
+    }
+
+    // RED: the generated Cargo.toml must have [dev-dependencies] with tokio
+    // so that #[tokio::test] compiles without the user adding anything.
+    #[test]
+    fn generated_cargo_toml_has_dev_deps_for_testing() {
+        let tmp = TempDir::new().unwrap();
+        generate("dev-dep-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("dev-dep-app/Cargo.toml")).unwrap();
+        assert!(
+            content.contains("[dev-dependencies]"),
+            "generated Cargo.toml must have [dev-dependencies]"
+        );
+        assert!(
+            content.contains("tokio"),
+            "generated Cargo.toml must include tokio in dev-dependencies for #[tokio::test]"
+        );
+    }
+
     #[test]
     fn cargo_toml_has_project_name() {
         let tmp = TempDir::new().unwrap();
