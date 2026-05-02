@@ -47,6 +47,9 @@ WORKDIR /app
 COPY --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
 COPY --from=builder /app/static /app/static
 COPY --from=builder /app/migrations /app/migrations
+# Use the production config example as the runtime autumn.toml.
+# It sets host = "0.0.0.0" so the container is reachable; override DATABASE_URL at runtime.
+COPY --from=builder /app/autumn.production.toml.example /app/autumn.toml
 
 ENV AUTUMN_PROFILE=prod
 EXPOSE 3000
