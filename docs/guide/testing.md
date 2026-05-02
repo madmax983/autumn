@@ -111,11 +111,14 @@ no one-container-per-test overhead.
 ### 1  Add the dev-dependency
 
 ```toml
-# Cargo.toml
+# Cargo.toml  — use the same version as your [dependencies] entry
 [dev-dependencies]
 autumn-web = { version = "0.3", features = ["test-support"] }
 serde_json = "1"
 ```
+
+Replace `"0.3"` with whatever version you have in `[dependencies]` (or omit
+`version` entirely and rely on Cargo's workspace resolution).
 
 The `test-support` feature activates `TestDb`. No other dev-dependency is
 needed; `diesel`, `diesel-async`, `serde`, and `tokio` are already in your

@@ -376,8 +376,7 @@ mod tests {
         assert!(!p.join("src/client.rs").exists());
     }
 
-    // RED: `autumn new` must generate a tests/ directory with a smoke test.
-    // Fails until generate_with() creates tests/integration_test.rs.
+    // `autumn new` must generate a tests/ directory with a smoke test.
     #[test]
     fn generates_tests_directory_with_smoke_test() {
         let tmp = TempDir::new().unwrap();
@@ -393,7 +392,7 @@ mod tests {
         );
     }
 
-    // RED: the generated Cargo.toml must have [dev-dependencies] with tokio
+    // The generated Cargo.toml must have [dev-dependencies] with tokio
     // so that #[tokio::test] compiles without the user adding anything.
     #[test]
     fn generated_cargo_toml_has_dev_deps_for_testing() {

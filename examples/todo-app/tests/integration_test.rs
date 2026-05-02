@@ -5,9 +5,14 @@
 //! # Running
 //!
 //! ```text
-//! cargo test -p todo-app                        # smoke tests (instant, no Docker)
-//! cargo test -p todo-app -- --include-ignored   # + DB round-trip (needs Docker)
+//! cargo test -p todo-app                                              # smoke tests (instant)
+//! cargo test -p todo-app -- --include-ignored --test-threads=1       # DB tests (needs Docker)
 //! ```
+//!
+//! `--test-threads=1` is required when running multiple DB-backed ignored
+//! tests: each test truncates the shared table, so concurrent execution would
+//! cause data races. With a single DB test the flag is optional, but keeping
+//! it explicit avoids surprises as the suite grows.
 
 use autumn_web::prelude::*;
 use autumn_web::test::{TestApp, TestDb};

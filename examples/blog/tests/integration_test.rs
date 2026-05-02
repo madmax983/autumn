@@ -6,9 +6,14 @@
 //! # Running
 //!
 //! ```text
-//! cargo test -p blog                        # smoke tests (instant, no Docker)
-//! cargo test -p blog -- --include-ignored   # + DB round-trip (needs Docker)
+//! cargo test -p blog                                              # smoke tests (instant)
+//! cargo test -p blog -- --include-ignored --test-threads=1       # DB tests (needs Docker)
 //! ```
+//!
+//! `--test-threads=1` is required when running multiple DB-backed ignored
+//! tests: each test truncates the shared table in `setup_posts_table()`, so
+//! concurrent execution would cause data races. With a single DB test this
+//! flag is optional, but keeping it explicit avoids surprises as the suite grows.
 //!
 //! # What these tests cover
 //!
@@ -83,6 +88,9 @@ async fn create_post(mut db: Db, Json(body): Json<NewPost>) -> AutumnResult<Json
 
 // ── DB setup helper ────────────────────────────────────────────────────────
 
+// TRUNCATE resets table state before each test. This is safe when DB tests
+// run serially (`--test-threads=1`). Do not add concurrent DB tests without
+// either that flag or per-test schema isolation.
 async fn setup_posts_table()
 -> diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection> {
     let db = TestDb::shared().await;

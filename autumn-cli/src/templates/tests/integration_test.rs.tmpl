@@ -2,11 +2,11 @@
 //!
 //! Run with:
 //!
-//!     cargo test                        # smoke tests (instant, no Docker)
-//!     cargo test -- --include-ignored   # + DB tests (requires Docker)
+//!     cargo test
 //!
-//! See `docs/guide/testing.md` in the Autumn repository for the full
-//! integration-testing walkthrough.
+//! Add DB-backed tests with `TestDb` (feature = "test-support") and mark
+//! them `#[ignore = "requires Docker"]`. See `docs/guide/testing.md` in
+//! the Autumn repository for the full integration-testing walkthrough.
 
 use autumn_web::prelude::*;
 use autumn_web::test::TestApp;
