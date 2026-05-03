@@ -814,6 +814,20 @@ mod tests {
     }
 
     #[test]
+    fn config_builder_methods_work() {
+        let config = OpenApiConfig::new("Demo", "1.0.0")
+            .description("A cool API")
+            .openapi_json_path("/api.json")
+            .swagger_ui_path(None);
+
+        assert_eq!(config.title, "Demo");
+        assert_eq!(config.version, "1.0.0");
+        assert_eq!(config.description.unwrap(), "A cool API");
+        assert_eq!(config.openapi_json_path, "/api.json");
+        assert_eq!(config.swagger_ui_path, None);
+    }
+
+    #[test]
     fn generate_spec_builds_path_with_parameters() {
         let doc = make_doc();
         let config = OpenApiConfig::new("Demo", "1.0.0");
@@ -1011,11 +1025,47 @@ mod tests {
     }
 
     #[test]
+    fn status_description_returns_correct_strings() {
+        assert_eq!(status_description(200), "OK");
+        assert_eq!(status_description(201), "Created");
+        assert_eq!(status_description(202), "Accepted");
+        assert_eq!(status_description(204), "No Content");
+        assert_eq!(status_description(301), "Moved Permanently");
+        assert_eq!(status_description(302), "Found");
+        assert_eq!(status_description(400), "Bad Request");
+        assert_eq!(status_description(401), "Unauthorized");
+        assert_eq!(status_description(403), "Forbidden");
+        assert_eq!(status_description(404), "Not Found");
+        assert_eq!(status_description(409), "Conflict");
+        assert_eq!(status_description(422), "Unprocessable Entity");
+        assert_eq!(status_description(500), "Internal Server Error");
+        assert_eq!(status_description(418), "Response");
+    }
+
+    #[test]
     fn default_tag_picks_first_static_segment() {
         assert_eq!(default_tag("/users/{id}"), Some("users"));
         assert_eq!(default_tag("/api/v1/users"), Some("api"));
         assert_eq!(default_tag("/"), None);
         assert_eq!(default_tag("/{id}"), None);
+    }
+
+    #[test]
+    fn schema_registry_into_map_returns_all_schemas() {
+        let mut registry = SchemaRegistry::default();
+        registry.insert("Foo", serde_json::json!({ "type": "string" }));
+        registry.insert("Bar", serde_json::json!({ "type": "integer" }));
+
+        let map = registry.into_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("Foo").unwrap(),
+            &serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(
+            map.get("Bar").unwrap(),
+            &serde_json::json!({ "type": "integer" })
+        );
     }
 
     #[test]
