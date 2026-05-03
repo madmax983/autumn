@@ -28,6 +28,7 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:pq-sys",
+    "dep:scoped-futures",
     "diesel/postgres",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
@@ -62,6 +63,7 @@ diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
+scoped-futures = { version = "0.1.4", optional = true }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
