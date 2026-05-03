@@ -17,6 +17,7 @@ mod templates {
     pub const GITIGNORE: &str = include_str!("templates/gitignore.tmpl");
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
+    pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
 }
 
 /// Errors that can occur during project generation.
@@ -82,6 +83,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
+    fs::create_dir_all(project_dir.join("tests"))?;
     if opts.with_i18n {
         fs::create_dir_all(project_dir.join("i18n"))?;
     }
@@ -138,9 +140,19 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     )?;
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
+    fs::write(
+        project_dir.join("tests/integration_test.rs"),
+        render(templates::INTEGRATION_TEST),
+    )?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
+    print_scaffold_summary(name, opts);
+
+    Ok(())
+}
+
+fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/");
     println!("  Created {name}/Cargo.toml");
     println!("  Created {name}/autumn.toml");
@@ -155,6 +167,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
     println!("  Created {name}/migrations/");
+    println!("  Created {name}/tests/integration_test.rs");
     if opts.with_i18n {
         println!("  Created {name}/i18n/en.ftl");
     }
@@ -174,8 +187,6 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
         println!("Seed your database:");
         println!("  autumn migrate && autumn seed");
     }
-
-    Ok(())
 }
 
 fn render_cargo_toml(
@@ -363,6 +374,39 @@ mod tests {
         assert!(p.join("migrations/.gitkeep").is_file());
         assert!(!p.join("src/lib.rs").exists());
         assert!(!p.join("src/client.rs").exists());
+    }
+
+    // `autumn new` must generate a tests/ directory with a smoke test.
+    #[test]
+    fn generates_tests_directory_with_smoke_test() {
+        let tmp = TempDir::new().unwrap();
+        generate("smoke-test-app", tmp.path()).unwrap();
+        let p = tmp.path().join("smoke-test-app");
+        assert!(
+            p.join("tests").is_dir(),
+            "`autumn new` should create a tests/ directory"
+        );
+        assert!(
+            p.join("tests/integration_test.rs").is_file(),
+            "`autumn new` should generate tests/integration_test.rs"
+        );
+    }
+
+    // The generated Cargo.toml must have [dev-dependencies] with tokio
+    // so that #[tokio::test] compiles without the user adding anything.
+    #[test]
+    fn generated_cargo_toml_has_dev_deps_for_testing() {
+        let tmp = TempDir::new().unwrap();
+        generate("dev-dep-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("dev-dep-app/Cargo.toml")).unwrap();
+        assert!(
+            content.contains("[dev-dependencies]"),
+            "generated Cargo.toml must have [dev-dependencies]"
+        );
+        assert!(
+            content.contains("tokio"),
+            "generated Cargo.toml must include tokio in dev-dependencies for #[tokio::test]"
+        );
     }
 
     #[test]

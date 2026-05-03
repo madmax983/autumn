@@ -1,4 +1,4 @@
-# Chapter 11: What's Next
+# Chapter 12: What's Next
 
 **Goal:** By the end of this chapter, you will have a complete, working todo
 application and a clear picture of where to go from here.
@@ -25,20 +25,20 @@ tutorial omitted. Then branch out into the newer example apps:
 
 ### Ideas for Extending the App
 
-- **Authentication** — add user accounts with session cookies
-- **Actuator hardening** — tune which operational endpoints stay visible in prod
-- **Background work** — add a `#[scheduled]` task for cleanup or polling
-- **Categories** — associate todos with categories (a second table, foreign keys)
-- **Search** — add a search bar with `ILIKE` queries
-- **Pagination** — limit the list with `.limit()` and `.offset()`
-- **Testing** — write integration tests with Autumn's test utilities
+- **Authentication** ï¿½ add user accounts with session cookies
+- **Actuator hardening** ï¿½ tune which operational endpoints stay visible in prod
+- **Background work** ï¿½ add a `#[scheduled]` task for cleanup or polling
+- **Categories** ï¿½ associate todos with categories (a second table, foreign keys)
+- **Search** ï¿½ add a search bar with `ILIKE` queries
+- **Pagination** ï¿½ limit the list with `.limit()` and `.offset()`
+- **Testing** â€” see [Chapter 11](11-testing.md) for the integration testing walkthrough
 
 ### Further Reading
 
-- [API Reference](https://docs.rs/autumn-web) — generated Rust docs for every public type
-- [Getting Started Guide](../getting-started.md) — quick overview of all features
-- [Example App](../../../examples/todo-app/) — the reference implementation
-- [Autumn on crates.io](https://crates.io/crates/autumn-web) — versioned releases
+- [API Reference](https://docs.rs/autumn-web) ï¿½ generated Rust docs for every public type
+- [Getting Started Guide](../getting-started.md) ï¿½ quick overview of all features
+- [Example App](../../../examples/todo-app/) ï¿½ the reference implementation
+- [Autumn on crates.io](https://crates.io/crates/autumn-web) ï¿½ versioned releases
 
 ### Community
 
@@ -50,4 +50,4 @@ Where to ask questions, report bugs, and contribute.
 
 ---
 
-Previous: [Chapter 10 — Configuration and Production Defaults](10-configuration.md) | Back to [Tutorial Index](index.md)
+Previous: [Chapter 11 â€” Writing Integration Tests](11-testing.md) | Back to [Tutorial Index](index.md)
