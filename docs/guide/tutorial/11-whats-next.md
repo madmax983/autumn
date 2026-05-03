@@ -25,20 +25,20 @@ tutorial omitted. Then branch out into the newer example apps:
 
 ### Ideas for Extending the App
 
-- **Authentication** — add user accounts with session cookies
-- **Actuator hardening** — tune which operational endpoints stay visible in prod
-- **Background work** — add a `#[scheduled]` task for cleanup or polling
-- **Categories** — associate todos with categories (a second table, foreign keys)
-- **Search** — add a search bar with `ILIKE` queries
-- **Pagination** — limit the list with `.limit()` and `.offset()`
-- **Testing** — write integration tests with Autumn's test utilities
+- **Authentication** \x97 add user accounts with session cookies
+- **Actuator hardening** \x97 tune which operational endpoints stay visible in prod
+- **Background work** \x97 add a `#[scheduled]` task for cleanup or polling
+- **Categories** \x97 associate todos with categories (a second table, foreign keys)
+- **Search** \x97 add a search bar with `ILIKE` queries
+- **Pagination** \x97 limit the list with `.limit()` and `.offset()`
+- **Testing** \x97 write integration tests with Autumn's test utilities
 
 ### Further Reading
 
-- [API Reference](https://docs.rs/autumn-web) — generated Rust docs for every public type
-- [Getting Started Guide](../getting-started.md) — quick overview of all features
-- [Example App](../../../examples/todo-app/) — the reference implementation
-- [Autumn on crates.io](https://crates.io/crates/autumn-web) — versioned releases
+- [API Reference](https://docs.rs/autumn-web) \x97 generated Rust docs for every public type
+- [Getting Started Guide](../getting-started.md) \x97 quick overview of all features
+- [Example App](../../../examples/todo-app/) \x97 the reference implementation
+- [Autumn on crates.io](https://crates.io/crates/autumn-web) \x97 versioned releases
 
 ### Community
 
@@ -50,4 +50,4 @@ Where to ask questions, report bugs, and contribute.
 
 ---
 
-Previous: [Chapter 10 — Configuration and Production Defaults](10-configuration.md) | Back to [Tutorial Index](index.md)
+Previous: [Chapter 10 \x97 Configuration and Production Defaults](10-configuration.md) | Back to [Tutorial Index](index.md)
