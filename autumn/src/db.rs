@@ -148,11 +148,12 @@ impl Db {
     /// `Err(_)`.
     pub async fn tx<T, E, F>(&mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
-        E: std::error::Error + Send + Sync + 'static,
+        E: From<diesel::result::Error> + std::error::Error + Send + Sync + 'static,
         crate::error::AutumnError: From<E>,
         F: for<'a> FnOnce(
-            &'a mut AsyncPgConnection,
-        ) -> scoped_futures::ScopedBoxFuture<'a, 'a, Result<T, E>>,
+                &'a mut AsyncPgConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'a, Result<T, E>>
+            + Send,
     {
         use diesel_async::AsyncConnection as _;
 
@@ -161,14 +162,20 @@ impl Db {
                 "Nested Db::tx calls are not supported",
             ));
         }
+        struct TxDepthGuard<'a>(&'a mut usize);
+        impl Drop for TxDepthGuard<'_> {
+            fn drop(&mut self) {
+                *self.0 -= 1;
+            }
+        }
+
         self.tx_depth += 1;
-        let result = self
-            .conn
+        let _guard = TxDepthGuard(&mut self.tx_depth);
+
+        self.conn
             .transaction::<T, E, _>(f)
             .await
-            .map_err(Into::into);
-        self.tx_depth -= 1;
-        result
+            .map_err(Into::into)
     }
 }
 
