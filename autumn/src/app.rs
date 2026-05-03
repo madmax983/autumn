@@ -2322,16 +2322,16 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some()
-        && let Some(url) = &config.database.url
-    {
-        for mig in migrations {
-            crate::migrate::auto_migrate(
-                url,
-                config.profile.as_deref(),
-                config.database.auto_migrate_in_production,
-                mig,
-            );
+    if pool.is_some() {
+        if let Some(url) = &config.database.url {
+            for mig in migrations {
+                crate::migrate::auto_migrate(
+                    url,
+                    config.profile.as_deref(),
+                    config.database.auto_migrate_in_production,
+                    mig,
+                );
+            }
         }
     }
 

@@ -251,10 +251,10 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
                 continue;
             }
 
-            if let Some(value) = segment.strip_prefix("q=")
-                && let Ok(parsed) = value.trim().parse::<f32>()
-            {
-                q = parsed.clamp(0.0, 1.0);
+            if let Some(value) = segment.strip_prefix("q=") {
+                if let Ok(parsed) = value.trim().parse::<f32>() {
+                    q = parsed.clamp(0.0, 1.0);
+                }
             }
         }
 

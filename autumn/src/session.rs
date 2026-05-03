@@ -721,10 +721,10 @@ where
             } else if inner_guard.dirty || generated_new_id {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
-                if let Some(ref old_id) = inner_guard.old_id
-                    && let Err(error) = store.destroy(old_id).await
-                {
-                    return Ok(session_store_unavailable_response(&error));
+                if let Some(ref old_id) = inner_guard.old_id {
+                    if let Err(error) = store.destroy(old_id).await {
+                        return Ok(session_store_unavailable_response(&error));
+                    }
                 }
                 drop(inner_guard);
                 if let Err(error) = store.save(&sid, data).await {

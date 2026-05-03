@@ -56,10 +56,10 @@ impl ComputedHeaders {
     fn from_config(config: &HeadersConfig) -> Self {
         let mut pairs = Vec::with_capacity(8);
 
-        if !config.x_frame_options.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&config.x_frame_options)
-        {
-            pairs.push((HeaderName::from_static("x-frame-options"), val));
+        if !config.x_frame_options.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&config.x_frame_options) {
+                pairs.push((HeaderName::from_static("x-frame-options"), val));
+            }
         }
 
         if config.x_content_type_options {
@@ -86,22 +86,22 @@ impl ComputedHeaders {
             }
         }
 
-        if !config.content_security_policy.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&config.content_security_policy)
-        {
-            pairs.push((HeaderName::from_static("content-security-policy"), val));
+        if !config.content_security_policy.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&config.content_security_policy) {
+                pairs.push((HeaderName::from_static("content-security-policy"), val));
+            }
         }
 
-        if !config.referrer_policy.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&config.referrer_policy)
-        {
-            pairs.push((HeaderName::from_static("referrer-policy"), val));
+        if !config.referrer_policy.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&config.referrer_policy) {
+                pairs.push((HeaderName::from_static("referrer-policy"), val));
+            }
         }
 
-        if !config.permissions_policy.is_empty()
-            && let Ok(val) = HeaderValue::from_str(&config.permissions_policy)
-        {
-            pairs.push((HeaderName::from_static("permissions-policy"), val));
+        if !config.permissions_policy.is_empty() {
+            if let Ok(val) = HeaderValue::from_str(&config.permissions_policy) {
+                pairs.push((HeaderName::from_static("permissions-policy"), val));
+            }
         }
 
         Self { pairs }

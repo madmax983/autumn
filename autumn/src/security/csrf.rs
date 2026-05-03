@@ -319,10 +319,10 @@ where
             // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
-            if let Some(cookie) = set_cookie
-                && let Ok(val) = http::header::HeaderValue::from_str(&cookie)
-            {
-                response.headers_mut().append(http::header::SET_COOKIE, val);
+            if let Some(cookie) = set_cookie {
+                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
+                    response.headers_mut().append(http::header::SET_COOKIE, val);
+                }
             }
 
             Ok(response)

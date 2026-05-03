@@ -156,32 +156,33 @@ fn resolve_database_url(profile: &str) -> Option<String> {
 }
 
 fn resolve_database_url_from_toml(profile: &str, config_path: &Path) -> Option<String> {
-    if config_path.exists()
-        && let Ok(contents) = std::fs::read_to_string(config_path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
-    {
-        let value = toml::Value::Table(table);
+    if config_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(config_path) {
+            if let Ok(table) = toml::from_str::<toml::Table>(&contents) {
+                let value = toml::Value::Table(table);
 
-        // Profile-specific override: [profile.<name>.database.url]
-        if let Some(url) = value
-            .get("profile")
-            .and_then(|p| p.get(profile))
-            .and_then(|p| p.get("database"))
-            .and_then(|db| db.get("url"))
-            .and_then(|u| u.as_str())
-            .filter(|u| !u.is_empty())
-        {
-            return Some(url.to_string());
-        }
+                // Profile-specific override: [profile.<name>.database.url]
+                if let Some(url) = value
+                    .get("profile")
+                    .and_then(|p| p.get(profile))
+                    .and_then(|p| p.get("database"))
+                    .and_then(|db| db.get("url"))
+                    .and_then(|u| u.as_str())
+                    .filter(|u| !u.is_empty())
+                {
+                    return Some(url.to_string());
+                }
 
-        // Top-level fallback: [database.url]
-        if let Some(url) = value
-            .get("database")
-            .and_then(|db: &toml::Value| db.get("url"))
-            .and_then(|u: &toml::Value| u.as_str())
-            .filter(|u| !u.is_empty())
-        {
-            return Some(url.to_string());
+                // Top-level fallback: [database.url]
+                if let Some(url) = value
+                    .get("database")
+                    .and_then(|db: &toml::Value| db.get("url"))
+                    .and_then(|u: &toml::Value| u.as_str())
+                    .filter(|u| !u.is_empty())
+                {
+                    return Some(url.to_string());
+                }
+            }
         }
     }
 

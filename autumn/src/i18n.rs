@@ -676,10 +676,10 @@ pub const LOCALE_SESSION_KEY: &str = "autumn_locale";
 fn resolve_query_override(parts: &Parts, supported: &[String]) -> Option<String> {
     let query = parts.uri.query()?;
     for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("locale=")
-            && let Some(matched) = negotiate(value, supported)
-        {
-            return Some(matched.to_owned());
+        if let Some(value) = pair.strip_prefix("locale=") {
+            if let Some(matched) = negotiate(value, supported) {
+                return Some(matched.to_owned());
+            }
         }
     }
     None
@@ -702,10 +702,10 @@ fn resolve_from_plain_cookie(parts: &Parts, supported: &[String]) -> Option<Stri
         .and_then(|h| h.to_str().ok())?;
     for cookie in cookie_header.split(';') {
         let cookie = cookie.trim();
-        if let Some(value) = cookie.strip_prefix("autumn_locale=")
-            && let Some(matched) = negotiate(value, supported)
-        {
-            return Some(matched.to_owned());
+        if let Some(value) = cookie.strip_prefix("autumn_locale=") {
+            if let Some(matched) = negotiate(value, supported) {
+                return Some(matched.to_owned());
+            }
         }
     }
     None
