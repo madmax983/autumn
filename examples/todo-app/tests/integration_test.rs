@@ -163,3 +163,106 @@ async fn create_todo_round_trip() {
             assert_eq!(todos[0]["title"], "Learn Autumn testing");
         });
 }
+
+// ── Factory tests ─────────────────────────────────────────────────────────────
+//
+// Uses `#[autumn_web::model]` to exercise the generated factory builder.
+// Unique table name (`factory_todo_items`) avoids conflicts with the `todos`
+// table used above. In-memory tests run without Docker; DB tests are ignored.
+
+mod factory_tests {
+    use autumn_web::prelude::*;
+
+    autumn_web::reexports::diesel::table! {
+        factory_todo_items (id) {
+            id -> Int8,
+            title -> Text,
+            completed -> Bool,
+            priority -> Int4,
+        }
+    }
+
+    #[autumn_web::model(table = "factory_todo_items")]
+    pub struct FactoryTodoItem {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        pub completed: bool,
+        pub priority: i32,
+    }
+
+    // ── In-memory tests (no Docker needed) ───────────────────────────────────
+
+    #[test]
+    fn factory_build_defaults_all_fields() {
+        let t = FactoryTodoItem::factory().build();
+        assert_eq!(t.title, "");
+        assert!(!t.completed);
+        assert_eq!(t.priority, 0);
+    }
+
+    #[test]
+    fn factory_build_override_title() {
+        let t = FactoryTodoItem::factory().title("Buy groceries").build();
+        assert_eq!(t.title, "Buy groceries");
+        assert_eq!(t.priority, 0); // untouched
+    }
+
+    #[test]
+    fn factory_build_all_fields() {
+        let t = FactoryTodoItem::factory()
+            .title("Ship feature")
+            .completed(true)
+            .priority(1)
+            .build();
+        assert_eq!(t.title, "Ship feature");
+        assert!(t.completed);
+        assert_eq!(t.priority, 1);
+    }
+
+    #[test]
+    fn factory_builds_are_independent() {
+        let a = FactoryTodoItem::factory().title("First").build();
+        let b = FactoryTodoItem::factory().title("Second").build();
+        assert_eq!(a.title, "First");
+        assert_eq!(b.title, "Second");
+    }
+
+    #[test]
+    fn factory_build_returns_insertable_type() {
+        let _: NewFactoryTodoItem = FactoryTodoItem::factory().build();
+    }
+
+    // ── DB test (requires Docker) ─────────────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn factory_create_persists_todo_item() {
+        use autumn_web::test::TestDb;
+        use autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        let db = TestDb::shared().await;
+        db.execute_sql(
+            "CREATE TABLE IF NOT EXISTS factory_todo_items (
+                id        BIGSERIAL PRIMARY KEY,
+                title     TEXT NOT NULL DEFAULT '',
+                completed BOOL NOT NULL DEFAULT false,
+                priority  INT  NOT NULL DEFAULT 0
+            )",
+        )
+        .await;
+        db.execute_sql("TRUNCATE factory_todo_items RESTART IDENTITY")
+            .await;
+
+        let item = FactoryTodoItem::factory()
+            .title("Learn Autumn factories")
+            .priority(2)
+            .create(&db.pool())
+            .await;
+
+        assert!(item.id > 0);
+        assert_eq!(item.title, "Learn Autumn factories");
+        assert_eq!(item.priority, 2);
+        assert!(!item.completed);
+    }
+}

@@ -189,3 +189,146 @@ mod factory_tests {
         assert_eq!(_item_for_user_42.score, 42);
     }
 }
+
+// ── Factory composition tests ────────────────────────────────────────────────
+
+#[cfg(all(feature = "db", feature = "test-support"))]
+mod composition_tests {
+    use diesel_async::RunQueryDsl;
+
+    // ── Schema ──────────────────────────────────────────────────
+    diesel::table! {
+        comp_users (id) {
+            id -> Int8,
+            name -> Text,
+        }
+    }
+
+    diesel::table! {
+        comp_posts (id) {
+            id -> Int8,
+            title -> Text,
+            user_id -> Int8,
+        }
+    }
+
+    // ── Models with factory_assoc ────────────────────────────────
+
+    #[autumn_web::model(table = "comp_users")]
+    pub struct CompUser {
+        #[id]
+        pub id: i64,
+        pub name: String,
+    }
+
+    #[autumn_web::model(table = "comp_posts")]
+    pub struct CompPost {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        #[factory_assoc(CompUser)]
+        pub user_id: i64,
+    }
+
+    // ── In-memory tests ─────────────────────────────────────────
+
+    #[test]
+    fn assoc_field_defaults_to_zero_in_build() {
+        let p = CompPost::factory().build();
+        assert_eq!(p.user_id, 0); // None => unwrap_or_default()
+    }
+
+    #[test]
+    fn assoc_field_explicit_id_setter() {
+        let p = CompPost::factory().user_id(99_i64).build();
+        assert_eq!(p.user_id, 99);
+    }
+
+    #[test]
+    fn assoc_field_pre_built_instance_setter() {
+        let user = CompUser { id: 42, name: "Alice".into() };
+        let p = CompPost::factory().user(&user).build();
+        assert_eq!(p.user_id, 42);
+        // user is still usable after calling .user(&user)
+        assert_eq!(user.id, 42);
+    }
+
+    // ── DB tests (Docker required) ───────────────────────────────
+
+    async fn setup(pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>) {
+        let mut conn = pool.get().await.unwrap();
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS comp_users (
+                id   BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT ''
+            )",
+        ).execute(&mut *conn).await.unwrap();
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS comp_posts (
+                id      BIGSERIAL PRIMARY KEY,
+                title   TEXT NOT NULL DEFAULT '',
+                user_id BIGINT NOT NULL DEFAULT 0
+            )",
+        ).execute(&mut *conn).await.unwrap();
+        diesel::sql_query("TRUNCATE comp_posts, comp_users RESTART IDENTITY CASCADE")
+            .execute(&mut *conn).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn factory_auto_creates_associated_model() {
+        let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
+        setup(&db.pool()).await;
+
+        // No user_id override — factory should auto-create a CompUser
+        let post = CompPost::factory()
+            .title("Auto-composed post")
+            .create(&db.pool())
+            .await;
+
+        assert!(post.id > 0);
+        assert!(post.user_id > 0, "factory should have auto-created a user");
+        assert_eq!(post.title, "Auto-composed post");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn factory_uses_pre_built_user_when_supplied() {
+        let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
+        setup(&db.pool()).await;
+
+        // Create a specific user first
+        let user = CompUser::factory()
+            .name("Alice")
+            .create(&db.pool())
+            .await;
+
+        // Pass the pre-built user so no extra user is created
+        let post = CompPost::factory()
+            .title("Alice's post")
+            .user(&user)
+            .create(&db.pool())
+            .await;
+
+        assert_eq!(post.user_id, user.id);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn factory_explicit_user_id_skips_auto_create() {
+        let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
+        setup(&db.pool()).await;
+
+        // Create a real user to get a valid FK
+        let user = CompUser::factory().name("Bob").create(&db.pool()).await;
+
+        // Supply id directly — no auto-creation of another user
+        let post = CompPost::factory()
+            .title("Bob's post")
+            .user_id(user.id)
+            .create(&db.pool())
+            .await;
+
+        assert_eq!(post.user_id, user.id);
+    }
+}

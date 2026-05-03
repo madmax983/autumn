@@ -188,3 +188,107 @@ async fn create_post_round_trip() {
             assert_eq!(posts[0]["title"], "Hello from Autumn tests");
         });
 }
+
+// ── Factory tests ─────────────────────────────────────────────────────────────
+//
+// Uses `#[autumn_web::model]` to exercise the generated factory builder.
+// Unique table name (`blog_factory_posts`) avoids conflicts with the `posts`
+// table used above. In-memory tests run without Docker; DB tests are ignored.
+
+mod factory_tests {
+    use autumn_web::prelude::*;
+
+    autumn_web::reexports::diesel::table! {
+        blog_factory_posts (id) {
+            id -> Int8,
+            title -> Text,
+            slug -> Text,
+            published -> Bool,
+        }
+    }
+
+    #[autumn_web::model(table = "blog_factory_posts")]
+    pub struct BlogFactoryPost {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        pub slug: String,
+        pub published: bool,
+    }
+
+    // ── In-memory tests (no Docker needed) ───────────────────────────────────
+
+    #[test]
+    fn factory_build_defaults_all_fields() {
+        let p = BlogFactoryPost::factory().build();
+        assert_eq!(p.title, "");
+        assert_eq!(p.slug, "");
+        assert!(!p.published);
+    }
+
+    #[test]
+    fn factory_build_override_title() {
+        let p = BlogFactoryPost::factory().title("Hello Autumn").build();
+        assert_eq!(p.title, "Hello Autumn");
+        assert_eq!(p.slug, ""); // untouched
+    }
+
+    #[test]
+    fn factory_build_all_fields() {
+        let p = BlogFactoryPost::factory()
+            .title("All set")
+            .slug("all-set")
+            .published(true)
+            .build();
+        assert_eq!(p.title, "All set");
+        assert_eq!(p.slug, "all-set");
+        assert!(p.published);
+    }
+
+    #[test]
+    fn factory_builds_are_independent() {
+        let a = BlogFactoryPost::factory().title("Alpha").build();
+        let b = BlogFactoryPost::factory().title("Beta").build();
+        assert_eq!(a.title, "Alpha");
+        assert_eq!(b.title, "Beta");
+    }
+
+    #[test]
+    fn factory_build_returns_insertable_type() {
+        let _: NewBlogFactoryPost = BlogFactoryPost::factory().build();
+    }
+
+    // ── DB test (requires Docker) ─────────────────────────────────────────────
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn factory_create_persists_blog_post() {
+        use autumn_web::test::TestDb;
+        use autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        let db = TestDb::shared().await;
+        db.execute_sql(
+            "CREATE TABLE IF NOT EXISTS blog_factory_posts (
+                id        BIGSERIAL PRIMARY KEY,
+                title     TEXT NOT NULL DEFAULT '',
+                slug      TEXT NOT NULL DEFAULT '',
+                published BOOL NOT NULL DEFAULT false
+            )",
+        )
+        .await;
+        db.execute_sql("TRUNCATE blog_factory_posts RESTART IDENTITY")
+            .await;
+
+        let post = BlogFactoryPost::factory()
+            .title("Factory post")
+            .slug("factory-post")
+            .published(true)
+            .create(&db.pool())
+            .await;
+
+        assert!(post.id > 0);
+        assert_eq!(post.title, "Factory post");
+        assert_eq!(post.slug, "factory-post");
+        assert!(post.published);
+    }
+}
