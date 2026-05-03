@@ -525,7 +525,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // leaving the data behind.
         let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy_create::<#model_name>(
+                ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
                     &__autumn_new_payload,

@@ -666,13 +666,32 @@ where
 /// `#[repository(policy = ...)]`-generated `POST` endpoint.
 ///
 /// Resolves the registered [`Policy`] for `R` and calls
-/// [`Policy::can_create_payload`] *before* the row is persisted,
-/// closing the "deny still wrote a row" hole that catches naive
-/// after-the-fact policy checks. Use [`authorize_create_payload`]
-/// from user code when payload-aware checks are needed; this is the
-/// framework's `__`-prefixed alias.
+/// [`Policy::can_create`] *before* the row is persisted, closing
+/// the "deny still wrote a row" hole that catches naive
+/// after-the-fact policy checks. Use [`authorize_create`] from user
+/// code; this is the framework's backward-compatible `__`-prefixed
+/// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
+    state: &crate::AppState,
+    session: &Session,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    authorize_create::<R>(state, session).await
+}
+
+/// Payload-aware pre-insert authorization helper for
+/// `#[repository(policy = ...)]`-generated `POST` endpoints.
+///
+/// Newer macro output uses this helper when it has the raw JSON
+/// request payload available. The two-argument
+/// [`__check_policy_create`] alias is kept so applications compiled
+/// with older `autumn-macros` output remain source-compatible when
+/// only `autumn-web` is upgraded.
+#[doc(hidden)]
+pub async fn __check_policy_create_payload<R>(
     state: &crate::AppState,
     session: &Session,
     payload: &serde_json::Value,
@@ -1162,6 +1181,62 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_alias_preserves_two_arg_shape() {
+        struct AuthOnlyCreatePolicy;
+        impl Policy<Note> for AuthOnlyCreatePolicy {
+            fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.is_authenticated() })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AuthOnlyCreatePolicy);
+
+        let anon = session_with(None, None);
+        let err = __check_policy_create::<Note>(&state, &anon)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        let user = session_with(Some("1"), None);
+        __check_policy_create::<Note>(&state, &user)
+            .await
+            .expect("old generated create policy alias remains compatible");
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_alias_dispatches_payload() {
+        struct OwnerPayloadPolicy;
+        impl Policy<Note> for OwnerPayloadPolicy {
+            fn can_create_payload<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                payload: &'a serde_json::Value,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    payload.get("author_id").and_then(serde_json::Value::as_i64)
+                        == ctx.user_id_i64()
+                })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(OwnerPayloadPolicy);
+
+        let user = session_with(Some("1"), None);
+        let payload = serde_json::json!({"author_id": 1});
+        __check_policy_create_payload::<Note>(&state, &user, &payload)
+            .await
+            .expect("new generated create policy alias passes payload");
     }
 
     #[tokio::test]
