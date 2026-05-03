@@ -1,3 +1,4 @@
+#![deny(unsafe_code)]
 //! # Autumn
 //!
 //! An opinionated, convention-over-configuration web framework for Rust.
