@@ -8,9 +8,9 @@
 #[cfg(all(feature = "db", feature = "test-support"))]
 mod factory_tests {
     use diesel::prelude::*;
+    use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
-    use diesel_async::AsyncPgConnection;
 
     // ── Schema ─────────────────────────────────────────────────
     diesel::table! {
@@ -148,7 +148,10 @@ mod factory_tests {
         let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
         setup_table(&db.pool()).await;
 
-        let created = FactoryItem::factory().name("QueryMe").create(&db.pool()).await;
+        let created = FactoryItem::factory()
+            .name("QueryMe")
+            .create(&db.pool())
+            .await;
 
         // Verify we can query it back
         let mut conn = db.pool().get().await.unwrap();
@@ -169,8 +172,16 @@ mod factory_tests {
         let db: &autumn_web::test::TestDb = autumn_web::test::TestDb::shared().await;
         setup_table(&db.pool()).await;
 
-        let a = FactoryItem::factory().name("Alpha").score(1).create(&db.pool()).await;
-        let b = FactoryItem::factory().name("Beta").score(2).create(&db.pool()).await;
+        let a = FactoryItem::factory()
+            .name("Alpha")
+            .score(1)
+            .create(&db.pool())
+            .await;
+        let b = FactoryItem::factory()
+            .name("Beta")
+            .score(2)
+            .create(&db.pool())
+            .await;
 
         assert_ne!(a.id, b.id, "each create() should produce a distinct record");
         assert_eq!(a.name, "Alpha");
@@ -246,7 +257,10 @@ mod composition_tests {
 
     #[test]
     fn assoc_field_pre_built_instance_setter() {
-        let user = CompUser { id: 42, name: "Alice".into() };
+        let user = CompUser {
+            id: 42,
+            name: "Alice".into(),
+        };
         let p = CompPost::factory().user(&user).build();
         assert_eq!(p.user_id, 42);
         // user is still usable after calling .user(&user)
@@ -255,23 +269,33 @@ mod composition_tests {
 
     // ── DB tests (Docker required) ───────────────────────────────
 
-    async fn setup(pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>) {
+    async fn setup(
+        pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    ) {
         let mut conn = pool.get().await.unwrap();
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS comp_users (
                 id   BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL DEFAULT ''
             )",
-        ).execute(&mut *conn).await.unwrap();
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS comp_posts (
                 id      BIGSERIAL PRIMARY KEY,
                 title   TEXT NOT NULL DEFAULT '',
                 user_id BIGINT NOT NULL DEFAULT 0
             )",
-        ).execute(&mut *conn).await.unwrap();
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
         diesel::sql_query("TRUNCATE comp_posts, comp_users RESTART IDENTITY CASCADE")
-            .execute(&mut *conn).await.unwrap();
+            .execute(&mut *conn)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -298,10 +322,7 @@ mod composition_tests {
         setup(&db.pool()).await;
 
         // Create a specific user first
-        let user = CompUser::factory()
-            .name("Alice")
-            .create(&db.pool())
-            .await;
+        let user = CompUser::factory().name("Alice").create(&db.pool()).await;
 
         // Pass the pre-built user so no extra user is created
         let post = CompPost::factory()

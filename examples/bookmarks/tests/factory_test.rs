@@ -10,8 +10,8 @@
 //! cargo test -p bookmarks -- --include-ignored                 # DB tests (needs Docker)
 //! ```
 
-use autumn_web::test::TestApp;
 use autumn_web::prelude::*;
+use autumn_web::test::TestApp;
 
 // ── Inline schema (mirrors src/schema.rs) ─────────────────────────────────────
 
@@ -56,9 +56,7 @@ fn bookmark_factory_zero_args() {
 
 #[test]
 fn bookmark_factory_override_url() {
-    let draft = Bookmark::factory()
-        .url("https://rust-lang.org")
-        .build();
+    let draft = Bookmark::factory().url("https://rust-lang.org").build();
     assert_eq!(draft.url, "https://rust-lang.org");
     assert_eq!(draft.title, ""); // untouched
 }
@@ -122,8 +120,7 @@ async fn bookmark_factory_create_persists() {
         )",
     )
     .await;
-    db.execute_sql("TRUNCATE bookmarks RESTART IDENTITY")
-        .await;
+    db.execute_sql("TRUNCATE bookmarks RESTART IDENTITY").await;
 
     let bm = Bookmark::factory()
         .url("https://crates.io")
@@ -163,8 +160,7 @@ async fn bookmark_factory_route_roundtrip() {
         )",
     )
     .await;
-    db.execute_sql("TRUNCATE bookmarks RESTART IDENTITY")
-        .await;
+    db.execute_sql("TRUNCATE bookmarks RESTART IDENTITY").await;
 
     // Factory-based seeding: intent-only, no struct-literal boilerplate.
     let rust_bm = Bookmark::factory()
@@ -216,10 +212,7 @@ async fn bookmark_factory_route_roundtrip() {
         .assert_ok()
         .assert_json::<Vec<serde_json::Value>, _>(|items| {
             assert_eq!(items.len(), 2);
-            let titles: Vec<&str> = items
-                .iter()
-                .map(|b| b["title"].as_str().unwrap())
-                .collect();
+            let titles: Vec<&str> = items.iter().map(|b| b["title"].as_str().unwrap()).collect();
             assert!(titles.contains(&"The Rust Programming Language"));
             assert!(titles.contains(&"docs.rs"));
         });

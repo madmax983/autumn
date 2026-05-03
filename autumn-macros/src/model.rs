@@ -75,7 +75,9 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// `validate_factory_assoc_attrs` first to surface a proper compile error.
 fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
     for attr in &field.attrs {
-        if attr.path().is_ident("factory_assoc") && let Ok(ident) = attr.parse_args::<syn::Ident>() {
+        if attr.path().is_ident("factory_assoc")
+            && let Ok(ident) = attr.parse_args::<syn::Ident>()
+        {
             return Some(ident);
         }
     }
@@ -89,7 +91,9 @@ fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
 fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     for field in fields {
         for attr in &field.attrs {
-            if attr.path().is_ident("factory_assoc") && let Err(err) = attr.parse_args::<syn::Ident>() {
+            if attr.path().is_ident("factory_assoc")
+                && let Err(err) = attr.parse_args::<syn::Ident>()
+            {
                 return Some(err.to_compile_error());
             }
         }
@@ -412,13 +416,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             factory_assoc_type(f).map_or_else(
                 // Normal field: a single setter that assigns directly.
-                || vec![quote! {
-                    #[must_use]
-                    pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
-                        self.#ident = val.into();
-                        self
-                    }
-                }],
+                || {
+                    vec![quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = val.into();
+                            self
+                        }
+                    }]
+                },
                 // Assoc field: two setters — explicit id and pre-built instance.
                 |assoc_type| {
                     let explicit_setter = quote! {
