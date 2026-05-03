@@ -116,6 +116,7 @@ pub struct Db {
     /// [`tracing::Instrument::instrument`].
     span: tracing::Span,
     tx_depth: usize,
+    tx_poisoned: bool,
 }
 
 impl Db {
@@ -146,48 +147,77 @@ impl Db {
     ///
     /// Commits when the closure returns `Ok(_)`, rolls back when it returns
     /// `Err(_)`.
-    pub async fn tx<T, E, F>(&mut self, f: F) -> Result<T, crate::error::AutumnError>
+    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
-        E: From<diesel::result::Error> + std::error::Error + Send + Sync + 'static,
+        T: Send + 'a,
+        E: From<diesel::result::Error> + std::error::Error + Send + Sync + 'a,
         crate::error::AutumnError: From<E>,
-        F: for<'a> FnOnce(
-                &'a mut AsyncPgConnection,
-            ) -> scoped_futures::ScopedBoxFuture<'a, 'a, Result<T, E>>
-            + Send,
+        F: for<'r> FnOnce(
+                &'r mut PooledConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
     {
         use diesel_async::AsyncConnection as _;
 
+        if self.tx_poisoned {
+            return Err(crate::error::AutumnError::service_unavailable_msg(
+                "Database connection is in an invalid transaction state",
+            ));
+        }
         if self.tx_depth > 0 {
             return Err(crate::error::AutumnError::bad_request_msg(
                 "Nested Db::tx calls are not supported",
             ));
         }
-        struct TxDepthGuard<'a>(&'a mut usize);
+        struct TxDepthGuard<'a> {
+            depth: &'a mut usize,
+            poisoned: &'a mut bool,
+            disarmed: bool,
+        }
         impl Drop for TxDepthGuard<'_> {
             fn drop(&mut self) {
-                *self.0 -= 1;
+                *self.depth -= 1;
+                if !self.disarmed {
+                    *self.poisoned = true;
+                }
             }
         }
 
         self.tx_depth += 1;
-        let _guard = TxDepthGuard(&mut self.tx_depth);
+        let mut guard = TxDepthGuard {
+            depth: &mut self.tx_depth,
+            poisoned: &mut self.tx_poisoned,
+            disarmed: false,
+        };
 
-        self.conn
+        let result = self
+            .conn
             .transaction::<T, E, _>(f)
             .await
-            .map_err(Into::into)
+            .map_err(Into::into);
+        guard.disarmed = true;
+        result
     }
 }
 
 impl std::ops::Deref for Db {
     type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
+        assert!(
+            !self.tx_poisoned,
+            "Db connection is poisoned due to a cancelled/dropped transaction"
+        );
         &self.conn
     }
 }
 
 impl std::ops::DerefMut for Db {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        assert!(
+            !self.tx_poisoned,
+            "Db connection is poisoned due to a cancelled/dropped transaction"
+        );
         &mut self.conn
     }
 }
@@ -230,6 +260,7 @@ where
             conn,
             span,
             tx_depth: 0,
+            tx_poisoned: false,
         })
     }
 }
