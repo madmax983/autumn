@@ -375,6 +375,7 @@ fn check_port_bindable(port: u16) -> CheckResult {
 ///
 /// `exists` and `can_run` are separate so that `can_run` is never invoked when
 /// the file is absent — avoiding a spurious "permission denied" OS error.
+#[cfg(test)]
 pub fn check_tailwind_binary_impl(
     path: &std::path::Path,
     exists: impl Fn(&std::path::Path) -> bool,
@@ -411,11 +412,25 @@ fn check_tailwind_binary() -> CheckResult {
     } else {
         std::path::PathBuf::from("target/autumn/tailwindcss")
     };
-    check_tailwind_binary_impl(&path, std::path::Path::exists, |p| {
-        // Try to invoke the binary; Ok(_) means the OS could execute it
-        // regardless of exit code (--help may return 0 or 1 depending on version).
-        std::process::Command::new(p).arg("--help").output().is_ok()
-    })
+
+    if !path.exists() {
+        return CheckResult {
+            name: "tailwind_binary",
+            status: CheckStatus::Fail,
+            detail: Some(format!("{} not found", path.display())),
+            hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+        };
+    }
+
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(format!(
+            "{} is present (execution skipped for safety)",
+            path.display()
+        )),
+        hint: None,
+    }
 }
 
 fn check_stale_artifacts() -> CheckResult {
