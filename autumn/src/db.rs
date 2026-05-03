@@ -175,7 +175,7 @@ impl Db {
     pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
         T: Send + 'a,
-        E: From<diesel::result::Error> + std::error::Error + Send + Sync + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
         crate::error::AutumnError: From<E>,
         F: for<'r> FnOnce(
                 &'r mut PooledConnection,

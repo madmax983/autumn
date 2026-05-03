@@ -357,7 +357,7 @@ pub async fn submit(
             enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
                 .await?;
 
-            Ok(())
+            Ok::<_, AutumnError>(())
         }
         .scope_boxed()
     })

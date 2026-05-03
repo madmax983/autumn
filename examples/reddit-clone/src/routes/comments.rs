@@ -99,7 +99,7 @@ pub async fn create(
                 let event_id =
                     store_activity_event_for_state(&state, conn, &sub_slug, &event).await?;
 
-                Ok(event_id)
+                Ok::<_, AutumnError>(event_id)
             }
             .scope_boxed()
         })

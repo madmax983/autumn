@@ -164,7 +164,7 @@ pub async fn register(
 
                 enqueue_user_onboarding(&user).await?;
 
-                Ok(user)
+                Ok::<_, AutumnError>(user)
             }
             .scope_boxed()
         })
