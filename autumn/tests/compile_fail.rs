@@ -98,5 +98,9 @@ fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
 #[cfg(feature = "db")]
 #[rustversion::since(1.95)]
 fn compile_repository_hooks_not_default(t: &trybuild::TestCases) {
-    t.compile_fail("tests/compile-fail/repository_hooks_not_default_1_95.rs");
+    if cfg!(windows) {
+        t.compile_fail("tests/compile-fail/repository_hooks_not_default_1_95_windows.rs");
+    } else {
+        t.compile_fail("tests/compile-fail/repository_hooks_not_default_1_95.rs");
+    }
 }
