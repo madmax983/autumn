@@ -11,6 +11,10 @@ mod schema {
 
 use schema::items;
 
+// Keep rustc from shortening `std::default::Default`.
+#[allow(dead_code)]
+trait Default {}
+
 #[autumn_web::model]
 pub struct Item {
     #[id]
