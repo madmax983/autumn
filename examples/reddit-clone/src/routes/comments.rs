@@ -8,7 +8,6 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
@@ -56,8 +55,8 @@ pub async fn create(
     let body_for_insert = body.clone();
     let author_username_for_event = author_username.clone();
     let state_for_event = state.clone();
-    let event_id = (*db)
-        .transaction::<i64, AutumnError, _>(|conn| {
+    let event_id = db
+        .tx(|conn| {
             let sub_slug = sub_slug_for_event.clone();
             let post_slug = post_slug_for_event.clone();
             let body = body_for_insert.clone();
@@ -100,7 +99,7 @@ pub async fn create(
                 let event_id =
                     store_activity_event_for_state(&state, conn, &sub_slug, &event).await?;
 
-                Ok(event_id)
+                Ok::<_, AutumnError>(event_id)
             }
             .scope_boxed()
         })

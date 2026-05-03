@@ -8,7 +8,6 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
@@ -153,8 +152,8 @@ pub async fn register(
         password_hash: hashed,
     };
 
-    let user = (*db)
-        .transaction::<User, AutumnError, _>(move |conn| {
+    let user = db
+        .tx(move |conn| {
             async move {
                 let user: User = diesel::insert_into(users::table)
                     .values(&new_user)
@@ -165,7 +164,7 @@ pub async fn register(
 
                 enqueue_user_onboarding(&user).await?;
 
-                Ok(user)
+                Ok::<_, AutumnError>(user)
             }
             .scope_boxed()
         })

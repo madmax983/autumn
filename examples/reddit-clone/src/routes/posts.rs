@@ -8,7 +8,6 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
@@ -330,40 +329,39 @@ pub async fn submit(
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    (*db)
-        .transaction::<(), AutumnError, _>(move |conn| {
-            async move {
-                let post_id: i64 = diesel::insert_into(posts::table)
-                    .values((
-                        posts::title.eq(&title),
-                        posts::slug.eq(&slug),
-                        posts::body.eq(&body),
-                        posts::url.eq(&url),
-                        posts::author_id.eq(user_id),
-                        posts::subreddit_id.eq(subreddit_id),
-                        posts::score.eq(1_i64),
-                    ))
-                    .returning(posts::id)
-                    .get_result(conn)
-                    .await?;
+    db.tx(move |conn| {
+        async move {
+            let post_id: i64 = diesel::insert_into(posts::table)
+                .values((
+                    posts::title.eq(&title),
+                    posts::slug.eq(&slug),
+                    posts::body.eq(&body),
+                    posts::url.eq(&url),
+                    posts::author_id.eq(user_id),
+                    posts::subreddit_id.eq(subreddit_id),
+                    posts::score.eq(1_i64),
+                ))
+                .returning(posts::id)
+                .get_result(conn)
+                .await?;
 
-                diesel::insert_into(crate::schema::votes::table)
-                    .values((
-                        crate::schema::votes::user_id.eq(user_id),
-                        crate::schema::votes::post_id.eq(post_id),
-                        crate::schema::votes::value.eq(1_i16),
-                    ))
-                    .execute(conn)
-                    .await?;
+            diesel::insert_into(crate::schema::votes::table)
+                .values((
+                    crate::schema::votes::user_id.eq(user_id),
+                    crate::schema::votes::post_id.eq(post_id),
+                    crate::schema::votes::value.eq(1_i16),
+                ))
+                .execute(conn)
+                .await?;
 
-                enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
-                    .await?;
+            enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
+                .await?;
 
-                Ok(())
-            }
-            .scope_boxed()
-        })
-        .await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
 
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
         &sub.slug,
