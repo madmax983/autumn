@@ -80,6 +80,10 @@ Call `AccountMailer.send_reset_password(&mailer, to, token).await` for an
 immediate send. Call `deliver_later_reset_password` when the request should not
 wait on SMTP.
 
+If the route also persists DB state (for example, writing an outbox row plus
+creating a user), wrap the DB side in [`Db::tx`](transactions.md) so your write
+sequence is atomic.
+
 ## Transports
 
 - `log`: writes headers and full bodies to tracing at INFO. Default for `dev`.
@@ -100,3 +104,5 @@ build a `Mailer::with_transport(...)`.
 - Assert file-transport `.eml` contents in integration tests.
 - Prefer a Harvest-backed queue for durable `deliver_later` retries. Without
   Harvest, Autumn falls back to an in-process Tokio task and logs failures.
+- For DB-write + mail-orchestration flows, use the [Transactions
+  Guide](transactions.md) for the canonical atomic write pattern.

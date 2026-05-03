@@ -115,6 +115,7 @@ pub struct Db {
     /// per-query spans as children with
     /// [`tracing::Instrument::instrument`].
     span: tracing::Span,
+    tx_depth: usize,
 }
 
 impl Db {
@@ -139,6 +140,35 @@ impl Db {
     #[must_use]
     pub const fn span(&self) -> &tracing::Span {
         &self.span
+    }
+
+    /// Run an async closure inside a database transaction.
+    ///
+    /// Commits when the closure returns `Ok(_)`, rolls back when it returns
+    /// `Err(_)`.
+    pub async fn tx<T, E, F>(&mut self, f: F) -> Result<T, crate::error::AutumnError>
+    where
+        E: std::error::Error + Send + Sync + 'static,
+        crate::error::AutumnError: From<E>,
+        F: for<'a> FnOnce(
+            &'a mut AsyncPgConnection,
+        ) -> scoped_futures::ScopedBoxFuture<'a, 'a, Result<T, E>>,
+    {
+        use diesel_async::AsyncConnection as _;
+
+        if self.tx_depth > 0 {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                "Nested Db::tx calls are not supported",
+            ));
+        }
+        self.tx_depth += 1;
+        let result = self
+            .conn
+            .transaction::<T, E, _>(f)
+            .await
+            .map_err(Into::into);
+        self.tx_depth -= 1;
+        result
     }
 }
 
@@ -189,7 +219,11 @@ where
         .instrument(span.clone())
         .await?;
 
-        Ok(Self { conn, span })
+        Ok(Self {
+            conn,
+            span,
+            tx_depth: 0,
+        })
     }
 }
 

@@ -151,6 +151,10 @@ your app already uses Harvest. Without that, `deliver_later` falls back to an
 in-process Tokio task, which is fine for local development and small single
 process deployments but not a durable queue.
 
+When email dispatch is coordinated with DB writes, use
+[`Db::tx`](transactions.md) for the database side so the write set commits or
+rolls back atomically.
+
 ## Background Work
 
 Use `#[scheduled]` when:
