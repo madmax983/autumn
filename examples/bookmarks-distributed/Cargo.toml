@@ -23,6 +23,3 @@ validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 autumn-web = { path = "../../autumn", features = ["test-support"] }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("test-support"))'] }

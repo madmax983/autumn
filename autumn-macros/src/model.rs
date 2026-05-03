@@ -593,7 +593,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// to skip the extra insert.
             ///
             /// Panics if the insert fails or if a cyclic association chain is detected
-            /// (depth > 32). Intended for use in tests only.
+            /// (depth > 32).
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
@@ -619,7 +619,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Insert a record built from this factory into the database and return
             /// the fully-populated model (with server-assigned primary key).
             ///
-            /// Panics if the insert fails. Intended for use in tests only.
+            /// Panics if the insert fails.
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
@@ -704,29 +704,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#draft_accessors)*
         }
 
-        // Factory builder — gated on `cfg(any(test, feature = "test-support"))`.
-        //
-        // `#[allow(unexpected_cfgs)]` is emitted on every gated item so that
-        // downstream crates (e.g. examples) that don't declare `test-support`
-        // in their own Cargo.toml don't trigger the `unexpected_cfgs` lint.
-        // `cfg(test)` covers inline models defined inside test files; the
-        // feature gate covers models in `src/` that need their factory visible
-        // from an integration-test crate that enables `test-support`.
-
-        /// Test-data factory builder for [`#name`].
+        /// Factory builder for [`#name`].
         ///
         /// Produced by [`#name::factory()`]. All fields are pre-filled with
-        /// `Default::default()` so tests only need to specify the fields that
-        /// matter for the scenario under test.
-        #[allow(unexpected_cfgs)]
-        #[cfg(any(test, feature = "test-support"))]
+        /// `Default::default()` so callers only need to specify the fields that
+        /// matter for their scenario.
         #[derive(Debug, Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
         }
 
-        #[allow(unexpected_cfgs)]
-        #[cfg(any(test, feature = "test-support"))]
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
                 Self {
@@ -735,8 +722,6 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        #[allow(unexpected_cfgs)]
-        #[cfg(any(test, feature = "test-support"))]
         impl #factory_name {
             #(#factory_setters)*
 
@@ -754,10 +739,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #factory_create_method
         }
 
-        #[allow(unexpected_cfgs)]
-        #[cfg(any(test, feature = "test-support"))]
         impl #name {
-            /// Create a factory builder for constructing [`#name`] instances in tests.
+            /// Create a factory builder for constructing [`#name`] instances.
             ///
             /// Returns a [`#factory_name`] with all fields at their [`Default`]
             /// value. Override any subset with the fluent setter methods, then call

@@ -5,7 +5,7 @@
 //! - accepts per-field overrides without touching other fields
 //! - persists through the pool and returns the fully-populated record
 
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(feature = "db")]
 mod factory_tests {
     use diesel::prelude::*;
     use diesel_async::AsyncPgConnection;
@@ -203,7 +203,7 @@ mod factory_tests {
 
 // ── Factory composition tests ────────────────────────────────────────────────
 
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(feature = "db")]
 mod composition_tests {
     use diesel_async::RunQueryDsl;
 
