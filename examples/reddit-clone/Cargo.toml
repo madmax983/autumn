@@ -31,3 +31,6 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("test-support"))'] }

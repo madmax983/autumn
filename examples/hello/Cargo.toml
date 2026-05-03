@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("test-support"))'] }

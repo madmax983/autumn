@@ -200,6 +200,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         id_fields.iter().filter_map(|f| f.ident.as_ref()).collect()
     };
 
+    // PK field ident + type — used by the test-support factory to generate
+    // `__autumn_pk()` so association setters don't hardcode `.id`.
+    let pk_field_for_factory: Option<(&syn::Ident, &syn::Type)> = if id_fields.is_empty() {
+        all_fields
+            .iter()
+            .find(|f| {
+                if let syn::Type::Path(tp) = &f.ty {
+                    tp.path.is_ident("i32") || tp.path.is_ident("i64")
+                } else {
+                    false
+                }
+            })
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    } else {
+        id_fields
+            .first()
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    };
+
     // Fields for NewX: exclude #[id], #[default], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
@@ -382,6 +401,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // ── Factory builder ────────────────────────────────────────
     let factory_name = format_ident!("{name}Factory");
 
+    // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
+    // no PK can be detected (the factory will fail to compile at the call site,
+    // which is a better diagnostic than a macro panic).
+    let (pk_id, pk_ty): (&syn::Ident, &syn::Type) = pk_field_for_factory.unwrap_or_else(|| {
+        // Dummy values — unreachable for well-formed models, which always
+        // have at least one i32/i64 field or an explicit #[id] annotation.
+        panic!("#[model]: could not detect primary-key field for factory generation")
+    });
+
     // Whether any factory field is an association (drives depth-check generation).
     let has_assoc_fields = fields_for_new
         .iter()
@@ -459,10 +487,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
                     let pre_built_setter = quote! {
                         /// Override the association with a pre-built instance.
-                        /// Extracts `.id` so no additional DB insert is performed on `create()`.
+                        /// Extracts the primary key so no additional DB insert is performed on `create()`.
                         #[must_use]
                         pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
-                            self.#ident = ::core::option::Option::Some(val.id);
+                            self.#ident = ::core::option::Option::Some(val.__autumn_pk());
                             self
                         }
                     };
@@ -505,7 +533,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let #resolved = match self.#ident {
                     ::core::option::Option::Some(id) => id,
                     ::core::option::Option::None => {
-                        #assoc_type::factory().create(pool).await.id
+                        #assoc_type::factory().create(pool).await.__autumn_pk()
                     }
                 };
             })
@@ -676,32 +704,29 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#draft_accessors)*
         }
 
+        // Factory builder — gated on `cfg(any(test, feature = "test-support"))`.
+        //
+        // `#[allow(unexpected_cfgs)]` is emitted on every gated item so that
+        // downstream crates (e.g. examples) that don't declare `test-support`
+        // in their own Cargo.toml don't trigger the `unexpected_cfgs` lint.
+        // `cfg(test)` covers inline models defined inside test files; the
+        // feature gate covers models in `src/` that need their factory visible
+        // from an integration-test crate that enables `test-support`.
+
         /// Test-data factory builder for [`#name`].
         ///
         /// Produced by [`#name::factory()`]. All fields are pre-filled with
         /// `Default::default()` so tests only need to specify the fields that
         /// matter for the scenario under test.
-        ///
-        /// # Examples
-        ///
-        /// ```rust,ignore
-        /// // Zero required args — all fields use sensible type defaults.
-        /// let record = MyModel::factory().build();
-        ///
-        /// // Override only the fields relevant to your test.
-        /// let record = MyModel::factory()
-        ///     .title("Hello")
-        ///     .published(true)
-        ///     .build();
-        ///
-        /// // Persist to the database (returns the fully-populated model with PK).
-        /// let persisted = MyModel::factory().title("Hello").create(&pool).await;
-        /// ```
+        #[allow(unexpected_cfgs)]
+        #[cfg(any(test, feature = "test-support"))]
         #[derive(Debug, Clone)]
         #vis struct #factory_name {
             #(#factory_struct_fields,)*
         }
 
+        #[allow(unexpected_cfgs)]
+        #[cfg(any(test, feature = "test-support"))]
         impl ::core::default::Default for #factory_name {
             fn default() -> Self {
                 Self {
@@ -710,6 +735,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        #[allow(unexpected_cfgs)]
+        #[cfg(any(test, feature = "test-support"))]
         impl #factory_name {
             #(#factory_setters)*
 
@@ -727,22 +754,27 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #factory_create_method
         }
 
+        #[allow(unexpected_cfgs)]
+        #[cfg(any(test, feature = "test-support"))]
         impl #name {
             /// Create a factory builder for constructing [`#name`] instances in tests.
             ///
-            /// All fields start at their [`Default`] value. Override any subset
-            /// with the fluent setter methods, then call
-            /// [`build()`](#factory_name::build) for an in-memory instance or
-            /// [`create(pool)`](#factory_name::create) to persist it.
-            ///
-            /// # Example
-            ///
-            /// ```rust,ignore
-            /// let record = MyModel::factory().title("Hello").build();
-            /// ```
+            /// Returns a [`#factory_name`] with all fields at their [`Default`]
+            /// value. Override any subset with the fluent setter methods, then call
+            /// `build()` for an in-memory instance or `create(pool)` to persist it.
             #[must_use]
             pub fn factory() -> #factory_name {
                 #factory_name::default()
+            }
+
+            /// Returns the primary-key value of this model.
+            ///
+            /// Used by generated `#[factory_assoc]` code to extract the PK from a
+            /// pre-built associated instance without hardcoding the field name.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_pk(&self) -> #pk_ty {
+                self.#pk_id
             }
         }
     }
