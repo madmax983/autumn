@@ -296,8 +296,22 @@ pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::U
         return axum::http::StatusCode::NO_CONTENT.into_response();
     }
 
-    crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
-        .into_response()
+    // For missing paths, we always return a structured 404 response.
+    // If the client requested HTML, the ErrorPageFilter middleware
+    // will automatically intercept this and render the styled 404 HTML page.
+    let mut res =
+        crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
+            .into_response();
+
+    // Ensure content length is set for the fallback JSON response.
+    if let Some(body_bytes) = axum::body::HttpBody::size_hint(res.body()).exact() {
+        res.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(body_bytes),
+        );
+    }
+
+    res
 }
 
 #[cfg(test)]

@@ -491,6 +491,11 @@ pub use autumn_macros::put;
 /// [`post`], [`put`], [`delete`]) which generates a companion
 /// `__autumn_route_info_{name}()` function.
 ///
+/// **Note on Typos**: If you misspell a route handler name in this macro, you will
+/// see two compiler errors: one indicating the missing handler name, and a second
+/// indicating that `__autumn_route_info_{missing_name}` cannot be found. This second
+/// error exposes internal generation details but is an unavoidable artifact of eager macro expansion.
+///
 /// # Examples
 ///
 /// ```rust,no_run
