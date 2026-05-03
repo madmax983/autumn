@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! # Autumn
 //!
 //! An opinionated, convention-over-configuration web framework for Rust.
