@@ -325,6 +325,81 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // ── Factory builder ────────────────────────────────────────
+    let factory_name = format_ident!("{name}Factory");
+
+    // Factory struct fields: same types as NewX fields (concrete, owned)
+    let factory_struct_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            quote! { pub #ident: #ty }
+        })
+        .collect();
+
+    // Default impl: use Default::default() for each field
+    let factory_default_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            quote! { #ident: ::core::default::Default::default() }
+        })
+        .collect();
+
+    // Per-field setter methods (consume self, return Self for chaining)
+    let factory_setters: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+            quote! {
+                #[must_use]
+                pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                    self.#ident = val.into();
+                    self
+                }
+            }
+        })
+        .collect();
+
+    // build() — assemble NewX from factory fields
+    let factory_build_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            quote! { #ident: self.#ident }
+        })
+        .collect();
+
+    // create() — insert via Diesel and return the persisted model (requires `db` feature)
+    let factory_create_method = quote! {
+        /// Insert a record built from this factory into the database and return
+        /// the fully-populated model (with server-assigned primary key).
+        ///
+        /// Panics if the insert fails. Intended for use in tests only.
+        pub async fn create(
+            self,
+            pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            >,
+        ) -> #name {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            let new_record = self.build();
+            let mut conn = pool
+                .get()
+                .await
+                .expect("factory: failed to acquire db connection");
+            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+                .values(&new_record)
+                .returning(#name::as_returning())
+                .get_result(&mut *conn)
+                .await
+                .expect("factory: insert failed")
+        }
+    };
+
     quote! {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -396,6 +471,76 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #(#draft_accessors)*
+        }
+
+        /// Test-data factory builder for [`#name`].
+        ///
+        /// Produced by [`#name::factory()`]. All fields are pre-filled with
+        /// `Default::default()` so tests only need to specify the fields that
+        /// matter for the scenario under test.
+        ///
+        /// # Examples
+        ///
+        /// ```rust,ignore
+        /// // Zero required args — all fields use sensible type defaults.
+        /// let record = MyModel::factory().build();
+        ///
+        /// // Override only the fields relevant to your test.
+        /// let record = MyModel::factory()
+        ///     .title("Hello")
+        ///     .published(true)
+        ///     .build();
+        ///
+        /// // Persist to the database (returns the fully-populated model with PK).
+        /// let persisted = MyModel::factory().title("Hello").create(&pool).await;
+        /// ```
+        #[derive(Debug, Clone)]
+        #vis struct #factory_name {
+            #(#factory_struct_fields,)*
+        }
+
+        impl ::core::default::Default for #factory_name {
+            fn default() -> Self {
+                Self {
+                    #(#factory_default_fields,)*
+                }
+            }
+        }
+
+        impl #factory_name {
+            #(#factory_setters)*
+
+            /// Build a [`#new_name`] instance from the current factory state.
+            ///
+            /// Does not touch the database. Use [`#factory_name::create`] to
+            /// also persist the record.
+            #[must_use]
+            pub fn build(self) -> #new_name {
+                #new_name {
+                    #(#factory_build_fields,)*
+                }
+            }
+
+            #factory_create_method
+        }
+
+        impl #name {
+            /// Create a factory builder for constructing [`#name`] instances in tests.
+            ///
+            /// All fields start at their [`Default`] value. Override any subset
+            /// with the fluent setter methods, then call
+            /// [`build()`](#factory_name::build) for an in-memory instance or
+            /// [`create(pool)`](#factory_name::create) to persist it.
+            ///
+            /// # Example
+            ///
+            /// ```rust,ignore
+            /// let record = MyModel::factory().title("Hello").build();
+            /// ```
+            #[must_use]
+            pub fn factory() -> #factory_name {
+                #factory_name::default()
+            }
         }
     }
 }

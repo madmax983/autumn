@@ -38,6 +38,62 @@
 //! | [`TestResponse`] | `MvcResult` | Response with assertion helpers |
 //! | `TestDb` | `@DataJpaTest` | Shared Postgres testcontainer with pool |
 //!
+//! # Test-data factories
+//!
+//! `#[model]` generates a `{Model}Factory` builder so tests only declare the
+//! fields that matter for the scenario under test — all others stay at
+//! `Default::default()`:
+//!
+//! ```rust
+//! mod schema {
+//!     autumn_web::reexports::diesel::table! {
+//!         notes (id) {
+//!             id -> Int8,
+//!             title -> Text,
+//!             body -> Text,
+//!             pinned -> Bool,
+//!         }
+//!     }
+//! }
+//! use schema::notes;
+//!
+//! #[autumn_web::model]
+//! pub struct Note {
+//!     #[id]
+//!     pub id: i64,
+//!     pub title: String,
+//!     pub body: String,
+//!     pub pinned: bool,
+//! }
+//!
+//! // Zero required args — every field defaults to its type's `Default`.
+//! let draft: NewNote = Note::factory().build();
+//! assert_eq!(draft.title, "");
+//! assert!(!draft.pinned);
+//!
+//! // Override only the fields relevant to your test.
+//! let draft = Note::factory().title("Hello").pinned(true).build();
+//! assert_eq!(draft.title, "Hello");
+//! assert!(draft.pinned);
+//! assert_eq!(draft.body, ""); // untouched
+//! ```
+//!
+//! To persist the record call `.create(&pool)` instead of `.build()` — it
+//! inserts via Diesel and returns the fully-populated model (PK included).
+//! Pair it with `TestDb` for a self-contained DB test:
+//!
+//! ```rust,ignore
+//! #[tokio::test]
+//! #[ignore = "requires Docker (testcontainers)"]
+//! async fn note_round_trip() {
+//!     let db = TestDb::shared().await;
+//!     // run CREATE TABLE ... against db.pool() first, then:
+//!     let note = Note::factory().title("TDD").create(&db.pool()).await;
+//!     assert!(note.id > 0);
+//!     assert_eq!(note.title, "TDD");
+//! }
+//! ```
+//!
 //! # Database testing
 //!
 //! For tests that need a real database, use `TestDb` to share a single

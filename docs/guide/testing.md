@@ -271,6 +271,121 @@ cargo test --doc -p autumn-web
 
 ---
 
+## Test-data factories
+
+Every `#[model]` type automatically gets a `{Model}Factory` builder. Tests
+declare only the fields that matter — everything else stays at its type default
+(`""` for `String`, `0` for integers, `false` for `bool`, `None` for
+`Option<T>`).
+
+### Declaring a model
+
+```rust
+// src/models.rs
+use crate::schema::posts;
+
+#[autumn_web::model]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub slug: String,
+    pub body: String,
+    pub published: bool,
+    pub views: i32,
+}
+```
+
+The macro generates `Post::factory()` → `PostFactory`, along with setter
+methods for each non-ID field and two terminus methods:
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `.build()` | `NewPost` | In-memory struct, no database |
+| `.create(&pool).await` | `Post` | Insert + return with PK populated |
+
+### Building in-memory instances
+
+```rust
+// Zero required args — only override what your test cares about
+let draft: NewPost = Post::factory().build();
+assert_eq!(draft.title, "");
+
+// Override one field; all others stay at default
+let draft = Post::factory().title("Hello TDD").build();
+assert_eq!(draft.title, "Hello TDD");
+assert_eq!(draft.views, 0);            // untouched
+
+// Override several fields
+let draft = Post::factory()
+    .title("Published piece")
+    .slug("published-piece")
+    .published(true)
+    .build();
+assert!(draft.published);
+assert_eq!(draft.body, "");            // untouched
+```
+
+### Persisting to the database
+
+Use `.create(&pool)` when a test needs a real DB row:
+
+```rust
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn post_appears_in_listing() {
+    let db = TestDb::shared().await;
+    // (run CREATE TABLE ... first)
+
+    let post = Post::factory()
+        .title("TDD post")
+        .published(true)
+        .create(&db.pool())
+        .await;
+
+    assert!(post.id > 0);
+    assert_eq!(post.title, "TDD post");
+}
+```
+
+### Factory composition
+
+When one model references another (e.g. a `Comment` that belongs to a `Post`),
+build the parent first and pass its primary key:
+
+```rust
+// 1. Persist the parent
+let post = Post::factory().title("Parent").create(&db.pool()).await;
+
+// 2. Build the child referencing the parent's id
+let comment = Comment::factory()
+    .post_id(post.id)
+    .body("Great read!")
+    .create(&db.pool())
+    .await;
+
+assert_eq!(comment.post_id, post.id);
+```
+
+This keeps associations explicit and avoids hidden global state or
+infinite-recursion footguns.
+
+### Line-count benchmark
+
+The success metric from the original spec: a "create user with one published
+post and one comment" fixture should be **≤ 8 lines** of intent, down from
+**≥ 25 lines** of struct-literal boilerplate:
+
+```rust
+// Before: 25+ lines of NewUser { id: 1, email: "a@b.c".into(), ... }
+// After factory pattern:
+let user    = User::factory().email("alice@example.com").create(&pool).await;
+let post    = Post::factory().user_id(user.id).title("Hello").published(true).create(&pool).await;
+let comment = Comment::factory().post_id(post.id).body("Nice!").create(&pool).await;
+```
+
+---
+
 ## Patterns at a glance
 
 | Scenario | Pattern |
@@ -281,6 +396,8 @@ cargo test --doc -p autumn-web
 | Authorization | `.policy(MyPolicy).scope(MyScope)` |
 | Custom middleware | `.layer(MyLayer)` |
 | Raw router | `TestApp::from_router(my_router)` |
+| Build model in-memory | `MyModel::factory().field(val).build()` |
+| Persist model to DB | `MyModel::factory().field(val).create(&pool).await` |
 
 ---
 
