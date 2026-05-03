@@ -80,6 +80,21 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
 /// Connection type managed by the deadpool pool.
 type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
 
+struct TxDepthGuard<'a> {
+    depth: &'a mut usize,
+    poisoned: &'a mut bool,
+    disarmed: bool,
+}
+
+impl Drop for TxDepthGuard<'_> {
+    fn drop(&mut self) {
+        *self.depth -= 1;
+        if !self.disarmed {
+            *self.poisoned = true;
+        }
+    }
+}
+
 /// Async database connection extractor.
 ///
 /// Declare `db: Db` in a handler signature to get a pooled connection to
@@ -147,6 +162,16 @@ impl Db {
     ///
     /// Commits when the closure returns `Ok(_)`, rolls back when it returns
     /// `Err(_)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`](crate::error::AutumnError) when:
+    ///
+    /// - the underlying transaction returns an error,
+    /// - the closure returns an error that converts into `AutumnError`,
+    /// - this `Db` is already inside a transaction,
+    /// - this `Db` has been poisoned by a previously cancelled/dropped
+    ///   transaction future.
     pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
     where
         T: Send + 'a,
@@ -170,20 +195,6 @@ impl Db {
                 "Nested Db::tx calls are not supported",
             ));
         }
-        struct TxDepthGuard<'a> {
-            depth: &'a mut usize,
-            poisoned: &'a mut bool,
-            disarmed: bool,
-        }
-        impl Drop for TxDepthGuard<'_> {
-            fn drop(&mut self) {
-                *self.depth -= 1;
-                if !self.disarmed {
-                    *self.poisoned = true;
-                }
-            }
-        }
-
         self.tx_depth += 1;
         let mut guard = TxDepthGuard {
             depth: &mut self.tx_depth,
