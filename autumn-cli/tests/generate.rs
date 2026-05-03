@@ -227,6 +227,7 @@ fn generate_scaffold_full_e2e_post() {
         "#[post(\"/posts/{id}/update\")]",
         "pub async fn index",
         "pub async fn show",
+        "pub async fn new_form() -> AutumnResult<Markup>",
         "pub async fn update",
     ] {
         assert!(routes.contains(needle), "routes file missing: {needle}");
@@ -234,8 +235,12 @@ fn generate_scaffold_full_e2e_post() {
 
     // Smoke test.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_index_returns_200"));
+    assert!(
+        test.contains("posts_index_returns_200_with_authenticated_session_when_server_is_running")
+    );
     assert!(test.contains("AUTUMN_TEST_BASE_URL"));
+    assert!(test.contains("AUTUMN_TEST_SESSION_COOKIE"));
+    assert!(test.contains("Cookie: {session_cookie}"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -298,9 +303,9 @@ fn generate_model_help_shows_example() {
 }
 
 /// Slow end-to-end check: scaffold a fresh project, run `autumn generate
-/// scaffold`, and `cargo check` the result against the local `autumn-web`
+/// scaffold`, and `cargo check --tests` the result against the local `autumn-web`
 /// crate. Verifies the generator adds every dep its emitted code needs and
-/// that the generated code actually type-checks.
+/// that the generated application and smoke test actually type-check.
 ///
 /// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
 #[test]
@@ -351,7 +356,7 @@ fn generated_scaffold_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check"])
+        .args(["check", "--tests"])
         .current_dir(&project)
         .output()
         .unwrap();

@@ -5,7 +5,8 @@
 //! - A `#[repository(Model)]` block (API routes are opt-in).
 //! - HTML route handlers for `index`, `show`, `new_form`, `create`, `edit_form`,
 //!   `update`, `delete`, returning Maud `Markup`.
-//! - A `tests/<snake>.rs` smoke test that asserts the index route returns 200.
+//! - A `tests/<snake>.rs` smoke test that asserts the secured index route
+//!   returns 200 with an authenticated session cookie.
 //! - Updates to `src/main.rs` registering all new routes in `routes![ … ]`.
 
 use std::path::Path;
@@ -225,13 +226,13 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {{
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new")]
-pub async fn new_form() -> Markup {{
-    layout("New {pascal_name}", html! {{
+pub async fn new_form() -> AutumnResult<Markup> {{
+    Ok(layout("New {pascal_name}", html! {{
         h1 {{ "New {pascal_name}" }}
         form action="/{plural}" method="post" {{
 {inputs}            button type="submit" {{ "Create" }}
         }}
-    }})
+    }}))
 }}
 
 /// `POST /{plural}` — accept a form submission and create a {snake_name}.
@@ -332,18 +333,40 @@ fn render_smoke_test(pascal_name: &str, plural: &str) -> String {
          //!\n\
          //! Compiles against the project's stock dependency set (just\n\
          //! `autumn-web`) so it lights up in CI immediately. Hit the\n\
-         //! actual server with the steps documented in the test body.\n\
+         //! secured route on a real server with the steps documented in the\n\
+         //! test body.\n\
          \n\
          #[test]\n\
-         fn {plural}_index_returns_200_when_server_is_running() {{\n\
-             // Hit the running app at $AUTUMN_TEST_BASE_URL — we go via raw\n\
-             // `std::net::TcpStream` to avoid forcing reqwest into the\n\
-             // project's dependency graph. Once the user wires in their\n\
-             // preferred HTTP client they should replace this body.\n\
+         fn {plural}_index_returns_200_with_authenticated_session_when_server_is_running() {{\n\
              let Ok(base) = std::env::var(\"AUTUMN_TEST_BASE_URL\") else {{\n\
                  eprintln!(\"skipping: AUTUMN_TEST_BASE_URL not set\");\n\
                  return;\n\
              }};\n\
+             // Scaffolded HTML routes are #[secured], so a plain anonymous\n\
+             // GET should return 401. Log in through your app's auth flow,\n\
+             // then set AUTUMN_TEST_SESSION_COOKIE to the Cookie header value\n\
+             // for that authenticated browser session, e.g. `autumn.sid=...`.\n\
+             let Ok(session_cookie) = std::env::var(\"AUTUMN_TEST_SESSION_COOKIE\") else {{\n\
+                 eprintln!(\"skipping: AUTUMN_TEST_SESSION_COOKIE not set\");\n\
+                 return;\n\
+             }};\n\
+             let session_cookie = session_cookie.trim();\n\
+             let session_cookie = session_cookie\n\
+                 .strip_prefix(\"Cookie:\")\n\
+                 .map(str::trim)\n\
+                 .unwrap_or(session_cookie);\n\
+             assert!(\n\
+                 !session_cookie.is_empty(),\n\
+                 \"AUTUMN_TEST_SESSION_COOKIE must not be empty\"\n\
+             );\n\
+             assert!(\n\
+                 !session_cookie.contains('\\r') && !session_cookie.contains('\\n'),\n\
+                 \"AUTUMN_TEST_SESSION_COOKIE must be a single Cookie header value\"\n\
+             );\n\
+             // Hit the running app at $AUTUMN_TEST_BASE_URL -- we go via raw\n\
+             // `std::net::TcpStream` to avoid forcing reqwest into the\n\
+             // project's dependency graph. Once the user wires in their\n\
+             // preferred HTTP client they should replace this body.\n\
              let url = format!(\"{{base}}/{plural}\");\n\
              let host_port = base\n\
                  .trim_start_matches(\"http://\")\n\
@@ -352,7 +375,7 @@ fn render_smoke_test(pascal_name: &str, plural: &str) -> String {
                  .unwrap_or_else(|_| panic!(\"could not connect to {{url}}\"));\n\
              use std::io::{{Read, Write}};\n\
              let req = format!(\n\
-                 \"GET /{plural} HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nConnection: close\\r\\n\\r\\n\"\n\
+                 \"GET /{plural} HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nCookie: {{session_cookie}}\\r\\nConnection: close\\r\\n\\r\\n\"\n\
              );\n\
              stream.write_all(req.as_bytes()).expect(\"write failed\");\n\
              let mut response = String::new();\n\
@@ -360,7 +383,7 @@ fn render_smoke_test(pascal_name: &str, plural: &str) -> String {
              assert!(\n\
                  response.starts_with(\"HTTP/1.1 200\")\n\
                      || response.starts_with(\"HTTP/1.0 200\"),\n\
-                 \"{pascal_name} index did not return 200:\\n{{response}}\"\n\
+                 \"{pascal_name} index did not return 200 for authenticated session:\\n{{response}}\"\n\
              );\n\
          }}\n",
     )
@@ -485,6 +508,8 @@ async fn main() {
         // (browsers can't submit PUT natively); the JSON `PUT /api/posts/{id}`
         // remains available via the auto-generated repository handler.
         assert!(routes.contains("#[post(\"/posts/{id}/update\")]"));
+        assert!(routes.contains("pub async fn new_form() -> AutumnResult<Markup>"));
+        assert!(routes.contains("Ok(layout(\"New Post\""));
         assert!(routes.contains("posts::title.eq(form.title.clone())"));
         // `execute()` returns the affected row count — `Ok(0)` means the id
         // didn't exist, and we must return 404 instead of redirecting as if
@@ -544,8 +569,14 @@ async fn main() {
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
-        assert!(test.contains("posts_index_returns_200_when_server_is_running"));
+        assert!(
+            test.contains(
+                "posts_index_returns_200_with_authenticated_session_when_server_is_running"
+            )
+        );
         assert!(test.contains("AUTUMN_TEST_BASE_URL"));
+        assert!(test.contains("AUTUMN_TEST_SESSION_COOKIE"));
+        assert!(test.contains("Cookie: {session_cookie}"));
         assert!(test.contains("/posts"));
     }
 

@@ -28,7 +28,8 @@ autumn migrate
 autumn dev
 ```
 
-Visit <http://localhost:3000/posts> — you'll see the generated index page.
+After signing in through your app's auth flow, visit
+<http://localhost:3000/posts> to see the generated index page.
 The JSON endpoint at <http://localhost:3000/api/posts> returns `[]` until
 you create one, and `POST /api/posts` with a JSON body inserts a row.
 
@@ -136,9 +137,10 @@ Everything `model` produces, plus:
   `create`, and `edit_form`. Update and delete go through the JSON REST API
   the repository already provides.
 - `src/routes/mod.rs` — module aggregator.
-- `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against a
-  running server and asserts a 2xx response (skipped unless
-  `AUTUMN_TEST_BASE_URL` is set).
+- `tests/<snake>.rs` — a smoke test that hits secured `GET /<plural>` against
+  a running server with an authenticated session cookie and asserts a 2xx
+  response (skipped unless `AUTUMN_TEST_BASE_URL` and
+  `AUTUMN_TEST_SESSION_COOKIE` are set).
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op.
