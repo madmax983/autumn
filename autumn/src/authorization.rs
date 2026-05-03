@@ -218,16 +218,22 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     /// Decide whether the current user may *create* a resource of
     /// this type.
     ///
-    /// `can_create` takes no `&R` argument because, at the moment
-    /// the framework asks "may this user create one of these?",
-    /// no instance exists yet — only the proposed insert payload
-    /// (typically `NewR`). Implementations therefore decide based
-    /// on `ctx.user_id` and `ctx.roles` alone. The
-    /// `#[repository(policy = ...)]`-generated `POST` handler
-    /// invokes this *before* the insert so a denied check never
-    /// commits a row.
+    /// `can_create` receives request context only. Policies that need
+    /// the proposed JSON payload before insert can override
+    /// [`Policy::can_create_payload`].
     fn can_create<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
+    }
+
+    /// Decide whether the current user may create the proposed
+    /// payload. Default behavior preserves compatibility by
+    /// delegating to [`Policy::can_create`].
+    fn can_create_payload<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        _payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, bool> {
+        self.can_create(ctx)
     }
 
     /// Decide whether the current user may *update* the resource.
@@ -662,8 +668,9 @@ where
 /// Resolves the registered [`Policy`] for `R` and calls
 /// [`Policy::can_create`] *before* the row is persisted, closing
 /// the "deny still wrote a row" hole that catches naive
-/// after-the-fact policy checks. Use [`authorize_create`] from
-/// user code; this is the framework's `__`-prefixed alias.
+/// after-the-fact policy checks. Use [`authorize_create`] from user
+/// code; this is the framework's backward-compatible `__`-prefixed
+/// alias for older macro output.
 #[doc(hidden)]
 pub async fn __check_policy_create<R>(
     state: &crate::AppState,
@@ -675,12 +682,31 @@ where
     authorize_create::<R>(state, session).await
 }
 
+/// Payload-aware pre-insert authorization helper for
+/// `#[repository(policy = ...)]`-generated `POST` endpoints.
+///
+/// Newer macro output uses this helper when it has the raw JSON
+/// request payload available. The two-argument
+/// [`__check_policy_create`] alias is kept so applications compiled
+/// with older `autumn-macros` output remain source-compatible when
+/// only `autumn-web` is upgraded.
+#[doc(hidden)]
+pub async fn __check_policy_create_payload<R>(
+    state: &crate::AppState,
+    session: &Session,
+    payload: &serde_json::Value,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    authorize_create_payload::<R>(state, session, payload).await
+}
+
 /// Run a policy's `can_create` check before persisting a new record.
 ///
 /// Mirrors [`authorize`] but takes no resource argument: at create
-/// time, no record instance exists yet — only the proposed insert
-/// payload — so policies decide based on `ctx.user_id` and
-/// `ctx.roles` alone.
+/// time, no record instance exists yet, so policies decide based on
+/// `ctx.user_id` and `ctx.roles` alone.
 ///
 /// # Errors
 ///
@@ -704,6 +730,43 @@ where
     let ctx = PolicyContext::from_request(state, session).await;
 
     if policy.can_create(&ctx).await {
+        Ok(())
+    } else {
+        Err(state.forbidden_response().into_error())
+    }
+}
+
+/// Run a policy's payload-aware `can_create_payload` check before
+/// persisting a new record.
+///
+/// Use this when a create policy must inspect the proposed JSON
+/// payload before insert, such as tenant/owner invariants. Existing
+/// custom handlers that only need context-based create authorization
+/// should keep calling [`authorize_create`].
+///
+/// # Errors
+///
+/// Returns the configured deny response when the policy denies.
+/// Returns `500` when no policy is registered for `R`.
+pub async fn authorize_create_payload<R>(
+    state: &crate::AppState,
+    session: &Session,
+    payload: &serde_json::Value,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
+        crate::AutumnError::from(std::io::Error::other(format!(
+            "no policy registered for resource type {}",
+            std::any::type_name::<R>()
+        )))
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    let ctx = PolicyContext::from_request(state, session).await;
+
+    if policy.can_create_payload(&ctx, payload).await {
         Ok(())
     } else {
         Err(state.forbidden_response().into_error())
@@ -1083,6 +1146,97 @@ mod tests {
         authorize_create::<Note>(&state, &user)
             .await
             .expect("authenticated user passes can_create");
+    }
+
+    #[tokio::test]
+    async fn authorize_create_payload_dispatches_can_create_payload() {
+        struct OwnerPayloadPolicy;
+        impl Policy<Note> for OwnerPayloadPolicy {
+            fn can_create_payload<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                payload: &'a serde_json::Value,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    payload.get("author_id").and_then(serde_json::Value::as_i64)
+                        == ctx.user_id_i64()
+                })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(OwnerPayloadPolicy);
+
+        let user = session_with(Some("1"), None);
+        let own_payload = serde_json::json!({"author_id": 1});
+        authorize_create_payload::<Note>(&state, &user, &own_payload)
+            .await
+            .expect("owner payload passes can_create_payload");
+
+        let other_payload = serde_json::json!({"author_id": 2});
+        let err = authorize_create_payload::<Note>(&state, &user, &other_payload)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_alias_preserves_two_arg_shape() {
+        struct AuthOnlyCreatePolicy;
+        impl Policy<Note> for AuthOnlyCreatePolicy {
+            fn can_create<'a>(&'a self, ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.is_authenticated() })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AuthOnlyCreatePolicy);
+
+        let anon = session_with(None, None);
+        let err = __check_policy_create::<Note>(&state, &anon)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+
+        let user = session_with(Some("1"), None);
+        __check_policy_create::<Note>(&state, &user)
+            .await
+            .expect("old generated create policy alias remains compatible");
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_alias_dispatches_payload() {
+        struct OwnerPayloadPolicy;
+        impl Policy<Note> for OwnerPayloadPolicy {
+            fn can_create_payload<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                payload: &'a serde_json::Value,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move {
+                    payload.get("author_id").and_then(serde_json::Value::as_i64)
+                        == ctx.user_id_i64()
+                })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(OwnerPayloadPolicy);
+
+        let user = session_with(Some("1"), None);
+        let payload = serde_json::json!({"author_id": 1});
+        __check_policy_create_payload::<Note>(&state, &user, &payload)
+            .await
+            .expect("new generated create policy alias passes payload");
     }
 
     #[tokio::test]

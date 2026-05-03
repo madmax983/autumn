@@ -790,6 +790,7 @@ pub use axum::extract::State;
 /// | `axum` | `autumn_web::reexports::axum` | Custom routers, middleware, extractors |
 /// | `diesel` | `autumn_web::reexports::diesel` | Raw Diesel queries, schema types |
 /// | `http` | `autumn_web::reexports::http` | HTTP types (`StatusCode`, `Method`, headers) |
+/// | `serde_json` | `autumn_web::reexports::serde_json` | JSON values and conversion helpers |
 /// | `tokio` | `autumn_web::reexports::tokio` | Async runtime, spawn, timers |
 pub mod reexports {
     pub use axum;

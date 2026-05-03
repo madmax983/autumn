@@ -531,11 +531,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // leaving the data behind.
         let policy_check_create_pre = if has_policy {
             quote! {
-                ::autumn_web::authorization::__check_policy_create::<#model_name>(
+                ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    &__autumn_new_payload,
                 )
                 .await?;
+            }
+        } else {
+            quote! {}
+        };
+        // Policy-backed create handlers keep the raw JSON value for
+        // `can_create_payload` instead of serializing `NewModel` back
+        // into JSON. That preserves hand-written `NewModel` types that
+        // are `Deserialize + Insertable` but intentionally not `Serialize`.
+        let create_payload_arg = if has_policy {
+            quote! {
+                ::autumn_web::prelude::Json(__autumn_new_payload): ::autumn_web::prelude::Json<
+                    ::autumn_web::reexports::serde_json::Value
+                >
+            }
+        } else {
+            quote! {
+                ::autumn_web::prelude::Json(new): ::autumn_web::prelude::Json<#new_name>
+            }
+        };
+        let decode_create_payload = if has_policy {
+            quote! {
+                let new: #new_name = ::autumn_web::reexports::serde_json::from_value(
+                    __autumn_new_payload.clone(),
+                )
+                .map_err(|err| ::autumn_web::AutumnError::unprocessable_msg(err.to_string()))?;
             }
         } else {
             quote! {}
@@ -804,8 +830,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #vis async fn #create_fn(
                 #session_state_args
                 repo: #pg_name,
-                ::autumn_web::prelude::Json(new): ::autumn_web::prelude::Json<#new_name>,
+                #create_payload_arg,
             ) -> ::autumn_web::AutumnResult<(::autumn_web::reexports::http::StatusCode, ::autumn_web::prelude::Json<#model_name>)> {
+                #decode_create_payload
                 #policy_check_create_pre
                 let record = repo.save(&new).await?;
                 Ok((::autumn_web::reexports::http::StatusCode::CREATED, ::autumn_web::prelude::Json(record)))
