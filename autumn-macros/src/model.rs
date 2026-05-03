@@ -71,11 +71,26 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
 /// Extract the associated model type from `#[factory_assoc(TypeName)]` if present.
 ///
 /// Returns `Some(Ident)` for the associated type, or `None` if the attribute is absent.
+/// Panics if `factory_assoc` is present but fails to parse — callers should run
+/// `validate_factory_assoc_attrs` first to surface a proper compile error.
 fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
     for attr in &field.attrs {
-        if attr.path().is_ident("factory_assoc") {
-            if let Ok(ident) = attr.parse_args::<syn::Ident>() {
-                return Some(ident);
+        if attr.path().is_ident("factory_assoc") && let Ok(ident) = attr.parse_args::<syn::Ident>() {
+            return Some(ident);
+        }
+    }
+    None
+}
+
+/// Validate that every `#[factory_assoc(...)]` attribute contains a valid Ident.
+///
+/// Returns a compile error token stream on the first malformed attribute so the
+/// user gets a clear diagnostic instead of silent fallback-to-normal-field behavior.
+fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
+    for field in fields {
+        for attr in &field.attrs {
+            if attr.path().is_ident("factory_assoc") && let Err(err) = attr.parse_args::<syn::Ident>() {
+                return Some(err.to_compile_error());
             }
         }
     }
@@ -176,6 +191,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .is_some_and(|id| !id_field_names.contains(&id))
         })
         .collect();
+
+    // Validate #[factory_assoc] attributes before using them.
+    if let Some(err) = validate_factory_assoc_attrs(&all_fields) {
+        return err;
+    }
 
     // Fields for UpdateX: same set as NewX (all become Patch<T>)
 
@@ -390,43 +410,44 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let ident = f.ident.as_ref().unwrap();
             let ty = &f.ty;
 
-            if let Some(assoc_type) = factory_assoc_type(f) {
-                // Setter that stores an explicit id via Some(...)
-                let explicit_setter = quote! {
-                    #[must_use]
-                    pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
-                        self.#ident = ::core::option::Option::Some(val.into());
-                        self
-                    }
-                };
-                // Setter that accepts a pre-built associated instance and extracts `.id`.
-                // Name is derived from the field ident by stripping the `_id` suffix:
-                // `user_id` → `.user()`, `author_id` → `.author()`.
-                let field_str = ident.to_string();
-                let assoc_snake = if field_str.ends_with("_id") {
-                    format_ident!("{}", &field_str[..field_str.len() - 3])
-                } else {
-                    format_ident!("{}_assoc", field_str)
-                };
-                let pre_built_setter = quote! {
-                    /// Override the association with a pre-built instance.
-                    /// Extracts `.id` so no additional DB insert is performed on `create()`.
-                    #[must_use]
-                    pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
-                        self.#ident = ::core::option::Option::Some(val.id);
-                        self
-                    }
-                };
-                vec![explicit_setter, pre_built_setter]
-            } else {
-                vec![quote! {
+            factory_assoc_type(f).map_or_else(
+                // Normal field: a single setter that assigns directly.
+                || vec![quote! {
                     #[must_use]
                     pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
                         self.#ident = val.into();
                         self
                     }
-                }]
-            }
+                }],
+                // Assoc field: two setters — explicit id and pre-built instance.
+                |assoc_type| {
+                    let explicit_setter = quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.into());
+                            self
+                        }
+                    };
+                    // Name derived from the field ident by stripping the `_id` suffix:
+                    // `user_id` → `.user()`, `author_id` → `.author()`.
+                    let field_str = ident.to_string();
+                    let assoc_snake = if field_str.ends_with("_id") {
+                        format_ident!("{}", &field_str[..field_str.len() - 3])
+                    } else {
+                        format_ident!("{}_assoc", field_str)
+                    };
+                    let pre_built_setter = quote! {
+                        /// Override the association with a pre-built instance.
+                        /// Extracts `.id` so no additional DB insert is performed on `create()`.
+                        #[must_use]
+                        pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.id);
+                            self
+                        }
+                    };
+                    vec![explicit_setter, pre_built_setter]
+                },
+            )
         })
         .collect();
 
@@ -486,33 +507,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Depth-guard block — only emitted when there are assoc fields.
     //
-    // Uses a RAII drop guard so the counter is decremented even if create()
-    // panics mid-flight (e.g. pool exhaustion, insert failure, nested panic).
-    // Without this, a panic leaves the thread-local elevated and later factory
-    // calls on the same test thread fail with a spurious depth-exceeded error.
+    // Uses the shared `::autumn_web::__private` depth counter so the limit
+    // applies to the total chain depth across ALL model types (not per-model),
+    // bounding cross-model cycles such as A → B → A → B → ….
+    // A RAII drop guard ensures the counter is decremented even on panic.
     let depth_guard_enter = if has_assoc_fields {
         quote! {
-            ::std::thread_local! {
-                static __AUTUMN_FACTORY_DEPTH: ::std::cell::Cell<u32> =
-                    ::std::cell::Cell::new(0);
-            }
             struct __AutumnFactoryDepthGuard;
             impl ::core::ops::Drop for __AutumnFactoryDepthGuard {
                 fn drop(&mut self) {
-                    __AUTUMN_FACTORY_DEPTH.with(|d| d.set(d.get() - 1));
+                    ::autumn_web::__private::factory_depth_exit();
                 }
             }
-            __AUTUMN_FACTORY_DEPTH.with(|d| {
-                let v = d.get();
-                assert!(
-                    v < 32,
-                    "factory `{}`: cyclic #[factory_assoc] chain exceeds depth 32 — \
-                     break the cycle by supplying a pre-built instance via a \
-                     pre-built setter.",
-                    stringify!(#name),
-                );
-                d.set(v + 1);
-            });
+            ::autumn_web::__private::factory_depth_enter(stringify!(#name));
             let _depth_guard = __AutumnFactoryDepthGuard;
         }
     } else {

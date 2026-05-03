@@ -80,8 +80,8 @@ mod factory_tests {
 
     #[test]
     fn factory_default_impl() {
-        let f1: FactoryItemFactory = Default::default();
-        let f2: FactoryItemFactory = Default::default();
+        let f1 = FactoryItemFactory::default();
+        let f2 = FactoryItemFactory::default();
         let i1 = f1.build();
         let i2 = f2.build();
         assert_eq!(i1.name, i2.name);
@@ -183,10 +183,10 @@ mod factory_tests {
     fn factory_composition_via_field_override() {
         // In a multi-model scenario, you build a parent first, then pass its id.
         // This test shows the field-override pattern works for foreign keys.
-        let _item_for_user_42 = FactoryItem::factory()
+        let item_for_user_42 = FactoryItem::factory()
             .score(42) // use score as a stand-in for a FK in this single-model test
             .build();
-        assert_eq!(_item_for_user_42.score, 42);
+        assert_eq!(item_for_user_42.score, 42);
     }
 }
 
