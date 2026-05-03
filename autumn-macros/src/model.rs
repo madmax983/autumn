@@ -485,11 +485,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
 
     // Depth-guard block — only emitted when there are assoc fields.
+    //
+    // Uses a RAII drop guard so the counter is decremented even if create()
+    // panics mid-flight (e.g. pool exhaustion, insert failure, nested panic).
+    // Without this, a panic leaves the thread-local elevated and later factory
+    // calls on the same test thread fail with a spurious depth-exceeded error.
     let depth_guard_enter = if has_assoc_fields {
         quote! {
             ::std::thread_local! {
                 static __AUTUMN_FACTORY_DEPTH: ::std::cell::Cell<u32> =
                     ::std::cell::Cell::new(0);
+            }
+            struct __AutumnFactoryDepthGuard;
+            impl ::core::ops::Drop for __AutumnFactoryDepthGuard {
+                fn drop(&mut self) {
+                    __AUTUMN_FACTORY_DEPTH.with(|d| d.set(d.get() - 1));
+                }
             }
             __AUTUMN_FACTORY_DEPTH.with(|d| {
                 let v = d.get();
@@ -502,16 +513,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
                 d.set(v + 1);
             });
+            let _depth_guard = __AutumnFactoryDepthGuard;
         }
     } else {
         quote! {}
     };
-    let depth_guard_exit = if has_assoc_fields {
-        quote! { __AUTUMN_FACTORY_DEPTH.with(|d| d.set(d.get() - 1)); }
-    } else {
-        quote! {}
-    };
-
     // create() — insert via Diesel and return the persisted model.
     let factory_create_method = quote! {
         /// Insert a record built from this factory into the database and return
@@ -543,14 +549,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .get()
                 .await
                 .expect("factory: failed to acquire db connection");
-            let result = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                 .values(&new_record)
                 .returning(#name::as_returning())
                 .get_result(&mut *conn)
                 .await
-                .expect("factory: insert failed");
-            #depth_guard_exit
-            result
+                .expect("factory: insert failed")
         }
     };
 

@@ -196,8 +196,6 @@ async fn create_post_round_trip() {
 // table used above. In-memory tests run without Docker; DB tests are ignored.
 
 mod factory_tests {
-    use autumn_web::prelude::*;
-
     autumn_web::reexports::diesel::table! {
         blog_factory_posts (id) {
             id -> Int8,
@@ -264,7 +262,6 @@ mod factory_tests {
     #[ignore = "requires Docker (testcontainers)"]
     async fn factory_create_persists_blog_post() {
         use autumn_web::test::TestDb;
-        use autumn_web::reexports::diesel_async::RunQueryDsl;
 
         let db = TestDb::shared().await;
         db.execute_sql(
