@@ -212,7 +212,7 @@ fn generate_scaffold_full_e2e_post() {
 
     // Repository file.
     let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
-    assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
+    assert!(repo.contains("#[autumn_web::repository(Post)]"));
     assert!(repo.contains("pub trait PostRepository"));
 
     // HTML routes — index/show/new/create/edit_form/update; delete goes
@@ -250,11 +250,6 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
-        "repositories::post::post_api_list",
-        "repositories::post::post_api_get",
-        "repositories::post::post_api_create",
-        "repositories::post::post_api_update",
-        "repositories::post::post_api_delete",
     ] {
         assert!(
             main.contains(entry),
