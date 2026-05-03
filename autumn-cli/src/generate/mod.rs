@@ -49,12 +49,19 @@ pub enum GenerateError {
     Io(#[from] std::io::Error),
 }
 
+/// ⚡ Bolt optimization: Formats collision paths directly into a pre-allocated
+/// String buffer to avoid multiple intermediate `String` and `Vec` allocations.
 fn format_collisions(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|p| format!("  {}", p.display().to_string().replace('\\', "/")))
-        .collect::<Vec<_>>()
-        .join("\n")
+    use std::fmt::Write;
+    // Estimate ~60 bytes per path
+    let mut out = String::with_capacity(paths.len() * 60);
+    for (i, p) in paths.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        write!(out, "  {}", p.display().to_string().replace('\\', "/")).unwrap();
+    }
+    out
 }
 
 /// Common flags shared by every `generate` subcommand.

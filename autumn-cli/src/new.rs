@@ -195,6 +195,7 @@ fn render_cargo_toml(
     mut cargo_toml: String,
     seed_bin_toml: &str,
 ) -> String {
+    use std::fmt::Write;
     let mut features = Vec::new();
     if opts.with_i18n {
         features.push("i18n");
@@ -204,13 +205,17 @@ fn render_cargo_toml(
     }
     if !features.is_empty() {
         let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
-        let features = features
-            .iter()
-            .map(|feature| format!(r#""{feature}""#))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let feature_dep =
-            format!(r#"autumn-web = {{ version = "{autumn_version}", features = [{features}] }}"#);
+        // ⚡ Bolt optimization: Pre-allocate capacity for comma-separated feature strings
+        let mut features_str = String::with_capacity(features.len() * 10);
+        for (i, feature) in features.iter().enumerate() {
+            if i > 0 {
+                features_str.push_str(", ");
+            }
+            write!(features_str, r#""{feature}""#).unwrap();
+        }
+        let feature_dep = format!(
+            r#"autumn-web = {{ version = "{autumn_version}", features = [{features_str}] }}"#
+        );
         cargo_toml = cargo_toml.replace(&plain_dep, &feature_dep);
     }
     if opts.with_seed {

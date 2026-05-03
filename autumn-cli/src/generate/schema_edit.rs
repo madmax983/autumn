@@ -225,7 +225,11 @@ pub fn update_main_rs(existing: &str, mods: &[&str], route_entries: &[String]) -
 
 /// Insert `mod <name>;` lines near the top of `main.rs`, preserving any that
 /// already exist.
+///
+/// ⚡ Bolt optimization: Pre-allocates string buffer based on mod count
+/// and writes sequentially instead of creating intermediate vectors of strings.
 fn ensure_mods(existing: &str, mods: &[&str]) -> String {
+    use std::fmt::Write;
     let mut needed: Vec<&str> = mods
         .iter()
         .copied()
@@ -235,11 +239,13 @@ fn ensure_mods(existing: &str, mods: &[&str]) -> String {
         return existing.to_owned();
     }
     needed.sort_unstable();
-    let block = needed
-        .iter()
-        .map(|m| format!("mod {m};"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut block = String::with_capacity(needed.len() * 15);
+    for (i, m) in needed.iter().enumerate() {
+        if i > 0 {
+            block.push('\n');
+        }
+        write!(block, "mod {m};").unwrap();
+    }
 
     // Mod declarations are *items* and must follow any crate-level inner
     // attributes (`#![allow(...)]`, `//!` doc comments) — Rust rejects the

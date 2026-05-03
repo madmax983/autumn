@@ -311,12 +311,25 @@ fn render_form_inputs(fields: &[Field]) -> String {
 /// `tablename::field.eq(form.field.clone()), …` per user field, leaving the
 /// auto-managed `id` and `created_at` columns alone. With no user fields the
 /// body is empty (Diesel accepts `set(())` as a no-op update).
+///
+/// ⚡ Bolt optimization: Avoids intermediate `Vec` allocations during string formatting
+/// by pre-allocating capacity and utilizing `std::fmt::Write` sequentially.
 fn render_update_columns(plural: &str, fields: &[Field]) -> String {
-    fields
-        .iter()
-        .map(|f| format!("{plural}::{name}.eq(form.{name}.clone())", name = f.name))
-        .collect::<Vec<_>>()
-        .join(", ")
+    use std::fmt::Write;
+    // Estimate 50 chars per field
+    let mut out = String::with_capacity(fields.len() * 50);
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        write!(
+            out,
+            "{plural}::{name}.eq(form.{name}.clone())",
+            name = f.name
+        )
+        .unwrap();
+    }
+    out
 }
 
 fn render_smoke_test(pascal_name: &str, plural: &str) -> String {
