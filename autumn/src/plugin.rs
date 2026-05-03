@@ -238,6 +238,18 @@ mod tests {
     }
 
     #[test]
+    fn single_plugin_applied_via_plugins_trait() {
+        let recorder = Arc::new(Recorder::new());
+        let builder = crate::app::app().plugins(RecordingPlugin {
+            label: "single_via_trait",
+            recorder: recorder.clone(),
+        });
+
+        assert_eq!(recorder.events(), vec!["single_via_trait"]);
+        assert!(builder.has_plugin("single_via_trait"));
+    }
+
+    #[test]
     fn tuple_of_plugins_applies_in_declaration_order() {
         let recorder = Arc::new(Recorder::new());
         let _builder = crate::app::app().plugins((
