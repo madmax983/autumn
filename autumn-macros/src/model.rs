@@ -53,7 +53,7 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`) that shouldn't be on the query struct (they'd confuse Diesel derives).
+/// `#[default]`, `#[factory_assoc]`) that shouldn't be on the query struct (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
         .attrs
@@ -63,8 +63,57 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("indexed")
                 && !a.path().is_ident("validate")
                 && !a.path().is_ident("default")
+                && !a.path().is_ident("factory_assoc")
         })
         .collect()
+}
+
+/// Extract the associated model type from `#[factory_assoc(TypeName)]` if present.
+///
+/// Returns `Some(Ident)` for the associated type, or `None` if the attribute is absent.
+/// Panics if `factory_assoc` is present but fails to parse — callers should run
+/// `validate_factory_assoc_attrs` first to surface a proper compile error.
+fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("factory_assoc")
+            && let Ok(ident) = attr.parse_args::<syn::Ident>()
+        {
+            return Some(ident);
+        }
+    }
+    None
+}
+
+/// Validate that every `#[factory_assoc(...)]` attribute contains a valid Ident.
+///
+/// Returns a compile error token stream on the first malformed attribute so the
+/// user gets a clear diagnostic instead of silent fallback-to-normal-field behavior.
+fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
+    for field in fields {
+        for attr in &field.attrs {
+            if attr.path().is_ident("factory_assoc") {
+                // Reject unparseable attribute argument.
+                if let Err(err) = attr.parse_args::<syn::Ident>() {
+                    return Some(err.to_compile_error());
+                }
+                // Reject Option<T> fields — the factory uses Option<T> itself to
+                // represent "not yet set vs. explicit value", so Option<Option<T>>
+                // would be generated, leading to an arm-type mismatch in create().
+                if is_option_type(&field.ty) {
+                    return Some(
+                        syn::Error::new_spanned(
+                            attr,
+                            "#[factory_assoc] cannot be applied to an Option<T> field; \
+                             factory_assoc is designed for non-nullable FK fields (e.g. i64). \
+                             Use a plain field setter to supply a nullable association.",
+                        )
+                        .to_compile_error(),
+                    );
+                }
+            }
+        }
+    }
+    None
 }
 
 /// True if a field has `#[id]` or `#[default]` — either way it's excluded
@@ -151,6 +200,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         id_fields.iter().filter_map(|f| f.ident.as_ref()).collect()
     };
 
+    // PK field ident + type — used by the test-support factory to generate
+    // `__autumn_pk()` so association setters don't hardcode `.id`.
+    let pk_field_for_factory: Option<(&syn::Ident, &syn::Type)> = if id_fields.is_empty() {
+        all_fields
+            .iter()
+            .find(|f| {
+                if let syn::Type::Path(tp) = &f.ty {
+                    tp.path.is_ident("i32") || tp.path.is_ident("i64")
+                } else {
+                    false
+                }
+            })
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    } else {
+        id_fields
+            .first()
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    };
+
     // Fields for NewX: exclude #[id], #[default], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
@@ -161,6 +229,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .is_some_and(|id| !id_field_names.contains(&id))
         })
         .collect();
+
+    // Validate #[factory_assoc] attributes before using them.
+    if let Some(err) = validate_factory_assoc_attrs(&all_fields) {
+        return err;
+    }
 
     // Fields for UpdateX: same set as NewX (all become Patch<T>)
 
@@ -325,6 +398,239 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // ── Factory builder ────────────────────────────────────────
+    let factory_name = format_ident!("{name}Factory");
+
+    // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
+    // no PK can be detected (the factory will fail to compile at the call site,
+    // which is a better diagnostic than a macro panic).
+    let (pk_id, pk_ty): (&syn::Ident, &syn::Type) = pk_field_for_factory.unwrap_or_else(|| {
+        // Dummy values — unreachable for well-formed models, which always
+        // have at least one i32/i64 field or an explicit #[id] annotation.
+        panic!("#[model]: could not detect primary-key field for factory generation")
+    });
+
+    // Whether any factory field is an association (drives depth-check generation).
+    let has_assoc_fields = fields_for_new
+        .iter()
+        .any(|f| factory_assoc_type(f).is_some());
+
+    // Factory struct fields.
+    // - Normal fields:  `pub {ident}: {ty}`
+    // - Assoc fields:   `pub {ident}: Option<{ty}>` (None = auto-create on create())
+    let factory_struct_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            if factory_assoc_type(f).is_some() {
+                quote! { pub #ident: ::core::option::Option<#ty> }
+            } else {
+                quote! { pub #ident: #ty }
+            }
+        })
+        .collect();
+
+    // Default impl.
+    // - Normal fields:  `{ident}: Default::default()`
+    // - Assoc fields:   `{ident}: None`
+    let factory_default_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            if factory_assoc_type(f).is_some() {
+                quote! { #ident: ::core::option::Option::None }
+            } else {
+                quote! { #ident: ::core::default::Default::default() }
+            }
+        })
+        .collect();
+
+    // Per-field setter methods.
+    // - Normal fields:  `pub fn {ident}(mut self, val: impl Into<T>) -> Self`
+    // - Assoc fields:   same setter (stores `Some(val.into())`), PLUS
+    //                   `pub fn {assoc_snake}(mut self, val: &AssocType) -> Self`
+    //                   that extracts `.id` from a pre-built instance.
+    let factory_setters: Vec<TokenStream> = fields_for_new
+        .iter()
+        .flat_map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+
+            factory_assoc_type(f).map_or_else(
+                // Normal field: a single setter that assigns directly.
+                || {
+                    vec![quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = val.into();
+                            self
+                        }
+                    }]
+                },
+                // Assoc field: two setters — explicit id and pre-built instance.
+                |assoc_type| {
+                    let explicit_setter = quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.into());
+                            self
+                        }
+                    };
+                    // Name derived from the field ident by stripping the `_id` suffix:
+                    // `user_id` → `.user()`, `author_id` → `.author()`.
+                    let field_str = ident.to_string();
+                    let assoc_snake = if field_str.ends_with("_id") {
+                        format_ident!("{}", &field_str[..field_str.len() - 3])
+                    } else {
+                        format_ident!("{}_assoc", field_str)
+                    };
+                    let pre_built_setter = quote! {
+                        /// Override the association with a pre-built instance.
+                        /// Extracts the primary key so no additional DB insert is performed on `create()`.
+                        #[must_use]
+                        pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.__autumn_pk());
+                            self
+                        }
+                    };
+                    vec![explicit_setter, pre_built_setter]
+                },
+            )
+        })
+        .collect();
+
+    // build() — assemble NewX.
+    // - Normal fields:  `{ident}: self.{ident}`
+    // - Assoc fields:   `{ident}: self.{ident}.unwrap_or_default()`
+    let factory_build_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            if factory_assoc_type(f).is_some() {
+                quote! { #ident: self.#ident.unwrap_or_default() }
+            } else {
+                quote! { #ident: self.#ident }
+            }
+        })
+        .collect();
+
+    // create() — auto-resolve assoc fields, then insert.
+    //
+    // For each assoc field, emit a `let __resolved_{ident}` that either uses the
+    // supplied value or auto-creates the associated model via its factory.
+    //
+    // A thread-local depth counter guards against cyclic associations: if the
+    // chain exceeds 32 levels the factory panics with a clear message rather than
+    // overflowing the stack.
+    let assoc_resolutions: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            let assoc_type = factory_assoc_type(f)?;
+            let ident = f.ident.as_ref().unwrap();
+            let resolved = format_ident!("__resolved_{ident}");
+            Some(quote! {
+                let #resolved = match self.#ident {
+                    ::core::option::Option::Some(id) => id,
+                    ::core::option::Option::None => {
+                        #assoc_type::factory().create(pool).await.__autumn_pk()
+                    }
+                };
+            })
+        })
+        .collect();
+
+    // NewX construction inside create() uses resolved values for assoc fields.
+    let create_build_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            if factory_assoc_type(f).is_some() {
+                let resolved = format_ident!("__resolved_{ident}");
+                quote! { #ident: #resolved }
+            } else {
+                quote! { #ident: self.#ident }
+            }
+        })
+        .collect();
+
+    // create() inner body — shared by both the assoc and non-assoc paths.
+    let create_inner_body = quote! {
+        use ::autumn_web::reexports::diesel::prelude::*;
+        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        #(#assoc_resolutions)*
+
+        let new_record = #new_name {
+            #(#create_build_fields,)*
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .expect("factory: failed to acquire db connection");
+        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+            .values(&new_record)
+            .returning(#name::as_returning())
+            .get_result(&mut *conn)
+            .await
+            .expect("factory: insert failed")
+    };
+
+    // create() — insert via Diesel and return the persisted model.
+    //
+    // For models with #[factory_assoc] fields, the body is wrapped in a
+    // `tokio::task_local` scope so the depth counter is maintained correctly
+    // when the future migrates between worker threads (work-stealing runtimes).
+    // Thread-local storage would corrupt the counter across await points.
+    let factory_create_method = if has_assoc_fields {
+        quote! {
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Fields annotated with `#[factory_assoc(Type)]` are auto-created via
+            /// `Type::factory().create(pool).await` when no explicit value was set.
+            /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
+            /// to skip the extra insert.
+            ///
+            /// Panics if the insert fails or if a cyclic association chain is detected
+            /// (depth > 32).
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                let __depth = ::autumn_web::__private::FACTORY_DEPTH
+                    .try_with(|d| d + 1)
+                    .unwrap_or(1_u32);
+                assert!(
+                    __depth <= 32,
+                    "factory `{}`: cyclic #[factory_assoc] chain exceeds depth 32 — \
+                     break the cycle by supplying a pre-built instance via a pre-built setter.",
+                    stringify!(#name),
+                );
+                ::autumn_web::__private::FACTORY_DEPTH
+                    .scope(__depth, async move { #create_inner_body })
+                    .await
+            }
+        }
+    } else {
+        quote! {
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Panics if the insert fails.
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                #create_inner_body
+            }
+        }
+    };
+
     quote! {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
         #[derive(::serde::Serialize, ::serde::Deserialize)]
@@ -396,6 +702,63 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #(#draft_accessors)*
+        }
+
+        /// Factory builder for [`#name`].
+        ///
+        /// Produced by [`#name::factory()`]. All fields are pre-filled with
+        /// `Default::default()` so callers only need to specify the fields that
+        /// matter for their scenario.
+        #[derive(Debug, Clone)]
+        #vis struct #factory_name {
+            #(#factory_struct_fields,)*
+        }
+
+        impl ::core::default::Default for #factory_name {
+            fn default() -> Self {
+                Self {
+                    #(#factory_default_fields,)*
+                }
+            }
+        }
+
+        impl #factory_name {
+            #(#factory_setters)*
+
+            /// Build a [`#new_name`] instance from the current factory state.
+            ///
+            /// Does not touch the database. Use [`#factory_name::create`] to
+            /// also persist the record.
+            #[must_use]
+            pub fn build(self) -> #new_name {
+                #new_name {
+                    #(#factory_build_fields,)*
+                }
+            }
+
+            #factory_create_method
+        }
+
+        impl #name {
+            /// Create a factory builder for constructing [`#name`] instances.
+            ///
+            /// Returns a [`#factory_name`] with all fields at their [`Default`]
+            /// value. Override any subset with the fluent setter methods, then call
+            /// `build()` for an in-memory instance or `create(pool)` to persist it.
+            #[must_use]
+            pub fn factory() -> #factory_name {
+                #factory_name::default()
+            }
+
+            /// Returns the primary-key value of this model.
+            ///
+            /// Used by generated `#[factory_assoc]` code to extract the PK from a
+            /// pre-built associated instance without hardcoding the field name.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_pk(&self) -> #pk_ty {
+                self.#pk_id.clone()
+            }
         }
     }
 }

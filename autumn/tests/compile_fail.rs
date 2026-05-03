@@ -66,6 +66,14 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_draft_accessors.rs");
 
+    // Model factory builder (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_factory.rs");
+
+    // Model factory composition (#[factory_assoc]) — requires db feature
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_factory_composition.rs");
+
     // Repository compile-pass (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_no_hooks.rs");
