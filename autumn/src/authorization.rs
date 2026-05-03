@@ -218,16 +218,24 @@ pub trait Policy<R: Send + Sync + 'static>: Send + Sync + 'static {
     /// Decide whether the current user may *create* a resource of
     /// this type.
     ///
-    /// `can_create` takes no `&R` argument because, at the moment
-    /// the framework asks "may this user create one of these?",
-    /// no instance exists yet — only the proposed insert payload
-    /// (typically `NewR`). Implementations therefore decide based
-    /// on `ctx.user_id` and `ctx.roles` alone. The
+    /// `can_create` receives the proposed JSON payload so policies
+    /// can enforce ownership/tenant invariants before insert. The
     /// `#[repository(policy = ...)]`-generated `POST` handler
     /// invokes this *before* the insert so a denied check never
     /// commits a row.
     fn can_create<'a>(&'a self, _ctx: &'a PolicyContext) -> BoxFuture<'a, bool> {
         Box::pin(async { false })
+    }
+
+    /// Decide whether the current user may create the proposed
+    /// payload. Default behavior preserves compatibility by
+    /// delegating to [`Policy::can_create`].
+    fn can_create_payload<'a>(
+        &'a self,
+        ctx: &'a PolicyContext,
+        _payload: &'a serde_json::Value,
+    ) -> BoxFuture<'a, bool> {
+        self.can_create(ctx)
     }
 
     /// Decide whether the current user may *update* the resource.
@@ -668,11 +676,12 @@ where
 pub async fn __check_policy_create<R>(
     state: &crate::AppState,
     session: &Session,
+    payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
 {
-    authorize_create::<R>(state, session).await
+    authorize_create::<R>(state, session, payload).await
 }
 
 /// Run a policy's `can_create` check before persisting a new record.
@@ -689,6 +698,7 @@ where
 pub async fn authorize_create<R>(
     state: &crate::AppState,
     session: &Session,
+    payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
@@ -703,7 +713,7 @@ where
 
     let ctx = PolicyContext::from_request(state, session).await;
 
-    if policy.can_create(&ctx).await {
+    if policy.can_create_payload(&ctx, payload).await {
         Ok(())
     } else {
         Err(state.forbidden_response().into_error())
@@ -1054,7 +1064,8 @@ mod tests {
     async fn authorize_create_returns_500_when_no_policy_registered() {
         let state = crate::AppState::detached();
         let session = session_with(Some("42"), None);
-        let err = authorize_create::<Note>(&state, &session)
+        let payload = serde_json::json!({"author_id": 42});
+        let err = authorize_create::<Note>(&state, &session, &payload)
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1076,11 +1087,14 @@ mod tests {
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
 
         let anon = session_with(None, None);
-        let err = authorize_create::<Note>(&state, &anon).await.unwrap_err();
+        let payload = serde_json::json!({"author_id": 1});
+        let err = authorize_create::<Note>(&state, &anon, &payload)
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let user = session_with(Some("1"), None);
-        authorize_create::<Note>(&state, &user)
+        authorize_create::<Note>(&state, &user, &payload)
             .await
             .expect("authenticated user passes can_create");
     }

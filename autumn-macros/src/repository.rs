@@ -528,6 +528,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::authorization::__check_policy_create::<#model_name>(
                     &__autumn_state,
                     &__autumn_session,
+                    &::autumn_web::reexports::serde_json::to_value(&new)
+                        .map_err(::autumn_web::AutumnError::from)?,
                 )
                 .await?;
             }
