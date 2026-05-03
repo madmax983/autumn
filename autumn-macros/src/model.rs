@@ -757,7 +757,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[inline]
             pub fn __autumn_pk(&self) -> #pk_ty {
-                self.#pk_id
+                self.#pk_id.clone()
             }
         }
     }
