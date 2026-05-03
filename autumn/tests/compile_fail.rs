@@ -77,6 +77,8 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_policy.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_policy_non_serialize_new.rs");
 
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
