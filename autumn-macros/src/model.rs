@@ -91,10 +91,25 @@ fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
 fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     for field in fields {
         for attr in &field.attrs {
-            if attr.path().is_ident("factory_assoc")
-                && let Err(err) = attr.parse_args::<syn::Ident>()
-            {
-                return Some(err.to_compile_error());
+            if attr.path().is_ident("factory_assoc") {
+                // Reject unparseable attribute argument.
+                if let Err(err) = attr.parse_args::<syn::Ident>() {
+                    return Some(err.to_compile_error());
+                }
+                // Reject Option<T> fields — the factory uses Option<T> itself to
+                // represent "not yet set vs. explicit value", so Option<Option<T>>
+                // would be generated, leading to an arm-type mismatch in create().
+                if is_option_type(&field.ty) {
+                    return Some(
+                        syn::Error::new_spanned(
+                            attr,
+                            "#[factory_assoc] cannot be applied to an Option<T> field; \
+                             factory_assoc is designed for non-nullable FK fields (e.g. i64). \
+                             Use a plain field setter to supply a nullable association.",
+                        )
+                        .to_compile_error(),
+                    );
+                }
             }
         }
     }
@@ -511,63 +526,80 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Depth-guard block — only emitted when there are assoc fields.
+    // create() inner body — shared by both the assoc and non-assoc paths.
+    let create_inner_body = quote! {
+        use ::autumn_web::reexports::diesel::prelude::*;
+        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        #(#assoc_resolutions)*
+
+        let new_record = #new_name {
+            #(#create_build_fields,)*
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .expect("factory: failed to acquire db connection");
+        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+            .values(&new_record)
+            .returning(#name::as_returning())
+            .get_result(&mut *conn)
+            .await
+            .expect("factory: insert failed")
+    };
+
+    // create() — insert via Diesel and return the persisted model.
     //
-    // Uses the shared `::autumn_web::__private` depth counter so the limit
-    // applies to the total chain depth across ALL model types (not per-model),
-    // bounding cross-model cycles such as A → B → A → B → ….
-    // A RAII drop guard ensures the counter is decremented even on panic.
-    let depth_guard_enter = if has_assoc_fields {
+    // For models with #[factory_assoc] fields, the body is wrapped in a
+    // `tokio::task_local` scope so the depth counter is maintained correctly
+    // when the future migrates between worker threads (work-stealing runtimes).
+    // Thread-local storage would corrupt the counter across await points.
+    let factory_create_method = if has_assoc_fields {
         quote! {
-            struct __AutumnFactoryDepthGuard;
-            impl ::core::ops::Drop for __AutumnFactoryDepthGuard {
-                fn drop(&mut self) {
-                    ::autumn_web::__private::factory_depth_exit();
-                }
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Fields annotated with `#[factory_assoc(Type)]` are auto-created via
+            /// `Type::factory().create(pool).await` when no explicit value was set.
+            /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
+            /// to skip the extra insert.
+            ///
+            /// Panics if the insert fails or if a cyclic association chain is detected
+            /// (depth > 32). Intended for use in tests only.
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                let __depth = ::autumn_web::__private::FACTORY_DEPTH
+                    .try_with(|d| d + 1)
+                    .unwrap_or(1_u32);
+                assert!(
+                    __depth <= 32,
+                    "factory `{}`: cyclic #[factory_assoc] chain exceeds depth 32 — \
+                     break the cycle by supplying a pre-built instance via a pre-built setter.",
+                    stringify!(#name),
+                );
+                ::autumn_web::__private::FACTORY_DEPTH
+                    .scope(__depth, async move { #create_inner_body })
+                    .await
             }
-            ::autumn_web::__private::factory_depth_enter(stringify!(#name));
-            let _depth_guard = __AutumnFactoryDepthGuard;
         }
     } else {
-        quote! {}
-    };
-    // create() — insert via Diesel and return the persisted model.
-    let factory_create_method = quote! {
-        /// Insert a record built from this factory into the database and return
-        /// the fully-populated model (with server-assigned primary key).
-        ///
-        /// Fields annotated with `#[factory_assoc(Type)]` are auto-created via
-        /// `Type::factory().create(pool).await` when no explicit value was set.
-        /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
-        /// to skip the extra insert.
-        ///
-        /// Panics if the insert fails or if a cyclic association chain is detected
-        /// (depth > 32). Intended for use in tests only.
-        pub async fn create(
-            self,
-            pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-            >,
-        ) -> #name {
-            #depth_guard_enter
-            use ::autumn_web::reexports::diesel::prelude::*;
-            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-
-            #(#assoc_resolutions)*
-
-            let new_record = #new_name {
-                #(#create_build_fields,)*
-            };
-            let mut conn = pool
-                .get()
-                .await
-                .expect("factory: failed to acquire db connection");
-            ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
-                .values(&new_record)
-                .returning(#name::as_returning())
-                .get_result(&mut *conn)
-                .await
-                .expect("factory: insert failed")
+        quote! {
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Panics if the insert fails. Intended for use in tests only.
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                #create_inner_body
+            }
         }
     };
 

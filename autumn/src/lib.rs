@@ -158,33 +158,14 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// Shared factory creation depth counter — bounds cyclic `#[factory_assoc]`
-        /// chains across all model types in a single chain.
-        static FACTORY_DEPTH: Cell<u32> = const { Cell::new(0) };
-    }
-
-    /// Called at the top of every generated `create()` method.
-    ///
-    /// Increments the shared depth counter and panics if it exceeds 32,
-    /// which indicates a cyclic association chain.
-    pub fn factory_depth_enter(model_name: &str) {
-        FACTORY_DEPTH.with(|d| {
-            let v = d.get();
-            assert!(
-                v < 32,
-                "factory `{model_name}`: cyclic #[factory_assoc] chain exceeds depth 32 — \
-                 break the cycle by supplying a pre-built instance via a pre-built setter.",
-            );
-            d.set(v + 1);
-        });
-    }
-
-    /// Called (via RAII drop guard) at the end of every generated `create()` method.
-    pub fn factory_depth_exit() {
-        FACTORY_DEPTH.with(|d| d.set(d.get() - 1));
+    // Shared factory creation depth — bounds cyclic `#[factory_assoc]` chains
+    // across all models in a single create() chain.
+    //
+    // Task-local (not thread-local) so it is maintained correctly when a
+    // generated async `create()` future migrates between worker threads on a
+    // work-stealing runtime such as Tokio's multi-thread scheduler.
+    tokio::task_local! {
+        pub static FACTORY_DEPTH: u32;
     }
 }
 
