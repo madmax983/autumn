@@ -71,6 +71,26 @@ pub const HTMX_VERSION: &str = "2.0.4";
 /// conditional rendering (e.g. sending back partials instead of full pages).
 ///
 /// See <https://htmx.org/reference/#request_headers> for more details.
+///
+/// ## Examples
+///
+/// Extracting HTMX headers in an Axum handler to serve partial HTML or a full page:
+///
+/// ```rust,ignore
+/// use autumn_web::htmx::HxRequest;
+/// use autumn_web::prelude::*;
+///
+/// #[get("/dashboard")]
+/// async fn dashboard(hx_request: HxRequest) -> Markup {
+///     if hx_request.is_htmx {
+///         // Return partial HTML for HTMX update
+///         html! { div { "HTMX Partial Content" } }
+///     } else {
+///         // Return full page for standard request
+///         html! { html { body { div { "Full Page Content" } } } }
+///     }
+/// }
+/// ```
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct HxRequest {
