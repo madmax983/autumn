@@ -1488,7 +1488,8 @@ pub struct ScopedGroup {
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
 }
 
-#[cfg(test)]
+pub type CustomLayerApplier = Box<dyn FnOnce(axum::Router<crate::AppState>) -> axum::Router<crate::AppState> + Send>;
+
 mod tests {
 
     #[allow(clippy::wildcard_imports, unused_imports)]
@@ -2296,8 +2297,7 @@ mod tests {
     }
 }
 
-pub(crate) type CustomLayerApplier =
-    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+
 use std::any::TypeId;
 
 pub struct CustomLayerRegistration {

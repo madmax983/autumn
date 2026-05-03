@@ -248,10 +248,6 @@ pub struct AppBuilder {
 /// [`tower::Layer`] to the app-wide router.
 ///
 /// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
-/// `apply_middleware` where the final layer stack is assembled.
-pub(crate) type CustomLayerApplier =
-    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
-
 mod sealed {
     pub trait Sealed {}
 }
