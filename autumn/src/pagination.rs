@@ -862,6 +862,56 @@ mod tests {
     }
 
     #[test]
+    fn page_boundaries_and_values() {
+        // Test `p >= 1` boundary in `page()`
+        let r_one = PageRequest::new(1, 10);
+        assert_eq!(r_one.page(), 1);
+
+        // Test normal page value
+        let r_two = PageRequest::new(2, 10);
+        assert_eq!(r_two.page(), 2);
+    }
+
+    #[test]
+    fn limit_matches_size() {
+        // Default size
+        let r_default = PageRequest::new(1, 0);
+        assert_eq!(r_default.size(), DEFAULT_PAGE_SIZE);
+        assert_eq!(r_default.limit(), i64::from(DEFAULT_PAGE_SIZE));
+
+        // Normal size
+        let r_normal = PageRequest::new(1, 42);
+        assert_eq!(r_normal.size(), 42);
+        assert_eq!(r_normal.limit(), 42);
+
+        // Max size
+        let r_max = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(r_max.size(), MAX_PAGE_SIZE);
+        assert_eq!(r_max.limit(), i64::from(MAX_PAGE_SIZE));
+
+        // Exceeds max
+        let r_over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(r_over.size(), MAX_PAGE_SIZE);
+        assert_eq!(r_over.limit(), i64::from(MAX_PAGE_SIZE));
+    }
+
+    #[test]
+    fn cursor_limit_and_fetch_limit() {
+        // Cursor limits
+        let cr = CursorRequest::new(None, 42);
+        assert_eq!(cr.limit(), 42);
+        assert_eq!(cr.fetch_limit(), 43); // limit + 1
+
+        let cr_max = CursorRequest::new(None, MAX_PAGE_SIZE);
+        assert_eq!(cr_max.limit(), i64::from(MAX_PAGE_SIZE));
+        assert_eq!(cr_max.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
+
+        let cr_zero = CursorRequest::new(None, 0);
+        assert_eq!(cr_zero.limit(), i64::from(DEFAULT_PAGE_SIZE));
+        assert_eq!(cr_zero.fetch_limit(), i64::from(DEFAULT_PAGE_SIZE) + 1);
+    }
+
+    #[test]
     fn size_is_clamped_to_max() {
         let r = PageRequest::new(1, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
