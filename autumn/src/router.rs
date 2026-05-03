@@ -88,10 +88,17 @@ pub enum RouterBuildError {
 /// Panics when framework router assembly encounters invalid configuration.
 /// Use [`try_build_router`] to handle configuration errors explicitly.
 #[allow(dead_code)]
-pub fn build_router(
-    route_list: Vec<Route>,
+pub fn build_router<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
+    state: S,
 ) -> axum::Router {
     try_build_router(route_list, config, state)
         .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
@@ -104,16 +111,16 @@ pub fn build_router(
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
-pub struct RouterContext {
+pub struct RouterContext<S = AppState> {
     pub exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    pub scoped_groups: Vec<ScopedGroup>,
-    pub merge_routers: Vec<axum::Router<AppState>>,
-    pub nest_routers: Vec<(String, axum::Router<AppState>)>,
+    pub scoped_groups: Vec<ScopedGroup<S>>,
+    pub merge_routers: Vec<axum::Router<S>>,
+    pub nest_routers: Vec<(String, axum::Router<S>)>,
     /// Custom Tower layers registered via
     /// [`AppBuilder::layer`](crate::app::AppBuilder::layer). Applied inside
     /// [`RequestIdLayer`] on the ingress
     /// path so user middleware observes the generated request ID.
-    pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    pub custom_layers: Vec<crate::app::CustomLayerRegistration<S>>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -136,10 +143,17 @@ pub struct RouterContext {
 ///
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
-pub fn try_build_router(
-    route_list: Vec<Route>,
+pub fn try_build_router<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
+    state: S,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
     let router = try_build_router_inner(
@@ -176,12 +190,19 @@ pub fn try_build_router(
 /// Panics when framework router assembly encounters invalid configuration.
 /// Use [`try_build_router_merged`] to handle configuration errors explicitly.
 #[allow(dead_code)]
-pub fn build_router_merged(
-    route_list: Vec<Route>,
+pub fn build_router_merged<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    state: S,
+    merge_routers: Vec<axum::Router<S>>,
+    nest_routers: Vec<(String, axum::Router<S>)>,
 ) -> axum::Router {
     try_build_router_merged(route_list, config, state, merge_routers, nest_routers)
         .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
@@ -195,12 +216,19 @@ pub fn build_router_merged(
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
 #[allow(dead_code)]
-pub fn try_build_router_merged(
-    route_list: Vec<Route>,
+pub fn try_build_router_merged<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
+    state: S,
+    merge_routers: Vec<axum::Router<S>>,
+    nest_routers: Vec<(String, axum::Router<S>)>,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
     let router = try_build_router_inner(
@@ -226,11 +254,18 @@ pub fn try_build_router_merged(
     ))
 }
 
-pub fn try_build_router_inner(
-    route_list: Vec<Route>,
+pub fn try_build_router_inner<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
-    ctx: RouterContext,
+    state: S,
+    ctx: RouterContext<S>,
 ) -> Result<axum::Router, RouterBuildError> {
     // Fail-fast if an OpenAPI mount path collides with a user or
     // framework GET route — axum panics on overlapping method routes,
@@ -337,11 +372,11 @@ fn extract_path_params(path: &str) -> Vec<String> {
 /// so the `/v3/api-docs` handler performs no serialization per request.
 #[cfg(feature = "openapi")]
 #[allow(clippy::too_many_lines)]
-fn build_openapi_router(
-    route_list: &[Route],
-    scoped_groups: &[ScopedGroup],
+fn build_openapi_router<S: Clone + Send + Sync + 'static>(
+    route_list: &[Route<S>],
+    scoped_groups: &[ScopedGroup<S>],
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
-) -> Result<Option<axum::Router<AppState>>, RouterBuildError> {
+) -> Result<Option<axum::Router<S>>, RouterBuildError> {
     let Some(config) = openapi_config else {
         return Ok(None);
     };
@@ -410,7 +445,7 @@ fn build_openapi_router(
     let swagger_path = config.swagger_ui_path.clone();
     let title = config.title.clone();
 
-    let mut router = axum::Router::<AppState>::new().route(
+    let mut router = axum::Router::<S>::new().route(
         &json_path,
         axum::routing::get(move || {
             let spec = spec_body.clone();
@@ -612,12 +647,12 @@ fn validate_route_path(field: &'static str, value: &str) -> Result<(), RouterBui
 /// We emit a `tracing::warn!` so operators know the check is
 /// incomplete in that case.
 #[cfg(feature = "openapi")]
-fn reject_openapi_path_collisions(
+fn reject_openapi_path_collisions<S>(
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
-    route_list: &[Route],
-    scoped_groups: &[ScopedGroup],
-    merge_routers: &[axum::Router<AppState>],
-    nest_routers: &[(String, axum::Router<AppState>)],
+    route_list: &[Route<S>],
+    scoped_groups: &[ScopedGroup<S>],
+    merge_routers: &[axum::Router<S>],
+    nest_routers: &[(String, axum::Router<S>)],
     config: &AutumnConfig,
 ) -> Result<(), RouterBuildError> {
     let Some(openapi) = openapi_config else {
@@ -704,11 +739,11 @@ fn reject_openapi_path_collisions(
 /// any nest prefixes. Returns an `OpenApiPathCollision` error on
 /// collision.
 #[cfg(feature = "openapi")]
-fn check_openapi_path_against(
+fn check_openapi_path_against<S>(
     field: &'static str,
     path: &str,
     claimed: &std::collections::HashSet<String>,
-    nest_routers: &[(String, axum::Router<AppState>)],
+    nest_routers: &[(String, axum::Router<S>)],
 ) -> Result<(), RouterBuildError> {
     if claimed.contains(path) {
         return Err(RouterBuildError::OpenApiPathCollision {
@@ -733,12 +768,14 @@ fn check_openapi_path_against(
     Ok(())
 }
 
-fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
+fn group_and_mount_routes<S: Clone + Send + Sync + 'static>(
+    route_list: Vec<Route<S>>,
+) -> axum::Router<S> {
     // Group routes by path so multiple methods on the same path
     // (e.g. GET /admin + POST /admin) are merged into a single
     // MethodRouter. Axum 0.7+ panics if .route() is called twice
     // with the same path — merging avoids this.
-    let mut grouped: indexmap::IndexMap<&str, axum::routing::MethodRouter<AppState>> =
+    let mut grouped: indexmap::IndexMap<&str, axum::routing::MethodRouter<S>> =
         indexmap::IndexMap::new();
     for route in &route_list {
         tracing::debug!(
@@ -764,10 +801,10 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
     router
 }
 
-fn mount_framework_routes(
-    mut router: axum::Router<AppState>,
+fn mount_framework_routes<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     dev_reload_enabled: bool,
-) -> axum::Router<AppState> {
+) -> axum::Router<S> {
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
@@ -809,35 +846,35 @@ fn mount_framework_routes(
     router
 }
 
-fn mount_probe_endpoints(
-    mut router: axum::Router<AppState>,
+fn mount_probe_endpoints<S: crate::probe::ProvideProbeState + Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> (std::collections::HashSet<String>, axum::Router<AppState>) {
+) -> (std::collections::HashSet<String>, axum::Router<S>) {
     // Probe endpoints (auto-mounted)
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
     if mounted_probe_paths.insert(config.health.live_path.clone()) {
         router = router.route(
             &config.health.live_path,
-            axum::routing::get(crate::probe::live_handler::<AppState>),
+            axum::routing::get(crate::probe::live_handler::<S>),
         );
     }
     if mounted_probe_paths.insert(config.health.ready_path.clone()) {
         router = router.route(
             &config.health.ready_path,
-            axum::routing::get(crate::probe::ready_handler::<AppState>),
+            axum::routing::get(crate::probe::ready_handler::<S>),
         );
     }
     if mounted_probe_paths.insert(config.health.startup_path.clone()) {
         router = router.route(
             &config.health.startup_path,
-            axum::routing::get(crate::probe::startup_handler::<AppState>),
+            axum::routing::get(crate::probe::startup_handler::<S>),
         );
     }
     if mounted_probe_paths.insert(config.health.path.clone()) {
         router = router.route(
             &config.health.path,
-            axum::routing::get(crate::health::handler::<AppState>),
+            axum::routing::get(crate::health::handler::<S>),
         );
     }
     tracing::debug!(
@@ -851,11 +888,13 @@ fn mount_probe_endpoints(
     (mounted_probe_paths, router)
 }
 
-fn mount_actuator_endpoints(
-    mut router: axum::Router<AppState>,
+fn mount_actuator_endpoints<
+    S: crate::actuator::ProvideActuatorState + Clone + Send + Sync + 'static,
+>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
     mounted_probe_paths: &std::collections::HashSet<String>,
-) -> Result<axum::Router<AppState>, RouterBuildError> {
+) -> Result<axum::Router<S>, RouterBuildError> {
     // Actuator endpoints
     let actuator_sensitive = config.actuator.sensitive;
     let actuator_paths =
@@ -882,13 +921,13 @@ fn mount_actuator_endpoints(
     Ok(router)
 }
 
-fn mount_scoped_groups(
-    mut router: axum::Router<AppState>,
-    scoped_groups: Vec<ScopedGroup>,
-) -> axum::Router<AppState> {
+fn mount_scoped_groups<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
+    scoped_groups: Vec<ScopedGroup<S>>,
+) -> axum::Router<S> {
     // Mount scoped route groups (each with its own middleware layer).
     for group in scoped_groups {
-        let mut sub_router = axum::Router::new();
+        let mut sub_router = axum::Router::<S>::new();
         for route in group.routes {
             tracing::debug!(
                 method = %route.method,
@@ -905,11 +944,11 @@ fn mount_scoped_groups(
     router
 }
 
-fn mount_raw_routers(
-    mut router: axum::Router<AppState>,
-    merge_routers: Vec<axum::Router<AppState>>,
-    nest_routers: Vec<(String, axum::Router<AppState>)>,
-) -> axum::Router<AppState> {
+fn mount_raw_routers<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
+    merge_routers: Vec<axum::Router<S>>,
+    nest_routers: Vec<(String, axum::Router<S>)>,
+) -> axum::Router<S> {
     // Merge user-supplied raw Axum routers (escape hatch).
     // Merged after annotated routes so annotated routes take precedence.
     for raw_router in merge_routers {
@@ -925,10 +964,10 @@ fn mount_raw_routers(
     router
 }
 
-fn apply_cors_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_cors_middleware<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S> {
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -942,10 +981,10 @@ fn apply_cors_middleware(
     router
 }
 
-fn apply_csrf_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_csrf_middleware<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S> {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
@@ -955,10 +994,10 @@ fn apply_csrf_middleware(
     router
 }
 
-fn apply_rate_limit_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_rate_limit_middleware<S: Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S> {
     // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
         let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
@@ -972,10 +1011,10 @@ fn apply_rate_limit_middleware(
     router
 }
 
-fn apply_upload_middleware(
-    router: axum::Router<AppState>,
+fn apply_upload_middleware<S: Clone + Send + Sync + 'static>(
+    router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S> {
     let upload_config = config.security.upload.clone();
     tracing::info!(
         max_request_size_bytes = upload_config.max_request_size_bytes,
@@ -995,15 +1034,15 @@ fn apply_upload_middleware(
     ))
 }
 
-fn apply_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_middleware<S: crate::actuator::ProvideActuatorState + Clone + Send + Sync + 'static>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-    state: &AppState,
+    state: &S,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
-    custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    custom_layers: Vec<crate::app::CustomLayerRegistration<S>>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
-) -> Result<axum::Router<AppState>, RouterBuildError> {
+) -> Result<axum::Router<S>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
     router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
@@ -1074,7 +1113,9 @@ fn apply_middleware(
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer)
         .layer(ExceptionFilterLayer::new(all_filters))
-        .layer(crate::middleware::MetricsLayer::new(state.metrics.clone()));
+        .layer(crate::middleware::MetricsLayer::new(
+            state.metrics().clone(),
+        ));
 
     Ok(router)
 }
@@ -1101,10 +1142,17 @@ fn apply_middleware(
 /// Use [`try_build_router_with_static`] to handle configuration errors
 /// explicitly.
 #[allow(dead_code)]
-pub fn build_router_with_static(
-    route_list: Vec<Route>,
+pub fn build_router_with_static<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
+    state: S,
     dist_dir: Option<&std::path::Path>,
 ) -> axum::Router {
     try_build_router_with_static(route_list, config, state, dist_dir)
@@ -1119,10 +1167,17 @@ pub fn build_router_with_static(
 /// Returns [`RouterBuildError`] when router assembly encounters invalid
 /// framework configuration, such as an unusable session backend.
 #[allow(dead_code)]
-pub fn try_build_router_with_static(
-    route_list: Vec<Route>,
+pub fn try_build_router_with_static<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
+    state: S,
     dist_dir: Option<&std::path::Path>,
 ) -> Result<axum::Router, RouterBuildError> {
     try_build_router_with_static_inner(
@@ -1144,12 +1199,19 @@ pub fn try_build_router_with_static(
     )
 }
 
-pub fn try_build_router_with_static_inner(
-    route_list: Vec<Route>,
+pub fn try_build_router_with_static_inner<
+    S: crate::actuator::ProvideActuatorState
+        + crate::probe::ProvideProbeState
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+>(
+    route_list: Vec<Route<S>>,
     config: &AutumnConfig,
-    state: AppState,
+    state: S,
     dist_dir: Option<&std::path::Path>,
-    ctx: RouterContext,
+    ctx: RouterContext<S>,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
     let app_router = try_build_router_inner(route_list, config, state, ctx)?;
@@ -1257,8 +1319,8 @@ pub fn try_build_router_with_static_inner(
 }
 
 #[derive(Clone)]
-struct StartupBarrierState {
-    app_state: AppState,
+struct StartupBarrierState<S> {
+    app_state: S,
     live_path: String,
     ready_path: String,
     startup_path: String,
@@ -1267,8 +1329,8 @@ struct StartupBarrierState {
     actuator_subtree_paths: Vec<String>,
 }
 
-impl StartupBarrierState {
-    fn from_config(config: &AutumnConfig, app_state: &AppState) -> Self {
+impl<S: Clone> StartupBarrierState<S> {
+    fn from_config(config: &AutumnConfig, app_state: &S) -> Self {
         let actuator_subtree_paths = if config.actuator.sensitive {
             vec![crate::actuator::actuator_route_path(
                 &config.actuator.prefix,
@@ -1305,10 +1367,10 @@ impl StartupBarrierState {
     }
 }
 
-fn apply_startup_barrier(
+fn apply_startup_barrier<S: crate::probe::ProvideProbeState + Clone + Send + Sync + 'static>(
     router: axum::Router,
     config: &AutumnConfig,
-    state: &AppState,
+    state: &S,
 ) -> axum::Router {
     let barrier_state = StartupBarrierState::from_config(config, state);
     let router = router.layer(axum::middleware::from_fn_with_state(
@@ -1327,8 +1389,8 @@ fn apply_startup_barrier(
     router
 }
 
-async fn startup_barrier(
-    State(state): State<StartupBarrierState>,
+async fn startup_barrier<S: crate::probe::ProvideProbeState + Clone + Send + Sync + 'static>(
+    State(state): State<StartupBarrierState<S>>,
     request: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
@@ -1930,7 +1992,7 @@ mod tests {
         };
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
-        let router = super::build_openapi_router(&[], &[group], Some(&config))
+        let router = super::build_openapi_router::<AppState>(&[], &[group], Some(&config))
             .expect("openapi sub-router builds")
             .expect("openapi sub-router present when config is Some");
         let state = test_state();
@@ -1966,7 +2028,7 @@ mod tests {
     fn openapi_rejects_json_path_without_leading_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("openapi.json");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -1984,7 +2046,7 @@ mod tests {
         // endpoints are static. Catch it before axum panics.
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id}");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("captures should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1994,7 +2056,7 @@ mod tests {
     fn openapi_rejects_path_with_unbalanced_brace() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("unbalanced brace should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2004,7 +2066,7 @@ mod tests {
     fn openapi_rejects_path_with_wildcard() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/*rest");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("wildcard should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2014,7 +2076,7 @@ mod tests {
     fn openapi_rejects_path_with_double_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("//docs");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("double-slash should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2024,7 +2086,7 @@ mod tests {
     fn openapi_rejects_swagger_ui_path_without_leading_slash() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .swagger_ui_path(Some("docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -2039,7 +2101,7 @@ mod tests {
     #[test]
     fn openapi_rejects_empty_json_path() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("empty path should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2050,7 +2112,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/api-docs")
             .swagger_ui_path(Some("/ui".to_owned()));
-        let out = super::build_openapi_router(&[], &[], Some(&config))
+        let out = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect("valid paths must not error");
         assert!(out.is_some());
     }
@@ -2061,7 +2123,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/docs")
             .swagger_ui_path(Some("/docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router::<AppState>(&[], &[], Some(&config))
             .expect_err("colliding paths should be rejected before axum panics");
         assert!(matches!(
             err,

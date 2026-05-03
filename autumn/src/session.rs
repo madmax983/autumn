@@ -745,12 +745,12 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
-pub(crate) fn apply_session_layer(
-    router: axum::Router<crate::state::AppState>,
+pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
+    router: axum::Router<S>,
     config: &SessionConfig,
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
-) -> Result<axum::Router<crate::state::AppState>, SessionBackendConfigError> {
+) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"

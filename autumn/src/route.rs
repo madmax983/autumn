@@ -82,7 +82,7 @@ pub struct RepositoryApiMeta {
 /// let route_vec: Vec<autumn_web::Route> = routes![hello];
 /// assert_eq!(route_vec.len(), 1);
 /// ```
-pub struct Route {
+pub struct Route<S = AppState> {
     /// HTTP method (`GET`, `POST`, `PUT`, `DELETE`, etc.).
     pub method: Method,
 
@@ -90,7 +90,7 @@ pub struct Route {
     pub path: &'static str,
 
     /// Axum [`MethodRouter`] that handles requests matching this route.
-    pub handler: MethodRouter<AppState>,
+    pub handler: MethodRouter<S>,
 
     /// Handler function name, used for startup logging
     /// (e.g., `"hello"`, `"create_item"`).

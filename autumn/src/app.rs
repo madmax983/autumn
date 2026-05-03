@@ -244,14 +244,13 @@ pub struct AppBuilder {
 ///
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
-pub(crate) struct ScopedGroup {
+pub(crate) struct ScopedGroup<S = AppState> {
     pub(crate) prefix: String,
-    pub(crate) routes: Vec<Route>,
+    pub(crate) routes: Vec<Route<S>>,
     /// Registration origin: user application or a named plugin.
     pub(crate) source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
-    pub(crate) apply_layer:
-        Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
+    pub(crate) apply_layer: Box<dyn FnOnce(axum::Router<S>) -> axum::Router<S> + Send>,
 }
 
 /// A deferred router mutator that applies a user-registered
@@ -259,15 +258,15 @@ pub(crate) struct ScopedGroup {
 ///
 /// Stored on [`AppBuilder`] by [`AppBuilder::layer`] and drained inside
 /// `apply_middleware` where the final layer stack is assembled.
-pub(crate) type CustomLayerApplier =
-    Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>;
+pub(crate) type CustomLayerApplier<S = AppState> =
+    Box<dyn FnOnce(axum::Router<S>) -> axum::Router<S> + Send>;
 
 /// Metadata and deferred application closure for a user-registered layer.
-pub(crate) struct CustomLayerRegistration {
+pub(crate) struct CustomLayerRegistration<S = AppState> {
     /// Concrete type for the registered layer.
     pub(crate) type_id: TypeId,
     /// Deferred router mutation that applies the layer.
-    pub(crate) apply: CustomLayerApplier,
+    pub(crate) apply: CustomLayerApplier<S>,
 }
 
 mod sealed {
