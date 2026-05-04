@@ -4,25 +4,25 @@ mod build_support;
 use build_support::{TailwindFailureAction, tailwind_failure_action};
 
 #[test]
-fn tailwind_failure_uses_checked_in_css_when_available() {
+fn tailwind_failure_is_optional_when_css_exists() {
     assert_eq!(
-        tailwind_failure_action(true, false),
-        TailwindFailureAction::UseCheckedInCss
+        tailwind_failure_action(false),
+        TailwindFailureAction::SkipRegeneration
     );
 }
 
 #[test]
-fn tailwind_failure_fails_when_css_is_missing() {
+fn tailwind_failure_is_optional_when_css_is_missing() {
     assert_eq!(
-        tailwind_failure_action(false, false),
-        TailwindFailureAction::FailBuild
+        tailwind_failure_action(false),
+        TailwindFailureAction::SkipRegeneration
     );
 }
 
 #[test]
 fn tailwind_failure_fails_when_tailwind_is_required() {
     assert_eq!(
-        tailwind_failure_action(true, true),
+        tailwind_failure_action(true),
         TailwindFailureAction::FailBuild
     );
 }

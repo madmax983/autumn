@@ -44,8 +44,10 @@ That stack brings up:
 - `bookmarks-1`, `bookmarks-2`, `bookmarks-3`
 - `load-balancer` on <http://localhost:3000>
 
-The checked-in `static/css/autumn.css` is enough for the container image. You do
-not need to run `autumn setup` just to boot the Docker stack.
+Generated `static/css/autumn.css` is intentionally ignored. You do not need to
+run `autumn setup` just to compile or test the example; the build skips CSS
+regeneration when Tailwind is unavailable. Set `AUTUMN_REQUIRE_TAILWIND=true`
+when you explicitly want missing or broken Tailwind to fail the build.
 The web replicas wait until the standby has replayed the latest Diesel migration
 version before they start serving traffic.
 

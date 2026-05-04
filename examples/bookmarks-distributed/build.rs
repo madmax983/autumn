@@ -1,7 +1,5 @@
 mod build_support;
 
-use std::path::Path;
-
 fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");
@@ -42,14 +40,13 @@ fn main() {
 }
 
 fn handle_tailwind_unavailable(reason: &str) {
-    let checked_in_css_exists = Path::new("static/css/autumn.css").exists();
     let require_tailwind = build_support::require_tailwind_from_env();
-    match build_support::tailwind_failure_action(checked_in_css_exists, require_tailwind) {
+    match build_support::tailwind_failure_action(require_tailwind) {
         build_support::TailwindFailureAction::FailBuild => {
-            panic!("{reason}; no checked-in CSS fallback is available");
+            panic!("{reason}; AUTUMN_REQUIRE_TAILWIND is set");
         }
-        build_support::TailwindFailureAction::UseCheckedInCss => {
-            println!("cargo:warning={reason}; using checked-in static/css/autumn.css");
+        build_support::TailwindFailureAction::SkipRegeneration => {
+            println!("cargo:warning={reason}; skipping static/css/autumn.css regeneration");
         }
     }
 }

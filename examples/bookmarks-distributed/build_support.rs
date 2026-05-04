@@ -1,17 +1,14 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailwindFailureAction {
     FailBuild,
-    UseCheckedInCss,
+    SkipRegeneration,
 }
 
-pub fn tailwind_failure_action(
-    checked_in_css_exists: bool,
-    require_tailwind: bool,
-) -> TailwindFailureAction {
-    if require_tailwind || !checked_in_css_exists {
+pub fn tailwind_failure_action(require_tailwind: bool) -> TailwindFailureAction {
+    if require_tailwind {
         TailwindFailureAction::FailBuild
     } else {
-        TailwindFailureAction::UseCheckedInCss
+        TailwindFailureAction::SkipRegeneration
     }
 }
 
