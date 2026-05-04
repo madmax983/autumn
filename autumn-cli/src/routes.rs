@@ -206,21 +206,25 @@ fn compute_column_widths(routes: &[RouteInfo], headers: &[&str; 5]) -> [usize; 5
     widths
 }
 
+/// Formats a single row of the routes table.
+///
+/// ⚡ Bolt Optimization: Building rows using `format!` iterators collected into
+/// an intermediate vector and then joined to a `String` results in multiple
+/// heap allocations per cell. We avoid this by pre-allocating the required capacity
+/// based on column widths and writing directly into the buffer, saving N allocations per row.
 fn format_row(cells: &[String; 5], widths: &[usize; 5]) -> String {
-    cells
-        .iter()
-        .zip(widths.iter())
-        .enumerate()
-        .map(|(i, (cell, &w))| {
-            if i == 0 {
-                format!("{cell:<w$}")
-            } else {
-                format!("  {cell:<w$}")
-            }
-        })
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+    use std::fmt::Write;
+    let mut out = String::with_capacity(widths.iter().sum::<usize>() + 8);
+    for (i, (cell, &w)) in cells.iter().zip(widths.iter()).enumerate() {
+        if i == 0 {
+            let _ = write!(out, "{cell:<w$}");
+        } else {
+            let _ = write!(out, "  {cell:<w$}");
+        }
+    }
+    let len = out.trim_end().len();
+    out.truncate(len);
+    out
 }
 
 /// Print routes as pretty JSON.
