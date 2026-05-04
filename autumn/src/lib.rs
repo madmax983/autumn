@@ -568,6 +568,32 @@ pub use autumn_macros::scheduled;
 /// Declare a one-off operational task. See [`task::OneOffTaskInfo`].
 pub use autumn_macros::task;
 
+/// Extractor that yields a verified bearer-token principal for API routes.
+///
+/// Must be used with [`auth::RequireApiToken`] middleware. See the
+/// [`auth`] module for a complete quick-start example.
+pub use auth::ApiToken;
+
+/// Tower layer that validates `Authorization: Bearer <token>` on API routes.
+///
+/// Verifies tokens against any [`auth::ApiTokenStore`] implementation.
+/// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
+pub use auth::RequireApiToken;
+
+/// Postgres-backed API token store (requires `db` feature).
+///
+/// Production replacement for [`auth::InMemoryApiTokenStore`]. Hashes tokens
+/// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`].
+#[cfg(feature = "db")]
+pub use auth::DbApiTokenStore;
+
+/// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
+///
+/// Pass to `app().migrations()` so that the `api_tokens` table is created
+/// automatically alongside your application migrations.
+#[cfg(feature = "db")]
+pub use auth::API_TOKEN_MIGRATIONS;
+
 /// Secure a route handler with authentication and optional role checks.
 ///
 /// Applied before a route macro (`#[get]`, `#[post]`, etc.), this attribute
