@@ -315,7 +315,7 @@ async fn openapi_json_endpoint_returns_spec() {
     response.assert_ok();
 
     let body: serde_json::Value = response.json();
-    assert_eq!(body["openapi"], "3.0.3");
+    assert_eq!(body["openapi"], "3.1.0");
     assert_eq!(body["info"]["title"], "Demo");
     assert!(body["paths"]["/hello"].is_object());
     assert!(body["paths"]["/users/{id}"].is_object());

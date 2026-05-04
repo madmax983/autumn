@@ -1377,8 +1377,10 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                // Respect the [openapi] profile gate: if disabled in config,
+                // suppress the endpoint even when .openapi(...) was called.
                 #[cfg(feature = "openapi")]
-                openapi,
+                openapi: if config.openapi_runtime.enabled { openapi } else { None },
             },
         )
         .unwrap_or_else(|error| {
@@ -1508,7 +1510,7 @@ impl AppBuilder {
             telemetry_provider,
             session_store,
             #[cfg(feature = "openapi")]
-                openapi: _,
+            openapi,
             audit_logger: _,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -1526,6 +1528,12 @@ impl AppBuilder {
         #[cfg(feature = "i18n")]
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        // Snapshot ApiDocs before all_routes is moved into the router builder.
+        // The OpenAPI spec write (below) needs these after the router is built.
+        #[cfg(feature = "openapi")]
+        let api_docs_snapshot: Vec<crate::openapi::ApiDoc> =
+            all_routes.iter().map(|r| r.api_doc.clone()).collect();
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -1639,6 +1647,25 @@ impl AppBuilder {
             Err(e) => {
                 eprintln!("\n  \u{2717} Static build failed: {e}");
                 std::process::exit(1);
+            }
+        }
+
+        // When OpenAPI is configured, write the spec to dist/ so consumers
+        // can retrieve a machine-readable API contract alongside the HTML.
+        #[cfg(feature = "openapi")]
+        if let Some(openapi_config) = openapi {
+            let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
+            let spec = crate::openapi::generate_spec(&openapi_config, &docs);
+            match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {
+                Ok(()) => {
+                    eprintln!(
+                        "  \u{2713} OpenAPI spec written \u{2192} {}/openapi.json",
+                        dist_dir.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
             }
         }
     }

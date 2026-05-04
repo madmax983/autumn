@@ -447,6 +447,34 @@ pub struct Components {
 // Spec generator
 // ──────────────────────────────────────────────────────────────────
 
+/// Write the generated OpenAPI spec to `dist/openapi.json` and
+/// `dist/openapi.yaml` inside `dist_dir`.
+///
+/// Called during `autumn build` (when `AUTUMN_BUILD_STATIC=1`) to emit
+/// a machine-readable API contract alongside the pre-rendered HTML pages.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if the directory cannot be created or
+/// either file cannot be written.
+#[cfg(feature = "openapi")]
+pub fn write_openapi_spec_to_dist(
+    spec: &OpenApiSpec,
+    dist_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dist_dir)?;
+
+    let json = serde_json::to_string_pretty(spec)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(dist_dir.join("openapi.json"), &json)?;
+
+    let yaml = serde_yaml::to_string(spec)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
+
+    Ok(())
+}
+
 /// Build an [`OpenApiSpec`] from a collection of routes and user config.
 ///
 /// This is the core of the auto-generation: every route's [`ApiDoc`] is
@@ -524,7 +552,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
     };
 
     OpenApiSpec {
-        openapi: "3.0.3".to_owned(),
+        openapi: "3.1.0".to_owned(),
         info: Info {
             title: config.title.clone(),
             version: config.version.clone(),
@@ -618,24 +646,26 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
             "items": schema_value_for(items),
         }),
         SchemaKind::Nullable(inner) => {
-            // OpenAPI 3.0 has no `type: "null"` (that's a 3.1 feature),
-            // so we use the 3.0-compatible patterns:
-            //   * For a `$ref`, wrap in `allOf` alongside
-            //     `nullable: true` — bare `$ref`s can't carry siblings,
-            //     and `allOf` is the standard workaround.
-            //   * For every other schema body, inject `nullable: true`
-            //     directly onto the existing object.
+            // OpenAPI 3.1 aligns with JSON Schema 2020-12, which supports
+            // `type: "null"` natively:
+            //   * For a `$ref`, use `oneOf: [{$ref: ...}, {type: "null"}]`
+            //     so the ref can stand alone without `allOf` workarounds.
+            //   * For primitives, use the type-array form: `type: ["T", "null"]`.
             if inner.kind == SchemaKind::Ref {
                 serde_json::json!({
-                    "nullable": true,
-                    "allOf": [schema_value_for(inner)],
+                    "oneOf": [
+                        schema_value_for(inner),
+                        { "type": "null" },
+                    ],
                 })
             } else {
-                let mut v = schema_value_for(inner);
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("nullable".to_owned(), serde_json::Value::Bool(true));
-                }
-                v
+                let inner_val = schema_value_for(inner);
+                let base_type = inner_val
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("string")
+                    .to_owned();
+                serde_json::json!({ "type": [base_type, "null"] })
             }
         }
     }
@@ -833,7 +863,7 @@ mod tests {
         let config = OpenApiConfig::new("Demo", "1.0.0");
         let spec = generate_spec(&config, &[&doc]);
 
-        assert_eq!(spec.openapi, "3.0.3");
+        assert_eq!(spec.openapi, "3.1.0");
         assert_eq!(spec.info.title, "Demo");
         assert!(spec.paths.contains_key("/users/{id}"));
 
@@ -914,49 +944,6 @@ mod tests {
         let js = swagger_ui_initializer_js("/v3/api-docs");
         assert!(js.contains("SwaggerUIBundle"));
         assert!(js.contains(r#""/v3/api-docs""#));
-    }
-
-    #[test]
-    fn nullable_ref_uses_openapi_3_0_shape() {
-        // OpenAPI 3.0 has no `type: "null"`, so nullable refs must use
-        // `nullable: true` + `allOf` instead. Wrapping in `anyOf` with
-        // a `type: "null"` member produces a spec that Swagger and
-        // OpenAPI validators reject.
-        static INNER: SchemaEntry = SchemaEntry {
-            name: "User",
-            kind: SchemaKind::Ref,
-        };
-        let entry = SchemaEntry {
-            name: "nullable",
-            kind: SchemaKind::Nullable(&INNER),
-        };
-        let value = schema_value_for(&entry);
-        assert_eq!(value["nullable"], true);
-        assert_eq!(
-            value["allOf"][0]["$ref"], "#/components/schemas/User",
-            "nullable refs must wrap in allOf so `$ref` can carry siblings"
-        );
-        assert!(value.get("anyOf").is_none(), "must not emit anyOf/null");
-        assert!(
-            value.get("type").is_none()
-                || value.get("type").unwrap() != &serde_json::Value::String("null".into()),
-            "must not emit type: null"
-        );
-    }
-
-    #[test]
-    fn nullable_primitive_inlines_nullable_flag() {
-        static INNER: SchemaEntry = SchemaEntry {
-            name: "integer",
-            kind: SchemaKind::Primitive("integer"),
-        };
-        let entry = SchemaEntry {
-            name: "nullable",
-            kind: SchemaKind::Nullable(&INNER),
-        };
-        let value = schema_value_for(&entry);
-        assert_eq!(value["type"], "integer");
-        assert_eq!(value["nullable"], true);
     }
 
     #[test]
@@ -1048,6 +1035,124 @@ mod tests {
         assert_eq!(default_tag("/api/v1/users"), Some("api"));
         assert_eq!(default_tag("/"), None);
         assert_eq!(default_tag("/{id}"), None);
+    }
+
+    // ── OpenAPI 3.1 compliance tests (RED phase) ───────────────────────────
+
+    #[test]
+    fn spec_version_is_3_1_0() {
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[]);
+        assert_eq!(
+            spec.openapi, "3.1.0",
+            "Autumn must emit OpenAPI 3.1.0, not {}", spec.openapi
+        );
+    }
+
+    #[test]
+    fn nullable_ref_uses_openapi_3_1_one_of() {
+        // OpenAPI 3.1 aligns with JSON Schema 2020-12: nullable refs use
+        // `oneOf: [{$ref: ...}, {type: "null"}]` instead of 3.0's
+        // `nullable: true` + `allOf` workaround.
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "User",
+            kind: SchemaKind::Ref,
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert!(
+            value.get("nullable").is_none(),
+            "3.1 must not emit `nullable: true` (that is 3.0 only)"
+        );
+        assert!(
+            value.get("allOf").is_none(),
+            "3.1 must not use allOf for nullable refs"
+        );
+        let one_of = value["oneOf"]
+            .as_array()
+            .expect("3.1 nullable ref must use oneOf");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(
+            one_of[0]["$ref"], "#/components/schemas/User",
+            "first oneOf branch must be the $ref"
+        );
+        assert_eq!(
+            one_of[1]["type"], "null",
+            "second oneOf branch must be {{type: null}}"
+        );
+    }
+
+    #[test]
+    fn nullable_primitive_uses_type_array() {
+        // OpenAPI 3.1 uses `type: ["integer", "null"]` for nullable
+        // primitives instead of the 3.0 `nullable: true` flag.
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "integer",
+            kind: SchemaKind::Primitive("integer"),
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert!(
+            value.get("nullable").is_none(),
+            "3.1 must not emit `nullable: true`"
+        );
+        let types = value["type"]
+            .as_array()
+            .expect("3.1 nullable primitive must use a type array");
+        assert!(
+            types.contains(&serde_json::Value::String("integer".to_owned())),
+            "type array must include the base type"
+        );
+        assert!(
+            types.contains(&serde_json::Value::String("null".to_owned())),
+            "type array must include null"
+        );
+    }
+
+    #[test]
+    fn write_openapi_spec_to_dist_creates_json_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let config = OpenApiConfig::new("TestAPI", "2.0.0");
+        let spec = generate_spec(&config, &[]);
+
+        write_openapi_spec_to_dist(&spec, &dist).expect("write must succeed");
+
+        let json_path = dist.join("openapi.json");
+        assert!(json_path.exists(), "dist/openapi.json must be written");
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["openapi"], "3.1.0");
+        assert_eq!(parsed["info"]["title"], "TestAPI");
+    }
+
+    #[test]
+    fn write_openapi_spec_to_dist_creates_yaml_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let config = OpenApiConfig::new("TestAPI", "2.0.0");
+        let spec = generate_spec(&config, &[]);
+
+        write_openapi_spec_to_dist(&spec, &dist).expect("write must succeed");
+
+        let yaml_path = dist.join("openapi.yaml");
+        assert!(yaml_path.exists(), "dist/openapi.yaml must be written");
+
+        let content = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(content.contains("openapi:"), "YAML must include the openapi field");
+        assert!(content.contains("3.1.0"), "YAML must include the version");
+        assert!(content.contains("TestAPI"), "YAML must include the title");
     }
 
     #[test]
