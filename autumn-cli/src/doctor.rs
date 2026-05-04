@@ -371,38 +371,131 @@ fn check_port_bindable(port: u16) -> CheckResult {
     })
 }
 
-/// Check whether the Tailwind binary is present and runnable (injectable for tests).
-///
-/// `exists` and `can_run` are separate so that `can_run` is never invoked when
-/// the file is absent — avoiding a spurious "permission denied" OS error.
-pub fn check_tailwind_binary_impl(
+/// Check whether the Tailwind binary is present and executable without launching it.
+pub fn check_tailwind_binary_at(path: &std::path::Path) -> CheckResult {
+    check_tailwind_binary_at_with_executable_probe(path, tailwind_file_is_executable)
+}
+
+fn check_tailwind_binary_at_with_executable_probe(
     path: &std::path::Path,
-    exists: impl Fn(&std::path::Path) -> bool,
-    can_run: impl Fn(&std::path::Path) -> bool,
+    executable_probe: impl Fn(&std::path::Path, &std::fs::Metadata) -> bool,
 ) -> CheckResult {
-    if !exists(path) {
+    let symlink_metadata = match path.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return CheckResult {
+                name: "tailwind_binary",
+                status: CheckStatus::Fail,
+                detail: Some(format!("{} not found", path.display())),
+                hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+            };
+        }
+        Err(e) => {
+            return CheckResult {
+                name: "tailwind_binary",
+                status: CheckStatus::Fail,
+                detail: Some(format!("cannot inspect {}: {e}", path.display())),
+                hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
+            };
+        }
+    };
+
+    let metadata = match path.metadata() {
+        Ok(metadata) => metadata,
+        Err(_) if symlink_metadata.file_type().is_symlink() => {
+            return CheckResult {
+                name: "tailwind_binary",
+                status: CheckStatus::Fail,
+                detail: Some(format!("{} is a broken symlink", path.display())),
+                hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
+            };
+        }
+        Err(e) => {
+            return CheckResult {
+                name: "tailwind_binary",
+                status: CheckStatus::Fail,
+                detail: Some(format!("cannot inspect {}: {e}", path.display())),
+                hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
+            };
+        }
+    };
+
+    if !metadata.is_file() {
+        let kind = if metadata.is_dir() {
+            "directory"
+        } else {
+            "non-file filesystem entry"
+        };
         return CheckResult {
             name: "tailwind_binary",
             status: CheckStatus::Fail,
-            detail: Some(format!("{} not found", path.display())),
-            hint: Some("Run `autumn setup` to download the Tailwind CSS binary"),
+            detail: Some(format!("{} is a {kind}, not a file", path.display())),
+            hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
         };
     }
-    if can_run(path) {
-        CheckResult {
-            name: "tailwind_binary",
-            status: CheckStatus::Pass,
-            detail: Some(format!("{} is present and runnable", path.display())),
-            hint: None,
-        }
-    } else {
-        CheckResult {
+
+    if !executable_probe(path, &metadata) {
+        return CheckResult {
             name: "tailwind_binary",
             status: CheckStatus::Fail,
-            detail: Some(format!("{} exists but is not runnable", path.display())),
+            detail: Some(format!("{} exists but is not executable", path.display())),
             hint: Some("Run `autumn setup --force` to re-download the Tailwind CSS binary"),
-        }
+        };
     }
+
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(format!("{} is present and executable", path.display())),
+        hint: None,
+    }
+}
+
+#[cfg(unix)]
+fn tailwind_file_is_executable(path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
+}
+
+#[cfg(windows)]
+fn tailwind_file_is_executable(path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    use std::io::{Read as _, Seek as _};
+
+    if !path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut dos_header = [0_u8; 64];
+    if file.read_exact(&mut dos_header).is_err() || &dos_header[0..2] != b"MZ" {
+        return false;
+    }
+
+    let pe_offset = u32::from_le_bytes([
+        dos_header[0x3c],
+        dos_header[0x3d],
+        dos_header[0x3e],
+        dos_header[0x3f],
+    ]);
+    if file
+        .seek(std::io::SeekFrom::Start(u64::from(pe_offset)))
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut pe_signature = [0_u8; 4];
+    file.read_exact(&mut pe_signature).is_ok() && pe_signature == *b"PE\0\0"
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tailwind_file_is_executable(_path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    true
 }
 
 fn check_tailwind_binary() -> CheckResult {
@@ -411,11 +504,8 @@ fn check_tailwind_binary() -> CheckResult {
     } else {
         std::path::PathBuf::from("target/autumn/tailwindcss")
     };
-    check_tailwind_binary_impl(&path, std::path::Path::exists, |p| {
-        // Try to invoke the binary; Ok(_) means the OS could execute it
-        // regardless of exit code (--help may return 0 or 1 depending on version).
-        std::process::Command::new(p).arg("--help").output().is_ok()
-    })
+
+    check_tailwind_binary_at(&path)
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -1210,58 +1300,120 @@ foo = "bar"
         assert!(parse_db_host_port("mysql://localhost/db").is_none());
     }
 
-    // ── check_tailwind_binary_impl ───────────────────────────────────────────
+    // ── check_tailwind_binary_at ─────────────────────────────────────────────
+
+    fn temp_tailwind_path(temp: &tempfile::TempDir) -> std::path::PathBuf {
+        let tailwind_name = if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        };
+        temp.path()
+            .join("target")
+            .join("autumn")
+            .join(tailwind_name)
+    }
+
+    fn create_executable_tailwind_fixture(path: &std::path::Path) {
+        let parent = path.parent().expect("tailwind path has parent");
+        std::fs::create_dir_all(parent).expect("create tailwind parent");
+        std::fs::copy(std::env::current_exe().expect("current test exe"), path)
+            .expect("copy executable fixture");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(path)
+                .expect("tailwind fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("make tailwind fixture executable");
+        }
+    }
+
+    #[test]
+    fn check_tailwind_expected_path_directory_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        std::fs::create_dir_all(&tailwind_path).expect("create directory at tailwind path");
+
+        let r = check_tailwind_binary_at(&tailwind_path);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(
+            r.detail.as_deref().unwrap_or("").contains("directory"),
+            "detail should identify directory path, got {r:?}"
+        );
+    }
 
     #[test]
     fn check_tailwind_not_found() {
-        let r = check_tailwind_binary_impl(
-            std::path::Path::new("target/autumn/tailwindcss"),
-            |_| false,
-            |_| false,
-        );
+        let temp = tempfile::tempdir().expect("temp dir");
+        let r = check_tailwind_binary_at(&temp_tailwind_path(&temp));
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.as_deref().unwrap_or("").contains("not found"));
         assert!(r.hint.unwrap_or("").contains("autumn setup"));
     }
 
     #[test]
-    fn check_tailwind_exists_but_not_runnable() {
-        let r = check_tailwind_binary_impl(
-            std::path::Path::new("target/autumn/tailwindcss"),
-            |_| true,
-            |_| false,
-        );
+    fn check_tailwind_regular_file_without_execute_permission_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        std::fs::create_dir_all(tailwind_path.parent().expect("tailwind path has parent"))
+            .expect("create tailwind parent");
+        std::fs::write(&tailwind_path, "not an executable").expect("write non-executable file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = std::fs::metadata(&tailwind_path)
+                .expect("tailwind file metadata")
+                .permissions();
+            permissions.set_mode(0o644);
+            std::fs::set_permissions(&tailwind_path, permissions)
+                .expect("clear executable permission");
+        }
+
+        let r = check_tailwind_binary_at(&tailwind_path);
         assert_eq!(r.status, CheckStatus::Fail);
-        assert!(r.detail.as_deref().unwrap_or("").contains("not runnable"));
+        assert!(r.detail.as_deref().unwrap_or("").contains("not executable"));
         assert!(r.hint.unwrap_or("").contains("--force"));
     }
 
     #[test]
-    fn check_tailwind_exists_and_runnable() {
-        let r = check_tailwind_binary_impl(
-            std::path::Path::new("target/autumn/tailwindcss"),
-            |_| true,
-            |_| true,
-        );
-        assert_eq!(r.status, CheckStatus::Pass);
-        assert!(r.detail.as_deref().unwrap_or("").contains("runnable"));
+    fn check_tailwind_existing_file_fails_when_current_user_cannot_execute() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        create_executable_tailwind_fixture(&tailwind_path);
+
+        let r = check_tailwind_binary_at_with_executable_probe(&tailwind_path, |_, _| false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("not executable"));
     }
 
     #[test]
-    fn check_tailwind_not_found_does_not_invoke_run_fn() {
-        let run_called = std::cell::Cell::new(false);
-        let _ = check_tailwind_binary_impl(
-            std::path::Path::new("target/autumn/tailwindcss"),
-            |_| false,
-            |_| {
-                run_called.set(true);
-                false
-            },
-        );
-        assert!(
-            !run_called.get(),
-            "run_fn must not be called when path doesn't exist"
-        );
+    fn check_tailwind_executable_file_passes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        create_executable_tailwind_fixture(&tailwind_path);
+
+        let r = check_tailwind_binary_at(&tailwind_path);
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert!(r.detail.as_deref().unwrap_or("").contains("executable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_tailwind_broken_symlink_fails() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        std::fs::create_dir_all(tailwind_path.parent().expect("tailwind path has parent"))
+            .expect("create tailwind parent");
+        std::os::unix::fs::symlink(temp.path().join("missing-tailwind"), &tailwind_path)
+            .expect("create broken symlink");
+
+        let r = check_tailwind_binary_at(&tailwind_path);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("broken symlink"));
     }
 
     // ── to_json_output ───────────────────────────────────────────────────────
