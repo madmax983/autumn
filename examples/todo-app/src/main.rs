@@ -13,7 +13,7 @@ use autumn_web::{AutumnResult, routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-// ── DeferredStore ─────────────────────────────────────────────────────────────
+// ── DeferredStore ─────────────────────────────────────────────────────────────────
 //
 // `RequireApiToken` needs a store at construction time, but the DB pool only
 // becomes available inside `on_startup`. `DeferredStore` holds a `OnceLock`
@@ -66,7 +66,7 @@ impl ApiTokenStore for DeferredStore {
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────────
 
 #[autumn_web::main]
 async fn main() {
@@ -142,7 +142,7 @@ mod tests {
         );
     }
 
-    // ── DeferredStore tests ───────────────────────────────────────────────────
+    // ── DeferredStore tests ───────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn deferred_store_delegates_to_inner_store() {
@@ -154,10 +154,7 @@ mod tests {
 
         let token = deferred.issue("user:1").await.unwrap();
         assert!(!token.is_empty());
-        assert_eq!(
-            deferred.verify(&token).await.unwrap(),
-            Some("user:1".to_owned())
-        );
+        assert_eq!(deferred.verify(&token).await.unwrap(), Some("user:1".to_owned()));
         deferred.revoke(&token).await.unwrap();
         assert_eq!(deferred.verify(&token).await.unwrap(), None);
     }
