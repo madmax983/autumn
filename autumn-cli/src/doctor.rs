@@ -373,6 +373,13 @@ fn check_port_bindable(port: u16) -> CheckResult {
 
 /// Check whether the Tailwind binary is present and executable without launching it.
 pub fn check_tailwind_binary_at(path: &std::path::Path) -> CheckResult {
+    check_tailwind_binary_at_with_executable_probe(path, tailwind_file_is_executable)
+}
+
+fn check_tailwind_binary_at_with_executable_probe(
+    path: &std::path::Path,
+    executable_probe: impl Fn(&std::path::Path, &std::fs::Metadata) -> bool,
+) -> CheckResult {
     let symlink_metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -427,7 +434,7 @@ pub fn check_tailwind_binary_at(path: &std::path::Path) -> CheckResult {
         };
     }
 
-    if !tailwind_file_is_executable(path, &metadata) {
+    if !executable_probe(path, &metadata) {
         return CheckResult {
             name: "tailwind_binary",
             status: CheckStatus::Fail,
@@ -445,9 +452,8 @@ pub fn check_tailwind_binary_at(path: &std::path::Path) -> CheckResult {
 }
 
 #[cfg(unix)]
-fn tailwind_file_is_executable(_path: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    metadata.permissions().mode() & 0o111 != 0
+fn tailwind_file_is_executable(path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
 }
 
 #[cfg(windows)]
@@ -1371,6 +1377,17 @@ foo = "bar"
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.as_deref().unwrap_or("").contains("not executable"));
         assert!(r.hint.unwrap_or("").contains("--force"));
+    }
+
+    #[test]
+    fn check_tailwind_existing_file_fails_when_current_user_cannot_execute() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let tailwind_path = temp_tailwind_path(&temp);
+        create_executable_tailwind_fixture(&tailwind_path);
+
+        let r = check_tailwind_binary_at_with_executable_probe(&tailwind_path, |_, _| false);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("not executable"));
     }
 
     #[test]
