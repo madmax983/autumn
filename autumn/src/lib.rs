@@ -563,7 +563,7 @@ pub use autumn_macros::ws;
 
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
-/// Declare a scheduled background task. See [`task`] module.
+/// Declare a scheduled background task. See [`mod@task`] module.
 pub use autumn_macros::scheduled;
 /// Declare a one-off operational task. See [`task::OneOffTaskInfo`].
 pub use autumn_macros::task;
