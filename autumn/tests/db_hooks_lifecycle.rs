@@ -14,7 +14,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-// ── Schema & model definitions ──────────────────────────────────────
+// ── Schema & model definitions ─────────────────────────────────────────────────
 
 diesel::table! {
     test_articles (id) {
@@ -44,7 +44,7 @@ struct NewArticle {
     pub status: String,
 }
 
-// ── Hook implementations ────────────────────────────────────────────
+// ── Hook implementations ─────────────────────────────────────────────────────
 
 /// Rewrites the `slug` field from the `title` when title changes.
 #[derive(Clone, Default)]
@@ -91,7 +91,7 @@ impl MutationHooks for RejectEmptyTitleHooks {
     }
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
+// ── Test helpers ────────────────────────────────────────────────────────────
 
 const CREATE_TABLE_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS test_articles (
@@ -135,7 +135,7 @@ async fn setup_pool() -> (
     (pool, container)
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -262,7 +262,7 @@ async fn draft_field_accessors_match_persisted_diff() {
     assert_eq!(persisted.published_at, None); // unchanged
 }
 
-// ── DbApiTokenStore tests ─────────────────────────────────────────────────────
+// ── DbApiTokenStore tests ────────────────────────────────────────────────────────────────────────
 
 const CREATE_API_TOKENS_SQL: &str = "
     CREATE TABLE api_tokens (
@@ -286,10 +286,7 @@ async fn setup_token_pool() -> (
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
-    let pool = Pool::builder(manager)
-        .max_size(5)
-        .build()
-        .expect("pool");
+    let pool = Pool::builder(manager).max_size(5).build().expect("pool");
     let mut conn = pool.get().await.expect("conn");
     diesel::sql_query(CREATE_API_TOKENS_SQL)
         .execute(&mut conn)
@@ -301,7 +298,7 @@ async fn setup_token_pool() -> (
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn db_api_token_store_issue_and_verify() {
-    use autumn_web::auth::DbApiTokenStore;
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
     let (pool, _c) = setup_token_pool().await;
     let store = DbApiTokenStore::new(pool);
 
@@ -318,7 +315,7 @@ async fn db_api_token_store_issue_and_verify() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn db_api_token_store_revoke_invalidates_token() {
-    use autumn_web::auth::DbApiTokenStore;
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
     let (pool, _c) = setup_token_pool().await;
     let store = DbApiTokenStore::new(pool);
 
@@ -332,7 +329,7 @@ async fn db_api_token_store_revoke_invalidates_token() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn db_api_token_store_two_tokens_same_principal() {
-    use autumn_web::auth::DbApiTokenStore;
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
     let (pool, _c) = setup_token_pool().await;
     let store = DbApiTokenStore::new(pool);
 
