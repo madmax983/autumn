@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ctrlc = "3.5.2"
-getrandom = "0.3"
+getrandom = "0.4"
 hex = "0.4"
 indicatif = "0.18"
 notify = "8"
