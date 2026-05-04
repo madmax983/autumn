@@ -204,7 +204,7 @@ mod tests {
         if std::process::Command::new("psql")
             .arg("--version")
             .output()
-            .map_or(false, |o| o.status.success())
+            .is_ok_and(|o| o.status.success())
         {
             check_psql();
         }
