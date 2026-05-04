@@ -173,5 +173,4 @@ mod tests {
         let t = generate_token();
         assert_ne!(t, "0".repeat(64));
     }
-
 }

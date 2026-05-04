@@ -1231,9 +1231,9 @@ mod db_store {
 
     use diesel::OptionalExtension as _;
     use diesel::prelude::*;
+    use diesel_async::AsyncPgConnection;
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::deadpool::Pool;
-    use diesel_async::AsyncPgConnection;
 
     use super::{ApiTokenStore, generate_raw_token, hash_api_token};
     use crate::error::AutumnError;
@@ -1317,7 +1317,8 @@ mod db_store {
         fn verify<'a>(
             &'a self,
             raw_token: &'a str,
-        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
+        {
             Box::pin(async move {
                 let hash = hash_api_token(raw_token);
                 let mut conn = self
@@ -2427,10 +2428,7 @@ mod api_token_tests {
     async fn issue_api_token_helper_issues_verifiable_token() {
         let store = InMemoryApiTokenStore::default();
         let raw = issue_api_token(&store, "user:5").await.unwrap();
-        assert_eq!(
-            store.verify(&raw).await.unwrap(),
-            Some("user:5".to_owned())
-        );
+        assert_eq!(store.verify(&raw).await.unwrap(), Some("user:5".to_owned()));
     }
 
     #[tokio::test]
@@ -2681,8 +2679,7 @@ mod api_token_tests {
         let app = axum::Router::new()
             .route(
                 "/api",
-                axum::routing::get(api_handler)
-                    .layer(RequireApiToken::new(Arc::clone(&store))),
+                axum::routing::get(api_handler).layer(RequireApiToken::new(Arc::clone(&store))),
             )
             .layer(SessionLayer::new(session_store, SessionConfig::default()));
 
@@ -2730,9 +2727,7 @@ mod api_token_tests {
             }
 
             fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
-                std::future::ready(Ok(axum::response::Response::new(
-                    axum::body::Body::empty(),
-                )))
+                std::future::ready(Ok(axum::response::Response::new(axum::body::Body::empty())))
             }
         }
 

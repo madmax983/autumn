@@ -1150,8 +1150,7 @@ mod tests {
 
     #[test]
     fn parse_token_revoke() {
-        let cli =
-            Cli::try_parse_from(["autumn", "token", "revoke", "abc123deadbeef"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "token", "revoke", "abc123deadbeef"]).unwrap();
         let Commands::Token(TokenCommands::Revoke { raw_token }) = cli.command else {
             panic!("expected token revoke");
         };

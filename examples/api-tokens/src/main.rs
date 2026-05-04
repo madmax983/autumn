@@ -111,10 +111,7 @@ async fn revoke_current(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| AutumnError::unauthorized_msg("Bearer token not found in request"))?;
-    let pool = state
-        .pool()
-        .expect("database not configured")
-        .clone();
+    let pool = state.pool().expect("database not configured").clone();
     let store = DbApiTokenStore::new(pool);
     revoke_api_token(&store, raw_token).await?;
     Ok(StatusCode::NO_CONTENT)
