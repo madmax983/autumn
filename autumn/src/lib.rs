@@ -566,6 +566,18 @@ pub use autumn_macros::job;
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
 
+/// Extractor that yields a verified bearer-token principal for API routes.
+///
+/// Must be used with [`auth::RequireApiToken`] middleware. See the
+/// [`auth`] module for a complete quick-start example.
+pub use auth::ApiToken;
+
+/// Tower layer that validates `Authorization: Bearer <token>` on API routes.
+///
+/// Verifies tokens against any [`auth::ApiTokenStore`] implementation.
+/// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
+pub use auth::RequireApiToken;
+
 /// Secure a route handler with authentication and optional role checks.
 ///
 /// Applied before a route macro (`#[get]`, `#[post]`, etc.), this attribute

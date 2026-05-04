@@ -112,8 +112,12 @@ pub use crate::hooks::{
 };
 
 // ── Session & Auth ──────────────────────────────────────────────
-/// Auth extractor for retrieving the authenticated user.
+/// Auth extractor for retrieving the authenticated user (session-based).
 pub use crate::auth::Auth;
+/// Extractor for the verified principal ID on bearer-token-protected routes.
+pub use crate::auth::ApiToken;
+/// Tower layer that validates `Authorization: Bearer <token>` on API routes.
+pub use crate::auth::RequireApiToken;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 

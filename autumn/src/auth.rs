@@ -864,10 +864,6 @@ impl Default for AuthConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API Token Authentication
-//
-// RED phase: types are declared with stub implementations that compile but
-// produce wrong results so that the tests below fail. Stubs will be replaced
-// in the GREEN phase.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Backend trait for storing and verifying API bearer tokens.
@@ -2172,7 +2168,7 @@ mod tests {
     }
 }
 
-// ── API token tests (RED phase: these fail until the GREEN implementation) ────
+// ── API token tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod api_token_tests {
