@@ -1237,6 +1237,15 @@ mod tests {
     }
 
     #[test]
+    fn cursor_page_from_overfetched_inner_exact_limit() {
+        let req = CursorRequest::new(None, 3);
+        let items = vec![1_i32, 2, 3];
+        let page = CursorPage::from_overfetched_inner(items, &req, |&n| n, |_| None::<String>);
+        assert_eq!(page.content, vec![1, 2, 3]);
+        assert!(!page.has_next);
+    }
+
+    #[test]
     fn cursor_page_truncates_overflow_and_emits_next_cursor() {
         let req = CursorRequest::new(None, 3);
         // Caller fetched limit+1 = 4 rows.
@@ -1283,6 +1292,14 @@ mod tests {
         let req_diff_size = CursorRequest::new(None, 5);
         let page_diff_size: CursorPage<i32> = CursorPage::empty(&req_diff_size);
         assert_eq!(page_diff_size.size, 5);
+    }
+
+    #[test]
+    fn cursor_page_no_next_cursor_when_size_zero_but_has_next() {
+        let req = CursorRequest::new(None, 0);
+        let items = vec![1_i32, 2];
+        let page = CursorPage::from_overfetched(items, &req, |&n| serde_json::json!({"id": n}));
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
