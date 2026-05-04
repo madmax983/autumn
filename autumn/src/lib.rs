@@ -578,6 +578,20 @@ pub use auth::ApiToken;
 /// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
 pub use auth::RequireApiToken;
 
+/// Postgres-backed API token store (requires `db` feature).
+///
+/// Production replacement for [`auth::InMemoryApiTokenStore`]. Hashes tokens
+/// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`].
+#[cfg(feature = "db")]
+pub use auth::DbApiTokenStore;
+
+/// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
+///
+/// Pass to [`app`]`.migrations()` so that the `api_tokens` table is created
+/// automatically alongside your application migrations.
+#[cfg(feature = "db")]
+pub use auth::API_TOKEN_MIGRATIONS;
+
 /// Secure a route handler with authentication and optional role checks.
 ///
 /// Applied before a route macro (`#[get]`, `#[post]`, etc.), this attribute

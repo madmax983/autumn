@@ -12,6 +12,7 @@ mod release;
 mod routes;
 mod seed;
 mod setup;
+mod token;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -140,6 +141,20 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
+    /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
+    ///
+    /// Requires the `api_tokens` table to exist (run `autumn migrate` first,
+    /// with `API_TOKEN_MIGRATIONS` included in your app's migration set).
+    /// The database URL is read from `autumn.toml` or the `DATABASE_URL` /
+    /// `AUTUMN_DATABASE__URL` environment variables.
+    ///
+    /// # Examples
+    ///
+    ///   autumn token issue user:42
+    ///   autumn token revoke <RAW_TOKEN>
+    #[command(subcommand, verbatim_doc_comment)]
+    Token(TokenCommands),
+
     /// Check the local environment and project configuration for common
     /// first-run problems (Rust MSRV, autumn.toml validity, database
     /// connectivity, port availability, Tailwind binary, and more).
@@ -190,6 +205,39 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+}
+
+/// Subcommands for `autumn token`.
+#[derive(Subcommand)]
+enum TokenCommands {
+    /// Issue a new API bearer token for a principal and print it to stdout.
+    ///
+    /// The token is generated with 256 bits of OS-backed randomness and stored
+    /// as a SHA-256 hash. It is printed **once** — there is no way to recover
+    /// it later. Store it securely (e.g. in a secrets manager).
+    ///
+    /// # Example
+    ///
+    ///   TOKEN=$(autumn token issue user:42)
+    ///   curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/data
+    #[command(verbatim_doc_comment)]
+    Issue {
+        /// Principal identifier to associate with the token (e.g. `user:42`).
+        principal_id: String,
+    },
+    /// Revoke an existing API bearer token.
+    ///
+    /// Hashes the provided raw token and sets `revoked_at` in the database.
+    /// Subsequent requests presenting the token will receive `401 Unauthorized`.
+    ///
+    /// # Example
+    ///
+    ///   autumn token revoke <RAW_TOKEN>
+    #[command(verbatim_doc_comment)]
+    Revoke {
+        /// The raw bearer token string to revoke.
+        raw_token: String,
+    },
 }
 
 /// Subcommands for `autumn release`.
@@ -328,6 +376,10 @@ fn main() {
                 });
                 release::run(release::ReleaseAction::Init { force, target: t });
             }
+        },
+        Commands::Token(cmd) => match cmd {
+            TokenCommands::Issue { principal_id } => token::run_issue(&principal_id),
+            TokenCommands::Revoke { raw_token } => token::run_revoke(&raw_token),
         },
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
@@ -1083,5 +1135,41 @@ mod tests {
             }
             _ => panic!("expected New command"),
         }
+    }
+
+    // ── autumn token tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_token_issue() {
+        let cli = Cli::try_parse_from(["autumn", "token", "issue", "user:42"]).unwrap();
+        let Commands::Token(TokenCommands::Issue { principal_id }) = cli.command else {
+            panic!("expected token issue");
+        };
+        assert_eq!(principal_id, "user:42");
+    }
+
+    #[test]
+    fn parse_token_revoke() {
+        let cli =
+            Cli::try_parse_from(["autumn", "token", "revoke", "abc123deadbeef"]).unwrap();
+        let Commands::Token(TokenCommands::Revoke { raw_token }) = cli.command else {
+            panic!("expected token revoke");
+        };
+        assert_eq!(raw_token, "abc123deadbeef");
+    }
+
+    #[test]
+    fn parse_token_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "token"]).is_err());
+    }
+
+    #[test]
+    fn parse_token_issue_without_principal_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "token", "issue"]).is_err());
+    }
+
+    #[test]
+    fn parse_token_revoke_without_token_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
     }
 }

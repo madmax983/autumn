@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo", "examples/api-tokens"]
 resolver = "3"
 
 [patch.crates-io]

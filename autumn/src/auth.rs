@@ -1199,6 +1199,169 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>() -> Respons
         .unwrap_or_default()
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Diesel-backed API Token Store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Embedded Diesel migrations for the `api_tokens` table.
+///
+/// Include this in your application's `.migrations()` call so that the
+/// `api_tokens` table is created and kept up-to-date alongside your own
+/// migrations:
+///
+/// ```rust,ignore
+/// use autumn_web::auth::API_TOKEN_MIGRATIONS;
+///
+/// #[autumn_web::main]
+/// async fn main() {
+///     autumn_web::app()
+///         .migrations(API_TOKEN_MIGRATIONS)
+///         .run()
+///         .await;
+/// }
+/// ```
+#[cfg(feature = "db")]
+pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("migrations");
+
+#[cfg(feature = "db")]
+mod db_store {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use diesel::OptionalExtension as _;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    use diesel_async::pooled_connection::deadpool::Pool;
+    use diesel_async::AsyncPgConnection;
+
+    use super::{ApiTokenStore, generate_raw_token, hash_api_token};
+    use crate::error::AutumnError;
+
+    diesel::table! {
+        api_tokens (id) {
+            id -> Int8,
+            token_hash -> Text,
+            principal_id -> Text,
+            created_at -> Timestamp,
+            revoked_at -> Nullable<Timestamp>,
+        }
+    }
+
+    #[derive(Insertable)]
+    #[diesel(table_name = api_tokens)]
+    struct NewApiToken<'a> {
+        token_hash: &'a str,
+        principal_id: &'a str,
+    }
+
+    /// Postgres-backed [`ApiTokenStore`].
+    ///
+    /// Tokens are hashed at rest (SHA-256) and never stored in plaintext.
+    /// Suitable for production deployments where token state must survive
+    /// process restarts and be shared across instances.
+    ///
+    /// # Setup
+    ///
+    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so the
+    /// `api_tokens` table is created automatically:
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::auth::{API_TOKEN_MIGRATIONS, DbApiTokenStore};
+    /// use autumn_web::db::Pool;
+    ///
+    /// let store = DbApiTokenStore::new(pool.clone());
+    /// autumn_web::app()
+    ///     .migrations(API_TOKEN_MIGRATIONS)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[derive(Clone)]
+    pub struct DbApiTokenStore {
+        pool: Pool<AsyncPgConnection>,
+    }
+
+    impl DbApiTokenStore {
+        /// Create a [`DbApiTokenStore`] backed by `pool`.
+        pub fn new(pool: Pool<AsyncPgConnection>) -> Self {
+            Self { pool }
+        }
+    }
+
+    impl ApiTokenStore for DbApiTokenStore {
+        fn issue<'a>(
+            &'a self,
+            principal_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+            Box::pin(async move {
+                let raw = generate_raw_token();
+                let hash = hash_api_token(&raw);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                diesel::insert_into(api_tokens::table)
+                    .values(NewApiToken {
+                        token_hash: &hash,
+                        principal_id,
+                    })
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(raw)
+            })
+        }
+
+        fn verify<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+            Box::pin(async move {
+                let hash = hash_api_token(raw_token);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                let principal: Option<String> = api_tokens::table
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .filter(api_tokens::revoked_at.is_null())
+                    .select(api_tokens::principal_id)
+                    .first(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(principal)
+            })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let hash = hash_api_token(raw_token);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                diesel::update(api_tokens::table)
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .set(api_tokens::revoked_at.eq(diesel::dsl::now.nullable()))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(())
+            })
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+pub use db_store::DbApiTokenStore;
+
 #[cfg(test)]
 mod tests {
     use super::*;
