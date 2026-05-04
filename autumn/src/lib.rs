@@ -587,7 +587,7 @@ pub use auth::DbApiTokenStore;
 
 /// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
 ///
-/// Pass to [`app`]`.migrations()` so that the `api_tokens` table is created
+/// Pass to `app().migrations()` so that the `api_tokens` table is created
 /// automatically alongside your application migrations.
 #[cfg(feature = "db")]
 pub use auth::API_TOKEN_MIGRATIONS;

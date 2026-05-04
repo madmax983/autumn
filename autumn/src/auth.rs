@@ -1077,7 +1077,7 @@ where
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         let principal = parts.extensions.get::<ApiTokenPrincipal>().cloned();
-        async move { principal.map(|p| ApiToken(p.0)).ok_or(AuthRejection) }
+        async move { principal.map(|p| Self(p.0)).ok_or(AuthRejection) }
     }
 }
 
@@ -1283,7 +1283,8 @@ mod db_store {
 
     impl DbApiTokenStore {
         /// Create a [`DbApiTokenStore`] backed by `pool`.
-        pub fn new(pool: Pool<AsyncPgConnection>) -> Self {
+        #[must_use]
+        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
             Self { pool }
         }
     }

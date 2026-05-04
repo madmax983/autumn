@@ -151,7 +151,7 @@ enum Commands {
     /// # Examples
     ///
     ///   autumn token issue user:42
-    ///   autumn token revoke <RAW_TOKEN>
+    ///   autumn token revoke `<RAW_TOKEN>`
     #[command(subcommand, verbatim_doc_comment)]
     Token(TokenCommands),
 
@@ -219,7 +219,7 @@ enum TokenCommands {
     /// # Example
     ///
     ///   TOKEN=$(autumn token issue user:42)
-    ///   curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/data
+    ///   curl -H "Authorization: Bearer $TOKEN" <http://localhost:3000/api/data>
     #[command(verbatim_doc_comment)]
     Issue {
         /// Principal identifier to associate with the token (e.g. `user:42`).
@@ -232,7 +232,7 @@ enum TokenCommands {
     ///
     /// # Example
     ///
-    ///   autumn token revoke <RAW_TOKEN>
+    ///   autumn token revoke `<RAW_TOKEN>`
     #[command(verbatim_doc_comment)]
     Revoke {
         /// The raw bearer token string to revoke.

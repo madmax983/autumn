@@ -8,6 +8,7 @@ use autumn_web::auth::{
 };
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::{Router, routing};
+use autumn_web::reexports::http;
 
 // ── Deferred store ────────────────────────────────────────────────────────────
 //
@@ -100,14 +101,22 @@ async fn whoami(ApiToken(principal_id): ApiToken) -> String {
 #[delete("/tokens/current")]
 async fn revoke_current(
     State(state): State<AppState>,
-    ApiToken(raw_token): ApiToken,
+    // ApiToken verifies the request is authenticated; we need the raw token
+    // from the header itself to revoke it (ApiToken gives the principal_id).
+    _principal: ApiToken,
+    headers: http::HeaderMap,
 ) -> AutumnResult<StatusCode> {
+    let raw_token = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .ok_or_else(|| AutumnError::unauthorized_msg("Bearer token not found in request"))?;
     let pool = state
         .pool()
         .expect("database not configured")
         .clone();
     let store = DbApiTokenStore::new(pool);
-    revoke_api_token(&store, &raw_token).await?;
+    revoke_api_token(&store, raw_token).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

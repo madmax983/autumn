@@ -18,13 +18,13 @@ pub fn run_issue(principal_id: &str) {
     let raw_token = generate_token();
     let token_hash = sha256_hex(&raw_token);
 
-    let escaped_hash = escape_sql_literal(&token_hash);
-    let escaped_principal = escape_sql_literal(principal_id);
-    let sql = format!(
-        "INSERT INTO api_tokens (token_hash, principal_id) VALUES ('{escaped_hash}', '{escaped_principal}');"
+    // Use psql variable substitution (:'var') to avoid any SQL injection risk.
+    // :'hash' and :'principal' are quoted by psql, no manual escaping needed.
+    run_psql_with_vars_or_die(
+        &database_url,
+        "INSERT INTO api_tokens (token_hash, principal_id) VALUES (:'hash', :'principal');",
+        &[("hash", &token_hash), ("principal", principal_id)],
     );
-
-    run_psql_or_die(&database_url, &sql);
 
     // Print raw token last so it's easy to capture with $(...)
     println!("{raw_token}");
@@ -37,12 +37,12 @@ pub fn run_revoke(raw_token: &str) {
     check_psql();
 
     let token_hash = sha256_hex(raw_token);
-    let escaped_hash = escape_sql_literal(&token_hash);
-    let sql = format!(
-        "UPDATE api_tokens SET revoked_at = NOW() WHERE token_hash = '{escaped_hash}' AND revoked_at IS NULL;"
-    );
 
-    run_psql_or_die(&database_url, &sql);
+    run_psql_with_vars_or_die(
+        &database_url,
+        "UPDATE api_tokens SET revoked_at = NOW() WHERE token_hash = :'hash' AND revoked_at IS NULL;",
+        &[("hash", &token_hash)],
+    );
     eprintln!("\u{2713} Token revoked.");
 }
 
@@ -60,36 +60,8 @@ fn generate_token() -> String {
 /// Read 32 cryptographically-random bytes from the OS.
 fn os_random_bytes() -> [u8; 32] {
     let mut buf = [0u8; 32];
-    #[cfg(unix)]
-    {
-        use std::io::Read as _;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            if f.read_exact(&mut buf).is_ok() {
-                return buf;
-            }
-        }
-    }
-    // Windows fallback: hash time+pid (low entropy, rare code path)
-    let seed = format!(
-        "{}{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        std::process::id(),
-    );
-    let hash = Sha256::digest(seed.as_bytes());
-    buf.copy_from_slice(&hash);
+    getrandom::fill(&mut buf).expect("OS random source unavailable");
     buf
-}
-
-/// Escape a string for use inside a PostgreSQL single-quoted literal.
-///
-/// Doubles any embedded single quotes per the SQL standard. The `token_hash`
-/// argument is always a 64-char hex string so it needs no escaping; this is
-/// only material for `principal_id`.
-fn escape_sql_literal(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 /// Resolve the database URL from autumn.toml and environment variables.
@@ -143,11 +115,19 @@ fn check_psql() {
     }
 }
 
-fn run_psql_or_die(database_url: &str, sql: &str) {
-    let status = Command::new("psql")
-        .args([database_url, "-c", sql])
-        .status();
-    match status {
+/// Run a SQL statement using psql variable substitution.
+///
+/// Each `(name, value)` in `vars` is passed as `-v name=value`, and the SQL
+/// may reference them as `:'name'` (psql quotes the value as a SQL string
+/// literal, preventing SQL injection).
+fn run_psql_with_vars_or_die(database_url: &str, sql: &str, vars: &[(&str, &str)]) {
+    let mut cmd = Command::new("psql");
+    cmd.arg(database_url);
+    for (name, value) in vars {
+        cmd.args(["-v", &format!("{name}={value}")]);
+    }
+    cmd.args(["-c", sql]);
+    match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(_) => {
             eprintln!("\u{2717} psql command failed. Check the output above.");
@@ -194,22 +174,4 @@ mod tests {
         assert_ne!(t, "0".repeat(64));
     }
 
-    #[test]
-    fn escape_sql_literal_doubles_single_quotes() {
-        let input = "user's principal";
-        let escaped = escape_sql_literal(input);
-        assert_eq!(escaped, "user''s principal");
-    }
-
-    #[test]
-    fn escape_sql_literal_no_quotes_unchanged() {
-        let input = "user:42";
-        assert_eq!(escape_sql_literal(input), input);
-    }
-
-    #[test]
-    fn escape_sql_literal_multiple_quotes() {
-        let input = "it's a 'test'";
-        assert_eq!(escape_sql_literal(input), "it''s a ''test''");
-    }
 }
