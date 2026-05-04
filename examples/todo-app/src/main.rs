@@ -154,7 +154,10 @@ mod tests {
 
         let token = deferred.issue("user:1").await.unwrap();
         assert!(!token.is_empty());
-        assert_eq!(deferred.verify(&token).await.unwrap(), Some("user:1".to_owned()));
+        assert_eq!(
+            deferred.verify(&token).await.unwrap(),
+            Some("user:1".to_owned())
+        );
         deferred.revoke(&token).await.unwrap();
         assert_eq!(deferred.verify(&token).await.unwrap(), None);
     }
