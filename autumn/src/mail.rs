@@ -996,13 +996,13 @@ mod extra_tests {
 
     #[test]
     fn tls_from_env_value_parses_correctly() {
-        assert_eq!(TlsMode::from_env_value("none"), Some(TlsMode::Disabled));
+        assert_eq!(TlsMode::from_env_value("disabled"), Some(TlsMode::Disabled));
         assert_eq!(
-            TlsMode::from_env_value("opportunistic"),
+            TlsMode::from_env_value("starttls"),
             Some(TlsMode::StartTls)
         );
-        assert_eq!(TlsMode::from_env_value("required"), Some(TlsMode::Tls));
-        assert_eq!(TlsMode::from_env_value("REQUIRED "), Some(TlsMode::Tls));
+        assert_eq!(TlsMode::from_env_value("tls"), Some(TlsMode::Tls));
+        assert_eq!(TlsMode::from_env_value("TLS "), Some(TlsMode::Tls));
         assert_eq!(TlsMode::from_env_value("invalid"), None);
     }
 
