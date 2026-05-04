@@ -25,6 +25,21 @@ fn git(root: &Path, args: &[&str]) -> Output {
         .expect("failed to run git")
 }
 
+fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
+    let inherits_workspace_lints = manifest_toml
+        .get("lints")
+        .and_then(|lints| lints.get("workspace"))
+        .and_then(toml::Value::as_bool)
+        == Some(true);
+    let local_unsafe_code_lint = manifest_toml
+        .get("lints")
+        .and_then(|lints| lints.get("rust"))
+        .and_then(|rust| rust.get("unsafe_code"))
+        .and_then(toml::Value::as_str);
+
+    local_unsafe_code_lint.map_or(inherits_workspace_lints, |level| level == "forbid")
+}
+
 #[test]
 fn workspace_forbids_unsafe_code_for_all_members() {
     let root = workspace_root();
@@ -46,8 +61,10 @@ fn workspace_forbids_unsafe_code_for_all_members() {
         "workspace root must set [workspace.lints.rust] unsafe_code = \"forbid\"",
     );
 
-    let members = root_toml["workspace"]["members"]
-        .as_array()
+    let members = root_toml
+        .get("workspace")
+        .and_then(|workspace| workspace.get("members"))
+        .and_then(toml::Value::as_array)
         .expect("workspace.members should be an array");
 
     for member in members {
@@ -61,23 +78,41 @@ fn workspace_forbids_unsafe_code_for_all_members() {
             panic!("{} should parse as TOML: {err}", manifest_path.display())
         });
 
-        let inherits_workspace_lints = manifest_toml
-            .get("lints")
-            .and_then(|lints| lints.get("workspace"))
-            .and_then(toml::Value::as_bool)
-            == Some(true);
-        let local_unsafe_code_lint = manifest_toml
-            .get("lints")
-            .and_then(|lints| lints.get("rust"))
-            .and_then(|rust| rust.get("unsafe_code"))
-            .and_then(toml::Value::as_str);
-
         assert!(
-            inherits_workspace_lints || local_unsafe_code_lint == Some("forbid"),
+            member_manifest_forbids_unsafe_code(&manifest_toml),
             "{member}/Cargo.toml must either inherit workspace lints or set \
              [lints.rust] unsafe_code = \"forbid\"",
         );
     }
+}
+
+#[test]
+fn member_manifest_forbid_check_rejects_local_override_of_workspace_lints() {
+    let manifest_toml: toml::Value = toml::from_str(
+        r#"
+        [lints]
+        workspace = true
+
+        [lints.rust]
+        unsafe_code = "warn"
+        "#,
+    )
+    .expect("manifest snippet should parse");
+
+    assert!(!member_manifest_forbids_unsafe_code(&manifest_toml));
+}
+
+#[test]
+fn member_manifest_forbid_check_allows_workspace_lints_without_override() {
+    let manifest_toml: toml::Value = toml::from_str(
+        r"
+        [lints]
+        workspace = true
+        ",
+    )
+    .expect("manifest snippet should parse");
+
+    assert!(member_manifest_forbids_unsafe_code(&manifest_toml));
 }
 
 #[test]
