@@ -92,6 +92,9 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/cached_basic.rs");
     t.pass("tests/compile-pass/cached_result.rs");
 
+    // One-off operational task macro
+    t.pass("tests/compile-pass/task_basic.rs");
+
     // WebSocket macro (requires ws feature)
     #[cfg(feature = "ws")]
     t.pass("tests/compile-pass/ws_basic.rs");

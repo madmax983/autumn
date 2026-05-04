@@ -1,12 +1,13 @@
 # Code Generators
 
 `autumn generate` collapses the five-file dance of "add a resource" into a
-single command. Three subcommands cover the cases you actually hit:
+single command. Four subcommands cover the cases you actually hit:
 
 | Command                              | What it produces                                                                 |
 | ------------------------------------ | -------------------------------------------------------------------------------- |
 | `autumn generate model`              | A `#[model]` struct, a Diesel `up.sql`/`down.sql` pair, a `schema.rs` entry      |
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
+| `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 
 The generators only emit code that uses macros and conventions Autumn already
@@ -125,6 +126,39 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Posts` as the table `posts`. If your name doesn't match `Add…To…` or
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
+
+## `autumn generate task`
+
+For operational scripts that should run through the full Autumn app context.
+
+```bash
+autumn generate task cleanup_users
+```
+
+Produces:
+
+```
+tasks/cleanup_users.rs                         # #[task] async function skeleton
+```
+
+The generated task uses `TaskArgs<T>` for CLI flags:
+
+```rust
+#[derive(Debug, Deserialize)]
+struct CleanupUsersArgs {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[autumn_web::task]
+pub async fn cleanup_users(TaskArgs(args): TaskArgs<CleanupUsersArgs>) -> AutumnResult<()> {
+    // ...
+    Ok(())
+}
+```
+
+Register the function with `.one_off_tasks(one_off_tasks![...])` before running
+it with `autumn task cleanup_users --dry-run`.
 
 ## `autumn generate scaffold`
 

@@ -661,6 +661,21 @@ pub struct AutumnConfig {
     pub mail: crate::mail::MailConfig,
 }
 
+impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
+    type Rejection = crate::AutumnError;
+
+    async fn from_request_parts(
+        _parts: &mut http::request::Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        state
+            .extension::<Self>()
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| crate::AutumnError::service_unavailable_msg("Config is not available"))
+    }
+}
+
 /// Background job runtime configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobConfig {

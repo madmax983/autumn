@@ -71,6 +71,7 @@ pub fn app() -> AppBuilder {
         route_sources: Vec::new(),
         current_plugin: None,
         tasks: Vec::new(),
+        one_off_tasks: Vec::new(),
         jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
@@ -178,6 +179,7 @@ pub struct AppBuilder {
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
+    one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
@@ -376,6 +378,16 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register one-off operational tasks runnable with `autumn task <name>`.
+    ///
+    /// Use the [`one_off_tasks!`](crate::one_off_tasks) macro to collect
+    /// `#[task]` handlers.
+    #[must_use]
+    pub fn one_off_tasks(mut self, tasks: Vec<crate::task::OneOffTaskInfo>) -> Self {
+        self.one_off_tasks.extend(tasks);
         self
     }
 
@@ -1186,11 +1198,22 @@ impl AppBuilder {
             return;
         }
 
+        if is_list_one_off_tasks_mode() {
+            self.run_list_one_off_tasks_mode();
+            return;
+        }
+
+        if let Some(task_name) = one_off_task_name_from_env() {
+            self.run_one_off_task_mode(task_name).await;
+            return;
+        }
+
         let Self {
             routes,
             route_sources: _,
             current_plugin: _,
             tasks,
+            one_off_tasks: _,
             jobs,
             static_metas: _,
             exception_filters,
@@ -1464,6 +1487,7 @@ impl AppBuilder {
             route_sources: _,
             current_plugin: _,
             tasks: _,
+            one_off_tasks: _,
             jobs: _,
             static_metas,
             exception_filters: _,
@@ -1669,6 +1693,157 @@ impl AppBuilder {
         println!("{json}");
         std::process::exit(0);
     }
+
+    /// Dump registered one-off tasks as JSON and exit.
+    ///
+    /// Triggered by `AUTUMN_LIST_TASKS=1` from `autumn task --list`.
+    fn run_list_one_off_tasks_mode(self) {
+        let Self { one_off_tasks, .. } = self;
+
+        if let Err(error) = crate::task::validate_unique_one_off_task_names(&one_off_tasks) {
+            eprintln!("Invalid task registration: {error}");
+            std::process::exit(1);
+        }
+
+        let listing = crate::task::list_one_off_tasks(&one_off_tasks);
+        let json = serde_json::to_string_pretty(&listing).unwrap_or_else(|error| {
+            eprintln!("Failed to serialize task listing: {error}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
+
+    /// Run a registered one-off task with full application context and exit.
+    ///
+    /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
+    #[allow(clippy::too_many_lines)]
+    async fn run_one_off_task_mode(self, requested_name: String) {
+        let Self {
+            one_off_tasks,
+            jobs,
+            #[cfg(feature = "i18n")]
+            custom_layers,
+            #[cfg(not(feature = "i18n"))]
+                custom_layers: _,
+            startup_hooks,
+            shutdown_hooks,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store,
+            audit_logger,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
+            policy_registrations,
+            ..
+        } = self;
+
+        if let Err(error) = crate::task::validate_unique_one_off_task_names(&one_off_tasks) {
+            eprintln!("Invalid task registration: {error}");
+            std::process::exit(1);
+        }
+
+        let Some((task_name, task_handler)) = one_off_tasks
+            .iter()
+            .find(|task| task.name == requested_name)
+            .map(|task| (task.name.clone(), task.handler))
+        else {
+            eprintln!("No one-off task named '{requested_name}' is registered.");
+            print_available_one_off_tasks(&one_off_tasks);
+            std::process::exit(1);
+        };
+
+        let args = one_off_task_args_from_env().unwrap_or_else(|error| {
+            eprintln!("Invalid task args: {error}");
+            std::process::exit(1);
+        });
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
+
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = preflight_storage(&config);
+
+        #[cfg(feature = "db")]
+        let pool = setup_database(&config, migrations, pool_provider_factory)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            pool,
+        );
+
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
+
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
+
+        #[cfg(feature = "i18n")]
+        let _custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+
+        #[cfg(feature = "storage")]
+        let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
+
+        let task_shutdown = tokio_util::sync::CancellationToken::new();
+        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
+            eprintln!("job runtime initialization failed: {error}");
+            std::process::exit(1);
+        }
+
+        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+            eprintln!("startup hook failed: {error}");
+            task_shutdown.cancel();
+            std::process::exit(1);
+        }
+        state.probes().mark_startup_complete();
+
+        tracing::info!(task = %task_name, "Running one-off task");
+        let span = tracing::info_span!("one_off_task", task = %task_name);
+        let result = (task_handler)(state.clone(), args).instrument(span).await;
+
+        task_shutdown.cancel();
+        run_shutdown_hooks(&shutdown_hooks).await;
+
+        match result {
+            Ok(()) => {
+                tracing::info!(task = %task_name, "One-off task completed");
+            }
+            Err(error) => {
+                tracing::error!(task = %task_name, error = %error, "One-off task failed");
+                eprintln!("Task '{task_name}' failed: {error}");
+                for cause in error.source_chain() {
+                    eprintln!("Caused by: {cause}");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 pub(crate) fn is_static_build_mode() -> bool {
@@ -1677,6 +1852,42 @@ pub(crate) fn is_static_build_mode() -> bool {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_list_one_off_tasks_mode() -> bool {
+    std::env::var("AUTUMN_LIST_TASKS").as_deref() == Ok("1")
+}
+
+fn one_off_task_name_from_env() -> Option<String> {
+    std::env::var("AUTUMN_RUN_TASK")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn one_off_task_args_from_env() -> Result<Vec<String>, String> {
+    match std::env::var("AUTUMN_TASK_ARGS_JSON") {
+        Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
+            .map_err(|error| format!("AUTUMN_TASK_ARGS_JSON must be a JSON string array: {error}")),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn print_available_one_off_tasks(tasks: &[crate::task::OneOffTaskInfo]) {
+    let listing = crate::task::list_one_off_tasks(tasks);
+    if listing.is_empty() {
+        eprintln!("No one-off tasks are registered. Add .one_off_tasks(one_off_tasks![...]).");
+        return;
+    }
+
+    eprintln!("Available tasks:");
+    for task in listing {
+        if task.description.is_empty() {
+            eprintln!("  {}", task.name);
+        } else {
+            eprintln!("  {:<24} {}", task.name, task.description);
+        }
+    }
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -2988,7 +3199,7 @@ fn build_state(
         diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     >,
 ) -> AppState {
-    AppState {
+    let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
         pool,
@@ -3008,7 +3219,9 @@ fn build_state(
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: config.auth.session_key.clone(),
-    }
+    };
+    state.insert_extension(config.clone());
+    state
 }
 
 /// Build the route listing string for the transparency log.

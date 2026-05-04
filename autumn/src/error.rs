@@ -458,6 +458,21 @@ impl AutumnError {
     pub const fn status(&self) -> StatusCode {
         self.status
     }
+
+    /// Return the wrapped error's source chain as displayable messages.
+    ///
+    /// The top-level [`AutumnError`] display already prints the wrapped error
+    /// message, so this list starts at that wrapped error's first source.
+    #[must_use]
+    pub fn source_chain(&self) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut source = self.inner.source();
+        while let Some(error) = source {
+            chain.push(error.to_string());
+            source = error.source();
+        }
+        chain
+    }
 }
 
 impl std::fmt::Display for AutumnError {
@@ -518,6 +533,24 @@ mod tests {
     }
 
     impl std::error::Error for TestError {}
+
+    #[derive(Debug)]
+    struct WrappedError {
+        message: String,
+        source: TestError,
+    }
+
+    impl std::fmt::Display for WrappedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for WrappedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
 
     #[test]
     fn blanket_from_defaults_to_500() {
@@ -637,6 +670,19 @@ mod tests {
     fn display_uses_inner_message() {
         let err: AutumnError = TestError("something broke".into()).into();
         assert_eq!(err.to_string(), "something broke");
+    }
+
+    #[test]
+    fn source_chain_lists_inner_sources() {
+        let err = AutumnError::internal_server_error(WrappedError {
+            message: "failed to backfill".to_string(),
+            source: TestError("database connection dropped".to_string()),
+        });
+
+        assert_eq!(
+            err.source_chain(),
+            vec!["database connection dropped".to_string()]
+        );
     }
 
     #[test]
