@@ -1,17 +1,20 @@
+mod build_support;
+
+use std::path::Path;
+
 fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
+    println!("cargo:rerun-if-changed=static/css/autumn.css");
+    println!("cargo:rerun-if-env-changed=AUTUMN_REQUIRE_TAILWIND");
 
     let Some(tailwind) = find_tailwind_cli() else {
-        println!(
-            "cargo:warning=Tailwind CSS CLI not found — CSS will not be compiled. \
-             Run `autumn setup` or install tailwindcss manually."
-        );
+        handle_tailwind_unavailable("Tailwind CSS CLI not found");
         return;
     };
 
-    let status = std::process::Command::new(&tailwind)
+    let output = std::process::Command::new(&tailwind)
         .args([
             "-i",
             "static/css/input.css",
@@ -21,10 +24,34 @@ fn main() {
             "src/**/*.rs",
             "--minify",
         ])
-        .status()
-        .expect("Failed to run Tailwind CLI");
+        .output();
 
-    assert!(status.success(), "Tailwind CSS compilation failed");
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            handle_tailwind_unavailable(&format!(
+                "Tailwind CSS CLI exited with status {}: {stderr}",
+                output.status
+            ));
+        }
+        Err(error) => {
+            handle_tailwind_unavailable(&format!("failed to run Tailwind CSS CLI: {error}"));
+        }
+    }
+}
+
+fn handle_tailwind_unavailable(reason: &str) {
+    let checked_in_css_exists = Path::new("static/css/autumn.css").exists();
+    let require_tailwind = build_support::require_tailwind_from_env();
+    match build_support::tailwind_failure_action(checked_in_css_exists, require_tailwind) {
+        build_support::TailwindFailureAction::FailBuild => {
+            panic!("{reason}; no checked-in CSS fallback is available");
+        }
+        build_support::TailwindFailureAction::UseCheckedInCss => {
+            println!("cargo:warning={reason}; using checked-in static/css/autumn.css");
+        }
+    }
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {
