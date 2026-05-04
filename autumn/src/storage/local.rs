@@ -1352,3 +1352,20 @@ mod tests {
         assert!(dbg.contains("len"));
     }
 }
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+
+    #[test]
+    fn blob_store_error_conversion_preserves_status() {
+        let nfe = BlobStoreError::NotFound("k".into());
+        assert_eq!(nfe.status(), http::StatusCode::NOT_FOUND);
+
+        let pe = BlobStoreError::PermissionDenied("k".into());
+        assert_eq!(pe.status(), http::StatusCode::FORBIDDEN);
+
+        let ae = nfe.into_autumn_error();
+        assert_eq!(ae.status(), http::StatusCode::NOT_FOUND);
+    }
+}

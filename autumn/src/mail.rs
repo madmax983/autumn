@@ -976,3 +976,42 @@ mod tests {
         mailer.deliver_later(mail);
     }
 }
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+
+    #[test]
+    fn transport_from_env_value_parses_correctly() {
+        assert_eq!(Transport::from_env_value("log"), Some(Transport::Log));
+        assert_eq!(Transport::from_env_value("LOG "), Some(Transport::Log));
+        assert_eq!(Transport::from_env_value("FiLe"), Some(Transport::File));
+        assert_eq!(Transport::from_env_value("smtp"), Some(Transport::Smtp));
+        assert_eq!(
+            Transport::from_env_value("disabled"),
+            Some(Transport::Disabled)
+        );
+        assert_eq!(Transport::from_env_value("invalid"), None);
+    }
+
+    #[test]
+    fn tls_from_env_value_parses_correctly() {
+        assert_eq!(TlsMode::from_env_value("none"), Some(TlsMode::Disabled));
+        assert_eq!(
+            TlsMode::from_env_value("opportunistic"),
+            Some(TlsMode::StartTls)
+        );
+        assert_eq!(TlsMode::from_env_value("required"), Some(TlsMode::Tls));
+        assert_eq!(TlsMode::from_env_value("REQUIRED "), Some(TlsMode::Tls));
+        assert_eq!(TlsMode::from_env_value("invalid"), None);
+    }
+
+    #[test]
+    fn mail_error_conversions() {
+        let builder_err = MailError::InvalidMessage("bad input".into());
+        assert_eq!(builder_err.to_string(), "invalid mail message: bad input");
+
+        let err: crate::AutumnError = builder_err.into();
+        assert_eq!(err.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
