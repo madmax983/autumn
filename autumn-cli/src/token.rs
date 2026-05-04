@@ -181,7 +181,7 @@ mod tests {
                 ("AUTUMN_DATABASE__URL", Some("postgres://autumn-primary")),
                 ("DATABASE_URL", Some("postgres://fallback")),
             ],
-            || resolve_database_url(),
+            resolve_database_url,
         );
         assert_eq!(url, "postgres://autumn-primary");
     }
@@ -193,7 +193,7 @@ mod tests {
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", Some("postgres://fallback")),
             ],
-            || resolve_database_url(),
+            resolve_database_url,
         );
         assert_eq!(url, "postgres://fallback");
     }
