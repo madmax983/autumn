@@ -405,33 +405,16 @@ fn run_command(command: Commands) {
             filter,
             method,
             user_only,
-        } => {
-            let fmt = format.parse().unwrap_or_else(|e| {
-                eprintln!("autumn routes: {e}");
-                std::process::exit(1);
-            });
-            // Positional prefix takes precedence over --filter when both are given.
-            let effective_filter = prefix.as_deref().or(filter.as_deref());
-            routes::run(&routes::RoutesOptions {
-                package: package.as_deref(),
-                bin: bin.as_deref(),
-                format: fmt,
-                filter: effective_filter,
-                methods: &method,
-                user_only,
-            });
-        }
-        Commands::Release(cmd) => match cmd {
-            ReleaseCommands::Init { force, target } => {
-                let t = target.as_deref().map_or(release::Target::Default, |s| {
-                    s.parse().unwrap_or_else(|e| {
-                        eprintln!("autumn release init: {e}");
-                        std::process::exit(1);
-                    })
-                });
-                release::run(release::ReleaseAction::Init { force, target: t });
-            }
-        },
+        } => run_routes_command(
+            package.as_deref(),
+            bin.as_deref(),
+            &format,
+            prefix.as_deref(),
+            filter.as_deref(),
+            &method,
+            user_only,
+        ),
+        Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue { principal_id } => token::run_issue(&principal_id),
             TokenCommands::Revoke { raw_token } => token::run_revoke(&raw_token),
