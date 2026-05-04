@@ -33,8 +33,9 @@ pub use autumn_macros::mailer;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, patch, paths, post,
-    put, routes, scheduled, secured, service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, one_off_tasks,
+    patch, paths, post, put, routes, scheduled, secured, service, static_get, static_routes, task,
+    tasks,
 };
 
 // ── Rendering ────────────────────────────────────────────────────
@@ -75,6 +76,8 @@ pub use crate::mail::{
 };
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
+/// Structured CLI argument extractor for one-off `#[task]` handlers.
+pub use crate::task::TaskArgs;
 /// State extractor.
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.

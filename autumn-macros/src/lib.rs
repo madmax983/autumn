@@ -22,6 +22,8 @@ mod mailer;
 mod main_macro;
 mod model;
 mod oauth2_callback;
+mod one_off_task;
+mod one_off_tasks_macro;
 mod param_helpers;
 mod parse;
 mod paths_macro;
@@ -313,6 +315,12 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     job::job_macro(attr.into(), item.into()).into()
 }
 
+/// Declare a one-off operational task runnable with `autumn task <name>`.
+#[proc_macro_attribute]
+pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
+    one_off_task::task_macro(attr.into(), item.into()).into()
+}
+
 /// Annotate an async function as a statically pre-rendered GET route.
 ///
 /// Like `#[get]`, this generates a route companion function. Additionally,
@@ -351,6 +359,12 @@ pub fn tasks(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn jobs(input: TokenStream) -> TokenStream {
     jobs_macro::jobs_macro(input.into()).into()
+}
+
+/// Collect `#[task]` handlers into a `Vec<OneOffTaskInfo>`.
+#[proc_macro]
+pub fn one_off_tasks(input: TokenStream) -> TokenStream {
+    one_off_tasks_macro::one_off_tasks_macro(input.into()).into()
 }
 
 /// Secure a route handler with authentication and optional role checks.

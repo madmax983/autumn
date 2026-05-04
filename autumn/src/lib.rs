@@ -565,6 +565,8 @@ pub use autumn_macros::ws;
 pub use autumn_macros::job;
 /// Declare a scheduled background task. See [`task`] module.
 pub use autumn_macros::scheduled;
+/// Declare a one-off operational task. See [`task::OneOffTaskInfo`].
+pub use autumn_macros::task;
 
 /// Secure a route handler with authentication and optional role checks.
 ///
@@ -629,6 +631,9 @@ pub use autumn_macros::secured;
 pub use autumn_macros::authorize;
 /// Collect `#[job]` handlers into a `Vec<JobInfo>`.
 pub use autumn_macros::jobs;
+
+/// Collect `#[task]` handlers into a `Vec<task::OneOffTaskInfo>`.
+pub use autumn_macros::one_off_tasks;
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
 pub use autumn_macros::tasks;
