@@ -173,4 +173,40 @@ mod tests {
         let t = generate_token();
         assert_ne!(t, "0".repeat(64));
     }
+
+    #[test]
+    fn resolve_prefers_autumn_database_url_over_database_url() {
+        let url = temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__URL", Some("postgres://autumn-primary")),
+                ("DATABASE_URL", Some("postgres://fallback")),
+            ],
+            || resolve_database_url(),
+        );
+        assert_eq!(url, "postgres://autumn-primary");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_database_url_when_autumn_unset() {
+        let url = temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", Some("postgres://fallback")),
+            ],
+            || resolve_database_url(),
+        );
+        assert_eq!(url, "postgres://fallback");
+    }
+
+    #[test]
+    fn check_psql_does_not_panic_when_available() {
+        // Run only when psql is on PATH; skip otherwise to avoid process::exit.
+        if std::process::Command::new("psql")
+            .arg("--version")
+            .output()
+            .map_or(false, |o| o.status.success())
+        {
+            check_psql();
+        }
+    }
 }

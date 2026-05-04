@@ -141,4 +141,24 @@ mod tests {
             "todo upgrade migration must widen the backing sequence to BIGINT",
         );
     }
+
+    // ── DeferredStore tests ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deferred_store_delegates_to_inner_store() {
+        use autumn_web::auth::{ApiTokenStore, InMemoryApiTokenStore};
+        use std::sync::Arc;
+
+        let deferred = super::DeferredStore::new();
+        deferred.init(Arc::new(InMemoryApiTokenStore::default()) as Arc<dyn ApiTokenStore>);
+
+        let token = deferred.issue("user:1").await.unwrap();
+        assert!(!token.is_empty());
+        assert_eq!(
+            deferred.verify(&token).await.unwrap(),
+            Some("user:1".to_owned())
+        );
+        deferred.revoke(&token).await.unwrap();
+        assert_eq!(deferred.verify(&token).await.unwrap(), None);
+    }
 }
