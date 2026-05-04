@@ -8,3 +8,6 @@ publish = false
 autumn-web = { path = "../../autumn", features = ["ws"] }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
