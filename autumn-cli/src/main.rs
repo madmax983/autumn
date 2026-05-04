@@ -12,8 +12,8 @@ mod release;
 mod routes;
 mod seed;
 mod setup;
-mod token;
 mod task;
+mod token;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
