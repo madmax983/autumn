@@ -873,7 +873,7 @@ impl AppBuilder {
 
     /// Auto-load the i18n translation bundle from the configured directory
     /// (`i18n/` by default), reading the `[i18n]` block from the active
-    /// [`AutumnConfig`](crate::config::AutumnConfig).
+    /// [`AutumnConfig`].
     ///
     /// Fails fast during [`Self::run`] if the configured default locale's file is
     /// missing — the spec calls out this as the desired behaviour: a

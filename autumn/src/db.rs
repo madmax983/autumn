@@ -165,7 +165,7 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// Returns [`AutumnError`](crate::error::AutumnError) when:
+    /// Returns [`AutumnError`] when:
     ///
     /// - the underlying transaction returns an error,
     /// - the closure returns an error that converts into `AutumnError`,
