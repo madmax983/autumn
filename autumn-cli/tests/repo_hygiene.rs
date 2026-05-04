@@ -26,6 +26,61 @@ fn git(root: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
+fn workspace_forbids_unsafe_code_for_all_members() {
+    let root = workspace_root();
+    let root_manifest_path = root.join("Cargo.toml");
+    let root_manifest = std::fs::read_to_string(&root_manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", root_manifest_path.display()));
+    let root_toml: toml::Value =
+        toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML");
+
+    let unsafe_code_lint = root_toml
+        .get("workspace")
+        .and_then(|workspace| workspace.get("lints"))
+        .and_then(|lints| lints.get("rust"))
+        .and_then(|rust| rust.get("unsafe_code"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        unsafe_code_lint,
+        Some("forbid"),
+        "workspace root must set [workspace.lints.rust] unsafe_code = \"forbid\"",
+    );
+
+    let members = root_toml["workspace"]["members"]
+        .as_array()
+        .expect("workspace.members should be an array");
+
+    for member in members {
+        let member = member
+            .as_str()
+            .expect("workspace member entries should be strings");
+        let manifest_path = root.join(member).join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", manifest_path.display()));
+        let manifest_toml: toml::Value = toml::from_str(&manifest).unwrap_or_else(|err| {
+            panic!("{} should parse as TOML: {err}", manifest_path.display())
+        });
+
+        let inherits_workspace_lints = manifest_toml
+            .get("lints")
+            .and_then(|lints| lints.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true);
+        let local_unsafe_code_lint = manifest_toml
+            .get("lints")
+            .and_then(|lints| lints.get("rust"))
+            .and_then(|rust| rust.get("unsafe_code"))
+            .and_then(toml::Value::as_str);
+
+        assert!(
+            inherits_workspace_lints || local_unsafe_code_lint == Some("forbid"),
+            "{member}/Cargo.toml must either inherit workspace lints or set \
+             [lints.rust] unsafe_code = \"forbid\"",
+        );
+    }
+}
+
+#[test]
 fn generated_example_css_is_ignored_and_untracked() {
     let root = workspace_root();
 

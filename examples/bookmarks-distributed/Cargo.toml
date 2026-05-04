@@ -23,3 +23,6 @@ validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 autumn-web = { path = "../../autumn", features = ["test-support"] }
+
+[lints.rust]
+unsafe_code = "forbid"

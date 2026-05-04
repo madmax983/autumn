@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
+
+[lints.rust]
+unsafe_code = "forbid"
