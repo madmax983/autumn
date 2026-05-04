@@ -232,7 +232,7 @@ pub fn print_json(routes: &[RouteInfo]) {
 
 // ── Binary discovery (mirrored from build.rs) ──────────────────────────────
 
-fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
+pub fn find_binary(package: Option<&str>, bin: Option<&str>) -> PathBuf {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -370,7 +370,7 @@ fn resolve_binary_from_metadata(
 
 // ── Also compile the binary before running ─────────────────────────────────
 
-fn compile_binary(package: Option<&str>) {
+pub fn compile_binary(package: Option<&str>) {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if let Some(pkg) = package {

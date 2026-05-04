@@ -2,10 +2,11 @@ mod admin;
 mod models;
 mod routes;
 mod schema;
+mod tasks;
 
 use autumn_admin_plugin::AdminPlugin;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
-use autumn_web::{jobs, routes, static_routes};
+use autumn_web::{jobs, one_off_tasks, routes, static_routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -42,6 +43,7 @@ async fn main() {
             routes::api::enqueue_publish_webhook,
         ])
         .jobs(jobs![routes::api::publish_webhook])
+        .one_off_tasks(one_off_tasks![tasks::cleanup_posts])
         .static_routes(static_routes![routes::about::about,])
         .run()
         .await;

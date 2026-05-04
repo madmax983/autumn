@@ -13,6 +13,7 @@ mod routes;
 mod seed;
 mod setup;
 mod token;
+mod task;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -100,9 +101,33 @@ enum Commands {
         #[arg(short, long)]
         package: Option<String>,
     },
+    /// Run or list one-off operational tasks registered by the application.
+    Task {
+        /// Package to run (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to run (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+        #[arg(long, default_value = "dev")]
+        profile: String,
+        /// List registered tasks instead of running one.
+        #[arg(long)]
+        list: bool,
+        /// Task name to run.
+        name: Option<String>,
+        /// Arguments forwarded to the task, e.g. `--user-id 42`.
+        #[arg(
+            value_name = "ARGS",
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        args: Vec<String>,
+    },
     /// Scaffold models, migrations, and CRUD code for a new resource.
     ///
-    /// Three subcommands collapse the repetitive five-file dance of adding
+    /// Four subcommands collapse the repetitive five-file dance of adding
     /// a resource — `#[model]` struct, Diesel migration, schema entry,
     /// `#[repository]`, route handlers, Maud templates, `routes![]`
     /// registration, smoke test — into a single command.
@@ -296,6 +321,17 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a one-off operational `#[task]` skeleton.
+    Task {
+        /// Task function name (`snake_case`, e.g. `cleanup_users`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -314,7 +350,11 @@ enum GenerateCommands {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    run_command(cli.command);
+}
+
+fn run_command(command: Commands) {
+    match command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
         Commands::Dev {
             package,
@@ -341,6 +381,21 @@ fn main() {
             },
         ),
         Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
+        Commands::Task {
+            package,
+            bin,
+            profile,
+            list,
+            name,
+            args,
+        } => run_task_command(
+            package.as_deref(),
+            bin.as_deref(),
+            &profile,
+            list,
+            name.as_deref(),
+            &args,
+        ),
         Commands::Setup { force } => setup::run(force),
         Commands::Routes {
             package,
@@ -384,26 +439,92 @@ fn main() {
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }
-        Commands::Generate(cmd) => match cmd {
-            GenerateCommands::Model {
-                name,
-                fields,
-                dry_run,
-                force,
-            } => generate::model::run(&name, &fields, generate::Flags { dry_run, force }),
-            GenerateCommands::Migration {
-                name,
-                fields,
-                dry_run,
-                force,
-            } => generate::migration::run(&name, &fields, generate::Flags { dry_run, force }),
-            GenerateCommands::Scaffold {
-                name,
-                fields,
-                dry_run,
-                force,
-            } => generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }),
-        },
+        Commands::Generate(cmd) => run_generate_command(cmd),
+    }
+}
+
+fn run_task_command(
+    package: Option<&str>,
+    bin: Option<&str>,
+    profile: &str,
+    list: bool,
+    name: Option<&str>,
+    args: &[String],
+) {
+    task::run(&task::TaskOptions {
+        package,
+        bin,
+        profile,
+        list,
+        name,
+        args,
+    });
+}
+
+fn run_routes_command(
+    package: Option<&str>,
+    bin: Option<&str>,
+    format: &str,
+    prefix: Option<&str>,
+    filter: Option<&str>,
+    method: &[String],
+    user_only: bool,
+) {
+    let fmt = format.parse().unwrap_or_else(|e| {
+        eprintln!("autumn routes: {e}");
+        std::process::exit(1);
+    });
+    // Positional prefix takes precedence over --filter when both are given.
+    let effective_filter = prefix.or(filter);
+    routes::run(&routes::RoutesOptions {
+        package,
+        bin,
+        format: fmt,
+        filter: effective_filter,
+        methods: method,
+        user_only,
+    });
+}
+
+fn run_release_command(cmd: ReleaseCommands) {
+    match cmd {
+        ReleaseCommands::Init { force, target } => {
+            let t = target.as_deref().map_or(release::Target::Default, |s| {
+                s.parse().unwrap_or_else(|e| {
+                    eprintln!("autumn release init: {e}");
+                    std::process::exit(1);
+                })
+            });
+            release::run(release::ReleaseAction::Init { force, target: t });
+        }
+    }
+}
+
+fn run_generate_command(cmd: GenerateCommands) {
+    match cmd {
+        GenerateCommands::Model {
+            name,
+            fields,
+            dry_run,
+            force,
+        } => generate::model::run(&name, &fields, generate::Flags { dry_run, force }),
+        GenerateCommands::Migration {
+            name,
+            fields,
+            dry_run,
+            force,
+        } => generate::migration::run(&name, &fields, generate::Flags { dry_run, force }),
+        GenerateCommands::Task {
+            name,
+            dry_run,
+            force,
+        } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::Scaffold {
+            name,
+            fields,
+            dry_run,
+            force,
+        } => generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }),
     }
 }
 
@@ -719,6 +840,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_generate_task() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "task", "cleanup_users", "--dry-run"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Task {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate task");
+        };
+        assert_eq!(name, "cleanup_users");
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
     fn parse_generate_scaffold() {
         let cli = Cli::try_parse_from([
             "autumn",
@@ -803,6 +941,72 @@ mod tests {
     }
 
     // ── autumn routes tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_task_run_with_cli_args() {
+        let cli =
+            Cli::try_parse_from(["autumn", "task", "cleanup-user", "--user-id", "42"]).unwrap();
+        match cli.command {
+            Commands::Task {
+                name,
+                args,
+                list,
+                profile,
+                package,
+                bin,
+            } => {
+                assert_eq!(name.as_deref(), Some("cleanup-user"));
+                assert_eq!(args, vec!["--user-id", "42"]);
+                assert!(!list);
+                assert_eq!(profile, "dev");
+                assert!(package.is_none());
+                assert!(bin.is_none());
+            }
+            _ => panic!("expected Task command"),
+        }
+    }
+
+    #[test]
+    fn parse_task_list_with_package_and_bin() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "task",
+            "--list",
+            "--package",
+            "blog",
+            "--bin",
+            "blog",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Task {
+                name,
+                list,
+                package,
+                bin,
+                ..
+            } => {
+                assert!(name.is_none());
+                assert!(list);
+                assert_eq!(package.as_deref(), Some("blog"));
+                assert_eq!(bin.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Task command"),
+        }
+    }
+
+    #[test]
+    fn parse_task_with_profile() {
+        let cli =
+            Cli::try_parse_from(["autumn", "task", "--profile", "prod", "cleanup-user"]).unwrap();
+        match cli.command {
+            Commands::Task { profile, name, .. } => {
+                assert_eq!(profile, "prod");
+                assert_eq!(name.as_deref(), Some("cleanup-user"));
+            }
+            _ => panic!("expected Task command"),
+        }
+    }
 
     #[test]
     fn parse_routes_defaults() {

@@ -191,6 +191,18 @@ fn generate_migration_unknown_pattern_is_empty() {
 }
 
 #[test]
+fn generate_task_emits_task_module() {
+    let (_tmp, project) = fresh_project("task-app");
+    run_autumn(&project, &["generate", "task", "cleanup_users"]);
+
+    let task = fs::read_to_string(project.join("tasks/cleanup_users.rs")).unwrap();
+    assert!(task.contains("#[autumn_web::task]"));
+    assert!(task.contains("pub async fn cleanup_users"));
+    assert!(task.contains("TaskArgs<CleanupUsersArgs>"));
+    assert!(task.contains("AutumnResult<()>"));
+}
+
+#[test]
 fn generate_scaffold_full_e2e_post() {
     let (_tmp, project) = fresh_project("scaffold-app");
     run_autumn(

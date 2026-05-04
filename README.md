@@ -22,12 +22,12 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Database ergonomics** - async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
-- **Background work** - `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
 - **Companion workflows** - [Autumn Harvest](docs/autumn-workflow-architecture.md) is the separate durable workflow engine for multi-step orchestration when `#[scheduled]` or `#[job]` is not enough
 - **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
 - **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
-- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, and `autumn task`
 
 ## Quickstart
 
@@ -158,6 +158,7 @@ async fn main() {
 
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
