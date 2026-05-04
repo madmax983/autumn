@@ -917,21 +917,31 @@ pub trait ApiTokenStore: Send + Sync + 'static {
 /// assert_eq!(h, hash_api_token("my_token")); // deterministic
 /// ```
 #[must_use]
-pub fn hash_api_token(_raw: &str) -> String {
-    // RED stub — always returns ""; tests expecting len == 64 will fail.
-    String::new()
+pub fn hash_api_token(raw: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(raw.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
-/// Generate a cryptographically random raw API token string.
+/// Generate a 256-bit random raw API token as a lowercase hex string.
+///
+/// Uses two UUID v4 values (128 bits each) concatenated for a 64-char result.
 fn generate_raw_token() -> String {
-    // RED stub — not random; uniqueness tests will fail.
-    "red_stub_token".to_owned()
+    let u1 = uuid::Uuid::new_v4();
+    let u2 = uuid::Uuid::new_v4();
+    format!("{}{}", u1.simple(), u2.simple())
 }
 
 /// In-memory API token store for development and testing.
 ///
-/// Tokens are stored as SHA-256 hashes mapped to principal IDs.
-/// **Not suitable for production** — state is lost on restart.
+/// Tokens are stored as SHA-256 hashes mapped to principal IDs inside a
+/// `RwLock`-protected `HashMap`. **Not suitable for production** — state is
+/// lost on restart and is not shared across processes.
 ///
 /// # Examples
 ///
@@ -947,34 +957,63 @@ fn generate_raw_token() -> String {
 /// assert_eq!(store.verify(&token).await.unwrap(), None);
 /// # });
 /// ```
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct InMemoryApiTokenStore {
-    // RED stub: no actual storage — will be replaced in GREEN.
+    // hash → principal_id
+    tokens: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+}
+
+impl Default for InMemoryApiTokenStore {
+    fn default() -> Self {
+        Self {
+            tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
 }
 
 impl ApiTokenStore for InMemoryApiTokenStore {
     fn issue<'a>(
         &'a self,
-        _principal_id: &'a str,
+        principal_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
-        // RED stub — same token every time, principal not stored.
-        Box::pin(std::future::ready(Ok(generate_raw_token())))
+        Box::pin(async move {
+            let raw = generate_raw_token();
+            let hash = hash_api_token(&raw);
+            self.tokens
+                .write()
+                .expect("api token store lock poisoned")
+                .insert(hash, principal_id.to_owned());
+            Ok(raw)
+        })
     }
 
     fn verify<'a>(
         &'a self,
-        _raw_token: &'a str,
+        raw_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
-        // RED stub — always None; valid tokens will not be found.
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(async move {
+            let hash = hash_api_token(raw_token);
+            Ok(self
+                .tokens
+                .read()
+                .expect("api token store lock poisoned")
+                .get(&hash)
+                .cloned())
+        })
     }
 
     fn revoke<'a>(
         &'a self,
-        _raw_token: &'a str,
+        raw_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
-        // RED stub — no-op.
-        Box::pin(std::future::ready(Ok(())))
+        Box::pin(async move {
+            let hash = hash_api_token(raw_token);
+            self.tokens
+                .write()
+                .expect("api token store lock poisoned")
+                .remove(&hash);
+            Ok(())
+        })
     }
 }
 
@@ -1121,22 +1160,47 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
-        // RED stub — always 401; store not yet consulted, valid tokens rejected.
-        let _store = Arc::clone(&self.store);
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        let store = Arc::clone(&self.store);
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
+
         Box::pin(async move {
-            let body = serde_json::json!({
-                "error": { "status": 401, "message": "authentication required" }
-            });
-            Ok(Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(http::header::CONTENT_TYPE, "application/json")
-                .body(ResBody::from(
-                    serde_json::to_string(&body).unwrap_or_default(),
-                ))
-                .unwrap_or_default())
+            // Parse "Authorization: Bearer <token>"
+            let raw_token = req
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(str::to_owned);
+
+            let Some(raw_token) = raw_token else {
+                return Ok(api_token_unauthorized_response());
+            };
+
+            match store.verify(&raw_token).await {
+                Ok(Some(principal_id)) => {
+                    req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
+                    inner.call(req).await
+                }
+                _ => Ok(api_token_unauthorized_response()),
+            }
         })
     }
+}
+
+/// Build a `401 Unauthorized` response using the standard JSON error envelope.
+fn api_token_unauthorized_response<ResBody: From<String> + Default>() -> Response<ResBody> {
+    let body = serde_json::json!({
+        "error": { "status": 401, "message": "authentication required" }
+    });
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(ResBody::from(
+            serde_json::to_string(&body).unwrap_or_default(),
+        ))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
