@@ -1973,6 +1973,7 @@ impl AppBuilder {
             #[cfg(feature = "i18n")]
             i18n_auto_load,
             policy_registrations,
+            cache_backend,
             ..
         } = self;
 
@@ -2024,13 +2025,19 @@ impl AppBuilder {
                 std::process::exit(1);
             });
 
-        let state = build_state(
+        let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
             pool,
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
+            state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
+        }
 
         for register in policy_registrations {
             register(state.policy_registry());
