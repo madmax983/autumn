@@ -610,6 +610,11 @@ fn redis_channel_name(prefix: &str, topic: &str) -> String {
 }
 
 #[cfg(feature = "redis")]
+fn redis_channel_topic<'a>(channel_prefix: &str, channel: &'a str) -> Option<&'a str> {
+    channel.strip_prefix(channel_prefix)
+}
+
+#[cfg(feature = "redis")]
 fn redis_channel_pattern(prefix: &str) -> String {
     format!("{prefix}:*")
 }
@@ -665,6 +670,7 @@ fn spawn_redis_listener(
     tokio::spawn(async move {
         use futures::StreamExt as _;
 
+        let channel_prefix = redis_channel_name(&key_prefix, "");
         let pattern = redis_channel_pattern(&key_prefix);
         loop {
             if shutdown.is_cancelled() {
@@ -694,6 +700,7 @@ fn spawn_redis_listener(
                         let Some(message) = message else {
                             break;
                         };
+                        let redis_channel = message.get_channel_name();
                         let payload: String = match message.get_payload() {
                             Ok(payload) => payload,
                             Err(error) => {
@@ -708,18 +715,48 @@ fn spawn_redis_listener(
                                 continue;
                             }
                         };
-                        if envelope.origin == origin_id {
-                            continue;
-                        }
-                        local.send_without_publish_metric(
-                            &envelope.topic,
-                            ChannelMessage(envelope.payload),
+                        deliver_redis_envelope(
+                            &local,
+                            &origin_id,
+                            &channel_prefix,
+                            redis_channel,
+                            envelope,
                         );
                     }
                 }
             }
         }
     });
+}
+
+#[cfg(feature = "redis")]
+fn deliver_redis_envelope(
+    local: &LocalChannelsBackend,
+    origin_id: &str,
+    channel_prefix: &str,
+    redis_channel: &str,
+    envelope: RedisEnvelope,
+) {
+    let Some(topic) = redis_channel_topic(channel_prefix, redis_channel) else {
+        tracing::warn!(channel = %redis_channel, "Redis channel name did not match channel prefix");
+        return;
+    };
+
+    if envelope.topic != topic {
+        tracing::warn!(
+            channel = %redis_channel,
+            channel_topic = %topic,
+            envelope_topic = %envelope.topic,
+            "Redis channel envelope topic mismatch"
+        );
+        return;
+    }
+
+    if envelope.origin == origin_id {
+        return;
+    }
+
+    local.publish_local(topic, ChannelMessage(envelope.payload));
 }
 
 #[cfg(feature = "redis")]
@@ -1136,6 +1173,63 @@ mod tests {
         let after_gc = channels.snapshot();
         assert!(!after_gc.contains_key("tenant:gone"));
         assert_eq!(channels.channel_count(), 0);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_listener_rejects_envelope_topic_that_mismatches_channel() {
+        let local = LocalChannelsBackend::new(16);
+        let mut private_rx = local.subscribe("private");
+        let channel_prefix = redis_channel_name("autumn:channels", "");
+
+        deliver_redis_envelope(
+            &local,
+            "local-origin",
+            &channel_prefix,
+            "autumn:channels:public",
+            RedisEnvelope {
+                origin: "remote-origin".to_owned(),
+                topic: "private".to_owned(),
+                payload: "secret".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            private_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(!local.snapshot().contains_key("public"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_listener_counts_successful_remote_deliveries() {
+        let local = LocalChannelsBackend::new(16);
+        let mut rx = local.subscribe("public");
+        let channel_prefix = redis_channel_name("autumn:channels", "");
+
+        deliver_redis_envelope(
+            &local,
+            "local-origin",
+            &channel_prefix,
+            "autumn:channels:public",
+            RedisEnvelope {
+                origin: "remote-origin".to_owned(),
+                topic: "public".to_owned(),
+                payload: "hello".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            rx.try_recv()
+                .expect("remote message should fan out")
+                .as_str(),
+            "hello"
+        );
+        let snapshot = local.snapshot();
+        let stats = snapshot.get("public").expect("topic should be tracked");
+        assert_eq!(stats.lifetime_publish_count, 1);
+        assert_eq!(stats.dropped_count, 0);
     }
 
     #[cfg(feature = "redis")]
