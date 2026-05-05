@@ -16,7 +16,7 @@ enabled = true
 # blobs (avatars, attachments) to an S3-compatible bucket so they
 # survive container restarts and are visible to every replica.
 #
-# Requires `autumn-web` to be built with `features = ["storage", "storage-s3"]`.
+# Requires the `autumn-storage-s3` plugin; see docs/guide/storage.md.
 #
 # [profile.prod.storage]
 # backend = "s3"
