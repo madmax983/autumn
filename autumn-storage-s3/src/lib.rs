@@ -294,6 +294,15 @@ impl BlobStore for S3BlobStore {
 
             // Upload loop. `current_part` is always non-empty at the top.
             loop {
+                if part_number > 10_000 {
+                    abort_multipart(&self.client, &self.options.bucket, key, &upload_id).await;
+                    return Err(BlobStoreError::PayloadTooLarge(
+                        "S3 multipart upload part limit (10,000) exceeded; \
+                         object is too large to upload in 5 MiB chunks"
+                            .into(),
+                    ));
+                }
+
                 let part_bytes = Bytes::from(std::mem::take(&mut current_part));
                 total_bytes += part_bytes.len() as u64;
 

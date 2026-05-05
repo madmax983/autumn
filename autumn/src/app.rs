@@ -1039,6 +1039,17 @@ impl AppBuilder {
     ///
     /// Emits a `tracing::warn!` if a store was already installed (last
     /// call wins).
+    ///
+    /// # Note on `LocalBlobStore`
+    ///
+    /// **Do not** pass a [`LocalBlobStore`](crate::storage::LocalBlobStore)
+    /// here. The local backend requires the framework to mount a `/_blobs`
+    /// serving route (for HMAC-signed presigned URLs); that route is only
+    /// wired up when the store is provisioned through the config-driven path
+    /// (`backend = "local"` in `autumn.toml`). Calling
+    /// `.with_blob_store(LocalBlobStore::new(...))` will silently succeed but
+    /// presigned URLs will return 404. Use the `[storage]` config section for
+    /// local storage.
     #[cfg(feature = "storage")]
     #[must_use]
     pub fn with_blob_store<B>(mut self, store: B) -> Self
