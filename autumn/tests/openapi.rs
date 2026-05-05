@@ -116,6 +116,34 @@ async fn create_validated_widget(
     http::StatusCode::CREATED
 }
 
+// ── Query parameter inference ─────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct SearchParams {
+    q: Option<String>,
+    page: Option<i32>,
+}
+
+#[get("/search")]
+async fn search(_params: Query<SearchParams>) -> &'static str {
+    "results"
+}
+
+// ── Security scheme detection ─────────────────────────────────────────
+
+#[get("/protected")]
+#[secured]
+async fn protected_handler() -> AutumnResult<&'static str> {
+    Ok("secret")
+}
+
+#[get("/admin-only")]
+#[secured("admin")]
+async fn admin_handler() -> AutumnResult<&'static str> {
+    Ok("admin")
+}
+
 #[test]
 fn get_macro_populates_api_doc() {
     let route = __autumn_route_info_hello();
@@ -311,11 +339,11 @@ async fn openapi_json_endpoint_returns_spec() {
         .openapi(OpenApiConfig::new("Demo", "1.0.0"))
         .build();
 
-    let response = client.get("/v3/api-docs").send().await;
+    let response = client.get("/openapi.json").send().await;
     response.assert_ok();
 
     let body: serde_json::Value = response.json();
-    assert_eq!(body["openapi"], "3.0.3");
+    assert_eq!(body["openapi"], "3.1.0");
     assert_eq!(body["info"]["title"], "Demo");
     assert!(body["paths"]["/hello"].is_object());
     assert!(body["paths"]["/users/{id}"].is_object());
@@ -368,24 +396,24 @@ async fn swagger_ui_assets_are_served_same_origin() {
         .await;
     init.assert_ok()
         .assert_header("content-type", "application/javascript; charset=utf-8");
-    assert!(init.text().contains(r#""/v3/api-docs""#));
+    assert!(init.text().contains(r#""/openapi.json""#));
 }
 
 #[tokio::test]
 async fn openapi_not_mounted_without_explicit_call() {
     let client = TestApp::new().routes(routes![hello]).build();
-    let response = client.get("/v3/api-docs").send().await;
+    let response = client.get("/openapi.json").send().await;
     assert_eq!(
         response.status,
         http::StatusCode::NOT_FOUND,
-        "/v3/api-docs should 404 until AppBuilder::openapi(...) is called"
+        "/openapi.json should 404 until AppBuilder::openapi(...) is called"
     );
 }
 
 #[tokio::test]
 async fn custom_openapi_paths_are_honored() {
     let config = OpenApiConfig::new("Demo", "1.0.0")
-        .openapi_json_path("/openapi.json")
+        .openapi_json_path("/api/openapi.json")
         .swagger_ui_path(Some("/docs".to_owned()));
 
     let client = TestApp::new()
@@ -393,7 +421,7 @@ async fn custom_openapi_paths_are_honored() {
         .openapi(config)
         .build();
 
-    client.get("/openapi.json").send().await.assert_ok();
+    client.get("/api/openapi.json").send().await.assert_ok();
     client.get("/docs").send().await.assert_ok();
     client.get("/docs/swagger-ui.css").send().await.assert_ok();
     client
@@ -402,8 +430,8 @@ async fn custom_openapi_paths_are_honored() {
         .await
         .assert_ok();
 
-    // The default paths should now return 404
-    let default_json = client.get("/v3/api-docs").send().await;
+    // The default path should return 404 when a custom path is set.
+    let default_json = client.get("/openapi.json").send().await;
     assert_eq!(default_json.status, http::StatusCode::NOT_FOUND);
 }
 
@@ -415,7 +443,179 @@ async fn swagger_ui_can_be_disabled() {
         .openapi(config)
         .build();
 
-    client.get("/v3/api-docs").send().await.assert_ok();
+    client.get("/openapi.json").send().await.assert_ok();
     let ui = client.get("/swagger-ui").send().await;
     assert_eq!(ui.status, http::StatusCode::NOT_FOUND);
+}
+
+// ── Default path ──────────────────────────────────────────────────
+
+#[test]
+fn openapi_json_default_path_is_openapi_json() {
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    assert_eq!(
+        config.openapi_json_path, "/openapi.json",
+        "default openapi JSON path must be /openapi.json per issue #523"
+    );
+}
+
+// ── Query parameter inference ─────────────────────────────────────
+
+#[test]
+fn query_extractor_populates_query_schema() {
+    let route = __autumn_route_info_search();
+    let query = route
+        .api_doc
+        .query_schema
+        .as_ref()
+        .expect("Query<T> extractor must populate query_schema");
+    assert_eq!(query.name, "SearchParams");
+    assert_eq!(query.kind, SchemaKind::Ref);
+}
+
+#[test]
+fn query_params_appear_in_generated_spec() {
+    let route = __autumn_route_info_search();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/search"].get.as_ref().unwrap();
+    let query_param = op
+        .parameters
+        .iter()
+        .find(|p| p.location == "query")
+        .expect("Query<T> handler must produce at least one query parameter");
+    assert_eq!(query_param.name, "SearchParams");
+    assert_eq!(query_param.location, "query");
+    assert!(
+        !query_param.required,
+        "query params from structs are optional"
+    );
+    assert_eq!(
+        query_param.style.as_deref(),
+        Some("form"),
+        "Query<T> must use style:form so fields serialize as individual keys"
+    );
+    assert_eq!(
+        query_param.explode,
+        Some(true),
+        "Query<T> must use explode:true so ?q=foo&page=2 not ?SearchParams=..."
+    );
+}
+
+// ── Security scheme detection ─────────────────────────────────────
+
+#[test]
+fn secured_route_has_secured_flag() {
+    let route = __autumn_route_info_protected_handler();
+    assert!(
+        route.api_doc.secured,
+        "routes decorated with #[secured] must have secured = true"
+    );
+}
+
+#[test]
+fn secured_route_with_role_has_required_roles() {
+    let route = __autumn_route_info_admin_handler();
+    assert!(route.api_doc.secured);
+    assert_eq!(
+        route.api_doc.required_roles,
+        &["admin"],
+        "#[secured(\"admin\")] must populate required_roles"
+    );
+}
+
+#[test]
+fn secured_operation_carries_security_requirement() {
+    let route = __autumn_route_info_protected_handler();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let op = spec.paths["/protected"].get.as_ref().unwrap();
+    assert!(
+        !op.security.is_empty(),
+        "secured operation must list at least one security requirement"
+    );
+    let req = &op.security[0];
+    assert!(
+        req.contains_key("BearerAuth"),
+        "security requirement must reference BearerAuth"
+    );
+}
+
+#[test]
+fn secured_spec_includes_bearer_auth_scheme() {
+    let route = __autumn_route_info_protected_handler();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    let comps = spec
+        .components
+        .as_ref()
+        .expect("components must be present");
+    assert!(
+        comps.security_schemes.contains_key("BearerAuth"),
+        "BearerAuth security scheme must be registered when any route is secured"
+    );
+    let scheme = &comps.security_schemes["BearerAuth"];
+    assert_eq!(scheme["type"], "http");
+    assert_eq!(scheme["scheme"], "bearer");
+}
+
+#[test]
+fn unsecured_spec_has_no_security_schemes() {
+    let route = __autumn_route_info_hello();
+    let config = OpenApiConfig::new("Demo", "1.0.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
+    if let Some(comps) = spec.components {
+        assert!(
+            comps.security_schemes.is_empty(),
+            "unsecured routes must not emit any security schemes"
+        );
+    }
+}
+
+// ── Spec validation (all $ref backed by components) ───────────────
+
+fn assert_all_refs_defined(
+    value: &serde_json::Value,
+    schemas: &std::collections::BTreeMap<String, serde_json::Value>,
+) {
+    if let Some(ref_str) = value.get("$ref").and_then(|v| v.as_str()) {
+        let prefix = "#/components/schemas/";
+        if let Some(name) = ref_str.strip_prefix(prefix) {
+            assert!(
+                schemas.contains_key(name),
+                "$ref to '{name}' has no backing component schema"
+            );
+        }
+    }
+    if let Some(obj) = value.as_object() {
+        for v in obj.values() {
+            assert_all_refs_defined(v, schemas);
+        }
+    }
+    if let Some(arr) = value.as_array() {
+        for v in arr {
+            assert_all_refs_defined(v, schemas);
+        }
+    }
+}
+
+#[test]
+fn all_refs_in_spec_are_backed_by_component_schemas() {
+    use autumn_web::Route;
+    let routes: Vec<Route> = routes![
+        hello,
+        get_user,
+        create_item,
+        admin,
+        list_widgets,
+        post_widgets,
+        create_validated_widget
+    ];
+    let docs: Vec<&ApiDoc> = routes.iter().map(|r| &r.api_doc).collect();
+    let config = OpenApiConfig::new("Test API", "0.1.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &docs);
+
+    let spec_json = serde_json::to_value(&spec).unwrap();
+    let schemas = spec.components.map(|c| c.schemas).unwrap_or_default();
+    assert_all_refs_defined(&spec_json, &schemas);
 }

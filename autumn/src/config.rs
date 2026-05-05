@@ -667,6 +667,13 @@ pub struct AutumnConfig {
     #[cfg(feature = "mail")]
     #[serde(default)]
     pub mail: crate::mail::MailConfig,
+    /// `OpenAPI` spec runtime exposure settings.
+    ///
+    /// Controls whether the generated `OpenAPI` spec is served at runtime
+    /// and at which path. Use `[openapi] enabled = false` in `autumn.toml`
+    /// to suppress the spec endpoint in production.
+    #[serde(default, rename = "openapi")]
+    pub openapi_runtime: OpenApiRuntimeConfig,
 }
 
 impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
@@ -763,6 +770,52 @@ const fn default_channel_capacity() -> usize {
 
 fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
+}
+
+/// `OpenAPI` spec runtime exposure settings.
+///
+/// Populated from the `[openapi]` block in `autumn.toml`. When
+/// `AppBuilder::openapi(...)` is called and `enabled = true`, the framework
+/// mounts the spec at `path`. Set `enabled = false` in a production profile
+/// to prevent exposing the spec publicly.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [openapi]
+/// enabled = false   # disable in prod
+/// path = "/openapi.json"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenApiRuntimeConfig {
+    /// Whether the `OpenAPI` spec endpoint is served.
+    ///
+    /// Defaults to `true` so new projects get the spec immediately.
+    /// Set to `false` in production profiles to suppress the endpoint.
+    #[serde(default = "default_openapi_enabled")]
+    pub enabled: bool,
+    /// URL path at which `openapi.json` is served.
+    ///
+    /// Defaults to `/openapi.json`.
+    #[serde(default = "default_openapi_path")]
+    pub path: String,
+}
+
+impl Default for OpenApiRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_openapi_enabled(),
+            path: default_openapi_path(),
+        }
+    }
+}
+
+const fn default_openapi_enabled() -> bool {
+    true
+}
+
+fn default_openapi_path() -> String {
+    "/openapi.json".to_owned()
 }
 
 /// Background job runtime configuration.
@@ -3865,5 +3918,47 @@ path = "/healthz"
         config.security.allow_unauthorized_repository_api = true;
         config.apply_env_overrides_with_env(&env);
         assert!(!config.security.allow_unauthorized_repository_api);
+    }
+
+    // ── [openapi] config section tests (RED phase) ─────────────────────────
+
+    #[test]
+    fn openapi_runtime_config_defaults_enabled() {
+        // The [openapi] section must default to enabled=true and path="/openapi.json".
+        let config = AutumnConfig::default();
+        assert!(
+            config.openapi_runtime.enabled,
+            "[openapi] must default to enabled = true"
+        );
+        assert_eq!(
+            config.openapi_runtime.path, "/openapi.json",
+            "[openapi] must default to path = \"/openapi.json\""
+        );
+    }
+
+    #[test]
+    fn openapi_runtime_config_can_be_disabled_via_toml() {
+        let toml_str = "
+[openapi]
+enabled = false
+";
+        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            !config.openapi_runtime.enabled,
+            "[openapi] enabled = false must deserialize correctly"
+        );
+    }
+
+    #[test]
+    fn openapi_runtime_config_path_can_be_customized() {
+        let toml_str = r#"
+[openapi]
+path = "/api-spec.json"
+"#;
+        let config: AutumnConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.openapi_runtime.path, "/api-spec.json",
+            "[openapi] path must deserialize correctly"
+        );
     }
 }

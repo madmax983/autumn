@@ -1408,8 +1408,14 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                // Respect the [openapi] profile gate: if disabled in config,
+                // suppress the endpoint even when .openapi(...) was called.
                 #[cfg(feature = "openapi")]
-                openapi,
+                openapi: if config.openapi_runtime.enabled {
+                    openapi
+                } else {
+                    None
+                },
             },
         )
         .unwrap_or_else(|error| {
@@ -1522,7 +1528,7 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
-            scoped_groups: _,
+            scoped_groups,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -1541,7 +1547,7 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
             #[cfg(feature = "openapi")]
-                openapi: _,
+            openapi,
             audit_logger: _,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -1559,6 +1565,36 @@ impl AppBuilder {
         #[cfg(feature = "i18n")]
         let i18n_bundle =
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        // Snapshot ApiDocs before all_routes is moved into the router builder.
+        // Includes top-level routes and scoped groups (with prefixed paths) so
+        // the emitted dist/openapi.json matches what the runtime spec serves.
+        #[cfg(feature = "openapi")]
+        let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
+            let mut docs: Vec<crate::openapi::ApiDoc> =
+                all_routes.iter().map(|r| r.api_doc.clone()).collect();
+            for group in &scoped_groups {
+                // Mirror the same normalization as the runtime OpenAPI builder:
+                // use join_nested_path for correct trailing-slash handling, and
+                // merge prefix path params so they appear in the operation.
+                let prefix_params = crate::router::extract_path_params(&group.prefix);
+                for route in &group.routes {
+                    let mut doc = route.api_doc.clone();
+                    let full = crate::router::join_nested_path(&group.prefix, route.api_doc.path);
+                    doc.path = Box::leak(full.into_boxed_str());
+                    if !prefix_params.is_empty() {
+                        let mut merged: Vec<&'static str> = prefix_params
+                            .iter()
+                            .map(|p| &*Box::leak(p.clone().into_boxed_str()))
+                            .collect();
+                        merged.extend_from_slice(doc.path_params);
+                        doc.path_params = Box::leak(merged.into_boxed_slice());
+                    }
+                    docs.push(doc);
+                }
+            }
+            docs
+        };
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -1674,6 +1710,25 @@ impl AppBuilder {
             Err(e) => {
                 eprintln!("\n  \u{2717} Static build failed: {e}");
                 std::process::exit(1);
+            }
+        }
+
+        // When OpenAPI is configured, write the spec to dist/ so consumers
+        // can retrieve a machine-readable API contract alongside the HTML.
+        #[cfg(feature = "openapi")]
+        if let Some(openapi_config) = openapi {
+            let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
+            let spec = crate::openapi::generate_spec(&openapi_config, &docs);
+            match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {
+                Ok(()) => {
+                    eprintln!(
+                        "  \u{2713} OpenAPI spec written \u{2192} {}/openapi.json",
+                        dist_dir.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
             }
         }
     }

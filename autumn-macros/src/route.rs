@@ -112,6 +112,8 @@ pub fn route_macro(
     let path_params_tokens = api_doc::emit_path_param_slice(&path_params);
     let request_body = api_doc::schema_option(api_doc::infer_request_body(&input_fn));
     let response_body = api_doc::schema_option(api_doc::infer_response_body(&input_fn));
+    let query_schema = api_doc::schema_option(api_doc::infer_query_params(&input_fn));
+    let (secured, required_roles) = api_doc::extract_secured_info(&input_fn);
     let api_doc_fields = api_doc_attr.emit_ident_fields(fn_name);
     let http_method_lit = LitStr::new(http_method, Span::call_site());
 
@@ -138,6 +140,9 @@ pub fn route_macro(
                     path_params: #path_params_tokens,
                     request_body: #request_body,
                     response: #response_body,
+                    query_schema: #query_schema,
+                    secured: #secured,
+                    required_roles: #required_roles,
                     register_schemas: ::core::option::Option::None,
                     #api_doc_fields
                 },
