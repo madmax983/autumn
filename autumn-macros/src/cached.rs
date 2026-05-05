@@ -131,13 +131,13 @@ fn generate_cache_body(
     if attrs.result {
         quote! {
             #cache_init
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+            if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
+                    ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -146,11 +146,11 @@ fn generate_cache_body(
     } else {
         quote! {
             #cache_init
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+            if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return __autumn_cached;
             }
             let __autumn_result = #compute;
-            ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
+            ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
             __autumn_result
         }
     }
@@ -298,6 +298,14 @@ mod tests {
         assert!(
             output_str.contains("OnceLock"),
             "should use OnceLock for static"
+        );
+        assert!(
+            output_str.contains("get_cached"),
+            "should use get_cached for serde-aware retrieval"
+        );
+        assert!(
+            output_str.contains("insert_cached"),
+            "should use insert_cached for serde-aware storage"
         );
     }
 

@@ -28,16 +28,20 @@
 //!
 //! Values are serialized as JSON so they survive across replicas and restarts.
 //! Invalidation on replica A is immediately visible on replica B — no TTL lag.
+//!
+//! Use [`autumn_web::cache::insert_cached`] / [`autumn_web::cache::get_cached`]
+//! (which the `#[cached]` macro generates) to read and write values that are
+//! `serde::Serialize + serde::Deserialize`. The plain [`autumn_web::cache::insert`]
+//! / [`autumn_web::cache::get`] functions work only for in-process backends.
 
 use std::any::Any;
 use std::sync::Arc;
 
-use autumn_web::cache::Cache;
-use redis::aio::ConnectionManager;
+use autumn_web::cache::{Cache, RawCacheBytes};
 use redis::AsyncCommands as _;
-use serde_json::Value as JsonValue;
+use redis::aio::ConnectionManager;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Errors that can occur when constructing or using a [`RedisCache`].
 #[derive(Debug, Error)]
@@ -50,8 +54,15 @@ pub enum RedisCacheError {
 
 /// A [`Cache`] implementation backed by Redis.
 ///
-/// Values are stored as JSON blobs with an optional TTL. Multiple replicas
-/// share the same Redis namespace so invalidations propagate instantly.
+/// Values are stored as JSON blobs. Multiple replicas share the same Redis
+/// namespace so writes on replica A are immediately visible on replica B, and
+/// invalidations propagate within a single round-trip.
+///
+/// Use [`autumn_web::cache::insert_cached`] and [`autumn_web::cache::get_cached`]
+/// (or equivalently the `#[cached]` macro) to store and retrieve values — both
+/// functions handle JSON serialization transparently. The plain
+/// `autumn_web::cache::insert` / `get` functions perform only in-memory
+/// downcasts and will miss on cross-replica reads.
 #[derive(Clone)]
 pub struct RedisCache {
     manager: ConnectionManager,
@@ -64,7 +75,10 @@ impl RedisCache {
     /// # Errors
     ///
     /// Returns [`RedisCacheError::Connection`] if the initial connection fails.
-    pub async fn connect(url: &str, key_prefix: impl Into<String>) -> Result<Self, RedisCacheError> {
+    pub async fn connect(
+        url: &str,
+        key_prefix: impl Into<String>,
+    ) -> Result<Self, RedisCacheError> {
         let client = redis::Client::open(url)?;
         let manager = ConnectionManager::new(client).await?;
         Ok(Self {
@@ -89,53 +103,80 @@ impl RedisCache {
     fn prefixed(&self, key: &str) -> String {
         format!("{}:{}", self.key_prefix, key)
     }
-}
 
-/// Wraps a JSON-serializable value so the `Arc<dyn Any>` can be
-/// restored from the raw bytes we get out of Redis.
-#[derive(Clone)]
-struct JsonBytes(Vec<u8>);
-
-impl Cache for RedisCache {
-    fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+    fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
-        // Run a blocking get on the Tokio current-thread context.
-        // `Cache` is synchronous per the trait contract; callers that need
-        // truly async access should use `RedisCache` directly.
-        let result: Option<Vec<u8>> = tokio::task::block_in_place(|| {
+        tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(async move { conn.get(&prefixed).await.ok().flatten() })
-        });
-        result.map(|bytes| Arc::new(JsonBytes(bytes)) as Arc<dyn Any + Send + Sync>)
+        })
     }
 
-    fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+    fn redis_set(&self, key: &str, bytes: Vec<u8>) {
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let _: Result<(), _> = conn.set(&prefixed, bytes).await;
+            });
+        });
+    }
+}
 
-        // Attempt to serialize the value as JSON. We check a few common types.
-        let json_bytes: Option<Vec<u8>> = if let Some(json) = value.downcast_ref::<JsonBytes>() {
-            Some(json.0.clone())
+impl Cache for RedisCache {
+    /// Retrieves a value from Redis and returns it as [`RawCacheBytes`].
+    ///
+    /// Callers using [`autumn_web::cache::get_cached`] (which the `#[cached]`
+    /// macro generates) will have the bytes automatically deserialized into the
+    /// concrete return type `V` via `serde_json`. Direct callers that need the
+    /// concrete type should also use `get_cached` rather than `get_value`.
+    fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.redis_get(key)
+            .map(|bytes| Arc::new(RawCacheBytes(bytes)) as Arc<dyn Any + Send + Sync>)
+    }
+
+    /// Stores a value in Redis by serializing the most common primitive types.
+    ///
+    /// For arbitrary serde types — including structs and collections — use
+    /// [`insert_raw_bytes`] (called automatically by
+    /// [`autumn_web::cache::insert_cached`]) instead. Unknown types are
+    /// silently skipped here because [`insert_cached`] will have already
+    /// written the serialized form via [`insert_raw_bytes`].
+    ///
+    /// [`insert_raw_bytes`]: Cache::insert_raw_bytes
+    fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+        // Only handle RawCacheBytes round-trips (e.g. values read from Redis
+        // and re-inserted) and the primitive types used by direct `insert`
+        // callers. All other types are handled by insert_raw_bytes.
+        let bytes: Option<Vec<u8>> = if let Some(raw) = value.downcast_ref::<RawCacheBytes>() {
+            Some(raw.0.clone())
         } else if let Some(s) = value.downcast_ref::<String>() {
-            serde_json::to_vec(&JsonValue::String(s.clone())).ok()
+            serde_json::to_vec(s).ok()
         } else if let Some(n) = value.downcast_ref::<i64>() {
-            serde_json::to_vec(&JsonValue::Number((*n).into())).ok()
+            serde_json::to_vec(n).ok()
         } else if let Some(n) = value.downcast_ref::<i32>() {
-            serde_json::to_vec(&JsonValue::Number((*n).into())).ok()
+            serde_json::to_vec(n).ok()
         } else {
-            warn!(key, "RedisCache: cannot serialize value type, skipping insert");
+            // Serde types (structs, Vec<T>, etc.) arrive via insert_raw_bytes.
             None
         };
 
-        if let Some(bytes) = json_bytes {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async move {
-                    let _: Result<(), _> = conn.set(&prefixed, bytes).await;
-                });
-            });
-            debug!(key, "RedisCache: inserted");
+        if let Some(bytes) = bytes {
+            self.redis_set(key, bytes);
+            debug!(key, "RedisCache: inserted via insert_value");
         }
+    }
+
+    /// Stores pre-serialized JSON bytes in Redis.
+    ///
+    /// This is the primary write path for `#[cached]`-annotated functions (via
+    /// [`autumn_web::cache::insert_cached`]). It handles all `serde::Serialize`
+    /// types, including structs and collections that `insert_value` cannot
+    /// serialize from an erased `Arc<dyn Any>`.
+    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>) {
+        self.redis_set(key, bytes);
+        debug!(key, "RedisCache: inserted via insert_raw_bytes");
     }
 
     fn invalidate(&self, key: &str) {
@@ -150,18 +191,30 @@ impl Cache for RedisCache {
     }
 
     fn clear(&self) {
-        // Scan-and-delete all keys under our prefix.
+        // Use SCAN instead of KEYS to avoid blocking the Redis server on large
+        // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
         let pattern = format!("{}:*", self.key_prefix);
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let keys: Vec<String> = redis::cmd("KEYS")
-                    .arg(&pattern)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or_default();
-                if !keys.is_empty() {
-                    let _: Result<(), _> = conn.del(keys).await;
+                let mut cursor: u64 = 0;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(100u32)
+                        .query_async(&mut conn)
+                        .await
+                        .unwrap_or((0, vec![]));
+                    if !keys.is_empty() {
+                        let _: Result<(), _> = conn.del(keys).await;
+                    }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
                 }
             });
         });
@@ -222,6 +275,7 @@ impl autumn_web::plugin::Plugin for RedisCachePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_web::cache::{get_cached, insert_cached};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::Redis as RedisImage;
 
@@ -233,18 +287,21 @@ mod tests {
 
         let cache = RedisCache::connect(&url, "test").await.unwrap();
 
-        // Insert a string
-        autumn_web::cache::insert(&cache, "hello", "world".to_string());
+        // insert_cached serializes via serde_json and stores via insert_raw_bytes
+        insert_cached(&cache, "hello", "world".to_string());
 
-        // get_value returns JsonBytes wrapping the JSON
+        // get_value returns RawCacheBytes wrapping the JSON
         let raw = cache.get_value("hello").expect("should be present");
-        // Downcast to JsonBytes and parse
-        let bytes = raw.downcast_ref::<JsonBytes>().expect("JsonBytes");
-        let v: serde_json::Value = serde_json::from_slice(&bytes.0).unwrap();
+        let raw_bytes = raw.downcast_ref::<RawCacheBytes>().expect("RawCacheBytes");
+        let v: serde_json::Value = serde_json::from_slice(&raw_bytes.0).unwrap();
         assert_eq!(v, serde_json::json!("world"));
 
+        // get_cached deserializes back to the concrete type
+        let s: Option<String> = get_cached(&cache, "hello");
+        assert_eq!(s.as_deref(), Some("world"));
+
         // Invalidate
-        cache.invalidate("hello");
+        autumn_web::cache::Cache::invalidate(&cache, "hello");
         assert!(cache.get_value("hello").is_none());
     }
 
@@ -258,24 +315,59 @@ mod tests {
         let replica_a = RedisCache::connect(&url, "xreplica").await.unwrap();
         let replica_b = RedisCache::connect(&url, "xreplica").await.unwrap();
 
-        // A writes
+        // A writes via insert_cached (the path used by #[cached])
         let start = std::time::Instant::now();
-        autumn_web::cache::insert(&replica_a, "key", "value".to_string());
+        insert_cached(&replica_a, "key", "value".to_string());
 
-        // B can read it
-        let raw = replica_b.get_value("key").expect("replica B should see the key");
+        // B can read it via get_cached and gets the correctly-typed value
+        let seen: Option<String> = get_cached(&replica_b, "key");
         let elapsed = start.elapsed();
 
-        let bytes = raw.downcast_ref::<JsonBytes>().unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes.0).unwrap();
-        assert_eq!(v, serde_json::json!("value"));
+        assert_eq!(
+            seen.as_deref(),
+            Some("value"),
+            "replica B must read the value written by replica A"
+        );
 
         // A invalidates
-        replica_a.invalidate("key");
+        autumn_web::cache::Cache::invalidate(&replica_a, "key");
 
         // B no longer sees it (within one round-trip = < 50 ms p99)
-        assert!(replica_b.get_value("key").is_none());
-        // Verify we're well within the < 50 ms SLA from the issue
-        assert!(elapsed.as_millis() < 50, "cross-replica lag {elapsed:?} exceeded 50 ms");
+        let gone: Option<String> = get_cached(&replica_b, "key");
+        assert!(gone.is_none());
+        assert!(
+            elapsed.as_millis() < 50,
+            "cross-replica lag {elapsed:?} exceeded 50 ms"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn redis_cache_serde_struct_round_trip() {
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Item {
+            id: i32,
+            name: String,
+        }
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        let cache_a = RedisCache::connect(&url, "structs").await.unwrap();
+        let cache_b = RedisCache::connect(&url, "structs").await.unwrap();
+
+        let item = Item {
+            id: 1,
+            name: "widget".into(),
+        };
+        insert_cached(&cache_a, "item:1", item.clone());
+
+        // Same replica
+        let retrieved: Option<Item> = get_cached(&cache_a, "item:1");
+        assert_eq!(retrieved, Some(item.clone()));
+
+        // Cross-replica
+        let from_b: Option<Item> = get_cached(&cache_b, "item:1");
+        assert_eq!(from_b, Some(item));
     }
 }

@@ -64,9 +64,7 @@ static GLOBAL_CACHE: RwLock<Option<Arc<dyn Cache>>> = RwLock::new(None);
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn set_global_cache(cache: Arc<dyn Cache>) {
-    *GLOBAL_CACHE
-        .write()
-        .expect("global cache lock poisoned") = Some(cache);
+    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = Some(cache);
 }
 
 /// Return a clone of the process-level shared cache, if one is registered.
@@ -93,12 +91,19 @@ pub fn global_cache() -> Option<Arc<dyn Cache>> {
 ///
 /// Panics if the internal `RwLock` is poisoned.
 pub fn clear_global_cache() {
-    *GLOBAL_CACHE
-        .write()
-        .expect("global cache lock poisoned") = None;
+    *GLOBAL_CACHE.write().expect("global cache lock poisoned") = None;
 }
 
 // ── Cache trait ──────────────────────────────────────────────────────
+
+/// Raw JSON bytes stored by serializing cache backends (e.g. Redis).
+///
+/// Backends that cannot store `Arc<dyn Any>` directly (because values must
+/// survive across process boundaries) return this from [`Cache::get_value`]
+/// instead. [`get_cached`] and [`insert_cached`] transparently deserialize it
+/// back into the concrete type `V` using `serde_json`.
+#[derive(Clone)]
+pub struct RawCacheBytes(pub Vec<u8>);
 
 /// A type-erased, thread-safe cache store.
 ///
@@ -107,10 +112,16 @@ pub fn clear_global_cache() {
 /// erasure, allowing a single cache instance to store heterogeneous
 /// types from different `#[cached]` functions.
 ///
-/// Use the free functions [`get`] and [`insert`] for typed access
-/// that handles `Arc` wrapping and downcasting automatically.
+/// Use the free functions [`get`] / [`insert`] for non-serde types (e.g.
+/// HTTP responses in [`CacheResponseLayer`]), or [`get_cached`] /
+/// [`insert_cached`] for types that also implement `serde` — which is
+/// required for cross-replica backends like Redis.
 pub trait Cache: Send + Sync + 'static {
     /// Retrieve a type-erased value by key. Returns `None` on miss.
+    ///
+    /// Backends that store serialized data (e.g. Redis) may return
+    /// `Arc<`[`RawCacheBytes`]`>` here; [`get_cached`] handles the
+    /// JSON deserialization transparently.
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>>;
 
     /// Store a type-erased value by key.
@@ -121,6 +132,13 @@ pub trait Cache: Send + Sync + 'static {
 
     /// Remove all entries.
     fn clear(&self);
+
+    /// Store pre-serialized JSON bytes for backends that persist data across
+    /// process boundaries (e.g. Redis). The default is a no-op; in-process
+    /// backends store values via [`insert_value`] instead.
+    ///
+    /// [`insert_value`]: Cache::insert_value
+    fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>) {}
 }
 
 // ── Typed convenience functions ──────────────────────────────────────
@@ -129,6 +147,9 @@ pub trait Cache: Send + Sync + 'static {
 ///
 /// Returns `None` if the key is absent or the stored type doesn't
 /// match `V`. Works with any `Cache` implementation.
+///
+/// For cross-replica backends (Redis) use [`get_cached`] instead, which
+/// also handles JSON deserialization of [`RawCacheBytes`].
 pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Option<V> {
     cache
         .get_value(key)
@@ -138,8 +159,50 @@ pub fn get<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str) -> Op
 /// Typed insert: wrap the value in an `Arc` and store it.
 ///
 /// Works with any `Cache` implementation.
+///
+/// For cross-replica backends (Redis) use [`insert_cached`] instead,
+/// which also serializes the value for storage across process boundaries.
 pub fn insert<V: Clone + Send + Sync + 'static>(cache: &dyn Cache, key: &str, value: V) {
     cache.insert_value(key, Arc::new(value));
+}
+
+/// Serde-aware get: retrieve a cached value, deserializing from JSON if needed.
+///
+/// First tries a direct in-memory downcast (fast path for `MokaCache`). If
+/// that fails — because the backend stored [`RawCacheBytes`] (e.g. Redis) —
+/// the bytes are deserialized with `serde_json`. This is what the `#[cached]`
+/// macro uses so that values survive across replicas when a shared backend
+/// is configured.
+pub fn get_cached<V>(cache: &dyn Cache, key: &str) -> Option<V>
+where
+    V: Clone + serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    let arc = cache.get_value(key)?;
+    // Fast path: in-memory backend stored the concrete type directly.
+    if let Some(v) = arc.downcast_ref::<V>() {
+        return Some(v.clone());
+    }
+    // Slow path: serializing backend (e.g. Redis) stored RawCacheBytes.
+    arc.downcast_ref::<RawCacheBytes>()
+        .and_then(|raw| serde_json::from_slice::<V>(&raw.0).ok())
+}
+
+/// Serde-aware insert: store the value both in-memory and as JSON bytes.
+///
+/// Calls [`Cache::insert_value`] (for in-process backends like Moka) **and**
+/// [`Cache::insert_raw_bytes`] (for cross-replica backends like Redis). This
+/// is what the `#[cached]` macro uses so that the stored value is accessible
+/// both within the same process and on other replicas.
+pub fn insert_cached<V>(cache: &dyn Cache, key: &str, value: V)
+where
+    V: Clone + serde::Serialize + Send + Sync + 'static,
+{
+    // In-memory path (MokaCache, CountingCache in tests, …)
+    cache.insert_value(key, Arc::new(value.clone()));
+    // Serialized path (RedisCache, any cross-replica backend)
+    if let Ok(bytes) = serde_json::to_vec(&value) {
+        cache.insert_raw_bytes(key, bytes);
+    }
 }
 
 // ── CacheableResult trait ────────────────────────────────────────────

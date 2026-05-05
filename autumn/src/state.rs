@@ -245,10 +245,9 @@ impl AppState {
     /// (set at runtime by startup hooks via [`Self::set_cache`]).
     #[must_use]
     pub fn cache(&self) -> Option<Arc<dyn Cache>> {
-        self.shared_cache.clone().or_else(|| {
-            self.extension::<GlobalCacheEntry>()
-                .map(|e| e.0.clone())
-        })
+        self.shared_cache
+            .clone()
+            .or_else(|| self.extension::<GlobalCacheEntry>().map(|e| e.0.clone()))
     }
 
     /// Register a global cache backend (builder / test helper, build-time).

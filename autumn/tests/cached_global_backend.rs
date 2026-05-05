@@ -4,10 +4,12 @@
 //! The global cache is process-wide, so these tests hold a mutex to prevent
 //! interference from other tests that also manipulate it.
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
-use autumn_web::cache::{Cache, MokaCache, clear_global_cache, global_cache, make_cache_key, set_global_cache};
+use autumn_web::cache::{
+    Cache, MokaCache, clear_global_cache, global_cache, make_cache_key, set_global_cache,
+};
 use autumn_web::prelude::*;
 
 // ── Serialise access to GLOBAL_CACHE across all tests in this file ────────────
@@ -119,11 +121,14 @@ fn cached_fn_writes_to_global_on_miss() {
 
     let result = double_b(5);
     assert_eq!(result, 10);
-    assert_eq!(inserts.load(Ordering::SeqCst), 1, "must insert once into the global");
+    assert_eq!(
+        inserts.load(Ordering::SeqCst),
+        1,
+        "must insert once into the global"
+    );
 
     // Global must now hold the computed value
-    let stored = global_cache()
-        .and_then(|c| autumn_web::cache::get::<i32>(c.as_ref(), &key));
+    let stored = global_cache().and_then(|c| autumn_web::cache::get::<i32>(c.as_ref(), &key));
     assert_eq!(stored, Some(10), "global must hold the result after a miss");
 
     clear_global_cache();

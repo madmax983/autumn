@@ -10,8 +10,8 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use autumn_web::cache::{Cache, CacheResponseLayer, MokaCache, get, insert};
 use autumn_web::AppState;
+use autumn_web::cache::{Cache, CacheResponseLayer, MokaCache, get, insert};
 use axum::body::Body;
 use http::Request;
 use http::StatusCode;
@@ -28,8 +28,8 @@ fn counting_service(
     Error = Infallible,
     Future = impl std::future::Future<Output = Result<axum::response::Response, Infallible>> + Send,
 > + Clone
-       + Send
-       + 'static {
++ Send
++ 'static {
     let body = body.to_owned();
     tower::service_fn(move |_req: Request<Body>| {
         let counter = counter.clone();
@@ -119,7 +119,11 @@ async fn cache_response_layer_from_cache_still_works() {
     svc.ready().await.unwrap().call(req).await.unwrap();
     let req = Request::get("/v1").body(Body::empty()).unwrap();
     svc.ready().await.unwrap().call(req).await.unwrap();
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "second call should be cached");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "second call should be cached"
+    );
 }
 
 // ── CacheConfig deserialization ───────────────────────────────────────────────
@@ -155,8 +159,5 @@ fn autumn_config_has_cache_section() {
     "#;
     let cfg: AutumnConfig = toml::from_str(toml_str).unwrap();
     assert!(cfg.cache.is_redis());
-    assert_eq!(
-        cfg.cache.redis.url.as_deref(),
-        Some("redis://redis:6379")
-    );
+    assert_eq!(cfg.cache.redis.url.as_deref(), Some("redis://redis:6379"));
 }

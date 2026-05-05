@@ -1117,7 +1117,9 @@ impl AppBuilder {
     #[must_use]
     pub fn with_cache_backend<C: crate::cache::Cache>(mut self, cache: C) -> Self {
         if self.cache_backend.is_some() {
-            tracing::warn!("cache backend replaced; the previously-installed backend was overwritten");
+            tracing::warn!(
+                "cache backend replaced; the previously-installed backend was overwritten"
+            );
         }
         self.cache_backend = Some(Arc::new(cache) as Arc<dyn crate::cache::Cache>);
         self
