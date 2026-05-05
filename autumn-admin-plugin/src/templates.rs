@@ -508,6 +508,9 @@ pub fn model_list_page(
                         "(" (result.total) ")"
                     }
                 }
+                a href={ (prefix) "/" (model_slug) "/export" } class="btn" style="margin-right: 0.5rem;" {
+                    "Export CSV"
+                }
                 a href={ (prefix) "/" (model_slug) "/new" } class="btn btn-primary" {
                     "+ Add " (model_slug.trim_end_matches('s'))
                 }
