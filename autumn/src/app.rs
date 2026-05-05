@@ -93,6 +93,8 @@ pub fn app() -> AppBuilder {
         session_store: None,
         #[cfg(feature = "ws")]
         channels_backend: None,
+        #[cfg(feature = "storage")]
+        blob_store: None,
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
@@ -1039,7 +1041,9 @@ impl AppBuilder {
             );
         }
         self.channels_backend = Some(Arc::new(backend));
+        self
     }
+
     /// Install a custom [`BlobStore`](crate::storage::BlobStore),
     /// bypassing the config-driven `local`/`s3` backend selection.
     ///
