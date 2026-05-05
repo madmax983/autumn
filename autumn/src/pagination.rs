@@ -1638,7 +1638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_request_extractor_rejects_missing_uri_query() {
+    async fn page_request_extractor_defaults_on_missing_uri_query() {
         use axum::extract::FromRequestParts;
         use axum::http::Request;
         let req = Request::builder().uri("/").body(()).unwrap();
@@ -1653,7 +1653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cursor_extractor_rejects_missing_uri_query() {
+    async fn cursor_extractor_defaults_on_missing_uri_query() {
         use axum::extract::FromRequestParts;
         use axum::http::Request;
         let req = Request::builder().uri("/").body(()).unwrap();
