@@ -1,0 +1,26 @@
+[package]
+name = "autumn-storage-s3"
+description = "S3-compatible blob storage plugin for autumn-web applications"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-web = { version = "0.3.0", path = "../autumn", features = ["storage"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = "1"
+bytes = "1"
+futures = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+temp-env = { version = "0.3.6", features = ["async_closure"] }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

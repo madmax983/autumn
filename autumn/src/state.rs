@@ -337,6 +337,13 @@ impl AppState {
         &self.channels
     }
 
+    /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcast(&self) -> crate::channels::Broadcast {
+        self.channels.broadcast()
+    }
+
     /// Returns a child cancellation token for the server shutdown signal.
     ///
     /// WebSocket handlers should select on this to clean up when the

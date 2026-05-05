@@ -22,6 +22,10 @@ fn channels_concurrent_subscribe() {
 
         assert_eq!(channels.channel_count(), 1);
         let snapshot = channels.snapshot();
+<<<<<<< chaos-testing-6711714747669971624
         assert_eq!(*snapshot.get("test_sub").unwrap(), 0);
+=======
+        assert_eq!(snapshot.get("test_sub").unwrap().subscriber_count, 0); // No receivers are kept alive
+>>>>>>> trunk-dev
     });
 }
