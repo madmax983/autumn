@@ -410,17 +410,18 @@ impl ListResult {
 ///
 /// `"created_at"` → `"Created At"`, `"user_id"` → `"User Id"`.
 fn humanize_field_name(name: &str) -> String {
-    name.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            chars.next().map_or_else(String::new, |c| {
-                let mut s = c.to_uppercase().to_string();
-                s.extend(chars);
-                s
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut s = String::with_capacity(name.len());
+    for (i, word) in name.split('_').enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        let mut chars = word.chars();
+        if let Some(c) = chars.next() {
+            s.extend(c.to_uppercase());
+            s.extend(chars);
+        }
+    }
+    s
 }
 
 #[cfg(test)]
