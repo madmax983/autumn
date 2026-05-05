@@ -5609,7 +5609,7 @@ mod tests {
             "postgres"
         }
 
-        fn replica_id(&self) -> &str {
+        fn replica_id(&self) -> &'static str {
             "replica-a"
         }
 

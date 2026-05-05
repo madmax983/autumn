@@ -138,9 +138,8 @@ fn postgres_scheduler_requires_a_database_pool() {
         ..SchedulerConfig::default()
     };
 
-    let error = match autumn_web::scheduler::coordinator_from_config(&config, &state) {
-        Ok(_) => panic!("postgres scheduler should fail before boot without a database pool"),
-        Err(error) => error,
+    let Err(error) = autumn_web::scheduler::coordinator_from_config(&config, &state) else {
+        panic!("postgres scheduler should fail before boot without a database pool");
     };
 
     assert!(error.to_string().contains("postgres"));
