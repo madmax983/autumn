@@ -1380,7 +1380,11 @@ impl AppBuilder {
                 // Respect the [openapi] profile gate: if disabled in config,
                 // suppress the endpoint even when .openapi(...) was called.
                 #[cfg(feature = "openapi")]
-                openapi: if config.openapi_runtime.enabled { openapi } else { None },
+                openapi: if config.openapi_runtime.enabled {
+                    openapi
+                } else {
+                    None
+                },
             },
         )
         .unwrap_or_else(|error| {
