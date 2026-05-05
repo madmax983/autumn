@@ -164,3 +164,55 @@ fn update_model_schema_has_no_required_fields() {
         schema["required"]
     );
 }
+
+// Model with Vec<T> and Option<T> fields to exercise array/nullable schema emission.
+mod schema2 {
+    autumn_web::reexports::diesel::table! {
+        tagged_widgets (id) {
+            id -> Int8,
+            tags -> Array<Text>,
+            description -> Nullable<Text>,
+        }
+    }
+}
+
+use schema2::tagged_widgets;
+
+#[autumn_web::model(table = "tagged_widgets")]
+pub struct TaggedWidget {
+    #[id]
+    pub id: i64,
+    pub tags: Vec<String>,
+    pub description: Option<String>,
+}
+
+#[test]
+fn vec_field_emits_array_schema() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = TaggedWidget::schema();
+    let tags = &schema["properties"]["tags"];
+    assert_eq!(tags["type"], "array", "Vec<String> should emit type:array");
+    assert_eq!(
+        tags["items"]["type"], "string",
+        "Vec<String> items should be string"
+    );
+}
+
+#[test]
+fn option_field_emits_nullable_schema() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = TaggedWidget::schema();
+    let desc = &schema["properties"]["description"];
+    let one_of = desc["oneOf"]
+        .as_array()
+        .expect("Option<T> should emit oneOf");
+    assert_eq!(one_of.len(), 2);
+    assert!(
+        one_of.iter().any(|v| v["type"] == "null"),
+        "oneOf should include null type"
+    );
+    assert!(
+        one_of.iter().any(|v| v["type"] == "string"),
+        "oneOf should include string type"
+    );
+}

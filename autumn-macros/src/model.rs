@@ -154,15 +154,24 @@ fn type_name_str(ty: &syn::Type) -> String {
 /// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
-/// Handles `Option<T>` (nullable), primitives (`String`, `i64`, etc.), and
-/// everything else as a `$ref` to a component schema by type name.
+/// Handles `Option<T>` (nullable), `Vec<T>` (array), primitives (`String`,
+/// `i64`, etc.), and everything else as a `$ref` to a component schema.
 fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
     if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
         let inner_tokens = emit_json_schema_tokens(&inner);
         return quote! {{
             let __inner = #inner_tokens;
-            ::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+        }};
+    }
+
+    // Vec<T> → {"type": "array", "items": <T-schema>}
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __items = #inner_tokens;
+            ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
         }};
     }
 
@@ -170,9 +179,11 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     crate::api_doc::primitive_json_type(&name).map_or_else(
         || {
             let ref_path = format!("#/components/schemas/{name}");
-            quote! { ::serde_json::json!({ "$ref": #ref_path }) }
+            quote! { ::autumn_web::reexports::serde_json::json!({ "$ref": #ref_path }) }
         },
-        |json_type| quote! { ::serde_json::json!({ "type": #json_type }) },
+        |json_type| {
+            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
+        },
     )
 }
 
@@ -205,27 +216,32 @@ fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
 
     let required_tokens: Vec<TokenStream> = required_names
         .iter()
-        .map(|name| quote! { ::serde_json::json!(#name) })
+        .map(|name| {
+            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
+        })
         .collect();
 
     quote! {
-        let mut __props = ::serde_json::Map::new();
+        let mut __props = ::autumn_web::reexports::serde_json::Map::new();
         #(#insertions)*
-        let mut __schema = ::serde_json::Map::new();
-        __schema.insert("type".to_owned(), ::serde_json::json!("object"));
+        let mut __schema = ::autumn_web::reexports::serde_json::Map::new();
+        __schema.insert(
+            "type".to_owned(),
+            ::autumn_web::reexports::serde_json::json!("object"),
+        );
         __schema.insert(
             "properties".to_owned(),
-            ::serde_json::Value::Object(__props),
+            ::autumn_web::reexports::serde_json::Value::Object(__props),
         );
-        let __required: ::std::vec::Vec<::serde_json::Value> =
+        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
             ::std::vec![#(#required_tokens),*];
         if !__required.is_empty() {
             __schema.insert(
                 "required".to_owned(),
-                ::serde_json::Value::Array(__required),
+                ::autumn_web::reexports::serde_json::Value::Array(__required),
             );
         }
-        ::serde_json::Value::Object(__schema)
+        ::autumn_web::reexports::serde_json::Value::Object(__schema)
     }
 }
 
