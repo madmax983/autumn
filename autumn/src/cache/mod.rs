@@ -267,6 +267,8 @@ pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cache-moka")]
+    use crate::cache::MokaCache;
 
     #[test]
     fn cache_key_deterministic() {
@@ -293,5 +295,47 @@ mod tests {
     fn cache_key_no_args() {
         let k = make_cache_key("get_config", &());
         assert!(k.starts_with("get_config:"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn insert_cached_and_get_cached_round_trip() {
+        let cache = MokaCache::new(10, None);
+        insert_cached(&cache, "key", "hello".to_string(), None);
+        let val: Option<String> = get_cached(&cache, "key");
+        assert_eq!(val.as_deref(), Some("hello"));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn get_cached_raw_bytes_slow_path() {
+        // Simulate a cross-replica backend: store RawCacheBytes directly, then
+        // verify get_cached deserializes it back to the concrete type.
+        let cache = MokaCache::new(10, None);
+        let bytes = serde_json::to_vec(&42_i32).unwrap();
+        cache.insert_value("k", Arc::new(RawCacheBytes(bytes)));
+        let val: Option<i32> = get_cached(&cache, "k");
+        assert_eq!(val, Some(42));
+    }
+
+    #[cfg(feature = "cache-moka")]
+    #[test]
+    fn get_cached_miss_returns_none() {
+        let cache = MokaCache::new(10, None);
+        let val: Option<String> = get_cached(&cache, "missing");
+        assert!(val.is_none());
+    }
+
+    #[test]
+    fn cacheable_result_ok_round_trips() {
+        let r: Result<i32, &str> = Result::from_ok(42);
+        assert_eq!(r, Ok(42));
+        assert_eq!(r.into_result(), Ok(42));
+    }
+
+    #[test]
+    fn cacheable_result_err_passes_through() {
+        let r: Result<i32, &str> = Err("oops");
+        assert_eq!(r.into_result(), Err("oops"));
     }
 }

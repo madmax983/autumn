@@ -126,6 +126,30 @@ async fn cache_response_layer_from_cache_still_works() {
     );
 }
 
+// ── AppState::set_cache() ─────────────────────────────────────────────────────
+
+#[test]
+fn app_state_set_cache_installs_via_extension_map() {
+    use autumn_web::cache::{clear_global_cache, global_cache};
+    clear_global_cache();
+
+    let state = AppState::for_test();
+    assert!(state.cache().is_none(), "starts with no cache");
+
+    let moka = Arc::new(MokaCache::new(10, None));
+    state.set_cache(moka.clone() as Arc<dyn Cache>);
+
+    // set_cache must also populate the global process-level cache
+    assert!(global_cache().is_some(), "global cache must be set");
+
+    // set_cache stores via extension map, so state.cache() must find it
+    let retrieved = state.cache().expect("set_cache must make cache() return Some");
+    insert(moka.as_ref(), "x", 7_i32);
+    assert_eq!(get::<i32>(retrieved.as_ref(), "x"), Some(7));
+
+    clear_global_cache();
+}
+
 // ── CacheConfig deserialization ───────────────────────────────────────────────
 
 #[test]
