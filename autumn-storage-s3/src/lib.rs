@@ -32,11 +32,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use autumn_web::storage::{
+    Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, StorageS3Config,
+};
 use aws_credential_types::Credentials;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
-use aws_sdk_s3::Client;
-use autumn_web::storage::{Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, StorageS3Config};
 use bytes::Bytes;
 use futures::StreamExt as _;
 use thiserror::Error;
@@ -126,11 +128,14 @@ impl S3BlobStore {
         let client = if let (Some(key_env), Some(secret_env)) =
             (&cfg.access_key_id_env, &cfg.secret_access_key_env)
         {
-            let key = std::env::var(key_env).map_err(|_| S3BlobStoreError::MissingCredentialEnvVar {
-                var: key_env.clone(),
-            })?;
-            let secret = std::env::var(secret_env).map_err(|_| S3BlobStoreError::MissingCredentialEnvVar {
-                var: secret_env.clone(),
+            let key =
+                std::env::var(key_env).map_err(|_| S3BlobStoreError::MissingCredentialEnvVar {
+                    var: key_env.clone(),
+                })?;
+            let secret = std::env::var(secret_env).map_err(|_| {
+                S3BlobStoreError::MissingCredentialEnvVar {
+                    var: secret_env.clone(),
+                }
             })?;
             let creds = Credentials::new(key, secret, None, None, "autumn-storage-s3");
             let mut builder = aws_sdk_s3::Config::builder()
@@ -147,8 +152,8 @@ impl S3BlobStore {
                 .region(Region::new(region))
                 .load()
                 .await;
-            let mut builder = aws_sdk_s3::config::Builder::from(&shared)
-                .force_path_style(cfg.force_path_style);
+            let mut builder =
+                aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
             if let Some(endpoint) = &cfg.endpoint {
                 builder = builder.endpoint_url(endpoint);
             }
@@ -208,7 +213,12 @@ impl BlobStore for S3BlobStore {
         &self.options.provider_id
     }
 
-    fn put<'a>(&'a self, key: &'a str, content_type: &'a str, bytes: Bytes) -> BlobFuture<'a, Blob> {
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        bytes: Bytes,
+    ) -> BlobFuture<'a, Blob> {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             let result = self
@@ -301,8 +311,7 @@ impl BlobStore for S3BlobStore {
                 let upload_resp = match upload_result {
                     Ok(r) => r,
                     Err(e) => {
-                        abort_multipart(&self.client, &self.options.bucket, key, &upload_id)
-                            .await;
+                        abort_multipart(&self.client, &self.options.bucket, key, &upload_id).await;
                         return Err(BlobStoreError::backend(e.to_string()));
                     }
                 };
@@ -325,13 +334,8 @@ impl BlobStore for S3BlobStore {
                             }
                         }
                         Some(Err(e)) => {
-                            abort_multipart(
-                                &self.client,
-                                &self.options.bucket,
-                                key,
-                                &upload_id,
-                            )
-                            .await;
+                            abort_multipart(&self.client, &self.options.bucket, key, &upload_id)
+                                .await;
                             return Err(e);
                         }
                         None => break,
@@ -519,7 +523,10 @@ mod tests {
             ..StorageS3Config::default()
         };
         let err = S3BlobStore::from_config(&cfg).await.unwrap_err();
-        assert!(matches!(err, S3BlobStoreError::MissingCredentialEnvVar { .. }));
+        assert!(matches!(
+            err,
+            S3BlobStoreError::MissingCredentialEnvVar { .. }
+        ));
     }
 
     #[tokio::test]
@@ -534,10 +541,15 @@ mod tests {
         Box::pin(temp_env::async_with_vars(
             [
                 ("__AUTUMN_S3_TEST_KEY_ID__", Some("AKIAIOSFODNN7EXAMPLE")),
-                ("__AUTUMN_S3_TEST_SECRET__", Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")),
+                (
+                    "__AUTUMN_S3_TEST_SECRET__",
+                    Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+                ),
             ],
             async {
-                let store = S3BlobStore::from_config(&cfg).await.expect("should build with static creds");
+                let store = S3BlobStore::from_config(&cfg)
+                    .await
+                    .expect("should build with static creds");
                 assert_eq!(store.provider_id(), "s3");
             },
         ))

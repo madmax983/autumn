@@ -37,7 +37,10 @@ async fn make_admin_client(port: u16) -> Client {
 #[ignore = "requires Docker (testcontainers)"]
 async fn avatar_blob_store_roundtrip() {
     let container = MinIO::default().start().await.expect("start MinIO");
-    let port = container.get_host_port_ipv4(9000).await.expect("MinIO port");
+    let port = container
+        .get_host_port_ipv4(9000)
+        .await
+        .expect("MinIO port");
     let endpoint = format!("http://127.0.0.1:{port}");
 
     let admin = make_admin_client(port).await;
@@ -59,7 +62,10 @@ async fn avatar_blob_store_roundtrip() {
     };
 
     temp_env::async_with_vars(
-        [(KEY_ENV, Some(MINIO_USER)), (SECRET_ENV, Some(MINIO_PASSWORD))],
+        [
+            (KEY_ENV, Some(MINIO_USER)),
+            (SECRET_ENV, Some(MINIO_PASSWORD)),
+        ],
         async move {
             let store = S3BlobStore::from_config(&cfg)
                 .await
@@ -70,7 +76,10 @@ async fn avatar_blob_store_roundtrip() {
             let data = Bytes::from_static(b"\x89PNG\r\n\x1a\n");
 
             // put
-            let blob = store.put(key, "image/png", data.clone()).await.expect("put");
+            let blob = store
+                .put(key, "image/png", data.clone())
+                .await
+                .expect("put");
             assert_eq!(blob.key, key);
             assert_eq!(blob.content_type, "image/png");
             assert_eq!(blob.byte_size, data.len() as u64);

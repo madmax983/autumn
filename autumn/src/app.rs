@@ -1046,9 +1046,7 @@ impl AppBuilder {
         B: crate::storage::BlobStore,
     {
         if self.blob_store.is_some() {
-            tracing::warn!(
-                "blob store replaced; the previously-installed store was overwritten"
-            );
+            tracing::warn!("blob store replaced; the previously-installed store was overwritten");
         }
         self.blob_store = Some(std::sync::Arc::new(store));
         self
@@ -1333,8 +1331,15 @@ impl AppBuilder {
         // A custom store installed via `.with_blob_store(...)` bypasses
         // config-driven instantiation entirely (no IO, no fail-fast).
         #[cfg(feature = "storage")]
-        let storage_bootstrap = blob_store
-            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
@@ -1549,7 +1554,7 @@ impl AppBuilder {
             #[cfg(feature = "openapi")]
             scoped_groups,
             #[cfg(not(feature = "openapi"))]
-            scoped_groups: _,
+                scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -1635,8 +1640,15 @@ impl AppBuilder {
         // the server path works. A custom store from `.with_blob_store()`
         // bypasses config-driven instantiation.
         #[cfg(feature = "storage")]
-        let storage_bootstrap = blob_store
-            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
@@ -1887,8 +1899,15 @@ impl AppBuilder {
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
         #[cfg(feature = "storage")]
-        let storage_bootstrap = blob_store
-            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
 
         #[cfg(feature = "db")]
         let pool = setup_database(&config, migrations, pool_provider_factory)
@@ -5310,17 +5329,26 @@ mod tests {
 
         #[test]
         fn with_blob_store_stores_custom_store() {
-            use crate::storage::{Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream};
+            use crate::storage::{
+                Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream,
+            };
             use bytes::Bytes;
             use std::time::Duration;
 
             struct FakeStore;
             impl BlobStore for FakeStore {
-                fn provider_id(&self) -> &'static str { "fake" }
+                fn provider_id(&self) -> &'static str {
+                    "fake"
+                }
                 fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
-                fn put_stream<'a>(&'a self, _k: &'a str, _ct: &'a str, _d: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+                fn put_stream<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _ct: &'a str,
+                    _d: ByteStream<'a>,
+                ) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
                 fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
@@ -5332,7 +5360,11 @@ mod tests {
                 fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
-                fn presigned_url<'a>(&'a self, _k: &'a str, _e: Duration) -> BlobFuture<'a, String> {
+                fn presigned_url<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _e: Duration,
+                ) -> BlobFuture<'a, String> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
             }
@@ -5343,17 +5375,26 @@ mod tests {
 
         #[tokio::test]
         async fn with_blob_store_is_installed_on_state() {
-            use crate::storage::{Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream};
+            use crate::storage::{
+                Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream,
+            };
             use bytes::Bytes;
             use std::time::Duration;
 
             struct FakeStore;
             impl BlobStore for FakeStore {
-                fn provider_id(&self) -> &'static str { "fake-installed" }
+                fn provider_id(&self) -> &'static str {
+                    "fake-installed"
+                }
                 fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
-                fn put_stream<'a>(&'a self, _k: &'a str, _ct: &'a str, _d: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+                fn put_stream<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _ct: &'a str,
+                    _d: ByteStream<'a>,
+                ) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
                 fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
@@ -5365,19 +5406,28 @@ mod tests {
                 fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
-                fn presigned_url<'a>(&'a self, _k: &'a str, _e: Duration) -> BlobFuture<'a, String> {
+                fn presigned_url<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _e: Duration,
+                ) -> BlobFuture<'a, String> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
             }
 
             let builder = crate::app().with_blob_store(FakeStore);
-            let bootstrap = builder.blob_store.map(|store| StorageBootstrap { store, serving: None });
+            let bootstrap = builder.blob_store.map(|store| StorageBootstrap {
+                store,
+                serving: None,
+            });
             let state = AppState::for_test();
             assert!(state.extension::<BlobStoreState>().is_none());
             if let Some(b) = bootstrap {
                 b.install(&state);
             }
-            let installed = state.extension::<BlobStoreState>().expect("store should be installed");
+            let installed = state
+                .extension::<BlobStoreState>()
+                .expect("store should be installed");
             assert_eq!(installed.store().provider_id(), "fake-installed");
         }
     }
