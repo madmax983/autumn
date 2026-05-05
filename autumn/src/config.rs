@@ -820,7 +820,7 @@ impl CacheBackend {
 /// url = "redis://redis:6379"
 /// key_prefix = "myapp:cache"
 /// ```
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct CacheConfig {
     /// Active cache backend.
     #[serde(default)]
@@ -829,15 +829,6 @@ pub struct CacheConfig {
     /// Redis backend options.
     #[serde(default)]
     pub redis: CacheRedisConfig,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            backend: CacheBackend::default(),
-            redis: CacheRedisConfig::default(),
-        }
-    }
 }
 
 impl CacheConfig {

@@ -120,7 +120,7 @@ pub trait Cache: Send + Sync + 'static {
     /// Retrieve a type-erased value by key. Returns `None` on miss.
     ///
     /// Backends that store serialized data (e.g. Redis) may return
-    /// `Arc<`[`RawCacheBytes`]`>` here; [`get_cached`] handles the
+    /// <code>Arc<[RawCacheBytes]></code> here; [`get_cached`] handles the
     /// JSON deserialization transparently.
     fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>>;
 

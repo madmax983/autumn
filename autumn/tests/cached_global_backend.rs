@@ -5,7 +5,7 @@
 //! interference from other tests that also manipulate it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use autumn_web::cache::{
     Cache, MokaCache, clear_global_cache, global_cache, make_cache_key, set_global_cache,
@@ -69,13 +69,13 @@ fn double_b(x: i32) -> i32 {
 /// `set_global_cache` / `global_cache` / `clear_global_cache` round-trips.
 #[test]
 fn global_cache_registry_round_trip() {
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
 
     assert!(global_cache().is_none());
 
     let moka = Arc::new(MokaCache::new(10, None));
-    set_global_cache(moka.clone());
+    set_global_cache(moka);
     assert!(global_cache().is_some());
 
     clear_global_cache();
@@ -87,14 +87,14 @@ fn global_cache_registry_round_trip() {
 /// from the global backend rather than computing.
 #[test]
 fn cached_fn_reads_from_global_on_hit() {
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
 
     let global_moka = Arc::new(MokaCache::new(100, None));
     let key = make_cache_key("double_a", &(42_i32,));
     // Store 999 under the key that double_a(42) would normally compute as 84.
     autumn_web::cache::insert(global_moka.as_ref(), &key, 999_i32);
-    set_global_cache(global_moka.clone() as Arc<dyn Cache>);
+    set_global_cache(global_moka);
 
     let result = double_a(42);
     assert_eq!(
@@ -109,7 +109,7 @@ fn cached_fn_reads_from_global_on_hit() {
 /// the global must hold the result afterward.
 #[test]
 fn cached_fn_writes_to_global_on_miss() {
-    let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _g = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     clear_global_cache();
 
     let (counting, inserts) = CountingCache::new();

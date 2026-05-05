@@ -146,21 +146,26 @@ impl Cache for RedisCache {
     ///
     /// [`insert_raw_bytes`]: Cache::insert_raw_bytes
     fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
-        // Only handle RawCacheBytes round-trips (e.g. values read from Redis
-        // and re-inserted) and the primitive types used by direct `insert`
-        // callers. All other types are handled by insert_raw_bytes.
-        let bytes: Option<Vec<u8>> = if let Some(raw) = value.downcast_ref::<RawCacheBytes>() {
-            Some(raw.0.clone())
-        } else if let Some(s) = value.downcast_ref::<String>() {
-            serde_json::to_vec(s).ok()
-        } else if let Some(n) = value.downcast_ref::<i64>() {
-            serde_json::to_vec(n).ok()
-        } else if let Some(n) = value.downcast_ref::<i32>() {
-            serde_json::to_vec(n).ok()
-        } else {
-            // Serde types (structs, Vec<T>, etc.) arrive via insert_raw_bytes.
-            None
-        };
+        // Only handle RawCacheBytes round-trips and the primitive types used by
+        // direct `cache::insert` callers. Serde types arrive via insert_raw_bytes.
+        let bytes: Option<Vec<u8>> = value
+            .downcast_ref::<RawCacheBytes>()
+            .map(|raw| raw.0.clone())
+            .or_else(|| {
+                value
+                    .downcast_ref::<String>()
+                    .and_then(|s| serde_json::to_vec(s).ok())
+            })
+            .or_else(|| {
+                value
+                    .downcast_ref::<i64>()
+                    .and_then(|n| serde_json::to_vec(n).ok())
+            })
+            .or_else(|| {
+                value
+                    .downcast_ref::<i32>()
+                    .and_then(|n| serde_json::to_vec(n).ok())
+            });
 
         if let Some(bytes) = bytes {
             self.redis_set(key, bytes);
@@ -235,7 +240,7 @@ pub struct RedisCachePlugin;
 impl RedisCachePlugin {
     /// Create the plugin.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
