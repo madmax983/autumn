@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **storage:** The `storage-s3` cargo feature on `autumn-web` has been
+  **removed**. S3-compatible blob storage now lives in the separate
+  `autumn-storage-s3` crate (#530). The `BlobStore` trait, `Blob` value
+  type, `LocalBlobStore`, multipart bridge, and all `[storage]`
+  configuration types remain in `autumn-web` under the existing `storage`
+  feature.
+
+  **Migration** (affects any app that was using the `storage-s3` feature;
+  since that feature stub returned `BlobStoreError::Unsupported` on every
+  operation, real usage was not yet possible):
+
+  ```toml
+  # Before (no longer valid):
+  autumn-web = { version = "0.4", features = ["storage", "storage-s3"] }
+
+  # After:
+  autumn-web        = { version = "0.4", features = ["storage"] }
+  autumn-storage-s3 = "0.3"
+  ```
+
+  Wire up in `main`:
+
+  ```rust,ignore
+  let store = S3BlobStore::from_config(&config.storage.s3).await?;
+  autumn_web::app()
+      .with_blob_store(store)
+      .run()
+      .await;
+  ```
+
+- **AppBuilder:** New `with_blob_store(impl BlobStore)` method
+  (mirrors `with_session_store`). When called, `preflight_storage` is
+  bypassed and the supplied store is installed directly onto `AppState`.
+  This is the installation contract for `autumn-storage-s3` and any
+  future storage plugins.
+
 ### Added
 
 - **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class

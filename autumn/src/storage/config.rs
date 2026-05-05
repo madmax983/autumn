@@ -63,7 +63,8 @@ pub enum StorageBackend {
     /// Local disk backend. Suitable for single-replica deployments and
     /// the default for `dev`.
     Local,
-    /// S3-compatible backend. Requires the `storage-s3` cargo feature.
+    /// S3-compatible backend. Requires the `autumn-storage-s3` plugin;
+    /// call `.with_blob_store(S3BlobStore::from_config(...))` on the builder.
     S3,
 }
 
@@ -238,9 +239,6 @@ pub enum StorageBackendConfigError {
     /// `s3` selected without a region.
     #[error("storage.backend=s3 requires storage.s3.region")]
     MissingS3Region,
-    /// `s3` selected without the `storage-s3` cargo feature compiled in.
-    #[error("storage.backend=s3 requires the `storage-s3` cargo feature")]
-    S3FeatureDisabled,
 }
 
 impl StorageConfig {
@@ -280,24 +278,15 @@ impl StorageConfig {
                     .clone()
                     .filter(|r| !r.trim().is_empty())
                     .ok_or(StorageBackendConfigError::MissingS3Region)?;
-
-                #[cfg(feature = "storage-s3")]
-                {
-                    Ok(StorageBackendPlan::S3 {
-                        provider_id: self.default_provider.clone(),
-                        bucket,
-                        region,
-                        endpoint: self.s3.endpoint.clone(),
-                        public_base_url: self.s3.public_base_url.clone(),
-                        force_path_style: self.s3.force_path_style,
-                        default_url_expiry_secs: self.s3.default_url_expiry_secs,
-                    })
-                }
-                #[cfg(not(feature = "storage-s3"))]
-                {
-                    let _ = (bucket, region);
-                    Err(StorageBackendConfigError::S3FeatureDisabled)
-                }
+                Ok(StorageBackendPlan::S3 {
+                    provider_id: self.default_provider.clone(),
+                    bucket,
+                    region,
+                    endpoint: self.s3.endpoint.clone(),
+                    public_base_url: self.s3.public_base_url.clone(),
+                    force_path_style: self.s3.force_path_style,
+                    default_url_expiry_secs: self.s3.default_url_expiry_secs,
+                })
             }
         }
     }
@@ -423,20 +412,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "storage-s3"))]
-    fn s3_plan_yields_feature_disabled_error() {
+    fn s3_plan_succeeds_with_bucket_and_region() {
         let cfg = StorageConfig {
             backend: StorageBackend::S3,
             s3: StorageS3Config {
                 bucket: Some("b".into()),
-                region: Some("r".into()),
+                region: Some("us-east-1".into()),
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(
-            cfg.backend_plan(Some("prod")),
-            Err(StorageBackendConfigError::S3FeatureDisabled)
-        );
+        let plan = cfg.backend_plan(Some("prod")).unwrap();
+        assert!(matches!(plan, StorageBackendPlan::S3 { .. }));
     }
 }
