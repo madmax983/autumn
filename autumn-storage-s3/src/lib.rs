@@ -51,6 +51,14 @@ pub enum S3BlobStoreError {
     /// `[storage.s3].region` is not set.
     #[error("storage.s3.region is required but not set")]
     MissingRegion,
+    /// Exactly one of `access_key_id_env` / `secret_access_key_env` is set.
+    /// Both must be provided together, or neither (to use the AWS default
+    /// credential chain).
+    #[error(
+        "partial credential configuration: access_key_id_env and \
+         secret_access_key_env must both be set, or neither"
+    )]
+    PartialCredentialConfig,
     /// A credential env var listed in config is not present in the process
     /// environment.
     #[error("credential env var '{var}' is not set in the environment")]
@@ -81,14 +89,22 @@ impl S3BlobStore {
     /// Build an `S3BlobStore` from the `[storage.s3]` config section.
     ///
     /// Credentials resolve from `access_key_id_env` /
-    /// `secret_access_key_env` when both are set; otherwise the AWS
-    /// default credential chain (environment variables, instance metadata,
-    /// IAM roles) is loaded.
+    /// `secret_access_key_env` when **both** are set; if neither is set the
+    /// AWS default credential chain (environment variables, instance metadata,
+    /// IAM roles) is used. Providing exactly one is a configuration error —
+    /// [`S3BlobStoreError::PartialCredentialConfig`] is returned immediately.
+    ///
+    /// The [`provider_id`](BlobStore::provider_id) recorded on every produced
+    /// [`Blob`] defaults to `"s3"`. Override it with
+    /// [`with_provider_id`](Self::with_provider_id) if you want blobs to carry
+    /// the same [`StorageConfig::default_provider`](autumn_web::storage::StorageConfig)
+    /// label used by other backends in your deployment.
     ///
     /// # Errors
     ///
-    /// Returns [`S3BlobStoreError`] when required config fields are absent
-    /// or a listed credential env var is missing from the environment.
+    /// Returns [`S3BlobStoreError`] when required config fields are absent,
+    /// credential env vars are partially configured, or a listed credential
+    /// env var is missing from the environment.
     pub async fn from_config(cfg: &StorageS3Config) -> Result<Self, S3BlobStoreError> {
         let bucket = cfg
             .bucket
@@ -102,6 +118,10 @@ impl S3BlobStore {
             .filter(|r| !r.trim().is_empty())
             .ok_or(S3BlobStoreError::MissingRegion)?
             .to_owned();
+
+        if cfg.access_key_id_env.is_some() != cfg.secret_access_key_env.is_some() {
+            return Err(S3BlobStoreError::PartialCredentialConfig);
+        }
 
         let client = if let (Some(key_env), Some(secret_env)) =
             (&cfg.access_key_id_env, &cfg.secret_access_key_env)
@@ -143,6 +163,44 @@ impl S3BlobStore {
             }),
         })
     }
+
+    /// Override the `provider_id` recorded on every [`Blob`] produced by
+    /// this store.
+    ///
+    /// Defaults to `"s3"`. Call this if you want blobs to carry the same
+    /// [`StorageConfig::default_provider`](autumn_web::storage::StorageConfig)
+    /// label used by other backends, so backend migrations appear as
+    /// provider mismatches in existing blob records.
+    ///
+    /// ```rust,ignore
+    /// let store = S3BlobStore::from_config(&config.storage.s3)
+    ///     .await?
+    ///     .with_provider_id(&config.storage.default_provider);
+    /// ```
+    #[must_use]
+    pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.options).provider_id = provider_id.into();
+        self
+    }
+}
+
+/// Minimum part size for S3 multipart uploads (5 MiB — the S3 minimum).
+///
+/// Streams smaller than this threshold are uploaded as a single `PutObject`
+/// call; larger streams are chunked into multipart uploads so the payload is
+/// never fully buffered in memory.
+const MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Best-effort abort of a multipart upload; errors are silently ignored
+/// because we're already on the failure path.
+async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &str) {
+    let _ = client
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await;
 }
 
 impl BlobStore for S3BlobStore {
@@ -172,6 +230,7 @@ impl BlobStore for S3BlobStore {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn put_stream<'a>(
         &'a self,
         key: &'a str,
@@ -179,17 +238,139 @@ impl BlobStore for S3BlobStore {
         data: ByteStream<'a>,
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
-            // Collect the stream into memory then delegate to put.
-            // A true multipart upload would be better for large files,
-            // but this keeps the implementation simple and correct for
-            // the common case.
-            let mut buf = Vec::new();
             let mut stream = data;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                buf.extend_from_slice(&chunk);
+            let mut current_part: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE);
+
+            // Buffer until we have one full part or the stream ends.
+            loop {
+                match stream.next().await {
+                    Some(Ok(chunk)) => {
+                        current_part.extend_from_slice(&chunk);
+                        if current_part.len() >= MULTIPART_PART_SIZE {
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => {
+                        // Stream ended before reaching the multipart threshold:
+                        // use a single-object PUT instead.
+                        return self.put(key, content_type, Bytes::from(current_part)).await;
+                    }
+                }
             }
-            self.put(key, content_type, Bytes::from(buf)).await
+
+            // The stream exceeded MULTIPART_PART_SIZE — use S3 multipart upload
+            // so the payload is never fully buffered in memory.
+            let create = self
+                .client
+                .create_multipart_upload()
+                .bucket(&self.options.bucket)
+                .key(key)
+                .content_type(content_type)
+                .send()
+                .await
+                .map_err(|e| BlobStoreError::backend(e.to_string()))?;
+
+            let upload_id = create
+                .upload_id()
+                .ok_or_else(|| {
+                    BlobStoreError::backend("CreateMultipartUpload returned no upload_id")
+                })?
+                .to_owned();
+
+            let mut completed_parts: Vec<aws_sdk_s3::types::CompletedPart> = Vec::new();
+            let mut part_number = 1_i32;
+            let mut total_bytes: u64 = 0;
+
+            // Upload loop. `current_part` is always non-empty at the top.
+            loop {
+                let part_bytes = Bytes::from(std::mem::take(&mut current_part));
+                total_bytes += part_bytes.len() as u64;
+
+                let upload_result = self
+                    .client
+                    .upload_part()
+                    .bucket(&self.options.bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(part_bytes.into())
+                    .send()
+                    .await;
+
+                let upload_resp = match upload_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        abort_multipart(&self.client, &self.options.bucket, key, &upload_id)
+                            .await;
+                        return Err(BlobStoreError::backend(e.to_string()));
+                    }
+                };
+
+                completed_parts.push(
+                    aws_sdk_s3::types::CompletedPart::builder()
+                        .part_number(part_number)
+                        .set_e_tag(upload_resp.e_tag().map(str::to_owned))
+                        .build(),
+                );
+                part_number += 1;
+
+                // Refill the part buffer from the remaining stream.
+                loop {
+                    match stream.next().await {
+                        Some(Ok(chunk)) => {
+                            current_part.extend_from_slice(&chunk);
+                            if current_part.len() >= MULTIPART_PART_SIZE {
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            abort_multipart(
+                                &self.client,
+                                &self.options.bucket,
+                                key,
+                                &upload_id,
+                            )
+                            .await;
+                            return Err(e);
+                        }
+                        None => break,
+                    }
+                }
+
+                if current_part.is_empty() {
+                    break;
+                }
+            }
+
+            let complete_result = self
+                .client
+                .complete_multipart_upload()
+                .bucket(&self.options.bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed_parts))
+                        .build(),
+                )
+                .send()
+                .await;
+
+            match complete_result {
+                Ok(resp) => {
+                    let mut blob =
+                        Blob::new(&self.options.provider_id, key, content_type, total_bytes);
+                    if let Some(etag) = resp.e_tag() {
+                        blob = blob.with_etag(etag.to_owned());
+                    }
+                    Ok(blob)
+                }
+                Err(e) => {
+                    abort_multipart(&self.client, &self.options.bucket, key, &upload_id).await;
+                    Err(BlobStoreError::backend(e.to_string()))
+                }
+            }
         })
     }
 
@@ -203,12 +384,12 @@ impl BlobStore for S3BlobStore {
                 .send()
                 .await
                 .map_err(|e| {
-                    let msg = e.to_string();
-                    if msg.contains("NoSuchKey") || msg.contains("404") {
-                        BlobStoreError::NotFound(key.to_owned())
-                    } else {
-                        BlobStoreError::backend(msg)
+                    if let aws_sdk_s3::error::SdkError::ServiceError(ref svc) = e
+                        && (svc.err().is_no_such_key() || svc.raw().status().as_u16() == 404)
+                    {
+                        return BlobStoreError::NotFound(key.to_owned());
                     }
+                    BlobStoreError::backend(e.to_string())
                 })?;
             let body = result
                 .body
@@ -260,12 +441,12 @@ impl BlobStore for S3BlobStore {
                     }))
                 }
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("NoSuchKey") || msg.contains("404") || msg.contains("NotFound") {
-                        Ok(None)
-                    } else {
-                        Err(BlobStoreError::backend(msg))
+                    if let aws_sdk_s3::error::SdkError::ServiceError(ref svc) = e
+                        && (svc.err().is_not_found() || svc.raw().status().as_u16() == 404)
+                    {
+                        return Ok(None);
                     }
+                    Err(BlobStoreError::backend(e.to_string()))
                 }
             }
         })
@@ -382,6 +563,57 @@ mod tests {
             async {
                 let store = S3BlobStore::from_config(&cfg).await.expect("should build");
                 assert_eq!(store.provider_id(), "s3");
+            },
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn from_config_partial_key_env_is_rejected() {
+        let cfg = StorageS3Config {
+            bucket: Some("b".into()),
+            region: Some("us-east-1".into()),
+            access_key_id_env: Some("SOME_KEY_ENV".into()),
+            secret_access_key_env: None,
+            ..StorageS3Config::default()
+        };
+        let err = S3BlobStore::from_config(&cfg).await.unwrap_err();
+        assert!(matches!(err, S3BlobStoreError::PartialCredentialConfig));
+    }
+
+    #[tokio::test]
+    async fn from_config_partial_secret_env_is_rejected() {
+        let cfg = StorageS3Config {
+            bucket: Some("b".into()),
+            region: Some("us-east-1".into()),
+            access_key_id_env: None,
+            secret_access_key_env: Some("SOME_SECRET_ENV".into()),
+            ..StorageS3Config::default()
+        };
+        let err = S3BlobStore::from_config(&cfg).await.unwrap_err();
+        assert!(matches!(err, S3BlobStoreError::PartialCredentialConfig));
+    }
+
+    #[tokio::test]
+    async fn with_provider_id_overrides_default() {
+        let cfg = StorageS3Config {
+            bucket: Some("b".into()),
+            region: Some("us-east-1".into()),
+            access_key_id_env: Some("__AUTUMN_S3_PROVID_KEY__".into()),
+            secret_access_key_env: Some("__AUTUMN_S3_PROVID_SECRET__".into()),
+            ..StorageS3Config::default()
+        };
+        Box::pin(temp_env::async_with_vars(
+            [
+                ("__AUTUMN_S3_PROVID_KEY__", Some("key")),
+                ("__AUTUMN_S3_PROVID_SECRET__", Some("secret")),
+            ],
+            async {
+                let store = S3BlobStore::from_config(&cfg)
+                    .await
+                    .expect("build store")
+                    .with_provider_id("myapp-prod");
+                assert_eq!(store.provider_id(), "myapp-prod");
             },
         ))
         .await;
