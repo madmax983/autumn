@@ -157,25 +157,11 @@ impl ChannelMetrics {
         drop(counters);
     }
 
-    fn topics(&self) -> HashSet<String> {
+    fn snapshot(&self) -> HashMap<String, ChannelMetricCounters> {
         self.counters
             .lock()
             .expect("channel metrics lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    fn snapshot_for(&self, topic: &str, subscriber_count: usize) -> ChannelStats {
-        let counters = self.counters.lock().expect("channel metrics lock poisoned");
-        let stats = counters.get(topic).cloned().unwrap_or_default();
-        drop(counters);
-        ChannelStats {
-            subscriber_count,
-            lifetime_publish_count: stats.publishes,
-            dropped_count: stats.drops,
-            lagged_count: stats.lags,
-        }
+            .clone()
     }
 }
 
@@ -479,6 +465,9 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn snapshot(&self) -> HashMap<String, ChannelStats> {
+        // Keep registry and metrics collection in separate phases. Publish and
+        // subscribe paths touch metrics before registry, so snapshot must never
+        // hold the registry mutex while reading metrics.
         let subscriber_counts: HashMap<String, usize> = {
             let registry = self.inner.registry.lock().expect("channels lock poisoned");
             registry
@@ -486,16 +475,25 @@ impl ChannelsBackend for LocalChannelsBackend {
                 .map(|(topic, sender)| (topic.clone(), sender.receiver_count()))
                 .collect()
         };
+        let metric_counters = self.inner.metrics.snapshot();
 
-        let mut topics = self.inner.metrics.topics();
+        let mut topics: HashSet<String> = metric_counters.keys().cloned().collect();
         topics.extend(subscriber_counts.keys().cloned());
 
         topics
             .into_iter()
             .map(|topic| {
                 let subscriber_count = subscriber_counts.get(&topic).copied().unwrap_or(0);
-                let stats = self.inner.metrics.snapshot_for(&topic, subscriber_count);
-                (topic, stats)
+                let counters = metric_counters.get(&topic).cloned().unwrap_or_default();
+                (
+                    topic,
+                    ChannelStats {
+                        subscriber_count,
+                        lifetime_publish_count: counters.publishes,
+                        dropped_count: counters.drops,
+                        lagged_count: counters.lags,
+                    },
+                )
             })
             .collect()
     }
@@ -1070,6 +1068,60 @@ mod tests {
         assert_eq!(stats.dropped_count, 0);
         assert_eq!(stats.lagged_count, 0);
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_releases_registry_before_waiting_on_metrics() {
+        let backend = LocalChannelsBackend::new(16);
+        backend.ensure_topic("race");
+
+        let metrics_guard = backend
+            .inner
+            .metrics
+            .counters
+            .lock()
+            .expect("channel metrics lock should not be poisoned");
+        let registry_guard = backend
+            .inner
+            .registry
+            .lock()
+            .expect("channel registry lock should not be poisoned");
+        let snapshot_backend = backend.clone();
+
+        let handle = std::thread::spawn(move || {
+            let snapshot = snapshot_backend.snapshot();
+            assert!(snapshot.contains_key("race"));
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        drop(registry_guard);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let registry_released_before_metrics = loop {
+            match backend.inner.registry.try_lock() {
+                Ok(registry) => {
+                    drop(registry);
+                    break true;
+                }
+                Err(std::sync::TryLockError::WouldBlock)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break false,
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    panic!("channel registry lock should not be poisoned: {error}");
+                }
+            }
+        };
+
+        drop(metrics_guard);
+        handle.join().expect("snapshot thread should finish");
+        assert!(
+            registry_released_before_metrics,
+            "snapshot held the registry mutex while waiting on metrics"
+        );
     }
 
     #[cfg(feature = "ws")]
