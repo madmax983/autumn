@@ -94,6 +94,7 @@ fn compile_pass_tests() {
 
     // One-off operational task macro
     t.pass("tests/compile-pass/task_basic.rs");
+    t.pass("tests/compile-pass/scheduled_coordination.rs");
 
     // WebSocket macro (requires ws feature)
     #[cfg(feature = "ws")]

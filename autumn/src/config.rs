@@ -84,6 +84,10 @@
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
+//! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
+//! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
+//! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
+//! | `AUTUMN_SCHEDULER__KEY_PREFIX` | `scheduler.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__ENABLED` | `security.rate_limit.enabled` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
@@ -644,6 +648,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub jobs: JobConfig,
 
+    /// Scheduled task coordination backend settings.
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
+
     /// Authentication settings.
     #[serde(default)]
     pub auth: crate::auth::AuthConfig,
@@ -765,6 +773,100 @@ const fn default_channel_capacity() -> usize {
 
 fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
+}
+
+/// Scheduled task coordination backend selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerBackend {
+    /// Per-process scheduler timers. This preserves existing single-replica behavior.
+    #[serde(alias = "local", alias = "memory")]
+    #[default]
+    InProcess,
+    /// Fleet coordination with Postgres advisory locks.
+    Postgres,
+}
+
+impl SchedulerBackend {
+    /// Parse an environment variable value for scheduler backend selection.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "in_process" | "in-process" | "local" | "memory" => Some(Self::InProcess),
+            "postgres" | "postgresql" => Some(Self::Postgres),
+            _ => None,
+        }
+    }
+}
+
+/// Scheduled task coordination runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SchedulerConfig {
+    /// Runtime backend selection.
+    #[serde(default)]
+    pub backend: SchedulerBackend,
+    /// Lease duration used by distributed backends for run visibility and timeout guidance.
+    #[serde(default = "default_scheduler_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+    /// Stable replica identifier surfaced in actuator metadata.
+    #[serde(default)]
+    pub replica_id: Option<String>,
+    /// Prefix included when deriving Postgres advisory lock keys.
+    #[serde(default = "default_scheduler_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl SchedulerConfig {
+    /// Resolve a stable-ish replica identifier for actuator metadata and lock ownership.
+    #[must_use]
+    pub fn resolved_replica_id(&self) -> String {
+        self.replica_id
+            .as_ref()
+            .filter(|id| !id.trim().is_empty())
+            .cloned()
+            .or_else(|| std::env::var("FLY_MACHINE_ID").ok())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| format!("pid-{}", std::process::id()))
+    }
+
+    /// Validate scheduler-specific config shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when values are syntactically valid TOML
+    /// but cannot be used by the runtime.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.lease_ttl_secs == 0 {
+            return Err(ConfigError::Validation(
+                "scheduler.lease_ttl_secs must be greater than zero".to_owned(),
+            ));
+        }
+        if self.key_prefix.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "scheduler.key_prefix must not be empty".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            backend: SchedulerBackend::default(),
+            lease_ttl_secs: default_scheduler_lease_ttl_secs(),
+            replica_id: None,
+            key_prefix: default_scheduler_key_prefix(),
+        }
+    }
+}
+
+const fn default_scheduler_lease_ttl_secs() -> u64 {
+    300
+}
+
+fn default_scheduler_key_prefix() -> String {
+    "autumn:scheduler".to_owned()
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -1009,6 +1111,7 @@ impl AutumnConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.database.validate()?;
         self.cors.validate()?;
+        self.scheduler.validate()?;
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         // Session backend validation deliberately lives in
@@ -1082,6 +1185,7 @@ impl AutumnConfig {
         self.apply_session_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
+        self.apply_scheduler_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
         #[cfg(feature = "storage")]
@@ -1318,6 +1422,33 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__REDIS__KEY_PREFIX",
             &mut self.jobs.redis.key_prefix,
+        );
+    }
+
+    fn apply_scheduler_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_SCHEDULER__BACKEND") {
+            match SchedulerBackend::from_env_value(&val) {
+                Some(backend) => self.scheduler.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_SCHEDULER__BACKEND={val:?} is not valid \
+                     (expected in_process or postgres), ignoring"
+                ),
+            }
+        }
+        parse_env(
+            env,
+            "AUTUMN_SCHEDULER__LEASE_TTL_SECS",
+            &mut self.scheduler.lease_ttl_secs,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SCHEDULER__REPLICA_ID",
+            &mut self.scheduler.replica_id,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_SCHEDULER__KEY_PREFIX",
+            &mut self.scheduler.key_prefix,
         );
     }
 

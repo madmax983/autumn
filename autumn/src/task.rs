@@ -4,7 +4,7 @@
 //! macro and `tasks![]` collection macro.
 //!
 //! Tasks are registered via [`AppBuilder::tasks`](crate::app::AppBuilder::tasks)
-//! and run alongside the HTTP server using `tokio-cron-scheduler`.
+//! and run alongside the HTTP server using Tokio timers.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -100,8 +100,30 @@ pub struct TaskInfo {
     pub name: String,
     /// When/how often to run.
     pub schedule: Schedule,
+    /// Whether this task is coordinated fleet-wide or intentionally per-replica.
+    pub coordination: TaskCoordination,
     /// The task handler, invoked with a clone of `AppState` each run.
     pub handler: TaskHandler,
+}
+
+/// Cross-replica coordination mode for a scheduled task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCoordination {
+    /// Run at most once per scheduled tick across the configured scheduler backend.
+    #[default]
+    Fleet,
+    /// Run on every replica, bypassing fleet coordination.
+    PerReplica,
+}
+
+impl std::fmt::Display for TaskCoordination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fleet => f.write_str("fleet"),
+            Self::PerReplica => f.write_str("per_replica"),
+        }
+    }
 }
 
 /// How a scheduled task is triggered.
