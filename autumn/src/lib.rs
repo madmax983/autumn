@@ -131,6 +131,7 @@ pub mod prelude;
 pub use paths::PathExt;
 pub(crate) mod route;
 pub use route::{RepositoryApiMeta, Route};
+pub mod scheduler;
 pub mod security;
 pub mod session;
 #[cfg(feature = "redis")]

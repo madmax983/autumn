@@ -85,8 +85,8 @@ If you add `#[static_get]` routes, `autumn build` pre-renders them into
 Autumn still distinguishes between "works on your laptop" and "safe to run in a
 multi-replica deployment":
 
-- Local-safe defaults: in-memory sessions, pretty logs in `dev`, process-local `#[scheduled]` tasks, and single-binary startup.
-- Production-safe defaults: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, container scaffolding from `autumn new`, and explicit migration jobs before web replicas roll.
+- Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, and single-binary startup.
+- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, and explicit migration jobs before web replicas roll.
 
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
@@ -159,6 +159,7 @@ async fn main() {
 - [Getting Started Guide](docs/guide/getting-started.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
+- [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
 - [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)

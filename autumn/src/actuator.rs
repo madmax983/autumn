@@ -152,6 +152,21 @@ impl std::fmt::Debug for LogLevels {
 pub struct TaskStatus {
     /// The schedule description (e.g., "every 5m" or "cron 0 0 * * *").
     pub schedule: String,
+    /// Whether this task is coordinated across the fleet or per replica.
+    pub coordination: crate::task::TaskCoordination,
+    /// Scheduler backend currently coordinating this task.
+    pub scheduler_backend: String,
+    /// Replica id for this process.
+    pub replica_id: String,
+    /// Replica id that last acquired leadership for this task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_leader: Option<String>,
+    /// Last global tick key observed for this task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tick: Option<String>,
+    /// Last time this task fired (ISO 8601), if ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
     /// Current task state.
     pub status: String,
     /// Last time the task ran (ISO 8601), if ever.
@@ -309,6 +324,24 @@ impl TaskRegistry {
 
     /// Register a task with its schedule description.
     pub fn register(&self, name: &str, schedule: &str) {
+        self.register_scheduled(
+            name,
+            schedule,
+            crate::task::TaskCoordination::Fleet,
+            "in_process",
+            "unknown",
+        );
+    }
+
+    /// Register a scheduled task with scheduler coordination metadata.
+    pub fn register_scheduled(
+        &self,
+        name: &str,
+        schedule: &str,
+        coordination: crate::task::TaskCoordination,
+        scheduler_backend: &str,
+        replica_id: &str,
+    ) {
         let Ok(mut guard) = self.inner.write() else {
             return;
         };
@@ -316,6 +349,12 @@ impl TaskRegistry {
             name.to_string(),
             TaskStatus {
                 schedule: schedule.to_string(),
+                coordination,
+                scheduler_backend: scheduler_backend.to_string(),
+                replica_id: replica_id.to_string(),
+                current_leader: None,
+                last_tick: None,
+                last_fired_at: None,
                 status: "idle".to_string(),
                 last_run: None,
                 last_duration_ms: None,
@@ -325,6 +364,18 @@ impl TaskRegistry {
                 total_failures: 0,
             },
         );
+    }
+
+    /// Record the replica that acquired leadership for a global task tick.
+    pub fn record_leader(&self, name: &str, leader_id: &str, tick_key: &str) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.current_leader = Some(leader_id.to_string());
+        task.last_tick = Some(tick_key.to_string());
     }
 
     /// Record that a task started running.
@@ -347,7 +398,9 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        task.last_run = Some(chrono::Utc::now().to_rfc3339());
+        let now = chrono::Utc::now().to_rfc3339();
+        task.last_run = Some(now.clone());
+        task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
         task.last_result = Some("ok".to_string());
         task.last_error = None;
@@ -363,7 +416,9 @@ impl TaskRegistry {
             return;
         };
         task.status = "idle".to_string();
-        task.last_run = Some(chrono::Utc::now().to_rfc3339());
+        let now = chrono::Utc::now().to_rfc3339();
+        task.last_run = Some(now.clone());
+        task.last_fired_at = Some(now);
         task.last_duration_ms = Some(duration_ms);
         task.last_result = Some("failed".to_string());
         task.last_error = Some(error.to_string());

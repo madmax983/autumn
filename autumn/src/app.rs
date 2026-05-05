@@ -1558,8 +1558,18 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty() {
-                start_task_scheduler(tasks, &state, server_shutdown.clone());
+            if !tasks.is_empty()
+                && let Err(error) = start_task_scheduler_with_config(
+                    tasks,
+                    &state,
+                    server_shutdown.clone(),
+                    &config.scheduler,
+                )
+            {
+                tracing::error!(error = %error, "scheduled task runtime initialization failed");
+                server_shutdown.cancel();
+                server_task.abort();
+                std::process::exit(1);
             }
             state.probes().mark_startup_complete();
         }
@@ -2081,35 +2091,83 @@ fn print_available_one_off_tasks(tasks: &[crate::task::OneOffTaskInfo]) {
 /// scheduler gracefully when the server receives a termination signal.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
+#[allow(dead_code)]
 fn start_task_scheduler(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    if let Err(error) = start_task_scheduler_with_config(
+        tasks,
+        state,
+        shutdown,
+        &crate::config::SchedulerConfig::default(),
+    ) {
+        tracing::error!(error = %error, "scheduled task runtime initialization failed");
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cognitive_complexity)]
+fn start_task_scheduler_with_config(
+    tasks: Vec<crate::task::TaskInfo>,
+    state: &AppState,
+    shutdown: tokio_util::sync::CancellationToken,
+    scheduler_config: &crate::config::SchedulerConfig,
+) -> crate::AutumnResult<()> {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
+    let coordinator = crate::scheduler::coordinator_from_config(scheduler_config, state)?;
+    let lease_ttl = std::time::Duration::from_secs(scheduler_config.lease_ttl_secs);
     for task_info in &tasks {
         let schedule_desc = task_info.schedule.to_string();
-        tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+        tracing::info!(
+            name = %task_info.name,
+            schedule = %schedule_desc,
+            coordination = %task_info.coordination,
+            scheduler_backend = coordinator.backend(),
+            replica_id = coordinator.replica_id(),
+            lease_ttl_secs = scheduler_config.lease_ttl_secs,
+            "Registered task"
+        );
     }
 
-    let mut cron_tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)> =
-        Vec::new();
+    let mut cron_tasks: Vec<CronTaskSpec> = Vec::new();
 
     for task_info in tasks {
         let state = state.clone();
         let name = task_info.name.clone();
         let handler = task_info.handler;
+        let coordination = task_info.coordination;
         let schedule_desc = task_info.schedule.to_string();
+        state.task_registry.register_scheduled(
+            &name,
+            &schedule_desc,
+            coordination,
+            coordinator.backend(),
+            coordinator.replica_id(),
+        );
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
-                // Register with the task registry for /actuator/tasks
-                state.task_registry.register(&name, &schedule_desc);
-
+                let coordinator = Arc::clone(&coordinator);
+                let shutdown = shutdown.child_token();
                 tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(delay).await;
-                        execute_fixed_delay_task(name.clone(), state.clone(), handler).await;
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {
+                                execute_fixed_delay_task(
+                                    name.clone(),
+                                    state.clone(),
+                                    handler,
+                                    delay,
+                                    coordination,
+                                    Arc::clone(&coordinator),
+                                    lease_ttl,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 });
             }
@@ -2117,18 +2175,26 @@ fn start_task_scheduler(
                 expression,
                 timezone,
             } => {
-                state.task_registry.register(&name, &schedule_desc);
-                cron_tasks.push((name, expression, timezone, handler));
+                cron_tasks.push(CronTaskSpec {
+                    name,
+                    expression,
+                    timezone,
+                    coordination,
+                    handler,
+                });
             }
         }
     }
 
     if !cron_tasks.is_empty() {
         let state = state.clone();
+        let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
-            run_cron_scheduler(cron_tasks, state, shutdown).await;
+            run_cron_scheduler(cron_tasks, state, shutdown, coordinator, lease_ttl).await;
         });
     }
+
+    Ok(())
 }
 
 #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -2183,19 +2249,79 @@ async fn execute_task_result(
     }
 }
 
+async fn execute_task_result_with_lease_ttl(
+    state: &AppState,
+    handler: crate::task::TaskHandler,
+    start: std::time::Instant,
+    name: &str,
+    schedule: &'static str,
+    lease_ttl: std::time::Duration,
+) -> Result<u64, (u64, String)> {
+    tokio::time::timeout(
+        lease_ttl,
+        execute_task_result(state, handler, start, name, schedule),
+    )
+    .await
+    .map_or_else(
+        |_| {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Err((
+                duration_ms,
+                format!(
+                    "scheduled task exceeded lease TTL of {}s",
+                    lease_ttl.as_secs()
+                ),
+            ))
+        },
+        std::convert::identity,
+    )
+}
+
 /// Handle the execution of a single fixed-delay task.
 async fn execute_fixed_delay_task(
     name: String,
     state: AppState,
     handler: crate::task::TaskHandler,
+    delay: std::time::Duration,
+    coordination: crate::task::TaskCoordination,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
+    let tick_key =
+        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_secs());
+    let lease = match coordinator
+        .try_acquire(&name, &tick_key, coordination)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::debug!(task = %name, tick = %tick_key, "Scheduled task tick already claimed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire scheduled task lease");
+            return;
+        }
+    };
+    state
+        .task_registry
+        .record_leader(&name, lease.leader_id(), &tick_key);
     tracing::debug!(task = %name, "Running scheduled task");
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
+    match execute_task_result_with_lease_ttl(
+        &state,
+        handler,
+        start,
+        &name,
+        "fixed_delay",
+        lease_ttl,
+    )
+    .await
+    {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Task completed");
@@ -2222,17 +2348,47 @@ async fn execute_fixed_delay_task(
             );
         }
     }
+
+    if let Err(error) = lease.release().await {
+        tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to release scheduled task lease");
+    }
 }
 
 /// Handle the execution of a single cron task.
-async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
+async fn execute_cron_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+    coordination: crate::task::TaskCoordination,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
+) {
+    let tick_key = crate::scheduler::cron_tick_key(&name, crate::scheduler::now_unix_secs());
+    let lease = match coordinator
+        .try_acquire(&name, &tick_key, coordination)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
+            return;
+        }
+    };
+    state
+        .task_registry
+        .record_leader(&name, lease.leader_id(), &tick_key);
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "cron").await {
+    match execute_task_result_with_lease_ttl(&state, handler, start, &name, "cron", lease_ttl).await
+    {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -2259,24 +2415,44 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
             );
         }
     }
+
+    if let Err(error) = lease.release().await {
+        tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to release cron task lease");
+    }
+}
+
+struct CronTaskSpec {
+    name: String,
+    expression: String,
+    timezone: Option<String>,
+    coordination: crate::task::TaskCoordination,
+    handler: crate::task::TaskHandler,
 }
 
 async fn register_cron_task(
     sched: &tokio_cron_scheduler::JobScheduler,
-    name: String,
-    expression: String,
-    timezone: Option<String>,
-    handler: crate::task::TaskHandler,
+    task: CronTaskSpec,
     state: AppState,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
+    let CronTaskSpec {
+        name,
+        expression,
+        timezone,
+        coordination,
+        handler,
+    } = task;
     let state_clone = state.clone();
     let name_clone = name.clone();
+    let coordinator_clone = Arc::clone(&coordinator);
 
     let job_result = build_cron_job(&expression, timezone.as_deref(), move |_uuid, _lock| {
         let state = state_clone.clone();
         let name = name_clone.clone();
+        let coordinator = Arc::clone(&coordinator_clone);
         Box::pin(async move {
-            execute_cron_task(name, state, handler).await;
+            execute_cron_task(name, state, handler, coordination, coordinator, lease_ttl).await;
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     });
 
@@ -2293,8 +2469,10 @@ async fn register_cron_task(
 }
 
 async fn setup_cron_scheduler(
-    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
+    tasks: Vec<CronTaskSpec>,
     state: AppState,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) -> Option<tokio_cron_scheduler::JobScheduler> {
     use tokio_cron_scheduler::JobScheduler;
 
@@ -2306,8 +2484,15 @@ async fn setup_cron_scheduler(
         }
     };
 
-    for (name, expression, timezone, handler) in tasks {
-        register_cron_task(&sched, name, expression, timezone, handler, state.clone()).await;
+    for task in tasks {
+        register_cron_task(
+            &sched,
+            task,
+            state.clone(),
+            Arc::clone(&coordinator),
+            lease_ttl,
+        )
+        .await;
     }
 
     if let Err(e) = sched.start().await {
@@ -2322,11 +2507,13 @@ async fn setup_cron_scheduler(
 /// `shutdown` token is cancelled.
 #[allow(clippy::cognitive_complexity)]
 async fn run_cron_scheduler(
-    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
+    tasks: Vec<CronTaskSpec>,
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
-    let Some(mut sched) = setup_cron_scheduler(tasks, state).await else {
+    let Some(mut sched) = setup_cron_scheduler(tasks, state, coordinator, lease_ttl).await else {
         return;
     };
 
@@ -3573,6 +3760,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     /// Helper to build a test router with default config and no database.
@@ -5041,6 +5229,7 @@ mod tests {
         let tasks = vec![crate::task::TaskInfo {
             name: "cleanup".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(300)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
@@ -5055,6 +5244,7 @@ mod tests {
                 expression: "0 0 * * *".into(),
                 timezone: None,
             },
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
@@ -5201,6 +5391,7 @@ mod tests {
         let tasks = vec![crate::task::TaskInfo {
             name: "cleanup".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let config = AutumnConfig::default();
@@ -5245,6 +5436,7 @@ mod tests {
             name: "test_broadcaster".into(),
             // 1ms delay so it fires immediately
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         };
 
@@ -5308,6 +5500,7 @@ mod tests {
         let task = crate::task::TaskInfo {
             name: "test_failing_task".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| {
                 Box::pin(async { Err(crate::AutumnError::bad_request_msg("forced error")) })
             },
@@ -5360,6 +5553,118 @@ mod tests {
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("test error"));
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_records_lease_ttl_timeout() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "slow_task",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "in_process",
+            "replica-a",
+        );
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(())
+            })
+        };
+        let coordinator = std::sync::Arc::new(
+            crate::scheduler::InProcessSchedulerCoordinator::new("replica-a"),
+        );
+
+        super::execute_fixed_delay_task(
+            "slow_task".to_owned(),
+            state.clone(),
+            handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["slow_task"];
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.last_result.as_deref(), Some("failed"));
+        assert_eq!(status.total_runs, 1);
+        assert_eq!(status.total_failures, 1);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("lease TTL"))
+        );
+    }
+
+    static SKIPPED_LEASE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DenyingSchedulerCoordinator;
+
+    impl crate::scheduler::SchedulerCoordinator for DenyingSchedulerCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+
+        fn replica_id(&self) -> &str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    fn counted_scheduled_handler(
+        _state: AppState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send>> {
+        Box::pin(async {
+            SKIPPED_LEASE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_skips_handler_when_lease_is_not_acquired() {
+        SKIPPED_LEASE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "claimed_elsewhere",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let coordinator = std::sync::Arc::new(DenyingSchedulerCoordinator);
+
+        super::execute_fixed_delay_task(
+            "claimed_elsewhere".to_owned(),
+            state.clone(),
+            counted_scheduled_handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["claimed_elsewhere"];
+        assert_eq!(SKIPPED_LEASE_HANDLER_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(status.total_runs, 0);
+        assert!(status.current_leader.is_none());
+        assert!(status.last_tick.is_none());
     }
 
     #[cfg(feature = "storage")]
