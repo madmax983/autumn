@@ -692,11 +692,12 @@ impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
 }
 
 /// Real-time channel backend selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelBackend {
     /// In-process Tokio broadcast channels. Default, zero config.
     #[serde(alias = "local", alias = "memory")]
+    #[default]
     InProcess,
     /// Redis pub/sub fan-out across application replicas.
     Redis,
@@ -711,12 +712,6 @@ impl ChannelBackend {
             "redis" => Some(Self::Redis),
             _ => None,
         }
-    }
-}
-
-impl Default for ChannelBackend {
-    fn default() -> Self {
-        Self::InProcess
     }
 }
 

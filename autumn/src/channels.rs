@@ -125,9 +125,9 @@ struct ChannelMetrics {
 
 #[derive(Clone, Default)]
 struct ChannelMetricCounters {
-    lifetime_publish_count: u64,
-    dropped_count: u64,
-    lagged_count: u64,
+    publishes: u64,
+    drops: u64,
+    lags: u64,
 }
 
 impl ChannelMetrics {
@@ -139,19 +139,22 @@ impl ChannelMetrics {
     fn record_publish(&self, topic: &str) {
         let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
         let stats = counters.entry(topic.to_owned()).or_default();
-        stats.lifetime_publish_count = stats.lifetime_publish_count.saturating_add(1);
+        stats.publishes = stats.publishes.saturating_add(1);
+        drop(counters);
     }
 
     fn record_dropped(&self, topic: &str, count: u64) {
         let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
         let stats = counters.entry(topic.to_owned()).or_default();
-        stats.dropped_count = stats.dropped_count.saturating_add(count);
+        stats.drops = stats.drops.saturating_add(count);
+        drop(counters);
     }
 
     fn record_lagged(&self, topic: &str, count: u64) {
         let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
         let stats = counters.entry(topic.to_owned()).or_default();
-        stats.lagged_count = stats.lagged_count.saturating_add(count);
+        stats.lags = stats.lags.saturating_add(count);
+        drop(counters);
     }
 
     fn topics(&self) -> HashSet<String> {
@@ -166,11 +169,12 @@ impl ChannelMetrics {
     fn snapshot_for(&self, topic: &str, subscriber_count: usize) -> ChannelStats {
         let counters = self.counters.lock().expect("channel metrics lock poisoned");
         let stats = counters.get(topic).cloned().unwrap_or_default();
+        drop(counters);
         ChannelStats {
             subscriber_count,
-            lifetime_publish_count: stats.lifetime_publish_count,
-            dropped_count: stats.dropped_count,
-            lagged_count: stats.lagged_count,
+            lifetime_publish_count: stats.publishes,
+            dropped_count: stats.drops,
+            lagged_count: stats.lags,
         }
     }
 }
@@ -249,7 +253,7 @@ pub struct Broadcast {
 impl Broadcast {
     /// Create a broadcast facade from a channel registry.
     #[must_use]
-    pub fn new(channels: Channels) -> Self {
+    pub const fn new(channels: Channels) -> Self {
         Self { channels }
     }
 
@@ -290,7 +294,7 @@ impl Broadcast {
     /// let channels = Channels::new(16);
     /// channels
     ///     .broadcast()
-    ///     .publish_html("feed", html! { div id="notice" { "Saved" } })
+    ///     .publish_html("feed", &html! { div id="notice" { "Saved" } })
     ///     .expect("html publish should succeed");
     /// ```
     ///
@@ -302,14 +306,14 @@ impl Broadcast {
     pub fn publish_html(
         &self,
         topic: &str,
-        fragment: maud::Markup,
+        fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
         self.publish(topic, htmx_oob_envelope(fragment))
     }
 }
 
 #[cfg(feature = "maud")]
-fn htmx_oob_envelope(fragment: maud::Markup) -> String {
+fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
     maud::html! {
         template hx-swap-oob="true" {
             (fragment)
@@ -323,7 +327,7 @@ fn htmx_oob_envelope(fragment: maud::Markup) -> String {
 pub struct Sender {
     topic: String,
     backend: Arc<dyn ChannelsBackend>,
-    _keepalive: Arc<broadcast::Sender<ChannelMessage>>,
+    keepalive: Arc<broadcast::Sender<ChannelMessage>>,
 }
 
 impl Sender {
@@ -342,7 +346,7 @@ impl Sender {
     /// Returns the current number of active subscribers.
     #[must_use]
     pub fn receiver_count(&self) -> usize {
-        self._keepalive.receiver_count()
+        self.keepalive.receiver_count()
     }
 }
 
@@ -475,16 +479,21 @@ impl ChannelsBackend for LocalChannelsBackend {
     }
 
     fn snapshot(&self) -> HashMap<String, ChannelStats> {
-        let registry = self.inner.registry.lock().expect("channels lock poisoned");
+        let subscriber_counts: HashMap<String, usize> = {
+            let registry = self.inner.registry.lock().expect("channels lock poisoned");
+            registry
+                .iter()
+                .map(|(topic, sender)| (topic.clone(), sender.receiver_count()))
+                .collect()
+        };
+
         let mut topics = self.inner.metrics.topics();
-        topics.extend(registry.keys().cloned());
+        topics.extend(subscriber_counts.keys().cloned());
 
         topics
             .into_iter()
             .map(|topic| {
-                let subscriber_count = registry
-                    .get(&topic)
-                    .map_or(0, |sender| sender.receiver_count());
+                let subscriber_count = subscriber_counts.get(&topic).copied().unwrap_or(0);
                 let stats = self.inner.metrics.snapshot_for(&topic, subscriber_count);
                 (topic, stats)
             })
@@ -806,7 +815,7 @@ impl Channels {
         Sender {
             topic: name.to_owned(),
             backend: Arc::clone(&self.backend),
-            _keepalive: keepalive,
+            keepalive,
         }
     }
 
@@ -999,7 +1008,7 @@ mod tests {
         let sent = broadcast
             .publish_html(
                 "feed",
-                maud::html! {
+                &maud::html! {
                     li id="item-1" { "one" }
                 },
             )

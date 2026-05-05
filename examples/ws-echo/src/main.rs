@@ -141,7 +141,7 @@ async fn create_item(
 
     state
         .broadcast()
-        .publish_html("lobby-html", list_insert_fragment(id, body))?;
+        .publish_html("lobby-html", &list_insert_fragment(id, body))?;
     Ok("sent")
 }
 
@@ -151,7 +151,7 @@ async fn notify(State(state): State<AppState>) -> AutumnResult<&'static str> {
     let id = NEXT_ITEM_ID.fetch_add(1, Ordering::Relaxed);
     state.broadcast().publish_html(
         "lobby-html",
-        list_insert_fragment(id, "Broadcast from /notify"),
+        &list_insert_fragment(id, "Broadcast from /notify"),
     )?;
     Ok("sent")
 }

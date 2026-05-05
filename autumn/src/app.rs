@@ -216,7 +216,7 @@ pub struct AppBuilder {
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     /// Custom channel backend (tier-1 subsystem replacement). When `Some`,
-    /// AppState skips config-driven `in_process`/`redis` channel selection.
+    /// `AppState` skips config-driven `in_process`/`redis` channel selection.
     #[cfg(feature = "ws")]
     channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
@@ -1528,7 +1528,10 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
+            #[cfg(feature = "openapi")]
             scoped_groups,
+            #[cfg(not(feature = "openapi"))]
+                scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,

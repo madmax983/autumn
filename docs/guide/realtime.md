@@ -25,7 +25,7 @@ use autumn_web::prelude::*;
 async fn complete(state: AppState, Path(id): Path<i64>) -> AutumnResult<&'static str> {
     state.broadcast().publish_html(
         "tasks",
-        html! {
+        &html! {
             li id={ "task-" (id) } class="done" { "complete" }
         },
     )?;
