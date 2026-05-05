@@ -1,0 +1,399 @@
+//! Redis-backed shared cache for Autumn applications.
+//!
+//! This crate provides [`RedisCache`], an implementation of the
+//! `autumn_web::cache::Cache` trait backed by Redis, plus
+//! [`RedisCachePlugin`] which wires it into the app via the plugin system.
+//!
+//! # Usage
+//!
+//! ```toml
+//! # autumn.toml
+//! [cache]
+//! backend = "redis"
+//!
+//! [cache.redis]
+//! url = "redis://redis:6379"
+//! key_prefix = "myapp:cache"
+//! ```
+//!
+//! ```rust,ignore
+//! use autumn_cache_redis::RedisCachePlugin;
+//!
+//! autumn_web::app()
+//!     .plugin(RedisCachePlugin::new())
+//!     .routes(routes![...])
+//!     .run()
+//!     .await;
+//! ```
+//!
+//! Values are serialized as JSON so they survive across replicas and restarts.
+//! Invalidation on replica A is immediately visible on replica B — no TTL lag.
+//!
+//! Use [`autumn_web::cache::insert_cached`] / [`autumn_web::cache::get_cached`]
+//! (which the `#[cached]` macro generates) to read and write values that are
+//! `serde::Serialize + serde::Deserialize`. The plain [`autumn_web::cache::insert`]
+//! / [`autumn_web::cache::get`] functions work only for in-process backends.
+
+use std::any::Any;
+use std::sync::Arc;
+
+use autumn_web::cache::{Cache, RawCacheBytes};
+use redis::AsyncCommands as _;
+use redis::aio::ConnectionManager;
+use thiserror::Error;
+use tracing::debug;
+
+/// Errors that can occur when constructing or using a [`RedisCache`].
+#[derive(Debug, Error)]
+pub enum RedisCacheError {
+    #[error("Redis connection error: {0}")]
+    Connection(#[from] redis::RedisError),
+    #[error("missing Redis URL in cache config")]
+    MissingUrl,
+}
+
+/// A [`Cache`] implementation backed by Redis.
+///
+/// Values are stored as JSON blobs. Multiple replicas share the same Redis
+/// namespace so writes on replica A are immediately visible on replica B, and
+/// invalidations propagate within a single round-trip.
+///
+/// Use [`autumn_web::cache::insert_cached`] and [`autumn_web::cache::get_cached`]
+/// (or equivalently the `#[cached]` macro) to store and retrieve values — both
+/// functions handle JSON serialization transparently. The plain
+/// `autumn_web::cache::insert` / `get` functions perform only in-memory
+/// downcasts and will miss on cross-replica reads.
+///
+/// # Runtime requirement
+///
+/// `RedisCache` bridges the synchronous [`Cache`] trait to async Redis
+/// operations via [`tokio::task::block_in_place`]. This requires a
+/// **multi-thread** Tokio runtime. Using `RedisCache` from a single-thread
+/// runtime (e.g. the default `#[tokio::test]` flavor) will panic. In tests,
+/// use `#[tokio::test(flavor = "multi_thread")]`.
+#[derive(Clone)]
+pub struct RedisCache {
+    manager: ConnectionManager,
+    key_prefix: String,
+}
+
+impl RedisCache {
+    /// Connect using an explicit URL and key prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedisCacheError::Connection`] if the initial connection fails.
+    pub async fn connect(
+        url: &str,
+        key_prefix: impl Into<String>,
+    ) -> Result<Self, RedisCacheError> {
+        let client = redis::Client::open(url)?;
+        let manager = ConnectionManager::new(client).await?;
+        Ok(Self {
+            manager,
+            key_prefix: key_prefix.into(),
+        })
+    }
+
+    /// Build a `RedisCache` from the `[cache]` section of `autumn.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RedisCacheError::MissingUrl`] if `cache.redis.url` is absent.
+    /// Returns [`RedisCacheError::Connection`] on connection failure.
+    pub async fn from_config(
+        config: &autumn_web::config::CacheRedisConfig,
+    ) -> Result<Self, RedisCacheError> {
+        let url = config.url.as_deref().ok_or(RedisCacheError::MissingUrl)?;
+        Self::connect(url, &config.key_prefix).await
+    }
+
+    fn prefixed(&self, key: &str) -> String {
+        format!("{}:{}", self.key_prefix, key)
+    }
+
+    fn redis_get(&self, key: &str) -> Option<Vec<u8>> {
+        let prefixed = self.prefixed(key);
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async move { conn.get(&prefixed).await.ok().flatten() })
+        })
+    }
+
+    fn redis_set(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        let prefixed = self.prefixed(key);
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                if let Some(ttl) = ttl {
+                    // Round sub-second TTLs up to 1 s to avoid a zero-second expiry.
+                    let secs = ttl.as_secs().max(1);
+                    let _: Result<(), _> = conn.set_ex(&prefixed, bytes, secs).await;
+                } else {
+                    let _: Result<(), _> = conn.set(&prefixed, bytes).await;
+                }
+            });
+        });
+    }
+}
+
+impl Cache for RedisCache {
+    /// Retrieves a value from Redis and returns it as [`RawCacheBytes`].
+    ///
+    /// Callers using [`autumn_web::cache::get_cached`] (which the `#[cached]`
+    /// macro generates) will have the bytes automatically deserialized into the
+    /// concrete return type `V` via `serde_json`. Direct callers that need the
+    /// concrete type should also use `get_cached` rather than `get_value`.
+    fn get_value(&self, key: &str) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.redis_get(key)
+            .map(|bytes| Arc::new(RawCacheBytes(bytes)) as Arc<dyn Any + Send + Sync>)
+    }
+
+    /// Stores a value in Redis by serializing the most common primitive types.
+    ///
+    /// For arbitrary serde types — including structs and collections — use
+    /// [`insert_raw_bytes`] (called automatically by
+    /// [`autumn_web::cache::insert_cached`]) instead. Unknown types are
+    /// silently skipped here because [`insert_cached`] will have already
+    /// written the serialized form via [`insert_raw_bytes`].
+    ///
+    /// [`insert_raw_bytes`]: Cache::insert_raw_bytes
+    fn insert_value(&self, key: &str, value: Arc<dyn Any + Send + Sync>) {
+        // Only handle RawCacheBytes round-trips and the primitive types used by
+        // direct `cache::insert` callers. Serde types arrive via insert_raw_bytes.
+        let bytes: Option<Vec<u8>> = value
+            .downcast_ref::<RawCacheBytes>()
+            .map(|raw| raw.0.clone())
+            .or_else(|| {
+                value
+                    .downcast_ref::<String>()
+                    .and_then(|s| serde_json::to_vec(s).ok())
+            })
+            .or_else(|| {
+                value
+                    .downcast_ref::<i64>()
+                    .and_then(|n| serde_json::to_vec(n).ok())
+            })
+            .or_else(|| {
+                value
+                    .downcast_ref::<i32>()
+                    .and_then(|n| serde_json::to_vec(n).ok())
+            });
+
+        if let Some(bytes) = bytes {
+            // insert_value has no TTL context; use no-expiry SET for these callers.
+            self.redis_set(key, bytes, None);
+            debug!(key, "RedisCache: inserted via insert_value");
+        }
+    }
+
+    /// Stores pre-serialized JSON bytes in Redis, applying the TTL when provided.
+    ///
+    /// This is the primary write path for `#[cached]`-annotated functions (via
+    /// [`autumn_web::cache::insert_cached`]). It handles all `serde::Serialize`
+    /// types, including structs and collections that `insert_value` cannot
+    /// serialize from an erased `Arc<dyn Any>`.
+    ///
+    /// When `ttl` is `Some`, the entry is stored with `SET EX` so Redis expires
+    /// it automatically — matching the TTL declared on `#[cached(ttl = "…")]`.
+    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        self.redis_set(key, bytes, ttl);
+        debug!(key, "RedisCache: inserted via insert_raw_bytes");
+    }
+
+    fn invalidate(&self, key: &str) {
+        let prefixed = self.prefixed(key);
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let _: Result<(), _> = conn.del(&prefixed).await;
+            });
+        });
+        debug!(key, "RedisCache: invalidated");
+    }
+
+    fn clear(&self) {
+        // Use SCAN instead of KEYS to avoid blocking the Redis server on large
+        // keyspaces. SCAN is O(1) per call and processes the keyspace in batches.
+        let pattern = format!("{}:*", self.key_prefix);
+        let mut conn = self.manager.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut cursor: u64 = 0;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(100u32)
+                        .query_async(&mut conn)
+                        .await
+                        .unwrap_or((0, vec![]));
+                    if !keys.is_empty() {
+                        let _: Result<(), _> = conn.del(keys).await;
+                    }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+            });
+        });
+    }
+}
+
+// ── Plugin ────────────────────────────────────────────────────────────────────
+
+/// Autumn plugin that wires `RedisCache` as the global application cache.
+///
+/// Reads `[cache.redis]` from the active `AutumnConfig` and installs a
+/// `RedisCache` into `AppState` via `with_cache_backend`.
+///
+/// When `cache.backend != "redis"` the plugin is a no-op and the default
+/// per-function Moka caches continue to work.
+pub struct RedisCachePlugin;
+
+impl RedisCachePlugin {
+    /// Create the plugin.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for RedisCachePlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl autumn_web::plugin::Plugin for RedisCachePlugin {
+    fn build(self, app: autumn_web::app::AppBuilder) -> autumn_web::app::AppBuilder {
+        app.on_startup(|state| async move {
+            // Read the config the framework already stored as an extension.
+            let config = state
+                .extension::<autumn_web::config::AutumnConfig>()
+                .expect("AutumnConfig must be registered before RedisCachePlugin startup");
+
+            if !config.cache.is_redis() {
+                return Ok(());
+            }
+
+            let redis_cfg = &config.cache.redis;
+            let cache = RedisCache::from_config(redis_cfg).await.map_err(|e| {
+                autumn_web::AutumnError::service_unavailable_msg(format!(
+                    "Failed to connect RedisCache: {e}"
+                ))
+            })?;
+
+            state.set_cache(Arc::new(cache));
+            tracing::info!("RedisCache registered as global application cache");
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_web::cache::{get_cached, insert_cached};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::redis::Redis as RedisImage;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_cache_insert_get_invalidate() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        let cache = RedisCache::connect(&url, "test").await.unwrap();
+
+        // insert_cached serializes via serde_json and stores via insert_raw_bytes
+        insert_cached(&cache, "hello", "world".to_string(), None);
+
+        // get_value returns RawCacheBytes wrapping the JSON
+        let raw = cache.get_value("hello").expect("should be present");
+        let raw_bytes = raw.downcast_ref::<RawCacheBytes>().expect("RawCacheBytes");
+        let v: serde_json::Value = serde_json::from_slice(&raw_bytes.0).unwrap();
+        assert_eq!(v, serde_json::json!("world"));
+
+        // get_cached deserializes back to the concrete type
+        let s: Option<String> = get_cached(&cache, "hello");
+        assert_eq!(s.as_deref(), Some("world"));
+
+        // Invalidate
+        autumn_web::cache::Cache::invalidate(&cache, "hello");
+        assert!(cache.get_value("hello").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_cache_cross_replica_invalidation() {
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        // Two "replicas" sharing the same Redis
+        let replica_a = RedisCache::connect(&url, "xreplica").await.unwrap();
+        let replica_b = RedisCache::connect(&url, "xreplica").await.unwrap();
+
+        // A writes via insert_cached (the path used by #[cached])
+        let start = std::time::Instant::now();
+        insert_cached(&replica_a, "key", "value".to_string(), None);
+
+        // B can read it via get_cached and gets the correctly-typed value
+        let seen: Option<String> = get_cached(&replica_b, "key");
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            seen.as_deref(),
+            Some("value"),
+            "replica B must read the value written by replica A"
+        );
+
+        // A invalidates
+        autumn_web::cache::Cache::invalidate(&replica_a, "key");
+
+        // B no longer sees it (within one round-trip = < 50 ms p99)
+        let gone: Option<String> = get_cached(&replica_b, "key");
+        assert!(gone.is_none());
+        assert!(
+            elapsed.as_millis() < 50,
+            "cross-replica lag {elapsed:?} exceeded 50 ms"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_cache_serde_struct_round_trip() {
+        #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct Item {
+            id: i32,
+            name: String,
+        }
+
+        let container = RedisImage::default().start().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://127.0.0.1:{port}");
+
+        let cache_a = RedisCache::connect(&url, "structs").await.unwrap();
+        let cache_b = RedisCache::connect(&url, "structs").await.unwrap();
+
+        let item = Item {
+            id: 1,
+            name: "widget".into(),
+        };
+        insert_cached(&cache_a, "item:1", item.clone(), None);
+
+        // Same replica
+        let retrieved: Option<Item> = get_cached(&cache_a, "item:1");
+        assert_eq!(retrieved, Some(item.clone()));
+
+        // Cross-replica
+        let from_b: Option<Item> = get_cached(&cache_b, "item:1");
+        assert_eq!(from_b, Some(item));
+    }
+}

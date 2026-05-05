@@ -64,6 +64,9 @@
 //! | `AUTUMN_CORS__ALLOWED_HEADERS` | `cors.allowed_headers` | comma-separated `String` |
 //! | `AUTUMN_CORS__ALLOW_CREDENTIALS` | `cors.allow_credentials` | `bool` |
 //! | `AUTUMN_CORS__MAX_AGE_SECS` | `cors.max_age_secs` | `u64` |
+//! | `AUTUMN_CACHE__BACKEND` | `cache.backend` | `memory` / `redis` |
+//! | `AUTUMN_CACHE__REDIS__URL` | `cache.redis.url` | `String` |
+//! | `AUTUMN_CACHE__REDIS__KEY_PREFIX` | `cache.redis.key_prefix` | `String` |
 //! | `AUTUMN_SESSION__BACKEND` | `session.backend` | `memory` / `redis` |
 //! | `AUTUMN_SESSION__COOKIE_NAME` | `session.cookie_name` | `String` |
 //! | `AUTUMN_SESSION__MAX_AGE_SECS` | `session.max_age_secs` | `u64` |
@@ -640,6 +643,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub session: crate::session::SessionConfig,
 
+    /// Cache backend settings.
+    #[serde(default)]
+    pub cache: CacheConfig,
+
     /// Real-time channel backend settings.
     #[serde(default)]
     pub channels: ChannelConfig,
@@ -773,6 +780,94 @@ const fn default_channel_capacity() -> usize {
 
 fn default_channels_redis_prefix() -> String {
     "autumn:channels".to_owned()
+}
+
+// ── Cache configuration ──────────────────────────────────────────────────────
+
+/// Cache backend selection for `#[cached]` and `CacheResponseLayer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum CacheBackend {
+    /// In-process Moka cache (default). Each replica has an independent store.
+    #[default]
+    Memory,
+    /// Shared Redis cache. Invalidations propagate across all replicas.
+    Redis,
+}
+
+impl CacheBackend {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+/// Configuration for the shared application cache.
+///
+/// Placed in `autumn.toml` under `[cache]`.
+///
+/// # Examples
+///
+/// ```toml
+/// [cache]
+/// backend = "redis"
+///
+/// [cache.redis]
+/// url = "redis://redis:6379"
+/// key_prefix = "myapp:cache"
+/// ```
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct CacheConfig {
+    /// Active cache backend.
+    #[serde(default)]
+    pub backend: CacheBackend,
+
+    /// Redis backend options.
+    #[serde(default)]
+    pub redis: CacheRedisConfig,
+}
+
+impl CacheConfig {
+    /// Returns `true` when the memory (Moka) backend is selected.
+    #[must_use]
+    pub fn is_memory(&self) -> bool {
+        self.backend == CacheBackend::Memory
+    }
+
+    /// Returns `true` when the Redis backend is selected.
+    #[must_use]
+    pub fn is_redis(&self) -> bool {
+        self.backend == CacheBackend::Redis
+    }
+}
+
+/// Redis cache backend configuration.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CacheRedisConfig {
+    /// Redis connection URL (e.g. `redis://127.0.0.1:6379`).
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Prefix for all cache keys stored in Redis.
+    #[serde(default = "default_cache_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for CacheRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_cache_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_cache_redis_key_prefix() -> String {
+    "autumn:cache".to_owned()
 }
 
 /// Scheduled task coordination backend selection.
@@ -1183,6 +1278,7 @@ impl AutumnConfig {
         self.apply_health_env_overrides_with_env(env);
         self.apply_cors_env_overrides_with_env(env);
         self.apply_session_env_overrides_with_env(env);
+        self.apply_cache_env_overrides_with_env(env);
         self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_scheduler_env_overrides_with_env(env);
@@ -1374,6 +1470,24 @@ impl AutumnConfig {
             env,
             "AUTUMN_SESSION__REDIS__KEY_PREFIX",
             &mut self.session.redis.key_prefix,
+        );
+    }
+
+    fn apply_cache_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_CACHE__BACKEND") {
+            match CacheBackend::from_env_value(&val) {
+                Some(backend) => self.cache.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_CACHE__BACKEND={val:?} is not valid \
+                     (expected memory or redis), ignoring"
+                ),
+            }
+        }
+        parse_env_option_string(env, "AUTUMN_CACHE__REDIS__URL", &mut self.cache.redis.url);
+        parse_env_string(
+            env,
+            "AUTUMN_CACHE__REDIS__KEY_PREFIX",
+            &mut self.cache.redis.key_prefix,
         );
     }
 
@@ -4086,5 +4200,72 @@ path = "/api-spec.json"
             config.openapi_runtime.path, "/api-spec.json",
             "[openapi] path must deserialize correctly"
         );
+    }
+
+    #[test]
+    fn cache_env_overrides_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CACHE__BACKEND", "redis")
+            .with("AUTUMN_CACHE__REDIS__URL", "redis://cache:6379/1")
+            .with("AUTUMN_CACHE__REDIS__KEY_PREFIX", "myapp:cache");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.cache.is_redis(), "backend should be redis");
+        assert_eq!(
+            config.cache.redis.url.as_deref(),
+            Some("redis://cache:6379/1")
+        );
+        assert_eq!(config.cache.redis.key_prefix, "myapp:cache");
+    }
+
+    #[test]
+    fn cache_backend_from_env_value_invalid_is_none() {
+        assert!(CacheBackend::from_env_value("postgres").is_none());
+        assert!(CacheBackend::from_env_value("").is_none());
+    }
+
+    #[test]
+    fn scheduler_validate_rejects_zero_lease_ttl() {
+        let cfg = SchedulerConfig {
+            lease_ttl_secs: 0,
+            ..SchedulerConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "zero lease_ttl_secs must fail");
+    }
+
+    #[test]
+    fn scheduler_validate_rejects_empty_key_prefix() {
+        let cfg = SchedulerConfig {
+            key_prefix: "   ".to_owned(),
+            ..SchedulerConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "blank key_prefix must fail");
+    }
+
+    #[test]
+    fn scheduler_validate_ok_with_defaults() {
+        assert!(SchedulerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_resolved_replica_id_uses_explicit_value() {
+        let cfg = SchedulerConfig {
+            replica_id: Some("my-pod".to_owned()),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(cfg.resolved_replica_id(), "my-pod");
+    }
+
+    #[test]
+    fn scheduler_resolved_replica_id_falls_back_to_pid() {
+        let cfg = SchedulerConfig {
+            replica_id: None,
+            ..SchedulerConfig::default()
+        };
+        // In CI, FLY_MACHINE_ID and HOSTNAME may or may not be set,
+        // so just verify we get a non-empty string back.
+        assert!(!cfg.resolved_replica_id().is_empty());
     }
 }

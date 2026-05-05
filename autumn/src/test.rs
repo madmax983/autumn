@@ -333,8 +333,15 @@ impl TestApp {
     /// This constructs the full Axum router with all middleware applied,
     /// identical to what `AppBuilder::run()` produces -- without binding
     /// a TCP listener.
+    ///
+    /// The process-level global cache is cleared unconditionally so that
+    /// `#[cached]` functions inside this test app always use their
+    /// per-function Moka stores and do not accidentally inherit a Redis or
+    /// other shared backend installed by a previous test.
     #[must_use]
     pub fn build(self) -> TestClient {
+        // Reset the global cache to prevent cross-test contamination.
+        crate::cache::clear_global_cache();
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
@@ -359,6 +366,7 @@ impl TestApp {
                 .forbidden_response_override
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
+            shared_cache: None,
         };
 
         for register in self.policy_registrations {

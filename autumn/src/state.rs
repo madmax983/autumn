@@ -13,6 +13,12 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cache::Cache;
+
+/// Newtype wrapper used to store the global cache in the extension map so that
+/// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
+pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
+
 use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
@@ -110,6 +116,10 @@ pub struct AppState {
     /// [`PolicyContext`](crate::authorization::PolicyContext).
     /// Mirrors `[auth] session_key` (default: `"user_id"`).
     pub(crate) auth_session_key: String,
+
+    /// Shared application cache backend. `None` means no global cache has been
+    /// registered; `#[cached]` will fall back to its per-function Moka store.
+    pub(crate) shared_cache: Option<Arc<dyn Cache>>,
 }
 
 impl AppState {
@@ -227,6 +237,35 @@ impl AppState {
     {
         self.insert_extension(value);
         self
+    }
+
+    /// Returns the registered global cache backend, if any.
+    ///
+    /// Checks the extension map first (populated at runtime by startup hooks
+    /// via [`Self::set_cache`]) so that a plugin replacing a build-time backend
+    /// is always visible. Falls back to `shared_cache` (set at build time via
+    /// [`Self::with_cache`]).
+    #[must_use]
+    pub fn cache(&self) -> Option<Arc<dyn Cache>> {
+        self.extension::<GlobalCacheEntry>()
+            .map(|e| e.0.clone())
+            .or_else(|| self.shared_cache.clone())
+    }
+
+    /// Register a global cache backend (builder / test helper, build-time).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+        self.shared_cache = Some(cache);
+        self
+    }
+
+    /// Install or replace the global cache backend at runtime (e.g. from a startup hook).
+    ///
+    /// Updates both the process-level global (used by `#[cached]` functions) and
+    /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
+    pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        crate::cache::set_global_cache(cache.clone());
+        self.insert_extension(GlobalCacheEntry(cache));
     }
 
     /// Sets the active profile.
@@ -407,6 +446,7 @@ impl AppState {
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         }
     }
 

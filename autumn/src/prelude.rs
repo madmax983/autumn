@@ -181,6 +181,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -203,6 +204,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let _err: AutumnResult<()> = Ok(());
     }

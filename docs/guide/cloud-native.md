@@ -178,6 +178,53 @@ deployment after it succeeds.
 
 The distributed bookmarks example uses this shape explicitly.
 
+## Shared Cache
+
+In-process Moka caches are the zero-config default and are perfect for
+local development. Each replica holds its own independent store, so:
+
+- `#[cached]` may return stale data depending on which replica answers.
+- `CacheResponseLayer` invalidations on one pod are invisible to peers.
+
+For multi-replica production deployments, enable the Redis backend via
+`autumn-cache-redis`:
+
+```toml
+# autumn.toml
+[cache]
+backend = "redis"
+
+[cache.redis]
+url = "redis://redis:6379"
+key_prefix = "myapp:cache"
+```
+
+```rust
+// main.rs
+use autumn_cache_redis::RedisCachePlugin;
+
+autumn_web::app()
+    .plugin(RedisCachePlugin::new())
+    .routes(routes![...])
+    .run()
+    .await;
+```
+
+`autumn-cache-redis` requires the `autumn-cache-redis` crate:
+
+```toml
+# Cargo.toml
+[dependencies]
+autumn-cache-redis = "0.3"
+```
+
+`CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the
+configured Redis backend when one has been registered, or `None` when running
+with the default per-function Moka caches.
+
+The `memory` default produces a startup warning in the `prod` profile — the
+same pattern as sessions and file storage.
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -185,6 +232,7 @@ Before calling an Autumn app "cloud ready", verify:
 - probes target `/live`, `/ready`, and `/startup`
 - logs or traces land in your collector
 - sessions are externalized if replicas > 1
+- cache uses the Redis backend if replicas > 1
 - file uploads use the `S3` blob store if replicas > 1
 - mail uses SMTP, not log/file transport
 - migrations run before web rollout
