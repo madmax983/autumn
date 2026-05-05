@@ -63,6 +63,14 @@ pub enum RedisCacheError {
 /// functions handle JSON serialization transparently. The plain
 /// `autumn_web::cache::insert` / `get` functions perform only in-memory
 /// downcasts and will miss on cross-replica reads.
+///
+/// # Runtime requirement
+///
+/// `RedisCache` bridges the synchronous [`Cache`] trait to async Redis
+/// operations via [`tokio::task::block_in_place`]. This requires a
+/// **multi-thread** Tokio runtime. Using `RedisCache` from a single-thread
+/// runtime (e.g. the default `#[tokio::test]` flavor) will panic. In tests,
+/// use `#[tokio::test(flavor = "multi_thread")]`.
 #[derive(Clone)]
 pub struct RedisCache {
     manager: ConnectionManager,
