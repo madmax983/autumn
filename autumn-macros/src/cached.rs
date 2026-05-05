@@ -115,9 +115,16 @@ fn generate_cache_body(
         static __AUTUMN_CACHE: ::std::sync::OnceLock<
             ::autumn_web::cache::MokaCache
         > = ::std::sync::OnceLock::new();
-        let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
+        let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
             ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
         });
+        // Use the process-level shared backend when registered, otherwise fall
+        // back to the per-function Moka store so zero-config local dev still works.
+        let __autumn_global = ::autumn_web::cache::global_cache();
+        let __autumn_cache: &dyn ::autumn_web::cache::Cache =
+            __autumn_global
+                .as_deref()
+                .unwrap_or(__autumn_moka as &dyn ::autumn_web::cache::Cache);
         let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
     };
 

@@ -260,9 +260,10 @@ impl AppState {
 
     /// Install or replace the global cache backend at runtime (e.g. from a startup hook).
     ///
-    /// Stores the cache in the shared extension map so that all `AppState` clones
-    /// (including those already given to route handlers) see the update.
+    /// Updates both the process-level global (used by `#[cached]` functions) and
+    /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
     pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        crate::cache::set_global_cache(cache.clone());
         self.insert_extension(GlobalCacheEntry(cache));
     }
 

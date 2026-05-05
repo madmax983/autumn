@@ -1452,6 +1452,7 @@ impl AppBuilder {
             channels_backend,
         );
         if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         }
         // Apply deferred policy / scope registrations onto the live
@@ -1759,6 +1760,7 @@ impl AppBuilder {
             channels_backend,
         );
         if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
         }
         #[cfg(feature = "mail")]

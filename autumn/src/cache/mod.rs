@@ -43,7 +43,60 @@ pub use moka_impl::MokaCache;
 
 use std::any::Any;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+// ── Global cache registry ────────────────────────────────────────────
+
+/// Process-level shared cache backend.
+///
+/// Set once at startup by [`set_global_cache`]; read by every
+/// `#[cached]`-annotated function to decide which store to use.
+static GLOBAL_CACHE: RwLock<Option<Arc<dyn Cache>>> = RwLock::new(None);
+
+/// Register (or replace) the process-level shared cache.
+///
+/// Called automatically by [`crate::app::AppBuilder`] when
+/// `.with_cache_backend(...)` has been used. Also called by
+/// [`crate::state::AppState::set_cache`] when a plugin installs a backend
+/// during the startup-hook phase.
+///
+/// # Panics
+///
+/// Panics if the internal `RwLock` is poisoned.
+pub fn set_global_cache(cache: Arc<dyn Cache>) {
+    *GLOBAL_CACHE
+        .write()
+        .expect("global cache lock poisoned") = Some(cache);
+}
+
+/// Return a clone of the process-level shared cache, if one is registered.
+///
+/// `None` means no global backend has been set and `#[cached]` functions
+/// fall back to their per-function Moka stores.
+///
+/// # Panics
+///
+/// Panics if the internal `RwLock` is poisoned.
+#[must_use]
+pub fn global_cache() -> Option<Arc<dyn Cache>> {
+    GLOBAL_CACHE
+        .read()
+        .expect("global cache lock poisoned")
+        .clone()
+}
+
+/// Remove the process-level shared cache.
+///
+/// Primarily useful in tests that need per-test isolation.
+///
+/// # Panics
+///
+/// Panics if the internal `RwLock` is poisoned.
+pub fn clear_global_cache() {
+    *GLOBAL_CACHE
+        .write()
+        .expect("global cache lock poisoned") = None;
+}
 
 // ── Cache trait ──────────────────────────────────────────────────────
 

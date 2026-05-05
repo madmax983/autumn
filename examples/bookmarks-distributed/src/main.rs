@@ -20,6 +20,7 @@ mod schema;
 mod state;
 mod tasks;
 
+use autumn_cache_redis::RedisCachePlugin;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 use std::sync::Arc;
@@ -52,12 +53,14 @@ async fn main() {
 
     // -- v0.2: .tasks() registers scheduled background tasks -----
     autumn_web::app()
+        .plugin(RedisCachePlugin::new())
         .migrations(MIGRATIONS)
         .routes(routes![
             routes::bookmarks::list,
             routes::bookmarks::by_tag,
             routes::bookmarks::new_form,
             routes::bookmarks::create,
+            repositories::bookmark_api_count,
             repositories::bookmark_api_list,
             repositories::bookmark_api_get,
             repositories::bookmark_api_create,

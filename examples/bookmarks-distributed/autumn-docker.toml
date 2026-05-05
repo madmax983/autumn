@@ -11,3 +11,10 @@ primary_url = "postgres://autumn:autumn@postgres-primary:5432/bookmarks_distribu
 replica_url = "postgres://autumn:autumn@postgres-replica:5432/bookmarks_distributed"
 primary_pool_size = 8
 replica_pool_size = 8
+
+[cache]
+backend = "redis"
+
+[cache.redis]
+url = "redis://redis:6379"
+key_prefix = "bookmarks:cache"
