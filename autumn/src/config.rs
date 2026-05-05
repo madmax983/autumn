@@ -659,9 +659,9 @@ pub struct AutumnConfig {
     #[cfg(feature = "mail")]
     #[serde(default)]
     pub mail: crate::mail::MailConfig,
-    /// OpenAPI spec runtime exposure settings.
+    /// `OpenAPI` spec runtime exposure settings.
     ///
-    /// Controls whether the generated OpenAPI spec is served at runtime
+    /// Controls whether the generated `OpenAPI` spec is served at runtime
     /// and at which path. Use `[openapi] enabled = false` in `autumn.toml`
     /// to suppress the spec endpoint in production.
     #[serde(default, rename = "openapi")]
@@ -683,7 +683,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
     }
 }
 
-/// OpenAPI spec runtime exposure settings.
+/// `OpenAPI` spec runtime exposure settings.
 ///
 /// Populated from the `[openapi]` block in `autumn.toml`. When
 /// `AppBuilder::openapi(...)` is called and `enabled = true`, the framework
@@ -699,7 +699,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct OpenApiRuntimeConfig {
-    /// Whether the OpenAPI spec endpoint is served.
+    /// Whether the `OpenAPI` spec endpoint is served.
     ///
     /// Defaults to `true` so new projects get the spec immediately.
     /// Set to `false` in production profiles to suppress the endpoint.
@@ -721,7 +721,7 @@ impl Default for OpenApiRuntimeConfig {
     }
 }
 
-fn default_openapi_enabled() -> bool {
+const fn default_openapi_enabled() -> bool {
     true
 }
 

@@ -151,37 +151,29 @@ fn type_name_str(ty: &syn::Type) -> String {
     crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// Emit a TokenStream that evaluates (at runtime) to a `serde_json::Value`
+/// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
 /// representing the JSON Schema for the given Rust type.
 ///
 /// Handles `Option<T>` (nullable), primitives (`String`, `i64`, etc.), and
 /// everything else as a `$ref` to a component schema by type name.
 fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
     // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
-    if is_option_type(ty) {
-        if let syn::Type::Path(tp) = ty {
-            if let Some(last) = tp.path.segments.last() {
-                if let syn::PathArguments::AngleBracketed(args) = &last.arguments {
-                    if let Some(syn::GenericArgument::Type(inner)) = args.args.first() {
-                        let inner_tokens = emit_json_schema_tokens(inner);
-                        return quote! {{
-                            let __inner = #inner_tokens;
-                            ::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
-                        }};
-                    }
-                }
-            }
-        }
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __inner = #inner_tokens;
+            ::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+        }};
     }
 
     let name = type_name_str(ty);
-    match crate::api_doc::primitive_json_type(&name) {
-        Some(json_type) => quote! { ::serde_json::json!({ "type": #json_type }) },
-        None => {
+    crate::api_doc::primitive_json_type(&name).map_or_else(
+        || {
             let ref_path = format!("#/components/schemas/{name}");
             quote! { ::serde_json::json!({ "$ref": #ref_path }) }
-        }
-    }
+        },
+        |json_type| quote! { ::serde_json::json!({ "type": #json_type }) },
+    )
 }
 
 /// Emit the body of `OpenApiSchema::schema()` for a list of fields.
@@ -207,7 +199,7 @@ fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
         fields
             .iter()
             .filter(|f| !is_option_type(&f.ty))
-            .filter_map(|f| f.ident.as_ref().map(|id| id.to_string()))
+            .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
             .collect()
     };
 

@@ -464,11 +464,11 @@ pub fn write_openapi_spec_to_dist(
     std::fs::create_dir_all(dist_dir)?;
 
     let json = serde_json::to_string_pretty(spec)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.json"), &json)?;
 
     let yaml = serde_yaml::to_string(spec)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
 
     Ok(())
@@ -692,22 +692,21 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
             // `type: "null"` natively:
             //   * For a `$ref`, use `oneOf: [{$ref: ...}, {type: "null"}]`
             //     so the ref can stand alone without `allOf` workarounds.
-            //   * For primitives, use the type-array form: `type: ["T", "null"]`.
-            if inner.kind == SchemaKind::Ref {
-                serde_json::json!({
-                    "oneOf": [
-                        schema_value_for(inner),
-                        { "type": "null" },
-                    ],
-                })
-            } else {
-                let inner_val = schema_value_for(inner);
-                let base_type = inner_val
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("string")
-                    .to_owned();
-                serde_json::json!({ "type": [base_type, "null"] })
+            //   * For primitives, use the compact type-array form: `type: ["T", "null"]`.
+            //   * For all other schemas (arrays, nested nullable, etc.), use `oneOf`
+            //     so the full inner schema (e.g. `items`) is preserved.
+            match inner.kind {
+                SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
+                    serde_json::json!({
+                        "oneOf": [
+                            schema_value_for(inner),
+                            { "type": "null" },
+                        ],
+                    })
+                }
+                SchemaKind::Primitive(base_type) => {
+                    serde_json::json!({ "type": [base_type, "null"] })
+                }
             }
         }
     }

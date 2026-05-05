@@ -408,7 +408,7 @@ fn unwrap_result_ok(ty: &syn::Type) -> Option<syn::Type> {
 
 /// If `ty` is `Name<Inner>` (single generic argument), return `Inner`.
 /// The outermost segment of `ty`'s path must match `wrapper`.
-fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
+pub fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
     let syn::Type::Path(path) = ty else {
         return None;
     };
@@ -477,7 +477,7 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
 }
 
 /// Map a short Rust primitive name to its JSON-schema `type` keyword.
-pub(crate) fn primitive_json_type(name: &str) -> Option<&'static str> {
+pub fn primitive_json_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "String" | "str" => "string",
         "bool" => "boolean",
@@ -490,7 +490,7 @@ pub(crate) fn primitive_json_type(name: &str) -> Option<&'static str> {
 }
 
 /// Return the final identifier in a type's path (e.g. `foo::Bar` → `"Bar"`).
-pub(crate) fn last_segment_name(ty: &syn::Type) -> Option<String> {
+pub fn last_segment_name(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
         syn::Type::Reference(r) => last_segment_name(&r.elem),
@@ -535,10 +535,10 @@ pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
     // Case 2 — #[secured] was above the route macro and already expanded;
     // detect the injected `__autumn_session` parameter.
     let has_session = input_fn.sig.inputs.iter().any(|param| {
-        if let syn::FnArg::Typed(pt) = param {
-            if let syn::Pat::Ident(pi) = pt.pat.as_ref() {
-                return pi.ident == "__autumn_session";
-            }
+        if let syn::FnArg::Typed(pt) = param
+            && let syn::Pat::Ident(pi) = pt.pat.as_ref()
+        {
+            return pi.ident == "__autumn_session";
         }
         false
     });
@@ -557,7 +557,7 @@ fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
         syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
             .parse2(list.tokens.clone());
     match roles {
-        Ok(r) => r.iter().map(|s| s.value()).collect(),
+        Ok(r) => r.iter().map(syn::LitStr::value).collect(),
         Err(_) => Vec::new(),
     }
 }
