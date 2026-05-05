@@ -25,6 +25,9 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
+#[cfg(feature = "redis")]
+const REDIS_PUBLISH_QUEUE_CAPACITY: usize = 1024;
+
 /// A registry of named broadcast channels.
 #[derive(Clone)]
 pub struct Channels {
@@ -110,7 +113,7 @@ impl std::fmt::Display for ChannelMessage {
 pub struct ChannelStats {
     /// Current active subscriber count.
     pub subscriber_count: usize,
-    /// Successful local publish attempts for this topic over this process lifetime.
+    /// Successful local deliveries for this topic over this process lifetime.
     pub lifetime_publish_count: u64,
     /// Messages dropped because no local receiver accepted them.
     pub dropped_count: u64,
@@ -171,6 +174,9 @@ pub enum ChannelPublishError {
     /// The backend has shut down and can no longer accept publish requests.
     #[error("channel backend is closed")]
     BackendClosed,
+    /// The backend's bounded publish queue is full.
+    #[error("channel backend publish queue is full")]
+    QueueFull,
 }
 
 /// Error returned by the htmx/raw broadcast facade.
@@ -419,8 +425,11 @@ impl LocalChannelsBackend {
     }
 
     fn publish_local(&self, topic: &str, msg: ChannelMessage) -> usize {
-        self.inner.metrics.record_publish(topic);
-        self.send_without_publish_metric(topic, msg)
+        let count = self.send_without_publish_metric(topic, msg);
+        if count > 0 {
+            self.inner.metrics.record_publish(topic);
+        }
+        count
     }
 
     fn send_without_publish_metric(&self, topic: &str, msg: ChannelMessage) -> usize {
@@ -503,7 +512,7 @@ impl ChannelsBackend for LocalChannelsBackend {
 #[derive(Clone)]
 struct RedisChannelsBackend {
     local: LocalChannelsBackend,
-    publisher: tokio::sync::mpsc::UnboundedSender<RedisPublishCommand>,
+    publisher: tokio::sync::mpsc::Sender<RedisPublishCommand>,
     origin_id: String,
     key_prefix: String,
 }
@@ -551,7 +560,7 @@ impl RedisChannelsBackend {
         let client = redis::Client::open(url)
             .map_err(|error| ChannelBackendConfigError::InvalidRedisUrl(error.to_string()))?;
         let local = LocalChannelsBackend::new(config.capacity);
-        let (publisher, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (publisher, receiver) = tokio::sync::mpsc::channel(REDIS_PUBLISH_QUEUE_CAPACITY);
         let origin_id = uuid::Uuid::new_v4().to_string();
         let backend = Self {
             local: local.clone(),
@@ -588,7 +597,7 @@ fn redis_channel_pattern(prefix: &str) -> String {
 #[cfg(feature = "redis")]
 fn spawn_redis_publisher(
     client: redis::Client,
-    mut receiver: tokio::sync::mpsc::UnboundedReceiver<RedisPublishCommand>,
+    mut receiver: tokio::sync::mpsc::Receiver<RedisPublishCommand>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -696,19 +705,23 @@ fn spawn_redis_listener(
 #[cfg(feature = "redis")]
 impl ChannelsBackend for RedisChannelsBackend {
     fn publish(&self, topic: &str, msg: ChannelMessage) -> Result<usize, ChannelPublishError> {
-        let local_count = self.local.publish_local(topic, msg.clone());
         let command = RedisPublishCommand {
             redis_channel: self.redis_channel(topic),
             envelope: RedisEnvelope {
                 origin: self.origin_id.clone(),
                 topic: topic.to_owned(),
-                payload: msg.into_string(),
+                payload: msg.as_str().to_owned(),
             },
         };
         self.publisher
-            .send(command)
-            .map_err(|_| ChannelPublishError::BackendClosed)?;
-        Ok(local_count)
+            .try_send(command)
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => ChannelPublishError::QueueFull,
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    ChannelPublishError::BackendClosed
+                }
+            })?;
+        Ok(self.local.publish_local(topic, msg))
     }
 
     fn ensure_topic(&self, topic: &str) -> Arc<broadcast::Sender<ChannelMessage>> {
@@ -1068,6 +1081,59 @@ mod tests {
         assert_eq!(stats.dropped_count, 0);
         assert_eq!(stats.lagged_count, 0);
         Ok(())
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn snapshot_counts_dropped_publish_without_successful_delivery() {
+        let channels = Channels::new(16);
+        let sent = channels
+            .broadcast()
+            .publish("metrics", "one")
+            .expect("publish with no subscribers should not fail");
+
+        assert_eq!(sent, 0);
+        let snap = channels.snapshot();
+        let stats = snap.get("metrics").expect("topic should be tracked");
+        assert_eq!(stats.subscriber_count, 0);
+        assert_eq!(stats.lifetime_publish_count, 0);
+        assert_eq!(stats.dropped_count, 1);
+        assert_eq!(stats.lagged_count, 0);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_publish_rejects_when_bounded_queue_is_full() {
+        let local = LocalChannelsBackend::new(16);
+        let mut rx = local.subscribe("queue");
+        let (publisher, _receiver) = tokio::sync::mpsc::channel(1);
+        publisher
+            .try_send(RedisPublishCommand {
+                redis_channel: "autumn:channels:queue".to_owned(),
+                envelope: RedisEnvelope {
+                    origin: "origin".to_owned(),
+                    topic: "queue".to_owned(),
+                    payload: "already queued".to_owned(),
+                },
+            })
+            .expect("first command should fill the queue");
+
+        let backend = RedisChannelsBackend {
+            local,
+            publisher,
+            origin_id: "origin".to_owned(),
+            key_prefix: "autumn:channels".to_owned(),
+        };
+
+        let error = backend
+            .publish("queue", ChannelMessage::from("second"))
+            .expect_err("full Redis queue should reject the publish");
+
+        assert_eq!(error, ChannelPublishError::QueueFull);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
