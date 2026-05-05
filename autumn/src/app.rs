@@ -2286,7 +2286,7 @@ async fn execute_fixed_delay_task(
     lease_ttl: std::time::Duration,
 ) {
     let tick_key =
-        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_secs());
+        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_duration());
     let lease = match coordinator
         .try_acquire(&name, &tick_key, coordination)
         .await
@@ -2501,7 +2501,8 @@ async fn run_cron_task_loop(
     let mut cursor = chrono::Utc::now().with_timezone(&timezone);
 
     loop {
-        let scheduled_at = match cron.find_next_occurrence(&cursor, false) {
+        let now = chrono::Utc::now().with_timezone(&timezone);
+        let scheduled_at = match next_cron_occurrence_after(&cron, &cursor, &now) {
             Ok(scheduled_at) => scheduled_at,
             Err(error) => {
                 tracing::error!(task = %name, expression = %expression, error = %error, "Failed to compute next cron tick");
@@ -2512,6 +2513,24 @@ async fn run_cron_task_loop(
         tokio::select! {
             () = shutdown.cancelled() => break,
             () = tokio::time::sleep(sleep_for) => {
+                let woke_at = chrono::Utc::now().with_timezone(&timezone);
+                match cron_occurrence_is_overdue(&cron, &scheduled_at, &woke_at) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task = %name,
+                            scheduled_at = %scheduled_at,
+                            woke_at = %woke_at,
+                            "Skipping overdue cron task tick"
+                        );
+                        cursor = woke_at;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(task = %name, expression = %expression, error = %error, "Failed to evaluate cron tick lateness");
+                        return;
+                    }
+                }
                 let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
                 tokio::spawn(execute_cron_task(
                     name.clone(),
@@ -2526,6 +2545,24 @@ async fn run_cron_task_loop(
             }
         }
     }
+}
+
+fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    cursor: &chrono::DateTime<Tz>,
+    now: &chrono::DateTime<Tz>,
+) -> Result<chrono::DateTime<Tz>, croner::errors::CronError> {
+    let anchor = if cursor < now { now } else { cursor };
+    cron.find_next_occurrence(anchor, false)
+}
+
+fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    scheduled_at: &chrono::DateTime<Tz>,
+    now: &chrono::DateTime<Tz>,
+) -> Result<bool, croner::errors::CronError> {
+    let next_after_scheduled = cron.find_next_occurrence(scheduled_at, false)?;
+    Ok(&next_after_scheduled <= now)
 }
 
 fn cron_sleep_duration_until<Tz: chrono::TimeZone>(
@@ -5751,6 +5788,57 @@ mod tests {
         assert_eq!(
             tick_keys.lock().unwrap().as_slice(),
             ["cron_review_task:1700000000"]
+        );
+    }
+
+    #[test]
+    fn next_cron_occurrence_skips_overdue_slots() {
+        use chrono::TimeZone as _;
+
+        let cron = "0 * * * * *"
+            .parse::<croner::Cron>()
+            .expect("cron expression should parse");
+        let stale_cursor = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 0, 0)
+            .unwrap();
+        let now = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
+            .unwrap();
+        let next = super::next_cron_occurrence_after(&cron, &stale_cursor, &now)
+            .expect("next cron occurrence should resolve");
+
+        assert_eq!(
+            next,
+            chrono_tz::UTC
+                .with_ymd_and_hms(2026, 5, 5, 12, 31, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cron_occurrence_is_overdue_after_later_slot_passed() {
+        use chrono::TimeZone as _;
+
+        let cron = "0 * * * * *"
+            .parse::<croner::Cron>()
+            .expect("cron expression should parse");
+        let scheduled_at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 1, 0)
+            .unwrap();
+        let slightly_late = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 1, 5)
+            .unwrap();
+        let after_later_slot = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
+            .unwrap();
+
+        assert!(
+            !super::cron_occurrence_is_overdue(&cron, &scheduled_at, &slightly_late)
+                .expect("overdue check should resolve")
+        );
+        assert!(
+            super::cron_occurrence_is_overdue(&cron, &scheduled_at, &after_later_slot)
+                .expect("overdue check should resolve")
         );
     }
 

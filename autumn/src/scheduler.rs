@@ -269,11 +269,11 @@ pub fn coordinator_from_config(
     }
 }
 
-/// Derive the global tick key for a fixed-delay task and a Unix timestamp.
+/// Derive the global tick key for a fixed-delay task and Unix elapsed time.
 #[must_use]
-pub fn fixed_delay_tick_key(task_name: &str, delay: Duration, unix_secs: u64) -> String {
-    let interval = delay.as_secs().max(1);
-    let bucket = unix_secs / interval;
+pub fn fixed_delay_tick_key(task_name: &str, delay: Duration, unix_elapsed: Duration) -> String {
+    let interval = delay.as_nanos().max(1);
+    let bucket = unix_elapsed.as_nanos() / interval;
     format!("{task_name}:{bucket}")
 }
 
@@ -301,10 +301,15 @@ pub fn advisory_lock_key(key_prefix: &str, task_name: &str, tick_key: &str) -> i
 /// Current Unix timestamp in seconds.
 #[must_use]
 pub fn now_unix_secs() -> u64 {
+    now_unix_duration().as_secs()
+}
+
+/// Current elapsed time since the Unix epoch.
+#[must_use]
+pub fn now_unix_duration() -> Duration {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
 }
 
 #[cfg(feature = "db")]

@@ -54,13 +54,48 @@ fn scheduler_config_supports_env_overrides() {
 
 #[test]
 fn fixed_delay_tick_key_is_stable_within_interval() {
-    let first = fixed_delay_tick_key("cleanup", Duration::from_secs(10), 1_700_000_004);
-    let second = fixed_delay_tick_key("cleanup", Duration::from_secs(10), 1_700_000_009);
-    let next = fixed_delay_tick_key("cleanup", Duration::from_secs(10), 1_700_000_010);
+    let first = fixed_delay_tick_key(
+        "cleanup",
+        Duration::from_secs(10),
+        Duration::from_secs(1_700_000_004),
+    );
+    let second = fixed_delay_tick_key(
+        "cleanup",
+        Duration::from_secs(10),
+        Duration::from_secs(1_700_000_009),
+    );
+    let next = fixed_delay_tick_key(
+        "cleanup",
+        Duration::from_secs(10),
+        Duration::from_secs(1_700_000_010),
+    );
 
     assert_eq!(first, second);
     assert_ne!(first, next);
     assert!(first.contains("cleanup"));
+}
+
+#[test]
+fn fixed_delay_tick_key_uses_sub_second_precision() {
+    let delay = Duration::from_millis(100);
+    let first = fixed_delay_tick_key(
+        "fast",
+        delay,
+        Duration::from_secs(1_700_000_000) + Duration::from_millis(100),
+    );
+    let same = fixed_delay_tick_key(
+        "fast",
+        delay,
+        Duration::from_secs(1_700_000_000) + Duration::from_millis(199),
+    );
+    let next = fixed_delay_tick_key(
+        "fast",
+        delay,
+        Duration::from_secs(1_700_000_000) + Duration::from_millis(200),
+    );
+
+    assert_eq!(first, same);
+    assert_ne!(first, next);
 }
 
 #[test]
