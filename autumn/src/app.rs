@@ -30,6 +30,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use tracing::Instrument as _;
 
 use crate::config::{AutumnConfig, ConfigLoader};
@@ -2234,13 +2235,32 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let result = (handler)(state.clone()).instrument(task_span).await;
+    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (handler)(state.clone()).instrument(task_span)
+    })) {
+        Ok(future) => future,
+        Err(panic) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
+        }
+    };
+    let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     match result {
-        Ok(()) => Ok(duration_ms),
-        Err(e) => Err((duration_ms, e.to_string())),
+        Ok(Ok(())) => Ok(duration_ms),
+        Ok(Err(e)) => Err((duration_ms, e.to_string())),
+        Err(panic) => Err((duration_ms, format_scheduled_task_panic(panic.as_ref()))),
     }
+}
+
+fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+    format!("scheduled task handler panicked: {detail}")
 }
 
 async fn execute_task_result_with_optional_lease_ttl(
@@ -5570,6 +5590,30 @@ mod tests {
         assert!(msg.contains("test error"));
     }
 
+    fn instantly_panicking_scheduled_handler(
+        _state: AppState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send>> {
+        panic!("panic before scheduled future")
+    }
+
+    #[tokio::test]
+    async fn execute_task_result_reports_immediate_handler_panics() {
+        let state = AppState::for_test();
+        let start = std::time::Instant::now();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+        )
+        .await;
+
+        let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
+        assert!(duration_ms < u64::MAX);
+        assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
     #[tokio::test]
     async fn execute_fixed_delay_task_does_not_timeout_in_process_runs() {
         let state = AppState::for_test();
@@ -5639,6 +5683,7 @@ mod tests {
     struct GrantingSchedulerCoordinator {
         backend: &'static str,
         tick_keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        release_count: Option<std::sync::Arc<AtomicUsize>>,
     }
 
     impl crate::scheduler::SchedulerCoordinator for GrantingSchedulerCoordinator {
@@ -5661,10 +5706,17 @@ mod tests {
         > {
             Box::pin(async move {
                 self.tick_keys.lock().unwrap().push(tick_key.to_owned());
-                Ok(Some(crate::scheduler::SchedulerLease::local(
-                    self.backend,
-                    "replica-a",
-                )))
+                let lease = self.release_count.as_ref().map_or_else(
+                    || crate::scheduler::SchedulerLease::local(self.backend, "replica-a"),
+                    |release_count| {
+                        crate::scheduler::SchedulerLease::tracked(
+                            self.backend,
+                            "replica-a",
+                            std::sync::Arc::clone(release_count),
+                        )
+                    },
+                );
+                Ok(Some(lease))
             })
         }
     }
@@ -5729,6 +5781,7 @@ mod tests {
         let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
             backend: "postgres",
             tick_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            release_count: None,
         });
 
         super::execute_fixed_delay_task(
@@ -5770,6 +5823,7 @@ mod tests {
         let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
             backend: "postgres",
             tick_keys: std::sync::Arc::clone(&tick_keys),
+            release_count: None,
         });
         let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
         let scheduled_unix_secs = 1_700_000_000;
@@ -5788,6 +5842,56 @@ mod tests {
         assert_eq!(
             tick_keys.lock().unwrap().as_slice(),
             ["cron_review_task:1700000000"]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_releases_lease_when_handler_panics() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "panic_task",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let release_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+            backend: "postgres",
+            tick_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            release_count: Some(std::sync::Arc::clone(&release_count)),
+        });
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                panic!("forced scheduled panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+        };
+
+        super::execute_fixed_delay_task(
+            "panic_task".to_owned(),
+            state.clone(),
+            handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["panic_task"];
+        assert_eq!(release_count.load(Ordering::SeqCst), 1);
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.last_result.as_deref(), Some("failed"));
+        assert_eq!(status.total_runs, 1);
+        assert_eq!(status.total_failures, 1);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("scheduled task handler panicked"))
         );
     }
 

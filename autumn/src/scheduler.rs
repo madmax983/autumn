@@ -40,6 +40,8 @@ pub trait SchedulerCoordinator: Send + Sync {
 pub struct SchedulerLease {
     backend: String,
     leader_id: String,
+    #[cfg(test)]
+    release_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(feature = "db")]
     postgres: Option<PostgresAdvisoryLease>,
 }
@@ -49,6 +51,23 @@ impl SchedulerLease {
         Self {
             backend: backend.into(),
             leader_id: leader_id.into(),
+            #[cfg(test)]
+            release_count: None,
+            #[cfg(feature = "db")]
+            postgres: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked(
+        backend: impl Into<String>,
+        leader_id: impl Into<String>,
+        release_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        Self {
+            backend: backend.into(),
+            leader_id: leader_id.into(),
+            release_count: Some(release_count),
             #[cfg(feature = "db")]
             postgres: None,
         }
@@ -59,6 +78,8 @@ impl SchedulerLease {
         Self {
             backend: "postgres".to_owned(),
             leader_id: leader_id.into(),
+            #[cfg(test)]
+            release_count: None,
             postgres: Some(lease),
         }
     }
@@ -81,6 +102,11 @@ impl SchedulerLease {
     ///
     /// Returns [`AutumnError`] when the backend cannot release its lock.
     pub async fn release(self) -> AutumnResult<()> {
+        #[cfg(test)]
+        if let Some(release_count) = self.release_count {
+            release_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
         #[cfg(feature = "db")]
         if let Some(lease) = self.postgres {
             return lease.release().await;
