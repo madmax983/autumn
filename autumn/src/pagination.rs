@@ -1636,4 +1636,71 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
+
+    #[tokio::test]
+    async fn page_request_extractor_rejects_missing_uri_query() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+
+        let extracted = PageRequest::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted.page(), 1);
+        assert_eq!(extracted.size(), 20); // Default is 20
+    }
+
+    #[tokio::test]
+    async fn cursor_extractor_rejects_missing_uri_query() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+
+        let extracted = CursorRequest::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted.size(), 20); // Default is 20
+        assert!(extracted.cursor.is_none());
+    }
+
+    #[test]
+    fn base64url_encode_pad_branch() {
+        // 2 byte string leads to rem.len() == 2, which exercises the second padding path.
+        let encoded = base64url_encode(b"ab");
+        assert_eq!(encoded, "YWI");
+    }
+
+    #[test]
+    fn base64url_decode_pad_branch() {
+        // Try to decode exactly a length that produces rem 3.
+        // YWI decodes to 'ab' (2 bytes)
+        let decoded = base64url_decode("YWI").unwrap();
+        assert_eq!(decoded, b"ab");
+    }
+
+    #[test]
+    fn cursor_encode_fails_gracefully_on_serialization_error() {
+        use serde::Serialize;
+
+        struct FailToSerialize;
+
+        impl Serialize for FailToSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("forced failure"))
+            }
+        }
+
+        let res = Cursor::encode(&FailToSerialize);
+        assert!(res.is_err());
+
+        let res_signed = Cursor::encode_signed(&FailToSerialize, b"key");
+        assert!(res_signed.is_err());
+    }
 }
