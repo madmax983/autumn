@@ -4201,4 +4201,71 @@ path = "/api-spec.json"
             "[openapi] path must deserialize correctly"
         );
     }
+
+    #[test]
+    fn cache_env_overrides_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CACHE__BACKEND", "redis")
+            .with("AUTUMN_CACHE__REDIS__URL", "redis://cache:6379/1")
+            .with("AUTUMN_CACHE__REDIS__KEY_PREFIX", "myapp:cache");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert!(config.cache.is_redis(), "backend should be redis");
+        assert_eq!(
+            config.cache.redis.url.as_deref(),
+            Some("redis://cache:6379/1")
+        );
+        assert_eq!(config.cache.redis.key_prefix, "myapp:cache");
+    }
+
+    #[test]
+    fn cache_backend_from_env_value_invalid_is_none() {
+        assert!(CacheBackend::from_env_value("postgres").is_none());
+        assert!(CacheBackend::from_env_value("").is_none());
+    }
+
+    #[test]
+    fn scheduler_validate_rejects_zero_lease_ttl() {
+        let cfg = SchedulerConfig {
+            lease_ttl_secs: 0,
+            ..SchedulerConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "zero lease_ttl_secs must fail");
+    }
+
+    #[test]
+    fn scheduler_validate_rejects_empty_key_prefix() {
+        let cfg = SchedulerConfig {
+            key_prefix: "   ".to_owned(),
+            ..SchedulerConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "blank key_prefix must fail");
+    }
+
+    #[test]
+    fn scheduler_validate_ok_with_defaults() {
+        assert!(SchedulerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn scheduler_resolved_replica_id_uses_explicit_value() {
+        let cfg = SchedulerConfig {
+            replica_id: Some("my-pod".to_owned()),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(cfg.resolved_replica_id(), "my-pod");
+    }
+
+    #[test]
+    fn scheduler_resolved_replica_id_falls_back_to_pid() {
+        let cfg = SchedulerConfig {
+            replica_id: None,
+            ..SchedulerConfig::default()
+        };
+        // In CI, FLY_MACHINE_ID and HOSTNAME may or may not be set,
+        // so just verify we get a non-empty string back.
+        assert!(!cfg.resolved_replica_id().is_empty());
+    }
 }
