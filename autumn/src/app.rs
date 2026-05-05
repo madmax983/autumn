@@ -91,6 +91,8 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        #[cfg(feature = "ws")]
+        channels_backend: None,
         #[cfg(feature = "storage")]
         blob_store: None,
         #[cfg(feature = "openapi")]
@@ -215,6 +217,10 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Custom channel backend (tier-1 subsystem replacement). When `Some`,
+    /// `AppState` skips config-driven `in_process`/`redis` channel selection.
+    #[cfg(feature = "ws")]
+    channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
     /// Custom blob store installed via
     /// [`AppBuilder::with_blob_store`]. When `Some`, `preflight_storage`
     /// is skipped and this store is installed directly onto `AppState`.
@@ -1017,6 +1023,27 @@ impl AppBuilder {
         self
     }
 
+    /// Install a custom [`ChannelsBackend`](crate::channels::ChannelsBackend),
+    /// bypassing the config-driven `in_process`/`redis` backend selection.
+    ///
+    /// Useful for NATS, Postgres `LISTEN/NOTIFY`, test harnesses, or a
+    /// sharded pub/sub fabric. Emits a `tracing::warn!` if a backend was
+    /// already installed.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels_backend<B>(mut self, backend: B) -> Self
+    where
+        B: crate::channels::ChannelsBackend,
+    {
+        if self.channels_backend.is_some() {
+            tracing::warn!(
+                "channels backend replaced; the previously-installed backend was overwritten"
+            );
+        }
+        self.channels_backend = Some(Arc::new(backend));
+        self
+    }
+
     /// Install a custom [`BlobStore`](crate::storage::BlobStore),
     /// bypassing the config-driven `local`/`s3` backend selection.
     ///
@@ -1286,6 +1313,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
             #[cfg(feature = "storage")]
             blob_store,
             #[cfg(feature = "openapi")]
@@ -1385,6 +1414,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool,
+            #[cfg(feature = "ws")]
+            channels_backend,
         );
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
@@ -1581,6 +1612,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
             #[cfg(feature = "storage")]
             blob_store,
             #[cfg(feature = "openapi")]
@@ -1674,6 +1707,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool,
+            #[cfg(feature = "ws")]
+            channels_backend,
         );
         #[cfg(feature = "mail")]
         crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
@@ -1869,6 +1904,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
             #[cfg(feature = "storage")]
             blob_store,
             audit_logger,
@@ -1932,6 +1969,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool,
+            #[cfg(feature = "ws")]
+            channels_backend,
         );
 
         for register in policy_registrations {
@@ -3311,7 +3350,22 @@ fn build_state(
     #[cfg(feature = "db")] pool: Option<
         diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     >,
+    #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
+    #[cfg(feature = "ws")]
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    #[cfg(feature = "ws")]
+    let channels = channels_backend.map_or_else(
+        || {
+            crate::channels::Channels::from_config(&config.channels, shutdown.child_token())
+                .unwrap_or_else(|error| {
+                    tracing::error!(error = %error, "Failed to configure channels backend");
+                    std::process::exit(1);
+                })
+        },
+        crate::channels::Channels::with_shared_backend,
+    );
+
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
@@ -3326,9 +3380,9 @@ fn build_state(
         job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
-        channels: crate::channels::Channels::new(32),
+        channels,
         #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown,
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: config.auth.session_key.clone(),
@@ -3548,6 +3602,36 @@ mod tests {
             auth_session_key: "user_id".to_owned(),
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn with_channels_backend_overrides_config_driven_backend_selection() {
+        let builder = app().with_channels_backend(crate::channels::LocalChannelsBackend::new(4));
+        let AppBuilder {
+            channels_backend, ..
+        } = builder;
+        assert!(channels_backend.is_some());
+
+        let mut config = AutumnConfig::default();
+        config.channels.backend = crate::config::ChannelBackend::Redis;
+        config.channels.redis.url = None;
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        let mut rx = state.channels().subscribe("override");
+
+        state
+            .broadcast()
+            .publish("override", "ok")
+            .expect("custom local backend should publish");
+
+        assert_eq!(rx.try_recv().expect("message should arrive").as_str(), "ok");
     }
 
     /// Helper to create a simple GET route for testing.

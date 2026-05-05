@@ -429,6 +429,7 @@ impl ConfigProperties {
         Self::track_health_props(&mut props, config, &defaults, &profile_str);
         Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
         Self::track_session_props(&mut props, config, &defaults, &profile_str);
+        Self::track_channels_props(&mut props, config, &defaults, &profile_str);
 
         Self {
             inner: Arc::new(RwLock::new(props)),
@@ -710,6 +711,42 @@ impl ConfigProperties {
             "session.redis.key_prefix",
             &config.session.redis.key_prefix,
             &defaults.session.redis.key_prefix,
+            profile_str,
+        );
+    }
+
+    fn track_channels_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "channels.backend",
+            &format!("{:?}", config.channels.backend),
+            &format!("{:?}", defaults.channels.backend),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.capacity",
+            &config.channels.capacity.to_string(),
+            &defaults.channels.capacity.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.redis.url",
+            config.channels.redis.url.as_deref().unwrap_or(""),
+            defaults.channels.redis.url.as_deref().unwrap_or(""),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.redis.key_prefix",
+            &config.channels.redis.key_prefix,
+            &defaults.channels.redis.key_prefix,
             profile_str,
         );
     }
@@ -1952,6 +1989,41 @@ mod tests {
         assert_eq!(job["in_flight"], 0);
         assert_eq!(job["total_successes"], 1);
         assert_eq!(job["total_failures"], 0);
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn actuator_channels_returns_metrics() {
+        let state = test_state();
+        let mut rx = state.channels().subscribe("feed");
+        state
+            .channels()
+            .broadcast()
+            .publish("feed", "hello")
+            .expect("publish should succeed");
+        rx.try_recv().expect("subscriber should receive payload");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feed = &json["channels"]["feed"];
+        assert_eq!(feed["subscriber_count"], 1);
+        assert_eq!(feed["lifetime_publish_count"], 1);
+        assert_eq!(feed["dropped_count"], 0);
+        assert_eq!(feed["lagged_count"], 0);
     }
 
     #[tokio::test]

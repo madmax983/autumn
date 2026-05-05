@@ -78,6 +78,12 @@ pub use crate::mail::{
 pub use crate::sse::{Event, Sse};
 /// Structured CLI argument extractor for one-off `#[task]` handlers.
 pub use crate::task::TaskArgs;
+/// Real-time broadcast facade and channel registry.
+#[cfg(feature = "ws")]
+pub use crate::{
+    Broadcast, BroadcastError, ChannelMessage, ChannelStats, Channels, ChannelsBackend,
+    LocalChannelsBackend,
+};
 /// State extractor.
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
