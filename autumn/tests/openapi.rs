@@ -119,6 +119,7 @@ async fn create_validated_widget(
 // ── Query parameter inference ─────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct SearchParams {
     q: Option<String>,
     page: Option<i32>,
@@ -485,7 +486,10 @@ fn query_params_appear_in_generated_spec() {
         .expect("Query<T> handler must produce at least one query parameter");
     assert_eq!(query_param.name, "SearchParams");
     assert_eq!(query_param.location, "query");
-    assert!(!query_param.required, "query params from structs are optional");
+    assert!(
+        !query_param.required,
+        "query params from structs are optional"
+    );
 }
 
 // ── Security scheme detection ─────────────────────────────────────
@@ -504,7 +508,8 @@ fn secured_route_with_role_has_required_roles() {
     let route = __autumn_route_info_admin_handler();
     assert!(route.api_doc.secured);
     assert_eq!(
-        route.api_doc.required_roles, &["admin"],
+        route.api_doc.required_roles,
+        &["admin"],
         "#[secured(\"admin\")] must populate required_roles"
     );
 }
@@ -531,7 +536,10 @@ fn secured_spec_includes_bearer_auth_scheme() {
     let route = __autumn_route_info_protected_handler();
     let config = OpenApiConfig::new("Demo", "1.0.0");
     let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
-    let comps = spec.components.as_ref().expect("components must be present");
+    let comps = spec
+        .components
+        .as_ref()
+        .expect("components must be present");
     assert!(
         comps.security_schemes.contains_key("BearerAuth"),
         "BearerAuth security scheme must be registered when any route is secured"
@@ -598,9 +606,6 @@ fn all_refs_in_spec_are_backed_by_component_schemas() {
     let spec = autumn_web::openapi::generate_spec(&config, &docs);
 
     let spec_json = serde_json::to_value(&spec).unwrap();
-    let schemas = spec
-        .components
-        .map(|c| c.schemas)
-        .unwrap_or_default();
+    let schemas = spec.components.map(|c| c.schemas).unwrap_or_default();
     assert_all_refs_defined(&spec_json, &schemas);
 }

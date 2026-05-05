@@ -463,12 +463,10 @@ pub fn write_openapi_spec_to_dist(
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(dist_dir)?;
 
-    let json = serde_json::to_string_pretty(spec)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_string_pretty(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.json"), &json)?;
 
-    let yaml = serde_yaml::to_string(spec)
-        .map_err(std::io::Error::other)?;
+    let yaml = serde_yaml::to_string(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
 
     Ok(())
@@ -1089,7 +1087,8 @@ mod tests {
         let spec = generate_spec(&config, &[]);
         assert_eq!(
             spec.openapi, "3.1.0",
-            "Autumn must emit OpenAPI 3.1.0, not {}", spec.openapi
+            "Autumn must emit OpenAPI 3.1.0, not {}",
+            spec.openapi
         );
     }
 
@@ -1194,7 +1193,10 @@ mod tests {
         assert!(yaml_path.exists(), "dist/openapi.yaml must be written");
 
         let content = std::fs::read_to_string(&yaml_path).unwrap();
-        assert!(content.contains("openapi:"), "YAML must include the openapi field");
+        assert!(
+            content.contains("openapi:"),
+            "YAML must include the openapi field"
+        );
         assert!(content.contains("3.1.0"), "YAML must include the version");
         assert!(content.contains("TestAPI"), "YAML must include the title");
     }

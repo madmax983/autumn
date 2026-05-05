@@ -3767,10 +3767,10 @@ path = "/healthz"
 
     #[test]
     fn openapi_runtime_config_can_be_disabled_via_toml() {
-        let toml_str = r#"
+        let toml_str = "
 [openapi]
 enabled = false
-"#;
+";
         let config: AutumnConfig = toml::from_str(toml_str).unwrap();
         assert!(
             !config.openapi_runtime.enabled,
