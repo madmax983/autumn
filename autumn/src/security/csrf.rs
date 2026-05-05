@@ -89,6 +89,29 @@ const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 #[derive(Clone, Debug)]
 pub struct CsrfFormField(pub String);
 
+/// A parsed, cryptographically secure CSRF token value.
+///
+/// This token is extracted from the request (either via cookie or header) and compared
+/// against the submitted token to prevent Cross-Site Request Forgery attacks.
+///
+/// ## Examples
+///
+/// Extracting a token in an Axum handler:
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::security::csrf::CsrfToken;
+///
+/// #[get("/form")]
+/// async fn my_form(token: CsrfToken) -> Markup {
+///     html! {
+///         form method="post" {
+///             // The form_tag! macro normally handles this for you
+///             input type="hidden" name="_csrf" value=(token.token());
+///             button { "Submit" }
+///         }
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct CsrfToken(String);
 

@@ -15,17 +15,73 @@ use serde_json::Value;
 
 use crate::{AppState, AutumnError, AutumnResult};
 
+/// A function pointer to a job handler that executes the job asynchronously.
+///
+/// This type defines the signature expected for all background job processors.
+/// It receives the application state and the deserialized JSON payload, returning
+/// a pinned box future.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use std::future::Future;
+/// use std::pin::Pin;
+///
+/// fn my_job(state: AppState, payload: serde_json::Value) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+///     Box::pin(async move {
+///         println!("Processing {:?}", payload);
+///         Ok(())
+///     })
+/// }
+/// ```
 pub type JobHandler =
     fn(AppState, Value) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>>;
 
+/// Metadata for a registered background job.
+///
+/// This is typically generated automatically by the [`#[job]`](crate::job) macro,
+/// though you can construct it manually if registering dynamic jobs.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use autumn_web::job::JobInfo;
+///
+/// let info = JobInfo {
+///     name: "my_job".into(),
+///     max_attempts: 3,
+///     initial_backoff_ms: 1000,
+///     handler: my_handler_fn,
+/// };
+/// ```
 #[derive(Clone)]
 pub struct JobInfo {
+    /// The unique name identifying the job type.
     pub name: String,
+    /// The maximum number of times the job should be attempted before failing permanently.
     pub max_attempts: u32,
+    /// The initial backoff duration in milliseconds for retries.
     pub initial_backoff_ms: u64,
+    /// The handler function that executes the job's logic.
     pub handler: JobHandler,
 }
 
+/// Client for interacting with the job queue, either locally or via Redis.
+///
+/// Handles routing job payloads to the active queue backend and managing defaults.
+///
+/// ## Examples
+///
+/// Typically accessed via [`global_job_client`]:
+/// ```rust,ignore
+/// use autumn_web::job::global_job_client;
+/// use serde_json::json;
+///
+/// if let Some(client) = global_job_client() {
+///     client.enqueue("process_video", json!({ "id": 123 })).await?;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct JobClient {
     local_sender: Option<tokio::sync::mpsc::Sender<QueuedJob>>,
@@ -108,6 +164,22 @@ fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
     format!("job handler panicked: {detail}")
 }
 
+/// Access the shared job client from anywhere in the application.
+///
+/// This is populated automatically when the Autumn application starts.
+/// It allows enqueuing background jobs from locations that might not have
+/// direct access to the [`AppState`], such as deeply nested domain logic.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use autumn_web::job::global_job_client;
+/// use serde_json::json;
+///
+/// if let Some(client) = global_job_client() {
+///     client.enqueue("send_email", json!({ "user": 42 })).await?;
+/// }
+/// ```
 #[must_use]
 pub fn global_job_client() -> Option<Arc<JobClient>> {
     GLOBAL_JOB_CLIENT

@@ -764,6 +764,18 @@ impl Default for JobConfig {
     }
 }
 
+/// Configuration for the Redis-backed job queue.
+///
+/// Use this to configure the Redis URL and key prefix when using the Redis job backend.
+///
+/// ## Examples
+///
+/// In `autumn.toml`:
+/// ```toml
+/// [jobs.redis]
+/// url = "redis://127.0.0.1:6379"
+/// key_prefix = "my_app_jobs"
+/// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobRedisConfig {
     /// Redis URL used when `jobs.backend = "redis"`.
