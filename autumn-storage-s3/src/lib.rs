@@ -350,7 +350,7 @@ mod tests {
             secret_access_key_env: Some("__AUTUMN_S3_TEST_SECRET__".into()),
             ..StorageS3Config::default()
         };
-        temp_env::async_with_vars(
+        Box::pin(temp_env::async_with_vars(
             [
                 ("__AUTUMN_S3_TEST_KEY_ID__", Some("AKIAIOSFODNN7EXAMPLE")),
                 ("__AUTUMN_S3_TEST_SECRET__", Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")),
@@ -359,7 +359,7 @@ mod tests {
                 let store = S3BlobStore::from_config(&cfg).await.expect("should build with static creds");
                 assert_eq!(store.provider_id(), "s3");
             },
-        )
+        ))
         .await;
     }
 
@@ -374,7 +374,7 @@ mod tests {
             secret_access_key_env: Some("__AUTUMN_S3_TEST_SECRET2__".into()),
             ..StorageS3Config::default()
         };
-        temp_env::async_with_vars(
+        Box::pin(temp_env::async_with_vars(
             [
                 ("__AUTUMN_S3_TEST_KEY_ID2__", Some("key")),
                 ("__AUTUMN_S3_TEST_SECRET2__", Some("secret")),
@@ -383,7 +383,7 @@ mod tests {
                 let store = S3BlobStore::from_config(&cfg).await.expect("should build");
                 assert_eq!(store.provider_id(), "s3");
             },
-        )
+        ))
         .await;
     }
 

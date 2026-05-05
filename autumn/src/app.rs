@@ -5316,7 +5316,7 @@ mod tests {
 
             struct FakeStore;
             impl BlobStore for FakeStore {
-                fn provider_id(&self) -> &str { "fake" }
+                fn provider_id(&self) -> &'static str { "fake" }
                 fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
@@ -5349,7 +5349,7 @@ mod tests {
 
             struct FakeStore;
             impl BlobStore for FakeStore {
-                fn provider_id(&self) -> &str { "fake-installed" }
+                fn provider_id(&self) -> &'static str { "fake-installed" }
                 fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
                     Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
                 }
