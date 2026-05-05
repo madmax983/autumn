@@ -597,7 +597,7 @@ mod tests {
         append_openapi_routes(&mut infos, &config);
         let paths: Vec<&str> = infos.iter().map(|i| i.path.as_str()).collect();
         assert!(
-            paths.contains(&"/v3/api-docs"),
+            paths.contains(&"/openapi.json"),
             "openapi json path missing: {paths:?}"
         );
         assert!(
@@ -631,7 +631,7 @@ mod tests {
         append_openapi_routes(&mut infos, &config);
         // Only the JSON endpoint; no swagger-ui entry.
         assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].path, "/v3/api-docs");
+        assert_eq!(infos[0].path, "/openapi.json");
     }
 
     // ── append_framework_routes static ────────────────────────────────────
