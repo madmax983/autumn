@@ -91,7 +91,7 @@ fn cached_fn_reads_from_global_on_hit() {
     clear_global_cache();
 
     let global_moka = Arc::new(MokaCache::new(100, None));
-    let key = make_cache_key("double_a", &(42_i32,));
+    let key = make_cache_key(concat!(module_path!(), "::double_a"), &(42_i32,));
     // Store 999 under the key that double_a(42) would normally compute as 84.
     autumn_web::cache::insert(global_moka.as_ref(), &key, 999_i32);
     set_global_cache(global_moka);
@@ -116,7 +116,7 @@ fn cached_fn_writes_to_global_on_miss() {
     set_global_cache(Arc::new(counting.clone()) as Arc<dyn Cache>);
 
     // Ensure the key is absent from the global before calling
-    let key = make_cache_key("double_b", &(5_i32,));
+    let key = make_cache_key(concat!(module_path!(), "::double_b"), &(5_i32,));
     counting.inner.invalidate(&key);
 
     let result = double_b(5);

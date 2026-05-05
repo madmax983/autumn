@@ -128,7 +128,7 @@ fn generate_cache_body(
             __autumn_global
                 .as_deref()
                 .unwrap_or(__autumn_moka as &dyn ::autumn_web::cache::Cache);
-        let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
+        let __autumn_key = ::autumn_web::cache::make_cache_key(concat!(module_path!(), "::", #fn_name_str), #key_args);
     };
 
     if attrs.result {

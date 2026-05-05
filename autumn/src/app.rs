@@ -1456,6 +1456,8 @@ impl AppBuilder {
         if let Some(cache) = cache_backend {
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
         }
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
@@ -1764,6 +1766,8 @@ impl AppBuilder {
         if let Some(cache) = cache_backend {
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
         }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
