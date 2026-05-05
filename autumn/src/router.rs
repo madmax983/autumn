@@ -305,7 +305,7 @@ pub fn try_build_router_inner(
 /// runtime spec assembly (which sees scope prefixes that the macro
 /// never does) produces consistent parameter lists.
 #[cfg(feature = "openapi")]
-fn extract_path_params(path: &str) -> Vec<String> {
+pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut remaining = path;
 
@@ -514,7 +514,7 @@ fn build_openapi_router(
 /// `/api` + `/` recorded as `/api/` but axum routes it at `/api`) or
 /// generating a spec whose URLs don't match what axum serves.
 #[cfg(feature = "openapi")]
-fn join_nested_path(prefix: &str, child: &str) -> String {
+pub fn join_nested_path(prefix: &str, child: &str) -> String {
     let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
         if prefix_trimmed.is_empty() {

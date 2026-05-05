@@ -490,6 +490,16 @@ fn query_params_appear_in_generated_spec() {
         !query_param.required,
         "query params from structs are optional"
     );
+    assert_eq!(
+        query_param.style.as_deref(),
+        Some("form"),
+        "Query<T> must use style:form so fields serialize as individual keys"
+    );
+    assert_eq!(
+        query_param.explode,
+        Some(true),
+        "Query<T> must use explode:true so ?q=foo&page=2 not ?SearchParams=..."
+    );
 }
 
 // ── Security scheme detection ─────────────────────────────────────

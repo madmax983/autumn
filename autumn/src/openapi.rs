@@ -400,6 +400,14 @@ pub struct Parameter {
     pub required: bool,
     /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
+    /// Serialization style. `"form"` with `explode: true` makes each object
+    /// property a separate query key — the correct mapping for `Query<T>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// When `true` with `style: "form"`, each schema property becomes an
+    /// independent query parameter (e.g. `?q=foo&page=2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explode: Option<bool>,
 }
 
 #[cfg(feature = "openapi")]
@@ -601,16 +609,23 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
             location: "path".to_owned(),
             required: true,
             schema: serde_json::json!({ "type": "string" }),
+            style: None,
+            explode: None,
         })
         .collect();
 
-    // Query parameters from `Query<T>` extractor — optional by default.
+    // Query parameters from `Query<T>` extractor.
+    // Use `style: form, explode: true` so each field of the query struct
+    // is serialized as an independent query key (e.g. `?q=foo&page=2`),
+    // which matches what the server's `Query<T>` deserialization expects.
     if let Some(query_entry) = &api_doc.query_schema {
         parameters.push(Parameter {
             name: query_entry.name.to_owned(),
             location: "query".to_owned(),
             required: false,
             schema: schema_value_for(query_entry),
+            style: Some("form".to_owned()),
+            explode: Some(true),
         });
     }
 

@@ -1541,11 +1541,22 @@ impl AppBuilder {
             let mut docs: Vec<crate::openapi::ApiDoc> =
                 all_routes.iter().map(|r| r.api_doc.clone()).collect();
             for group in &scoped_groups {
+                // Mirror the same normalization as the runtime OpenAPI builder:
+                // use join_nested_path for correct trailing-slash handling, and
+                // merge prefix path params so they appear in the operation.
+                let prefix_params = crate::router::extract_path_params(&group.prefix);
                 for route in &group.routes {
                     let mut doc = route.api_doc.clone();
-                    // Prepend the scope prefix so the spec reflects the full path.
-                    let prefixed = format!("{}{}", group.prefix, doc.path);
-                    doc.path = Box::leak(prefixed.into_boxed_str());
+                    let full = crate::router::join_nested_path(&group.prefix, route.api_doc.path);
+                    doc.path = Box::leak(full.into_boxed_str());
+                    if !prefix_params.is_empty() {
+                        let mut merged: Vec<&'static str> = prefix_params
+                            .iter()
+                            .map(|p| &*Box::leak(p.clone().into_boxed_str()))
+                            .collect();
+                        merged.extend_from_slice(doc.path_params);
+                        doc.path_params = Box::leak(merged.into_boxed_slice());
+                    }
                     docs.push(doc);
                 }
             }
