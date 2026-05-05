@@ -75,6 +75,11 @@ pub mod authorization;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
+#[cfg(feature = "ws")]
+pub use channels::{
+    Broadcast, BroadcastError, BroadcastPayload, ChannelBackendConfigError, ChannelMessage,
+    ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
+};
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;

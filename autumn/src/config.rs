@@ -74,6 +74,10 @@
 //! | `AUTUMN_SESSION__ALLOW_MEMORY_IN_PRODUCTION` | `session.allow_memory_in_production` | `bool` |
 //! | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` | `String` |
 //! | `AUTUMN_SESSION__REDIS__KEY_PREFIX` | `session.redis.key_prefix` | `String` |
+//! | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` | `in_process` / `redis` |
+//! | `AUTUMN_CHANNELS__CAPACITY` | `channels.capacity` | `usize` |
+//! | `AUTUMN_CHANNELS__REDIS__URL` | `channels.redis.url` | `String` |
+//! | `AUTUMN_CHANNELS__REDIS__KEY_PREFIX` | `channels.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__BACKEND` | `jobs.backend` | `local` / `redis` |
 //! | `AUTUMN_JOBS__WORKERS` | `jobs.workers` | `usize` |
 //! | `AUTUMN_JOBS__MAX_ATTEMPTS` | `jobs.max_attempts` | `u32` |
@@ -632,6 +636,10 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub session: crate::session::SessionConfig,
 
+    /// Real-time channel backend settings.
+    #[serde(default)]
+    pub channels: ChannelConfig,
+
     /// Background job backend and runtime settings.
     #[serde(default)]
     pub jobs: JobConfig,
@@ -674,6 +682,87 @@ impl axum::extract::FromRequestParts<crate::AppState> for AutumnConfig {
             .cloned()
             .ok_or_else(|| crate::AutumnError::service_unavailable_msg("Config is not available"))
     }
+}
+
+/// Real-time channel backend selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelBackend {
+    /// In-process Tokio broadcast channels. Default, zero config.
+    #[serde(alias = "local", alias = "memory")]
+    InProcess,
+    /// Redis pub/sub fan-out across application replicas.
+    Redis,
+}
+
+impl ChannelBackend {
+    /// Parse an environment variable value for channel backend selection.
+    #[must_use]
+    pub fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "in_process" | "in-process" | "local" | "memory" => Some(Self::InProcess),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ChannelBackend {
+    fn default() -> Self {
+        Self::InProcess
+    }
+}
+
+/// Real-time channel runtime configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelConfig {
+    /// Runtime backend selection.
+    #[serde(default)]
+    pub backend: ChannelBackend,
+    /// Per-topic broadcast ring buffer capacity.
+    #[serde(default = "default_channel_capacity")]
+    pub capacity: usize,
+    /// Redis backend options.
+    #[serde(default)]
+    pub redis: ChannelRedisConfig,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            backend: ChannelBackend::default(),
+            capacity: default_channel_capacity(),
+            redis: ChannelRedisConfig::default(),
+        }
+    }
+}
+
+/// Redis channel backend configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelRedisConfig {
+    /// Redis URL used when `channels.backend = "redis"`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Redis pub/sub channel prefix.
+    #[serde(default = "default_channels_redis_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for ChannelRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_channels_redis_prefix(),
+        }
+    }
+}
+
+const fn default_channel_capacity() -> usize {
+    32
+}
+
+fn default_channels_redis_prefix() -> String {
+    "autumn:channels".to_owned()
 }
 
 /// Background job runtime configuration.
@@ -943,6 +1032,7 @@ impl AutumnConfig {
         self.apply_health_env_overrides_with_env(env);
         self.apply_cors_env_overrides_with_env(env);
         self.apply_session_env_overrides_with_env(env);
+        self.apply_channels_env_overrides_with_env(env);
         self.apply_jobs_env_overrides_with_env(env);
         self.apply_auth_env_overrides_with_env(env);
         self.apply_security_env_overrides_with_env(env);
@@ -1132,6 +1222,33 @@ impl AutumnConfig {
             env,
             "AUTUMN_SESSION__REDIS__KEY_PREFIX",
             &mut self.session.redis.key_prefix,
+        );
+    }
+
+    fn apply_channels_env_overrides_with_env(&mut self, env: &dyn Env) {
+        if let Ok(val) = env.var("AUTUMN_CHANNELS__BACKEND") {
+            match ChannelBackend::from_env_value(&val) {
+                Some(backend) => self.channels.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_CHANNELS__BACKEND={val:?} is not valid \
+                     (expected in_process or redis), ignoring"
+                ),
+            }
+        }
+        parse_env(
+            env,
+            "AUTUMN_CHANNELS__CAPACITY",
+            &mut self.channels.capacity,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_CHANNELS__REDIS__URL",
+            &mut self.channels.redis.url,
+        );
+        parse_env_string(
+            env,
+            "AUTUMN_CHANNELS__REDIS__KEY_PREFIX",
+            &mut self.channels.redis.key_prefix,
         );
     }
 
@@ -2563,6 +2680,60 @@ path = "/healthz"
             Some("redis://jobs:6379/2")
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
+    }
+
+    #[test]
+    fn channels_defaults_to_in_process_backend() {
+        let config = AutumnConfig::default();
+
+        assert_eq!(config.channels.backend, ChannelBackend::InProcess);
+        assert_eq!(config.channels.capacity, 32);
+        assert_eq!(config.channels.redis.key_prefix, "autumn:channels");
+        assert!(config.channels.redis.url.is_none());
+    }
+
+    #[test]
+    fn channels_env_overrides_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_CHANNELS__BACKEND", "redis")
+            .with("AUTUMN_CHANNELS__CAPACITY", "128")
+            .with("AUTUMN_CHANNELS__REDIS__URL", "redis://channels:6379/4")
+            .with("AUTUMN_CHANNELS__REDIS__KEY_PREFIX", "myapp:channels");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.channels.backend, ChannelBackend::Redis);
+        assert_eq!(config.channels.capacity, 128);
+        assert_eq!(
+            config.channels.redis.url.as_deref(),
+            Some("redis://channels:6379/4")
+        );
+        assert_eq!(config.channels.redis.key_prefix, "myapp:channels");
+    }
+
+    #[test]
+    fn channels_toml_deserializes_redis_backend() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [channels]
+            backend = "redis"
+            capacity = 64
+
+            [channels.redis]
+            url = "redis://localhost:6379/5"
+            key_prefix = "demo:channels"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.channels.backend, ChannelBackend::Redis);
+        assert_eq!(config.channels.capacity, 64);
+        assert_eq!(
+            config.channels.redis.url.as_deref(),
+            Some("redis://localhost:6379/5")
+        );
+        assert_eq!(config.channels.redis.key_prefix, "demo:channels");
     }
 
     #[test]
