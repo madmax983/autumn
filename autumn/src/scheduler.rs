@@ -45,7 +45,7 @@ pub struct SchedulerLease {
 }
 
 impl SchedulerLease {
-    fn local(backend: impl Into<String>, leader_id: impl Into<String>) -> Self {
+    pub(crate) fn local(backend: impl Into<String>, leader_id: impl Into<String>) -> Self {
         Self {
             backend: backend.into(),
             leader_id: leader_id.into(),

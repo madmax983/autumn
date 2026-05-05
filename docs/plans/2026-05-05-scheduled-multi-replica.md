@@ -4,7 +4,7 @@
 
 **Architecture:** Keep current per-process behavior as the default `scheduler.backend = "in_process"`. Add scheduler coordination metadata to `TaskInfo`, a config-driven coordinator abstraction, and a Postgres advisory-lock backend that reuses the existing `Db` pool. Extend `/actuator/tasks` with backend, replica, leader, and last-fired visibility.
 
-**Tech Stack:** Rust 2024, Tokio, Diesel async Postgres pool, `tokio-cron-scheduler`, Axum actuator JSON, proc macros, TDD red/green/refactor.
+**Tech Stack:** Rust 2024, Tokio, Diesel async Postgres pool, Croner, Axum actuator JSON, proc macros, TDD red/green/refactor.
 
 ---
 

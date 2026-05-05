@@ -4,7 +4,7 @@
 //! macro and `tasks![]` collection macro.
 //!
 //! Tasks are registered via [`AppBuilder::tasks`](crate::app::AppBuilder::tasks)
-//! and run alongside the HTTP server using `tokio-cron-scheduler`.
+//! and run alongside the HTTP server using Tokio timers.
 
 use std::future::Future;
 use std::pin::Pin;
