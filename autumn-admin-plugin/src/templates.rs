@@ -1103,7 +1103,10 @@ fn render_pagination(
     let start = if result.total == 0 {
         0
     } else {
-        result.per_page.saturating_mul(current - 1) + 1
+        result
+            .per_page
+            .saturating_mul(current.saturating_sub(1))
+            .saturating_add(1)
     };
     let end = start
         .saturating_add(result.per_page)
@@ -1147,7 +1150,7 @@ fn pagination_range(current: u64, total: u64) -> Vec<u64> {
         pages.push(0); // ellipsis
     }
     let start = current.saturating_sub(1).max(2);
-    let end = (current + 1).min(total - 1);
+    let end = current.saturating_add(1).min(total.saturating_sub(1));
     for p in start..=end {
         pages.push(p);
     }
@@ -1953,6 +1956,28 @@ mod tests {
         assert!(
             js.contains("removeAttribute(\"name\")"),
             "admin.js should strip blank password input names"
+        );
+    }
+
+    #[test]
+    fn pagination_range_start_underflow_protection() {
+        // The start calculation could previously panic in debug mode if current was 0.
+        let result = crate::traits::ListResult {
+            total: 10,
+            per_page: 5,
+            page: 0,
+            records: vec![],
+        };
+        // render_pagination itself expects the request page, which is usually clamped to >=1,
+        // but just to verify it won't panic if it somehow gets 0:
+        let _ = render_pagination(
+            &result,
+            "y",
+            "x",
+            None,
+            crate::traits::SortDirection::Asc,
+            "",
+            "",
         );
     }
 }
