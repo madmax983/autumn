@@ -113,12 +113,18 @@ impl RedisCache {
         })
     }
 
-    fn redis_set(&self, key: &str, bytes: Vec<u8>) {
+    fn redis_set(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
         let prefixed = self.prefixed(key);
         let mut conn = self.manager.clone();
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                let _: Result<(), _> = conn.set(&prefixed, bytes).await;
+                if let Some(ttl) = ttl {
+                    // Round sub-second TTLs up to 1 s to avoid a zero-second expiry.
+                    let secs = ttl.as_secs().max(1);
+                    let _: Result<(), _> = conn.set_ex(&prefixed, bytes, secs).await;
+                } else {
+                    let _: Result<(), _> = conn.set(&prefixed, bytes).await;
+                }
             });
         });
     }
@@ -168,19 +174,23 @@ impl Cache for RedisCache {
             });
 
         if let Some(bytes) = bytes {
-            self.redis_set(key, bytes);
+            // insert_value has no TTL context; use no-expiry SET for these callers.
+            self.redis_set(key, bytes, None);
             debug!(key, "RedisCache: inserted via insert_value");
         }
     }
 
-    /// Stores pre-serialized JSON bytes in Redis.
+    /// Stores pre-serialized JSON bytes in Redis, applying the TTL when provided.
     ///
     /// This is the primary write path for `#[cached]`-annotated functions (via
     /// [`autumn_web::cache::insert_cached`]). It handles all `serde::Serialize`
     /// types, including structs and collections that `insert_value` cannot
     /// serialize from an erased `Arc<dyn Any>`.
-    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>) {
-        self.redis_set(key, bytes);
+    ///
+    /// When `ttl` is `Some`, the entry is stored with `SET EX` so Redis expires
+    /// it automatically — matching the TTL declared on `#[cached(ttl = "…")]`.
+    fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
+        self.redis_set(key, bytes, ttl);
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
     }
 
@@ -285,6 +295,7 @@ mod tests {
     use testcontainers_modules::redis::Redis as RedisImage;
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_cache_insert_get_invalidate() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
@@ -293,7 +304,7 @@ mod tests {
         let cache = RedisCache::connect(&url, "test").await.unwrap();
 
         // insert_cached serializes via serde_json and stores via insert_raw_bytes
-        insert_cached(&cache, "hello", "world".to_string());
+        insert_cached(&cache, "hello", "world".to_string(), None);
 
         // get_value returns RawCacheBytes wrapping the JSON
         let raw = cache.get_value("hello").expect("should be present");
@@ -311,6 +322,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_cache_cross_replica_invalidation() {
         let container = RedisImage::default().start().await.unwrap();
         let port = container.get_host_port_ipv4(6379).await.unwrap();
@@ -322,7 +334,7 @@ mod tests {
 
         // A writes via insert_cached (the path used by #[cached])
         let start = std::time::Instant::now();
-        insert_cached(&replica_a, "key", "value".to_string());
+        insert_cached(&replica_a, "key", "value".to_string(), None);
 
         // B can read it via get_cached and gets the correctly-typed value
         let seen: Option<String> = get_cached(&replica_b, "key");
@@ -347,6 +359,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
     async fn redis_cache_serde_struct_round_trip() {
         #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
         struct Item {
@@ -365,7 +378,7 @@ mod tests {
             id: 1,
             name: "widget".into(),
         };
-        insert_cached(&cache_a, "item:1", item.clone());
+        insert_cached(&cache_a, "item:1", item.clone(), None);
 
         // Same replica
         let retrieved: Option<Item> = get_cached(&cache_a, "item:1");

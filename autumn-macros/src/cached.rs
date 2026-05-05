@@ -115,8 +115,11 @@ fn generate_cache_body(
         static __AUTUMN_CACHE: ::std::sync::OnceLock<
             ::autumn_web::cache::MokaCache
         > = ::std::sync::OnceLock::new();
+        // Evaluate TTL once; Duration is Copy so it can be used for both
+        // the Moka initializer and the Redis insert call.
+        let __autumn_ttl: ::std::option::Option<::std::time::Duration> = #ttl_expr;
         let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
-            ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
+            ::autumn_web::cache::MokaCache::new(#max_expr, __autumn_ttl)
         });
         // Use the process-level shared backend when registered, otherwise fall
         // back to the per-function Moka store so zero-config local dev still works.
@@ -137,7 +140,7 @@ fn generate_cache_body(
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
+                    ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl);
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -150,7 +153,7 @@ fn generate_cache_body(
                 return __autumn_cached;
             }
             let __autumn_result = #compute;
-            ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
+            ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl);
             __autumn_result
         }
     }

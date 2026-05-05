@@ -137,8 +137,12 @@ pub trait Cache: Send + Sync + 'static {
     /// process boundaries (e.g. Redis). The default is a no-op; in-process
     /// backends store values via [`insert_value`] instead.
     ///
+    /// `ttl` carries the same time-to-live that was declared on the
+    /// `#[cached(ttl = "…")]` attribute so backends can apply native expiry
+    /// (e.g. Redis `SET EX`). `None` means no expiry.
+    ///
     /// [`insert_value`]: Cache::insert_value
-    fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>) {}
+    fn insert_raw_bytes(&self, _key: &str, _bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {}
 }
 
 // ── Typed convenience functions ──────────────────────────────────────
@@ -193,7 +197,12 @@ where
 /// [`Cache::insert_raw_bytes`] (for cross-replica backends like Redis). This
 /// is what the `#[cached]` macro uses so that the stored value is accessible
 /// both within the same process and on other replicas.
-pub fn insert_cached<V>(cache: &dyn Cache, key: &str, value: V)
+///
+/// `ttl` is forwarded verbatim to [`Cache::insert_raw_bytes`] so backends
+/// like Redis can apply a native entry expiry (e.g. `SET EX`). In-process
+/// backends (Moka) manage TTL via the per-function static cache instance
+/// and ignore this parameter.
+pub fn insert_cached<V>(cache: &dyn Cache, key: &str, value: V, ttl: Option<std::time::Duration>)
 where
     V: Clone + serde::Serialize + Send + Sync + 'static,
 {
@@ -201,7 +210,7 @@ where
     cache.insert_value(key, Arc::new(value.clone()));
     // Serialized path (RedisCache, any cross-replica backend)
     if let Ok(bytes) = serde_json::to_vec(&value) {
-        cache.insert_raw_bytes(key, bytes);
+        cache.insert_raw_bytes(key, bytes, ttl);
     }
 }
 
