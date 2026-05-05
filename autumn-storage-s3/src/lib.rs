@@ -74,6 +74,10 @@ pub enum S3BlobStoreError {
 struct S3Options {
     provider_id: String,
     bucket: String,
+    /// When set, the scheme+authority of SDK-generated presigned URLs is
+    /// replaced with this base so end-users receive public-facing links even
+    /// when the S3 API endpoint is private/internal.
+    public_base_url: Option<String>,
 }
 
 /// S3-compatible [`BlobStore`](autumn_web::storage::BlobStore) backed by
@@ -165,6 +169,7 @@ impl S3BlobStore {
             options: Arc::new(S3Options {
                 provider_id: "s3".to_owned(),
                 bucket,
+                public_base_url: cfg.public_base_url.clone(),
             }),
         })
     }
@@ -477,9 +482,38 @@ impl BlobStore for S3BlobStore {
                 .presigned(presigning)
                 .await
                 .map_err(|e| BlobStoreError::backend(e.to_string()))?;
-            Ok(req.uri().to_string())
+            let uri = req.uri().to_string();
+            if let Some(ref base) = self.options.public_base_url {
+                Ok(rewrite_url_authority(&uri, base))
+            } else {
+                Ok(uri)
+            }
         })
     }
+}
+
+/// Replace the scheme+authority of `url` with `public_base`, keeping the
+/// path and query string intact.
+///
+/// ```text
+/// rewrite_url_authority(
+///     "https://internal:9000/bucket/key?sig=...",
+///     "https://cdn.example.com",
+/// ) == "https://cdn.example.com/bucket/key?sig=..."
+/// ```
+fn rewrite_url_authority(url: &str, public_base: &str) -> String {
+    // Find the first '/' that begins the path, i.e. the one after the
+    // scheme+authority (`https://host:port/…`). If there is no `://`, treat
+    // the whole input as a path and just prepend the base.
+    let path_start = url
+        .find("://")
+        .and_then(|scheme_end| url[scheme_end + 3..].find('/').map(|i| scheme_end + 3 + i))
+        .unwrap_or(0);
+    format!(
+        "{}{}",
+        public_base.trim_end_matches('/'),
+        &url[path_start..]
+    )
 }
 
 #[cfg(test)]
@@ -638,6 +672,37 @@ mod tests {
             },
         ))
         .await;
+    }
+
+    #[test]
+    fn rewrite_url_authority_replaces_host() {
+        assert_eq!(
+            rewrite_url_authority(
+                "https://internal:9000/bucket/avatars/42.bin?X-Amz-Algo=foo&sig=bar",
+                "https://cdn.example.com",
+            ),
+            "https://cdn.example.com/bucket/avatars/42.bin?X-Amz-Algo=foo&sig=bar"
+        );
+    }
+
+    #[test]
+    fn rewrite_url_authority_strips_trailing_slash_from_base() {
+        assert_eq!(
+            rewrite_url_authority(
+                "https://internal/bucket/key?sig=x",
+                "https://public.example.com/",
+            ),
+            "https://public.example.com/bucket/key?sig=x"
+        );
+    }
+
+    #[test]
+    fn rewrite_url_authority_no_op_without_scheme() {
+        let url = "/bucket/key?sig=x";
+        assert_eq!(
+            rewrite_url_authority(url, "https://cdn.example.com"),
+            "https://cdn.example.com/bucket/key?sig=x"
+        );
     }
 
     #[test]
