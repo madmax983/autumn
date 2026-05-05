@@ -35,7 +35,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
+use syn::parse::{Parse, ParseStream, Parser as _};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
@@ -477,7 +477,7 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
 }
 
 /// Map a short Rust primitive name to its JSON-schema `type` keyword.
-fn primitive_json_type(name: &str) -> Option<&'static str> {
+pub(crate) fn primitive_json_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "String" | "str" => "string",
         "bool" => "boolean",
@@ -490,11 +490,87 @@ fn primitive_json_type(name: &str) -> Option<&'static str> {
 }
 
 /// Return the final identifier in a type's path (e.g. `foo::Bar` → `"Bar"`).
-fn last_segment_name(ty: &syn::Type) -> Option<String> {
+pub(crate) fn last_segment_name(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
         syn::Type::Reference(r) => last_segment_name(&r.elem),
         _ => None,
+    }
+}
+
+/// Inspect the handler's parameter list for `Query<T>` query-string extractors.
+///
+/// Returns `Some(tokens)` producing a `SchemaEntry` initializer when a
+/// `Query<T>` parameter is found, `None` otherwise. Only the first `Query`
+/// extractor is used — multiple `Query<T>` parameters are uncommon and the
+/// first one captures the intent.
+pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
+    for arg in &input_fn.sig.inputs {
+        let syn::FnArg::Typed(pat) = arg else {
+            continue;
+        };
+        if let Some(inner) = unwrap_single_generic(&pat.ty, "Query") {
+            return Some(schema_entry_for_type(&inner));
+        }
+    }
+    None
+}
+
+/// Detect `#[secured]` on a handler and return `(secured, required_roles)`.
+///
+/// Two detection strategies:
+/// 1. `#[secured]` still in attrs (route macro is outermost; secured is below it).
+/// 2. `__autumn_session` param present (secured was above the route macro and
+///    already expanded its body — roles are not recoverable in this case).
+pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
+    // Case 1 — #[secured] visible as a remaining attribute.
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("secured") {
+            let roles = extract_secured_roles(attr);
+            let roles_tokens = emit_static_str_slice(&roles);
+            return (true, roles_tokens);
+        }
+    }
+
+    // Case 2 — #[secured] was above the route macro and already expanded;
+    // detect the injected `__autumn_session` parameter.
+    let has_session = input_fn.sig.inputs.iter().any(|param| {
+        if let syn::FnArg::Typed(pt) = param {
+            if let syn::Pat::Ident(pi) = pt.pat.as_ref() {
+                return pi.ident == "__autumn_session";
+            }
+        }
+        false
+    });
+    if has_session {
+        return (true, quote! { &[] });
+    }
+
+    (false, quote! { &[] })
+}
+
+fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return Vec::new();
+    };
+    let roles: syn::Result<syn::punctuated::Punctuated<syn::LitStr, syn::Token![,]>> =
+        syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone());
+    match roles {
+        Ok(r) => r.iter().map(|s| s.value()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn emit_static_str_slice(items: &[String]) -> TokenStream {
+    if items.is_empty() {
+        quote! { &[] }
+    } else {
+        let lits: Vec<_> = items
+            .iter()
+            .map(|s| LitStr::new(s, Span::call_site()))
+            .collect();
+        quote! { &[#(#lits),*] }
     }
 }
 

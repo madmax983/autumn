@@ -17,6 +17,7 @@ mod schema;
 mod tasks;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
+use autumn_web::openapi::OpenApiConfig;
 use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
@@ -38,6 +39,7 @@ async fn main() {
             repositories::bookmark_api_delete,
         ])
         .tasks(tasks![tasks::check_links])
+        .openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))
         .run()
         .await;
 }

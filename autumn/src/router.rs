@@ -1939,7 +1939,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/v3/api-docs")
+                    .uri("/openapi.json")
                     .body(Body::empty())
                     .unwrap(),
             )

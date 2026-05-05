@@ -5,7 +5,7 @@ version.workspace = true
 publish = false
 
 [dependencies]
-autumn-web = { path = "../../autumn" }
+autumn-web = { path = "../../autumn", features = ["openapi"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }

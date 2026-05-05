@@ -100,3 +100,63 @@ fn delete_route_has_no_body_and_uses_204() {
     assert!(route.api_doc.request_body.is_none());
     assert!(route.api_doc.response.is_none());
 }
+
+#[test]
+fn model_impl_open_api_schema_returns_object_type() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = Widget::schema();
+    assert_eq!(schema["type"], "object");
+}
+
+#[test]
+fn model_schema_includes_all_fields_as_properties() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = Widget::schema();
+    let props = schema["properties"].as_object().expect("properties must be an object");
+    assert!(props.contains_key("id"), "should have id property");
+    assert!(props.contains_key("name"), "should have name property");
+}
+
+#[test]
+fn model_schema_maps_i64_to_integer() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = Widget::schema();
+    assert_eq!(schema["properties"]["id"]["type"], "integer");
+}
+
+#[test]
+fn model_schema_maps_string_to_string_type() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = Widget::schema();
+    assert_eq!(schema["properties"]["name"]["type"], "string");
+}
+
+#[test]
+fn model_schema_lists_non_optional_fields_as_required() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = Widget::schema();
+    let required = schema["required"].as_array().expect("required must be an array");
+    let req_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+    assert!(req_names.contains(&"id"));
+    assert!(req_names.contains(&"name"));
+}
+
+#[test]
+fn new_model_schema_excludes_id_field() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = NewWidget::schema();
+    let props = schema["properties"].as_object().expect("properties");
+    assert!(!props.contains_key("id"), "NewWidget should not have id");
+    assert!(props.contains_key("name"));
+}
+
+#[test]
+fn update_model_schema_has_no_required_fields() {
+    use autumn_web::openapi::OpenApiSchema;
+    let schema = UpdateWidget::schema();
+    assert!(
+        schema["required"].is_null(),
+        "UpdateWidget should have no required fields, got: {:?}",
+        schema["required"]
+    );
+}
