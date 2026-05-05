@@ -166,6 +166,16 @@ impl ChannelMetrics {
             .expect("channel metrics lock poisoned")
             .clone()
     }
+
+    fn remove_topics(&self, topics: &HashSet<String>) {
+        if topics.is_empty() {
+            return;
+        }
+
+        let mut counters = self.counters.lock().expect("channel metrics lock poisoned");
+        counters.retain(|topic, _| !topics.contains(topic));
+        drop(counters);
+    }
 }
 
 /// Error returned when a channel backend cannot accept a publish request.
@@ -470,7 +480,17 @@ impl ChannelsBackend for LocalChannelsBackend {
 
     fn gc(&self) {
         let mut registry = self.inner.registry.lock().expect("channels lock poisoned");
-        registry.retain(|_, tx| tx.receiver_count() > 0 || Arc::strong_count(tx) > 1);
+        let mut removed_topics = HashSet::new();
+        registry.retain(|topic, tx| {
+            let keep = tx.receiver_count() > 0 || Arc::strong_count(tx) > 1;
+            if !keep {
+                removed_topics.insert(topic.clone());
+            }
+            keep
+        });
+        drop(registry);
+
+        self.inner.metrics.remove_topics(&removed_topics);
     }
 
     fn snapshot(&self) -> HashMap<String, ChannelStats> {
@@ -1099,6 +1119,23 @@ mod tests {
         assert_eq!(stats.lifetime_publish_count, 0);
         assert_eq!(stats.dropped_count, 1);
         assert_eq!(stats.lagged_count, 0);
+    }
+
+    #[test]
+    fn gc_prunes_metrics_for_removed_idle_topics() {
+        let channels = Channels::new(16);
+        channels
+            .publish("tenant:gone", "one")
+            .expect("publish with no subscribers should only record a drop");
+
+        let before_gc = channels.snapshot();
+        assert!(before_gc.contains_key("tenant:gone"));
+
+        channels.gc();
+
+        let after_gc = channels.snapshot();
+        assert!(!after_gc.contains_key("tenant:gone"));
+        assert_eq!(channels.channel_count(), 0);
     }
 
     #[cfg(feature = "redis")]
