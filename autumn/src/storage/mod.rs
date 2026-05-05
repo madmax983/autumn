@@ -1,15 +1,17 @@
 //! Pluggable file storage backends for Autumn applications.
 //!
-//! This module provides a [`BlobStore`] trait abstraction with two
-//! built-in backends:
+//! This module provides a [`BlobStore`] trait abstraction with one
+//! built-in backend:
 //!
 //! - **[`Local`](local::LocalBlobStore)** — writes to a configurable root
 //!   directory and serves bytes through an autumn-mounted route at
 //!   `[storage.local].mount_path` (default `/_blobs`). URLs are signed
 //!   with HMAC-SHA256 and time-bounded.
-//! - **`S3`** (gated behind `storage-s3`) — talks to
-//!   any S3-compatible endpoint (AWS S3, Cloudflare R2, `MinIO`,
-//!   `DigitalOcean` Spaces, Wasabi) and emits real S3 presigned URLs.
+//!
+//! For S3-compatible storage (AWS S3, Cloudflare R2, `MinIO`, `DigitalOcean`
+//! Spaces, Wasabi) add the `autumn-storage-s3` crate and call
+//! `.with_blob_store(S3BlobStore::from_config(&config.storage.s3).await?)`
+//! on your [`AppBuilder`](crate::app::AppBuilder).
 //!
 //! ## Quick start
 //!
@@ -62,8 +64,6 @@ pub mod blob;
 pub mod config;
 pub mod local;
 pub mod migrations;
-#[cfg(feature = "storage-s3")]
-pub mod s3;
 
 pub use blob::{Blob, BlobMeta};
 pub use config::{
@@ -174,9 +174,9 @@ impl BlobStoreError {
 
 /// Pluggable file-storage backend.
 ///
-/// Implement this trait to add new backends. Two are provided
-/// out of the box: [`LocalBlobStore`] and (with feature `storage-s3`)
-/// `s3::S3BlobStore`.
+/// Implement this trait to add new backends. The built-in backend is
+/// [`LocalBlobStore`]. S3-compatible storage is provided by the
+/// `autumn-storage-s3` crate.
 ///
 /// The trait is **dyn-safe** so apps can hold `Arc<dyn BlobStore>` and
 /// swap backends at runtime — for example, choosing local in tests and

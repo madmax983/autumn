@@ -24,11 +24,14 @@ primitive is fine.
 
 ## Quick start
 
-Enable the `storage` cargo feature on `autumn-web`:
+Enable the `storage` feature on `autumn-web` (for the Local backend and the
+`BlobStore` trait). For S3-compatible production storage also add
+`autumn-storage-s3`:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.4", features = ["storage", "multipart"] }
+autumn-web       = { version = "0.4", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.3"   # only needed when storage.backend = "s3"
 ```
 
 The framework gives you a working `Local` backend in `dev` out of the
@@ -205,6 +208,60 @@ Before flipping a real app to `backend = "s3"`:
 - [ ] You're using a region that's geographically near your app
       tier (latency on every `put` / `get`).
 
+## Using the S3 backend
+
+Add `autumn-storage-s3` to your `Cargo.toml` and wire it up in `main`:
+
+```toml
+[dependencies]
+autumn-web        = { version = "0.4", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.3"
+```
+
+```rust,ignore
+use autumn_storage_s3::S3BlobStore;
+
+#[tokio::main]
+async fn main() {
+    let config = autumn_web::config::TomlEnvConfigLoader::new()
+        .load()
+        .await
+        .expect("config");
+
+    let store = S3BlobStore::from_config(&config.storage.s3)
+        .await
+        .expect("S3 store");
+
+    autumn_web::app()
+        .routes(routes![...])
+        .with_blob_store(store)
+        .run()
+        .await;
+}
+```
+
+And in `autumn.toml`:
+
+```toml
+[storage]
+backend = "s3"
+
+[storage.s3]
+bucket = "my-app-uploads"
+region = "us-east-1"
+access_key_id_env = "AWS_ACCESS_KEY_ID"
+secret_access_key_env = "AWS_SECRET_ACCESS_KEY"
+```
+
+`S3BlobStore::from_config` resolves credentials from the named
+environment variables, or falls back to the AWS default chain
+(`~/.aws/credentials`, instance-metadata, ECS task role, etc.) when
+neither `access_key_id_env` nor `secret_access_key_env` is set.
+
+The S3 plugin lives in its own crate (`autumn-storage-s3`) so apps
+that don't need S3 don't pull in the AWS SDK tree. Peer plugins for
+other providers (GCS, Azure, B2) follow the same pattern.
+
 ## What's out of scope (for now)
 
 - **Image processing / resizing.** Track separately. `image` and
@@ -213,8 +270,8 @@ Before flipping a real app to `backend = "s3"`:
   the first slice keeps bytes flowing through the autumn process so
   the multipart MIME / size-cap policies still apply.
 - **Native non-S3 backends (GCS, Azure Blob, B2 native).** Anyone
-  whose object store speaks S3 is covered by `storage-s3`. Native
-  backends are a future feature-flagged extension.
+  whose object store speaks S3 is covered by `autumn-storage-s3`. Native
+  backends are a future plugin-crate extension.
 - **Antivirus / content moderation.** Compose a Tower middleware on
   top of `BlobStore` for this.
 - **Orphan-blob garbage collection.** Document: lifecycle is the
@@ -222,18 +279,3 @@ Before flipping a real app to `backend = "s3"`:
   `harvest`-backed sweeper can come later.
 - **Migration tooling for moving data between backends.** Not
   framework's job today.
-
-## Status: S3 backend
-
-Acceptance for issue #494 ships the trait surface, the Local backend
-with HMAC-signed URLs, the multipart integration, and the
-configuration story. The `storage-s3` cargo feature builds, the
-[`S3BlobStore`](../../autumn/src/storage/s3.rs) shell exists, but the
-on-the-wire SDK calls are not yet wired up — operations return
-`BlobStoreError::Unsupported` so applications fail loudly rather than
-silently dropping bytes.
-
-Hooking up an SDK (engineering's call between `aws-sdk-s3` and
-`rust-s3`) is a follow-up. The trait surface is designed so the swap
-is local to `autumn/src/storage/s3.rs`; nothing downstream of the
-trait needs to change.

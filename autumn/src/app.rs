@@ -91,6 +91,8 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        #[cfg(feature = "storage")]
+        blob_store: None,
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
@@ -213,6 +215,11 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Custom blob store installed via
+    /// [`AppBuilder::with_blob_store`]. When `Some`, `preflight_storage`
+    /// is skipped and this store is installed directly onto `AppState`.
+    #[cfg(feature = "storage")]
+    blob_store: Option<crate::storage::SharedBlobStore>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -1010,6 +1017,43 @@ impl AppBuilder {
         self
     }
 
+    /// Install a custom [`BlobStore`](crate::storage::BlobStore),
+    /// bypassing the config-driven `local`/`s3` backend selection.
+    ///
+    /// The typical use case is the `autumn-storage-s3` plugin:
+    ///
+    /// ```rust,ignore
+    /// use autumn_storage_s3::S3BlobStore;
+    ///
+    /// # async fn example() {
+    /// let config = autumn_web::config::TomlEnvConfigLoader::new()
+    ///     .load().await.unwrap();
+    /// let store = S3BlobStore::from_config(&config.storage.s3)
+    ///     .await.unwrap();
+    /// autumn_web::app()
+    ///     .with_blob_store(store)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// Emits a `tracing::warn!` if a store was already installed (last
+    /// call wins).
+    #[cfg(feature = "storage")]
+    #[must_use]
+    pub fn with_blob_store<B>(mut self, store: B) -> Self
+    where
+        B: crate::storage::BlobStore,
+    {
+        if self.blob_store.is_some() {
+            tracing::warn!(
+                "blob store replaced; the previously-installed store was overwritten"
+            );
+        }
+        self.blob_store = Some(std::sync::Arc::new(store));
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -1233,6 +1277,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "storage")]
+            blob_store,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
@@ -1281,11 +1327,14 @@ impl AppBuilder {
         // 4d. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
         // root) and the storage code may `process::exit(1)` on failure
-        // (unwritable root, or `storage.backend = "s3"` while the SDK
-        // wiring is still tracked in #530). Doing it before migrations
-        // means a doomed boot can't mutate the DB schema first.
+        // (unwritable root, or `storage.backend = "s3"` with no plugin).
+        // Doing it before migrations means a doomed boot can't mutate
+        // the DB schema first.
+        // A custom store installed via `.with_blob_store(...)` bypasses
+        // config-driven instantiation entirely (no IO, no fail-fast).
         #[cfg(feature = "storage")]
-        let storage_bootstrap = preflight_storage(&config);
+        let storage_bootstrap = blob_store
+            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
@@ -1497,7 +1546,10 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
+            #[cfg(feature = "openapi")]
             scoped_groups,
+            #[cfg(not(feature = "openapi"))]
+            scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -1513,6 +1565,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "storage")]
+            blob_store,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger: _,
@@ -1578,9 +1632,11 @@ impl AppBuilder {
         // Static routes can read presigned URLs out of `BlobStoreState`
         // during pre-rendering (e.g. `<img src=blob.url()>`); without
         // the bootstrap they'd 500 during `autumn build` even though
-        // the server path works.
+        // the server path works. A custom store from `.with_blob_store()`
+        // bypasses config-driven instantiation.
         #[cfg(feature = "storage")]
-        let storage_bootstrap = preflight_storage(&config);
+        let storage_bootstrap = blob_store
+            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
@@ -1790,6 +1846,8 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "storage")]
+            blob_store,
             audit_logger,
             #[cfg(feature = "i18n")]
             i18n_bundle,
@@ -1829,7 +1887,8 @@ impl AppBuilder {
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
         #[cfg(feature = "storage")]
-        let storage_bootstrap = preflight_storage(&config);
+        let storage_bootstrap = blob_store
+            .map_or_else(|| preflight_storage(&config), |store| Some(StorageBootstrap { store, serving: None }));
 
         #[cfg(feature = "db")]
         let pool = setup_database(&config, migrations, pool_provider_factory)
@@ -2441,48 +2500,17 @@ fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
                 serving: Some(serving),
             })
         }
-        StorageBackendPlan::S3 {
-            provider_id,
-            bucket,
-            region,
-            endpoint,
-            public_base_url,
-            force_path_style,
-            default_url_expiry_secs,
-        } => {
-            // The `storage-s3` shell ships the trait surface and config
-            // story but no on-the-wire SDK — every op returns
-            // `Unsupported`. Booting "successfully" here would let an
-            // app with `storage.backend = "s3"` reach production and
-            // only fail on first upload. Fail-fast instead, the same
-            // way `local`-without-acknowledgement does. Tracked in
-            // https://github.com/madmax983/autumn/issues/530.
-            let _ = (
-                provider_id,
-                bucket,
-                region,
-                endpoint,
-                public_base_url,
-                force_path_style,
-                default_url_expiry_secs,
+        StorageBackendPlan::S3 { .. } => {
+            // `storage.backend = "s3"` requires the `autumn-storage-s3` plugin.
+            // Construct an `S3BlobStore` and register it with `.with_blob_store()`
+            // before calling `.run()` — when you do, the custom store bypasses
+            // this path entirely and `preflight_storage` is never called.
+            tracing::error!(
+                "storage.backend=s3 requires the `autumn-storage-s3` plugin. \
+                 Add it to your Cargo.toml, build an S3BlobStore from your config, \
+                 and call `.with_blob_store(store)` on your AppBuilder. \
+                 Aborting startup."
             );
-            #[cfg(feature = "storage-s3")]
-            {
-                tracing::error!(
-                    "storage.backend=s3 is not yet implemented in autumn-web — \
-                     the storage-s3 stub returns Unsupported on every operation. \
-                     Wait for the autumn-storage-s3 plugin (issue #530), or pick \
-                     storage.backend=local with allow_local_in_production=true \
-                     for single-replica deployments. Aborting startup."
-                );
-            }
-            #[cfg(not(feature = "storage-s3"))]
-            {
-                tracing::error!(
-                    "storage.backend=s3 selected but the `storage-s3` cargo feature \
-                     is not enabled. Aborting startup."
-                );
-            }
             std::process::exit(1);
         }
     }
@@ -5278,6 +5306,79 @@ mod tests {
             let serving = bootstrap.install(&state);
             assert!(serving.is_some());
             assert!(state.extension::<BlobStoreState>().is_some());
+        }
+
+        #[test]
+        fn with_blob_store_stores_custom_store() {
+            use crate::storage::{Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream};
+            use bytes::Bytes;
+            use std::time::Duration;
+
+            struct FakeStore;
+            impl BlobStore for FakeStore {
+                fn provider_id(&self) -> &str { "fake" }
+                fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn put_stream<'a>(&'a self, _k: &'a str, _ct: &'a str, _d: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn delete<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, ()> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn presigned_url<'a>(&'a self, _k: &'a str, _e: Duration) -> BlobFuture<'a, String> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+            }
+
+            let builder = crate::app().with_blob_store(FakeStore);
+            assert!(builder.blob_store.is_some());
+        }
+
+        #[tokio::test]
+        async fn with_blob_store_is_installed_on_state() {
+            use crate::storage::{Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream};
+            use bytes::Bytes;
+            use std::time::Duration;
+
+            struct FakeStore;
+            impl BlobStore for FakeStore {
+                fn provider_id(&self) -> &str { "fake-installed" }
+                fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn put_stream<'a>(&'a self, _k: &'a str, _ct: &'a str, _d: ByteStream<'a>) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn delete<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, ()> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn presigned_url<'a>(&'a self, _k: &'a str, _e: Duration) -> BlobFuture<'a, String> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+            }
+
+            let builder = crate::app().with_blob_store(FakeStore);
+            let bootstrap = builder.blob_store.map(|store| StorageBootstrap { store, serving: None });
+            let state = AppState::for_test();
+            assert!(state.extension::<BlobStoreState>().is_none());
+            if let Some(b) = bootstrap {
+                b.install(&state);
+            }
+            let installed = state.extension::<BlobStoreState>().expect("store should be installed");
+            assert_eq!(installed.store().provider_id(), "fake-installed");
         }
     }
 
