@@ -143,7 +143,9 @@ fn app_state_set_cache_installs_via_extension_map() {
     assert!(global_cache().is_some(), "global cache must be set");
 
     // set_cache stores via extension map, so state.cache() must find it
-    let retrieved = state.cache().expect("set_cache must make cache() return Some");
+    let retrieved = state
+        .cache()
+        .expect("set_cache must make cache() return Some");
     insert(moka.as_ref(), "x", 7_i32);
     assert_eq!(get::<i32>(retrieved.as_ref(), "x"), Some(7));
 

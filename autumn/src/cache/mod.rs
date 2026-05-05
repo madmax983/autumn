@@ -267,8 +267,6 @@ pub fn make_cache_key<K: Hash>(fn_name: &str, args: &K) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "cache-moka")]
-    use crate::cache::MokaCache;
 
     #[test]
     fn cache_key_deterministic() {
