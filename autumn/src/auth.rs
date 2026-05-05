@@ -1627,6 +1627,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1683,6 +1684,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         // Middleware that inserts a user into extensions
@@ -1747,6 +1749,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1867,6 +1870,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1937,6 +1941,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -2012,6 +2017,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -2083,6 +2089,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -2147,6 +2154,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()

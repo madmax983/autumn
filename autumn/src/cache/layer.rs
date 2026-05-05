@@ -65,6 +65,15 @@ impl CacheResponseLayer {
     pub fn from_shared(store: Arc<dyn Cache>) -> Self {
         Self { store }
     }
+
+    /// Create from the global cache registered in `AppState`.
+    ///
+    /// Returns `None` when no global cache has been registered (i.e. the app
+    /// is running with the default per-function Moka caches only).
+    #[must_use]
+    pub fn from_app(state: &crate::state::AppState) -> Option<Self> {
+        state.cache().map(Self::from_shared)
+    }
 }
 
 impl<S> Layer<S> for CacheResponseLayer {

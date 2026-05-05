@@ -1102,6 +1102,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1147,6 +1148,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         }
     }
 

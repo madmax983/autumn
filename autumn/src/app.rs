@@ -96,6 +96,7 @@ pub fn app() -> AppBuilder {
         channels_backend: None,
         #[cfg(feature = "storage")]
         blob_store: None,
+        cache_backend: None,
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
@@ -227,6 +228,10 @@ pub struct AppBuilder {
     /// is skipped and this store is installed directly onto `AppState`.
     #[cfg(feature = "storage")]
     blob_store: Option<crate::storage::SharedBlobStore>,
+    /// Shared cache backend installed via [`AppBuilder::with_cache_backend`].
+    /// When `Some`, installed onto `AppState` as `shared_cache` before startup
+    /// hooks run.
+    cache_backend: Option<Arc<dyn crate::cache::Cache>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -1091,6 +1096,33 @@ impl AppBuilder {
         self
     }
 
+    /// Register a shared cache backend for the application.
+    ///
+    /// Once registered, `#[cached]` functions will use this backend as their
+    /// primary store (falling back to their per-function Moka cache only if the
+    /// global backend is absent). `CacheResponseLayer::from_app` returns a layer
+    /// wired to this same backend.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_cache_redis::RedisCache;
+    ///
+    /// let cache = RedisCache::connect("redis://redis:6379", "myapp:cache").await?;
+    /// autumn_web::app()
+    ///     .with_cache_backend(cache)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_cache_backend<C: crate::cache::Cache>(mut self, cache: C) -> Self {
+        if self.cache_backend.is_some() {
+            tracing::warn!("cache backend replaced; the previously-installed backend was overwritten");
+        }
+        self.cache_backend = Some(Arc::new(cache) as Arc<dyn crate::cache::Cache>);
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -1318,6 +1350,7 @@ impl AppBuilder {
             channels_backend,
             #[cfg(feature = "storage")]
             blob_store,
+            cache_backend,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
@@ -1411,13 +1444,16 @@ impl AppBuilder {
         validate_repository_api_policies(&all_routes, &scoped_groups, &config);
 
         // 6. Build the router (with optional static-file layer)
-        let state = build_state(
+        let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
             pool,
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(cache) = cache_backend {
+            state.shared_cache = Some(cache);
+        }
         // Apply deferred policy / scope registrations onto the live
         // app state. Done before the router is built so any panic
         // from double-registration surfaces during startup, not
@@ -1627,6 +1663,7 @@ impl AppBuilder {
             channels_backend,
             #[cfg(feature = "storage")]
             blob_store,
+            cache_backend,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger: _,
@@ -1721,6 +1758,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(cache) = cache_backend {
+            state.shared_cache = Some(cache);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
@@ -3608,6 +3648,7 @@ fn build_state(
         policy_registry: crate::authorization::PolicyRegistry::default(),
         forbidden_response: config.security.forbidden_response,
         auth_session_key: config.auth.session_key.clone(),
+        shared_cache: None,
     };
     state.insert_extension(config.clone());
     state
@@ -3823,6 +3864,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         crate::router::build_router(routes, &config, state)
     }
@@ -4276,6 +4318,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -4374,6 +4417,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -4446,6 +4490,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -4731,6 +4776,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -5030,6 +5076,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         crate::router::build_router(routes, config, state)
     }
@@ -5173,6 +5220,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -5214,6 +5262,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -5463,6 +5512,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -5528,6 +5578,7 @@ mod tests {
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");

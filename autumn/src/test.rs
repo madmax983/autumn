@@ -359,6 +359,7 @@ impl TestApp {
                 .forbidden_response_override
                 .unwrap_or(self.config.security.forbidden_response),
             auth_session_key: self.config.auth.session_key.clone(),
+            shared_cache: None,
         };
 
         for register in self.policy_registrations {
