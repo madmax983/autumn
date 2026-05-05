@@ -22,6 +22,6 @@ fn channels_concurrent_subscribe() {
 
         assert_eq!(channels.channel_count(), 1);
         let snapshot = channels.snapshot();
-        assert_eq!(*snapshot.get("test_sub").unwrap(), 0); // No receivers are kept alive
+        assert_eq!(*snapshot.get("test_sub").unwrap(), 0);
     });
 }

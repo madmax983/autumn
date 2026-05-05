@@ -41,8 +41,6 @@ proptest! {
                 let layer = RateLimitLayer::from_config(&config);
                 let mut svc = layer.layer(MockService);
 
-                // Allow request builder to fail if header value is totally invalid (e.g. \0)
-                // but if it builds, the rate limiter should not panic.
                 let mut req_builder = Request::builder();
                 if let Ok(hv) = axum::http::HeaderValue::from_str(&ip) {
                     req_builder = req_builder.header("X-Forwarded-For", hv);

@@ -32,7 +32,6 @@ fn metrics_layer_concurrent_drops() {
         let t1 = thread::spawn(move || {
             let req = Request::builder().uri("/").body(Body::empty()).unwrap();
             let fut = s1.call(req);
-            // Drop it immediately
             drop(fut);
         });
 
