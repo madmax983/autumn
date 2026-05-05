@@ -241,13 +241,15 @@ impl AppState {
 
     /// Returns the registered global cache backend, if any.
     ///
-    /// Checks `shared_cache` (set at build time) first, then the extension map
-    /// (set at runtime by startup hooks via [`Self::set_cache`]).
+    /// Checks the extension map first (populated at runtime by startup hooks
+    /// via [`Self::set_cache`]) so that a plugin replacing a build-time backend
+    /// is always visible. Falls back to `shared_cache` (set at build time via
+    /// [`Self::with_cache`]).
     #[must_use]
     pub fn cache(&self) -> Option<Arc<dyn Cache>> {
-        self.shared_cache
-            .clone()
-            .or_else(|| self.extension::<GlobalCacheEntry>().map(|e| e.0.clone()))
+        self.extension::<GlobalCacheEntry>()
+            .map(|e| e.0.clone())
+            .or_else(|| self.shared_cache.clone())
     }
 
     /// Register a global cache backend (builder / test helper, build-time).

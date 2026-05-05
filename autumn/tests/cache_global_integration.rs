@@ -152,6 +152,38 @@ fn app_state_set_cache_installs_via_extension_map() {
     clear_global_cache();
 }
 
+// ── set_cache overrides build-time with_cache ─────────────────────────────────
+
+#[test]
+fn set_cache_overrides_build_time_cache() {
+    use autumn_web::cache::clear_global_cache;
+    clear_global_cache();
+
+    let build_time = Arc::new(MokaCache::new(10, None));
+    let state = AppState::for_test().with_cache(build_time.clone() as Arc<dyn Cache>);
+
+    // Initially cache() returns the build-time backend.
+    insert(build_time.as_ref(), "k", "build".to_string());
+    assert_eq!(
+        get::<String>(state.cache().unwrap().as_ref(), "k"),
+        Some("build".to_string())
+    );
+
+    // A startup hook replaces it via set_cache.
+    let runtime = Arc::new(MokaCache::new(10, None));
+    insert(runtime.as_ref(), "k", "runtime".to_string());
+    state.set_cache(runtime as Arc<dyn Cache>);
+
+    // cache() must now return the runtime backend, not the build-time one.
+    assert_eq!(
+        get::<String>(state.cache().unwrap().as_ref(), "k"),
+        Some("runtime".to_string()),
+        "set_cache must take priority over build-time with_cache"
+    );
+
+    clear_global_cache();
+}
+
 // ── CacheConfig deserialization ───────────────────────────────────────────────
 
 #[test]
