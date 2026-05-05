@@ -1497,7 +1497,7 @@ impl AppBuilder {
             jobs: _,
             static_metas,
             exception_filters: _,
-            scoped_groups: _,
+            scoped_groups,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -1534,10 +1534,23 @@ impl AppBuilder {
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         // Snapshot ApiDocs before all_routes is moved into the router builder.
-        // The OpenAPI spec write (below) needs these after the router is built.
+        // Includes top-level routes and scoped groups (with prefixed paths) so
+        // the emitted dist/openapi.json matches what the runtime spec serves.
         #[cfg(feature = "openapi")]
-        let api_docs_snapshot: Vec<crate::openapi::ApiDoc> =
-            all_routes.iter().map(|r| r.api_doc.clone()).collect();
+        let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
+            let mut docs: Vec<crate::openapi::ApiDoc> =
+                all_routes.iter().map(|r| r.api_doc.clone()).collect();
+            for group in &scoped_groups {
+                for route in &group.routes {
+                    let mut doc = route.api_doc.clone();
+                    // Prepend the scope prefix so the spec reflects the full path.
+                    let prefixed = format!("{}{}", group.prefix, doc.path);
+                    doc.path = Box::leak(prefixed.into_boxed_str());
+                    docs.push(doc);
+                }
+            }
+            docs
+        };
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");

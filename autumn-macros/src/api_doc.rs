@@ -523,9 +523,15 @@ pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
 /// 2. `__autumn_session` param present (secured was above the route macro and
 ///    already expanded its body — roles are not recoverable in this case).
 pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
-    // Case 1 — #[secured] visible as a remaining attribute.
+    // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
     for attr in &input_fn.attrs {
-        if attr.path().is_ident("secured") {
+        if attr.path().is_ident("secured")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "secured")
+        {
             let roles = extract_secured_roles(attr);
             let roles_tokens = emit_static_str_slice(&roles);
             return (true, roles_tokens);
