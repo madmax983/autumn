@@ -4219,10 +4219,15 @@ mod tests {
         }
 
         let builder = app().with_mail_delivery_queue(NoopQueue);
-        assert!(
-            builder.mail_delivery_queue_factory.is_some(),
-            "with_mail_delivery_queue should store a factory on the builder"
-        );
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("with_mail_delivery_queue should store a factory on the builder");
+
+        // Invoke the trivial wrapper closure built by with_mail_delivery_queue
+        // and verify it returns the wrapped queue successfully.
+        let state = AppState::for_test();
+        let queue = factory(&state).expect("trivial factory should produce the queue");
+        assert!(Arc::strong_count(&queue) >= 1);
     }
 
     #[cfg(feature = "mail")]

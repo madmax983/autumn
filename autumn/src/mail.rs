@@ -1297,6 +1297,25 @@ mod tests {
         assert_eq!(received.subject, "Hi");
     }
 
+    #[test]
+    fn mailer_with_transport_starts_without_delivery_queue() {
+        let mailer = Mailer::with_transport(NoopTransport);
+        assert!(
+            !mailer.has_durable_delivery_queue(),
+            "with_transport should default to no durable queue"
+        );
+    }
+
+    struct NoopTransport;
+    impl MailTransport for NoopTransport {
+        fn send<'a>(
+            &'a self,
+            _mail: Mail,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     #[tokio::test]
     async fn deliver_later_is_noop_when_transport_disabled_even_with_queue() {
         // The Mailer-level builder lets callers attach a queue *and* pick
