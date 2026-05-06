@@ -273,10 +273,7 @@ pub struct AppBuilder {
 /// [`AppState`].
 #[cfg(feature = "mail")]
 pub(crate) type MailDeliveryQueueFactory = Box<
-    dyn FnOnce(
-            &AppState,
-        ) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>>
-        + Send,
+    dyn FnOnce(&AppState) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>> + Send,
 >;
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -1539,9 +1536,8 @@ impl AppBuilder {
         {
             if let Some(factory) = mail_delivery_queue_factory {
                 match factory(&state) {
-                    Ok(queue) => state.insert_extension(
-                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
-                    ),
+                    Ok(queue) => state
+                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
                     Err(error) => {
                         tracing::error!(error = %error, "mail delivery queue factory failed");
                         std::process::exit(1);
@@ -1851,9 +1847,8 @@ impl AppBuilder {
         {
             if let Some(factory) = mail_delivery_queue_factory {
                 match factory(&state) {
-                    Ok(queue) => state.insert_extension(
-                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
-                    ),
+                    Ok(queue) => state
+                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
                     Err(error) => {
                         eprintln!("mail delivery queue factory failed: {error}");
                         std::process::exit(1);
@@ -2143,9 +2138,8 @@ impl AppBuilder {
         {
             if let Some(factory) = mail_delivery_queue_factory {
                 match factory(&state) {
-                    Ok(queue) => state.insert_extension(
-                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
-                    ),
+                    Ok(queue) => state
+                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
                     Err(error) => {
                         eprintln!("mail delivery queue factory failed: {error}");
                         std::process::exit(1);
@@ -4306,9 +4300,7 @@ mod tests {
         }
 
         let builder = app().with_mail_delivery_queue_factory(|_state| {
-            Err::<NoopQueue, _>(crate::AutumnError::service_unavailable_msg(
-                "factory boom",
-            ))
+            Err::<NoopQueue, _>(crate::AutumnError::service_unavailable_msg("factory boom"))
         });
 
         let factory = builder
