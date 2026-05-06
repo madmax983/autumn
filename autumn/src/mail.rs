@@ -881,13 +881,18 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
 pub(crate) fn install_mailer(state: &AppState, config: &MailConfig) -> AutumnResult<()> {
     let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
 
-    let queue_handle = state.extension::<MailDeliveryQueueHandle>();
-    if let Some(handle) = queue_handle.as_ref() {
-        mailer.delivery_queue = Some(Arc::clone(handle.inner()));
-    }
-
     let in_production = matches!(state.profile(), "prod" | "production");
     let transport_sends_mail = config.transport != Transport::Disabled;
+
+    // Honor the disabled transport contract: if the operator turned mail off
+    // for this profile (tests, review apps, etc.), `deliver_later` must also
+    // be a no-op — even when a durable queue was registered globally.
+    if transport_sends_mail {
+        let queue_handle = state.extension::<MailDeliveryQueueHandle>();
+        if let Some(handle) = queue_handle.as_ref() {
+            mailer.delivery_queue = Some(Arc::clone(handle.inner()));
+        }
+    }
 
     if in_production && transport_sends_mail {
         let has_durable_queue = mailer.delivery_queue.is_some();
@@ -1318,6 +1323,27 @@ mod tests {
         assert!(
             installed.has_durable_delivery_queue(),
             "registered queue handle should be attached to the installed mailer"
+        );
+    }
+
+    #[test]
+    fn install_mailer_does_not_attach_queue_when_transport_disabled() {
+        // When mail.transport = "disabled" the operator has explicitly turned
+        // mail off for this profile (tests, review apps, etc.). A globally
+        // registered queue must not turn deliver_later back into a durable
+        // persist; it should remain a no-op.
+        let state = crate::AppState::for_test().with_profile("dev");
+        state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
+        let config = MailConfig::default(); // transport = Disabled
+
+        install_mailer(&state, &config).expect("disabled transport should install cleanly");
+
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+        assert!(
+            !installed.has_durable_delivery_queue(),
+            "disabled transport must suppress queue attachment so deliver_later is a no-op"
         );
     }
 }
