@@ -53,7 +53,8 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`) that shouldn't be on the query struct (they'd confuse Diesel derives).
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`) that shouldn't be on the query struct
+/// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
         .attrs
@@ -64,6 +65,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("validate")
                 && !a.path().is_ident("default")
                 && !a.path().is_ident("factory_assoc")
+                && !a.path().is_ident("lock_version")
         })
         .collect()
 }
@@ -116,10 +118,14 @@ fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
     None
 }
 
-/// True if a field has `#[id]` or `#[default]` — either way it's excluded
-/// from the `NewX` insert type.
+/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
+/// three are excluded from the `NewX` insert type.
+///
+/// `#[lock_version]` fields are excluded because the DB column must carry a
+/// `DEFAULT 0` constraint; the initial version is always zero and is never
+/// supplied by the caller on insert.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default")
+    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -192,8 +198,17 @@ fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// `all_optional` is `true` for `UpdateX` structs where every field is
 /// conceptually optional (backed by `Patch<T>`).
 fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
+    emit_schema_fn_body_ext(fields, all_optional, &[])
+}
+
+fn emit_schema_fn_body_ext(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+) -> TokenStream {
     let insertions: Vec<TokenStream> = fields
         .iter()
+        .chain(extra_required.iter())
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
             let field_name = ident.to_string();
@@ -204,7 +219,7 @@ fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
         })
         .collect();
 
-    let required_names: Vec<String> = if all_optional {
+    let mut required_names: Vec<String> = if all_optional {
         Vec::new()
     } else {
         fields
@@ -213,6 +228,11 @@ fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
             .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
             .collect()
     };
+    for f in extra_required {
+        if let Some(id) = f.ident.as_ref() {
+            required_names.push(id.to_string());
+        }
+    }
 
     let required_tokens: Vec<TokenStream> = required_names
         .iter()
@@ -318,7 +338,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
     };
 
-    // Fields for NewX: exclude #[id], #[default], and auto-detected ID fields
+    // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
         .filter(|f| {
@@ -329,12 +349,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    // The single #[lock_version] field (if any). Only one is supported; the
+    // first one wins. The field is excluded from NewX but is included in
+    // UpdateX as a plain (non-Patch) required field so the client always
+    // sends the version they read.
+    let lock_version_field: Option<&&Field> =
+        all_fields.iter().find(|f| has_attr(f, "lock_version"));
+
     // Validate #[factory_assoc] attributes before using them.
     if let Some(err) = validate_factory_assoc_attrs(&all_fields) {
         return err;
     }
 
-    // Fields for UpdateX: same set as NewX (all become Patch<T>)
+    // Fields for UpdateX: Patch fields (from fields_for_new) plus the
+    // lock_version field (plain required type, not Patch<T>).
 
     // Check if any field has #[validate(...)]
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
@@ -361,9 +389,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Build UpdateX fields (non-ID, all Patch<T>; no #[validate] — validation
-    // doesn't apply to Patch<T> fields, only to NewX and the merged model)
-    let update_fields: Vec<TokenStream> = fields_for_new
+    // Build UpdateX fields:
+    // - Regular mutable fields: Patch<T> (no #[validate] — validation only
+    //   applies to NewX and the merged model)
+    // - #[lock_version] field: plain required T (the client supplies the
+    //   version they read; the framework increments it atomically)
+    let mut update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
@@ -374,6 +405,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    if let Some(lv_field) = lock_version_field {
+        let ident = &lv_field.ident;
+        let ty = &lv_field.ty;
+        update_fields.push(quote! {
+            pub #ident: #ty
+        });
+    }
 
     // Build XField enum variants (one per mutable field, PascalCase)
     let field_enum_name = format_ident!("{name}Field");
@@ -394,7 +432,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
-    let merge_arms: Vec<TokenStream> = fields_for_new
+    let mut merge_arms: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
@@ -422,6 +460,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // For #[lock_version] fields, from_patch always increments the version in
+    // `after` by one — the client-supplied patch.{field} is the expected
+    // (before) version; the repository validates it and the changeset carries
+    // the incremented value into the DB.
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        merge_arms.push(quote! {
+            after.#ident = current.#ident.wrapping_add(1);
+        });
+    }
 
     // Build per-field DraftField accessor method signatures (for the trait)
     let draft_accessor_sigs: Vec<TokenStream> = fields_for_new
@@ -455,7 +503,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
-    let changeset_fields: Vec<TokenStream> = fields_for_new
+    let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
@@ -467,8 +515,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { pub #ident: Option<#ty> }
         })
         .collect();
+    // The lock_version column must be in the changeset so the UPDATE can
+    // atomically bump it to current+1.
+    if let Some(lv_field) = lock_version_field {
+        let ident = &lv_field.ident;
+        let ty = &lv_field.ty;
+        changeset_fields.push(quote! { pub #ident: Option<#ty> });
+    }
 
-    let changeset_conversions: Vec<TokenStream> = fields_for_new
+    let mut changeset_conversions: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
@@ -496,6 +551,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // The lock_version field in UpdateX holds the version the client expects;
+    // the changeset always sets it to current+1 (wrapping to avoid overflow).
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        changeset_conversions.push(quote! {
+            #ident: Some(self.#ident.wrapping_add(1))
+        });
+    }
 
     // ── Factory builder ────────────────────────────────────────
     let factory_name = format_ident!("{name}Factory");
@@ -730,12 +793,35 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // ── Optimistic-lock helper bodies ──────────────────────────────────────
+    // Generate the bodies for the two hidden lock-version methods.
+    // For models without #[lock_version] both bodies return `None` so the
+    // repository macro can call them unconditionally.
+    let lock_version_actual_body: TokenStream = lock_version_field.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lv_field| {
+            let ident = lv_field.ident.as_ref().unwrap();
+            quote! { ::core::option::Option::Some(self.#ident as i64) }
+        },
+    );
+
+    let lock_version_expected_body: TokenStream = lock_version_field.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lv_field| {
+            let ident = lv_field.ident.as_ref().unwrap();
+            quote! { ::core::option::Option::Some(self.#ident as i64) }
+        },
+    );
+
     // Compute schema bodies for OpenApiSchema impls.
     // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
     let all_field_refs: Vec<&&Field> = all_fields.iter().collect();
     let query_struct_schema_body = emit_schema_fn_body(&all_field_refs, false);
     let new_struct_schema_body = emit_schema_fn_body(&fields_for_new, false);
-    let update_struct_schema_body = emit_schema_fn_body(&fields_for_new, true);
+    let update_struct_schema_body = {
+        let extra: &[&&Field] = lock_version_field.as_slice();
+        emit_schema_fn_body_ext(&fields_for_new, true, extra)
+    };
 
     quote! {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
@@ -867,6 +953,35 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
+        // ── Optimistic-lock helpers ─────────────────────────────────────
+        // Always emitted so the generated repository code can call them
+        // unconditionally regardless of whether the model has a
+        // `#[lock_version]` field.  The `None` paths compile away with zero
+        // overhead for models that don't use optimistic locking.
+
+        impl #name {
+            /// Returns the current stored lock version, or `None` if this model
+            /// does not have a `#[lock_version]` field.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
+                #lock_version_actual_body
+            }
+        }
+
+        impl #update_name {
+            /// Returns the client-supplied expected lock version, or `None`
+            /// if this model does not have a `#[lock_version]` field.
+            ///
+            /// The repository compares this against the stored version and
+            /// returns `RepositoryError::Conflict` on a mismatch.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_lock_version_expected(&self) -> ::core::option::Option<i64> {
+                #lock_version_expected_body
+            }
+        }
+
         // ── OpenAPI schema impls ────────────────────────────────────────
         // Always emitted (OpenApiSchema is not feature-gated) so external
         // crates can register rich schemas without the openapi feature.
@@ -914,6 +1029,62 @@ pub fn pascal_to_snake(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RED: #[lock_version] detection ────────────────────────────────────
+    // These tests cover the new `excluded_from_new` behaviour (must also
+    // exclude `#[lock_version]` fields) and the helper that detects whether
+    // a field carries the attribute.
+
+    #[test]
+    fn lock_version_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub version: i32
+        };
+        assert!(has_attr(&field, "lock_version"));
+    }
+
+    #[test]
+    fn lock_version_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub lock_version: i32
+        };
+        // A #[lock_version] field must be absent from NewModel (the DB
+        // supplies the initial value via a DEFAULT constraint).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn regular_field_is_not_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            pub title: String
+        };
+        assert!(!excluded_from_new(&field));
+    }
+
+    #[test]
+    fn id_field_is_still_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[id]
+            pub id: i64
+        };
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn lock_version_filtered_from_user_attrs() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub version: i32
+        };
+        let attrs = user_attrs(&field);
+        // The lock_version attribute must not leak onto the generated Diesel
+        // struct — Diesel doesn't know about it and would emit a warning/error.
+        assert!(attrs.is_empty());
+    }
+
+    // ── Existing tests ────────────────────────────────────────────────────
 
     #[test]
     fn pascal_to_snake_simple() {

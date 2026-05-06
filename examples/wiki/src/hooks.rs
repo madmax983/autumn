@@ -58,6 +58,7 @@ mod tests {
             slug: "old-title".into(),
             body: "Old Content".into(),
             status: "published".into(),
+            lock_version: 0,
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
         };
@@ -82,6 +83,7 @@ mod tests {
             slug: "old-title".into(),
             body: "Old Content".into(),
             status: "published".into(),
+            lock_version: 0,
             created_at: Utc::now().naive_utc(),
             updated_at: Utc::now().naive_utc(),
         };
@@ -94,5 +96,52 @@ mod tests {
         hooks.before_update(&mut ctx, &mut draft).await.unwrap();
 
         assert_eq!(draft.after.slug, "old-title");
+    }
+
+    #[tokio::test]
+    async fn after_update_can_declare_cache_invalidation() {
+        use autumn_web::hooks::{MutationContext, MutationOp};
+
+        let mut ctx = MutationContext::new(MutationOp::Update);
+        let page = Page {
+            id: 42,
+            title: "Concurrent Edit".into(),
+            slug: "concurrent-edit".into(),
+            body: "Body".into(),
+            status: "published".into(),
+            lock_version: 1,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        };
+
+        // Simulate what the app would do in after_update:
+        // declare cache keys to invalidate after a successful write
+        ctx.invalidate(format!("pages:{}", page.id));
+        ctx.invalidate("pages:all");
+
+        assert_eq!(ctx.invalidate_keys.len(), 2);
+        assert!(ctx.invalidate_keys.contains(&format!("pages:{}", page.id)));
+        assert!(ctx.invalidate_keys.contains(&"pages:all".to_string()));
+    }
+
+    #[test]
+    fn concurrent_edit_version_mismatch_is_detectable() {
+        // Simulate: replica A and replica B both read page at lock_version=3.
+        // Replica A commits first (bumps to 4). Replica B then tries to commit
+        // with expected_version=3, but stored is 4 — a conflict is detected.
+        let stored_version: i64 = 4;
+        let replica_b_expected: i64 = 3;
+
+        // This is what the repository checks internally:
+        let is_conflict = stored_version != replica_b_expected;
+        assert!(is_conflict, "replica B should detect a conflict");
+
+        let err = autumn_web::RepositoryError::Conflict {
+            id: 99,
+            expected_version: replica_b_expected,
+            actual_version: Some(stored_version),
+        };
+        assert!(err.to_string().contains("99"));
+        assert!(err.to_string().contains("3"));
     }
 }

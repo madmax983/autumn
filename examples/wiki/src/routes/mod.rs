@@ -63,6 +63,7 @@ mod tests {
             title: "Test Title".into(),
             body: "Test Body".into(),
             status: "published".into(),
+            lock_version: 3,
         };
 
         let update_page = form.into_update();

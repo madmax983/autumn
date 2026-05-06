@@ -341,6 +341,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
 
+                self.hooks.after_create(&mut ctx, &record).await?;
+
                 Ok(record)
             };
 
@@ -350,35 +352,88 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::hooks::{MutationContext, MutationOp, MutationHooks, UpdateDraft};
+                use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
 
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
                 let mut ctx = MutationContext::new(MutationOp::Update);
 
-                // Load current record
-                let current = #table_ident::table
-                    .find(id)
-                    .first::<#model_name>(&mut conn)
-                    .await
-                    .optional()
-                    .map_err(::autumn_web::AutumnError::from)?
-                    .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
-                        format!("{} with id {} not found", stringify!(#model_name), id)
-                    ))?;
+                let record: #model_name = if let ::core::option::Option::Some(expected_version) =
+                    changes.__autumn_lock_version_expected()
+                {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                // Build merged draft from current + patch
-                let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                    let (record, inner_ctx) = conn.transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            // SELECT FOR UPDATE grabs an exclusive row lock so
+                            // no concurrent writer can commit between our
+                            // version check and the UPDATE below.
+                            let current = #table_ident::table
+                                .find(id)
+                                .for_update()
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
 
-                // before_update can inspect/rewrite via draft field accessors
-                self.hooks.before_update(&mut ctx, &mut draft).await?;
+                            if let ::core::option::Option::Some(actual_version) =
+                                current.__autumn_lock_version_actual()
+                            {
+                                if actual_version != expected_version {
+                                    return Err(::autumn_web::AutumnError::conflict(
+                                        ::autumn_web::RepositoryError::Conflict {
+                                            id,
+                                            expected_version,
+                                            actual_version: ::core::option::Option::Some(actual_version),
+                                        },
+                                    ));
+                                }
+                            }
 
-                // Persist the proposed state
-                let proposed = draft.into_after();
-                let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                    .set(&proposed)
-                    .get_result::<#model_name>(&mut conn)
-                    .await
-                    .map_err(::autumn_web::AutumnError::from)?;
+                            let mut inner_ctx = MutationContext::new(MutationOp::Update);
+                            let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                            self.hooks.before_update(&mut inner_ctx, &mut draft).await?;
 
+                            let proposed = draft.into_after();
+                            let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                .set(&proposed)
+                                .get_result::<#model_name>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)?;
+                            Ok((record, inner_ctx))
+                        }
+                        .scope_boxed()
+                    })
+                    .await?;
+                    ctx = inner_ctx;
+                    record
+                } else {
+                    // Load current record
+                    let current = #table_ident::table
+                        .find(id)
+                        .first::<#model_name>(&mut conn)
+                        .await
+                        .optional()
+                        .map_err(::autumn_web::AutumnError::from)?
+                        .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                            format!("{} with id {} not found", stringify!(#model_name), id)
+                        ))?;
+
+                    let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
+                    self.hooks.before_update(&mut ctx, &mut draft).await?;
+
+                    let proposed = draft.into_after();
+                    ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                        .set(&proposed)
+                        .get_result::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)?
+                };
+
+                self.hooks.after_update(&mut ctx, &record).await?;
                 Ok(record)
             };
 
@@ -457,13 +512,63 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let update_body = quote! {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::repository::{AutumnLockVersionModelExt as _, AutumnLockVersionUpdateExt as _};
                 let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
-                let diesel_changeset = changes.__to_changeset();
-                ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
-                    .set(&diesel_changeset)
-                    .get_result::<#model_name>(&mut conn)
+
+                if let ::core::option::Option::Some(expected_version) =
+                    changes.__autumn_lock_version_expected()
+                {
+                    use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                    use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                        async move {
+                            // SELECT FOR UPDATE grabs an exclusive row lock so
+                            // no concurrent writer can commit between our
+                            // version check and the UPDATE below.
+                            let current = #table_ident::table
+                                .find(id)
+                                .for_update()
+                                .first::<#model_name>(conn)
+                                .await
+                                .optional()
+                                .map_err(::autumn_web::AutumnError::from)?
+                                .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                    format!("{} with id {} not found", stringify!(#model_name), id)
+                                ))?;
+
+                            if let ::core::option::Option::Some(actual_version) =
+                                current.__autumn_lock_version_actual()
+                            {
+                                if actual_version != expected_version {
+                                    return Err(::autumn_web::AutumnError::conflict(
+                                        ::autumn_web::RepositoryError::Conflict {
+                                            id,
+                                            expected_version,
+                                            actual_version: ::core::option::Option::Some(actual_version),
+                                        },
+                                    ));
+                                }
+                            }
+
+                            let diesel_changeset = changes.__to_changeset();
+                            ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                                .set(&diesel_changeset)
+                                .get_result::<#model_name>(conn)
+                                .await
+                                .map_err(::autumn_web::AutumnError::from)
+                        }
+                        .scope_boxed()
+                    })
                     .await
-                    .map_err(::autumn_web::AutumnError::from)
+                } else {
+                    let diesel_changeset = changes.__to_changeset();
+                    ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
+                        .set(&diesel_changeset)
+                        .get_result::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
             };
 
             let delete_body = quote! {
@@ -1090,6 +1195,45 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 self.pool.get().await.map_err(::autumn_web::AutumnError::from)
+            }
+
+            /// Pessimistic lock helper: SELECT FOR UPDATE the row with
+            /// the given `id` inside a transaction, then call `f` with
+            /// the locked record and the transaction connection.
+            ///
+            /// Returns `404 Not Found` if no row with `id` exists.
+            pub async fn with_lock<F, T>(&self, id: i64, f: F) -> ::autumn_web::AutumnResult<T>
+            where
+                F: for<'c> ::core::ops::FnOnce(
+                    #model_name,
+                    &'c mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                ) -> ::autumn_web::reexports::scoped_futures::ScopedBoxFuture<'c, 'c, ::autumn_web::AutumnResult<T>>
+                    + ::core::marker::Send + 'static,
+                T: ::core::marker::Send + 'static,
+            {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                use ::autumn_web::reexports::diesel_async::AsyncConnection;
+                use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+                let mut conn = self.pool.get().await.map_err(::autumn_web::AutumnError::from)?;
+                conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
+                    async move {
+                        let row = #table_ident::table
+                            .find(id)
+                            .for_update()
+                            .first::<#model_name>(conn)
+                            .await
+                            .optional()
+                            .map_err(::autumn_web::AutumnError::from)?
+                            .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg(
+                                format!("{} with id {} not found", stringify!(#model_name), id)
+                            ))?;
+                        f(row, conn).await
+                    }
+                    .scope_boxed()
+                })
+                .await
             }
         }
 
