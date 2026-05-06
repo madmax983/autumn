@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::StaticManifest;
+use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
 
 /// Per-route ISR state, tracking whether a regeneration is in flight
 /// and when the last regeneration attempt occurred.
@@ -52,6 +53,12 @@ pub struct StaticFileLayer {
     /// The Axum router used for ISR regeneration. Cloned from the app
     /// router at construction time. `None` if ISR is not needed.
     isr_router: Option<Arc<axum::Router>>,
+    /// Coordination backend that prevents duplicate regeneration.
+    /// Defaults to [`LocalIsrCoordinator`] (in-process only).
+    /// Use [`with_isr_coordinator`](Self::with_isr_coordinator) to supply
+    /// a distributed backend such as `PostgresIsrCoordinator` for
+    /// multi-replica deployments.
+    isr_coordinator: Arc<dyn IsrCoordinator>,
 }
 
 impl StaticFileLayer {
@@ -75,6 +82,7 @@ impl StaticFileLayer {
             manifest: Arc::new(manifest),
             isr_state: Arc::new(isr_state),
             isr_router: None,
+            isr_coordinator: Arc::new(LocalIsrCoordinator::new()),
         })
     }
 
@@ -85,6 +93,31 @@ impl StaticFileLayer {
     #[must_use]
     pub fn with_router(mut self, router: axum::Router) -> Self {
         self.isr_router = Some(Arc::new(router));
+        self
+    }
+
+    /// Set the ISR coordination backend.
+    ///
+    /// The default is [`LocalIsrCoordinator`], which is suitable for
+    /// single-replica and development deployments. For multi-replica
+    /// deployments sharing a writable `dist/` volume, supply a distributed
+    /// backend such as `PostgresIsrCoordinator` (feature `db`) to prevent
+    /// stampede writes.
+    ///
+    /// # Example (production multi-replica)
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use autumn_web::static_gen::{StaticFileLayer, PostgresIsrCoordinator};
+    ///
+    /// let layer = StaticFileLayer::new("dist")
+    ///     .unwrap()
+    ///     .with_router(app_router)
+    ///     .with_isr_coordinator(Arc::new(PostgresIsrCoordinator::new(pool)));
+    /// ```
+    #[must_use]
+    pub fn with_isr_coordinator(mut self, coordinator: Arc<dyn IsrCoordinator>) -> Self {
+        self.isr_coordinator = coordinator;
         self
     }
 
@@ -149,29 +182,52 @@ impl StaticFileLayer {
             return;
         }
 
-        // Try to claim the in-flight flag (CAS: false -> true)
+        // Try to claim the in-flight flag (CAS: false -> true).
+        // This prevents this process from spawning more than one task per route.
         if route_state
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            // Another task is already regenerating this route
+            // Another task is already regenerating this route in this process
             return;
         }
 
         // Record attempt time
         route_state.last_attempt.store(now, Ordering::Relaxed);
 
+        // Compute the revalidation window key for distributed coordination
+        let window_key = isr_window_key(url_path, revalidate_secs, now);
+
         // Spawn background regeneration
         let router = Arc::clone(router);
         let url = url_path.to_owned();
         let dest = file_path.to_owned();
         let in_flight = Arc::clone(&self.isr_state);
+        let coordinator = Arc::clone(&self.isr_coordinator);
 
         tokio::spawn(async move {
+            // Distributed coordination: prevents multiple replicas from
+            // regenerating the same route in the same revalidation window.
+            let acquired = coordinator.try_acquire(&url, &window_key).await;
+            if !acquired {
+                tracing::debug!(
+                    route = %url,
+                    backend = coordinator.backend(),
+                    "ISR: another replica holds the lock for this window, skipping"
+                );
+                if let Some(state) = in_flight.get(&url) {
+                    state.in_flight.store(false, Ordering::Release);
+                }
+                return;
+            }
+
             let result = regenerate_page(&router, &url, &dest).await;
 
-            // Clear the in-flight flag
+            // Release distributed lock
+            coordinator.release(&url, &window_key).await;
+
+            // Clear the in-process in-flight flag
             if let Some(state) = in_flight.get(&url) {
                 state.in_flight.store(false, Ordering::Release);
             }
