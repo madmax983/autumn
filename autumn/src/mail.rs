@@ -356,6 +356,19 @@ pub trait MailTransport: Send + Sync {
         &'a self,
         mail: Mail,
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
+
+    /// Returns `true` if this transport is intentionally a no-op (e.g.
+    /// [`Transport::Disabled`] for review apps and tests).
+    ///
+    /// When `true`, [`Mailer::deliver_later`] short-circuits before the queue
+    /// or in-process fallback so deferred mail honors the same "drop
+    /// everything" contract as immediate sends. Custom transports that mean
+    /// "drop all mail" can override this to opt into the same behavior; the
+    /// default of `false` preserves the existing contract for transports that
+    /// merely capture mail (file, log, etc.) or send it (SMTP, custom APIs).
+    fn is_disabled(&self) -> bool {
+        false
+    }
 }
 
 /// Durable backend for [`Mailer::deliver_later`].
@@ -505,6 +518,14 @@ impl Mailer {
     /// Returns an error when no active Tokio runtime is available to host the
     /// background task.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
+        // Honor the disabled-transport contract for deferred mail too: if the
+        // operator turned mail off for this profile, deliver_later must drop
+        // the message just like immediate `send` does — even when a queue is
+        // attached. Otherwise `Mailer::builder().transport(Disabled)
+        // .delivery_queue(...)` would persist mail through the queue branch.
+        if self.transport.is_disabled() {
+            return Ok(());
+        }
         let mail = mail.with_defaults(&self.defaults);
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             MailError::RuntimeUnavailable(
@@ -658,6 +679,10 @@ impl MailTransport for DisabledTransport {
         _mail: Mail,
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn is_disabled(&self) -> bool {
+        true
     }
 }
 
@@ -1270,6 +1295,31 @@ mod tests {
             .expect("queue should receive the mail");
 
         assert_eq!(received.subject, "Hi");
+    }
+
+    #[tokio::test]
+    async fn deliver_later_is_noop_when_transport_disabled_even_with_queue() {
+        // The Mailer-level builder lets callers attach a queue *and* pick
+        // Transport::Disabled. The disabled-transport contract requires
+        // deliver_later to drop the message in that case — the queue must
+        // not persist mail when the operator has turned mail off entirely.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+        let mailer = Mailer::builder()
+            .transport(Transport::Disabled)
+            .delivery_queue(CapturingQueue { tx })
+            .build()
+            .expect("mailer should build");
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("disabled transport should succeed as a no-op");
+
+        // Wait briefly for any spawn that might erroneously fire to land.
+        let received = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            received.is_err(),
+            "queue must not be invoked when transport is disabled"
+        );
     }
 
     #[tokio::test]
