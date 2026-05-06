@@ -443,6 +443,43 @@ impl AutumnError {
         Self::service_unavailable(StringError(msg.into()))
     }
 
+    /// Create a `409 Conflict` error.
+    ///
+    /// Use this for optimistic-lock conflicts surfaced by repository `update`
+    /// calls when the client's expected version is stale.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::conflict(std::io::Error::other("stale version"));
+    /// assert_eq!(err.status(), StatusCode::CONFLICT);
+    /// ```
+    pub fn conflict(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::CONFLICT,
+            details: None,
+        }
+    }
+
+    /// Create a `409 Conflict` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::conflict_msg("Concurrent edit: please reload and retry");
+    /// assert_eq!(err.status(), StatusCode::CONFLICT);
+    /// ```
+    pub fn conflict_msg(msg: impl Into<String>) -> Self {
+        Self::conflict(StringError(msg.into()))
+    }
+
     /// Returns the HTTP status code associated with this error.
     ///
     /// # Examples
@@ -736,6 +773,32 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(json["error"]["status"], 503);
         assert_eq!(json["error"]["message"], "db down");
+        Ok(())
+    }
+
+    #[test]
+    fn conflict_is_409() {
+        let err = AutumnError::conflict(TestError("stale version".into()));
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn conflict_msg_is_409() {
+        let err = AutumnError::conflict_msg("please reload and retry");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(err.to_string(), "please reload and retry");
+    }
+
+    #[tokio::test]
+    async fn conflict_response_is_409_json() -> Result<(), axum::Error> {
+        let err = AutumnError::conflict_msg("version mismatch");
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["error"]["status"], 409);
+        assert_eq!(json["error"]["message"], "version mismatch");
         Ok(())
     }
 }

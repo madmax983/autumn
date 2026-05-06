@@ -99,6 +99,12 @@ fn compile_pass_tests() {
     // WebSocket macro (requires ws feature)
     #[cfg(feature = "ws")]
     t.pass("tests/compile-pass/ws_basic.rs");
+
+    // Optimistic concurrency control: #[lock_version] (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_lock_version.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_lock_version.rs");
 }
 
 #[cfg(feature = "db")]

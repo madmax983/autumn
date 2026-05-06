@@ -107,6 +107,11 @@ pub use plugin::{Plugin, Plugins};
 
 pub mod route_listing;
 
+#[cfg(feature = "db")]
+pub mod repository;
+#[cfg(feature = "db")]
+pub use repository::RepositoryError;
+
 /// Router construction and integration with Axum.
 ///
 /// This module is responsible for taking the application's configuration,
@@ -840,6 +845,8 @@ pub mod reexports {
     #[cfg(feature = "mail")]
     pub use lettre;
     pub use serde_json;
+    #[cfg(feature = "db")]
+    pub use scoped_futures;
     pub use tokio;
     pub use tokio_util;
     pub use tracing;
