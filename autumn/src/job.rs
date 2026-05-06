@@ -123,6 +123,28 @@ impl RedisMaintenanceThrottle {
 }
 
 #[cfg(feature = "redis")]
+const REDIS_STALE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(feature = "redis")]
+const REDIS_WORKER_IDLE_SLEEP_MAX: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[cfg(feature = "redis")]
+fn redis_retry_promotion_interval_ms(default_backoff_ms: u64, jobs: &[JobInfo]) -> u64 {
+    let mut interval_ms = default_backoff_ms.max(1);
+    for job in jobs {
+        if job.initial_backoff_ms > 0 {
+            interval_ms = interval_ms.min(job.initial_backoff_ms);
+        }
+    }
+    interval_ms
+}
+
+#[cfg(feature = "redis")]
+fn redis_worker_idle_sleep(retry_promotion_interval: std::time::Duration) -> std::time::Duration {
+    retry_promotion_interval.min(REDIS_WORKER_IDLE_SLEEP_MAX)
+}
+
+#[cfg(feature = "redis")]
 #[derive(Clone)]
 struct RedisWorkerConfig {
     queue_key: String,
@@ -134,6 +156,7 @@ struct RedisWorkerConfig {
     visibility_timeout_ms: u64,
     default_attempts: u32,
     default_backoff: u64,
+    retry_promotion_interval: std::time::Duration,
 }
 
 static GLOBAL_JOB_CLIENT: OnceLock<RwLock<Option<Arc<JobClient>>>> = OnceLock::new();
@@ -1054,26 +1077,36 @@ fn spawn_redis_worker(
         new_redis_connection_manager(client, "jobs redis worker connection manager")?;
 
     tokio::spawn(async move {
-        let mut maintenance_throttle = RedisMaintenanceThrottle::new(
+        let mut retry_promotion_throttle = RedisMaintenanceThrottle::new(
             std::time::Instant::now(),
-            std::time::Duration::from_secs(1),
+            worker_config.retry_promotion_interval,
         );
+        let mut stale_recovery_throttle = RedisMaintenanceThrottle::new(
+            std::time::Instant::now(),
+            REDIS_STALE_MAINTENANCE_INTERVAL,
+        );
+        let idle_sleep = redis_worker_idle_sleep(worker_config.retry_promotion_interval);
 
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
 
-            if maintenance_throttle.take_due(std::time::Instant::now()) {
-                if let Err(error) =
-                    promote_due_redis_retries(&mut connection, &worker_config, &state).await
-                {
-                    tracing::warn!(error = %error, "redis job worker retry promotion failed");
+            if retry_promotion_throttle.take_due(std::time::Instant::now()) {
+                match promote_due_redis_retries(&mut connection, &worker_config, &state).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "redis job worker retry promotion failed");
+                    }
                 }
-                if let Err(error) =
-                    recover_stale_redis_jobs(&mut connection, &worker_config, &state).await
-                {
-                    tracing::warn!(error = %error, "redis job worker stale recovery failed");
+            }
+
+            if stale_recovery_throttle.take_due(std::time::Instant::now()) {
+                match recover_stale_redis_jobs(&mut connection, &worker_config, &state).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "redis job worker stale recovery failed");
+                    }
                 }
             }
 
@@ -1081,11 +1114,11 @@ fn spawn_redis_worker(
                 Ok(record) => record,
                 Err(error) => {
                     tracing::warn!(error = %error, "redis job worker claim failed");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(idle_sleep).await;
                     continue;
                 }
             }) else {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(idle_sleep).await;
                 continue;
             };
 
@@ -1300,6 +1333,9 @@ fn start_redis_runtime(
     let record_prefix = format!("{}:record:", config.redis.key_prefix);
 
     let per_job_defaults = build_per_job_defaults(&jobs);
+    let retry_promotion_interval = std::time::Duration::from_millis(
+        redis_retry_promotion_interval_ms(config.initial_backoff_ms, &jobs),
+    );
     let jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>> = Arc::new(RwLock::new(
         jobs.into_iter().map(|j| (j.name.clone(), j)).collect(),
     ));
@@ -1341,6 +1377,7 @@ fn start_redis_runtime(
                 visibility_timeout_ms: config.redis.visibility_timeout_ms,
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
+                retry_promotion_interval,
             },
         )?;
     }
@@ -1649,6 +1686,41 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_retry_promotion_interval_uses_smallest_configured_backoff() {
+        let jobs = vec![
+            JobInfo {
+                name: "slow".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                handler: redis_counting_success_handler,
+            },
+            JobInfo {
+                name: "fast".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 25,
+                handler: redis_counting_success_handler,
+            },
+        ];
+
+        assert_eq!(redis_retry_promotion_interval_ms(250, &jobs), 25);
+        assert_eq!(redis_retry_promotion_interval_ms(0, &[]), 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_worker_idle_sleep_is_bounded_by_retry_promotion_interval() {
+        assert_eq!(
+            redis_worker_idle_sleep(Duration::from_millis(25)),
+            Duration::from_millis(25)
+        );
+        assert_eq!(
+            redis_worker_idle_sleep(Duration::from_millis(250)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_failed_job_schedules_next_attempt_with_exponential_backoff() {
         let mut record = redis_test_record(2, 4);
         record.claimed_by = Some("worker-a".to_string());
@@ -1769,6 +1841,7 @@ mod tests {
             visibility_timeout_ms,
             default_attempts: 3,
             default_backoff: 1,
+            retry_promotion_interval: Duration::from_millis(1),
         }
     }
 
