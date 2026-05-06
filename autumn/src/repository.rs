@@ -112,7 +112,7 @@ mod tests {
         };
         let s = err.to_string();
         assert!(s.contains("99"), "display should include id");
-        assert!(s.contains("7"), "display should include expected_version");
+        assert!(s.contains('7'), "display should include expected_version");
     }
 
     #[test]
@@ -123,6 +123,7 @@ mod tests {
             actual_version: Some(1),
         };
         let cloned = err.clone();
+        assert!(matches!(err, RepositoryError::Conflict { id: 1, .. }));
         assert!(matches!(cloned, RepositoryError::Conflict { id: 1, .. }));
     }
 

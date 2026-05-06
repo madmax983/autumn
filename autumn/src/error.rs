@@ -545,6 +545,7 @@ impl std::fmt::Debug for AutumnError {
             .field("status", &self.status)
             .field("inner", &self.inner)
             .field("details", &self.details)
+            .field("problem_type", &self.problem_type)
             .finish()
     }
 }

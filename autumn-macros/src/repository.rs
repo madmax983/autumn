@@ -363,7 +363,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel_async::AsyncConnection;
                     use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
-                    conn.transaction::<_, ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, inner_ctx) = conn.transaction::<(#model_name, MutationContext), ::autumn_web::AutumnError, _>(|conn| {
                         async move {
                             // SELECT FOR UPDATE grabs an exclusive row lock so
                             // no concurrent writer can commit between our
@@ -393,9 +393,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             }
 
-                            let mut ctx = MutationContext::new(MutationOp::Update);
+                            let mut inner_ctx = MutationContext::new(MutationOp::Update);
                             let mut draft = <UpdateDraft<#model_name> as #draft_ext_trait>::from_patch(&current, changes)?;
-                            self.hooks.before_update(&mut ctx, &mut draft).await?;
+                            self.hooks.before_update(&mut inner_ctx, &mut draft).await?;
 
                             let proposed = draft.into_after();
                             let record = ::autumn_web::reexports::diesel::update(#table_ident::table.find(id))
@@ -403,11 +403,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 .get_result::<#model_name>(conn)
                                 .await
                                 .map_err(::autumn_web::AutumnError::from)?;
-                            Ok(record)
+                            Ok((record, inner_ctx))
                         }
                         .scope_boxed()
                     })
-                    .await?
+                    .await?;
+                    ctx = inner_ctx;
+                    record
                 } else {
                     // Load current record
                     let current = #table_ident::table

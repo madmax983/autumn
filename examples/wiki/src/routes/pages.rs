@@ -222,6 +222,7 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
                         option value="archived" selected[page.status == "archived"] { "Archived" }
                     }
                 }
+                input type="hidden" name="lock_version" value=(page.lock_version);
                 button type="submit"
                        class="bg-emerald-600 text-white px-6 py-2 rounded hover:bg-emerald-700" {
                     "Save Changes"
@@ -240,6 +241,7 @@ pub struct PageForm {
     pub title: String,
     pub body: String,
     pub status: String,
+    pub lock_version: i32,
 }
 
 impl PageForm {
@@ -258,6 +260,7 @@ impl PageForm {
             slug: Patch::Unchanged,
             body: Patch::Set(self.body),
             status: Patch::Set(self.status),
+            lock_version: self.lock_version,
         }
     }
 }

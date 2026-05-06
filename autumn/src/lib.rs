@@ -844,9 +844,9 @@ pub mod reexports {
     pub use http;
     #[cfg(feature = "mail")]
     pub use lettre;
-    pub use serde_json;
     #[cfg(feature = "db")]
     pub use scoped_futures;
+    pub use serde_json;
     pub use tokio;
     pub use tokio_util;
     pub use tracing;
