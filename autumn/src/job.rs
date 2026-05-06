@@ -526,6 +526,13 @@ fn prepare_redis_failure_action(
 }
 
 #[cfg(feature = "redis")]
+fn prepare_redis_panic_dead_letter(mut record: RedisJobRecord, error: String) -> RedisJobRecord {
+    clear_redis_claim(&mut record);
+    record.last_error = Some(error);
+    record
+}
+
+#[cfg(feature = "redis")]
 fn recover_stale_redis_record(
     mut record: RedisJobRecord,
     now_ms: u64,
@@ -1151,6 +1158,31 @@ async fn settle_failed_redis_job(
 }
 
 #[cfg(feature = "redis")]
+async fn dead_letter_panicked_redis_job(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    state: &AppState,
+    record: &RedisJobRecord,
+    error: String,
+) {
+    let dead = prepare_redis_panic_dead_letter(record.clone(), error.clone());
+    match dead_letter_redis_job(connection, worker_config, record, &dead).await {
+        Ok(true) => state.job_registry.record_failure(&dead.name, error, true),
+        Ok(false) => tracing::warn!(
+            job = %record.name,
+            job_id = %record.id,
+            "redis job panic dead-letter skipped because claim changed"
+        ),
+        Err(error) => tracing::warn!(
+            job = %record.name,
+            job_id = %record.id,
+            error = %error,
+            "redis job panic dead-letter failed"
+        ),
+    }
+}
+
+#[cfg(feature = "redis")]
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
@@ -1230,8 +1262,7 @@ async fn process_redis_job_record(
         }
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
-            settle_failed_redis_job(connection, worker_config, state, &record, error, "panicked")
-                .await;
+            dead_letter_panicked_redis_job(connection, worker_config, state, &record, error).await;
         }
     }
 }
@@ -1658,6 +1689,22 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_panicking_job_dead_letters_without_retry_even_when_attempts_remain() {
+        let mut record = redis_test_record(1, 3);
+        record.claimed_by = Some("worker-a".to_string());
+        record.claimed_at_ms = Some(20_000);
+
+        let dead = prepare_redis_panic_dead_letter(record, "job handler panicked".to_string());
+
+        assert_eq!(dead.attempt, 1);
+        assert_eq!(dead.max_attempts, 3);
+        assert_eq!(dead.claimed_by, None);
+        assert_eq!(dead.claimed_at_ms, None);
+        assert_eq!(dead.last_error.as_deref(), Some("job handler panicked"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_stale_claim_recovery_requeues_next_attempt() {
         let mut record = redis_test_record(1, 3);
         record.claimed_by = Some("worker-a".to_string());
@@ -1878,6 +1925,52 @@ mod tests {
         assert_eq!(dead_count, 1);
         assert_eq!(delayed_count, 0);
         assert_eq!(REDIS_HANDLER_CALLS.load(Ordering::SeqCst), 2);
+        let status = state.job_registry().snapshot()["send_email"].clone();
+        assert_eq!(status.in_flight, 0);
+        assert_eq!(status.total_failures, 1);
+        assert_eq!(status.dead_letters, 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_panicking_handler_dead_letters_without_retry() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("autumn:test:panic", "worker-a", 30_000);
+        redis_enqueue_test_job(&client, &worker_config, 3).await;
+
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("send_email");
+        state.job_registry().record_enqueue("send_email");
+
+        let record = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("panicking job should be claimed");
+        process_redis_job_record(
+            &mut connection,
+            record,
+            &redis_jobs_by_name(panicking_handler, 3),
+            &state,
+            &worker_config,
+        )
+        .await;
+
+        let queued_count: usize = connection.llen(&worker_config.queue_key).await.unwrap();
+        let delayed_count: usize = connection.zcard(&worker_config.delayed_key).await.unwrap();
+        let processing_count: usize = connection
+            .zcard(&worker_config.processing_key)
+            .await
+            .unwrap();
+        let dead_count: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(queued_count, 0);
+        assert_eq!(delayed_count, 0);
+        assert_eq!(processing_count, 0);
+        assert_eq!(dead_count, 1);
+
         let status = state.job_registry().snapshot()["send_email"].clone();
         assert_eq!(status.in_flight, 0);
         assert_eq!(status.total_failures, 1);
