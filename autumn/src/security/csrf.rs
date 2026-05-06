@@ -89,6 +89,28 @@ const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 #[derive(Clone, Debug)]
 pub struct CsrfFormField(pub String);
 
+/// A CSRF token extracted from the request.
+///
+/// Use this as a handler parameter to access the CSRF token for embedding
+/// in HTML forms. The token is generated per-request and stored in
+/// request extensions by the [`CsrfLayer`].
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::security::CsrfToken;
+///
+/// #[get("/edit")]
+/// async fn edit_form(csrf: CsrfToken) -> Markup {
+///     html! {
+///         form method="POST" {
+///             input type="hidden" name="_csrf" value=(csrf.token());
+///             // ...
+///         }
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct CsrfToken(String);
 

@@ -385,7 +385,7 @@ pub use autumn_macros::oauth2_callback;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
-/// See [`repository`] for details.
+/// See [`macro@repository`] for details.
 #[cfg(feature = "db")]
 pub use autumn_macros::repository;
 
@@ -393,7 +393,7 @@ pub use autumn_macros::repository;
 ///
 /// Generates a `XxxServiceImpl` struct with dependency injection.
 /// Use when logic spans multiple repositories or involves non-DB work.
-/// For single-model CRUD, use [`repository`] instead.
+/// For single-model CRUD, use [`macro@repository`] instead.
 ///
 /// # Examples
 ///

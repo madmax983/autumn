@@ -15,17 +15,28 @@ use serde_json::Value;
 
 use crate::{AppState, AutumnError, AutumnResult};
 
+/// The asynchronous function signature for a background job.
+///
+/// Handlers receive the full `AppState` and a JSON `Value` representing the job's payload.
 pub type JobHandler =
     fn(AppState, Value) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>>;
 
+/// Metadata describing a registered background job.
 #[derive(Clone)]
 pub struct JobInfo {
+    /// The unique identifier for this job type.
     pub name: String,
+    /// Maximum number of times a failing job will be retried.
     pub max_attempts: u32,
+    /// Base delay in milliseconds before the first retry (scales exponentially).
     pub initial_backoff_ms: u64,
+    /// The async function that executes the job logic.
     pub handler: JobHandler,
 }
 
+/// The runtime client for interacting with the job queue.
+///
+/// Used to enqueue jobs to the active backend (local or Redis).
 #[derive(Clone)]
 pub struct JobClient {
     local_sender: Option<tokio::sync::mpsc::Sender<QueuedJob>>,
@@ -108,6 +119,9 @@ fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
     format!("job handler panicked: {detail}")
 }
 
+/// Retrieves the global initialized job client.
+///
+/// Returns `None` if the job runtime hasn't been started yet.
 #[must_use]
 pub fn global_job_client() -> Option<Arc<JobClient>> {
     GLOBAL_JOB_CLIENT
