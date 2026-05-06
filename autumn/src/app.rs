@@ -105,6 +105,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "i18n")]
         i18n_auto_load: false,
         policy_registrations: Vec::new(),
+        #[cfg(feature = "mail")]
+        mail_delivery_queue_factory: None,
     }
 }
 
@@ -259,7 +261,20 @@ pub struct AppBuilder {
     /// built. Stored as boxed closures so we can carry the
     /// generic type parameters across the builder boundary.
     policy_registrations: Vec<PolicyRegistration>,
+    /// Durable mail delivery queue factory registered at builder time. Invoked
+    /// with the freshly-built [`AppState`] before `install_mailer` runs so it
+    /// can capture framework-managed resources (DB pool, channels, etc.).
+    #[cfg(feature = "mail")]
+    mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
 }
+
+/// Boxed builder closure that constructs a durable
+/// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the live
+/// [`AppState`].
+#[cfg(feature = "mail")]
+pub(crate) type MailDeliveryQueueFactory = Box<
+    dyn FnOnce(&AppState) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>> + Send,
+>;
 
 /// A group of routes sharing a common path prefix and middleware layer.
 ///
@@ -1125,6 +1140,49 @@ impl AppBuilder {
         self
     }
 
+    /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
+    /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
+    ///
+    /// Must be called before [`run`](Self::run). Plugins call this inside their
+    /// `apply` implementation to satisfy the production delivery guard without
+    /// requiring `mail.allow_in_process_deliver_later_in_production`.
+    ///
+    /// Use [`Self::with_mail_delivery_queue_factory`] when the queue needs
+    /// framework-managed resources (the DB pool, channels, etc.) that only
+    /// exist after the [`AppState`] is constructed.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue(
+        mut self,
+        queue: impl crate::mail::MailDeliveryQueue + 'static,
+    ) -> Self {
+        let arc: Arc<dyn crate::mail::MailDeliveryQueue> = Arc::new(queue);
+        self.mail_delivery_queue_factory = Some(Box::new(move |_state| Ok(arc)));
+        self
+    }
+
+    /// Register a factory that builds the durable
+    /// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the
+    /// fully-built [`AppState`].
+    ///
+    /// Use this when the queue captures framework-managed resources — for
+    /// example a DB-outbox queue that needs the connection pool returned by
+    /// [`AppState::pool`]. The factory runs once, immediately before
+    /// `install_mailer`, with the live `AppState`. Returning `Err` aborts
+    /// startup with the propagated error.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue_factory<F, Q>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&AppState) -> crate::AutumnResult<Q> + Send + 'static,
+        Q: crate::mail::MailDeliveryQueue + 'static,
+    {
+        self.mail_delivery_queue_factory = Some(Box::new(move |state| {
+            factory(state).map(|q| Arc::new(q) as Arc<dyn crate::mail::MailDeliveryQueue>)
+        }));
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -1361,6 +1419,8 @@ impl AppBuilder {
             #[cfg(feature = "i18n")]
             i18n_auto_load,
             policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
         } = self;
 
         let all_routes = routes;
@@ -1473,7 +1533,13 @@ impl AppBuilder {
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to configure mailer");
             std::process::exit(1);
         });
@@ -1677,6 +1743,8 @@ impl AppBuilder {
             #[cfg(feature = "i18n")]
             i18n_auto_load,
             policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
         } = self;
 
         let all_routes = routes;
@@ -1769,8 +1837,20 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
+        // Static-site builds are short-lived and don't run the request loop,
+        // so deliver_later is never invoked. install_mailer_with_factory skips
+        // the queue factory when enforce_durable_guard is false (the factory
+        // may open Redis/Harvest connections unavailable here), and the guard
+        // itself is bypassed too — the Mailer is still installed so static
+        // routes that extract `Mailer` for immediate `send` calls resolve.
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            false,
+        )
+        .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
             std::process::exit(1);
         });
@@ -1974,6 +2054,8 @@ impl AppBuilder {
             i18n_auto_load,
             policy_registrations,
             cache_backend,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
             ..
         } = self;
 
@@ -2044,7 +2126,13 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
             std::process::exit(1);
         });
@@ -3854,6 +3942,33 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    /// Shared no-op `MailDeliveryQueue` used by builder tests so the trait
+    /// impl body is defined once and exercised by at least one test.
+    #[cfg(feature = "mail")]
+    struct MailTestNoopQueue;
+
+    #[cfg(feature = "mail")]
+    impl crate::mail::MailDeliveryQueue for MailTestNoopQueue {
+        fn enqueue<'a>(
+            &'a self,
+            _mail: crate::mail::Mail,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    fn test_mail() -> crate::mail::Mail {
+        crate::mail::Mail::builder()
+            .to("test@example.com")
+            .subject("hi")
+            .text("hello")
+            .build()
+            .expect("test mail should build")
+    }
+
     /// Helper to build a test router with default config and no database.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
@@ -4109,6 +4224,67 @@ mod tests {
             .extension::<String>()
             .expect("string extension should be present");
         assert_eq!(value, "haunted harvest");
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn app_builder_with_mail_delivery_queue_stores_queue_for_install() {
+        let builder = app().with_mail_delivery_queue(MailTestNoopQueue);
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("with_mail_delivery_queue should store a factory on the builder");
+
+        // Invoke the trivial wrapper closure built by with_mail_delivery_queue
+        // and verify it returns the wrapped queue successfully.
+        let state = AppState::for_test();
+        let queue = factory(&state).expect("trivial factory should produce the queue");
+        assert!(Arc::strong_count(&queue) >= 1);
+        // Cover the enqueue method body by invoking it once.
+        queue
+            .enqueue(test_mail())
+            .await
+            .expect("noop queue should always succeed");
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_runs_with_app_state() {
+        let observed_profile: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&observed_profile);
+        let builder = app().with_mail_delivery_queue_factory(move |state| {
+            *captured.lock().expect("lock") = Some(state.profile().to_owned());
+            Ok::<_, crate::AutumnError>(MailTestNoopQueue)
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory should be stored on the builder");
+        let state = AppState::for_test().with_profile("dev");
+        let _queue = factory(&state).expect("factory should succeed");
+
+        assert_eq!(
+            observed_profile.lock().expect("lock").as_deref(),
+            Some("dev"),
+            "factory must run with the live AppState"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_propagates_errors() {
+        let builder = app().with_mail_delivery_queue_factory(|_state| {
+            Err::<MailTestNoopQueue, _>(crate::AutumnError::service_unavailable_msg("factory boom"))
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory present");
+        let state = AppState::for_test();
+        match factory(&state) {
+            Ok(_) => panic!("factory should have errored"),
+            Err(err) => assert!(err.to_string().contains("factory boom")),
+        }
     }
 
     #[tokio::test]
