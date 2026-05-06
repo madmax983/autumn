@@ -1297,13 +1297,18 @@ mod tests {
         assert_eq!(received.subject, "Hi");
     }
 
-    #[test]
-    fn mailer_with_transport_starts_without_delivery_queue() {
+    #[tokio::test]
+    async fn mailer_with_transport_starts_without_delivery_queue() {
         let mailer = Mailer::with_transport(NoopTransport);
         assert!(
             !mailer.has_durable_delivery_queue(),
             "with_transport should default to no durable queue"
         );
+        // Exercise NoopTransport::send so its body is also covered.
+        mailer
+            .send(sample_mail())
+            .await
+            .expect("noop transport should always succeed");
     }
 
     struct NoopTransport;

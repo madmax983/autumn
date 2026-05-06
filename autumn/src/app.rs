@@ -3942,6 +3942,33 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
+    /// Shared no-op `MailDeliveryQueue` used by builder tests so the trait
+    /// impl body is defined once and exercised by at least one test.
+    #[cfg(feature = "mail")]
+    struct MailTestNoopQueue;
+
+    #[cfg(feature = "mail")]
+    impl crate::mail::MailDeliveryQueue for MailTestNoopQueue {
+        fn enqueue<'a>(
+            &'a self,
+            _mail: crate::mail::Mail,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    fn test_mail() -> crate::mail::Mail {
+        crate::mail::Mail::builder()
+            .to("test@example.com")
+            .subject("hi")
+            .text("hello")
+            .build()
+            .expect("test mail should build")
+    }
+
     /// Helper to build a test router with default config and no database.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
         let config = AutumnConfig::default();
@@ -4200,25 +4227,9 @@ mod tests {
     }
 
     #[cfg(feature = "mail")]
-    #[test]
-    fn app_builder_with_mail_delivery_queue_stores_queue_for_install() {
-        struct NoopQueue;
-        impl crate::mail::MailDeliveryQueue for NoopQueue {
-            fn enqueue<'a>(
-                &'a self,
-                _mail: crate::mail::Mail,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-        }
-
-        let builder = app().with_mail_delivery_queue(NoopQueue);
+    #[tokio::test]
+    async fn app_builder_with_mail_delivery_queue_stores_queue_for_install() {
+        let builder = app().with_mail_delivery_queue(MailTestNoopQueue);
         let factory = builder
             .mail_delivery_queue_factory
             .expect("with_mail_delivery_queue should store a factory on the builder");
@@ -4228,33 +4239,22 @@ mod tests {
         let state = AppState::for_test();
         let queue = factory(&state).expect("trivial factory should produce the queue");
         assert!(Arc::strong_count(&queue) >= 1);
+        // Cover the enqueue method body by invoking it once.
+        queue
+            .enqueue(test_mail())
+            .await
+            .expect("noop queue should always succeed");
     }
 
     #[cfg(feature = "mail")]
     #[test]
     fn app_builder_with_mail_delivery_queue_factory_runs_with_app_state() {
-        struct ProfileBackedQueue(#[allow(dead_code)] String);
-        impl crate::mail::MailDeliveryQueue for ProfileBackedQueue {
-            fn enqueue<'a>(
-                &'a self,
-                _mail: crate::mail::Mail,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-        }
-
         let observed_profile: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let captured = Arc::clone(&observed_profile);
         let builder = app().with_mail_delivery_queue_factory(move |state| {
             *captured.lock().expect("lock") = Some(state.profile().to_owned());
-            Ok::<_, crate::AutumnError>(ProfileBackedQueue(state.profile().to_owned()))
+            Ok::<_, crate::AutumnError>(MailTestNoopQueue)
         });
 
         let factory = builder
@@ -4273,24 +4273,8 @@ mod tests {
     #[cfg(feature = "mail")]
     #[test]
     fn app_builder_with_mail_delivery_queue_factory_propagates_errors() {
-        struct NoopQueue;
-        impl crate::mail::MailDeliveryQueue for NoopQueue {
-            fn enqueue<'a>(
-                &'a self,
-                _mail: crate::mail::Mail,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                        + Send
-                        + 'a,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
-        }
-
         let builder = app().with_mail_delivery_queue_factory(|_state| {
-            Err::<NoopQueue, _>(crate::AutumnError::service_unavailable_msg("factory boom"))
+            Err::<MailTestNoopQueue, _>(crate::AutumnError::service_unavailable_msg("factory boom"))
         });
 
         let factory = builder
