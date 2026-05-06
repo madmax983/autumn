@@ -1234,4 +1234,90 @@ mod tests {
             .try_deliver_later(sample_mail())
             .expect("in-process fallback should still schedule");
     }
+
+    #[test]
+    fn mail_delivery_queue_handle_round_trips_via_from_arc_and_inner() {
+        let arc: Arc<dyn MailDeliveryQueue> = Arc::new(NoopQueue);
+        let handle = MailDeliveryQueueHandle::from_arc(Arc::clone(&arc));
+
+        assert!(Arc::ptr_eq(handle.inner(), &arc));
+    }
+
+    #[test]
+    fn mail_delivery_queue_handle_debug_does_not_panic() {
+        let handle = MailDeliveryQueueHandle::new(NoopQueue);
+        let rendered = format!("{handle:?}");
+        assert!(rendered.contains("MailDeliveryQueueHandle"));
+    }
+
+    #[test]
+    fn mailer_has_durable_delivery_queue_reflects_attachment() {
+        let plain = Mailer::builder().build().expect("mailer should build");
+        assert!(!plain.has_durable_delivery_queue());
+
+        let with_queue = Mailer::builder()
+            .delivery_queue(NoopQueue)
+            .build()
+            .expect("mailer should build");
+        assert!(with_queue.has_durable_delivery_queue());
+    }
+
+    #[test]
+    fn mailer_with_delivery_queue_post_build_attaches_queue() {
+        let mailer = Mailer::builder()
+            .build()
+            .expect("mailer should build")
+            .with_delivery_queue(NoopQueue);
+
+        assert!(mailer.has_durable_delivery_queue());
+    }
+
+    #[test]
+    fn mailer_builder_delivery_queue_arc_attaches_shared_queue() {
+        let arc: Arc<dyn MailDeliveryQueue> = Arc::new(NoopQueue);
+        let mailer = Mailer::builder()
+            .delivery_queue_arc(arc)
+            .build()
+            .expect("mailer should build");
+
+        assert!(mailer.has_durable_delivery_queue());
+    }
+
+    #[test]
+    fn install_mailer_warns_but_succeeds_with_explicit_ack_in_prod() {
+        // Same as the explicit-ack test, but also asserts the mailer was
+        // actually inserted and has no durable queue attached.
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = MailConfig {
+            allow_in_process_deliver_later_in_production: true,
+            ..sample_smtp_config()
+        };
+
+        install_mailer(&state, &config).expect("explicit ack should permit fallback in prod");
+
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+        assert!(
+            !installed.has_durable_delivery_queue(),
+            "no queue was registered, so installed mailer should fall back in-process"
+        );
+    }
+
+    #[test]
+    fn install_mailer_attaches_registered_queue_to_mailer() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
+        let config = sample_smtp_config();
+
+        install_mailer(&state, &config).expect("durable queue should permit prod startup");
+
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+        assert!(
+            installed.has_durable_delivery_queue(),
+            "registered queue handle should be attached to the installed mailer"
+        );
+    }
 }

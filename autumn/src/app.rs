@@ -4155,6 +4155,32 @@ mod tests {
         assert_eq!(value, "haunted harvest");
     }
 
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_stores_queue_for_install() {
+        struct NoopQueue;
+        impl crate::mail::MailDeliveryQueue for NoopQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: crate::mail::Mail,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let builder = app().with_mail_delivery_queue(NoopQueue);
+        assert!(
+            builder.mail_delivery_queue.is_some(),
+            "with_mail_delivery_queue should store the queue on the builder"
+        );
+    }
+
     #[tokio::test]
     async fn startup_and_shutdown_hooks_run_in_expected_order() {
         let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
