@@ -210,7 +210,7 @@ pub fn authorize_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let original_body = &input_fn.block;
     input_fn.block = parse_quote! {
         {
-            ::autumn_web::authorization::__check_policy::<#resource_ident>(
+            ::autumn_web::authorization::__check_policy::<#resource_ident, _>(
                 &__autumn_state,
                 &__autumn_session,
                 #action_lit,

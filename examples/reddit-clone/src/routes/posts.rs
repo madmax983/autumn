@@ -556,7 +556,7 @@ pub async fn edit_form(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    autumn_web::authorization::authorize::<Post, _>(&state, &session, "update", &post).await?;
 
     Ok(layout(
         &format!("Edit: {}", post.title),
@@ -627,7 +627,7 @@ pub async fn update(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
+    autumn_web::authorization::authorize::<Post, _>(&state, &session, "update", &post).await?;
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -677,7 +677,7 @@ pub async fn delete_post(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
+    autumn_web::authorization::authorize::<Post, _>(&state, &session, "delete", &post).await?;
 
     diesel::delete(posts::table.find(post.id))
         .execute(&mut *db)

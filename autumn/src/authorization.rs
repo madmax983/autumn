@@ -75,7 +75,27 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// re-threading state), and a clone of the database pool so
 /// policies can consult related rows. `Clone + Send + Sync` — flows
 /// freely across `.await` points.
-#[derive(Clone)]
+/// Trait to abstract the state requirements for authorization handlers.
+///
+/// Implement this trait on your application's state type to provide
+/// the necessary dependencies for policy enforcement.
+pub trait ProvideAuthorizationState {
+    /// Returns a reference to the [`PolicyRegistry`].
+    fn policy_registry(&self) -> &PolicyRegistry;
+
+    /// Returns the session key used to identify the authenticated user.
+    fn auth_session_key(&self) -> &str;
+
+    /// Configured deny-response shape.
+    fn forbidden_response(&self) -> ForbiddenResponse;
+
+    /// Returns the database connection pool, if configured.
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+}
+
 pub struct PolicyContext {
     /// The full per-request [`Session`]. Read raw values via
     /// [`Session::get`] when a policy needs data beyond the
@@ -130,7 +150,10 @@ impl PolicyContext {
     /// Build a fully-populated [`PolicyContext`] from `AppState` +
     /// `Session`. Used by the `#[authorize]` macro and
     /// `#[repository(policy = ...)]`-generated handlers.
-    pub async fn from_request(state: &crate::AppState, session: &Session) -> Self {
+    pub async fn from_request<S: ProvideAuthorizationState + Sync>(
+        state: &S,
+        session: &Session,
+    ) -> Self {
         let mut ctx = Self::from_session(session, state.auth_session_key()).await;
         ctx.policy_registry = state.policy_registry().clone();
         #[cfg(feature = "db")]
@@ -620,8 +643,8 @@ impl<'de> serde::Deserialize<'de> for ForbiddenResponse {
 ///     Ok(())
 /// }
 /// ```
-pub async fn authorize<R>(
-    state: &crate::AppState,
+pub async fn authorize<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
     action: &str,
     resource: &R,
@@ -650,8 +673,8 @@ where
 /// `#[repository(policy = ...)]` generated handlers. **Not part of
 /// the public API** — call [`authorize`] from user code.
 #[doc(hidden)]
-pub async fn __check_policy<R>(
-    state: &crate::AppState,
+pub async fn __check_policy<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
     action: &str,
     resource: &R,
@@ -672,14 +695,14 @@ where
 /// code; this is the framework's backward-compatible `__`-prefixed
 /// alias for older macro output.
 #[doc(hidden)]
-pub async fn __check_policy_create<R>(
-    state: &crate::AppState,
+pub async fn __check_policy_create<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
 {
-    authorize_create::<R>(state, session).await
+    authorize_create::<R, _>(state, session).await
 }
 
 /// Payload-aware pre-insert authorization helper for
@@ -691,15 +714,15 @@ where
 /// with older `autumn-macros` output remain source-compatible when
 /// only `autumn-web` is upgraded.
 #[doc(hidden)]
-pub async fn __check_policy_create_payload<R>(
-    state: &crate::AppState,
+pub async fn __check_policy_create_payload<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
 where
     R: Send + Sync + 'static,
 {
-    authorize_create_payload::<R>(state, session, payload).await
+    authorize_create_payload::<R, _>(state, session, payload).await
 }
 
 /// Run a policy's `can_create` check before persisting a new record.
@@ -712,8 +735,8 @@ where
 ///
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
-pub async fn authorize_create<R>(
-    state: &crate::AppState,
+pub async fn authorize_create<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
 ) -> crate::AutumnResult<()>
 where
@@ -748,8 +771,8 @@ where
 ///
 /// Returns the configured deny response when the policy denies.
 /// Returns `500` when no policy is registered for `R`.
-pub async fn authorize_create_payload<R>(
-    state: &crate::AppState,
+pub async fn authorize_create_payload<R, S: ProvideAuthorizationState + Sync>(
+    state: &S,
     session: &Session,
     payload: &serde_json::Value,
 ) -> crate::AutumnResult<()>
@@ -776,6 +799,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestState {
+        policy_registry: PolicyRegistry,
+        auth_session_key: String,
+        forbidden_response: ForbiddenResponse,
+        #[cfg(feature = "db")]
+        pool: Option<
+            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        >,
+    }
+    impl TestState {
+        fn with_forbidden_response(mut self, response: ForbiddenResponse) -> Self {
+            self.forbidden_response = response;
+            self
+        }
+        fn with_auth_session_key(mut self, key: &str) -> Self {
+            self.auth_session_key = key.to_string();
+            self
+        }
+    }
+    impl Default for TestState {
+        fn default() -> Self {
+            Self {
+                policy_registry: PolicyRegistry::default(),
+                auth_session_key: "user_id".to_string(),
+                forbidden_response: ForbiddenResponse::default(),
+                #[cfg(feature = "db")]
+                pool: None,
+            }
+        }
+    }
+    impl ProvideAuthorizationState for TestState {
+        fn policy_registry(&self) -> &PolicyRegistry {
+            &self.policy_registry
+        }
+        fn auth_session_key(&self) -> &str {
+            &self.auth_session_key
+        }
+        fn forbidden_response(&self) -> ForbiddenResponse {
+            self.forbidden_response
+        }
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            self.pool.as_ref()
+        }
+    }
+
+    fn detached_state() -> TestState {
+        TestState::default()
+    }
+
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, PartialEq)]
@@ -1050,11 +1126,8 @@ mod tests {
         assert!(dbg.contains("scopes"));
     }
 
-    fn detached_state_with(
-        _registry: PolicyRegistry,
-        forbidden: ForbiddenResponse,
-    ) -> crate::AppState {
-        crate::AppState::detached()
+    fn detached_state_with(_registry: PolicyRegistry, forbidden: ForbiddenResponse) -> TestState {
+        detached_state()
             .with_forbidden_response(forbidden)
             .with_auth_session_key("user_id")
     }
@@ -1075,9 +1148,7 @@ mod tests {
         let state = detached_state_with(PolicyRegistry::default(), ForbiddenResponse::default());
         let session = session_with(Some("42"), None);
         let n = Note { author_id: 42 };
-        let err = authorize::<Note>(&state, &session, "update", &n)
-            .await
-            .unwrap_err();
+        let err = authorize(&state, &session, "update", &n).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -1094,30 +1165,28 @@ mod tests {
 
         let session = session_with(Some("99"), None); // not the owner, no role
         let n = Note { author_id: 42 };
-        let err = authorize::<Note>(&state, &session, "update", &n)
-            .await
-            .unwrap_err();
+        let err = authorize(&state, &session, "update", &n).await.unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn authorize_returns_ok_when_policy_allows() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
         let session = session_with(Some("42"), None); // owner
         let n = Note { author_id: 42 };
-        authorize::<Note>(&state, &session, "update", &n)
+        authorize(&state, &session, "update", &n)
             .await
             .expect("owner is allowed to update");
     }
 
     #[tokio::test]
     async fn authorize_create_returns_500_when_no_policy_registered() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("42"), None);
-        let err = authorize_create::<Note>(&state, &session)
+        let err = authorize_create::<Note, _>(&state, &session)
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1132,18 +1201,19 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
 
         let anon = session_with(None, None);
-        let err = authorize_create::<Note>(&state, &anon).await.unwrap_err();
+        let err = authorize_create::<Note, _>(&state, &anon)
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let user = session_with(Some("1"), None);
-        authorize_create::<Note>(&state, &user)
+        authorize_create::<Note, _>(&state, &user)
             .await
             .expect("authenticated user passes can_create");
     }
@@ -1164,20 +1234,19 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
 
         let user = session_with(Some("1"), None);
         let own_payload = serde_json::json!({"author_id": 1});
-        authorize_create_payload::<Note>(&state, &user, &own_payload)
+        authorize_create_payload::<Note, _>(&state, &user, &own_payload)
             .await
             .expect("owner payload passes can_create_payload");
 
         let other_payload = serde_json::json!({"author_id": 2});
-        let err = authorize_create_payload::<Note>(&state, &user, &other_payload)
+        let err = authorize_create_payload::<Note, _>(&state, &user, &other_payload)
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
@@ -1192,20 +1261,19 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(AuthOnlyCreatePolicy);
 
         let anon = session_with(None, None);
-        let err = __check_policy_create::<Note>(&state, &anon)
+        let err = __check_policy_create::<Note, _>(&state, &anon)
             .await
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
 
         let user = session_with(Some("1"), None);
-        __check_policy_create::<Note>(&state, &user)
+        __check_policy_create::<Note, _>(&state, &user)
             .await
             .expect("old generated create policy alias remains compatible");
     }
@@ -1226,22 +1294,21 @@ mod tests {
             }
         }
 
-        let state =
-            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        let state = detached_state().with_forbidden_response(ForbiddenResponse::Forbidden403);
         state
             .policy_registry()
             .register_policy::<Note, _>(OwnerPayloadPolicy);
 
         let user = session_with(Some("1"), None);
         let payload = serde_json::json!({"author_id": 1});
-        __check_policy_create_payload::<Note>(&state, &user, &payload)
+        __check_policy_create_payload::<Note, _>(&state, &user, &payload)
             .await
             .expect("new generated create policy alias passes payload");
     }
 
     #[tokio::test]
     async fn check_policy_alias_round_trips() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1249,14 +1316,14 @@ mod tests {
         let n = Note { author_id: 42 };
         // The macro-internal alias goes through `authorize` — exercise
         // the full round-trip.
-        __check_policy::<Note>(&state, &session, "update", &n)
+        __check_policy(&state, &session, "update", &n)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn from_request_clones_pool_and_registry_from_state() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         state
             .policy_registry()
             .register_policy::<Note, _>(AdminOrOwnerPolicy);
@@ -1270,7 +1337,7 @@ mod tests {
 
     #[tokio::test]
     async fn scoped_blanket_trait_constructible_without_registered_scope() {
-        let state = crate::AppState::detached();
+        let state = detached_state();
         let session = session_with(Some("1"), None);
         let ctx = PolicyContext::from_request(&state, &session).await;
         // No scope registered for `Note`.

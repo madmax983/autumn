@@ -745,12 +745,12 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
-pub(crate) fn apply_session_layer(
-    router: axum::Router<crate::state::AppState>,
+pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
+    router: axum::Router<S>,
     config: &SessionConfig,
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
-) -> Result<axum::Router<crate::state::AppState>, SessionBackendConfigError> {
+) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"
@@ -1074,36 +1074,12 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
-        use crate::state::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
             "ok".to_owned()
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-        };
+        let state = ();
 
         let app = Router::new()
             .route("/", get(handler))
@@ -1127,31 +1103,6 @@ mod tests {
         assert!(cookie_str.contains("autumn.sid="));
     }
 
-    fn test_state() -> crate::state::AppState {
-        crate::state::AppState {
-            extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-        }
-    }
-
     #[tokio::test]
     async fn session_layer_persists_data_across_requests() {
         async fn write_handler(session: Session) -> String {
@@ -1165,7 +1116,7 @@ mod tests {
 
         let store = MemoryStore::new();
         let config = SessionConfig::default();
-        let state = test_state();
+        let state = ();
 
         let app = Router::new()
             .route("/write", get(write_handler))
@@ -1220,7 +1171,7 @@ mod tests {
             "destroyed".to_owned()
         }
 
-        let state = test_state();
+        let state = ();
 
         let store = MemoryStore::new();
         store
@@ -1258,7 +1209,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_returns_503_when_store_load_fails() {
-        let state = test_state();
+        let state = ();
 
         let app = Router::new()
             .route("/", get(|| async { "ok" }))
@@ -1288,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_returns_503_when_store_save_fails() {
-        let state = test_state();
+        let state = ();
 
         let app = Router::new()
             .route(
