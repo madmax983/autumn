@@ -48,16 +48,36 @@ initial_backoff_ms = 250
 [jobs.redis]
 url = "redis://127.0.0.1/"
 key_prefix = "autumn:jobs"
+visibility_timeout_ms = 30000
 ```
 
 - `local`: in-process queue, zero configuration.
-- `redis`: durable queue for multi-replica workers.
+- `redis`: durable, Redis-backed queue for multi-replica workers.
+
+## Redis delivery semantics
+
+The Redis backend provides **at-least-once delivery**. A job is written as a
+durable record, queued by id, atomically claimed into an in-flight set, and
+acked only after the handler returns `Ok(())`.
+
+If a worker crashes after claiming a job, the record remains in Redis. Another
+worker requeues the stale claim after `jobs.redis.visibility_timeout_ms`.
+Recovered stale claims consume another attempt and retain a `last_error`
+explaining the visibility timeout. If the job has exhausted `max_attempts`, it
+is moved to the dead-letter list instead of being requeued.
+
+Because Redis uses at-least-once delivery, handlers must be idempotent. A worker
+that is slow beyond the visibility timeout can overlap with a recovered retry,
+so external side effects should use natural idempotency keys such as the job id,
+domain aggregate id, or provider idempotency token.
 
 ## Retry/backoff and dead letters
 
 - Jobs retry with exponential backoff (`initial_backoff_ms * 2^(attempt-1)`).
 - Retries stop at `max_attempts` (job-level override or config default).
 - Exhausted jobs are dead-lettered.
+- Redis retries are scheduled in Redis before the worker moves on, so a crash
+  during the backoff window does not drop the job.
 
 ## Observability
 
@@ -69,6 +89,11 @@ key_prefix = "autumn:jobs"
 - `total_failures`
 - `dead_letters`
 - `last_error`
+
+For Redis deployments these counters are process-local operational telemetry,
+not a strongly consistent Redis aggregate. They remain useful for seeing queued,
+in-flight, success, retry/failure, and dead-letter activity observed by the
+replica serving the actuator request.
 
 ## Migration notes
 

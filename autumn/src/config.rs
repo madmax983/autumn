@@ -87,6 +87,7 @@
 //! | `AUTUMN_JOBS__INITIAL_BACKOFF_MS` | `jobs.initial_backoff_ms` | `u64` |
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
+//! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` | `in_process` / `postgres` |
 //! | `AUTUMN_SCHEDULER__LEASE_TTL_SECS` | `scheduler.lease_ttl_secs` | `u64` |
 //! | `AUTUMN_SCHEDULER__REPLICA_ID` | `scheduler.replica_id` | `String` |
@@ -1053,6 +1054,9 @@ pub struct JobRedisConfig {
     /// Key prefix for all queue keys.
     #[serde(default = "default_jobs_redis_prefix")]
     pub key_prefix: String,
+    /// Duration before an in-flight job claim is considered stale.
+    #[serde(default = "default_jobs_redis_visibility_timeout_ms")]
+    pub visibility_timeout_ms: u64,
 }
 
 impl Default for JobRedisConfig {
@@ -1060,6 +1064,7 @@ impl Default for JobRedisConfig {
         Self {
             url: None,
             key_prefix: default_jobs_redis_prefix(),
+            visibility_timeout_ms: default_jobs_redis_visibility_timeout_ms(),
         }
     }
 }
@@ -1082,6 +1087,10 @@ const fn default_job_backoff_ms() -> u64 {
 
 fn default_jobs_redis_prefix() -> String {
     "autumn:jobs".to_owned()
+}
+
+const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
+    30_000
 }
 
 impl AutumnConfig {
@@ -1265,6 +1274,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__INITIAL_BACKOFF_MS` → `jobs.initial_backoff_ms` (`u64`)
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
+    /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -1536,6 +1546,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__REDIS__KEY_PREFIX",
             &mut self.jobs.redis.key_prefix,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
+            &mut self.jobs.redis.visibility_timeout_ms,
         );
     }
 
@@ -2960,7 +2975,8 @@ path = "/healthz"
             .with("AUTUMN_JOBS__MAX_ATTEMPTS", "12")
             .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
             .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
-            .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs");
+            .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs")
+            .with("AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS", "45000");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
 
@@ -2973,6 +2989,31 @@ path = "/healthz"
             Some("redis://jobs:6379/2")
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
+        assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+    }
+
+    #[test]
+    fn jobs_toml_deserializes_redis_visibility_timeout() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "redis"
+
+            [jobs.redis]
+            url = "redis://localhost:6379/5"
+            key_prefix = "demo:jobs"
+            visibility_timeout_ms = 15000
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.jobs.backend, "redis");
+        assert_eq!(
+            config.jobs.redis.url.as_deref(),
+            Some("redis://localhost:6379/5")
+        );
+        assert_eq!(config.jobs.redis.key_prefix, "demo:jobs");
+        assert_eq!(config.jobs.redis.visibility_timeout_ms, 15_000);
     }
 
     #[test]
