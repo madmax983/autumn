@@ -941,7 +941,14 @@ pub(crate) fn install_mailer_with_factory<F>(
 where
     F: FnOnce(&AppState) -> AutumnResult<Arc<dyn MailDeliveryQueue>>,
 {
-    if enforce_durable_guard && let Some(factory) = queue_factory {
+    // Honor the disabled transport contract: a profile that turned mail off
+    // (tests, review apps, etc.) must not open queue infrastructure either,
+    // since all sends — immediate and deferred — are supposed to be no-ops.
+    let transport_sends_mail = config.transport != Transport::Disabled;
+    if enforce_durable_guard
+        && transport_sends_mail
+        && let Some(factory) = queue_factory
+    {
         let queue = factory(state)?;
         state.insert_extension(MailDeliveryQueueHandle::from_arc(queue));
     }
@@ -1425,6 +1432,32 @@ mod tests {
         let error = install_mailer_with_factory(&state, &config, Some(factory), true)
             .expect_err("factory error should propagate");
         assert!(error.to_string().contains("queue offline"));
+    }
+
+    #[test]
+    fn install_mailer_with_factory_skips_factory_when_transport_disabled() {
+        // Even when enforce_durable_guard=true (normal server path), a
+        // profile with transport=disabled must not run the factory: the
+        // factory might open Redis/Harvest/DB connections, but all mail in
+        // this profile is supposed to be a no-op.
+        let state = crate::AppState::for_test().with_profile("dev");
+        let config = MailConfig::default(); // transport = Disabled
+        let factory_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::clone(&factory_called);
+
+        let factory = move |_state: &crate::AppState| {
+            captured.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err::<Arc<dyn MailDeliveryQueue>, _>(crate::AutumnError::service_unavailable_msg(
+                "queue must not be reached",
+            ))
+        };
+
+        install_mailer_with_factory(&state, &config, Some(factory), true)
+            .expect("disabled transport should bypass the factory entirely");
+        assert!(
+            !factory_called.load(std::sync::atomic::Ordering::SeqCst),
+            "factory must not run when transport = disabled"
+        );
     }
 
     #[test]
