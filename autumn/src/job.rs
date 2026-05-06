@@ -99,6 +99,30 @@ enum RedisStaleRecovery {
 }
 
 #[cfg(feature = "redis")]
+struct RedisMaintenanceThrottle {
+    next_run_at: std::time::Instant,
+    interval: std::time::Duration,
+}
+
+#[cfg(feature = "redis")]
+impl RedisMaintenanceThrottle {
+    const fn new(now: std::time::Instant, interval: std::time::Duration) -> Self {
+        Self {
+            next_run_at: now,
+            interval,
+        }
+    }
+
+    fn take_due(&mut self, now: std::time::Instant) -> bool {
+        if now < self.next_run_at {
+            return false;
+        }
+        self.next_run_at = now + self.interval;
+        true
+    }
+}
+
+#[cfg(feature = "redis")]
 #[derive(Clone)]
 struct RedisWorkerConfig {
     queue_key: String,
@@ -682,6 +706,35 @@ return { id, updated }
 }
 
 #[cfg(feature = "redis")]
+async fn record_enqueues_for_redis_ids(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    state: &AppState,
+    ids: &[String],
+) -> Result<(), redis::RedisError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|id| redis_record_key(&worker_config.record_prefix, id))
+        .collect();
+    let bodies: Vec<Option<String>> = redis::cmd("MGET")
+        .arg(&keys)
+        .query_async(connection)
+        .await?;
+
+    for body in bodies.into_iter().flatten() {
+        if let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body) {
+            state.job_registry.record_enqueue(&record.name);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "redis")]
 async fn promote_due_redis_retries(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -709,16 +762,7 @@ return promoted
         .query_async(connection)
         .await?;
 
-    for id in promoted {
-        let key = redis_record_key(&worker_config.record_prefix, &id);
-        let body: Option<String> = redis::cmd("GET").arg(key).query_async(connection).await?;
-        if let Some(body) = body
-            && let Ok(record) = serde_json::from_str::<RedisJobRecord>(&body)
-        {
-            state.job_registry.record_enqueue(&record.name);
-        }
-    }
-
+    record_enqueues_for_redis_ids(connection, worker_config, state, &promoted).await?;
     Ok(())
 }
 
@@ -927,9 +971,20 @@ async fn recover_stale_redis_jobs(
         .query_async(connection)
         .await?;
 
-    for id in stale_ids {
-        let key = redis_record_key(&worker_config.record_prefix, &id);
-        let body: Option<String> = redis::cmd("GET").arg(&key).query_async(connection).await?;
+    if stale_ids.is_empty() {
+        return Ok(());
+    }
+
+    let keys: Vec<String> = stale_ids
+        .iter()
+        .map(|id| redis_record_key(&worker_config.record_prefix, id))
+        .collect();
+    let bodies: Vec<Option<String>> = redis::cmd("MGET")
+        .arg(&keys)
+        .query_async(connection)
+        .await?;
+
+    for (id, body) in stale_ids.into_iter().zip(bodies) {
         let Some(body) = body else {
             let _ = redis::cmd("ZREM")
                 .arg(&worker_config.processing_key)
@@ -992,20 +1047,27 @@ fn spawn_redis_worker(
         new_redis_connection_manager(client, "jobs redis worker connection manager")?;
 
     tokio::spawn(async move {
+        let mut maintenance_throttle = RedisMaintenanceThrottle::new(
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(1),
+        );
+
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
 
-            if let Err(error) =
-                promote_due_redis_retries(&mut connection, &worker_config, &state).await
-            {
-                tracing::warn!(error = %error, "redis job worker retry promotion failed");
-            }
-            if let Err(error) =
-                recover_stale_redis_jobs(&mut connection, &worker_config, &state).await
-            {
-                tracing::warn!(error = %error, "redis job worker stale recovery failed");
+            if maintenance_throttle.take_due(std::time::Instant::now()) {
+                if let Err(error) =
+                    promote_due_redis_retries(&mut connection, &worker_config, &state).await
+                {
+                    tracing::warn!(error = %error, "redis job worker retry promotion failed");
+                }
+                if let Err(error) =
+                    recover_stale_redis_jobs(&mut connection, &worker_config, &state).await
+                {
+                    tracing::warn!(error = %error, "redis job worker stale recovery failed");
+                }
             }
 
             let Some(record) = (match claim_next_redis_job(&mut connection, &worker_config).await {
@@ -1541,6 +1603,17 @@ mod tests {
         assert_eq!(claimed.record.claimed_by.as_deref(), Some("worker-a"));
         assert_eq!(claimed.record.claimed_at_ms, Some(10_000));
         assert_eq!(claimed.record.attempt, 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_maintenance_throttle_runs_immediately_then_waits_for_interval() {
+        let start = std::time::Instant::now();
+        let mut throttle = RedisMaintenanceThrottle::new(start, Duration::from_secs(1));
+
+        assert!(throttle.take_due(start));
+        assert!(!throttle.take_due(start + Duration::from_millis(999)));
+        assert!(throttle.take_due(start + Duration::from_secs(1)));
     }
 
     #[cfg(feature = "redis")]
