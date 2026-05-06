@@ -1845,19 +1845,13 @@ impl AppBuilder {
         }
         #[cfg(feature = "mail")]
         {
-            if let Some(factory) = mail_delivery_queue_factory {
-                match factory(&state) {
-                    Ok(queue) => state
-                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
-                    Err(error) => {
-                        eprintln!("mail delivery queue factory failed: {error}");
-                        std::process::exit(1);
-                    }
-                }
-            }
             // Static-site builds are short-lived and don't run the request
-            // loop; the durable deliver_later guard isn't relevant here, so
-            // skip it to avoid forcing a queue/ack just to render assets.
+            // loop, so deliver_later is never invoked. Skip the queue factory
+            // (it may open Redis/Harvest connections unavailable in the asset-
+            // build environment) and the durable-delivery guard, but still
+            // install a Mailer so static routes that extract `Mailer` for
+            // immediate `send` calls still resolve.
+            let _ = mail_delivery_queue_factory;
             crate::mail::install_mailer(&state, &config.mail, false).unwrap_or_else(|error| {
                 eprintln!("Failed to configure mailer: {error}");
                 std::process::exit(1);

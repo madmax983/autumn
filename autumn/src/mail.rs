@@ -1333,6 +1333,26 @@ mod tests {
     }
 
     #[test]
+    fn install_mailer_does_not_run_factory_when_not_enforced_and_no_handle() {
+        // Mirrors run_build_mode: queue factory is intentionally skipped, so
+        // no MailDeliveryQueueHandle is on AppState. install_mailer must
+        // tolerate this and not try to enforce or warn about a missing queue.
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+
+        install_mailer(&state, &config, false)
+            .expect("static-build mode should install cleanly with no queue handle");
+
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+        assert!(
+            !installed.has_durable_delivery_queue(),
+            "no queue is expected when run_build_mode skips the factory"
+        );
+    }
+
+    #[test]
     fn install_mailer_skips_production_guard_when_not_enforced() {
         // Static-site builds (run_build_mode) call install_mailer with
         // enforce_durable_guard=false because they don't run the request
