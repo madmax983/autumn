@@ -48,16 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **mail:** Pluggable durable backend for `Mailer::deliver_later` and
-  `#[mailer]`'s generated `deliver_later_*` helpers (#649). Implement the new
-  `MailDeliveryQueue` trait once for your queue (DB outbox row, Redis stream,
-  Harvest job, ...) and register it via
-  `state.insert_extension(MailDeliveryQueueHandle::new(queue))` before the
-  mailer is installed; `deliver_later` then routes mail through the queue
-  instead of the in-process Tokio fallback. In `prod`/`production`, startup
-  now fails when no durable queue is registered and the transport is not
-  `disabled`, unless the new `mail.allow_in_process_deliver_later_in_production`
-  acknowledgement flag is set. The flag opts into the non-durable fallback
-  explicitly; without it, `prod` deployments must wire a real backend. See the
+  `#[mailer]`'s generated `deliver_later_*` helpers (#649). Implement
+  `MailDeliveryQueue` for your queue (DB outbox row, Redis stream, Harvest
+  job, ...) and register it via
+  `AppBuilder::with_mail_delivery_queue(queue)` before `.run()`; plugins
+  call this inside `apply`. `deliver_later` then routes mail through the
+  queue instead of the in-process Tokio fallback. In `prod`/`production`,
+  startup now fails when no durable queue is registered and the transport is
+  not `disabled`, unless the new
+  `mail.allow_in_process_deliver_later_in_production` acknowledgement flag
+  is set. The flag opts into the non-durable fallback explicitly; without
+  it, `prod` deployments must wire a real backend. See the
   [Mail guide](docs/guide/mail.md) for the outbox pattern.
 
 - **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class

@@ -146,14 +146,15 @@ password_env = "SMTP_PASSWORD"
 tls = "starttls"
 ```
 
-For durable retries across replicas, register a `MailDeliveryQueueHandle` on
-`AppState` before the mailer is installed (see the [Mail
-Guide](mail.md#deferred-delivery-deliver_later) for the trait and an outbox
-example). Without one, `prod` startup fails unless you explicitly set
-`mail.allow_in_process_deliver_later_in_production = true`, which acknowledges
-the in-process Tokio fallback. The fallback is fine for local development and
-small single-process deployments but is not durable across restarts or
-replicas.
+For durable retries across replicas, register a durable
+[`MailDeliveryQueue`](mail.md#deferred-delivery-deliver_later) via
+`AppBuilder::with_mail_delivery_queue` before `.run()` (see the Mail Guide
+for the trait definition and an outbox example). Without one, `prod` startup
+fails unless you explicitly set
+`mail.allow_in_process_deliver_later_in_production = true`, which
+acknowledges the in-process Tokio fallback. The fallback is fine for local
+development and small single-process deployments but is not durable across
+restarts or replicas.
 
 When email dispatch is coordinated with DB writes, use
 [`Db::tx`](transactions.md) for the database side so the write set commits or

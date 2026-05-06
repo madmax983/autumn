@@ -505,7 +505,6 @@ impl Mailer {
     /// Returns an error when no active Tokio runtime is available to host the
     /// background task.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
-        let mailer = self.clone();
         let mail = mail.with_defaults(&self.defaults);
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             MailError::RuntimeUnavailable(
@@ -519,6 +518,7 @@ impl Mailer {
                 }
             });
         } else {
+            let mailer = self.clone();
             handle.spawn(async move {
                 if let Err(error) = mailer.send(mail).await {
                     tracing::error!(error = %error, "background mail delivery failed");
@@ -1185,27 +1185,27 @@ mod tests {
             .expect("disabled transport never sends mail so it should not need an ack");
     }
 
+    struct CapturingQueue {
+        tx: tokio::sync::mpsc::UnboundedSender<Mail>,
+    }
+
+    impl MailDeliveryQueue for CapturingQueue {
+        fn enqueue<'a>(
+            &'a self,
+            mail: Mail,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            let tx = self.tx.clone();
+            Box::pin(async move {
+                tx.send(mail)
+                    .map_err(|err| MailError::RuntimeUnavailable(err.to_string()))?;
+                Ok(())
+            })
+        }
+    }
+
     #[tokio::test]
     async fn deliver_later_routes_through_configured_queue() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
-
-        struct CapturingQueue {
-            tx: tokio::sync::mpsc::UnboundedSender<Mail>,
-        }
-
-        impl MailDeliveryQueue for CapturingQueue {
-            fn enqueue<'a>(
-                &'a self,
-                mail: Mail,
-            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
-                let tx = self.tx.clone();
-                Box::pin(async move {
-                    tx.send(mail)
-                        .map_err(|err| MailError::RuntimeUnavailable(err.to_string()))?;
-                    Ok(())
-                })
-            }
-        }
 
         let mailer = Mailer::builder()
             .delivery_queue(CapturingQueue { tx })

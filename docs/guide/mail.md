@@ -94,13 +94,13 @@ imply durable delivery on their own. The framework provides two paths:
    single-process deployments, but it is not durable: a process restart, pod
    eviction, or deploy can drop the email after the request has already
    returned success.
-2. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once for
-   your queue of choice (DB outbox row, Redis stream, Harvest job, etc.) and
-   register it on `AppState` before the mailer is installed:
+2. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once
+   for your queue of choice (DB outbox row, Redis stream, Harvest job, etc.)
+   and register it via [`AppBuilder::with_mail_delivery_queue`] before
+   `.run()`:
 
    ```rust
    use autumn_web::prelude::*;
-   use std::sync::Arc;
 
    struct OutboxQueue { /* db handle */ }
 
@@ -119,12 +119,14 @@ imply durable delivery on their own. The framework provides two paths:
        }
    }
 
-   // During app boot, before the mailer is installed:
-   state.insert_extension(MailDeliveryQueueHandle::new(OutboxQueue { /* ... */ }));
+   autumn_web::app()
+       .with_mail_delivery_queue(OutboxQueue { /* ... */ })
+       .run()
+       .await;
    ```
 
-   When a `MailDeliveryQueueHandle` is present, `deliver_later` routes through
-   it instead of the in-process fallback.
+   When a queue is registered, `deliver_later` routes through it instead of
+   the in-process fallback.
 
 ### Production Guard
 

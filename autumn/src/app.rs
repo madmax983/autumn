@@ -105,6 +105,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "i18n")]
         i18n_auto_load: false,
         policy_registrations: Vec::new(),
+        #[cfg(feature = "mail")]
+        mail_delivery_queue: None,
     }
 }
 
@@ -259,6 +261,11 @@ pub struct AppBuilder {
     /// built. Stored as boxed closures so we can carry the
     /// generic type parameters across the builder boundary.
     policy_registrations: Vec<PolicyRegistration>,
+    /// Durable mail delivery queue registered at builder time via
+    /// [`AppBuilder::with_mail_delivery_queue`]. Wired into [`AppState`] before
+    /// `install_mailer` runs so the production guard can see it.
+    #[cfg(feature = "mail")]
+    mail_delivery_queue: Option<Arc<dyn crate::mail::MailDeliveryQueue>>,
 }
 
 /// A group of routes sharing a common path prefix and middleware layer.
@@ -1125,6 +1132,22 @@ impl AppBuilder {
         self
     }
 
+    /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
+    /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
+    ///
+    /// Must be called before [`run`](Self::run). Plugins call this inside their
+    /// `apply` implementation to satisfy the production delivery guard without
+    /// requiring `mail.allow_in_process_deliver_later_in_production`.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue(
+        mut self,
+        queue: impl crate::mail::MailDeliveryQueue + 'static,
+    ) -> Self {
+        self.mail_delivery_queue = Some(Arc::new(queue));
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -1361,6 +1384,8 @@ impl AppBuilder {
             #[cfg(feature = "i18n")]
             i18n_auto_load,
             policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue,
         } = self;
 
         let all_routes = routes;
@@ -1473,10 +1498,15 @@ impl AppBuilder {
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
-            tracing::error!(error = %error, "Failed to configure mailer");
-            std::process::exit(1);
-        });
+        {
+            if let Some(queue) = mail_delivery_queue {
+                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            }
+            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+                tracing::error!(error = %error, "Failed to configure mailer");
+                std::process::exit(1);
+            });
+        }
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1677,6 +1707,8 @@ impl AppBuilder {
             #[cfg(feature = "i18n")]
             i18n_auto_load,
             policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue,
         } = self;
 
         let all_routes = routes;
@@ -1770,10 +1802,15 @@ impl AppBuilder {
             crate::cache::clear_global_cache();
         }
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
-            eprintln!("Failed to configure mailer: {error}");
-            std::process::exit(1);
-        });
+        {
+            if let Some(queue) = mail_delivery_queue {
+                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            }
+            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+                eprintln!("Failed to configure mailer: {error}");
+                std::process::exit(1);
+            });
+        }
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -1974,6 +2011,8 @@ impl AppBuilder {
             i18n_auto_load,
             policy_registrations,
             cache_backend,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue,
             ..
         } = self;
 
@@ -2044,10 +2083,15 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "mail")]
-        crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
-            eprintln!("Failed to configure mailer: {error}");
-            std::process::exit(1);
-        });
+        {
+            if let Some(queue) = mail_delivery_queue {
+                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            }
+            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+                eprintln!("Failed to configure mailer: {error}");
+                std::process::exit(1);
+            });
+        }
 
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
