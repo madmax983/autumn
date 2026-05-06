@@ -42,7 +42,7 @@
 //! assert_eq!(err.status(), StatusCode::NOT_FOUND);
 //! ```
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
@@ -73,6 +73,16 @@ struct ErrorInner {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// JSON body for RFC 7807 Problem Details responses.
+#[derive(Serialize)]
+struct ProblemBody {
+    #[serde(rename = "type")]
+    type_uri: &'static str,
+    title: &'static str,
+    status: u16,
+    detail: String,
 }
 
 /// Framework error type wrapping any error with an HTTP status code.
@@ -118,6 +128,7 @@ pub struct AutumnError {
     inner: Box<dyn std::error::Error + Send + Sync>,
     status: StatusCode,
     details: Option<std::collections::HashMap<String, Vec<String>>>,
+    problem_type: Option<&'static str>,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -146,6 +157,7 @@ where
             inner: Box::new(err),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
+            problem_type: None,
         }
     }
 }
@@ -185,6 +197,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -204,6 +217,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::NOT_FOUND,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -223,6 +237,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::BAD_REQUEST,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -245,6 +260,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -264,6 +280,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::SERVICE_UNAVAILABLE,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -283,6 +300,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::UNAUTHORIZED,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -302,6 +320,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::FORBIDDEN,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -332,6 +351,7 @@ impl AutumnError {
             inner: Box::new(StringError("Validation failed".into())),
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: Some(details),
+            problem_type: None,
         }
     }
 
@@ -462,6 +482,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::CONFLICT,
             details: None,
+            problem_type: Some("https://autumn.dev/problems/conflict"),
         }
     }
 
@@ -540,6 +561,26 @@ impl IntoResponse for AutumnError {
             message: message.clone(),
             details: self.details.clone(),
         };
+
+        if let Some(type_uri) = self.problem_type {
+            let body = ProblemBody {
+                type_uri,
+                title: "Conflict",
+                status: status.as_u16(),
+                detail: message,
+            };
+            let mut response = (status, axum::Json(body)).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/problem+json"),
+            );
+            response.headers_mut().insert(
+                "HX-Trigger",
+                HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
+            );
+            response.extensions_mut().insert(error_info);
+            return response;
+        }
 
         let body = ErrorBody {
             error: ErrorInner {
@@ -797,8 +838,24 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
-        assert_eq!(json["error"]["status"], 409);
-        assert_eq!(json["error"]["message"], "version mismatch");
+        assert_eq!(json["status"], 409);
+        assert_eq!(json["detail"], "version mismatch");
+        assert_eq!(json["type"], "https://autumn.dev/problems/conflict");
+        assert_eq!(json["title"], "Conflict");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflict_response_has_hx_trigger_header() -> Result<(), axum::Error> {
+        let err = AutumnError::conflict_msg("version mismatch");
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let hx_trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .expect("HX-Trigger header present");
+        assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
 }

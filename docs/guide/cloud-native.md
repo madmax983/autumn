@@ -225,6 +225,134 @@ with the default per-function Moka caches.
 The `memory` default produces a startup warning in the `prod` profile — the
 same pattern as sessions and file storage.
 
+## Concurrent Writes
+
+### The lost-update problem
+
+With more than one replica, two requests can read the same row, compute
+independent changes, and both write back — the second write silently overwrites
+the first. No error is raised, no conflict is detected, data is lost.
+
+### Optimistic concurrency via `#[lock_version]`
+
+Add the attribute to any model field named `lock_version`:
+
+```rust
+#[autumn_web::model]
+pub struct Article {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub body: String,
+    #[lock_version]
+    pub lock_version: i32,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+    #[default]
+    pub updated_at: chrono::NaiveDateTime,
+}
+```
+
+The framework then:
+
+1. Stores the current `lock_version` as a counter column in the database.
+2. Requires the client to send the expected version alongside its update
+   payload (the generated `UpdateArticle` struct carries this automatically).
+3. On write, issues an atomic `UPDATE … WHERE id = $1 AND lock_version = $2`
+   and increments the counter only if the row matched.
+
+If the row was updated between the client's read and its write — i.e. the
+stored version is no longer what the client expected — the UPDATE matches zero
+rows and the repository returns `RepositoryError::Conflict`, which the
+framework maps to HTTP 409 with an RFC 7807 problem body:
+
+```json
+{"type": "about:blank", "status": 409, "title": "Conflict", "detail": "..."}
+```
+
+For htmx clients, the framework also emits the response header:
+
+```
+HX-Trigger: {"autumn:conflict":true}
+```
+
+Your client-side script can listen for that event and re-fetch the current
+version before letting the user resubmit.
+
+A handler that catches the conflict and signals a retry:
+
+```rust
+async fn update_article(
+    State(repo): State<ArticleRepository>,
+    Path(id): Path<i64>,
+    Form(input): Form<UpdateArticle>,
+) -> Response {
+    match repo.update(id, input).await {
+        Ok(article) => Redirect::to(&format!("/articles/{}", article.id)).into_response(),
+        Err(RepositoryError::Conflict { .. }) => {
+            // Re-fetch the current version and tell the user to retry
+            let current = repo.find(id).await.unwrap();
+            (StatusCode::CONFLICT, EditTemplate { article: current, conflict: true })
+                .into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+```
+
+Optimistic concurrency is the right default for most web applications: reads
+are cheap, conflicts are rare, and throughput scales well.
+
+### Pessimistic concurrency via `with_lock`
+
+For low-contention but high-consequence writes — think inventory deductions,
+financial ledger entries, or seat reservations — you cannot afford to retry
+after detecting a conflict because another request may have already acted on
+the same data. Use `with_lock` to acquire a database-level advisory or
+row-level lock before reading:
+
+```rust
+repo.with_lock(id, |row, conn| async move {
+    // `row` is the freshly locked Page; `conn` is the transaction connection.
+    // Any writes here are serialized against other `with_lock` callers for
+    // the same `id`.
+    row.seats_remaining -= 1;
+    diesel::update(seats::table.find(row.id))
+        .set(seats::seats_remaining.eq(row.seats_remaining))
+        .execute(conn)
+        .await?;
+    Ok(row)
+}.scope_boxed()).await
+```
+
+The closure runs inside a transaction. The lock is released when the
+transaction commits or rolls back.
+
+### Trade-offs
+
+| | Optimistic | Pessimistic |
+|---|---|---|
+| **Throughput** | High — no blocking between readers | Lower — concurrent writers queue |
+| **Latency** | Low on the happy path; a retry adds one round trip | Consistently higher; each writer waits for the lock |
+| **Complexity** | Low — framework handles version checks | Moderate — closure-based API, must reason about deadlocks |
+| **Best for** | Typical CRUD, forms, wiki edits, profile updates | Inventory, ledger, seat/slot reservation, anything where retry is unsafe |
+
+### Cache invalidation after writes
+
+`after_update` hooks receive a `MutationContext` that accepts
+`ctx.invalidate("key")` calls to declare cache keys that should be evicted
+after the write commits. This is coordinated with the shared-cache integration
+(#535) so that the correct backend — Moka or Redis — is targeted regardless of
+which replica processed the write:
+
+```rust
+async fn after_update(&self, ctx: &mut MutationContext, page: &Page) -> AutumnResult<()> {
+    ctx.invalidate(format!("pages:{}", page.id));
+    ctx.invalidate("pages:all");
+    Ok(())
+}
+```
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -237,4 +365,5 @@ Before calling an Autumn app "cloud ready", verify:
 - mail uses SMTP, not log/file transport
 - migrations run before web rollout
 - background jobs use the right runtime model
+- multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery

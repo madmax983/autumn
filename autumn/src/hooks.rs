@@ -99,6 +99,8 @@ pub struct MutationContext {
     pub request_id: Option<String>,
     /// Timestamp of the mutation.
     pub now: chrono::DateTime<chrono::Utc>,
+    /// Cache keys to invalidate after the mutation.
+    pub invalidate_keys: Vec<String>,
 }
 
 impl MutationContext {
@@ -113,7 +115,13 @@ impl MutationContext {
             actor: None,
             request_id: Some(uuid::Uuid::new_v4().to_string()),
             now: chrono::Utc::now(),
+            invalidate_keys: Vec::new(),
         }
+    }
+
+    /// Add a cache key to the invalidation list.
+    pub fn invalidate(&mut self, key: impl Into<String>) {
+        self.invalidate_keys.push(key.into());
     }
 }
 
@@ -174,6 +182,24 @@ pub trait MutationHooks: Send + Sync + 'static {
 
     /// Called before an existing record is deleted.
     fn before_delete(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after a new record is inserted.
+    fn after_create(
+        &self,
+        _ctx: &mut MutationContext,
+        _record: &Self::Model,
+    ) -> impl Future<Output = AutumnResult<()>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Called after an existing record is updated.
+    fn after_update(
         &self,
         _ctx: &mut MutationContext,
         _record: &Self::Model,
@@ -691,6 +717,15 @@ mod tests {
         // UUID v4 format: 8-4-4-4-12 = 36 chars
         assert_eq!(ctx.request_id.as_ref().unwrap().len(), 36);
         assert!(matches!(ctx.op, MutationOp::Create));
+        assert!(ctx.invalidate_keys.is_empty());
+    }
+
+    #[test]
+    fn mutation_context_invalidate_pushes_key() {
+        let mut ctx = MutationContext::new(MutationOp::Create);
+        assert!(ctx.invalidate_keys.is_empty());
+        ctx.invalidate("cache:key");
+        assert_eq!(ctx.invalidate_keys, vec!["cache:key".to_string()]);
     }
 
     #[test]
@@ -713,6 +748,8 @@ mod tests {
         assert!(hooks.before_create(&mut ctx, &mut new_model).await.is_ok());
         assert!(hooks.before_update(&mut ctx, &mut draft).await.is_ok());
         assert!(hooks.before_delete(&mut ctx, &model).await.is_ok());
+        assert!(hooks.after_create(&mut ctx, &model).await.is_ok());
+        assert!(hooks.after_update(&mut ctx, &model).await.is_ok());
     }
 
     // ── Patch serde tests ──────────────────────────────────────────

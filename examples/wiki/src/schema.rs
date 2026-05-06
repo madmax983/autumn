@@ -5,6 +5,7 @@ diesel::table! {
         slug -> Text,
         body -> Text,
         status -> Text,
+        lock_version -> Int4,
         created_at -> Timestamp,
         updated_at -> Timestamp,
     }
