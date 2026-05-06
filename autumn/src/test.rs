@@ -619,7 +619,12 @@ impl TestResponse {
     /// Panics if the body is not valid UTF-8.
     #[must_use]
     pub fn text(&self) -> String {
-        String::from_utf8(self.body.clone()).expect("response body is not valid UTF-8")
+        String::from_utf8(self.body.clone()).unwrap_or_else(|e| {
+            panic!(
+                "response body is not valid UTF-8: {e}\nRaw bytes: {:?}",
+                self.body
+            )
+        })
     }
 
     /// Deserialize the response body as JSON.
@@ -630,7 +635,12 @@ impl TestResponse {
     /// into `T`.
     #[must_use]
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> T {
-        serde_json::from_slice(&self.body).expect("failed to parse response body as JSON")
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "failed to parse response body as JSON: {e}\nBody: {}",
+                String::from_utf8_lossy(&self.body)
+            )
+        })
     }
 
     /// Get the value of a response header.
@@ -686,9 +696,12 @@ impl TestResponse {
     /// Assert a response header exists and equals the expected value.
     #[track_caller]
     pub fn assert_header(&self, name: &str, expected: &str) -> &Self {
-        let value = self
-            .header(name)
-            .unwrap_or_else(|| panic!("expected header `{name}` to be present"));
+        let value = self.header(name).unwrap_or_else(|| {
+            panic!(
+                "expected header `{name}` to be present.\nAvailable headers: {:?}",
+                self.headers
+            )
+        });
         assert_eq!(
             value, expected,
             "header `{name}`: expected `{expected}`, got `{value}`"
@@ -699,9 +712,12 @@ impl TestResponse {
     /// Assert a response header exists and contains the expected substring.
     #[track_caller]
     pub fn assert_header_contains(&self, name: &str, substring: &str) -> &Self {
-        let value = self
-            .header(name)
-            .unwrap_or_else(|| panic!("expected header `{name}` to be present"));
+        let value = self.header(name).unwrap_or_else(|| {
+            panic!(
+                "expected header `{name}` to be present.\nAvailable headers: {:?}",
+                self.headers
+            )
+        });
         assert!(
             value.contains(substring),
             "header `{name}`: expected `{value}` to contain `{substring}`"
@@ -724,7 +740,7 @@ impl TestResponse {
     #[track_caller]
     pub fn assert_body_eq(&self, expected: &str) -> &Self {
         let body = self.text();
-        assert_eq!(body, expected, "body mismatch");
+        assert_eq!(body, expected, "body mismatch.\nActual Body: {body}");
         self
     }
 
