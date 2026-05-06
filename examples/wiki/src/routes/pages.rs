@@ -241,6 +241,7 @@ pub struct PageForm {
     pub title: String,
     pub body: String,
     pub status: String,
+    #[serde(default)]
     pub lock_version: i32,
 }
 
