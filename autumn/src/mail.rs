@@ -117,6 +117,11 @@ pub struct MailConfig {
     /// Permit log transport in `prod`.
     #[serde(default)]
     pub allow_log_in_production: bool,
+    /// Acknowledge that `deliver_later` may use the in-process Tokio fallback in
+    /// `prod`. Without a registered durable [`MailDeliveryQueue`], this is the
+    /// only way to start the app in `prod` with an active mail transport.
+    #[serde(default)]
+    pub allow_in_process_deliver_later_in_production: bool,
     /// Directory for file transport.
     #[serde(default = "default_file_dir")]
     pub file_dir: PathBuf,
@@ -132,6 +137,7 @@ impl Default for MailConfig {
             from: None,
             reply_to: None,
             allow_log_in_production: false,
+            allow_in_process_deliver_later_in_production: false,
             file_dir: default_file_dir(),
             smtp: SmtpConfig::default(),
         }
@@ -352,6 +358,57 @@ pub trait MailTransport: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
 }
 
+/// Durable backend for [`Mailer::deliver_later`].
+///
+/// Implementors persist the mail (DB row, Redis stream, Harvest job, etc.) and
+/// return as soon as the handoff is durable. The framework's in-process Tokio
+/// fallback is intentionally not durable; production deployments should
+/// register a real implementation via [`MailDeliveryQueueHandle`] before
+/// [`install_mailer`] runs, or set
+/// [`MailConfig::allow_in_process_deliver_later_in_production`] to opt into the
+/// fallback explicitly.
+pub trait MailDeliveryQueue: Send + Sync {
+    /// Enqueue a mail for durable later delivery.
+    fn enqueue<'a>(
+        &'a self,
+        mail: Mail,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
+}
+
+/// Cloneable handle to a [`MailDeliveryQueue`].
+///
+/// Designed for storage on [`AppState`](crate::AppState) extensions. Plugins
+/// (Harvest, custom Redis, etc.) install this before `install_mailer` runs and
+/// the mailer picks it up.
+#[derive(Clone)]
+pub struct MailDeliveryQueueHandle(Arc<dyn MailDeliveryQueue>);
+
+impl MailDeliveryQueueHandle {
+    /// Wrap a queue implementation in a cloneable handle.
+    #[must_use]
+    pub fn new(queue: impl MailDeliveryQueue + 'static) -> Self {
+        Self(Arc::new(queue))
+    }
+
+    /// Wrap an already-shared queue implementation.
+    #[must_use]
+    pub fn from_arc(queue: Arc<dyn MailDeliveryQueue>) -> Self {
+        Self(queue)
+    }
+
+    /// Borrow the inner queue.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn MailDeliveryQueue> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for MailDeliveryQueueHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailDeliveryQueueHandle").finish()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct MailerDefaults {
     from: Option<String>,
@@ -363,6 +420,7 @@ struct MailerDefaults {
 pub struct Mailer {
     defaults: Arc<MailerDefaults>,
     transport: Arc<dyn MailTransport>,
+    delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
 }
 
 impl Mailer {
@@ -400,7 +458,21 @@ impl Mailer {
         Self {
             defaults: Arc::new(MailerDefaults::default()),
             transport: Arc::new(transport),
+            delivery_queue: None,
         }
+    }
+
+    /// Attach a durable [`MailDeliveryQueue`] used by [`Self::deliver_later`].
+    #[must_use]
+    pub fn with_delivery_queue(mut self, queue: impl MailDeliveryQueue + 'static) -> Self {
+        self.delivery_queue = Some(Arc::new(queue));
+        self
+    }
+
+    /// Returns whether a durable [`MailDeliveryQueue`] is attached.
+    #[must_use]
+    pub fn has_durable_delivery_queue(&self) -> bool {
+        self.delivery_queue.is_some()
     }
 
     /// Send mail immediately.
@@ -434,16 +506,25 @@ impl Mailer {
     /// background task.
     pub fn try_deliver_later(&self, mail: Mail) -> Result<(), MailError> {
         let mailer = self.clone();
+        let mail = mail.with_defaults(&self.defaults);
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             MailError::RuntimeUnavailable(
                 "deliver_later requires an active Tokio runtime".to_owned(),
             )
         })?;
-        handle.spawn(async move {
-            if let Err(error) = mailer.send(mail).await {
-                tracing::error!(error = %error, "background mail delivery failed");
-            }
-        });
+        if let Some(queue) = self.delivery_queue.clone() {
+            handle.spawn(async move {
+                if let Err(error) = queue.enqueue(mail).await {
+                    tracing::error!(error = %error, "durable mail enqueue failed");
+                }
+            });
+        } else {
+            handle.spawn(async move {
+                if let Err(error) = mailer.send(mail).await {
+                    tracing::error!(error = %error, "background mail delivery failed");
+                }
+            });
+        }
         Ok(())
     }
 }
@@ -471,6 +552,7 @@ pub struct MailerBuilder {
     reply_to: Option<String>,
     file_dir: PathBuf,
     smtp: Option<SmtpConfig>,
+    delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
 }
 
 impl Default for MailerBuilder {
@@ -481,6 +563,7 @@ impl Default for MailerBuilder {
             reply_to: None,
             file_dir: default_file_dir(),
             smtp: None,
+            delivery_queue: None,
         }
     }
 }
@@ -521,6 +604,21 @@ impl MailerBuilder {
         self
     }
 
+    /// Attach a durable [`MailDeliveryQueue`] used by
+    /// [`Mailer::deliver_later`].
+    #[must_use]
+    pub fn delivery_queue(mut self, queue: impl MailDeliveryQueue + 'static) -> Self {
+        self.delivery_queue = Some(Arc::new(queue));
+        self
+    }
+
+    /// Attach an already-shared durable [`MailDeliveryQueue`].
+    #[must_use]
+    pub fn delivery_queue_arc(mut self, queue: Arc<dyn MailDeliveryQueue>) -> Self {
+        self.delivery_queue = Some(queue);
+        self
+    }
+
     /// Build the mailer.
     ///
     /// # Errors
@@ -547,6 +645,7 @@ impl MailerBuilder {
                 reply_to: self.reply_to,
             }),
             transport,
+            delivery_queue: self.delivery_queue,
         })
     }
 }
@@ -769,16 +868,41 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
 
 /// Install the configured mailer into app state.
 ///
+/// Picks up a runtime-installed [`MailDeliveryQueueHandle`] from
+/// [`AppState`] extensions when present, so plugins (Harvest, Redis-backed,
+/// etc.) can register durable delivery before this runs. In `prod` with a
+/// non-`Disabled` transport, startup fails when neither a durable queue nor
+/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set.
+///
 /// # Errors
 ///
-/// Returns an Autumn error when the configured transport cannot be created.
+/// Returns an Autumn error when the configured transport cannot be created or
+/// when the production `deliver_later` guard is not satisfied.
 pub(crate) fn install_mailer(state: &AppState, config: &MailConfig) -> AutumnResult<()> {
-    let mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
-    if matches!(state.profile(), "prod" | "production") && config.transport != Transport::Disabled {
-        tracing::warn!(
-            "mail deliver_later currently uses the in-process Tokio fallback unless a Harvest-backed mail queue is installed"
-        );
+    let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
+
+    let queue_handle = state.extension::<MailDeliveryQueueHandle>();
+    if let Some(handle) = queue_handle.as_ref() {
+        mailer.delivery_queue = Some(Arc::clone(handle.inner()));
     }
+
+    let in_production = matches!(state.profile(), "prod" | "production");
+    let transport_sends_mail = config.transport != Transport::Disabled;
+
+    if in_production && transport_sends_mail {
+        let has_durable_queue = mailer.delivery_queue.is_some();
+        if !has_durable_queue && !config.allow_in_process_deliver_later_in_production {
+            return Err(AutumnError::service_unavailable_msg(
+                "mail.deliver_later has no durable backend in prod: register a MailDeliveryQueueHandle on AppState or set mail.allow_in_process_deliver_later_in_production = true to opt into the in-process Tokio fallback",
+            ));
+        }
+        if !has_durable_queue {
+            tracing::warn!(
+                "mail.deliver_later is using the in-process Tokio fallback in prod; this is acknowledged via mail.allow_in_process_deliver_later_in_production but is not durable across restarts or replicas"
+            );
+        }
+    }
+
     state.insert_extension(mailer);
     Ok(())
 }
@@ -974,5 +1098,140 @@ mod tests {
             .expect("mail should build");
 
         mailer.deliver_later(mail);
+    }
+
+    fn sample_smtp_config() -> MailConfig {
+        MailConfig {
+            transport: Transport::Smtp,
+            from: Some("Autumn <noreply@example.com>".to_owned()),
+            smtp: SmtpConfig {
+                host: Some("smtp.example.com".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn sample_mail() -> Mail {
+        Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .build()
+            .expect("mail should build")
+    }
+
+    struct NoopQueue;
+
+    impl MailDeliveryQueue for NoopQueue {
+        fn enqueue<'a>(
+            &'a self,
+            _mail: Mail,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[test]
+    fn install_mailer_rejects_in_process_fallback_in_prod_without_ack() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+
+        let error = install_mailer(&state, &config)
+            .expect_err("prod must reject in-process deliver_later fallback without ack");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("allow_in_process_deliver_later_in_production"),
+            "error should explain how to opt in: {message}"
+        );
+    }
+
+    #[test]
+    fn install_mailer_allows_in_process_fallback_in_prod_with_explicit_ack() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = MailConfig {
+            allow_in_process_deliver_later_in_production: true,
+            ..sample_smtp_config()
+        };
+
+        install_mailer(&state, &config).expect("explicit ack should permit fallback in prod");
+    }
+
+    #[test]
+    fn install_mailer_allows_durable_queue_in_prod_without_ack() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
+        let config = sample_smtp_config();
+
+        install_mailer(&state, &config)
+            .expect("a registered durable queue should satisfy the prod guard");
+    }
+
+    #[test]
+    fn install_mailer_does_not_require_ack_outside_production() {
+        let state = crate::AppState::for_test().with_profile("dev");
+        let config = sample_smtp_config();
+
+        install_mailer(&state, &config).expect("non-prod profiles should not require an ack");
+    }
+
+    #[test]
+    fn install_mailer_does_not_require_ack_when_transport_is_disabled() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = MailConfig::default();
+
+        install_mailer(&state, &config)
+            .expect("disabled transport never sends mail so it should not need an ack");
+    }
+
+    #[tokio::test]
+    async fn deliver_later_routes_through_configured_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Mail>();
+
+        struct CapturingQueue {
+            tx: tokio::sync::mpsc::UnboundedSender<Mail>,
+        }
+
+        impl MailDeliveryQueue for CapturingQueue {
+            fn enqueue<'a>(
+                &'a self,
+                mail: Mail,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                let tx = self.tx.clone();
+                Box::pin(async move {
+                    tx.send(mail)
+                        .map_err(|err| MailError::RuntimeUnavailable(err.to_string()))?;
+                    Ok(())
+                })
+            }
+        }
+
+        let mailer = Mailer::builder()
+            .delivery_queue(CapturingQueue { tx })
+            .build()
+            .expect("mailer should build");
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("scheduling onto the queue should succeed");
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("queue should receive within 1s")
+            .expect("queue should receive the mail");
+
+        assert_eq!(received.subject, "Hi");
+    }
+
+    #[tokio::test]
+    async fn deliver_later_uses_in_process_fallback_when_no_queue() {
+        // The default Mailer has no durable queue, so deliver_later should
+        // still spawn the in-process Tokio task and not call any queue.
+        let mailer = Mailer::builder().build().expect("mailer should build");
+
+        mailer
+            .try_deliver_later(sample_mail())
+            .expect("in-process fallback should still schedule");
     }
 }

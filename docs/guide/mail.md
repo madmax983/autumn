@@ -84,6 +84,80 @@ If the route also persists DB state (for example, writing an outbox row plus
 creating a user), wrap the DB side in [`Db::tx`](transactions.md) so your write
 sequence is atomic.
 
+## Deferred Delivery (`deliver_later`)
+
+`Mailer::deliver_later` and the generated `deliver_later_*` helpers do **not**
+imply durable delivery on their own. The framework provides two paths:
+
+1. **In-process Tokio fallback (default).** The mail send is spawned onto the
+   current Tokio runtime. This is fine for local development and small
+   single-process deployments, but it is not durable: a process restart, pod
+   eviction, or deploy can drop the email after the request has already
+   returned success.
+2. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once for
+   your queue of choice (DB outbox row, Redis stream, Harvest job, etc.) and
+   register it on `AppState` before the mailer is installed:
+
+   ```rust
+   use autumn_web::prelude::*;
+   use std::sync::Arc;
+
+   struct OutboxQueue { /* db handle */ }
+
+   impl MailDeliveryQueue for OutboxQueue {
+       fn enqueue<'a>(
+           &'a self,
+           mail: Mail,
+       ) -> std::pin::Pin<Box<dyn std::future::Future<
+           Output = Result<(), MailError>,
+       > + Send + 'a>> {
+           Box::pin(async move {
+               // INSERT into mail_outbox (...) VALUES (...)
+               // Return Ok(()) once the row is durably committed.
+               Ok(())
+           })
+       }
+   }
+
+   // During app boot, before the mailer is installed:
+   state.insert_extension(MailDeliveryQueueHandle::new(OutboxQueue { /* ... */ }));
+   ```
+
+   When a `MailDeliveryQueueHandle` is present, `deliver_later` routes through
+   it instead of the in-process fallback.
+
+### Production Guard
+
+In `prod`/`production`, Autumn refuses to start with an active mail transport
+and no durable backend unless you explicitly opt in:
+
+```toml
+[mail]
+transport = "smtp"
+allow_in_process_deliver_later_in_production = true
+```
+
+Without that flag, startup fails with a clear message asking you to either
+install a `MailDeliveryQueueHandle` or set the flag. The flag is intended as an
+acknowledged single-replica escape hatch, not a recommended production setup.
+
+### DB-Write + Mail Patterns (Outbox)
+
+When a request both writes to the DB and dispatches mail, send mail **after**
+the DB transaction commits, but make the dispatch idempotent so retries
+recover:
+
+1. Inside `Db::tx`, insert the user row **and** an `email_outbox` row
+   (`(id, kind, payload, status='pending')`) atomically.
+2. After commit, call `mailer.deliver_later(...)`.
+3. A `MailDeliveryQueue` implementation reads the outbox row, sends the email,
+   and marks the row `sent`. On retry, it skips already-`sent` rows. This is
+   the canonical outbox pattern: the DB transaction is the source of truth for
+   "the user signed up", and the queue worker is responsible for at-least-once
+   delivery without losing mail across restarts.
+
+For the transaction shape see [`Db::tx`](transactions.md).
+
 ## Transports
 
 - `log`: writes headers and full bodies to tracing at INFO. Default for `dev`.
@@ -102,7 +176,9 @@ build a `Mailer::with_transport(...)`.
 - Keep SMTP secrets in environment variables via `password_env`.
 - Add a plain-text fallback for every HTML email.
 - Assert file-transport `.eml` contents in integration tests.
-- Prefer a Harvest-backed queue for durable `deliver_later` retries. Without
-  Harvest, Autumn falls back to an in-process Tokio task and logs failures.
+- Register a `MailDeliveryQueueHandle` (Harvest, DB outbox, Redis, etc.) for
+  durable `deliver_later` retries. Without one, `prod` startup fails unless
+  `mail.allow_in_process_deliver_later_in_production = true` is set, in which
+  case Autumn falls back to an in-process Tokio task and logs failures.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
