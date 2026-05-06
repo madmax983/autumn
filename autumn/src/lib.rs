@@ -103,7 +103,11 @@ pub mod mail;
 pub mod migrate;
 pub mod plugin;
 pub mod probe;
+#[cfg(feature = "system-info")]
+pub mod system_info;
 pub use plugin::{Plugin, Plugins};
+#[cfg(feature = "system-info")]
+pub use system_info::SystemInfoPlugin;
 
 pub mod route_listing;
 
