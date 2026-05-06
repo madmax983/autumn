@@ -256,6 +256,17 @@ impl BlobStoreState {
 ///
 /// Returns [`BlobStoreError::InvalidInput`] when the key is rejected.
 pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
+    check_basic_formatting(key)?;
+    check_windows_paths(key)?;
+    for segment in key.split('/') {
+        validate_segment(segment)?;
+    }
+    check_reserved_suffixes(key)?;
+    check_case_folding(key)?;
+    Ok(())
+}
+
+fn check_basic_formatting(key: &str) -> Result<(), BlobStoreError> {
     if key.is_empty() {
         return Err(BlobStoreError::InvalidInput("blob key is empty".into()));
     }
@@ -278,6 +289,10 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             "blob key contains a backslash; use `/` as the segment separator".into(),
         ));
     }
+    Ok(())
+}
+
+fn check_windows_paths(key: &str) -> Result<(), BlobStoreError> {
     // Windows drive-letter forms (`C:\…`, `C:/…`, `\\?\…`, `\\server\share\…`)
     // would be treated as absolute by `Path::join` on Windows, silently
     // escaping the storage root regardless of whether the host happens
@@ -295,74 +310,80 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             "blob key looks like a UNC / network path".into(),
         ));
     }
-    for segment in key.split('/') {
-        if segment == ".." {
-            return Err(BlobStoreError::InvalidInput(
-                "blob key contains traversal segment".into(),
-            ));
-        }
-        // `.` and empty segments collapse on the filesystem (`a/./b`,
-        // `a//b`, and `a/b` all resolve to the same path on POSIX) and
-        // are normalized away by most HTTP clients before they reach
-        // the serving route. Either way, two distinct logical keys
-        // would alias and the HMAC signature would no longer match
-        // the path the client actually requests. Reject them here so
-        // every key is canonical at the point it's persisted or signed.
-        if segment == "." {
-            return Err(BlobStoreError::InvalidInput(
-                "blob key contains a `.` segment".into(),
-            ));
-        }
-        if segment.is_empty() {
-            return Err(BlobStoreError::InvalidInput(
-                "blob key contains an empty segment".into(),
-            ));
-        }
-        // Windows silently strips trailing `.` and trailing space from
-        // filenames (`foo.png.` → `foo.png`, `con ` → `con`). That
-        // would let two distinct logical keys alias the same on-disk
-        // file on Windows, and could bypass the reserved-name guard
-        // below (a segment of `con ` passes the literal `==` check
-        // but normalizes to `con` once Windows touches it).
-        if segment.ends_with('.') || segment.ends_with(' ') {
-            return Err(BlobStoreError::InvalidInput(format!(
-                "blob key segment {segment:?} ends with `.` or space; Windows normalizes \
-                 these and would alias the segment with its stripped form"
-            )));
-        }
-        // Windows rejects these characters in filenames; a key
-        // containing any of them passes Linux/S3 but errors with
-        // I/O on Windows. Same portability rationale as the
-        // uppercase check above. Control chars (< 0x20) are also
-        // rejected on Windows and rarely meaningful as path
-        // components anyway.
-        if segment.bytes().any(|b| {
-            matches!(
-                b,
-                b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' | 0x01..=0x1F
-            )
-        }) {
-            return Err(BlobStoreError::InvalidInput(
-                "blob key contains a Windows-reserved filename character (`<`, `>`, \
-                 `:`, `\"`, `|`, `?`, `*`, or a control byte) — keys must be portable \
-                 across local and S3 backends"
-                    .into(),
-            ));
-        }
-        // Windows reserved device names: a key like `con/foo` or
-        // `nul.png` errors with I/O on Windows even though Linux/S3
-        // accept it. Compare against the Unicode-lowercased
-        // basename (the part before the first `.`). The uppercase
-        // check above already enforces lowercase, so checking the
-        // raw lowercase set is sufficient.
-        let basename = segment.split('.').next().unwrap_or("");
-        if WINDOWS_RESERVED_NAMES.contains(&basename) {
-            return Err(BlobStoreError::InvalidInput(format!(
-                "blob key segment {segment:?} starts with a Windows-reserved device name \
-                 (`con`, `prn`, `aux`, `nul`, `com1-9`, `lpt1-9`)"
-            )));
-        }
+    Ok(())
+}
+
+fn validate_segment(segment: &str) -> Result<(), BlobStoreError> {
+    if segment == ".." {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key contains traversal segment".into(),
+        ));
     }
+    // `.` and empty segments collapse on the filesystem (`a/./b`,
+    // `a//b`, and `a/b` all resolve to the same path on POSIX) and
+    // are normalized away by most HTTP clients before they reach
+    // the serving route. Either way, two distinct logical keys
+    // would alias and the HMAC signature would no longer match
+    // the path the client actually requests. Reject them here so
+    // every key is canonical at the point it's persisted or signed.
+    if segment == "." {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key contains a `.` segment".into(),
+        ));
+    }
+    if segment.is_empty() {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key contains an empty segment".into(),
+        ));
+    }
+    // Windows silently strips trailing `.` and trailing space from
+    // filenames (`foo.png.` → `foo.png`, `con ` → `con`). That
+    // would let two distinct logical keys alias the same on-disk
+    // file on Windows, and could bypass the reserved-name guard
+    // below (a segment of `con ` passes the literal `==` check
+    // but normalizes to `con` once Windows touches it).
+    if segment.ends_with('.') || segment.ends_with(' ') {
+        return Err(BlobStoreError::InvalidInput(format!(
+            "blob key segment {segment:?} ends with `.` or space; Windows normalizes \
+             these and would alias the segment with its stripped form"
+        )));
+    }
+    // Windows rejects these characters in filenames; a key
+    // containing any of them passes Linux/S3 but errors with
+    // I/O on Windows. Same portability rationale as the
+    // uppercase check above. Control chars (< 0x20) are also
+    // rejected on Windows and rarely meaningful as path
+    // components anyway.
+    if segment.bytes().any(|b| {
+        matches!(
+            b,
+            b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*' | 0x01..=0x1F
+        )
+    }) {
+        return Err(BlobStoreError::InvalidInput(
+            "blob key contains a Windows-reserved filename character (`<`, `>`, \
+             `:`, `\"`, `|`, `?`, `*`, or a control byte) — keys must be portable \
+             across local and S3 backends"
+                .into(),
+        ));
+    }
+    // Windows reserved device names: a key like `con/foo` or
+    // `nul.png` errors with I/O on Windows even though Linux/S3
+    // accept it. Compare against the Unicode-lowercased
+    // basename (the part before the first `.`). The uppercase
+    // check above already enforces lowercase, so checking the
+    // raw lowercase set is sufficient.
+    let basename = segment.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_NAMES.contains(&basename) {
+        return Err(BlobStoreError::InvalidInput(format!(
+            "blob key segment {segment:?} starts with a Windows-reserved device name \
+             (`con`, `prn`, `aux`, `nul`, `com1-9`, `lpt1-9`)"
+        )));
+    }
+    Ok(())
+}
+
+fn check_reserved_suffixes(key: &str) -> Result<(), BlobStoreError> {
     // The local backend persists `<path>.meta` sidecars next to each
     // blob's bytes (carrying the original `content_type` so the serving
     // route can render images, PDFs, etc. correctly). If we let user
@@ -388,6 +409,10 @@ pub fn validate_key(key: &str) -> Result<(), BlobStoreError> {
             ));
         }
     }
+    Ok(())
+}
+
+fn check_case_folding(key: &str) -> Result<(), BlobStoreError> {
     // Case-insensitive filesystems (Windows NTFS default, macOS APFS
     // default) collapse keys whose Unicode case-fold is identical to
     // the same on-disk path, so two distinct logical keys would
