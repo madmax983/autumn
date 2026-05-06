@@ -240,6 +240,17 @@ impl JobRegistry {
         }
     }
 
+    fn update_status<F>(&self, name: &str, f: F)
+    where
+        F: FnOnce(&mut JobStatus),
+    {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            f(status);
+        }
+    }
+
     /// Record that a new job instance was enqueued.
     pub fn record_enqueue(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
@@ -257,47 +268,39 @@ impl JobRegistry {
 
     /// Record that a queued job started execution.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.update_status(name, |status| {
             status.queued = status.queued.saturating_sub(1);
             status.in_flight = status.in_flight.saturating_add(1);
-        }
+        });
     }
 
     /// Record a successful execution.
     pub fn record_success(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.update_status(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.total_successes = status.total_successes.saturating_add(1);
             status.last_error = None;
-        }
+        });
     }
 
     /// Record a retriable failure.
     pub fn record_retry(&self, name: &str, error: &str, _attempt: u32) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.update_status(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.last_error = Some(error.to_string());
-        }
+        });
     }
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.update_status(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.total_failures = status.total_failures.saturating_add(1);
             status.last_error = Some(error);
             if dead_lettered {
                 status.dead_letters = status.dead_letters.saturating_add(1);
             }
-        }
+        });
     }
 
     /// Snapshot all registered jobs.
@@ -366,64 +369,59 @@ impl TaskRegistry {
         );
     }
 
+    fn update_status<F>(&self, name: &str, f: F)
+    where
+        F: FnOnce(&mut TaskStatus),
+    {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            f(status);
+        }
+    }
+
     /// Record the replica that acquired leadership for a global task tick.
     pub fn record_leader(&self, name: &str, leader_id: &str, tick_key: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.current_leader = Some(leader_id.to_string());
-        task.last_tick = Some(tick_key.to_string());
+        self.update_status(name, |task| {
+            task.current_leader = Some(leader_id.to_string());
+            task.last_tick = Some(tick_key.to_string());
+        });
     }
 
     /// Record that a task started running.
     pub fn record_start(&self, name: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "running".to_string();
+        self.update_status(name, |task| {
+            task.status = "running".to_string();
+        });
     }
 
     /// Record that a task completed successfully.
     pub fn record_success(&self, name: &str, duration_ms: u64) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        task.last_run = Some(now.clone());
-        task.last_fired_at = Some(now);
-        task.last_duration_ms = Some(duration_ms);
-        task.last_result = Some("ok".to_string());
-        task.last_error = None;
-        task.total_runs += 1;
+        self.update_status(name, |task| {
+            task.status = "idle".to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            task.last_run = Some(now.clone());
+            task.last_fired_at = Some(now);
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("ok".to_string());
+            task.last_error = None;
+            task.total_runs += 1;
+        });
     }
 
     /// Record that a task failed.
     pub fn record_failure(&self, name: &str, duration_ms: u64, error: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        task.last_run = Some(now.clone());
-        task.last_fired_at = Some(now);
-        task.last_duration_ms = Some(duration_ms);
-        task.last_result = Some("failed".to_string());
-        task.last_error = Some(error.to_string());
-        task.total_runs += 1;
-        task.total_failures += 1;
+        self.update_status(name, |task| {
+            task.status = "idle".to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            task.last_run = Some(now.clone());
+            task.last_fired_at = Some(now);
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("failed".to_string());
+            task.last_error = Some(error.to_string());
+            task.total_runs += 1;
+            task.total_failures += 1;
+        });
     }
 
     /// Get a snapshot of all task statuses.
