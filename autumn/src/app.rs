@@ -1502,7 +1502,7 @@ impl AppBuilder {
             if let Some(queue) = mail_delivery_queue {
                 state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
             }
-            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
                 tracing::error!(error = %error, "Failed to configure mailer");
                 std::process::exit(1);
             });
@@ -1806,7 +1806,10 @@ impl AppBuilder {
             if let Some(queue) = mail_delivery_queue {
                 state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
             }
-            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            // Static-site builds are short-lived and don't run the request
+            // loop; the durable deliver_later guard isn't relevant here, so
+            // skip it to avoid forcing a queue/ack just to render assets.
+            crate::mail::install_mailer(&state, &config.mail, false).unwrap_or_else(|error| {
                 eprintln!("Failed to configure mailer: {error}");
                 std::process::exit(1);
             });
@@ -2087,7 +2090,7 @@ impl AppBuilder {
             if let Some(queue) = mail_delivery_queue {
                 state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
             }
-            crate::mail::install_mailer(&state, &config.mail).unwrap_or_else(|error| {
+            crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
                 eprintln!("Failed to configure mailer: {error}");
                 std::process::exit(1);
             });

@@ -872,13 +872,19 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
 /// [`AppState`] extensions when present, so plugins (Harvest, Redis-backed,
 /// etc.) can register durable delivery before this runs. In `prod` with a
 /// non-`Disabled` transport, startup fails when neither a durable queue nor
-/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set.
+/// [`MailConfig::allow_in_process_deliver_later_in_production`] is set, unless
+/// `enforce_durable_guard` is `false` (used by short-lived contexts like
+/// static-site builds where `deliver_later` semantics don't apply).
 ///
 /// # Errors
 ///
 /// Returns an Autumn error when the configured transport cannot be created or
 /// when the production `deliver_later` guard is not satisfied.
-pub(crate) fn install_mailer(state: &AppState, config: &MailConfig) -> AutumnResult<()> {
+pub(crate) fn install_mailer(
+    state: &AppState,
+    config: &MailConfig,
+    enforce_durable_guard: bool,
+) -> AutumnResult<()> {
     let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
 
     let in_production = matches!(state.profile(), "prod" | "production");
@@ -894,7 +900,7 @@ pub(crate) fn install_mailer(state: &AppState, config: &MailConfig) -> AutumnRes
         }
     }
 
-    if in_production && transport_sends_mail {
+    if enforce_durable_guard && in_production && transport_sends_mail {
         let has_durable_queue = mailer.delivery_queue.is_some();
         if !has_durable_queue && !config.allow_in_process_deliver_later_in_production {
             return Err(AutumnError::service_unavailable_msg(
@@ -1142,7 +1148,7 @@ mod tests {
         let state = crate::AppState::for_test().with_profile("prod");
         let config = sample_smtp_config();
 
-        let error = install_mailer(&state, &config)
+        let error = install_mailer(&state, &config, true)
             .expect_err("prod must reject in-process deliver_later fallback without ack");
 
         let message = error.to_string();
@@ -1160,7 +1166,7 @@ mod tests {
             ..sample_smtp_config()
         };
 
-        install_mailer(&state, &config).expect("explicit ack should permit fallback in prod");
+        install_mailer(&state, &config, true).expect("explicit ack should permit fallback in prod");
     }
 
     #[test]
@@ -1169,7 +1175,7 @@ mod tests {
         state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
         let config = sample_smtp_config();
 
-        install_mailer(&state, &config)
+        install_mailer(&state, &config, true)
             .expect("a registered durable queue should satisfy the prod guard");
     }
 
@@ -1178,7 +1184,7 @@ mod tests {
         let state = crate::AppState::for_test().with_profile("dev");
         let config = sample_smtp_config();
 
-        install_mailer(&state, &config).expect("non-prod profiles should not require an ack");
+        install_mailer(&state, &config, true).expect("non-prod profiles should not require an ack");
     }
 
     #[test]
@@ -1186,7 +1192,7 @@ mod tests {
         let state = crate::AppState::for_test().with_profile("prod");
         let config = MailConfig::default();
 
-        install_mailer(&state, &config)
+        install_mailer(&state, &config, true)
             .expect("disabled transport never sends mail so it should not need an ack");
     }
 
@@ -1298,7 +1304,7 @@ mod tests {
             ..sample_smtp_config()
         };
 
-        install_mailer(&state, &config).expect("explicit ack should permit fallback in prod");
+        install_mailer(&state, &config, true).expect("explicit ack should permit fallback in prod");
 
         let installed = state
             .extension::<Mailer>()
@@ -1315,7 +1321,7 @@ mod tests {
         state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
         let config = sample_smtp_config();
 
-        install_mailer(&state, &config).expect("durable queue should permit prod startup");
+        install_mailer(&state, &config, true).expect("durable queue should permit prod startup");
 
         let installed = state
             .extension::<Mailer>()
@@ -1324,6 +1330,20 @@ mod tests {
             installed.has_durable_delivery_queue(),
             "registered queue handle should be attached to the installed mailer"
         );
+    }
+
+    #[test]
+    fn install_mailer_skips_production_guard_when_not_enforced() {
+        // Static-site builds (run_build_mode) call install_mailer with
+        // enforce_durable_guard=false because they don't run the request
+        // loop and don't actually defer mail. Even with a prod profile,
+        // an active SMTP transport, no queue, and no ack flag, install
+        // must succeed in this mode.
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+
+        install_mailer(&state, &config, false)
+            .expect("static-build mode should not enforce the deliver_later guard");
     }
 
     #[test]
@@ -1336,7 +1356,7 @@ mod tests {
         state.insert_extension(MailDeliveryQueueHandle::new(NoopQueue));
         let config = MailConfig::default(); // transport = Disabled
 
-        install_mailer(&state, &config).expect("disabled transport should install cleanly");
+        install_mailer(&state, &config, true).expect("disabled transport should install cleanly");
 
         let installed = state
             .extension::<Mailer>()
