@@ -125,6 +125,21 @@ imply durable delivery on their own. The framework provides two paths:
        .await;
    ```
 
+   When the queue needs framework-managed resources (the DB pool, channels,
+   etc.) that only exist after the [`AppState`] is built, use
+   [`AppBuilder::with_mail_delivery_queue_factory`] instead. The factory
+   runs once with the live `AppState` immediately before `install_mailer`:
+
+   ```rust,ignore
+   autumn_web::app()
+       .with_mail_delivery_queue_factory(|state| {
+           let pool = state.pool().expect("DB pool required").clone();
+           Ok(OutboxQueue::new(pool))
+       })
+       .run()
+       .await;
+   ```
+
    When a queue is registered, `deliver_later` routes through it instead of
    the in-process fallback.
 

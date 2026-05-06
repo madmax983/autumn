@@ -106,7 +106,7 @@ pub fn app() -> AppBuilder {
         i18n_auto_load: false,
         policy_registrations: Vec::new(),
         #[cfg(feature = "mail")]
-        mail_delivery_queue: None,
+        mail_delivery_queue_factory: None,
     }
 }
 
@@ -261,12 +261,23 @@ pub struct AppBuilder {
     /// built. Stored as boxed closures so we can carry the
     /// generic type parameters across the builder boundary.
     policy_registrations: Vec<PolicyRegistration>,
-    /// Durable mail delivery queue registered at builder time via
-    /// [`AppBuilder::with_mail_delivery_queue`]. Wired into [`AppState`] before
-    /// `install_mailer` runs so the production guard can see it.
+    /// Durable mail delivery queue factory registered at builder time. Invoked
+    /// with the freshly-built [`AppState`] before `install_mailer` runs so it
+    /// can capture framework-managed resources (DB pool, channels, etc.).
     #[cfg(feature = "mail")]
-    mail_delivery_queue: Option<Arc<dyn crate::mail::MailDeliveryQueue>>,
+    mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
 }
+
+/// Boxed builder closure that constructs a durable
+/// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the live
+/// [`AppState`].
+#[cfg(feature = "mail")]
+pub(crate) type MailDeliveryQueueFactory = Box<
+    dyn FnOnce(
+            &AppState,
+        ) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>>
+        + Send,
+>;
 
 /// A group of routes sharing a common path prefix and middleware layer.
 ///
@@ -1138,13 +1149,40 @@ impl AppBuilder {
     /// Must be called before [`run`](Self::run). Plugins call this inside their
     /// `apply` implementation to satisfy the production delivery guard without
     /// requiring `mail.allow_in_process_deliver_later_in_production`.
+    ///
+    /// Use [`Self::with_mail_delivery_queue_factory`] when the queue needs
+    /// framework-managed resources (the DB pool, channels, etc.) that only
+    /// exist after the [`AppState`] is constructed.
     #[cfg(feature = "mail")]
     #[must_use]
     pub fn with_mail_delivery_queue(
         mut self,
         queue: impl crate::mail::MailDeliveryQueue + 'static,
     ) -> Self {
-        self.mail_delivery_queue = Some(Arc::new(queue));
+        let arc: Arc<dyn crate::mail::MailDeliveryQueue> = Arc::new(queue);
+        self.mail_delivery_queue_factory = Some(Box::new(move |_state| Ok(arc)));
+        self
+    }
+
+    /// Register a factory that builds the durable
+    /// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the
+    /// fully-built [`AppState`].
+    ///
+    /// Use this when the queue captures framework-managed resources — for
+    /// example a DB-outbox queue that needs the connection pool returned by
+    /// [`AppState::pool`]. The factory runs once, immediately before
+    /// `install_mailer`, with the live `AppState`. Returning `Err` aborts
+    /// startup with the propagated error.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue_factory<F, Q>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&AppState) -> crate::AutumnResult<Q> + Send + 'static,
+        Q: crate::mail::MailDeliveryQueue + 'static,
+    {
+        self.mail_delivery_queue_factory = Some(Box::new(move |state| {
+            factory(state).map(|q| Arc::new(q) as Arc<dyn crate::mail::MailDeliveryQueue>)
+        }));
         self
     }
 
@@ -1385,7 +1423,7 @@ impl AppBuilder {
             i18n_auto_load,
             policy_registrations,
             #[cfg(feature = "mail")]
-            mail_delivery_queue,
+            mail_delivery_queue_factory,
         } = self;
 
         let all_routes = routes;
@@ -1499,8 +1537,16 @@ impl AppBuilder {
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
         {
-            if let Some(queue) = mail_delivery_queue {
-                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            if let Some(factory) = mail_delivery_queue_factory {
+                match factory(&state) {
+                    Ok(queue) => state.insert_extension(
+                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
+                    ),
+                    Err(error) => {
+                        tracing::error!(error = %error, "mail delivery queue factory failed");
+                        std::process::exit(1);
+                    }
+                }
             }
             crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
                 tracing::error!(error = %error, "Failed to configure mailer");
@@ -1708,7 +1754,7 @@ impl AppBuilder {
             i18n_auto_load,
             policy_registrations,
             #[cfg(feature = "mail")]
-            mail_delivery_queue,
+            mail_delivery_queue_factory,
         } = self;
 
         let all_routes = routes;
@@ -1803,8 +1849,16 @@ impl AppBuilder {
         }
         #[cfg(feature = "mail")]
         {
-            if let Some(queue) = mail_delivery_queue {
-                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            if let Some(factory) = mail_delivery_queue_factory {
+                match factory(&state) {
+                    Ok(queue) => state.insert_extension(
+                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
+                    ),
+                    Err(error) => {
+                        eprintln!("mail delivery queue factory failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }
             // Static-site builds are short-lived and don't run the request
             // loop; the durable deliver_later guard isn't relevant here, so
@@ -2015,7 +2069,7 @@ impl AppBuilder {
             policy_registrations,
             cache_backend,
             #[cfg(feature = "mail")]
-            mail_delivery_queue,
+            mail_delivery_queue_factory,
             ..
         } = self;
 
@@ -2087,8 +2141,16 @@ impl AppBuilder {
 
         #[cfg(feature = "mail")]
         {
-            if let Some(queue) = mail_delivery_queue {
-                state.insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue));
+            if let Some(factory) = mail_delivery_queue_factory {
+                match factory(&state) {
+                    Ok(queue) => state.insert_extension(
+                        crate::mail::MailDeliveryQueueHandle::from_arc(queue),
+                    ),
+                    Err(error) => {
+                        eprintln!("mail delivery queue factory failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
             }
             crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
                 eprintln!("Failed to configure mailer: {error}");
@@ -4179,9 +4241,84 @@ mod tests {
 
         let builder = app().with_mail_delivery_queue(NoopQueue);
         assert!(
-            builder.mail_delivery_queue.is_some(),
-            "with_mail_delivery_queue should store the queue on the builder"
+            builder.mail_delivery_queue_factory.is_some(),
+            "with_mail_delivery_queue should store a factory on the builder"
         );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_runs_with_app_state() {
+        struct ProfileBackedQueue(#[allow(dead_code)] String);
+        impl crate::mail::MailDeliveryQueue for ProfileBackedQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: crate::mail::Mail,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let observed_profile: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&observed_profile);
+        let builder = app().with_mail_delivery_queue_factory(move |state| {
+            *captured.lock().expect("lock") = Some(state.profile().to_owned());
+            Ok::<_, crate::AutumnError>(ProfileBackedQueue(state.profile().to_owned()))
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory should be stored on the builder");
+        let state = AppState::for_test().with_profile("dev");
+        let _queue = factory(&state).expect("factory should succeed");
+
+        assert_eq!(
+            observed_profile.lock().expect("lock").as_deref(),
+            Some("dev"),
+            "factory must run with the live AppState"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_propagates_errors() {
+        struct NoopQueue;
+        impl crate::mail::MailDeliveryQueue for NoopQueue {
+            fn enqueue<'a>(
+                &'a self,
+                _mail: crate::mail::Mail,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let builder = app().with_mail_delivery_queue_factory(|_state| {
+            Err::<NoopQueue, _>(crate::AutumnError::service_unavailable_msg(
+                "factory boom",
+            ))
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory present");
+        let state = AppState::for_test();
+        match factory(&state) {
+            Ok(_) => panic!("factory should have errored"),
+            Err(err) => assert!(err.to_string().contains("factory boom")),
+        }
     }
 
     #[tokio::test]

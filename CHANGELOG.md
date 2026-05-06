@@ -51,7 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[mailer]`'s generated `deliver_later_*` helpers (#649). Implement
   `MailDeliveryQueue` for your queue (DB outbox row, Redis stream, Harvest
   job, ...) and register it via
-  `AppBuilder::with_mail_delivery_queue(queue)` before `.run()`; plugins
+  `AppBuilder::with_mail_delivery_queue(queue)` (or
+  `with_mail_delivery_queue_factory(|state| ...)` when the queue needs
+  framework-managed resources like the DB pool) before `.run()`; plugins
   call this inside `apply`. `deliver_later` then routes mail through the
   queue instead of the in-process Tokio fallback. In `prod`/`production`,
   startup now fails when no durable queue is registered and the transport is
