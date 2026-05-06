@@ -1795,6 +1795,11 @@ impl AutumnConfig {
             "AUTUMN_MAIL__ALLOW_LOG_IN_PRODUCTION",
             &mut self.mail.allow_log_in_production,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION",
+            &mut self.mail.allow_in_process_deliver_later_in_production,
+        );
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }
@@ -4308,5 +4313,38 @@ path = "/api-spec.json"
         // In CI, FLY_MACHINE_ID and HOSTNAME may or may not be set,
         // so just verify we get a non-empty string back.
         assert!(!cfg.resolved_replica_id().is_empty());
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_allow_in_process_deliver_later_in_production_is_overridable_via_env() {
+        let env = MockEnv::new()
+            .with(
+                "AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION",
+                "true",
+            )
+            .with("AUTUMN_MAIL__TRANSPORT", "smtp")
+            .with("AUTUMN_MAIL__SMTP__HOST", "smtp.example.com");
+
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            config.mail.allow_in_process_deliver_later_in_production,
+            "env var should set allow_in_process_deliver_later_in_production"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn mail_allow_in_process_deliver_later_in_production_defaults_false() {
+        let env = MockEnv::new();
+        let mut config = AutumnConfig::default();
+        config.apply_mail_env_overrides_with_env(&env);
+
+        assert!(
+            !config.mail.allow_in_process_deliver_later_in_production,
+            "flag should default to false when env var is not set"
+        );
     }
 }
