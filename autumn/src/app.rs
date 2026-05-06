@@ -1533,22 +1533,16 @@ impl AppBuilder {
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
         #[cfg(feature = "mail")]
-        {
-            if let Some(factory) = mail_delivery_queue_factory {
-                match factory(&state) {
-                    Ok(queue) => state
-                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
-                    Err(error) => {
-                        tracing::error!(error = %error, "mail delivery queue factory failed");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
-                tracing::error!(error = %error, "Failed to configure mailer");
-                std::process::exit(1);
-            });
-        }
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1843,20 +1837,23 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
+        // Static-site builds are short-lived and don't run the request loop,
+        // so deliver_later is never invoked. install_mailer_with_factory skips
+        // the queue factory when enforce_durable_guard is false (the factory
+        // may open Redis/Harvest connections unavailable here), and the guard
+        // itself is bypassed too — the Mailer is still installed so static
+        // routes that extract `Mailer` for immediate `send` calls resolve.
         #[cfg(feature = "mail")]
-        {
-            // Static-site builds are short-lived and don't run the request
-            // loop, so deliver_later is never invoked. Skip the queue factory
-            // (it may open Redis/Harvest connections unavailable in the asset-
-            // build environment) and the durable-delivery guard, but still
-            // install a Mailer so static routes that extract `Mailer` for
-            // immediate `send` calls still resolve.
-            let _ = mail_delivery_queue_factory;
-            crate::mail::install_mailer(&state, &config.mail, false).unwrap_or_else(|error| {
-                eprintln!("Failed to configure mailer: {error}");
-                std::process::exit(1);
-            });
-        }
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            false,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 
@@ -2129,22 +2126,16 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "mail")]
-        {
-            if let Some(factory) = mail_delivery_queue_factory {
-                match factory(&state) {
-                    Ok(queue) => state
-                        .insert_extension(crate::mail::MailDeliveryQueueHandle::from_arc(queue)),
-                    Err(error) => {
-                        eprintln!("mail delivery queue factory failed: {error}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            crate::mail::install_mailer(&state, &config.mail, true).unwrap_or_else(|error| {
-                eprintln!("Failed to configure mailer: {error}");
-                std::process::exit(1);
-            });
-        }
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
 
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());

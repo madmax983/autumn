@@ -918,6 +918,36 @@ pub(crate) fn install_mailer(
     Ok(())
 }
 
+/// Run the optional [`MailDeliveryQueue`] factory and install the configured
+/// mailer.
+///
+/// Centralizes the wiring used by every [`AppBuilder`](crate::app::AppBuilder)
+/// build path: optionally invoke `queue_factory` against the live `AppState`,
+/// register the resulting [`MailDeliveryQueueHandle`], then call
+/// [`install_mailer`]. The factory is skipped entirely when
+/// `enforce_durable_guard` is `false` (static-site builds), since the queue
+/// may capture infrastructure (Redis, Harvest, etc.) that isn't available in
+/// the asset-build environment.
+///
+/// # Errors
+///
+/// Propagates errors from the queue factory and from [`install_mailer`].
+pub(crate) fn install_mailer_with_factory<F>(
+    state: &AppState,
+    config: &MailConfig,
+    queue_factory: Option<F>,
+    enforce_durable_guard: bool,
+) -> AutumnResult<()>
+where
+    F: FnOnce(&AppState) -> AutumnResult<Arc<dyn MailDeliveryQueue>>,
+{
+    if enforce_durable_guard && let Some(factory) = queue_factory {
+        let queue = factory(state)?;
+        state.insert_extension(MailDeliveryQueueHandle::from_arc(queue));
+    }
+    install_mailer(state, config, enforce_durable_guard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1360,82 @@ mod tests {
             installed.has_durable_delivery_queue(),
             "registered queue handle should be attached to the installed mailer"
         );
+    }
+
+    #[test]
+    fn install_mailer_with_factory_runs_factory_and_attaches_queue() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+        let factory_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::clone(&factory_called);
+
+        let factory = move |_state: &crate::AppState| {
+            captured.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, crate::AutumnError>(Arc::new(NoopQueue) as Arc<dyn MailDeliveryQueue>)
+        };
+
+        install_mailer_with_factory(&state, &config, Some(factory), true)
+            .expect("factory should produce a queue and satisfy the prod guard");
+
+        assert!(
+            factory_called.load(std::sync::atomic::Ordering::SeqCst),
+            "factory must run when enforce_durable_guard is true"
+        );
+        let installed = state
+            .extension::<Mailer>()
+            .expect("install_mailer should store a Mailer extension");
+        assert!(
+            installed.has_durable_delivery_queue(),
+            "factory's queue should be wired into the installed Mailer"
+        );
+    }
+
+    #[test]
+    fn install_mailer_with_factory_skips_factory_when_not_enforced() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+        let factory_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = Arc::clone(&factory_called);
+
+        let factory = move |_state: &crate::AppState| {
+            captured.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, crate::AutumnError>(Arc::new(NoopQueue) as Arc<dyn MailDeliveryQueue>)
+        };
+
+        install_mailer_with_factory(&state, &config, Some(factory), false)
+            .expect("static-build path should skip factory and install cleanly");
+
+        assert!(
+            !factory_called.load(std::sync::atomic::Ordering::SeqCst),
+            "factory must be skipped when enforce_durable_guard is false"
+        );
+    }
+
+    #[test]
+    fn install_mailer_with_factory_propagates_factory_errors() {
+        let state = crate::AppState::for_test().with_profile("prod");
+        let config = sample_smtp_config();
+
+        let factory = |_state: &crate::AppState| {
+            Err::<Arc<dyn MailDeliveryQueue>, _>(crate::AutumnError::service_unavailable_msg(
+                "queue offline",
+            ))
+        };
+
+        let error = install_mailer_with_factory(&state, &config, Some(factory), true)
+            .expect_err("factory error should propagate");
+        assert!(error.to_string().contains("queue offline"));
+    }
+
+    #[test]
+    fn install_mailer_with_factory_works_without_factory() {
+        type FactoryFn = fn(&crate::AppState) -> AutumnResult<Arc<dyn MailDeliveryQueue>>;
+        let state = crate::AppState::for_test().with_profile("dev");
+        let config = sample_smtp_config();
+        let no_factory: Option<FactoryFn> = None;
+
+        install_mailer_with_factory(&state, &config, no_factory, true)
+            .expect("absent factory should be fine in non-prod");
     }
 
     #[test]
