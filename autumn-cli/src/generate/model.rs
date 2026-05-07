@@ -62,7 +62,7 @@ pub fn plan_model(
     );
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
-    // for `diesel`, `serde`, and `chrono`, none of which are in the
+    // for `diesel`, `serde`, `serde_json`, and `chrono`, none of which are in the
     // freshly-`autumn new`-ed project.
     plan_cargo_deps(&mut plan, project_root, MODEL_DEPS);
 
@@ -86,6 +86,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ),
     ("diesel_migrations", "\"2\""),
     ("serde", "{ version = \"1\", features = [\"derive\"] }"),
+    ("serde_json", "\"1\""),
 ];
 
 /// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
@@ -812,6 +813,7 @@ autumn-web = \"0.3\"\n";
             "diesel",
             "diesel-async",
             "serde",
+            "serde_json",
             "diesel_migrations",
         ] {
             assert!(
