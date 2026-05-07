@@ -468,6 +468,51 @@ fn generate_scaffold_rejects_query_name_field_mismatch() {
     );
 }
 
+#[test]
+fn generate_scaffold_rejects_validator_field_type_mismatch() {
+    let (_tmp, project) = fresh_project("scaffold-bad-validator-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "alive:bool",
+            "--validate",
+            "alive=url",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("alive=url") && stderr.contains("url validation requires String or Text"),
+        "expected validator type validation error; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generate_scaffold_rejects_i32_default_outside_sql_integer_range() {
+    let (_tmp, project) = fresh_project("scaffold-bad-default-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Counter",
+            "count:i32",
+            "--default",
+            "count=9223372036854775807",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("count=9223372036854775807")
+            && stderr.contains("i32 defaults must fit the SQL INTEGER range"),
+        "expected i32 default range validation error; got stderr: {stderr}"
+    );
+}
+
 /// Slow live-HTTP check: scaffold a fresh project, run migrations against a
 /// real Postgres testcontainer, boot the generated server, and assert the
 /// generated HTML and JSON routes actually respond.

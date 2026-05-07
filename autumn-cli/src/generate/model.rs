@@ -441,11 +441,16 @@ pub fn parse_model_metadata(
 
     for validation in &options.validations {
         let (field_name, rule) = split_key_value(validation, '=')?;
-        validate_known_field(fields, field_name, validation)?;
-        let attr = render_validation_attr(rule).map_err(|reason| GenerateError::InvalidField {
-            token: validation.clone(),
-            reason,
-        })?;
+        let field =
+            field_by_name(fields, field_name).ok_or_else(|| GenerateError::InvalidField {
+                token: validation.clone(),
+                reason: format!("unknown field '{field_name}'"),
+            })?;
+        let attr =
+            render_validation_attr(field, rule).map_err(|reason| GenerateError::InvalidField {
+                token: validation.clone(),
+                reason,
+            })?;
         metadata
             .validations
             .entry(field_name.to_owned())
@@ -508,14 +513,20 @@ fn validate_known_field(
     }
 }
 
-fn render_validation_attr(rule: &str) -> Result<String, String> {
+fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
     if rule == "url" || rule == "email" {
+        if !is_string_like(field) {
+            return Err(format!("{rule} validation requires String or Text fields"));
+        }
         return Ok(rule.to_owned());
     }
 
     let Some(rest) = rule.strip_prefix("length:") else {
         return Err("supported validation rules: url, email, length:min=N,max=N".to_owned());
     };
+    if !is_string_like(field) {
+        return Err("length validation requires String or Text fields".to_owned());
+    }
     let mut min = None;
     let mut max = None;
     for part in rest.split(',') {
@@ -546,6 +557,10 @@ fn render_validation_attr(rule: &str) -> Result<String, String> {
     Ok(format!("length({})", args.join(", ")))
 }
 
+const fn is_string_like(field: &Field) -> bool {
+    matches!(field.kind, FieldKind::String | FieldKind::Text)
+}
+
 fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
     match field.kind {
         FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
@@ -561,7 +576,11 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
                 .unwrap_or(value);
             Ok(format!("'{}'", unquoted.replace('\'', "''")))
         }
-        FieldKind::I32 | FieldKind::I64 => value
+        FieldKind::I32 => value
+            .parse::<i32>()
+            .map(|_| value.to_owned())
+            .map_err(|_| "i32 defaults must fit the SQL INTEGER range".to_owned()),
+        FieldKind::I64 => value
             .parse::<i64>()
             .map(|_| value.to_owned())
             .map_err(|_| "integer defaults must be valid integers".to_owned()),
