@@ -79,6 +79,8 @@ fn fetch_html(url: &str) -> Result<String, String> {
         .get(url)
         .send()
         .map_err(|e| format!("failed to fetch {url}: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("server returned error status for {url}: {e}"))?
         .text()
         .map_err(|e| format!("failed to read response body: {e}"))
 }
@@ -345,7 +347,13 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         let tag_end = rest.find('>').unwrap_or(0);
         let tag = &rest[..tag_end];
 
-        let has_aria_label = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+        // Require non-empty values — aria-label="" is not a valid accessible name.
+        let has_aria_label = tag
+            .find("aria-label=")
+            .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
+            || tag
+                .find("aria-labelledby=")
+                .is_some_and(|p| !extract_attr_value(&tag[p + 16..]).is_empty());
         let inner = if close > tag_end {
             &button_html[tag_end + 1..close]
         } else {
@@ -800,6 +808,15 @@ mod tests {
             !violation_ids(&html).contains(&"button-name"),
             "{:?}",
             violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn button_with_empty_aria_label_fails() {
+        let html = clean_page(r#"<button aria-label=""></button>"#);
+        assert!(
+            violation_ids(&html).contains(&"button-name"),
+            "aria-label=\"\" must not count as an accessible button name"
         );
     }
 
