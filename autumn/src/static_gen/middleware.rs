@@ -685,4 +685,59 @@ mod tests {
         let content = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(content, "old content");
     }
+
+    #[tokio::test]
+    async fn isr_coordinator_deny_clears_in_flight_and_skips_regen() {
+        use crate::static_gen::isr_coordinator::IsrFuture;
+
+        // A coordinator that always denies acquisition — exercises the
+        // `if !acquired { return; }` branch in the spawned ISR task.
+        struct DenyCoordinator;
+        impl IsrCoordinator for DenyCoordinator {
+            fn backend(&self) -> &'static str {
+                "deny"
+            }
+
+            fn try_acquire<'a>(&'a self, _: &'a str, _: &'a str) -> IsrFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+
+            fn release<'a>(&'a self, _: &'a str, _: &'a str) -> IsrFuture<'a, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let tmp = create_isr_dist(1);
+        let dist = tmp.path().join("dist");
+        let file = dist.join("about/index.html");
+
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
+        let _ = filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time));
+
+        let router =
+            axum::Router::new().fallback(axum::routing::get(|| async { "should not appear" }));
+        let layer = StaticFileLayer::new(&dist)
+            .expect("layer")
+            .with_router(router)
+            .with_isr_coordinator(Arc::new(DenyCoordinator));
+
+        // Trigger the ISR background task.
+        let _ = layer.resolve("/about");
+
+        // Wait for the spawned task to run the deny branch and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // InFlightReset guard must have cleared the flag despite early return.
+        let state = layer.isr_state.get("/about").unwrap();
+        assert!(
+            !state.in_flight.load(Ordering::Relaxed),
+            "in_flight must be cleared when coordinator denies acquisition"
+        );
+
+        // File must be unchanged — regeneration was skipped.
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "<h1>About (stale)</h1>"
+        );
+    }
 }
