@@ -129,3 +129,7 @@ rusty-fork = "0.3.1"
 
 [lints]
 workspace = true
+
+[[test]]
+name = "factory_integration"
+required-features = ["db", "test-support"]

@@ -1408,6 +1408,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
 
+    #[cfg(feature = "redis")]
     static REDIS_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn always_fail_handler(
@@ -1421,6 +1422,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "redis")]
     fn redis_counting_success_handler(
         _state: AppState,
         _payload: Value,
@@ -1431,6 +1433,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "redis")]
     fn redis_counting_failure_handler(
         _state: AppState,
         _payload: Value,
