@@ -131,16 +131,20 @@ fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
 fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
     let html_lower = html.to_lowercase();
 
-    // Scan the first 2000 bytes after <body> to detect the skip link.
     let body_start = html_lower.find("<body").unwrap_or(0);
-    let early_end = (body_start + 2000).min(html_lower.len());
-    let early_html = &html_lower[body_start..early_end];
+    let body_content = &html_lower[body_start..];
 
-    // Accept class="skip-link" or an <a href="#main-content"> / <a href="#main"> anchor.
-    let has_skip_link = early_html.contains("skip-link")
-        || (early_html.contains("<a ")
-            && (early_html.contains(r##"href="#main-content""##)
-                || early_html.contains(r##"href="#main""##)));
+    // The skip link must be the FIRST focusable link in the document; a skip
+    // link that comes after navigation links doesn't help keyboard users.
+    // Verify by finding the first <a > and checking it is the skip link.
+    let has_skip_link = body_content.find("<a ").is_some_and(|a_pos| {
+        let rest = &body_content[a_pos..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        tag.contains("skip-link")
+            || tag.contains(r##"href="#main-content""##)
+            || tag.contains(r##"href="#main""##)
+    });
 
     if !has_skip_link {
         out.push(A11yViolation {
@@ -295,7 +299,12 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
                     let id_val = extract_attr_value(&tag[id_pos + 4..]);
                     !id_val.is_empty() && labelled_ids.contains(&id_val)
                 });
-                let is_wrapped = label_regions.iter().any(|r| r.contains(&abs_pos));
+                // A wrapping <label> only provides an accessible name when it
+                // contains visible text; <label><input></label> still fails.
+                let is_wrapped = label_regions.iter().any(|r| {
+                    r.contains(&abs_pos)
+                        && !strip_html_tags(&html_lower[r.clone()]).trim().is_empty()
+                });
 
                 if !has_aria && !has_for && !is_wrapped {
                     unlabelled += 1;
@@ -625,6 +634,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skip_link_after_nav_link_fails() {
+        // The skip link must be the FIRST focusable link; a nav link before it
+        // defeats the purpose for keyboard users.
+        let html = r##"<html lang="en"><body><a href="/home">Home</a><a class="skip-link" href="#main">Skip</a><main></main></body></html>"##;
+        assert!(
+            violation_ids(html).contains(&"bypass"),
+            "skip link placed after a nav link must fail"
+        );
+    }
+
     // ── landmark-one-main ──────────────────────────────────────────
 
     #[test]
@@ -782,6 +802,15 @@ mod tests {
         assert!(
             !violation_ids(&html).contains(&"label"),
             "input wrapped in <label> must pass"
+        );
+    }
+
+    #[test]
+    fn empty_wrapped_label_fails() {
+        let html = clean_page("<label><input type=\"text\"></label>");
+        assert!(
+            violation_ids(&html).contains(&"label"),
+            "<label><input></label> with no label text must still fail"
         );
     }
 
