@@ -7,6 +7,7 @@
 //!
 //! [`emit`]: super::emit
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use super::dsl::Field;
@@ -69,6 +70,18 @@ fn has_table(existing: &str, table: &str) -> bool {
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration.
 #[must_use]
 pub fn create_table_sql(table: &str, fields: &[Field]) -> String {
+    create_table_sql_with_metadata(table, fields, &BTreeSet::new(), &BTreeMap::new())
+}
+
+/// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with
+/// optional defaults and non-unique indexes.
+#[must_use]
+pub fn create_table_sql_with_metadata(
+    table: &str,
+    fields: &[Field],
+    indexes: &BTreeSet<String>,
+    defaults: &BTreeMap<String, String>,
+) -> String {
     let mut sql = String::new();
     let _ = writeln!(sql, "CREATE TABLE {table} (");
     sql.push_str("    id BIGSERIAL PRIMARY KEY");
@@ -81,8 +94,17 @@ pub fn create_table_sql(table: &str, fields: &[Field]) -> String {
             f.sql_type(),
             f.sql_nullability()
         );
+        if let Some(default) = defaults.get(&f.name) {
+            let _ = write!(sql, " DEFAULT {default}");
+        }
     }
     sql.push_str(",\n    created_at TIMESTAMP NOT NULL DEFAULT NOW()\n);\n");
+    for field_name in indexes {
+        let _ = writeln!(
+            sql,
+            "CREATE INDEX idx_{table}_{field_name} ON {table} ({field_name});"
+        );
+    }
     sql
 }
 

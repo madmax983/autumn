@@ -375,6 +375,67 @@ fn generate_scaffold_full_e2e_post() {
     }
 }
 
+#[test]
+fn generate_scaffold_accepts_metadata_flags() {
+    let (_tmp, project) = fresh_project("scaffold-metadata-app");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "url:String",
+            "title:String",
+            "tag:String",
+            "alive:bool",
+            "--index",
+            "url",
+            "--index",
+            "tag",
+            "--validate",
+            "url=url",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--default",
+            "alive=true",
+            "--query",
+            "find_by_tag:tag",
+            "--query",
+            "find_by_alive:alive",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/bookmark.rs")).unwrap();
+    assert!(model.contains("#[indexed]\n    #[validate(url)]\n    pub url: String,"));
+    assert!(model.contains("#[validate(length(min = 1, max = 200))]\n    pub title: String,"));
+    assert!(model.contains("#[indexed]\n    pub tag: String,"));
+    assert!(model.contains("#[default]\n    pub alive: bool,"));
+
+    let repo = fs::read_to_string(project.join("src/repositories/bookmark.rs")).unwrap();
+    assert!(repo.contains("fn find_by_tag(tag: String) -> Vec<Bookmark>;"));
+    assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_bookmarks")
+        })
+        .expect("create_bookmarks migration should exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(up.contains("alive BOOLEAN NOT NULL DEFAULT TRUE"));
+    assert!(up.contains("CREATE INDEX idx_bookmarks_url ON bookmarks (url);"));
+    assert!(up.contains("CREATE INDEX idx_bookmarks_tag ON bookmarks (tag);"));
+
+    let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_toml.contains("validator ="),
+        "validation attributes need validator in Cargo.toml:\n{cargo_toml}"
+    );
+}
+
 /// Slow live-HTTP check: scaffold a fresh project, run migrations against a
 /// real Postgres testcontainer, boot the generated server, and assert the
 /// generated HTML and JSON routes actually respond.

@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **generators:** `autumn generate scaffold` now accepts repeatable
+  `--index`, `--validate`, `--default`, and `--query` flags so generated
+  resources can include field indexes, validator attributes, SQL defaults,
+  and derived repository query methods without a handwritten model/repository
+  diff.
+
 ### Changed
+
+- **examples:** Regenerated `examples/bookmarks` from
+  `autumn generate scaffold Bookmark url:String title:String tag:String alive:bool`
+  plus the new scaffold metadata flags, then reapplied the example-specific
+  htmx layout, scheduled link checker, and local-demo write routes (#534).
 
 - **storage:** The `storage-s3` cargo feature on `autumn-web` has been
   **removed**. S3-compatible blob storage now lives in the separate
