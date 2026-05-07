@@ -417,6 +417,7 @@ where
 
 pin_project! {
     #[project = MetricsFutureProj]
+    #[project_replace = MetricsFutureProjReplace]
     /// Future that records metrics after the inner service completes.
     pub struct MetricsFuture<F> {
         #[pin]
