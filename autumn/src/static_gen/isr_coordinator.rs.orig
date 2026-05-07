@@ -208,25 +208,6 @@ impl IsrCoordinator for PostgresIsrCoordinator {
 // Key derivation utilities (public -- useful in application code and tests)
 // ---------------------------------------------------------------------------
 
-/// Computes the revalidation window key for a given route and time.
-///
-/// This key is used by the `IsrCoordinator` to determine if a background
-/// generation task should run. Replicas that calculate the same key will compete
-/// for the same lock.
-///
-/// ## Examples
-///
-/// ```rust
-/// use autumn_web::static_gen::isr_window_key;
-///
-/// let key_1 = isr_window_key("/products", 60, 100);
-/// let key_2 = isr_window_key("/products", 60, 159);
-/// assert_eq!(key_1, key_2); // Same 60-second window
-///
-/// let key_3 = isr_window_key("/products", 60, 160);
-/// assert_ne!(key_1, key_3); // Next window
-/// ```
-///
 /// Compute the revalidation window key for a route and the current time.
 ///
 /// All replicas that evaluate a given route as stale within the same
@@ -249,15 +230,6 @@ pub fn isr_window_key(url_path: &str, revalidate_secs: u64, now_unix_secs: u64) 
     format!("{url_path}:{bucket}")
 }
 
-/// Derives a stable signed 64-bit advisory lock key.
-///
-/// ## Examples
-///
-/// ```rust
-/// use autumn_web::static_gen::isr_advisory_lock_key;
-///
-/// let lock_id = isr_advisory_lock_key("/products", "/products:1000");
-/// ```
 /// Derive a stable signed 64-bit advisory lock key for a (route, window) pair.
 ///
 /// Suitable for `pg_try_advisory_lock`. The result is a deterministic hash

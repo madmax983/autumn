@@ -36,14 +36,14 @@
 //! #### Multi-replica ISR
 //!
 //! In single-replica / development deployments the default
-//! [`isr_coordinator::LocalIsrCoordinator`] is sufficient: an `AtomicBool`
+//! [`LocalIsrCoordinator`](crate::static_gen::isr_coordinator::LocalIsrCoordinator) is sufficient: an `AtomicBool`
 //! per route prevents duplicate background tasks within the same process.
 //!
 //! In **multi-replica** deployments sharing a writable `dist/` volume or
 //! object-backed storage, each replica independently detects staleness and
 //! can race to regenerate the same page. Supply a
-//! [`isr_coordinator::PostgresIsrCoordinator`] (feature `db`) via
-//! [`StaticFileLayer::with_isr_coordinator`] so that only one replica wins
+//! [`PostgresIsrCoordinator`](crate::static_gen::isr_coordinator::PostgresIsrCoordinator) (feature `db`) via
+//! [`StaticFileLayer::with_isr_coordinator`](crate::static_gen::StaticFileLayer::with_isr_coordinator) so that only one replica wins
 //! the lock per revalidation window:
 //!
 //! ```rust,ignore
@@ -56,7 +56,7 @@
 //!     .with_isr_coordinator(Arc::new(PostgresIsrCoordinator::new(db_pool)));
 //! ```
 //!
-//! See [`isr_coordinator`] for the full deployment contract table.
+//! See [`isr_coordinator`](crate::static_gen::isr_coordinator) for the full deployment contract table.
 
 pub(crate) mod build;
 pub mod isr_coordinator;
