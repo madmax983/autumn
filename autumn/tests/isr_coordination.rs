@@ -87,32 +87,25 @@ fn isr_advisory_lock_key_differs_by_window() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn local_coordinator_try_acquire_returns_true_first() {
+async fn local_coordinator_always_grants_acquisition() {
+    // LocalIsrCoordinator is a true no-op: local dedup is handled by the
+    // AtomicBool in StaticFileLayer, not by this coordinator.
     let coord = LocalIsrCoordinator::new();
-    let acquired = coord.try_acquire("/about", "window-1").await;
-    assert!(acquired, "first try_acquire should succeed");
+    assert!(coord.try_acquire("/about", "window-1").await, "first call should succeed");
+    // A second concurrent call also returns true — no HashMap tracking.
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "local coordinator always grants (no-op dedup)"
+    );
 }
 
 #[tokio::test]
-async fn local_coordinator_second_acquire_denied_while_held() {
+async fn local_coordinator_release_is_noop_and_does_not_panic() {
     let coord = LocalIsrCoordinator::new();
-    let first = coord.try_acquire("/about", "window-1").await;
-    assert!(first);
-
-    let second = coord.try_acquire("/about", "window-1").await;
-    assert!(!second, "second try_acquire for the same key should fail while first is held");
-}
-
-#[tokio::test]
-async fn local_coordinator_can_reacquire_after_release() {
-    let coord = LocalIsrCoordinator::new();
-    let first = coord.try_acquire("/about", "window-1").await;
-    assert!(first);
-
+    // release without a prior acquire must not panic.
     coord.release("/about", "window-1").await;
-
-    let second = coord.try_acquire("/about", "window-1").await;
-    assert!(second, "should be able to reacquire after release");
+    // Subsequent acquire still works.
+    assert!(coord.try_acquire("/about", "window-1").await);
 }
 
 #[tokio::test]

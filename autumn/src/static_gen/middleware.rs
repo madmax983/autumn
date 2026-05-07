@@ -207,6 +207,14 @@ impl StaticFileLayer {
         let coordinator = Arc::clone(&self.isr_coordinator);
 
         tokio::spawn(async move {
+            // RAII guard: clears the in_flight flag when this scope exits,
+            // including on panic, so ISR is never permanently disabled for
+            // a route after a handler crash.
+            let _guard = InFlightReset {
+                state: &in_flight,
+                url: &url,
+            };
+
             // Distributed coordination: prevents multiple replicas from
             // regenerating the same route in the same revalidation window.
             let acquired = coordinator.try_acquire(&url, &window_key).await;
@@ -216,21 +224,13 @@ impl StaticFileLayer {
                     backend = coordinator.backend(),
                     "ISR: another replica holds the lock for this window, skipping"
                 );
-                if let Some(state) = in_flight.get(&url) {
-                    state.in_flight.store(false, Ordering::Release);
-                }
-                return;
+                return; // _guard drops here, resetting in_flight
             }
 
             let result = regenerate_page(&router, &url, &dest).await;
 
-            // Release distributed lock
+            // Release distributed lock before the guard drops.
             coordinator.release(&url, &window_key).await;
-
-            // Clear the in-process in-flight flag
-            if let Some(state) = in_flight.get(&url) {
-                state.in_flight.store(false, Ordering::Release);
-            }
 
             match result {
                 Ok(()) => {
@@ -240,7 +240,25 @@ impl StaticFileLayer {
                     tracing::warn!(route = %url, error = %e, "ISR: regeneration failed");
                 }
             }
+            // _guard drops here, resetting in_flight
         });
+    }
+}
+
+/// RAII guard that resets the per-route `in_flight` flag when dropped.
+///
+/// Placed at the top of every ISR background task so the flag is always
+/// cleared on normal exit, early return, or panic.
+struct InFlightReset<'a> {
+    state: &'a HashMap<String, IsrRouteState>,
+    url: &'a str,
+}
+
+impl Drop for InFlightReset<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.state.get(self.url) {
+            s.in_flight.store(false, Ordering::Release);
+        }
     }
 }
 
