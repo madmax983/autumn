@@ -1,21 +1,9 @@
+use autumn_web::form::skip_link;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
-#[cfg(feature = "maud")]
-use autumn_web::form::skip_link;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-// ── Accessible page layout ──────────────────────────────────────────
-//
-// Ships with WCAG 2.1 AA scaffold requirements out of the box:
-//   • lang="en" on <html> for correct screen-reader language rules
-//   • Skip-to-content link as the first focusable element
-//   • Semantic landmark regions (<header>, <main>, <footer>)
-//
-// Add to your CSS / Tailwind config to reveal the skip link on focus:
-//   .skip-link { position: absolute; top: -9999px; }
-//   .skip-link:focus { position: static; }
-#[cfg(feature = "maud")]
 pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
     maud::html! {
         (maud::DOCTYPE)

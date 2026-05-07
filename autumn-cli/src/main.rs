@@ -190,7 +190,7 @@ enum Commands {
     ///
     /// # Examples
     ///
-    ///   autumn check --a11y --url http://localhost:3000
+    ///   autumn check --a11y --url <http://localhost:3000>
     ///   autumn check --a11y --html "$(cat dist/index.html)"
     #[command(verbatim_doc_comment)]
     Check {
@@ -469,12 +469,11 @@ fn run_command(command: Commands) {
                 let opts = check::A11yCheckOptions {
                     url: url.clone(),
                     html,
-                    critical_only,
                 };
                 let label = url.as_deref().unwrap_or("<inline>");
                 match check::run_a11y_check(&opts) {
                     Ok(violations) => {
-                        if check::print_report(&violations, label) {
+                        if check::print_report(&violations, label, critical_only) {
                             std::process::exit(1);
                         }
                     }

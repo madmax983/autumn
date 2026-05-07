@@ -35,7 +35,7 @@ pub struct A11yPosture {
 impl A11yPosture {
     /// Returns `true` when all scaffold-level a11y concerns are addressed.
     #[must_use]
-    pub fn is_compliant(&self) -> bool {
+    pub const fn is_compliant(&self) -> bool {
         self.lang_set && self.skip_link_present && self.landmark_regions_present
     }
 }

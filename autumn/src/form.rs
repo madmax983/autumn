@@ -1279,7 +1279,12 @@ mod tests {
         }
         let mut errors = HashMap::new();
         errors.insert("password".to_string(), vec!["too short".to_string()]);
-        let cs = Changeset::from_errors(F { password: "x".into() }, errors);
+        let cs = Changeset::from_errors(
+            F {
+                password: "x".into(),
+            },
+            errors,
+        );
         let html = password_input(&cs, "password", "Password").into_string();
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"role="alert""#), "{html}");
@@ -1332,7 +1337,7 @@ mod tests {
         });
         let html = required_text_input(&cs, "name", "Name").into_string();
         assert!(html.contains(r#"aria-required="true""#), "{html}");
-        assert!(html.contains(r#"required"#), "{html}");
+        assert!(html.contains("required"), "{html}");
         assert!(html.contains(r#"name="name""#), "{html}");
         assert!(html.contains("Name"), "{html}");
     }
@@ -1346,7 +1351,12 @@ mod tests {
         }
         let mut errors = HashMap::new();
         errors.insert("name".to_string(), vec!["required".to_string()]);
-        let cs = Changeset::from_errors(F { name: String::new() }, errors);
+        let cs = Changeset::from_errors(
+            F {
+                name: String::new(),
+            },
+            errors,
+        );
         let html = required_text_input(&cs, "name", "Name").into_string();
         assert!(html.contains(r#"aria-invalid="true""#), "{html}");
         assert!(html.contains(r#"aria-required="true""#), "{html}");
