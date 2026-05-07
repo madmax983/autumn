@@ -352,8 +352,10 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
 
     while let Some(pos) = search.find("<button") {
         let rest = &search[pos..];
-        let close = rest.find("</button>").unwrap_or(rest.len());
-        let button_html = &rest[..close + 9];
+        let (close, btn_end) = rest
+            .find("</button>")
+            .map_or((rest.len(), rest.len()), |c| (c, c + 9));
+        let button_html = &rest[..btn_end];
         let tag_end = rest.find('>').unwrap_or(0);
         let tag = &rest[..tag_end];
 
@@ -950,6 +952,15 @@ mod tests {
             violation_ids(html).contains(&"button-name"),
             "button with img alt=\"\" has no accessible name"
         );
+    }
+
+    #[test]
+    fn unclosed_button_does_not_panic() {
+        // Malformed HTML with no </button> must not panic — it should be flagged
+        // as nameless (no visible text, no aria) rather than causing an index OOB.
+        let html = r#"<html lang="en"><body><main><button></main></body></html>"#;
+        // We only care that this returns without panicking; the violation may or may not fire.
+        let _ = violation_ids(html);
     }
 
     // ── strip_html_tags ────────────────────────────────────────────
