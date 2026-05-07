@@ -281,7 +281,13 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
             };
 
             if !skip {
-                let has_aria = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+                // Require non-empty values — aria-label="" is not a valid accessible name.
+                let has_aria = tag
+                    .find("aria-label=")
+                    .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
+                    || tag
+                        .find("aria-labelledby=")
+                        .is_some_and(|p| !extract_attr_value(&tag[p + 16..]).is_empty());
                 let has_for = tag.find(" id=").is_some_and(|id_pos| {
                     let id_val = extract_attr_value(&tag[id_pos + 4..]);
                     !id_val.is_empty() && labelled_ids.contains(&id_val)
@@ -670,6 +676,15 @@ mod tests {
             !violation_ids(&html).contains(&"label"),
             "{:?}",
             violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn input_with_empty_aria_label_fails() {
+        let html = clean_page(r#"<input type="text" aria-label="">"#);
+        assert!(
+            violation_ids(&html).contains(&"label"),
+            "aria-label=\"\" must not count as an accessible name"
         );
     }
 
