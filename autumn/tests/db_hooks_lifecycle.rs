@@ -345,3 +345,109 @@ async fn db_api_token_store_two_tokens_same_principal() {
     assert_eq!(store.verify(&t1).await.unwrap(), None);
     assert_eq!(store.verify(&t2).await.unwrap(), Some("user:1".to_owned()));
 }
+
+// ── PostgresIsrCoordinator tests ─────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_backend_name() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+    assert_eq!(coord.backend(), "postgres");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_acquire_grants_and_release_unlocks() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "first acquire must succeed"
+    );
+    // release must not panic
+    coord.release("/about", "window-1").await;
+
+    // after release, the same window is acquirable again
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "acquire after release must succeed"
+    );
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_blocks_duplicate_window() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // First acquisition holds the advisory lock on its connection.
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "first acquire must succeed"
+    );
+
+    // Second acquisition for the same (route, window) must fail: the advisory
+    // lock is session-scoped, and the first connection still holds it.
+    assert!(
+        !coord.try_acquire("/about", "window-1").await,
+        "duplicate acquire for the same window must fail"
+    );
+
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_release_without_acquire_is_noop() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // release without a preceding acquire must not panic (emits a warning).
+    coord.release("/about", "window-1").await;
+
+    // Subsequent acquire must still succeed.
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "acquire after orphaned release must succeed"
+    );
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_independent_routes_and_windows() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // Different routes in the same window get different lock keys.
+    assert!(coord.try_acquire("/", "window-1").await);
+    assert!(coord.try_acquire("/about", "window-1").await);
+
+    coord.release("/", "window-1").await;
+    coord.release("/about", "window-1").await;
+
+    // Same route in different windows also gets different lock keys.
+    assert!(coord.try_acquire("/about", "window-1").await);
+    assert!(coord.try_acquire("/about", "window-2").await);
+
+    coord.release("/about", "window-1").await;
+    coord.release("/about", "window-2").await;
+}
