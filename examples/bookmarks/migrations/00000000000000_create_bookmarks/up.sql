@@ -8,4 +8,5 @@ CREATE TABLE bookmarks (
 );
 
 CREATE INDEX idx_bookmarks_tag ON bookmarks (tag);
+CREATE INDEX idx_bookmarks_url ON bookmarks (url);
 CREATE INDEX idx_bookmarks_alive ON bookmarks (alive);

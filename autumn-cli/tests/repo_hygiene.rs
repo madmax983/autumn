@@ -153,3 +153,31 @@ fn generated_example_css_is_ignored_and_untracked() {
         );
     }
 }
+
+#[test]
+fn bookmarks_example_tracks_regenerated_scaffold_layout() {
+    let root = workspace_root();
+    let bookmarks = root.join("examples/bookmarks");
+
+    for generated_path in [
+        "src/models/bookmark.rs",
+        "src/models/mod.rs",
+        "src/repositories/bookmark.rs",
+        "src/repositories/mod.rs",
+        "src/routes/bookmarks.rs",
+        "src/routes/mod.rs",
+        "tests/bookmark.rs",
+    ] {
+        assert!(
+            bookmarks.join(generated_path).is_file(),
+            "issue #534 expects examples/bookmarks to keep the generated scaffold file: {generated_path}",
+        );
+    }
+
+    for replaced_path in ["src/models.rs", "src/repositories.rs"] {
+        assert!(
+            !bookmarks.join(replaced_path).exists(),
+            "issue #534 expects the old flat bookmarks source file to be replaced: {replaced_path}",
+        );
+    }
+}

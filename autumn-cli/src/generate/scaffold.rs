@@ -12,7 +12,9 @@ use std::path::Path;
 
 use super::dsl::{Field, parse_fields};
 use super::emit::Plan;
-use super::model::{plan_cargo_deps, plan_model};
+use super::model::{
+    ModelOptions, field_by_name, parse_model_metadata, plan_cargo_deps, plan_model_with_options,
+};
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{add_mod_declaration, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
@@ -22,20 +24,67 @@ use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 const SCAFFOLD_EXTRA_DEPS: &[(&str, &str)] =
     &[("maud", "{ version = \"0.27\", features = [\"axum\"] }")];
 
+/// Optional metadata applied by `autumn generate scaffold`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScaffoldOptions {
+    /// Model-level field metadata.
+    pub model: ModelOptions,
+    /// Repository derived-query specs in `method:field` form.
+    pub queries: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuerySpec {
+    method: String,
+    field_name: String,
+    rust_type: String,
+}
+
 /// Compute the file actions for `autumn generate scaffold`.
 ///
 /// # Errors
 /// Surfaces any planning error from the underlying [`plan_model`] call as
 /// well as project-layout problems (missing `src/main.rs`).
+#[cfg(test)]
 pub fn plan_scaffold(
     project_root: &Path,
     name: &str,
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_scaffold_with_options(
+        project_root,
+        name,
+        field_tokens,
+        timestamp,
+        &ScaffoldOptions::default(),
+    )
+}
+
+/// Compute the file actions for `autumn generate scaffold`, using optional
+/// metadata flags.
+///
+/// # Errors
+/// Surfaces any planning error from the underlying model generation as well
+/// as project-layout, repository query, and metadata problems.
+pub fn plan_scaffold_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ScaffoldOptions,
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    let mut plan = plan_model(project_root, name, field_tokens, timestamp)?;
+    let mut plan =
+        plan_model_with_options(project_root, name, field_tokens, timestamp, &options.model)?;
     let fields = parse_fields(field_tokens)?;
+    let metadata = parse_model_metadata(&fields, &options.model)?;
+    let queries = parse_query_specs(&fields, &options.queries)?;
+    let form_fields = fields
+        .iter()
+        .filter(|field| !metadata.defaults().contains_key(&field.name))
+        .cloned()
+        .collect::<Vec<_>>();
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
@@ -44,7 +93,7 @@ pub fn plan_scaffold(
     let repos_dir = project_root.join("src").join("repositories");
     plan.create(
         repos_dir.join(format!("{snake_name}.rs")),
-        render_repository_file(&pascal_name, &snake_name),
+        render_repository_file(&pascal_name, &snake_name, &queries),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
     plan.modify(
@@ -56,7 +105,7 @@ pub fn plan_scaffold(
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join(format!("{plural}.rs")),
-        render_routes_file(&pascal_name, &snake_name, &plural, &fields),
+        render_routes_file(&pascal_name, &snake_name, &plural, &form_fields),
     );
     let route_mod_path = routes_dir.join("mod.rs");
     plan.modify(
@@ -92,18 +141,24 @@ pub fn plan_scaffold(
     // would clobber the first (each rendering is computed at plan time
     // against the on-disk Cargo.toml).
     plan.actions.retain(|a| !a.path().ends_with("Cargo.toml"));
-    let combined: Vec<(&str, &str)> = super::model::MODEL_DEPS
+    let mut combined: Vec<(&str, &str)> = super::model::MODEL_DEPS
         .iter()
         .copied()
         .chain(SCAFFOLD_EXTRA_DEPS.iter().copied())
         .collect();
+    if metadata.has_validator_rules() {
+        combined.push((
+            "validator",
+            "{ version = \"0.20\", features = [\"derive\"] }",
+        ));
+    }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
     Ok(plan)
 }
 
 /// CLI entry point.
-pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
+pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &ScaffoldOptions) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -112,7 +167,8 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags) {
         }
     };
     let timestamp = timestamp_now();
-    match plan_scaffold(&cwd, name, field_tokens, &timestamp).and_then(|p| p.execute(flags)) {
+    let plan = plan_scaffold_with_options(&cwd, name, field_tokens, &timestamp, options);
+    match plan.and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("Error: {e}");
@@ -125,8 +181,70 @@ fn read_or_empty(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn render_repository_file(pascal_name: &str, snake_name: &str) -> String {
+fn parse_query_specs(
+    fields: &[Field],
+    queries: &[String],
+) -> Result<Vec<QuerySpec>, GenerateError> {
+    let mut parsed = Vec::with_capacity(queries.len());
+    for query in queries {
+        let (method, field_name) =
+            query
+                .split_once(':')
+                .ok_or_else(|| GenerateError::InvalidField {
+                    token: query.clone(),
+                    reason: "expected `method:field`, for example `find_by_tag:tag`".into(),
+                })?;
+        let method = method.trim();
+        let field_name = field_name.trim();
+        if !method.starts_with("find_by_") || !is_valid_fn_name(method) {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: "query method must be a valid `find_by_<field>` function name".into(),
+            });
+        }
+        let method_field = method
+            .strip_prefix("find_by_")
+            .expect("prefix checked above");
+        let field =
+            field_by_name(fields, field_name).ok_or_else(|| GenerateError::InvalidField {
+                token: query.clone(),
+                reason: format!("unknown field '{field_name}'"),
+            })?;
+        if method_field != field_name {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: format!(
+                    "query method suffix '{method_field}' must match field '{field_name}'"
+                ),
+            });
+        }
+        if parsed.iter().any(|spec: &QuerySpec| spec.method == method) {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: format!("duplicate query method '{method}'"),
+            });
+        }
+        parsed.push(QuerySpec {
+            method: method.to_owned(),
+            field_name: field_name.to_owned(),
+            rust_type: field.rust_type(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn is_valid_fn_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn render_repository_file(pascal_name: &str, snake_name: &str, queries: &[QuerySpec]) -> String {
     let plural = pluralize(snake_name);
+    let query_body = render_repository_queries(pascal_name, queries);
     format!(
         "//! Generated by `autumn generate scaffold`.\n\
          //!\n\
@@ -139,10 +257,24 @@ fn render_repository_file(pascal_name: &str, snake_name: &str) -> String {
          \n\
          #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\")]\n\
          pub trait {pascal_name}Repository {{\n\
-             // Add `find_by_<field>(field: Type) -> Vec<Model>` here to expose\n\
-             // derived queries — `#[repository]` generates the SQL for you.\n\
+{query_body}\
          }}\n"
     )
+}
+
+fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String {
+    let mut out = String::with_capacity(queries.len() * 64);
+    for query in queries {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "    fn {method}({field}: {rust_type}) -> Vec<{pascal_name}>;",
+            method = query.method,
+            field = query.field_name,
+            rust_type = query.rust_type,
+        );
+    }
+    out
 }
 
 #[allow(

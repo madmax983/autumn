@@ -1,15 +1,51 @@
 //! `autumn generate model` — emit a `#[model]` struct, its migration, and a
 //! `schema.rs` table block.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::dsl::{Field, parse_fields};
+use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, append_schema_table, create_table_sql, drop_table_sql,
+    add_mod_declaration, append_schema_table, create_table_sql_with_metadata, drop_table_sql,
 };
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+
+/// Optional metadata applied to generated model fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelOptions {
+    /// Field names that should receive `#[indexed]` and SQL indexes.
+    pub indexes: Vec<String>,
+    /// Validation specs in `field=rule` form.
+    pub validations: Vec<String>,
+    /// Default specs in `field=value` form.
+    pub defaults: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelMetadata {
+    indexes: BTreeSet<String>,
+    validations: BTreeMap<String, Vec<String>>,
+    defaults: BTreeMap<String, String>,
+}
+
+impl ModelMetadata {
+    #[must_use]
+    pub fn has_validator_rules(&self) -> bool {
+        !self.validations.is_empty()
+    }
+
+    #[must_use]
+    pub const fn indexes(&self) -> &BTreeSet<String> {
+        &self.indexes
+    }
+
+    #[must_use]
+    pub const fn defaults(&self) -> &BTreeMap<String, String> {
+        &self.defaults
+    }
+}
 
 /// Compute every action a `generate model` invocation would perform.
 ///
@@ -24,10 +60,32 @@ pub fn plan_model(
     field_tokens: &[String],
     timestamp: &str,
 ) -> Result<Plan, GenerateError> {
+    plan_model_with_options(
+        project_root,
+        name,
+        field_tokens,
+        timestamp,
+        &ModelOptions::default(),
+    )
+}
+
+/// Compute every action a `generate model` invocation would perform, using
+/// optional metadata flags supplied by higher-level generators.
+///
+/// # Errors
+/// Surfaces project-layout, DSL, naming, and metadata errors before any file is written.
+pub fn plan_model_with_options(
+    project_root: &Path,
+    name: &str,
+    field_tokens: &[String],
+    timestamp: &str,
+    options: &ModelOptions,
+) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
     let fields = parse_fields(field_tokens)?;
     validate_field_names(&fields)?;
+    let metadata = parse_model_metadata(&fields, options)?;
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -38,7 +96,10 @@ pub fn plan_model(
     // (a) `src/models/<snake>.rs` + `src/models/mod.rs`
     let models_dir = project_root.join("src").join("models");
     let model_file = models_dir.join(format!("{snake_name}.rs"));
-    plan.create(model_file, render_model_file(&pascal_name, &table, &fields));
+    plan.create(
+        model_file,
+        render_model_file(&pascal_name, &table, &fields, &metadata),
+    );
 
     let mod_path = models_dir.join("mod.rs");
     let mod_existing = read_or_empty(&mod_path);
@@ -47,10 +108,9 @@ pub fn plan_model(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    plan.create(
-        migration_dir.join("up.sql"),
-        create_table_sql(&table, &fields),
-    );
+    let up_sql =
+        create_table_sql_with_metadata(&table, &fields, metadata.indexes(), metadata.defaults());
+    plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
 
     // (c) `src/schema.rs` entry
@@ -64,7 +124,14 @@ pub fn plan_model(
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
     // for `diesel`, `serde`, `serde_json`, and `chrono`, none of which are in the
     // freshly-`autumn new`-ed project.
-    plan_cargo_deps(&mut plan, project_root, MODEL_DEPS);
+    let mut deps: Vec<(&str, &str)> = MODEL_DEPS.to_vec();
+    if metadata.has_validator_rules() {
+        deps.push((
+            "validator",
+            "{ version = \"0.20\", features = [\"derive\"] }",
+        ));
+    }
+    plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
 }
@@ -360,9 +427,184 @@ fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn render_model_file(name: &str, table: &str, fields: &[Field]) -> String {
+pub fn parse_model_metadata(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<ModelMetadata, GenerateError> {
+    let mut metadata = ModelMetadata::default();
+
+    for index in &options.indexes {
+        let field_name = index.trim();
+        validate_known_field(fields, field_name, index)?;
+        metadata.indexes.insert(field_name.to_owned());
+    }
+
+    for validation in &options.validations {
+        let (field_name, rule) = split_key_value(validation, '=')?;
+        let field =
+            field_by_name(fields, field_name).ok_or_else(|| GenerateError::InvalidField {
+                token: validation.clone(),
+                reason: format!("unknown field '{field_name}'"),
+            })?;
+        let attr =
+            render_validation_attr(field, rule).map_err(|reason| GenerateError::InvalidField {
+                token: validation.clone(),
+                reason,
+            })?;
+        metadata
+            .validations
+            .entry(field_name.to_owned())
+            .or_default()
+            .push(attr);
+    }
+
+    for default in &options.defaults {
+        let (field_name, value) = split_key_value(default, '=')?;
+        let field =
+            field_by_name(fields, field_name).ok_or_else(|| GenerateError::InvalidField {
+                token: default.clone(),
+                reason: format!("unknown field '{field_name}'"),
+            })?;
+        let sql =
+            sql_default_literal(field, value).map_err(|reason| GenerateError::InvalidField {
+                token: default.clone(),
+                reason,
+            })?;
+        metadata.defaults.insert(field_name.to_owned(), sql);
+    }
+
+    Ok(metadata)
+}
+
+fn split_key_value(token: &str, sep: char) -> Result<(&str, &str), GenerateError> {
+    let (key, value) = token
+        .split_once(sep)
+        .ok_or_else(|| GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!("expected `field{sep}value`"),
+        })?;
+    let key = key.trim();
+    let value = value.trim();
+    if key.is_empty() || value.is_empty() {
+        return Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!("expected non-empty field and value in `field{sep}value`"),
+        });
+    }
+    Ok((key, value))
+}
+
+pub fn field_by_name<'a>(fields: &'a [Field], name: &str) -> Option<&'a Field> {
+    fields.iter().find(|field| field.name == name)
+}
+
+fn validate_known_field(
+    fields: &[Field],
+    field_name: &str,
+    token: &str,
+) -> Result<(), GenerateError> {
+    if field_by_name(fields, field_name).is_some() {
+        Ok(())
+    } else {
+        Err(GenerateError::InvalidField {
+            token: token.to_owned(),
+            reason: format!("unknown field '{field_name}'"),
+        })
+    }
+}
+
+fn render_validation_attr(field: &Field, rule: &str) -> Result<String, String> {
+    if rule == "url" || rule == "email" {
+        if !is_string_like(field) {
+            return Err(format!("{rule} validation requires String or Text fields"));
+        }
+        return Ok(rule.to_owned());
+    }
+
+    let Some(rest) = rule.strip_prefix("length:") else {
+        return Err("supported validation rules: url, email, length:min=N,max=N".to_owned());
+    };
+    if !is_string_like(field) {
+        return Err("length validation requires String or Text fields".to_owned());
+    }
+    let mut min = None;
+    let mut max = None;
+    for part in rest.split(',') {
+        let (key, value) = part
+            .split_once('=')
+            .ok_or_else(|| "length validation expects min=N and/or max=N".to_owned())?;
+        let parsed = value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "length validation bounds must be unsigned integers".to_owned())?;
+        match key.trim() {
+            "min" => min = Some(parsed),
+            "max" => max = Some(parsed),
+            other => return Err(format!("unsupported length validation option '{other}'")),
+        }
+    }
+    if min.is_none() && max.is_none() {
+        return Err("length validation needs at least min=N or max=N".to_owned());
+    }
+
+    let mut args = Vec::new();
+    if let Some(min) = min {
+        args.push(format!("min = {min}"));
+    }
+    if let Some(max) = max {
+        args.push(format!("max = {max}"));
+    }
+    Ok(format!("length({})", args.join(", ")))
+}
+
+const fn is_string_like(field: &Field) -> bool {
+    matches!(field.kind, FieldKind::String | FieldKind::Text)
+}
+
+fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
+    match field.kind {
+        FieldKind::Bool => match value.to_ascii_lowercase().as_str() {
+            "true" => Ok("TRUE".to_owned()),
+            "false" => Ok("FALSE".to_owned()),
+            _ => Err("bool defaults must be true or false".to_owned()),
+        },
+        FieldKind::String | FieldKind::Text => {
+            let unquoted = value
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+                .unwrap_or(value);
+            Ok(format!("'{}'", unquoted.replace('\'', "''")))
+        }
+        FieldKind::I32 => value
+            .parse::<i32>()
+            .map(|_| value.to_owned())
+            .map_err(|_| "i32 defaults must fit the SQL INTEGER range".to_owned()),
+        FieldKind::I64 => value
+            .parse::<i64>()
+            .map(|_| value.to_owned())
+            .map_err(|_| "integer defaults must be valid integers".to_owned()),
+        FieldKind::F32 | FieldKind::F64 => value
+            .parse::<f64>()
+            .map(|_| value.to_owned())
+            .map_err(|_| "float defaults must be valid numbers".to_owned()),
+        FieldKind::Uuid | FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Bytea => {
+            Err(format!(
+                "defaults for {} fields are not supported by `autumn generate` yet",
+                field.rust_type()
+            ))
+        }
+    }
+}
+
+fn render_model_file(
+    name: &str,
+    table: &str,
+    fields: &[Field],
+    metadata: &ModelMetadata,
+) -> String {
     use std::fmt::Write as _;
-    let mut out = String::new();
+    let mut out = String::with_capacity(fields.len() * 128 + 256);
     out.push_str("//! Generated by `autumn generate`.\n");
     out.push_str("//!\n");
     out.push_str("//! Edit this file freely — once a generator has run, the\n");
@@ -374,6 +616,17 @@ fn render_model_file(name: &str, table: &str, fields: &[Field]) -> String {
     out.push_str("    #[id]\n");
     out.push_str("    pub id: i64,\n");
     for f in fields {
+        if metadata.indexes.contains(&f.name) {
+            out.push_str("    #[indexed]\n");
+        }
+        if let Some(validations) = metadata.validations.get(&f.name) {
+            for validation in validations {
+                let _ = writeln!(out, "    #[validate({validation})]");
+            }
+        }
+        if metadata.defaults.contains_key(&f.name) {
+            out.push_str("    #[default]\n");
+        }
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
     }
     out.push_str("    #[default]\n");

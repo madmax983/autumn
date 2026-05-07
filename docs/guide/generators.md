@@ -178,6 +178,27 @@ Everything `model` produces, plus:
   API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`) by default;
   mount `POST`/`PUT`/`DELETE` handlers only after adding a repository policy.
 
+Metadata flags let you keep common model and repository polish in the
+generation step:
+
+```bash
+autumn generate scaffold Bookmark url:String title:String tag:String alive:bool \
+  --index url \
+  --index tag \
+  --validate url=url \
+  --validate title=length:min=1,max=200 \
+  --default alive=true \
+  --query find_by_tag:tag \
+  --query find_by_alive:alive
+```
+
+| Flag | Effect |
+| ---- | ------ |
+| `--index FIELD` | Adds `#[indexed]` and `CREATE INDEX idx_<table>_<field> ...`. Repeatable. |
+| `--validate FIELD=RULE` | Adds `#[validate(...)]` and the `validator` dependency. Supported rules: `url`, `email`, and `length:min=N,max=N` on `String` / `Text` fields. |
+| `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. `i32` defaults must fit PostgreSQL's `INTEGER` range. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
+| `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
+
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
 | `src/models/<name>.rs`                | [`#[autumn_web::model]`](../../autumn-macros/src/model.rs)                                 |
@@ -187,6 +208,34 @@ Everything `model` produces, plus:
 | `migrations/<ts>_create_<plural>/`    | Diesel migrations                                                                          |
 | `src/schema.rs`                       | Diesel `table!` blocks                                                                     |
 | `tests/<name>.rs`                     | Standard `cargo test` integration test                                                     |
+
+### Shipped example
+
+The [`examples/bookmarks`](../../examples/bookmarks) app is regenerated from
+the current scaffold shape:
+
+```bash
+autumn new bookmarks
+cd bookmarks
+autumn generate scaffold Bookmark url:String title:String tag:String alive:bool \
+  --index url \
+  --index tag \
+  --validate url=url \
+  --validate title=length:min=1,max=200 \
+  --default alive=true \
+  --query find_by_tag:tag \
+  --query find_by_alive:alive
+```
+
+It is the reference for what `autumn generate scaffold` produces in practice
+after a user makes ordinary app-specific edits. The committed follow-up diff is
+intentionally small and documents which gaps are outside the generic generator:
+
+| Bookmarks addition | Disposition |
+| ------------------ | ----------- |
+| Tailwind layout, htmx delete buttons, and public local-demo write forms | UI and access-policy choices; replace the generated route templates. |
+| Hourly `#[scheduled]` link checker | Operational workflow; generate or write a task separately. |
+| Mounting `POST`/`PUT`/`DELETE` JSON API routes | Application policy; scaffold keeps only read APIs registered by default. |
 
 ### Slow live scaffold verification
 

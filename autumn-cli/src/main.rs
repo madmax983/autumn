@@ -339,6 +339,18 @@ enum GenerateCommands {
         name: String,
         /// Field DSL tokens, each `name:Type`.
         fields: Vec<String>,
+        /// Add `#[indexed]` and a SQL index for this field. Repeatable.
+        #[arg(long, value_name = "FIELD")]
+        index: Vec<String>,
+        /// Add a validator rule, e.g. `url=url` or `title=length:min=1,max=200`.
+        #[arg(long, value_name = "FIELD=RULE")]
+        validate: Vec<String>,
+        /// Add `#[default]` and a SQL default, e.g. `alive=true`.
+        #[arg(long, value_name = "FIELD=VALUE")]
+        default: Vec<String>,
+        /// Add a derived repository query, e.g. `find_by_tag:tag`.
+        #[arg(long, value_name = "METHOD:FIELD")]
+        query: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -505,9 +517,23 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Scaffold {
             name,
             fields,
+            index,
+            validate,
+            default,
+            query,
             dry_run,
             force,
-        } => generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }),
+        } => {
+            let options = generate::scaffold::ScaffoldOptions {
+                model: generate::model::ModelOptions {
+                    indexes: index,
+                    validations: validate,
+                    defaults: default,
+                },
+                queries: query,
+            };
+            generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+        }
     }
 }
 
@@ -857,6 +883,41 @@ mod tests {
         };
         assert_eq!(name, "Post");
         assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn parse_generate_scaffold_metadata_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "url:String",
+            "alive:bool",
+            "--index",
+            "url",
+            "--validate",
+            "url=url",
+            "--default",
+            "alive=true",
+            "--query",
+            "find_by_alive:alive",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold {
+            index,
+            validate,
+            default,
+            query,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate scaffold");
+        };
+        assert_eq!(index, vec!["url"]);
+        assert_eq!(validate, vec!["url=url"]);
+        assert_eq!(default, vec!["alive=true"]);
+        assert_eq!(query, vec!["find_by_alive:alive"]);
     }
 
     #[test]
