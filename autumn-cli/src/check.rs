@@ -210,13 +210,13 @@ fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
     }
 }
 
-/// Check: `<input>` elements must have an associated `<label>`.
+/// Check: interactive form controls must have an associated `<label>`.
 ///
+/// Covers `<input>`, `<textarea>`, and `<select>`.
 /// WCAG 2.1 SC 1.3.1 / 3.3.2 (Level A) — axe-core rule `label`.
 fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
     let html_lower = html.to_lowercase();
     let mut unlabelled = 0u32;
-    let mut search = html_lower.as_str();
 
     // Collect all `for=` values from `<label` tags.  Use "<label" to avoid
     // matching the word "label" in text content, and " for=" (space prefix) to
@@ -238,35 +238,43 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
         }
     }
 
-    while let Some(pos) = search.find("<input") {
-        let rest = &search[pos..];
-        let tag_end = rest.find('>').unwrap_or(rest.len());
-        let tag = &rest[..tag_end];
+    // Collect byte ranges of wrapped <label>…</label> blocks so that controls
+    // implicitly associated by containment (no for=/id pair needed) pass.
+    let label_regions = label_regions(&html_lower);
 
-        // Skip hidden and submit/button/reset inputs — they don't need visible labels
-        let input_type = tag
-            .find("type=")
-            .map_or_else(String::new, |t_pos| extract_attr_value(&tag[t_pos + 5..]));
+    // Check <input>, <textarea>, and <select> — all require an accessible label.
+    for (tag_name, skip_len) in &[("<input", 6usize), ("<textarea", 9), ("<select", 7)] {
+        let mut offset = 0usize;
+        while let Some(rel_pos) = html_lower[offset..].find(tag_name) {
+            let abs_pos = offset + rel_pos;
+            let rest = &html_lower[abs_pos..];
+            let tag_end = rest.find('>').unwrap_or(rest.len());
+            let tag = &rest[..tag_end];
 
-        let skip_types = ["hidden", "submit", "button", "reset", "image"];
-        if !skip_types.contains(&input_type.as_str()) {
-            // Check for aria-label / aria-labelledby as valid alternatives
-            let has_aria_label = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+            // For <input>, skip types that don't need a visible label.
+            let skip = if *tag_name == "<input" {
+                let input_type = tag
+                    .find("type=")
+                    .map_or_else(String::new, |t| extract_attr_value(&tag[t + 5..]));
+                ["hidden", "submit", "button", "reset", "image"].contains(&input_type.as_str())
+            } else {
+                false
+            };
 
-            // Match " id=" (space prefix) to avoid hitting "data-id=".
-            let has_label_for = tag.find(" id=").is_some_and(|id_pos| {
-                let id_val = extract_attr_value(&tag[id_pos + 4..]);
-                !id_val.is_empty() && labelled_ids.contains(&id_val)
-            });
+            if !skip {
+                let has_aria = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+                let has_for = tag.find(" id=").is_some_and(|id_pos| {
+                    let id_val = extract_attr_value(&tag[id_pos + 4..]);
+                    !id_val.is_empty() && labelled_ids.contains(&id_val)
+                });
+                let is_wrapped = label_regions.iter().any(|r| r.contains(&abs_pos));
 
-            if !has_aria_label && !has_label_for {
-                unlabelled += 1;
+                if !has_aria && !has_for && !is_wrapped {
+                    unlabelled += 1;
+                }
             }
-        }
 
-        search = &search[pos + 6..];
-        if search.is_empty() {
-            break;
+            offset = abs_pos + skip_len;
         }
     }
 
@@ -274,10 +282,27 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
         out.push(A11yViolation {
             rule_id: "label",
             severity: Severity::Critical,
-            description: format!("{unlabelled} form input(s) are not associated with a <label>"),
-            help: "Add <label for=\"input-id\"> or use aria-label / aria-labelledby on each input",
+            description: format!("{unlabelled} form control(s) are not associated with a <label>"),
+            help: "Add <label for=\"id\"> or wrap the control in <label>, or use aria-label",
         });
     }
+}
+
+/// Return the byte ranges of all `<label>…</label>` blocks in `html`.
+fn label_regions(html: &str) -> Vec<std::ops::Range<usize>> {
+    let mut regions = Vec::new();
+    let mut offset = 0usize;
+    while let Some(rel_start) = html[offset..].find("<label") {
+        let abs_start = offset + rel_start;
+        if let Some(close_rel) = html[abs_start..].find("</label>") {
+            let abs_end = abs_start + close_rel + 8; // 8 = len("</label>")
+            regions.push(abs_start..abs_end);
+            offset = abs_end;
+        } else {
+            offset = abs_start + 6;
+        }
+    }
+    regions
 }
 
 /// Check: `<button>` elements must have an accessible name.
@@ -648,6 +673,65 @@ mod tests {
         let html =
             r#"<html lang="en"><body><main><input type="text" id="name"></main></body></html>"#;
         assert!(violation_ids(html).contains(&"label"));
+    }
+
+    #[test]
+    fn wrapped_label_input_passes() {
+        let html = clean_page(r#"<label>Name <input type="text"></label>"#);
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "input wrapped in <label> must pass"
+        );
+    }
+
+    #[test]
+    fn textarea_with_label_for_passes() {
+        let html = clean_page(r#"<label for="bio">Bio</label><textarea id="bio"></textarea>"#);
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "{:?}",
+            violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn unlabelled_textarea_fails() {
+        let html =
+            r#"<html lang="en"><body><main><textarea id="bio"></textarea></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"label"),
+            "unlabelled <textarea> must fail"
+        );
+    }
+
+    #[test]
+    fn wrapped_label_textarea_passes() {
+        let html = clean_page("<label>Bio <textarea></textarea></label>");
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "textarea wrapped in <label> must pass"
+        );
+    }
+
+    #[test]
+    fn select_with_label_for_passes() {
+        let html = clean_page(
+            r#"<label for="role">Role</label><select id="role"><option>Admin</option></select>"#,
+        );
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "{:?}",
+            violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn unlabelled_select_fails() {
+        let html = r#"<html lang="en"><body><main><select id="role"><option>Admin</option></select></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"label"),
+            "unlabelled <select> must fail"
+        );
     }
 
     #[test]
