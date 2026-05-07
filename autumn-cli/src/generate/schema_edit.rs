@@ -67,12 +67,6 @@ fn has_table(existing: &str, table: &str) -> bool {
     existing.lines().any(|l| l.trim().starts_with(&needle))
 }
 
-/// Build the full SQL for `up.sql` of a `CREATE TABLE` migration.
-#[must_use]
-pub fn create_table_sql(table: &str, fields: &[Field]) -> String {
-    create_table_sql_with_metadata(table, fields, &BTreeSet::new(), &BTreeMap::new())
-}
-
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with
 /// optional defaults and non-unique indexes.
 #[must_use]
@@ -82,7 +76,7 @@ pub fn create_table_sql_with_metadata(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
 ) -> String {
-    let mut sql = String::new();
+    let mut sql = String::with_capacity(fields.len() * 64 + indexes.len() * 96 + 128);
     let _ = writeln!(sql, "CREATE TABLE {table} (");
     sql.push_str("    id BIGSERIAL PRIMARY KEY");
     for f in fields {
@@ -108,7 +102,7 @@ pub fn create_table_sql_with_metadata(
     sql
 }
 
-/// `down.sql` companion to [`create_table_sql`].
+/// `down.sql` companion to [`create_table_sql_with_metadata`].
 #[must_use]
 pub fn drop_table_sql(table: &str) -> String {
     format!("DROP TABLE {table};\n")
@@ -485,7 +479,12 @@ mod tests {
 
     #[test]
     fn create_table_sql_minimal() {
-        let sql = create_table_sql("posts", &fields(&["title:String"]));
+        let sql = create_table_sql_with_metadata(
+            "posts",
+            &fields(&["title:String"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
         assert!(sql.contains("CREATE TABLE posts ("));
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
         assert!(sql.contains("title TEXT NOT NULL"));
@@ -494,14 +493,20 @@ mod tests {
 
     #[test]
     fn create_table_sql_no_extra_fields() {
-        let sql = create_table_sql("widgets", &[]);
+        let sql =
+            create_table_sql_with_metadata("widgets", &[], &BTreeSet::new(), &BTreeMap::new());
         assert!(sql.contains("id BIGSERIAL PRIMARY KEY"));
         assert!(sql.contains("created_at"));
     }
 
     #[test]
     fn create_table_sql_nullable() {
-        let sql = create_table_sql("posts", &fields(&["body:Option<Text>"]));
+        let sql = create_table_sql_with_metadata(
+            "posts",
+            &fields(&["body:Option<Text>"]),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
         assert!(sql.contains("body TEXT NULL"));
     }
 

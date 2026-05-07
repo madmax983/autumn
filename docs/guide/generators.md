@@ -196,8 +196,8 @@ autumn generate scaffold Bookmark url:String title:String tag:String alive:bool 
 | ---- | ------ |
 | `--index FIELD` | Adds `#[indexed]` and `CREATE INDEX idx_<table>_<field> ...`. Repeatable. |
 | `--validate FIELD=RULE` | Adds `#[validate(...)]` and the `validator` dependency. Supported rules: `url`, `email`, and `length:min=N,max=N`. |
-| `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. |
-| `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. |
+| `--default FIELD=VALUE` | Adds `#[default]` and a SQL `DEFAULT` for bool, string/text, integer, and float fields. Defaulted fields are omitted from generated HTML forms and update columns because the model macro keeps them out of `NewX`. |
+| `--query METHOD:FIELD` | Adds a derived repository method such as `find_by_tag(tag: String) -> Vec<Model>`. The `find_by_` suffix must match `FIELD`. |
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |

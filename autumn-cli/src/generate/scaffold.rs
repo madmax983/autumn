@@ -45,6 +45,7 @@ struct QuerySpec {
 /// # Errors
 /// Surfaces any planning error from the underlying [`plan_model`] call as
 /// well as project-layout problems (missing `src/main.rs`).
+#[cfg(test)]
 pub fn plan_scaffold(
     project_root: &Path,
     name: &str,
@@ -79,6 +80,11 @@ pub fn plan_scaffold_with_options(
     let fields = parse_fields(field_tokens)?;
     let metadata = parse_model_metadata(&fields, &options.model)?;
     let queries = parse_query_specs(&fields, &options.queries)?;
+    let form_fields = fields
+        .iter()
+        .filter(|field| !metadata.defaults().contains_key(&field.name))
+        .cloned()
+        .collect::<Vec<_>>();
     let pascal_name = pascal(name);
     let snake_name = snake(name);
     let plural = pluralize(&snake_name);
@@ -99,7 +105,7 @@ pub fn plan_scaffold_with_options(
     let routes_dir = project_root.join("src").join("routes");
     plan.create(
         routes_dir.join(format!("{plural}.rs")),
-        render_routes_file(&pascal_name, &snake_name, &plural, &fields),
+        render_routes_file(&pascal_name, &snake_name, &plural, &form_fields),
     );
     let route_mod_path = routes_dir.join("mod.rs");
     plan.modify(
@@ -161,11 +167,7 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &Scaffold
         }
     };
     let timestamp = timestamp_now();
-    let plan = if *options == ScaffoldOptions::default() {
-        plan_scaffold(&cwd, name, field_tokens, &timestamp)
-    } else {
-        plan_scaffold_with_options(&cwd, name, field_tokens, &timestamp, options)
-    };
+    let plan = plan_scaffold_with_options(&cwd, name, field_tokens, &timestamp, options);
     match plan.and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
@@ -200,11 +202,22 @@ fn parse_query_specs(
                 reason: "query method must be a valid `find_by_<field>` function name".into(),
             });
         }
+        let method_field = method
+            .strip_prefix("find_by_")
+            .expect("prefix checked above");
         let field =
             field_by_name(fields, field_name).ok_or_else(|| GenerateError::InvalidField {
                 token: query.clone(),
                 reason: format!("unknown field '{field_name}'"),
             })?;
+        if method_field != field_name {
+            return Err(GenerateError::InvalidField {
+                token: query.clone(),
+                reason: format!(
+                    "query method suffix '{method_field}' must match field '{field_name}'"
+                ),
+            });
+        }
         if parsed.iter().any(|spec: &QuerySpec| spec.method == method) {
             return Err(GenerateError::InvalidField {
                 token: query.clone(),
@@ -250,7 +263,7 @@ fn render_repository_file(pascal_name: &str, snake_name: &str, queries: &[QueryS
 }
 
 fn render_repository_queries(pascal_name: &str, queries: &[QuerySpec]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(queries.len() * 64);
     for query in queries {
         use std::fmt::Write as _;
         let _ = writeln!(

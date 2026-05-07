@@ -415,6 +415,15 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(repo.contains("fn find_by_tag(tag: String) -> Vec<Bookmark>;"));
     assert!(repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"));
 
+    let routes = fs::read_to_string(project.join("src/routes/bookmarks.rs")).unwrap();
+    assert!(routes.contains("name=\"url\""));
+    assert!(routes.contains("name=\"title\""));
+    assert!(routes.contains("name=\"tag\""));
+    assert!(!routes.contains("name=\"alive\""));
+    assert!(routes.contains("bookmarks::tag.eq(form.tag.clone())"));
+    assert!(!routes.contains("bookmarks::alive.eq(form.alive.clone())"));
+    assert!(!routes.contains("form.alive"));
+
     let migration = fs::read_dir(project.join("migrations"))
         .unwrap()
         .filter_map(Result::ok)
@@ -433,6 +442,29 @@ fn generate_scaffold_accepts_metadata_flags() {
     assert!(
         cargo_toml.contains("validator ="),
         "validation attributes need validator in Cargo.toml:\n{cargo_toml}"
+    );
+}
+
+#[test]
+fn generate_scaffold_rejects_query_name_field_mismatch() {
+    let (_tmp, project) = fresh_project("scaffold-bad-query-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Bookmark",
+            "tag:String",
+            "alive:bool",
+            "--query",
+            "find_by_alive:tag",
+        ],
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("find_by_alive:tag") && stderr.contains("must match field 'tag'"),
+        "expected query mismatch validation error; got stderr: {stderr}"
     );
 }
 
