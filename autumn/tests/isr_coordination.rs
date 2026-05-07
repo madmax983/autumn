@@ -21,7 +21,10 @@ fn isr_window_key_is_stable_within_interval() {
     // Two timestamps within that range must produce the same key.
     let key_a = isr_window_key("/about", 60, 1_700_000_000);
     let key_b = isr_window_key("/about", 60, 1_700_000_039);
-    assert_eq!(key_a, key_b, "same revalidation window should yield the same key");
+    assert_eq!(
+        key_a, key_b,
+        "same revalidation window should yield the same key"
+    );
 }
 
 #[test]
@@ -30,7 +33,10 @@ fn isr_window_key_changes_on_new_interval() {
     // 1_700_000_040 is the first second of bucket 28_333_334.
     let key_a = isr_window_key("/about", 60, 1_700_000_039);
     let key_b = isr_window_key("/about", 60, 1_700_000_040);
-    assert_ne!(key_a, key_b, "adjacent revalidation windows should yield different keys");
+    assert_ne!(
+        key_a, key_b,
+        "adjacent revalidation windows should yield different keys"
+    );
 }
 
 #[test]
@@ -39,7 +45,10 @@ fn isr_window_key_includes_route_path() {
     // that their distributed locks are independent.
     let home = isr_window_key("/", 60, 1_700_000_010);
     let about = isr_window_key("/about", 60, 1_700_000_010);
-    assert_ne!(home, about, "different routes must produce different window keys");
+    assert_ne!(
+        home, about,
+        "different routes must produce different window keys"
+    );
 }
 
 #[test]
@@ -91,7 +100,10 @@ async fn local_coordinator_always_grants_acquisition() {
     // LocalIsrCoordinator is a true no-op: local dedup is handled by the
     // AtomicBool in StaticFileLayer, not by this coordinator.
     let coord = LocalIsrCoordinator::new();
-    assert!(coord.try_acquire("/about", "window-1").await, "first call should succeed");
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "first call should succeed"
+    );
     // A second concurrent call also returns true — no HashMap tracking.
     assert!(
         coord.try_acquire("/about", "window-1").await,
@@ -123,7 +135,10 @@ async fn local_coordinator_different_windows_are_independent() {
     let w1 = coord.try_acquire("/about", "window-1").await;
     let w2 = coord.try_acquire("/about", "window-2").await;
     assert!(w1, "window-1 should be acquirable");
-    assert!(w2, "window-2 should be acquirable independently of window-1");
+    assert!(
+        w2,
+        "window-2 should be acquirable independently of window-1"
+    );
 }
 
 #[tokio::test]

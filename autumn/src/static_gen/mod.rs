@@ -64,9 +64,11 @@ mod middleware;
 mod types;
 
 pub use build::{BuildError, render_static_routes};
-pub use isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_advisory_lock_key, isr_window_key};
 #[cfg(feature = "db")]
 pub use isr_coordinator::PostgresIsrCoordinator;
+pub use isr_coordinator::{
+    IsrCoordinator, LocalIsrCoordinator, isr_advisory_lock_key, isr_window_key,
+};
 pub use middleware::StaticFileLayer;
 pub use types::{
     ManifestEntry, ParamsFn, StaticManifest, StaticParams, StaticRouteMeta, url_to_file_path,

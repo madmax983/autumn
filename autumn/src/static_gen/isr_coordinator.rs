@@ -51,20 +51,12 @@ pub trait IsrCoordinator: Send + Sync + 'static {
     ///
     /// Returns `true` when this caller may proceed; `false` when another
     /// task or replica already holds the lock for this (route, window) pair.
-    fn try_acquire<'a>(
-        &'a self,
-        url_path: &'a str,
-        window_key: &'a str,
-    ) -> IsrFuture<'a, bool>;
+    fn try_acquire<'a>(&'a self, url_path: &'a str, window_key: &'a str) -> IsrFuture<'a, bool>;
 
     /// Release the lock after regeneration completes (success or failure).
     ///
     /// Must be called exactly once for every successful [`try_acquire`](Self::try_acquire).
-    fn release<'a>(
-        &'a self,
-        url_path: &'a str,
-        window_key: &'a str,
-    ) -> IsrFuture<'a, ()>;
+    fn release<'a>(&'a self, url_path: &'a str, window_key: &'a str) -> IsrFuture<'a, ()>;
 }
 
 /// In-process ISR coordinator — always grants the lock.
@@ -93,19 +85,11 @@ impl IsrCoordinator for LocalIsrCoordinator {
         "local"
     }
 
-    fn try_acquire<'a>(
-        &'a self,
-        _url_path: &'a str,
-        _window_key: &'a str,
-    ) -> IsrFuture<'a, bool> {
+    fn try_acquire<'a>(&'a self, _url_path: &'a str, _window_key: &'a str) -> IsrFuture<'a, bool> {
         Box::pin(async move { true })
     }
 
-    fn release<'a>(
-        &'a self,
-        _url_path: &'a str,
-        _window_key: &'a str,
-    ) -> IsrFuture<'a, ()> {
+    fn release<'a>(&'a self, _url_path: &'a str, _window_key: &'a str) -> IsrFuture<'a, ()> {
         Box::pin(async move {})
     }
 }
@@ -165,11 +149,7 @@ impl IsrCoordinator for PostgresIsrCoordinator {
         "postgres"
     }
 
-    fn try_acquire<'a>(
-        &'a self,
-        url_path: &'a str,
-        window_key: &'a str,
-    ) -> IsrFuture<'a, bool> {
+    fn try_acquire<'a>(&'a self, url_path: &'a str, window_key: &'a str) -> IsrFuture<'a, bool> {
         let lock_key = isr_advisory_lock_key(url_path, window_key);
         Box::pin(async move {
             let mut conn = match self.pool.get().await {
@@ -194,11 +174,7 @@ impl IsrCoordinator for PostgresIsrCoordinator {
         })
     }
 
-    fn release<'a>(
-        &'a self,
-        url_path: &'a str,
-        window_key: &'a str,
-    ) -> IsrFuture<'a, ()> {
+    fn release<'a>(&'a self, url_path: &'a str, window_key: &'a str) -> IsrFuture<'a, ()> {
         let lock_key = isr_advisory_lock_key(url_path, window_key);
         Box::pin(async move {
             // Retrieve the connection that holds the lock.
@@ -347,7 +323,10 @@ mod tests {
     #[test]
     fn window_key_route_prefix() {
         let key = isr_window_key("/about", 60, 1_700_000_000);
-        assert!(key.starts_with("/about:"), "key should start with route: {key}");
+        assert!(
+            key.starts_with("/about:"),
+            "key should start with route: {key}"
+        );
     }
 
     #[test]
