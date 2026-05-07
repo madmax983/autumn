@@ -687,18 +687,13 @@ where
         Box::pin(async move {
             // 1. Extract or create session ID
             let existing_id = get_cookie(req.headers(), &config.cookie_name);
-            let mut generated_new_id = false;
             let (session_id, data) = if let Some(ref id) = existing_id {
                 match store.load(id).await {
                     Ok(Some(data)) => (id.clone(), data),
-                    Ok(None) => {
-                        generated_new_id = true;
-                        (Uuid::new_v4().to_string(), HashMap::new())
-                    }
+                    Ok(None) => (Uuid::new_v4().to_string(), HashMap::new()),
                     Err(error) => return Ok(session_store_unavailable_response(&error)),
                 }
             } else {
-                generated_new_id = true;
                 (Uuid::new_v4().to_string(), HashMap::new())
             };
 
@@ -718,7 +713,7 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
-            } else if inner_guard.dirty || generated_new_id {
+            } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
                 if let Some(ref old_id) = inner_guard.old_id
