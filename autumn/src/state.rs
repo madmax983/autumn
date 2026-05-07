@@ -17,7 +17,7 @@ use crate::cache::Cache;
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
-pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
+struct GlobalCacheEntry(pub Arc<dyn Cache>);
 
 use crate::actuator;
 use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
