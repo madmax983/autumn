@@ -11,6 +11,14 @@ A full-stack reference application demonstrating the classic Autumn stack:
 - **`autumn seed`** for one-command database bootstrap with representative data
 - **Framework ops endpoints** via `/health` and `/actuator/*`
 
+> [!TIP]
+> Alternative: skip the typing with
+> `autumn generate scaffold Todo title:String completed:bool`.
+> The scaffold produces the same Todo resource shape as a CRUD starting point,
+> but it does not include this example's htmx wiring or `/todos/{id}/toggle`
+> endpoint; add those by hand when you want the interactive behavior. See the
+> [generators guide](../../docs/guide/generators.md).
+
 ## Prerequisites
 
 - Rust (edition 2024)
