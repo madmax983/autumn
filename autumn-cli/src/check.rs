@@ -155,8 +155,27 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
 /// WCAG 2.1 SC 1.3.6 (Level AAA) / best practice — axe-core rule `landmark-one-main`.
 fn check_landmark_main(html: &str, out: &mut Vec<A11yViolation>) {
     let html_lower = html.to_lowercase();
-    let main_count =
-        html_lower.matches("<main").count() + html_lower.matches("role=\"main\"").count();
+
+    // Count <main> elements.
+    let main_tag_count = html_lower.matches("<main").count();
+
+    // Count role="main" only on non-<main> elements to avoid double-counting
+    // the common pattern <main role="main">.
+    let mut extra_role_main = 0usize;
+    let mut offset = 0usize;
+    while let Some(rel) = html_lower[offset..].find("role=\"main\"") {
+        let abs = offset + rel;
+        let before = &html_lower[..abs];
+        if before
+            .rfind('<')
+            .is_some_and(|s| !html_lower[s..].starts_with("<main"))
+        {
+            extra_role_main += 1;
+        }
+        offset = abs + 11; // 11 = len("role=\"main\"")
+    }
+
+    let main_count = main_tag_count + extra_role_main;
     match main_count {
         0 => {
             out.push(A11yViolation {
@@ -593,6 +612,22 @@ mod tests {
     fn multiple_main_landmarks_fails() {
         let html = r#"<html lang="en"><body><main>A</main><main>B</main></body></html>"#;
         assert!(violation_ids(html).contains(&"landmark-one-main"));
+    }
+
+    #[test]
+    fn main_with_role_main_does_not_double_count() {
+        // <main role="main"> is the scaffold default; must not count as two landmarks.
+        let html = r##"<html lang="en"><body><a class="skip-link" href="#main">Skip</a><main id="main" role="main">content</main></body></html>"##;
+        assert!(
+            !violation_ids(html).contains(&"landmark-one-main"),
+            "<main role=\"main\"> should count as one landmark, not two"
+        );
+    }
+
+    #[test]
+    fn div_with_role_main_passes() {
+        let html = r#"<html lang="en"><body><div role="main">content</div></body></html>"#;
+        assert!(!violation_ids(html).contains(&"landmark-one-main"));
     }
 
     // ── image-alt ─────────────────────────────────────────────────
