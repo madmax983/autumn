@@ -1046,6 +1046,7 @@ impl Default for JobConfig {
     }
 }
 
+/// Redis backend configuration options for the job runner.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobRedisConfig {
     /// Redis URL used when `jobs.backend = "redis"`.
