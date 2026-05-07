@@ -103,10 +103,14 @@ pub fn analyse_html(html: &str) -> Vec<A11yViolation> {
 fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
     let html_lower = html.to_lowercase();
     // Use " lang=" (space prefix) to avoid matching "data-lang=" or similar.
+    // Also verify the value is non-empty — lang="" fails WCAG just as much as no lang.
     let has_lang = html_lower.find("<html").is_some_and(|start| {
         let tag_end = html_lower[start..].find('>').unwrap_or(0);
         let tag = &html_lower[start..start + tag_end];
-        tag.contains(" lang=")
+        tag.find(" lang=").is_some_and(|lang_pos| {
+            let val = extract_attr_value(&tag[lang_pos + 6..]); // 6 = len(" lang=")
+            !val.is_empty()
+        })
     });
 
     if !has_lang {
@@ -297,10 +301,11 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         } else {
             ""
         };
-        // Strip HTML tags (e.g. <img>) before checking for visible text so
-        // that a button containing only an image without alt text is not
-        // incorrectly considered named.
-        let has_text = !strip_html_tags(inner).trim().is_empty();
+        // Strip HTML tags (e.g. <img>) before checking for visible text so that a
+        // button containing only an image without alt text is not incorrectly named.
+        // Also accept a non-empty alt on a child <img> — that alt contributes to
+        // the button's accessible name per the AccName algorithm.
+        let has_text = !strip_html_tags(inner).trim().is_empty() || img_alt_text(inner);
 
         if !has_aria_label && !has_text {
             nameless += 1;
@@ -320,6 +325,27 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
             help: "Add visible text inside <button> or use aria-label",
         });
     }
+}
+
+/// Returns `true` when `html` contains at least one `<img>` with a non-empty `alt`.
+///
+/// Used to recognise icon buttons whose accessible name comes from the child image.
+fn img_alt_text(html: &str) -> bool {
+    let lower = html.to_lowercase();
+    let mut search = lower.as_str();
+    while let Some(img_pos) = search.find("<img") {
+        let rest = &search[img_pos..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if tag
+            .find(" alt=")
+            .is_some_and(|alt_pos| !extract_attr_value(&tag[alt_pos + 5..]).is_empty())
+        {
+            return true;
+        }
+        search = &search[img_pos + 4..];
+    }
+    false
 }
 
 /// Remove all HTML tags from `s`, leaving only text nodes.
@@ -464,6 +490,15 @@ mod tests {
     fn html_data_lang_attribute_does_not_satisfy_lang_requirement() {
         let html = r#"<html data-lang="en"><body><main></main></body></html>"#;
         assert!(violation_ids(html).contains(&"html-has-lang"));
+    }
+
+    #[test]
+    fn html_empty_lang_fails() {
+        let html = r#"<html lang=""><body><main></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"html-has-lang"),
+            "lang=\"\" must not satisfy the lang requirement"
+        );
     }
 
     // ── bypass (skip link) ─────────────────────────────────────────
@@ -654,6 +689,24 @@ mod tests {
     fn button_with_only_img_no_alt_fails() {
         let html = r#"<html lang="en"><body><main><button><img src="icon.png"></button></main></body></html>"#;
         assert!(violation_ids(html).contains(&"button-name"));
+    }
+
+    #[test]
+    fn button_with_img_with_alt_passes() {
+        let html = r#"<html lang="en"><body><main><button><img src="delete.svg" alt="Delete"></button></main></body></html>"#;
+        assert!(
+            !violation_ids(html).contains(&"button-name"),
+            "icon button with non-empty img alt should pass"
+        );
+    }
+
+    #[test]
+    fn button_with_img_empty_alt_fails() {
+        let html = r#"<html lang="en"><body><main><button><img src="deco.png" alt=""></button></main></body></html>"#;
+        assert!(
+            violation_ids(html).contains(&"button-name"),
+            "button with img alt=\"\" has no accessible name"
+        );
     }
 
     // ── strip_html_tags ────────────────────────────────────────────
