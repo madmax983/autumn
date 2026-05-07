@@ -29,8 +29,7 @@ autumn migrate
 autumn dev
 ```
 
-After signing in through your app's auth flow, visit
-<http://localhost:3000/posts> to see the generated index page.
+Visit <http://localhost:3000/posts> to see the generated index page.
 The JSON endpoint at <http://localhost:3000/api/posts> returns `[]` until
 you create one, and `POST /api/posts` with a JSON body inserts a row.
 
@@ -168,13 +167,12 @@ Everything `model` produces, plus:
   block that auto-generates 7 CRUD methods plus a 5-handler JSON REST API.
 - `src/repositories/mod.rs` — module aggregator.
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
-  `create`, and `edit_form`. Update and delete go through the JSON REST API
+  `create`, `edit_form`, and `update`. Delete goes through the JSON REST API
   the repository already provides.
 - `src/routes/mod.rs` — module aggregator.
-- `tests/<snake>.rs` — a smoke test that hits secured `GET /<plural>` against
-  a running server with an authenticated session cookie and asserts a 2xx
-  response (skipped unless `AUTUMN_TEST_BASE_URL` and
-  `AUTUMN_TEST_SESSION_COOKIE` are set).
+- `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
+  a running server and asserts a 2xx response (skipped unless
+  `AUTUMN_TEST_BASE_URL` is set).
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op.
@@ -188,6 +186,23 @@ Everything `model` produces, plus:
 | `migrations/<ts>_create_<plural>/`    | Diesel migrations                                                                          |
 | `src/schema.rs`                       | Diesel `table!` blocks                                                                     |
 | `tests/<name>.rs`                     | Standard `cargo test` integration test                                                     |
+
+### Slow live scaffold verification
+
+The CLI test suite includes two ignored scaffold checks:
+
+```bash
+# Compile-check the generated app and its generated smoke test.
+cargo test -p autumn-cli --test generate generated_scaffold_cargo_checks -- --ignored --exact
+
+# Boot Postgres, run `autumn migrate`, start the generated server, and
+# verify GET /posts and GET /api/posts over real HTTP.
+cargo test -p autumn-cli --test generate generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact
+```
+
+The live HTTP test requires Docker access for the Postgres testcontainer and
+the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
+`diesel migration run`.
 
 ## Common flags
 

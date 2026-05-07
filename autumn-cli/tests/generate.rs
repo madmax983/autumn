@@ -6,9 +6,13 @@
 //!
 //! [Issue #493]: https://github.com/madmax983/autumn/issues/493
 
+use std::fmt::Write as _;
 use std::fs;
+use std::io::Read as _;
+use std::net::TcpListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 /// Spawn the production `autumn` binary in `dir` with the given args and
 /// assert it exits successfully, returning the captured stdout + stderr.
@@ -17,6 +21,25 @@ fn run_autumn(dir: &Path, args: &[&str]) -> (String, String) {
     let output = Command::new(autumn_bin)
         .args(args)
         .current_dir(dir)
+        .output()
+        .expect("failed to run autumn");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "autumn {args:?} failed (exit={:?})\nstdout: {stdout}\nstderr: {stderr}",
+        output.status.code(),
+    );
+    (stdout, stderr)
+}
+
+/// Spawn the production `autumn` binary with environment overrides.
+fn run_autumn_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, String) {
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(args)
+        .current_dir(dir)
+        .envs(envs.iter().copied())
         .output()
         .expect("failed to run autumn");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -49,6 +72,73 @@ fn fresh_project(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     run_autumn(tmp.path(), &["new", name]);
     let project = tmp.path().join(name);
     (tmp, project)
+}
+
+fn patch_generated_cargo_toml(project_dir: &Path) {
+    let cargo_toml_path = project_dir.join("Cargo.toml");
+    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let autumn_web = workspace_root.join("autumn");
+    write!(
+        content,
+        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
+        autumn_web.display().to_string().replace('\\', "/")
+    )
+    .unwrap();
+    fs::write(&cargo_toml_path, content).unwrap();
+}
+
+fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    listener.local_addr().expect("local addr").port()
+}
+
+struct ServerGuard(Child);
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn child_output(child: &mut Child) -> (String, String) {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    (stdout, stderr)
+}
+
+fn wait_for_server_ready(
+    mut child: Child,
+    client: &reqwest::blocking::Client,
+    base: &str,
+) -> ServerGuard {
+    for _ in 0..60 {
+        if let Some(status) = child.try_wait().expect("server status") {
+            let (stdout, stderr) = child_output(&mut child);
+            panic!(
+                "server exited before becoming ready: {status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+
+        if client.get(format!("{base}/health")).send().is_ok() {
+            return ServerGuard(child);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let (stdout, stderr) = child_output(&mut child);
+    panic!("server failed to become ready within 30 seconds\nstdout:\n{stdout}\nstderr:\n{stderr}");
 }
 
 #[test]
@@ -224,7 +314,7 @@ fn generate_scaffold_full_e2e_post() {
 
     // Repository file.
     let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
-    assert!(repo.contains("#[autumn_web::repository(Post)]"));
+    assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
     assert!(repo.contains("pub trait PostRepository"));
 
     // HTML routes — index/show/new/create/edit_form/update; delete goes
@@ -247,12 +337,10 @@ fn generate_scaffold_full_e2e_post() {
 
     // Smoke test.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(
-        test.contains("posts_index_returns_200_with_authenticated_session_when_server_is_running")
-    );
+    assert!(test.contains("posts_index_returns_200_when_server_is_running"));
     assert!(test.contains("AUTUMN_TEST_BASE_URL"));
-    assert!(test.contains("AUTUMN_TEST_SESSION_COOKIE"));
-    assert!(test.contains("Cookie: {session_cookie}"));
+    assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"));
+    assert!(!test.contains("Cookie: {session_cookie}"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -267,12 +355,109 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::create",
         "routes::posts::edit_form",
         "routes::posts::update",
+        "repositories::post::post_api_list",
+        "repositories::post::post_api_get",
+        "repositories::post::post_api_create",
+        "repositories::post::post_api_update",
+        "repositories::post::post_api_delete",
     ] {
         assert!(
             main.contains(entry),
             "main.rs missing routes![] entry: {entry}\n{main}"
         );
     }
+}
+
+/// Slow live-HTTP check: scaffold a fresh project, run migrations against a
+/// real Postgres testcontainer, boot the generated server, and assert the
+/// generated HTML and JSON routes actually respond.
+///
+/// Ignored by default; requires Docker and `diesel` CLI on PATH. Run with:
+/// `cargo test -p autumn-cli --test generate generated_scaffold_serves_posts_index_and_json_api -- --ignored --exact`
+#[tokio::test]
+#[ignore = "slow: starts Postgres, runs diesel migrations, builds and boots a generated app"]
+async fn generated_scaffold_serves_posts_index_and_json_api() {
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::postgres::Postgres;
+
+    let (_tmp, project) = fresh_project("scaffold-live");
+    patch_generated_cargo_toml(&project);
+    let _ = fs::remove_file(project.join("build.rs"));
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+        ],
+    );
+
+    let postgres = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer");
+    let host = postgres.get_host().await.expect("postgres host");
+    let pg_port = postgres
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("postgres port");
+    let database_url = format!("postgres://postgres:postgres@{host}:{pg_port}/postgres");
+
+    run_autumn_with_env(
+        &project,
+        &["migrate"],
+        &[("AUTUMN_DATABASE__URL", database_url.as_str())],
+    );
+
+    let build = Command::new("cargo")
+        .args(["build", "--offline"])
+        .current_dir(&project)
+        .output()
+        .expect("failed to run cargo build");
+    assert!(
+        build.status.success(),
+        "cargo build failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    let port = free_port();
+    let child = Command::new("cargo")
+        .args(["run", "--quiet", "--offline"])
+        .current_dir(&project)
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_DATABASE__URL", &database_url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn generated server");
+
+    let client = reqwest::blocking::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let _server = wait_for_server_ready(child, &client, &base);
+
+    let response = client
+        .get(format!("{base}/posts"))
+        .send()
+        .expect("GET /posts failed");
+    assert_eq!(response.status(), 200, "GET /posts status");
+    let html = response.text().expect("GET /posts body");
+    assert!(
+        html.contains("<h1>Posts</h1>") && html.contains("New Post"),
+        "GET /posts did not render the generated index template:\n{html}",
+    );
+
+    let response = client
+        .get(format!("{base}/api/posts"))
+        .send()
+        .expect("GET /api/posts failed");
+    assert_eq!(response.status(), 200, "GET /api/posts status");
+    let body = response.text().expect("GET /api/posts body");
+    assert_eq!(body.trim(), "[]", "empty JSON index body");
 }
 
 #[test]
@@ -323,7 +508,6 @@ fn generate_model_help_shows_example() {
 #[test]
 #[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn generated_scaffold_cargo_checks() {
-    use std::fmt::Write as _;
     let (_tmp, project) = fresh_project("scaffold-build");
 
     // Patch Cargo.toml to point at the *local* autumn-web crate (so we don't
@@ -331,18 +515,7 @@ fn generated_scaffold_cargo_checks() {
     // pre-add the diesel/maud/etc deps here — that's what the generator is
     // supposed to do automatically.
     let cargo_toml_path = project.join("Cargo.toml");
-    let mut content = fs::read_to_string(&cargo_toml_path).unwrap();
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
-    let autumn_web = workspace_root.join("autumn");
-    write!(
-        content,
-        "\n[patch.crates-io]\nautumn-web = {{ path = \"{}\" }}\n",
-        autumn_web.display().to_string().replace('\\', "/")
-    )
-    .unwrap();
-    fs::write(&cargo_toml_path, content).unwrap();
+    patch_generated_cargo_toml(&project);
     // Drop build.rs so we don't need the Tailwind CLI installed.
     let _ = fs::remove_file(project.join("build.rs"));
 
@@ -360,7 +533,14 @@ fn generated_scaffold_cargo_checks() {
 
     // The generator must have added every dep its emitted code needs.
     let cargo_toml_after = fs::read_to_string(&cargo_toml_path).unwrap();
-    for dep in ["chrono", "diesel", "diesel-async", "maud", "serde"] {
+    for dep in [
+        "chrono",
+        "diesel",
+        "diesel-async",
+        "maud",
+        "serde",
+        "serde_json",
+    ] {
         assert!(
             cargo_toml_after.contains(&format!("{dep} =")),
             "Cargo.toml is missing '{dep}' after `generate scaffold`"
@@ -368,7 +548,7 @@ fn generated_scaffold_cargo_checks() {
     }
 
     let check = Command::new("cargo")
-        .args(["check", "--tests"])
+        .args(["check", "--tests", "--offline"])
         .current_dir(&project)
         .output()
         .unwrap();
