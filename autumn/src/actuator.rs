@@ -1404,6 +1404,14 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(ui_tasks::<S>),
             );
 
+        #[cfg(feature = "system-info")]
+        {
+            router = router.route(
+                &actuator_route_path(prefix, "/system"),
+                axum::routing::get(crate::system_info::system_info_handler),
+            );
+        }
+
         #[cfg(feature = "ws")]
         {
             router = router
