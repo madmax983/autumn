@@ -22,7 +22,7 @@
 //! then renames atomically so a reader never observes a partially written
 //! page.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
@@ -79,8 +79,8 @@ pub trait IsrCoordinator: Send + Sync + 'static {
 /// For multi-replica deployments use [`PostgresIsrCoordinator`] (feature
 /// `db`) which enforces fleet-wide deduplication via `pg_try_advisory_lock`.
 pub struct LocalIsrCoordinator {
-    /// Tracks (url_path, window_key) pairs currently held by this process.
-    held: Mutex<HashMap<(String, String), ()>>,
+    /// Tracks (`url_path`, `window_key`) pairs currently held by this process.
+    held: Mutex<HashSet<(String, String)>>,
 }
 
 impl LocalIsrCoordinator {
@@ -88,7 +88,7 @@ impl LocalIsrCoordinator {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            held: Mutex::new(HashMap::new()),
+            held: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -111,13 +111,7 @@ impl IsrCoordinator for LocalIsrCoordinator {
     ) -> IsrFuture<'a, bool> {
         Box::pin(async move {
             let key = (url_path.to_owned(), window_key.to_owned());
-            let mut held = self.held.lock().unwrap();
-            if held.contains_key(&key) {
-                false
-            } else {
-                held.insert(key, ());
-                true
-            }
+            self.held.lock().unwrap().insert(key)
         })
     }
 
@@ -159,7 +153,7 @@ pub struct PostgresIsrCoordinator {
 impl PostgresIsrCoordinator {
     /// Create a Postgres ISR coordinator backed by the given connection pool.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         Self { pool }
