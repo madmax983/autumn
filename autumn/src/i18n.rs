@@ -311,7 +311,8 @@ pub struct Bundle {
 impl fmt::Debug for Bundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Bundle")
-            .field("locales", &self.messages.keys().collect::<Vec<_>>())
+            // Iterators natively implement fmt::Debug, avoiding unnecessary heap allocations.
+            .field("locales", &self.messages.keys())
             .field("default_locale", &self.default_locale)
             .field("supported_locales", &self.supported_locales)
             .field("miss_count", &self.miss_count.load(Ordering::Relaxed))
