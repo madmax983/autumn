@@ -283,13 +283,14 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
             };
 
             if !skip {
-                // Require non-empty values — aria-label="" is not a valid accessible name.
+                // Require non-empty aria-label values and resolve aria-labelledby IDs.
                 let has_aria = tag
                     .find("aria-label=")
                     .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
-                    || tag
-                        .find("aria-labelledby=")
-                        .is_some_and(|p| !extract_attr_value(&tag[p + 16..]).is_empty());
+                    || tag.find("aria-labelledby=").is_some_and(|p| {
+                        let ids = extract_attr_value(&tag[p + 16..]);
+                        !ids.is_empty() && aria_labelledby_resolves(&html_lower, &ids)
+                    });
                 let has_for = tag.find(" id=").is_some_and(|id_pos| {
                     let id_val = extract_attr_value(&tag[id_pos + 4..]);
                     !id_val.is_empty() && labelled_ids.contains(&id_val)
@@ -347,13 +348,14 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         let tag_end = rest.find('>').unwrap_or(0);
         let tag = &rest[..tag_end];
 
-        // Require non-empty values — aria-label="" is not a valid accessible name.
+        // Require non-empty aria-label values and resolve aria-labelledby IDs.
         let has_aria_label = tag
             .find("aria-label=")
             .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
-            || tag
-                .find("aria-labelledby=")
-                .is_some_and(|p| !extract_attr_value(&tag[p + 16..]).is_empty());
+            || tag.find("aria-labelledby=").is_some_and(|p| {
+                let ids = extract_attr_value(&tag[p + 16..]);
+                !ids.is_empty() && aria_labelledby_resolves(&html_lower, &ids)
+            });
         let inner = if close > tag_end {
             &button_html[tag_end + 1..close]
         } else {
@@ -404,6 +406,27 @@ fn img_alt_text(html: &str) -> bool {
         search = &search[img_pos + 4..];
     }
     false
+}
+
+/// Check whether all IDs referenced by an `aria-labelledby` attribute resolve to
+/// elements with usable text content.
+///
+/// `html` should already be lowercased. Splits `ids` on whitespace and verifies
+/// that at least one referenced element exists and has non-empty text.
+fn aria_labelledby_resolves(html: &str, ids: &str) -> bool {
+    ids.split_whitespace().any(|id| {
+        let search = format!(" id=\"{id}\"");
+        html.find(&search).is_some_and(|pos| {
+            // Advance past the opening tag to its content.
+            let after_tag = html[pos..].find('>').map_or(html.len(), |t| pos + t + 1);
+            // Grab up to 500 chars of inner content (enough for typical labels).
+            let content_end = (after_tag + 500).min(html.len());
+            let inner_raw = &html[after_tag..content_end];
+            // Stop at the first closing tag boundary.
+            let inner = &inner_raw[..inner_raw.find("</").unwrap_or(inner_raw.len())];
+            !strip_html_tags(inner).trim().is_empty()
+        })
+    })
 }
 
 /// Remove all HTML tags from `s`, leaving only text nodes.
@@ -734,6 +757,26 @@ mod tests {
     }
 
     #[test]
+    fn input_aria_labelledby_resolving_id_passes() {
+        let html = clean_page(
+            r#"<span id="lbl">Username</span><input type="text" aria-labelledby="lbl">"#,
+        );
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "aria-labelledby referencing existing element with text must pass"
+        );
+    }
+
+    #[test]
+    fn input_aria_labelledby_missing_id_fails() {
+        let html = clean_page(r#"<input type="text" aria-labelledby="nonexistent">"#);
+        assert!(
+            violation_ids(&html).contains(&"label"),
+            "aria-labelledby referencing a missing ID must fail"
+        );
+    }
+
+    #[test]
     fn wrapped_label_input_passes() {
         let html = clean_page(r#"<label>Name <input type="text"></label>"#);
         assert!(
@@ -834,6 +877,26 @@ mod tests {
     fn empty_button_fails() {
         let html = r#"<html lang="en"><body><main><button></button></main></body></html>"#;
         assert!(violation_ids(html).contains(&"button-name"));
+    }
+
+    #[test]
+    fn button_aria_labelledby_resolving_id_passes() {
+        let html = clean_page(
+            r#"<span id="close-label">Close</span><button aria-labelledby="close-label"></button>"#,
+        );
+        assert!(
+            !violation_ids(&html).contains(&"button-name"),
+            "aria-labelledby referencing existing element with text must pass"
+        );
+    }
+
+    #[test]
+    fn button_aria_labelledby_missing_id_fails() {
+        let html = clean_page(r#"<button aria-labelledby="ghost"></button>"#);
+        assert!(
+            violation_ids(&html).contains(&"button-name"),
+            "aria-labelledby referencing a missing ID must fail"
+        );
     }
 
     #[test]
