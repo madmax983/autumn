@@ -16,6 +16,30 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+/// Scaffold-level accessibility posture reported by `/actuator/a11y`.
+///
+/// Each field indicates whether a foundational WCAG 2.1 AA scaffold concern is
+/// addressed in the application.  Apps generated with `autumn new` satisfy all
+/// three by default; existing apps can opt in incrementally.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct A11yPosture {
+    /// `<html lang="…">` is set in the page template.
+    pub lang_set: bool,
+    /// A skip-to-content link is present as the first focusable element.
+    pub skip_link_present: bool,
+    /// Semantic landmark regions (`<header>`, `<main>`, `<nav>`, `<footer>`)
+    /// are used in the page layout.
+    pub landmark_regions_present: bool,
+}
+
+impl A11yPosture {
+    /// Returns `true` when all scaffold-level a11y concerns are addressed.
+    #[must_use]
+    pub fn is_compliant(&self) -> bool {
+        self.lang_set && self.skip_link_present && self.landmark_regions_present
+    }
+}
+
 /// Trait to abstract the state requirements for actuator handlers.
 ///
 /// Implement this trait on your application's state type to provide
@@ -65,6 +89,15 @@ pub trait ProvideActuatorState {
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+
+    /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
+    ///
+    /// Override this in your `AppState` implementation to declare which
+    /// WCAG 2.1 AA scaffold concerns your application addresses.  The default
+    /// returns all-false (no concerns addressed) — a conservative safe default.
+    fn a11y_posture(&self) -> A11yPosture {
+        A11yPosture::default()
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -1226,6 +1259,18 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
     Json(serde_json::json!({ "jobs": jobs }))
 }
 
+// ── A11y ───────────────────────────────────────────────────────
+
+/// `GET <actuator-prefix>/a11y` -- scaffold-level accessibility posture.
+///
+/// Returns a JSON object describing which WCAG 2.1 AA scaffold concerns the
+/// application addresses.  Available in all profiles (like `/actuator/health`).
+pub(crate) async fn a11y_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<A11yPosture> {
+    Json(state.a11y_posture())
+}
+
 // ── Channels (sensitive) ───────────────────────────────────────
 
 /// `GET <actuator-prefix>/channels` -- get current channel snapshots.
@@ -1314,6 +1359,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
         actuator_route_path(prefix, "/metrics"),
+        actuator_route_path(prefix, "/a11y"),
         actuator_route_path(prefix, "/ui"),
         actuator_route_path(prefix, "/ui/metrics"),
     ];
@@ -1367,6 +1413,10 @@ pub(crate) fn actuator_router_with_prefix<
         .route(
             &actuator_route_path(prefix, "/metrics"),
             axum::routing::get(metrics_endpoint::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/a11y"),
+            axum::routing::get(a11y_endpoint::<S>),
         );
 
     if sensitive {
@@ -2310,6 +2360,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── RED: /actuator/a11y endpoint ───────────────────────────────
+
+    #[tokio::test]
+    async fn actuator_a11y_returns_posture_json() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["lang_set"].is_boolean(), "{json}");
+        assert!(json["skip_link_present"].is_boolean(), "{json}");
+        assert!(json["landmark_regions_present"].is_boolean(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_available_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_posture_default_values() {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Default test state should report false for all posture fields
+        assert_eq!(json["lang_set"], false, "{json}");
+        assert_eq!(json["skip_link_present"], false, "{json}");
+        assert_eq!(json["landmark_regions_present"], false, "{json}");
+    }
+
+    #[test]
+    fn a11y_posture_all_passing_is_compliant() {
+        let posture = A11yPosture {
+            lang_set: true,
+            skip_link_present: true,
+            landmark_regions_present: true,
+        };
+        assert!(posture.is_compliant());
+    }
+
+    #[test]
+    fn a11y_posture_missing_lang_is_not_compliant() {
+        let posture = A11yPosture {
+            lang_set: false,
+            skip_link_present: true,
+            landmark_regions_present: true,
+        };
+        assert!(!posture.is_compliant());
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_endpoint_paths_includes_a11y() {
+        let paths = actuator_endpoint_paths("/actuator", false);
+        assert!(
+            paths.iter().any(|p| p == "/actuator/a11y"),
+            "a11y path not found in: {paths:?}"
+        );
     }
 }
 

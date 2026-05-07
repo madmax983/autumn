@@ -1,11 +1,55 @@
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
+#[cfg(feature = "maud")]
+use autumn_web::form::skip_link;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
+// ── Accessible page layout ──────────────────────────────────────────
+//
+// Ships with WCAG 2.1 AA scaffold requirements out of the box:
+//   • lang="en" on <html> for correct screen-reader language rules
+//   • Skip-to-content link as the first focusable element
+//   • Semantic landmark regions (<header>, <main>, <footer>)
+//
+// Add to your CSS / Tailwind config to reveal the skip link on focus:
+//   .skip-link { position: absolute; top: -9999px; }
+//   .skip-link:focus { position: static; }
+#[cfg(feature = "maud")]
+pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
+    maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                meta name="viewport" content="width=device-width, initial-scale=1";
+                title { (title) }
+                link rel="stylesheet" href="/static/css/app.css";
+            }
+            body {
+                (skip_link("#main-content", "Skip to main content"))
+                header role="banner" {
+                    nav aria-label="Main navigation" {
+                        a href="/" { "{{project_name}}" }
+                    }
+                }
+                main id="main-content" role="main" {
+                    (content)
+                }
+                footer role="contentinfo" {
+                    p { "Built with Autumn" }
+                }
+            }
+        }
+    }
+}
+
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to {{project_name}}!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]

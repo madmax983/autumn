@@ -617,6 +617,170 @@ pub fn submit_button(label: &str) -> maud::Markup {
     }
 }
 
+/// Render a labeled `<input type="password">` tied to a changeset field.
+///
+/// Like [`text_input`] but uses `type="password"` and never populates the
+/// `value` attribute — browsers must not auto-fill passwords into the markup
+/// and screen readers must not announce the value.
+///
+/// ARIA annotations (`aria-invalid`, `aria-describedby`, error block) behave
+/// identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn password_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let error_id = format!("{field}-error");
+
+    maud::html! {
+        div {
+            label for=(field) { (label) }
+            input
+                type="password"
+                id=(field)
+                name=(field)
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" {
+                    @for error in errors {
+                        p { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<textarea>` tied to a changeset field.
+///
+/// The current field value is emitted as the textarea body (not a `value`
+/// attribute). ARIA annotations behave identically to [`text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn textarea_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+
+    maud::html! {
+        div {
+            label for=(field) { (label) }
+            textarea
+                id=(field)
+                name=(field)
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" })
+                { (value) }
+            @if has_errors {
+                div id=(error_id) role="alert" {
+                    @for error in errors {
+                        p { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render a labeled `<input type="text">` for a required field.
+///
+/// Identical to [`text_input`] but adds `aria-required="true"` and the HTML
+/// `required` attribute, giving both AT users and browser-native validation
+/// the required-field signal without relying solely on color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_text_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    let errors = changeset.errors_for(field);
+    let has_errors = !errors.is_empty();
+    let value = changeset.field_value(field).unwrap_or_default();
+    let error_id = format!("{field}-error");
+
+    maud::html! {
+        div {
+            label for=(field) { (label) }
+            input
+                type="text"
+                id=(field)
+                name=(field)
+                value=(value)
+                required
+                aria-required="true"
+                aria-invalid=(if has_errors { "true" } else { "false" })
+                aria-describedby=(if has_errors { error_id.as_str() } else { "" });
+            @if has_errors {
+                div id=(error_id) role="alert" {
+                    @for error in errors {
+                        p { (error) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render an ARIA live region for htmx swap announcements.
+///
+/// Emits `<div id="…" role="status" aria-live="polite" aria-atomic="true">`.
+/// Place this element in your page layout and update its content via
+/// `hx-swap-oob` to announce htmx-driven changes to screen readers without
+/// moving keyboard focus.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// // In your page layout:
+/// (aria_live_region("htmx-status", ""))
+///
+/// // In an htmx response fragment (announces to screen readers):
+/// div id="htmx-status" role="status" aria-live="polite" aria-atomic="true"
+///     hx-swap-oob="true" {
+///     "Post submitted successfully"
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn aria_live_region(id: &str, message: &str) -> maud::Markup {
+    maud::html! {
+        div id=(id) role="status" aria-live="polite" aria-atomic="true" {
+            (message)
+        }
+    }
+}
+
+/// Render a visually-hidden skip-to-content link that becomes visible on focus.
+///
+/// Place this as the **first element inside `<body>`** so keyboard users can
+/// bypass repeated navigation and jump directly to main content.
+///
+/// The link carries the `skip-link` CSS class; pair it with the bundled
+/// Tailwind config's `skip-link` utility or add your own:
+///
+/// ```css
+/// .skip-link { position: absolute; top: -9999px; }
+/// .skip-link:focus { position: static; }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn skip_link(target: &str, label: &str) -> maud::Markup {
+    maud::html! {
+        a href=(target) class="skip-link" { (label) }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1084,6 +1248,140 @@ mod tests {
         let html = submit_button("Save").into_string();
         assert!(html.contains(r#"type="submit""#), "{html}");
         assert!(html.contains("Save"), "{html}");
+    }
+
+    // ── RED: accessible form helpers ───────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn password_input_renders_type_password() {
+        #[derive(serde::Serialize)]
+        struct F {
+            password: String,
+        }
+        let cs = Changeset::new(F {
+            password: String::new(),
+        });
+        let html = password_input(&cs, "password", "Password").into_string();
+        assert!(html.contains(r#"type="password""#), "{html}");
+        assert!(html.contains(r#"name="password""#), "{html}");
+        assert!(html.contains("Password"), "{html}");
+        // Must NOT expose the value in the rendered HTML
+        assert!(!html.contains(r#"value=""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn password_input_emits_aria_invalid_on_error() {
+        #[derive(serde::Serialize)]
+        struct F {
+            password: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("password".to_string(), vec!["too short".to_string()]);
+        let cs = Changeset::from_errors(F { password: "x".into() }, errors);
+        let html = password_input(&cs, "password", "Password").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("too short"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn textarea_input_renders_textarea_element() {
+        #[derive(serde::Serialize)]
+        struct F {
+            bio: String,
+        }
+        let cs = Changeset::new(F {
+            bio: "Hello world".into(),
+        });
+        let html = textarea_input(&cs, "bio", "Bio").into_string();
+        assert!(html.contains("<textarea"), "{html}");
+        assert!(html.contains(r#"name="bio""#), "{html}");
+        assert!(html.contains(r#"id="bio""#), "{html}");
+        assert!(html.contains("Bio"), "{html}");
+        assert!(html.contains("Hello world"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn textarea_input_aria_invalid_on_error() {
+        #[derive(serde::Serialize)]
+        struct F {
+            bio: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("bio".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(F { bio: String::new() }, errors);
+        let html = textarea_input(&cs, "bio", "Bio").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(html.contains("required"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_emits_aria_required() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            name: "Alice".into(),
+        });
+        let html = required_text_input(&cs, "name", "Name").into_string();
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains(r#"required"#), "{html}");
+        assert!(html.contains(r#"name="name""#), "{html}");
+        assert!(html.contains("Name"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn required_text_input_preserves_error_handling() {
+        #[derive(serde::Serialize)]
+        struct F {
+            name: String,
+        }
+        let mut errors = HashMap::new();
+        errors.insert("name".to_string(), vec!["required".to_string()]);
+        let cs = Changeset::from_errors(F { name: String::new() }, errors);
+        let html = required_text_input(&cs, "name", "Name").into_string();
+        assert!(html.contains(r#"aria-invalid="true""#), "{html}");
+        assert!(html.contains(r#"aria-required="true""#), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn aria_live_region_renders_role_status() {
+        let html = aria_live_region("status-msg", "").into_string();
+        assert!(html.contains(r#"role="status""#), "{html}");
+        assert!(html.contains(r#"aria-live="polite""#), "{html}");
+        assert!(html.contains(r#"id="status-msg""#), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn aria_live_region_renders_message_content() {
+        let html = aria_live_region("status-msg", "Form submitted").into_string();
+        assert!(html.contains("Form submitted"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn skip_link_renders_anchor_with_href() {
+        let html = skip_link("#main-content", "Skip to main content").into_string();
+        assert!(html.contains(r##"href="#main-content""##), "{html}");
+        assert!(html.contains("Skip to main content"), "{html}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn skip_link_has_visually_hidden_class_for_focus_reveal() {
+        let html = skip_link("#main", "Skip").into_string();
+        assert!(html.contains("skip-link"), "{html}");
     }
 
     // ── ChangesetForm extractor (axum integration) ─────────────────
