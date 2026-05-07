@@ -1006,7 +1006,13 @@ fn apply_middleware(
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+    router = router.fallback(
+        |method: axum::http::Method, uri: axum::http::Uri| async move {
+            crate::middleware::error_page_filter::fallback_404_handler(method, uri)
+                .await
+                .map_err(|e| e)
+        },
+    );
 
     router = apply_cors_middleware(router, config);
     router = apply_csrf_middleware(router, config);

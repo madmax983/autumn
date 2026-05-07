@@ -289,15 +289,20 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
 ///
 /// This is mounted as the router's fallback so unmatched routes get proper
 /// error pages instead of Axum's default plain-text "Not Found".
-pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+pub async fn fallback_404_handler(
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> crate::error::AutumnResult<Response> {
     if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
         && uri.path() == crate::router::DEFAULT_FAVICON_PATH
     {
-        return axum::http::StatusCode::NO_CONTENT.into_response();
+        return Ok(axum::http::StatusCode::NO_CONTENT.into_response());
     }
 
-    crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
-        .into_response()
+    Err(crate::error::AutumnError::not_found_msg(format!(
+        "No route matches {}",
+        uri.path()
+    )))
 }
 
 #[cfg(test)]
@@ -702,10 +707,21 @@ mod tests {
         let uri = axum::http::Uri::from_static("/some/unknown/path");
         let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        assert!(response.is_err());
+        assert_eq!(
+            response.as_ref().unwrap_err().status(),
+            StatusCode::NOT_FOUND
+        );
+        let body = axum::body::to_bytes(
+            if response.is_ok() {
+                response.unwrap().into_body()
+            } else {
+                response.unwrap_err().into_response().into_body()
+            },
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("No route matches /some/unknown/path"));
     }
 
@@ -714,10 +730,21 @@ mod tests {
         let uri = axum::http::Uri::from_static("/search?q=rust&sort=desc");
         let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        assert!(response.is_err());
+        assert_eq!(
+            response.as_ref().unwrap_err().status(),
+            StatusCode::NOT_FOUND
+        );
+        let body = axum::body::to_bytes(
+            if response.is_ok() {
+                response.unwrap().into_body()
+            } else {
+                response.unwrap_err().into_response().into_body()
+            },
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("No route matches /search"));
     }
 
@@ -726,10 +753,21 @@ mod tests {
         let uri = axum::http::Uri::from_static("/");
         let response = fallback_404_handler(axum::http::Method::GET, uri).await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        assert!(response.is_err());
+        assert_eq!(
+            response.as_ref().unwrap_err().status(),
+            StatusCode::NOT_FOUND
+        );
+        let body = axum::body::to_bytes(
+            if response.is_ok() {
+                response.unwrap().into_body()
+            } else {
+                response.unwrap_err().into_response().into_body()
+            },
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert!(String::from_utf8_lossy(&body).contains("No route matches /"));
     }
 
@@ -741,10 +779,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        assert_eq!(response.as_ref().unwrap().status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(
+            if response.is_ok() {
+                response.unwrap().into_body()
+            } else {
+                response.unwrap_err().into_response().into_body()
+            },
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert!(body.is_empty());
     }
 
@@ -756,10 +801,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        assert_eq!(response.as_ref().unwrap().status(), StatusCode::NO_CONTENT);
+        let body = axum::body::to_bytes(
+            if response.is_ok() {
+                response.unwrap().into_body()
+            } else {
+                response.unwrap_err().into_response().into_body()
+            },
+            usize::MAX,
+        )
+        .await
+        .unwrap();
         assert!(body.is_empty());
     }
 
@@ -771,6 +823,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.is_err());
+        assert_eq!(
+            response.as_ref().unwrap_err().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }
