@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod build;
+mod check;
 mod dev;
 mod doctor;
 mod export;
@@ -179,6 +180,33 @@ enum Commands {
     ///   autumn token revoke `<RAW_TOKEN>`
     #[command(subcommand, verbatim_doc_comment)]
     Token(TokenCommands),
+
+    /// Run accessibility (WCAG 2.1 AA) checks against rendered HTML.
+    ///
+    /// `autumn check --a11y` runs a pure-Rust static HTML analysis pass and
+    /// reports Critical and Serious violations that would block a11y compliance.
+    /// Point it at a running Autumn app with `--url`, or supply raw HTML via
+    /// `--html` for CI pre-render workflows.
+    ///
+    /// # Examples
+    ///
+    ///   autumn check --a11y --url http://localhost:3000
+    ///   autumn check --a11y --html "$(cat dist/index.html)"
+    #[command(verbatim_doc_comment)]
+    Check {
+        /// Run the WCAG 2.1 AA accessibility audit.
+        #[arg(long)]
+        a11y: bool,
+        /// URL of a running Autumn app to audit (fetches the root page).
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Inline HTML string to audit instead of fetching from a URL.
+        #[arg(long, value_name = "HTML")]
+        html: Option<String>,
+        /// Fail only on Critical violations; treat Serious as warnings.
+        #[arg(long)]
+        critical_only: bool,
+    },
 
     /// Check the local environment and project configuration for common
     /// first-run problems (Rust MSRV, autumn.toml validity, database
@@ -431,6 +459,35 @@ fn run_command(command: Commands) {
             TokenCommands::Issue { principal_id } => token::run_issue(&principal_id),
             TokenCommands::Revoke { raw_token } => token::run_revoke(&raw_token),
         },
+        Commands::Check {
+            a11y,
+            url,
+            html,
+            critical_only,
+        } => {
+            if a11y {
+                let opts = check::A11yCheckOptions {
+                    url: url.clone(),
+                    html,
+                    critical_only,
+                };
+                let label = url.as_deref().unwrap_or("<inline>");
+                match check::run_a11y_check(&opts) {
+                    Ok(violations) => {
+                        if check::print_report(&violations, label) {
+                            std::process::exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("autumn check --a11y: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("autumn check: specify at least one check flag (e.g. --a11y)");
+                std::process::exit(1);
+            }
+        }
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }

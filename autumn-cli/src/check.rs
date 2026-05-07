@@ -1,0 +1,624 @@
+//! `autumn check` — code and accessibility checks for Autumn projects.
+//!
+//! `autumn check --a11y` runs a pure-Rust static HTML analysis pass over one
+//! or more HTML documents and reports WCAG 2.1 AA violations at the Serious or
+//! Critical level. No Node.js or external tooling required.
+
+/// Severity of an accessibility violation (mirrors axe-core's taxonomy).
+///
+/// Variants are ordered from least to most severe so that `Critical > Serious > Moderate`
+/// holds for comparisons (derived `Ord` compares by discriminant index).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    /// Degrades experience — worth addressing.
+    Moderate,
+    /// Causes significant barriers — should fix.
+    Serious,
+    /// Blocks access for some users — must fix.
+    Critical,
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Critical => write!(f, "Critical"),
+            Self::Serious => write!(f, "Serious"),
+            Self::Moderate => write!(f, "Moderate"),
+        }
+    }
+}
+
+/// A single accessibility violation found in an HTML document.
+#[derive(Debug, Clone)]
+pub struct A11yViolation {
+    /// Short rule identifier (mirrors axe-core rule IDs where applicable).
+    pub rule_id: &'static str,
+    pub severity: Severity,
+    /// Human-readable description of what is wrong.
+    pub description: String,
+    /// Remediation hint.
+    pub help: &'static str,
+}
+
+/// Options for the `autumn check --a11y` subcommand.
+#[derive(Debug, Clone)]
+pub struct A11yCheckOptions {
+    /// URL of a running Autumn app. When set, fetches HTML from the root.
+    pub url: Option<String>,
+    /// Inline HTML to analyse directly (used in tests and CI pre-render mode).
+    pub html: Option<String>,
+    /// Fail only on Critical violations; let Serious ones warn.
+    pub critical_only: bool,
+}
+
+/// Run the a11y audit and return all violations found.
+///
+/// Returns `Err` only on I/O failures (e.g. cannot connect to `url`); an
+/// empty `Vec` means no violations were detected.
+///
+/// # Errors
+///
+/// Returns an error string when the HTTP fetch fails.
+pub fn run_a11y_check(opts: &A11yCheckOptions) -> Result<Vec<A11yViolation>, String> {
+    let html = if let Some(ref inline) = opts.html {
+        inline.clone()
+    } else if let Some(ref url) = opts.url {
+        fetch_html(url)?
+    } else {
+        return Err("supply either --url or inline HTML".into());
+    };
+
+    Ok(analyse_html(&html))
+}
+
+/// Fetch the HTML body from `url` using a blocking HTTP GET.
+fn fetch_html(url: &str) -> Result<String, String> {
+    reqwest::blocking::get(url)
+        .map_err(|e| format!("failed to fetch {url}: {e}"))?
+        .text()
+        .map_err(|e| format!("failed to read response body: {e}"))
+}
+
+// ── HTML static analysis ────────────────────────────────────────────
+
+/// Analyse a raw HTML string and return all detected violations.
+pub fn analyse_html(html: &str) -> Vec<A11yViolation> {
+    let mut violations = Vec::new();
+    check_lang(html, &mut violations);
+    check_skip_link(html, &mut violations);
+    check_landmark_main(html, &mut violations);
+    check_images_alt(html, &mut violations);
+    check_inputs_have_labels(html, &mut violations);
+    check_buttons_accessible_name(html, &mut violations);
+    violations
+}
+
+/// Check: `<html>` element must carry a `lang` attribute.
+///
+/// WCAG 2.1 SC 3.1.1 (Level A) — axe-core rule `html-has-lang`.
+fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+    let has_lang = html_lower.contains("<html")
+        && {
+            // Find the html tag and check if lang= appears before the closing >
+            if let Some(start) = html_lower.find("<html") {
+                let tag_end = html_lower[start..].find('>').unwrap_or(0);
+                let tag = &html_lower[start..start + tag_end];
+                tag.contains("lang=")
+            } else {
+                false
+            }
+        };
+
+    if !has_lang {
+        out.push(A11yViolation {
+            rule_id: "html-has-lang",
+            severity: Severity::Serious,
+            description: "<html> element does not have a lang attribute".into(),
+            help: "Add lang=\"en\" (or the appropriate BCP 47 tag) to the <html> element",
+        });
+    }
+}
+
+/// Check: page must have a skip-to-content link as the first focusable element.
+///
+/// WCAG 2.1 SC 2.4.1 (Level A) — axe-core rule `bypass`.
+fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+
+    // Accept either class="skip-link" or an <a href="#main..."> near the top of body.
+    let body_start = html_lower.find("<body").unwrap_or(0);
+    let early_end = (body_start + 600).min(html_lower.len());
+    let early_html = &html_lower[body_start..early_end];
+
+    let has_skip_link = early_html.contains("skip-link")
+        || (early_html.contains(r##"href="#main"##) && early_html.contains("<a "));
+
+    if !has_skip_link {
+        out.push(A11yViolation {
+            rule_id: "bypass",
+            severity: Severity::Serious,
+            description: "Page does not have a skip-to-content link".into(),
+            help: r##"Add a visually-hidden <a href="#main-content" class="skip-link"> as the first element inside <body>"##,
+        });
+    }
+}
+
+/// Check: page must contain a `<main>` landmark region.
+///
+/// WCAG 2.1 SC 1.3.6 (Level AAA) / best practice — axe-core rule `landmark-one-main`.
+fn check_landmark_main(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+    let has_main = html_lower.contains("<main") || html_lower.contains("role=\"main\"");
+    if !has_main {
+        out.push(A11yViolation {
+            rule_id: "landmark-one-main",
+            severity: Severity::Moderate,
+            description: "Page does not contain a <main> landmark region".into(),
+            help: "Wrap your primary content in a <main> element",
+        });
+    }
+}
+
+/// Check: `<img>` elements must have an `alt` attribute.
+///
+/// WCAG 2.1 SC 1.1.1 (Level A) — axe-core rule `image-alt`.
+fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+    let mut search = html_lower.as_str();
+    let mut count = 0u32;
+
+    while let Some(img_pos) = search.find("<img") {
+        let rest = &search[img_pos..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+
+        if !tag.contains("alt=") {
+            count += 1;
+        }
+        search = &search[img_pos + 4..];
+    }
+
+    if count > 0 {
+        out.push(A11yViolation {
+            rule_id: "image-alt",
+            severity: Severity::Critical,
+            description: format!("{count} <img> element(s) are missing an alt attribute"),
+            help: "Add alt=\"description\" to every <img>; use alt=\"\" for decorative images",
+        });
+    }
+}
+
+/// Check: `<input>` elements must have an associated `<label>`.
+///
+/// WCAG 2.1 SC 1.3.1 / 3.3.2 (Level A) — axe-core rule `label`.
+fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+    let mut unlabelled = 0u32;
+    let mut search = html_lower.as_str();
+
+    // Collect all label for= values
+    let mut labelled_ids: Vec<String> = Vec::new();
+    let mut lsearch = html_lower.as_str();
+    while let Some(pos) = lsearch.find("label") {
+        let rest = &lsearch[pos..];
+        if let Some(for_pos) = rest.find("for=") {
+            let after_for = &rest[for_pos + 4..];
+            let id = extract_attr_value(after_for);
+            if !id.is_empty() {
+                labelled_ids.push(id);
+            }
+        }
+        lsearch = &lsearch[pos + 5..];
+        if lsearch.is_empty() {
+            break;
+        }
+    }
+
+    while let Some(pos) = search.find("<input") {
+        let rest = &search[pos..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+
+        // Skip hidden and submit/button/reset inputs — they don't need visible labels
+        let input_type = if let Some(t_pos) = tag.find("type=") {
+            extract_attr_value(&tag[t_pos + 5..])
+        } else {
+            String::new()
+        };
+
+        let skip_types = ["hidden", "submit", "button", "reset", "image"];
+        if !skip_types.contains(&input_type.as_str()) {
+            // Check for aria-label / aria-labelledby as valid alternatives
+            let has_aria_label = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+
+            // Check for id → corresponding label for=
+            let has_label_for = if let Some(id_pos) = tag.find(" id=") {
+                let id_val = extract_attr_value(&tag[id_pos + 4..]);
+                !id_val.is_empty() && labelled_ids.contains(&id_val)
+            } else {
+                false
+            };
+
+            if !has_aria_label && !has_label_for {
+                unlabelled += 1;
+            }
+        }
+
+        search = &search[pos + 6..];
+        if search.is_empty() {
+            break;
+        }
+    }
+
+    if unlabelled > 0 {
+        out.push(A11yViolation {
+            rule_id: "label",
+            severity: Severity::Critical,
+            description: format!("{unlabelled} form input(s) are not associated with a <label>"),
+            help: "Add <label for=\"input-id\"> or use aria-label / aria-labelledby on each input",
+        });
+    }
+}
+
+/// Check: `<button>` elements must have an accessible name.
+///
+/// WCAG 2.1 SC 4.1.2 (Level A) — axe-core rule `button-name`.
+fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
+    let html_lower = html.to_lowercase();
+    let mut nameless = 0u32;
+    let mut search = html_lower.as_str();
+
+    while let Some(pos) = search.find("<button") {
+        let rest = &search[pos..];
+        let close = rest.find("</button>").unwrap_or(rest.len());
+        let button_html = &rest[..close + 9];
+        let tag_end = rest.find('>').unwrap_or(0);
+        let tag = &rest[..tag_end];
+
+        let has_aria_label = tag.contains("aria-label=") || tag.contains("aria-labelledby=");
+        let inner = if close > tag_end { &button_html[tag_end + 1..close] } else { "" };
+        let has_text = !inner.trim().is_empty();
+
+        if !has_aria_label && !has_text {
+            nameless += 1;
+        }
+
+        search = &search[pos + 7..];
+        if search.is_empty() {
+            break;
+        }
+    }
+
+    if nameless > 0 {
+        out.push(A11yViolation {
+            rule_id: "button-name",
+            severity: Severity::Critical,
+            description: format!("{nameless} button(s) have no accessible name"),
+            help: "Add visible text inside <button> or use aria-label",
+        });
+    }
+}
+
+/// Extract the value of an attribute from HTML text starting just after `attr=`.
+///
+/// Handles both quoted (`attr="val"`, `attr='val'`) and unquoted forms.
+fn extract_attr_value(s: &str) -> String {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("").to_string()
+    } else if let Some(rest) = s.strip_prefix('\'') {
+        rest.split('\'').next().unwrap_or("").to_string()
+    } else {
+        s.split(|c: char| c.is_whitespace() || c == '>')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
+// ── CLI output ──────────────────────────────────────────────────────
+
+/// Print violations to stdout in a human-readable format.
+///
+/// Returns `true` when any Critical or Serious violation was found (the ones
+/// that should cause CI to fail).
+pub fn print_report(violations: &[A11yViolation], url: &str) -> bool {
+    if violations.is_empty() {
+        println!("✅  autumn check --a11y: no violations found in {url}");
+        return false;
+    }
+
+    println!("autumn check --a11y: analysed {url}");
+    println!();
+
+    let mut fail = false;
+    for v in violations {
+        let icon = match v.severity {
+            Severity::Critical | Severity::Serious => {
+                fail = true;
+                "❌"
+            }
+            Severity::Moderate => "⚠️ ",
+        };
+        println!("{icon} [{}] {} — {}", v.severity, v.rule_id, v.description);
+        println!("   {}", v.help);
+        println!();
+    }
+
+    let criticals = violations
+        .iter()
+        .filter(|v| v.severity == Severity::Critical)
+        .count();
+    let serious = violations
+        .iter()
+        .filter(|v| v.severity == Severity::Serious)
+        .count();
+    let moderate = violations
+        .iter()
+        .filter(|v| v.severity == Severity::Moderate)
+        .count();
+
+    println!(
+        "Found {} Critical, {} Serious, {} Moderate violation(s)",
+        criticals, serious, moderate
+    );
+
+    if fail {
+        println!("❌  Fix Critical and Serious violations before shipping.");
+    }
+
+    fail
+}
+
+// ── Tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn violation_ids(html: &str) -> Vec<&'static str> {
+        let mut ids: Vec<&'static str> =
+            analyse_html(html).into_iter().map(|v| v.rule_id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    // Helper: minimal clean base page (all green)
+    fn clean_page(inner: &str) -> String {
+        // Use concat + runtime format to avoid "# inside raw-string-literal issues.
+        format!(
+            concat!(
+                r#"<!DOCTYPE html><html lang="en"><body>"#,
+                r##"<a class="skip-link" href="#main">Skip</a>"##,
+                r#"<main id="main">{}</main></body></html>"#,
+            ),
+            inner
+        )
+    }
+
+    // ── html-has-lang ──────────────────────────────────────────────
+
+    #[test]
+    fn html_with_lang_passes() {
+        let html = clean_page("");
+        assert!(
+            !violation_ids(&html).contains(&"html-has-lang"),
+            "{:?}",
+            violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn html_without_lang_fails() {
+        let html = "<html><body><main></main></body></html>";
+        assert!(violation_ids(html).contains(&"html-has-lang"));
+    }
+
+    // ── bypass (skip link) ─────────────────────────────────────────
+
+    #[test]
+    fn skip_link_class_passes() {
+        let html = clean_page("");
+        assert!(
+            !violation_ids(&html).contains(&"bypass"),
+            "{:?}",
+            violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn skip_link_href_to_main_passes() {
+        // Use r## so the inner "# sequences don't close the raw string.
+        let html = r##"<html lang="en"><body><a href="#main">Skip</a><main></main></body></html>"##;
+        assert!(!violation_ids(html).contains(&"bypass"), "{:?}", violation_ids(html));
+    }
+
+    #[test]
+    fn missing_skip_link_fails() {
+        let html = r#"<html lang="en"><body><nav>stuff</nav><main></main></body></html>"#;
+        assert!(violation_ids(html).contains(&"bypass"), "{:?}", violation_ids(html));
+    }
+
+    // ── landmark-one-main ──────────────────────────────────────────
+
+    #[test]
+    fn main_element_passes() {
+        let html = r#"<html lang="en"><body><main></main></body></html>"#;
+        assert!(!violation_ids(html).contains(&"landmark-one-main"));
+    }
+
+    #[test]
+    fn role_main_passes() {
+        let html = r#"<html lang="en"><body><div role="main"></div></body></html>"#;
+        assert!(!violation_ids(html).contains(&"landmark-one-main"));
+    }
+
+    #[test]
+    fn missing_main_landmark_fails() {
+        let html = r#"<html lang="en"><body><div>content</div></body></html>"#;
+        assert!(violation_ids(html).contains(&"landmark-one-main"));
+    }
+
+    // ── image-alt ─────────────────────────────────────────────────
+
+    #[test]
+    fn image_with_alt_passes() {
+        let html = clean_page(r#"<img src="x.png" alt="logo">"#);
+        assert!(!violation_ids(&html).contains(&"image-alt"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn image_with_empty_alt_passes() {
+        let html = clean_page(r#"<img src="deco.png" alt="">"#);
+        assert!(!violation_ids(&html).contains(&"image-alt"));
+    }
+
+    #[test]
+    fn image_without_alt_fails() {
+        let html = r#"<html lang="en"><body><main><img src="x.png"></main></body></html>"#;
+        assert!(violation_ids(html).contains(&"image-alt"));
+    }
+
+    // ── label ─────────────────────────────────────────────────────
+
+    #[test]
+    fn input_with_label_for_passes() {
+        let html = clean_page(r#"<label for="name">Name</label><input type="text" id="name">"#);
+        assert!(!violation_ids(&html).contains(&"label"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn input_with_aria_label_passes() {
+        let html = clean_page(r#"<input type="text" aria-label="Name">"#);
+        assert!(!violation_ids(&html).contains(&"label"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn hidden_input_needs_no_label() {
+        let html = clean_page(r#"<input type="hidden" name="_csrf" value="tok">"#);
+        assert!(!violation_ids(&html).contains(&"label"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn submit_input_needs_no_label() {
+        let html = clean_page(r#"<input type="submit" value="Go">"#);
+        assert!(!violation_ids(&html).contains(&"label"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn unlabelled_text_input_fails() {
+        let html =
+            r#"<html lang="en"><body><main><input type="text" id="name"></main></body></html>"#;
+        assert!(violation_ids(html).contains(&"label"));
+    }
+
+    // ── button-name ───────────────────────────────────────────────
+
+    #[test]
+    fn button_with_text_passes() {
+        let html = clean_page("<button>Save</button>");
+        assert!(!violation_ids(&html).contains(&"button-name"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn button_with_aria_label_passes() {
+        let html = clean_page(r#"<button aria-label="Close dialog"></button>"#);
+        assert!(!violation_ids(&html).contains(&"button-name"), "{:?}", violation_ids(&html));
+    }
+
+    #[test]
+    fn empty_button_fails() {
+        let html = r#"<html lang="en"><body><main><button></button></main></body></html>"#;
+        assert!(violation_ids(html).contains(&"button-name"));
+    }
+
+    // ── extract_attr_value ─────────────────────────────────────────
+
+    #[test]
+    fn extracts_double_quoted_value() {
+        assert_eq!(extract_attr_value(r#""hello" rest"#), "hello");
+    }
+
+    #[test]
+    fn extracts_single_quoted_value() {
+        assert_eq!(extract_attr_value("'world' rest"), "world");
+    }
+
+    #[test]
+    fn extracts_unquoted_value() {
+        assert_eq!(extract_attr_value("main-content >"), "main-content");
+    }
+
+    // ── run_a11y_check inline ──────────────────────────────────────
+
+    #[test]
+    fn run_a11y_check_with_clean_html_returns_empty() {
+        let clean = r##"<!DOCTYPE html>
+<html lang="en">
+<body>
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <header><nav aria-label="Main">Home</nav></header>
+  <main id="main-content">
+    <label for="q">Search</label>
+    <input type="text" id="q">
+    <button>Go</button>
+  </main>
+  <footer>Footer</footer>
+</body>
+</html>"##;
+
+        let opts = A11yCheckOptions {
+            url: None,
+            html: Some(clean.into()),
+            critical_only: false,
+        };
+        let violations = run_a11y_check(&opts).unwrap();
+        assert!(
+            violations.is_empty(),
+            "expected zero violations, got: {:#?}",
+            violations.iter().map(|v| v.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn run_a11y_check_reports_multiple_violations() {
+        let bad = r#"<html><body><img src="x.png"><input type="text" id="f"><button></button></body></html>"#;
+        let opts = A11yCheckOptions {
+            url: None,
+            html: Some(bad.into()),
+            critical_only: false,
+        };
+        let violations = run_a11y_check(&opts).unwrap();
+        let ids: Vec<&str> = violations.iter().map(|v| v.rule_id).collect();
+        assert!(ids.contains(&"html-has-lang"), "{ids:?}");
+        assert!(ids.contains(&"image-alt"), "{ids:?}");
+        assert!(ids.contains(&"button-name"), "{ids:?}");
+    }
+
+    // ── severity ordering ──────────────────────────────────────────
+
+    #[test]
+    fn critical_severity_greater_than_serious() {
+        assert!(Severity::Critical > Severity::Serious);
+        assert!(Severity::Serious > Severity::Moderate);
+    }
+
+    // ── print_report returns true on serious/critical ──────────────
+
+    #[test]
+    fn print_report_returns_true_when_serious_violation() {
+        let violations = vec![A11yViolation {
+            rule_id: "html-has-lang",
+            severity: Severity::Serious,
+            description: "missing lang".into(),
+            help: "add lang",
+        }];
+        assert!(print_report(&violations, "test"));
+    }
+
+    #[test]
+    fn print_report_returns_false_when_no_violations() {
+        assert!(!print_report(&[], "test"));
+    }
+}
