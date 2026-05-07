@@ -11,6 +11,52 @@
 //!
 //! 1. **Build phase:** `autumn build` discovers your `#[static_get]` routes and runs them, saving the HTML to `dist/`.
 //! 2. **Runtime phase:** The `StaticFileLayer` intercepts requests. If a pre-rendered file exists, it serves it directly!
+//!
+//! ## Build-time-only vs runtime ISR: choosing the right model
+//!
+//! ### Build-time-only (`revalidate = None`)
+//!
+//! Pages are rendered once during `autumn build` and served read-only at
+//! runtime. `dist/` can be baked into a container image or uploaded to a
+//! CDN -- no process needs write access at runtime.
+//!
+//! **When to use:** marketing pages, blog posts, documentation -- any page
+//! where staleness of a full redeploy cycle is acceptable.
+//!
+//! ### Runtime ISR (`#[static_get(..., revalidate = N)]`)
+//!
+//! Pages are pre-rendered at build time **and** refreshed in the background
+//! when they become stale (stale-while-revalidate). The serving process
+//! needs write access to `dist/` at runtime.
+//!
+//! **When to use:** product listings, leaderboards, dashboards -- pages
+//! that should stay fresh without a full redeploy but don't need to be
+//! up-to-the-second accurate.
+//!
+//! #### Multi-replica ISR
+//!
+//! In single-replica / development deployments the default
+//! [`isr_coordinator::LocalIsrCoordinator`] is sufficient: an `AtomicBool`
+//! per route prevents duplicate background tasks within the same process.
+//!
+//! In **multi-replica** deployments sharing a writable `dist/` volume or
+//! object-backed storage, each replica independently detects staleness and
+//! can race to regenerate the same page. Supply a
+//! [`isr_coordinator::PostgresIsrCoordinator`] (feature `db`) via
+//! [`StaticFileLayer::with_isr_coordinator`] so that only one replica wins
+//! the lock per revalidation window:
+//!
+//! ```rust,ignore
+//! use std::sync::Arc;
+//! use autumn_web::static_gen::{StaticFileLayer, PostgresIsrCoordinator};
+//!
+//! let layer = StaticFileLayer::new("dist")
+//!     .unwrap()
+//!     .with_router(app_router.clone())
+//!     .with_isr_coordinator(Arc::new(PostgresIsrCoordinator::new(db_pool)));
+//! ```
+//!
+//! See [`isr_coordinator`] for the full deployment contract table.
 
 pub(crate) mod build;
 pub mod isr_coordinator;
