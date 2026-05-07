@@ -357,13 +357,20 @@ fn generate_scaffold_full_e2e_post() {
         "routes::posts::update",
         "repositories::post::post_api_list",
         "repositories::post::post_api_get",
+    ] {
+        assert!(
+            main.contains(entry),
+            "main.rs missing routes![] entry: {entry}\n{main}"
+        );
+    }
+    for entry in [
         "repositories::post::post_api_create",
         "repositories::post::post_api_update",
         "repositories::post::post_api_delete",
     ] {
         assert!(
-            main.contains(entry),
-            "main.rs missing routes![] entry: {entry}\n{main}"
+            !main.contains(entry),
+            "main.rs should not mount public scaffold write API route: {entry}\n{main}"
         );
     }
 }

@@ -31,7 +31,7 @@ autumn dev
 
 Visit <http://localhost:3000/posts> to see the generated index page.
 The JSON endpoint at <http://localhost:3000/api/posts> returns `[]` until
-you create one, and `POST /api/posts` with a JSON body inserts a row.
+rows exist; mount mutating API handlers only after adding a repository policy.
 
 ## The field-type DSL
 
@@ -164,18 +164,19 @@ it with `autumn task cleanup_users --dry-run`.
 Everything `model` produces, plus:
 
 - `src/repositories/<snake>.rs` — a `#[repository(Model, api = "/api/<plural>")]`
-  block that auto-generates 7 CRUD methods plus a 5-handler JSON REST API.
+  block that auto-generates CRUD methods plus JSON REST handlers.
 - `src/repositories/mod.rs` — module aggregator.
 - `src/routes/<plural>.rs` — Maud HTML handlers for `index`, `show`, `new_form`,
-  `create`, `edit_form`, and `update`. Delete goes through the JSON REST API
-  the repository already provides.
+  `create`, `edit_form`, and `update`.
 - `src/routes/mod.rs` — module aggregator.
 - `tests/<snake>.rs` — a smoke test that hits `GET /<plural>` against
   a running server and asserts a 2xx response (skipped unless
   `AUTUMN_TEST_BASE_URL` is set).
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
-  with the same arguments is a no-op.
+  with the same arguments is a no-op. The scaffold registers only read-only
+  API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`) by default;
+  mount `POST`/`PUT`/`DELETE` handlers only after adding a repository policy.
 
 | Generated file                        | Existing concept it maps to                                                                |
 | ------------------------------------- | ------------------------------------------------------------------------------------------ |
