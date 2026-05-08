@@ -501,7 +501,7 @@ pub async fn forgot_password(
             .execute(&mut *db)
             .await?;
 
-        send_reset_email(&mailer, &{snake_name}.email, &raw_token)?;
+        send_reset_email(&mailer, &{snake_name}.email, &raw_token).await?;
     }}
 
     Ok(layout("Check Your Email", html! {{
@@ -614,9 +614,17 @@ fn sha256_hex(input: &str) -> String {{
 /// Send a password-reset email via the Autumn mailer.
 ///
 /// # Errors
-/// Returns a clear `AutumnError::internal` message naming the missing mail
-/// configuration and the password-reset feature affected.
-fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResult<()> {{
+/// Returns a clear `AutumnError::internal` message when mail is not configured
+/// (`transport = "disabled"`) or when the send itself fails.
+async fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResult<()> {{
+    if mailer.is_disabled() {{
+        return Err(AutumnError::internal_msg(
+            "Password reset requires mail to be configured. \
+             Set [mail] transport in autumn.toml (e.g. transport = \"smtp\"). \
+             The forgot-password feature is unavailable until mail is set up."
+                .to_owned(),
+        ));
+    }}
     let reset_url = format!("/reset-password?token={{token}}");
     let mail = Mail::builder()
         .to(to.to_owned())
@@ -638,12 +646,9 @@ fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResult<()> 
                 "Failed to build password-reset email: {{e}}"
             ))
         }})?;
-    mailer.send_now(mail).map_err(|e| {{
+    mailer.send(mail).await.map_err(|e| {{
         AutumnError::internal_msg(format!(
-            "Password reset requires mail to be configured \
-             ([mail] transport in autumn.toml). \
-             The password-reset feature is unavailable until mail is set up. \
-             Error: {{e}}"
+            "Failed to send password-reset email: {{e}}"
         ))
     }})
 }}
@@ -1133,6 +1138,22 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let mod_rs = fs::read_to_string(tmp.path().join("src/routes/mod.rs")).unwrap();
         assert!(mod_rs.contains("pub mod auth;"), "missing pub mod auth: {mod_rs}");
+    }
+
+    #[test]
+    fn routes_file_forgot_password_checks_mailer_is_disabled() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        assert!(
+            routes.contains("mailer.is_disabled()"),
+            "forgot_password must guard against disabled mail transport: {routes}"
+        );
+        assert!(
+            routes.contains("mailer.send(mail).await"),
+            "forgot_password must use async mailer.send(): {routes}"
+        );
     }
 
     // ── Generated tests ─────────────────────────────────────────────────────
