@@ -503,7 +503,7 @@ pub async fn login(
     let email = form.email.trim().to_lowercase();
     let auth_err = || AutumnError::unprocessable_msg("Invalid email or password.");
 
-    let maybe_{snake_name}: Option<{pascal_name}> = {table}::table
+    let found_{snake_name}: Option<{pascal_name}> = {table}::table
         .filter({table}::email.eq(&email))
         .select({pascal_name}::as_select())
         .first(&mut *db)
@@ -514,7 +514,7 @@ pub async fn login(
     // response latency is indistinguishable from a wrong-password attempt
     // on a real account.
     const DUMMY_HASH: &str = "$2b$12$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let password_hash = maybe_{snake_name}
+    let password_hash = found_{snake_name}
         .as_ref()
         .map(|u| u.password_digest.as_str())
         .unwrap_or(DUMMY_HASH);
@@ -522,7 +522,7 @@ pub async fn login(
     if !password_ok {{
         return Err(auth_err());
     }}
-    let {snake_name} = maybe_{snake_name}.ok_or_else(auth_err)?;
+    let {snake_name} = found_{snake_name}.ok_or_else(auth_err)?;
 
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
