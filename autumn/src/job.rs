@@ -485,6 +485,25 @@ impl JobAdminMemoryBackend {
         Ok(retry)
     }
 
+    fn ensure_retryable(&self, id: &str) -> AutumnResult<()> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| AutumnError::internal_server_error_msg("job admin store lock poisoned"))?;
+        let record = inner
+            .records
+            .get(id)
+            .ok_or_else(|| AutumnError::not_found_msg(format!("job '{id}' not found")))?;
+        let status = record.status;
+        drop(inner);
+        if status != JobAdminStatus::Failed {
+            return Err(AutumnError::bad_request_msg(
+                "only failed jobs can be retried",
+            ));
+        }
+        Ok(())
+    }
+
     fn discard_failed(&self, id: &str) -> AutumnResult<()> {
         let mut inner = self
             .inner
@@ -613,6 +632,7 @@ impl JobAdminBackend for JobAdminMemoryBackend {
     fn retry(&self, id: &str) -> JobAdminFuture<'_, ()> {
         let id = id.to_owned();
         Box::pin(async move {
+            self.ensure_retryable(&id)?;
             let client = global_job_client().ok_or_else(|| {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
@@ -1938,15 +1958,17 @@ fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
 }
 
 #[cfg(feature = "redis")]
-async fn apply_claimed_redis_transition(
-    connection: &mut redis::aio::ConnectionManager,
-    worker_config: &RedisWorkerConfig,
-    expected: &RedisJobRecord,
-    mode: &str,
-    encoded_record: Option<String>,
-    due_at_ms: Option<u64>,
-) -> Result<bool, redis::RedisError> {
-    const TRANSITION_SCRIPT: &str = r"
+const CLAIMED_REDIS_TRANSITION_SCRIPT: &str = r"
+local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+  for _, encoded in ipairs(trimmed_records) do
+    local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
+    if trimmed_ok and trimmed['id'] then
+      redis.call('DEL', dead_record_prefix .. trimmed['id'])
+    end
+  end
+  redis.call('LTRIM', dead_key, 0, limit - 1)
+end
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
@@ -1973,7 +1995,7 @@ elseif ARGV[4] == 'retry' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
-  redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[7]) - 1)
+  trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))
   redis.call('DEL', key)
 else
   return 0
@@ -1981,12 +2003,21 @@ end
 return 1
 ";
 
+#[cfg(feature = "redis")]
+async fn apply_claimed_redis_transition(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    expected: &RedisJobRecord,
+    mode: &str,
+    encoded_record: Option<String>,
+    due_at_ms: Option<u64>,
+) -> Result<bool, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
         return Ok(false);
     };
 
     let applied: usize = redis::cmd("EVAL")
-        .arg(TRANSITION_SCRIPT)
+        .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
         .arg(6)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
@@ -2077,13 +2108,17 @@ async fn dead_letter_redis_job(
 }
 
 #[cfg(feature = "redis")]
-async fn apply_stale_redis_recovery(
-    connection: &mut redis::aio::ConnectionManager,
-    worker_config: &RedisWorkerConfig,
-    expected: &RedisJobRecord,
-    action: &RedisStaleRecovery,
-) -> Result<bool, redis::RedisError> {
-    const STALE_SCRIPT: &str = r"
+const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
+local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+  for _, encoded in ipairs(trimmed_records) do
+    local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
+    if trimmed_ok and trimmed['id'] then
+      redis.call('DEL', dead_record_prefix .. trimmed['id'])
+    end
+  end
+  redis.call('LTRIM', dead_key, 0, limit - 1)
+end
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
@@ -2108,7 +2143,7 @@ if ARGV[4] == 'requeue' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
-  redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[6]) - 1)
+  trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
   redis.call('DEL', key)
 else
   return 0
@@ -2116,6 +2151,13 @@ end
 return 1
 ";
 
+#[cfg(feature = "redis")]
+async fn apply_stale_redis_recovery(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    expected: &RedisJobRecord,
+    action: &RedisStaleRecovery,
+) -> Result<bool, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
         return Ok(false);
     };
@@ -2129,7 +2171,7 @@ return 1
     };
 
     let applied: usize = redis::cmd("EVAL")
-        .arg(STALE_SCRIPT)
+        .arg(STALE_REDIS_RECOVERY_SCRIPT)
         .arg(5)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
@@ -3346,6 +3388,35 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("visibility timeout expired")),
             "dead-lettered stale claims should retain the recovery reason"
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_scripts_delete_trimmed_dead_record_metadata() {
+        assert!(
+            CLAIMED_REDIS_TRANSITION_SCRIPT
+                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))"),
+            "claimed-job dead-letter trim should delete metadata for records beyond the history limit"
+        );
+        assert!(
+            STALE_REDIS_RECOVERY_SCRIPT
+                .contains("trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))"),
+            "stale-recovery dead-letter trim should delete metadata for records beyond the history limit"
+        );
+        assert!(
+            CLAIMED_REDIS_TRANSITION_SCRIPT
+                .matches("redis.call('DEL', dead_record_prefix .. trimmed['id'])")
+                .count()
+                >= 1,
+            "claimed-job dead-letter script should remove trimmed per-id metadata"
+        );
+        assert!(
+            STALE_REDIS_RECOVERY_SCRIPT
+                .matches("redis.call('DEL', dead_record_prefix .. trimmed['id'])")
+                .count()
+                >= 1,
+            "stale-recovery dead-letter script should remove trimmed per-id metadata"
         );
     }
 
