@@ -345,7 +345,28 @@ pub fn check_route_prefix(
     }
 }
 
+/// Canonicalize dynamic route segments so that `{user_id}` and `{id}` both
+/// become `{}`, and `{*rest}` becomes `{*}`. Axum matches routes by shape, not
+/// parameter name, so collision detection must do the same.
+fn normalize_path_for_collision(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with('{') && seg.ends_with('}') {
+                if seg.starts_with("{*") { "{*}" } else { "{}" }
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
+///
+/// Dynamic segment names are normalized before comparison so that
+/// `GET /users/{user_id}` and `GET /users/{id}` are correctly detected as
+/// colliding. The `path` field in each `CollisionDiagnostic` reflects the
+/// normalized shape (e.g. `/users/{}`).
 ///
 /// Returns both a `CheckResult` and the full list of `CollisionDiagnostic` values
 /// so callers can serialize detailed collision info in JSON output.
@@ -355,7 +376,10 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
     let mut by_key: HashMap<(String, String), Vec<&RouteInfo>> = HashMap::new();
     for route in routes {
         by_key
-            .entry((route.method.clone(), route.path.clone()))
+            .entry((
+                route.method.clone(),
+                normalize_path_for_collision(&route.path),
+            ))
             .or_default()
             .push(route);
     }
@@ -787,12 +811,14 @@ mod tests {
             make_route("DELETE", "/items/{id}", plugin("inventory")),
         ];
         let (result, _) = check_collisions(&routes);
+        // Path is shown in normalized form ({id} → {}) so the reader
+        // sees the structural shape that Axum matches on.
         assert!(
             result
                 .diagnostics
                 .iter()
-                .any(|d| d.contains("DELETE") && d.contains("/items/{id}")),
-            "diagnostic should mention method and path: {:?}",
+                .any(|d| d.contains("DELETE") && d.contains("/items/{}")),
+            "diagnostic should mention method and normalized path: {:?}",
             result.diagnostics
         );
     }
@@ -805,6 +831,67 @@ mod tests {
         ];
         let (result, _) = check_collisions(&routes);
         assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn collisions_dynamic_segment_different_names_detected() {
+        let routes = vec![
+            make_route("GET", "/users/{user_id}", RouteSource::User),
+            make_route("GET", "/users/{id}", plugin("auth")),
+        ];
+        let (result, diagnostics) = check_collisions(&routes);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "different param names should collide: {}",
+            result.message
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].path, "/users/{}");
+    }
+
+    #[test]
+    fn collisions_catchall_different_names_detected() {
+        let routes = vec![
+            make_route("GET", "/files/{*path}", RouteSource::User),
+            make_route("GET", "/files/{*rest}", plugin("storage")),
+        ];
+        let (result, diagnostics) = check_collisions(&routes);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "different catch-all names should collide"
+        );
+        assert_eq!(diagnostics[0].path, "/files/{*}");
+    }
+
+    #[test]
+    fn collisions_catchall_vs_param_not_collapsed() {
+        // {*rest} matches multiple segments; {id} matches one — different shapes.
+        let routes = vec![
+            make_route("GET", "/files/{id}", RouteSource::User),
+            make_route("GET", "/files/{*rest}", plugin("storage")),
+        ];
+        let (result, _) = check_collisions(&routes);
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "catch-all and single-segment params are different shapes"
+        );
+    }
+
+    #[test]
+    fn normalize_path_for_collision_replaces_param_names() {
+        assert_eq!(
+            normalize_path_for_collision("/users/{user_id}/posts/{post_id}"),
+            "/users/{}/posts/{}"
+        );
+        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{*}");
+        assert_eq!(
+            normalize_path_for_collision("/static/app.js"),
+            "/static/app.js"
+        );
+        assert_eq!(normalize_path_for_collision("/"), "/");
     }
 
     // ── check_sensitive_surfaces ───────────────────────────────────────────
