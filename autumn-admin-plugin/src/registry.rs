@@ -8,6 +8,8 @@ use std::collections::btree_map::{BTreeMap, Entry};
 
 use crate::traits::AdminModel;
 
+const RESERVED_MODEL_SLUGS: &[&str] = &["jobs"];
+
 /// Holds all registered admin models, keyed by their URL slug.
 ///
 /// Stored as an `Arc<AdminRegistry>` in `AppState` extensions so route
@@ -29,6 +31,10 @@ impl AdminRegistry {
     /// at startup rather than silently shadowing).
     pub(crate) fn register<M: AdminModel>(&mut self, model: M) {
         let slug = model.slug();
+        assert!(
+            !RESERVED_MODEL_SLUGS.contains(&slug),
+            "autumn-admin: reserved model slug '{slug}' conflicts with built-in admin routes",
+        );
         let name = model.display_name();
         match self.models.entry(slug) {
             Entry::Occupied(_) => panic!(
@@ -184,6 +190,16 @@ mod tests {
         registry.register(DummyModel {
             slug: "projects",
             name: "Project 2",
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved model slug 'jobs'")]
+    fn reserved_jobs_slug_panics() {
+        let mut registry = AdminRegistry::new();
+        registry.register(DummyModel {
+            slug: "jobs",
+            name: "Jobs",
         });
     }
 }

@@ -8,6 +8,7 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
 - Public blog listing and slug-based post pages
 - Admin UI for create, edit, publish, and delete
 - First-party `autumn-admin-plugin` mounted at `/backoffice`
+- Built-in jobs dashboard for the demo `publish_webhook` job
 - JSON endpoints alongside server-rendered HTML
 - Validation before insert/update
 - `#[static_get]` + `static_routes![]` for build-time rendering
@@ -34,6 +35,20 @@ cargo run -p blog
 ```
 
 Open <http://localhost:3000>.
+
+## Try the jobs dashboard
+
+The blog registers a demo `publish_webhook` background job and mounts the
+first-party admin plugin at `/backoffice` with role checks disabled for the
+example. Queue a job, then inspect the dashboard:
+
+```bash
+curl -X POST http://localhost:3000/api/posts/1/enqueue-publish-webhook
+curl http://localhost:3000/backoffice/jobs
+```
+
+The jobs page shows enqueued, running, completed, and failed work, plus the
+registered scheduled cleanup task.
 
 ## Try the hybrid-rendering flow
 
@@ -188,6 +203,7 @@ git diff routes.txt
 | GET | `/admin/{id}/edit` | Edit post form |
 | POST | `/admin/{id}` | Update a post |
 | DELETE | `/admin/{id}` | Delete a post with htmx |
+| GET | `/backoffice/jobs` | Admin plugin jobs dashboard |
 | GET | `/backoffice/posts` | Admin plugin list view for posts |
 
 ### JSON API

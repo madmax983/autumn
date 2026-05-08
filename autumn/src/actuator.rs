@@ -200,6 +200,9 @@ pub struct TaskStatus {
     /// Last time this task fired (ISO 8601), if ever.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_fired_at: Option<String>,
+    /// Next scheduled run time (ISO 8601), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
     /// Current task state.
     pub status: String,
     /// Last time the task ran (ISO 8601), if ever.
@@ -298,6 +301,15 @@ impl JobRegistry {
         }
     }
 
+    /// Record that a queued job was canceled before execution.
+    pub fn record_cancel(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+    }
+
     /// Record a successful execution.
     pub fn record_success(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
@@ -388,6 +400,7 @@ impl TaskRegistry {
                 current_leader: None,
                 last_tick: None,
                 last_fired_at: None,
+                next_run_at: None,
                 status: "idle".to_string(),
                 last_run: None,
                 last_duration_ms: None,
@@ -420,6 +433,18 @@ impl TaskRegistry {
             return;
         };
         task.status = "running".to_string();
+        task.next_run_at = None;
+    }
+
+    /// Record the next scheduled run time for an idle task.
+    pub fn record_next_run_at(&self, name: &str, next_run_at: &str) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.next_run_at = Some(next_run_at.to_string());
     }
 
     /// Record that a task completed successfully.

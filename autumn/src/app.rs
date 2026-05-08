@@ -2359,6 +2359,9 @@ fn start_task_scheduler_with_config(
                 let shutdown = shutdown.child_token();
                 tokio::spawn(async move {
                     loop {
+                        state
+                            .task_registry
+                            .record_next_run_at(&name, &format_next_task_run_after(delay));
                         tokio::select! {
                             () = shutdown.cancelled() => break,
                             () = tokio::time::sleep(delay) => {
@@ -2734,6 +2737,10 @@ async fn run_cron_task_loop(
                 return;
             }
         };
+        state.task_registry.record_next_run_at(
+            &name,
+            &scheduled_at.with_timezone(&chrono::Utc).to_rfc3339(),
+        );
         let sleep_for = cron_sleep_duration_until(&scheduled_at);
         tokio::select! {
             () = shutdown.cancelled() => break,
@@ -2770,6 +2777,14 @@ async fn run_cron_task_loop(
             }
         }
     }
+}
+
+fn format_next_task_run_after(delay: std::time::Duration) -> String {
+    let now = chrono::Utc::now();
+    let Ok(delay) = chrono::TimeDelta::from_std(delay) else {
+        return now.to_rfc3339();
+    };
+    (now + delay).to_rfc3339()
 }
 
 fn next_cron_occurrence_after<Tz: chrono::TimeZone>(

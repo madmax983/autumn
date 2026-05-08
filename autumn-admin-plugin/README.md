@@ -9,6 +9,7 @@
 
 - Mounts an admin UI under `/admin` by default
 - Generates list, create, detail, edit, delete, and bulk-action flows
+- Includes a built-in jobs dashboard for queued, running, completed, and failed work
 - Uses Maud + HTMX and works under Autumn's default `Content-Security-Policy`
 - Reads and writes model data through a small `AdminModel` trait
 - Requires an authenticated session with the `"admin"` role by default
@@ -23,8 +24,10 @@ autumn-web = { version = "0.3", features = ["db", "flash", "htmx", "maud"] }
 autumn-admin-plugin = "0.3"
 ```
 
-`autumn-admin-plugin` expects a configured Autumn database pool because all
- admin model operations receive the app's Postgres pool.
+`autumn-admin-plugin` expects a configured Autumn database pool for registered
+admin models because model operations receive the app's Postgres pool. The
+built-in jobs dashboard can render without a database pool when no model route
+is accessed.
 
 ## Quick Start
 
@@ -49,6 +52,11 @@ async fn main() {
 When mounted at the default `/admin` prefix, the plugin serves:
 
 - `GET /admin/` — dashboard
+- `GET /admin/jobs` — background jobs dashboard
+- `GET /admin/jobs/counters` — HTMX counter fragment, refreshed at most every 2s
+- `POST /admin/jobs/{id}/retry` — retry a failed job
+- `POST /admin/jobs/{id}/discard` — discard a failed job
+- `POST /admin/jobs/{id}/cancel` — cancel an enqueued job
 - `GET /admin/{slug}` — paginated list view
 - `POST /admin/{slug}` — create record
 - `GET /admin/{slug}/new` — new-record form
