@@ -485,6 +485,16 @@ impl JobAdminMemoryBackend {
         Ok(retry)
     }
 
+    fn restore_failed_retry(&self, id: &str) {
+        if let Ok(mut inner) = self.inner.write()
+            && let Some(record) = inner.records.get_mut(id)
+            && record.status == JobAdminStatus::Retried
+        {
+            record.status = JobAdminStatus::Failed;
+            record.finished_at = Some(chrono::Utc::now());
+        }
+    }
+
     fn ensure_retryable(&self, id: &str) -> AutumnResult<()> {
         let inner = self
             .inner
@@ -637,8 +647,13 @@ impl JobAdminBackend for JobAdminMemoryBackend {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
             let (name, payload) = self.retry_payload(&id)?;
-            client.enqueue(&name, payload).await?;
-            Ok(())
+            match client.enqueue(&name, payload).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    self.restore_failed_retry(&id);
+                    Err(error)
+                }
+            }
         })
     }
 
@@ -974,10 +989,10 @@ impl JobClient {
         self.job_admin
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
-        if let Some(sender) = &self.local_sender {
+        let result = if let Some(sender) = &self.local_sender {
             sender
                 .send(QueuedJob {
-                    id,
+                    id: id.clone(),
                     name: name.to_string(),
                     payload,
                     attempt: 1,
@@ -994,15 +1009,28 @@ impl JobClient {
             #[cfg(feature = "redis")]
             {
                 if let Some(redis) = &self.redis {
-                    return redis
-                        .enqueue(id, name, payload, job_max_attempts, job_backoff_ms)
-                        .await;
+                    redis
+                        .enqueue(id.clone(), name, payload, job_max_attempts, job_backoff_ms)
+                        .await
+                } else {
+                    Err(AutumnError::internal_server_error(std::io::Error::other(
+                        "job runtime backend is unavailable",
+                    )))
                 }
             }
-            Err(AutumnError::internal_server_error(std::io::Error::other(
-                "job runtime backend is unavailable",
-            )))
+            #[cfg(not(feature = "redis"))]
+            {
+                let _ = payload;
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "job runtime backend is unavailable",
+                )))
+            }
+        };
+        if result.is_err() {
+            self.registry.record_cancel(name);
+            self.job_admin.record_cancelled(&id);
         }
+        result
     }
 }
 
@@ -2884,6 +2912,58 @@ mod tests {
             .expect("snapshot after retry");
         assert!(snapshot.failed.records.is_empty());
         assert_eq!(snapshot.enqueued.total, 1);
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn job_admin_retry_restores_failed_record_when_enqueue_fails() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let registry = crate::actuator::JobRegistry::new();
+        registry.register("send_email");
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            #[cfg(feature = "redis")]
+            redis: None,
+            registry: registry.clone(),
+            job_admin: backend.clone(),
+            default_max_attempts: 5,
+            default_initial_backoff_ms: 250,
+            per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+        });
+
+        let failed_id =
+            backend.record_enqueue_for_test("send_email", serde_json::json!({"user_id": 7}), 2, 5);
+        backend.record_start_for_test(&failed_id, 2);
+        backend.record_failure_for_test(&failed_id, "smtp refused recipient");
+
+        let error = backend
+            .retry(&failed_id)
+            .await
+            .expect_err("closed worker channel should make retry enqueue fail");
+        assert!(
+            error.to_string().contains("failed to enqueue job"),
+            "unexpected retry error: {error}"
+        );
+
+        let snapshot = backend
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot after failed retry enqueue");
+        assert_eq!(snapshot.failed.total, 1);
+        assert_eq!(snapshot.failed.records[0].id, failed_id);
+        assert_eq!(
+            snapshot.failed.records[0].last_error.as_deref(),
+            Some("smtp refused recipient")
+        );
+        assert_eq!(snapshot.enqueued.total, 0);
+        let status = registry.snapshot()["send_email"].clone();
+        assert_eq!(status.queued, 0);
 
         clear_global_job_client();
     }
