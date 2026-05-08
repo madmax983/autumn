@@ -160,7 +160,7 @@ pub struct PluginCheckOptions<'a> {
 /// Run `autumn plugin-check`.
 pub fn run(opts: &PluginCheckOptions<'_>) {
     eprintln!("\u{1F342} autumn plugin-check\n");
-    compile_binary(opts.package);
+    compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
     let output = Command::new(&binary)
