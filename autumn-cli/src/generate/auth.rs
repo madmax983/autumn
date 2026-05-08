@@ -502,16 +502,26 @@ pub async fn login(
     let email = form.email.trim().to_lowercase();
     let auth_err = || AutumnError::unprocessable_msg("Invalid email or password.");
 
-    let {snake_name}: {pascal_name} = {table}::table
+    let maybe_{snake_name}: Option<{pascal_name}> = {table}::table
         .filter({table}::email.eq(&email))
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
-        .map_err(|_| auth_err())?;
+        .ok();
 
-    if !verify_password(&form.password, &{snake_name}.password_digest).await? {{
+    // Always run bcrypt to equalise timing: a miss uses a dummy hash so
+    // response latency is indistinguishable from a wrong-password attempt
+    // on a real account.
+    const DUMMY_HASH: &str = "$2b$12$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let password_hash = maybe_{snake_name}
+        .as_ref()
+        .map(|u| u.password_digest.as_str())
+        .unwrap_or(DUMMY_HASH);
+    let password_ok = verify_password(&form.password, password_hash).await.unwrap_or(false);
+    if !password_ok {{
         return Err(auth_err());
     }}
+    let {snake_name} = maybe_{snake_name}.ok_or_else(auth_err)?;
 
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -613,6 +623,11 @@ pub async fn forgot_password(
 
     let email = form.email.trim().to_lowercase();
 
+    // Record start time; the response is padded to a constant minimum below
+    // so an attacker cannot infer whether an address is registered by
+    // measuring response latency.
+    let t0 = std::time::Instant::now();
+
     // Non-enumerating: silently skip unknown addresses.
     let maybe_{snake_name}: Option<{pascal_name}> = {table}::table
         .filter({table}::email.eq(&email))
@@ -640,6 +655,12 @@ pub async fn forgot_password(
         if let Err(e) = send_reset_email(&mailer, &{snake_name}.email, &raw_token).await {{
             tracing::error!("password-reset email failed: {{e}}");
         }}
+    }}
+
+    // Pad to a constant minimum so hit and miss paths take indistinguishable
+    // wall-clock time.
+    if let Some(remaining) = std::time::Duration::from_secs(1).checked_sub(t0.elapsed()) {{
+        tokio::time::sleep(remaining).await;
     }}
 
     Ok(layout("Check Your Email", html! {{
