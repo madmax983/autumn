@@ -726,27 +726,18 @@ fn parse_oauth2_token_response(
         });
     }
 
-    let mut access_token = None;
-    let mut token_type = None;
-    let mut id_token = None;
+    let mut form: std::collections::HashMap<_, _> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
 
-    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
-        match k.as_ref() {
-            "access_token" => access_token = Some(v.into_owned()),
-            "token_type" => token_type = Some(v.into_owned()),
-            "id_token" => id_token = Some(v.into_owned()),
-            _ => {}
-        }
-    }
-
-    let access_token = access_token.ok_or_else(|| {
+    let access_token = form.remove("access_token").ok_or_else(|| {
         crate::AutumnError::bad_request_msg("token response missing access_token")
     })?;
 
     Ok(OAuth2TokenResponse {
         access_token,
-        token_type,
-        id_token,
+        token_type: form.remove("token_type"),
+        id_token: form.remove("id_token"),
     })
 }
 
