@@ -773,6 +773,7 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
     router
 }
 
+#[cfg_attr(not(feature = "mail"), allow(unused_variables))]
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,

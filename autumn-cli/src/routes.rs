@@ -55,7 +55,7 @@ pub struct RoutesOptions<'a> {
 /// Run `autumn routes`.
 pub fn run(opts: &RoutesOptions<'_>) {
     eprintln!("\u{1F342} autumn routes\n");
-    compile_binary(opts.package);
+    compile_binary(opts.package, opts.bin);
     let binary = find_binary(opts.package, opts.bin);
 
     let output = Command::new(&binary)
@@ -370,11 +370,14 @@ fn resolve_binary_from_metadata(
 
 // ── Also compile the binary before running ─────────────────────────────────
 
-pub fn compile_binary(package: Option<&str>) {
+pub fn compile_binary(package: Option<&str>, bin: Option<&str>) {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if let Some(pkg) = package {
         cargo.args(["-p", pkg]);
+    }
+    if let Some(b) = bin {
+        cargo.args(["--bin", b]);
     }
 
     let status = cargo.status().expect("failed to run cargo build");

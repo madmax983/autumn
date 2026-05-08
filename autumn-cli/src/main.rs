@@ -9,6 +9,7 @@ mod generate;
 mod migrate;
 mod monitor;
 mod new;
+mod plugin_check;
 mod release;
 mod routes;
 mod seed;
@@ -220,6 +221,41 @@ enum Commands {
         strict: bool,
     },
 
+    /// Run conformance checks against a plugin's route contributions.
+    ///
+    /// Compiles the application (debug profile), introspects its route table,
+    /// and verifies that the named plugin satisfies five checks: installability,
+    /// route attribution, route prefix, route collision, and sensitive-surface
+    /// gating.  Exits 0 on pass, 1 on failure.
+    ///
+    /// # Examples
+    ///
+    ///   autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin \
+    ///       --sensitive-route /admin:"Role: admin required"
+    #[command(verbatim_doc_comment)]
+    PluginCheck {
+        /// Package to build (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to build (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Documented plugin name to check (e.g. `autumn-admin-plugin`).
+        #[arg(long, value_name = "NAME")]
+        plugin_name: String,
+        /// Expected route prefix for all plugin routes (e.g. `/admin`).
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// Declare a sensitive route with its auth/profile gating mechanism.
+        /// Format: `PATH_PREFIX:DESCRIPTION` (e.g. `/admin:Role admin required`).
+        /// Repeatable.
+        #[arg(long, value_name = "PATH:DESCRIPTION")]
+        sensitive_route: Vec<String>,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text", value_name = "FORMAT")]
+        format: String,
+    },
+
     /// Print every mounted route — method, path, handler, source, middleware.
     ///
     /// Compiles the application (debug profile) and introspects its route
@@ -393,6 +429,7 @@ fn main() {
     run_command(cli.command);
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_command(command: Commands) {
     match command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),
@@ -490,6 +527,23 @@ fn run_command(command: Commands) {
         Commands::Doctor { json, strict } => {
             doctor::run(doctor::DoctorOptions { json, strict });
         }
+        Commands::PluginCheck {
+            package,
+            bin,
+            plugin_name,
+            prefix,
+            sensitive_route,
+            format,
+        } => {
+            run_plugin_check_command(
+                package.as_deref(),
+                bin.as_deref(),
+                &plugin_name,
+                prefix.as_deref(),
+                &sensitive_route,
+                &format,
+            );
+        }
         Commands::Generate(cmd) => run_generate_command(cmd),
     }
 }
@@ -509,6 +563,44 @@ fn run_task_command(
         list,
         name,
         args,
+    });
+}
+
+fn run_plugin_check_command(
+    package: Option<&str>,
+    bin: Option<&str>,
+    plugin_name: &str,
+    prefix: Option<&str>,
+    sensitive_route_args: &[String],
+    format: &str,
+) {
+    let fmt = format.parse().unwrap_or_else(|e| {
+        eprintln!("autumn plugin-check: {e}");
+        std::process::exit(1);
+    });
+
+    let mut sensitive_routes: Vec<plugin_check::SensitiveRouteDecl> = Vec::new();
+    for arg in sensitive_route_args {
+        if let Some((path, desc)) = arg.split_once(':') {
+            sensitive_routes.push(plugin_check::SensitiveRouteDecl {
+                path_pattern: path.to_owned(),
+                auth_mechanism: desc.to_owned(),
+            });
+        } else {
+            eprintln!(
+                "autumn plugin-check: invalid --sensitive-route '{arg}'; expected PATH:DESCRIPTION"
+            );
+            std::process::exit(1);
+        }
+    }
+
+    plugin_check::run(&plugin_check::PluginCheckOptions {
+        package,
+        bin,
+        plugin_name,
+        expected_prefix: prefix,
+        sensitive_routes: &sensitive_routes,
+        format: fmt,
     });
 }
 
@@ -1474,5 +1566,200 @@ mod tests {
     #[test]
     fn parse_token_revoke_without_token_is_error() {
         assert!(Cli::try_parse_from(["autumn", "token", "revoke"]).is_err());
+    }
+
+    // ── autumn plugin-check tests ──────────────────────────────────────────
+
+    #[test]
+    fn parse_plugin_check_required_plugin_name() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "autumn-admin-plugin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck { plugin_name, .. } => {
+                assert_eq!(plugin_name, "autumn-admin-plugin");
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_missing_plugin_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "plugin-check"]).is_err());
+    }
+
+    #[test]
+    fn parse_plugin_check_with_prefix() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "autumn-admin-plugin",
+            "--prefix",
+            "/admin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck { prefix, .. } => {
+                assert_eq!(prefix.as_deref(), Some("/admin"));
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_with_package() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "-p",
+            "my-app",
+            "--plugin-name",
+            "myplugin",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck { package, .. } => {
+                assert_eq!(package.as_deref(), Some("my-app"));
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_with_json_format() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck { format, .. } => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_default_format_is_text() {
+        let cli =
+            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "myplugin"]).unwrap();
+        match cli.command {
+            Commands::PluginCheck { format, .. } => {
+                assert_eq!(format, "text");
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_with_sensitive_route() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--sensitive-route",
+            "/admin:Role admin required",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                sensitive_route, ..
+            } => {
+                assert_eq!(sensitive_route, vec!["/admin:Role admin required"]);
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_multiple_sensitive_routes() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--sensitive-route",
+            "/admin:Role admin required",
+            "--sensitive-route",
+            "/debug:Internal use only",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                sensitive_route, ..
+            } => {
+                assert_eq!(sensitive_route.len(), 2);
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_with_bin() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "myplugin",
+            "--bin",
+            "server",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck { bin, .. } => {
+                assert_eq!(bin.as_deref(), Some("server"));
+            }
+            _ => panic!("expected PluginCheck"),
+        }
+    }
+
+    #[test]
+    fn parse_plugin_check_all_options() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "-p",
+            "my-app",
+            "--bin",
+            "server",
+            "--plugin-name",
+            "autumn-admin-plugin",
+            "--prefix",
+            "/admin",
+            "--sensitive-route",
+            "/admin:Role: admin required",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::PluginCheck {
+                package,
+                bin,
+                plugin_name,
+                prefix,
+                sensitive_route,
+                format,
+            } => {
+                assert_eq!(package.as_deref(), Some("my-app"));
+                assert_eq!(bin.as_deref(), Some("server"));
+                assert_eq!(plugin_name, "autumn-admin-plugin");
+                assert_eq!(prefix.as_deref(), Some("/admin"));
+                assert_eq!(sensitive_route, vec!["/admin:Role: admin required"]);
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected PluginCheck"),
+        }
     }
 }

@@ -102,6 +102,7 @@ pub mod mail;
 #[cfg(feature = "db")]
 pub mod migrate;
 pub mod plugin;
+pub mod plugin_conformance;
 pub mod probe;
 #[cfg(feature = "system-info")]
 pub mod system_info;

@@ -109,6 +109,7 @@ pub fn app() -> AppBuilder {
         mail_delivery_queue_factory: None,
         #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
+        declared_routes: Vec::new(),
     }
 }
 
@@ -271,6 +272,10 @@ pub struct AppBuilder {
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
+    /// Routes explicitly declared by plugins for listing purposes, to complement
+    /// opaque `nest_routers`. Included in `autumn routes` output even though
+    /// the underlying Axum router is not enumerable.
+    declared_routes: Vec<crate::route_listing::RouteInfo>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -814,6 +819,33 @@ impl AppBuilder {
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self
+    }
+
+    /// Explicitly register route metadata for listing via `autumn routes`.
+    ///
+    /// Plugins that mount routes via [`AppBuilder::nest`] (which is opaque to
+    /// the route listing) can call this method so that `autumn routes --format json`
+    /// shows their routes with the correct plugin attribution.
+    ///
+    /// Routes are automatically attributed to the current plugin when called from
+    /// within a plugin's `build()` method. The `source` field of each supplied
+    /// `RouteInfo` is overwritten with that attribution.
+    #[must_use]
+    pub fn declare_plugin_routes(
+        mut self,
+        routes: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
+    ) -> Self {
+        let source = self
+            .current_plugin
+            .as_deref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            });
+        for mut route in routes {
+            route.source = source.clone();
+            self.declared_routes.push(route);
+        }
         self
     }
 
@@ -1441,6 +1473,7 @@ impl AppBuilder {
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
             mail_previews,
+            declared_routes: _,
         } = self;
 
         let all_routes = routes;
@@ -1769,6 +1802,7 @@ impl AppBuilder {
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
             mail_previews,
+            declared_routes: _,
         } = self;
 
         let all_routes = routes;
@@ -1989,6 +2023,7 @@ impl AppBuilder {
             scoped_groups,
             merge_routers,
             nest_routers,
+            declared_routes,
             config_loader_factory,
             telemetry_provider,
             #[cfg(feature = "openapi")]
@@ -1997,8 +2032,8 @@ impl AppBuilder {
         } = self;
 
         // Raw Axum routers registered via .merge()/.nest() are opaque: there is
-        // no public API to enumerate their routes. Warn so callers know the
-        // snapshot may be incomplete.
+        // no public API to enumerate their routes. Always warn so callers know
+        // some routes may be missing even if declare_plugin_routes was used.
         let hidden = merge_routers.len() + nest_routers.len();
         if hidden > 0 {
             eprintln!(
@@ -2012,6 +2047,7 @@ impl AppBuilder {
 
         let mut infos =
             crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        infos.extend(declared_routes);
         crate::route_listing::append_framework_routes(&mut infos, &config);
         #[cfg(feature = "openapi")]
         if let Some(ref oa) = openapi {
