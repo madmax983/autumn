@@ -496,12 +496,7 @@ pub fn jobs_page(
             "Jobs"
         }
 
-        div id="jobs-counters"
-            hx-get={ (prefix) "/jobs/counters" }
-            hx-trigger="load, every 2s"
-            hx-swap="outerHTML" {
-            (jobs_counters(snapshot))
-        }
+        (jobs_counters(snapshot, prefix))
 
         (job_list_card(
             "Enqueued",
@@ -556,9 +551,13 @@ pub fn jobs_page(
 }
 
 /// Render the HTMX-refreshable job counter fragment.
-pub fn jobs_counters(snapshot: &JobAdminSnapshot) -> Markup {
+pub fn jobs_counters(snapshot: &JobAdminSnapshot, prefix: &str) -> Markup {
     html! {
-        div id="jobs-counters" class="jobs-counter-grid" {
+        div id="jobs-counters"
+            class="jobs-counter-grid"
+            hx-get={ (prefix) "/jobs/counters" }
+            hx-trigger="load, every 2s"
+            hx-swap="outerHTML" {
             (job_counter("Enqueued", snapshot.enqueued.total))
             (job_counter("Running", snapshot.running.total))
             (job_counter("Completed 24h", snapshot.completed.total))
@@ -1795,6 +1794,17 @@ mod tests {
         assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));
         assert!(html.contains(r#"hx-trigger="load, every 2s""#));
         assert!(html.contains("send-digest"));
+    }
+
+    #[test]
+    fn jobs_counters_fragment_preserves_polling_after_outer_swap() {
+        use autumn_web::job::JobAdminSnapshot;
+
+        let html = jobs_counters(&JobAdminSnapshot::empty(), "/admin").into_string();
+        assert!(html.contains(r#"id="jobs-counters""#));
+        assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));
+        assert!(html.contains(r#"hx-trigger="load, every 2s""#));
+        assert!(html.contains(r#"hx-swap="outerHTML""#));
     }
 
     #[test]

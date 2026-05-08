@@ -361,6 +361,7 @@ async fn jobs_dashboard(
 /// `GET /admin/jobs/counters` -- HTMX counter refresh fragment.
 async fn jobs_counters(
     State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     Query(query): Query<JobsQuery>,
 ) -> AutumnResult<Response> {
     let mut snapshot = match job_admin_backend(&state) {
@@ -368,7 +369,7 @@ async fn jobs_counters(
         None => JobAdminSnapshot::empty(),
     };
     snapshot.schedules = scheduled_job_summaries(&state);
-    Ok(render(templates::jobs_counters(&snapshot)))
+    Ok(render(templates::jobs_counters(&snapshot, &prefix)))
 }
 
 /// `POST /admin/jobs/{id}/retry` -- retry a failed job.
