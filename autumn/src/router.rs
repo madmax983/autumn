@@ -778,6 +778,9 @@ fn mount_framework_routes(
     config: &AutumnConfig,
     dev_reload_enabled: bool,
 ) -> axum::Router<AppState> {
+    #[cfg(not(feature = "mail"))]
+    let _ = config;
+
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {

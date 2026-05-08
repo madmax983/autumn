@@ -160,6 +160,7 @@ async fn main() {
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)

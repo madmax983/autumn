@@ -81,6 +81,12 @@ domain aggregate id, or provider idempotency token.
 
 ## Observability
 
+Mount `autumn-admin-plugin` to get the built-in operator dashboard at
+`GET /admin/jobs` (or the plugin prefix you choose). It lists enqueued, running,
+recently completed, and failed jobs with retry/discard/cancel actions. See the
+[Operating Background Jobs](operating-background-jobs.md) guide for dashboard
+setup, action semantics, and bounded refresh behavior.
+
 `GET /actuator/jobs` returns per-job:
 
 - `queued`

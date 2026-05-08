@@ -5,6 +5,9 @@
 //! color palette, clean cards with subtle shadows.
 
 use autumn_web::flash::FlashMessage;
+use autumn_web::job::{
+    JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
+};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -17,6 +20,7 @@ use crate::traits::{
 const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 const TOKENS_CSS: &str = include_str!("tokens.css");
+const JOBS_NAV_SLUG: &str = "__admin_jobs";
 const FLASH_CSS: &str = "\
 .flash {
     padding: 0.75rem 1rem;
@@ -307,6 +311,43 @@ const ADMIN_CSS: &str = "
     .stat-label { font-size: 0.8125rem; color: var(--text-muted); font-weight: 500; }
     .stat-value { font-size: 1.75rem; font-weight: 700; margin-top: 0.25rem; }
     .stat-link { font-size: 0.8125rem; margin-top: 0.375rem; }
+    .jobs-counter-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 0.75rem;
+        margin-bottom: 1rem;
+    }
+    .jobs-counter {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 0.875rem;
+        background: var(--bg);
+    }
+    .jobs-counter strong {
+        display: block;
+        font-size: 1.35rem;
+        line-height: 1.1;
+        margin-top: 0.2rem;
+    }
+    .job-error summary {
+        cursor: pointer;
+        color: var(--danger);
+    }
+    .job-error pre {
+        margin-top: 0.5rem;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: var(--danger-light);
+        border-radius: 0.375rem;
+        padding: 0.5rem;
+        max-width: 32rem;
+    }
+    .job-actions {
+        display: flex;
+        gap: 0.375rem;
+        flex-wrap: wrap;
+    }
+    .job-actions form { display: inline; }
 
     /* Breadcrumbs */
     .breadcrumbs {
@@ -408,6 +449,12 @@ pub fn admin_layout(
                                     }
                                 }
                                 li { div class="admin-nav-section" { "System" } }
+                                li {
+                                    a href={ (prefix) "/jobs" }
+                                      class=[(active_slug == Some(JOBS_NAV_SLUG)).then_some("active")] {
+                                        "Jobs"
+                                    }
+                                }
                                 li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
                             }
                         }
@@ -425,6 +472,301 @@ pub fn admin_layout(
             }
         }
     }
+}
+
+// ── Jobs dashboard ──────────────────────────────────────────────────
+
+/// Render the built-in jobs admin dashboard.
+pub fn jobs_page(
+    registry: &AdminRegistry,
+    snapshot: &JobAdminSnapshot,
+    messages: &[FlashMessage],
+    csrf_token: &str,
+    prefix: &str,
+    actuator_prefix: &str,
+) -> Markup {
+    let content = html! {
+        div class="breadcrumbs" {
+            a href=(prefix) { "Admin" }
+            span class="sep" { "›" }
+            span { "Jobs" }
+        }
+
+        h1 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 1rem;" {
+            "Jobs"
+        }
+
+        div id="jobs-counters"
+            hx-get={ (prefix) "/jobs/counters" }
+            hx-trigger="load, every 2s"
+            hx-swap="outerHTML" {
+            (jobs_counters(snapshot))
+        }
+
+        (job_list_card(
+            "Enqueued",
+            "Work waiting for a worker.",
+            &snapshot.enqueued,
+            "enqueued_page",
+            csrf_token,
+            prefix,
+        ))
+        (job_list_card(
+            "Running",
+            "Work currently executing in this runtime.",
+            &snapshot.running,
+            "running_page",
+            csrf_token,
+            prefix,
+        ))
+        (job_list_card(
+            "Completed (last 24h)",
+            "Recently completed work retained by the bounded dashboard history.",
+            &snapshot.completed,
+            "completed_page",
+            csrf_token,
+            prefix,
+        ))
+        (job_list_card(
+            "Failed (last 7d)",
+            "Terminal failures available for retry or discard.",
+            &snapshot.failed,
+            "failed_page",
+            csrf_token,
+            prefix,
+        ))
+        (job_schedules_card(&snapshot.schedules))
+
+        p style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 1rem;" {
+            "Default backend history is bounded to " (snapshot.bounded_history_limit)
+            " lifecycle entries; counter refreshes use bounded in-memory reads."
+        }
+    };
+
+    admin_layout(
+        registry,
+        Some(JOBS_NAV_SLUG),
+        "Jobs",
+        prefix,
+        actuator_prefix,
+        csrf_token,
+        messages,
+        &content,
+    )
+}
+
+/// Render the HTMX-refreshable job counter fragment.
+pub fn jobs_counters(snapshot: &JobAdminSnapshot) -> Markup {
+    html! {
+        div id="jobs-counters" class="jobs-counter-grid" {
+            (job_counter("Enqueued", snapshot.enqueued.total))
+            (job_counter("Running", snapshot.running.total))
+            (job_counter("Completed 24h", snapshot.completed.total))
+            (job_counter("Failed 7d", snapshot.failed.total))
+        }
+    }
+}
+
+fn job_counter(label: &str, value: u64) -> Markup {
+    html! {
+        div class="jobs-counter" {
+            span class="stat-label" { (label) }
+            strong { (value) }
+        }
+    }
+}
+
+fn job_list_card(
+    title: &str,
+    description: &str,
+    page: &JobAdminPage,
+    page_param: &str,
+    csrf_token: &str,
+    prefix: &str,
+) -> Markup {
+    html! {
+        div class="card" {
+            div class="card-header" {
+                div {
+                    span class="card-title" { (title) }
+                    div style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem;" {
+                        (description)
+                    }
+                }
+                span style="font-size: 0.875rem; color: var(--text-muted);" {
+                    (page.total) " total"
+                }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "Job" }
+                            th { "Enqueued At" }
+                            th { "Started At" }
+                            th { "Finished At" }
+                            th { "Attempts" }
+                            th { "Principal" }
+                            th { "Correlation" }
+                            th { "Last Error" }
+                            th { "Actions" }
+                        }
+                    }
+                    tbody {
+                        @if page.records.is_empty() {
+                            tr {
+                                td colspan="9" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                    "No jobs."
+                                }
+                            }
+                        }
+                        @for record in &page.records {
+                            (job_row(record, csrf_token, prefix))
+                        }
+                    }
+                }
+            }
+            (jobs_pagination(page, page_param, prefix))
+        }
+    }
+}
+
+fn job_row(record: &JobAdminRecord, csrf_token: &str, prefix: &str) -> Markup {
+    html! {
+        tr {
+            td {
+                strong { (record.name) }
+                div style="font-size: 0.75rem; color: var(--text-muted);" {
+                    (record.status.label()) " · " (record.id)
+                }
+            }
+            td { (optional_text(record.enqueued_at.as_deref())) }
+            td { (optional_text(record.started_at.as_deref())) }
+            td { (optional_text(record.finished_at.as_deref())) }
+            td { (record.attempt) "/" (record.max_attempts) }
+            td { (optional_text(record.principal_id.as_deref())) }
+            td { (optional_text(record.correlation_id.as_deref())) }
+            td { (job_error(record)) }
+            td { (job_actions(record, csrf_token, prefix)) }
+        }
+    }
+}
+
+fn job_error(record: &JobAdminRecord) -> Markup {
+    let Some(error) = record.last_error.as_deref() else {
+        return html! { span style="color: var(--text-muted);" { "—" } };
+    };
+    if record.status == JobAdminStatus::Failed {
+        html! {
+            details class="job-error" {
+                summary { (truncate_display(error, 80)) }
+                pre { (error) }
+            }
+        }
+    } else {
+        html! { (truncate_display(error, 80)) }
+    }
+}
+
+fn job_actions(record: &JobAdminRecord, csrf_token: &str, prefix: &str) -> Markup {
+    html! {
+        div class="job-actions" {
+            @if record.status == JobAdminStatus::Failed {
+                (job_action_form(prefix, &record.id, "retry", "Retry", "btn btn-sm btn-primary", csrf_token))
+                (job_action_form(prefix, &record.id, "discard", "Discard", "btn btn-sm btn-danger", csrf_token))
+            } @else if record.status == JobAdminStatus::Enqueued {
+                (job_action_form(prefix, &record.id, "cancel", "Cancel", "btn btn-sm btn-danger", csrf_token))
+            } @else {
+                span style="color: var(--text-muted);" { "—" }
+            }
+        }
+    }
+}
+
+fn job_action_form(
+    prefix: &str,
+    id: &str,
+    action: &str,
+    label: &str,
+    class_name: &str,
+    csrf_token: &str,
+) -> Markup {
+    html! {
+        form method="post" action={ (prefix) "/jobs/" (id) "/" (action) } {
+            input type="hidden" name="_csrf" value=(csrf_token);
+            button type="submit" class=(class_name) {
+                (label)
+            }
+        }
+    }
+}
+
+fn jobs_pagination(page: &JobAdminPage, page_param: &str, prefix: &str) -> Markup {
+    if page.total_pages() <= 1 {
+        return html! {};
+    }
+    html! {
+        div class="pagination" {
+            div {
+                "Page " (page.page) " of " (page.total_pages())
+            }
+            div class="pagination-links" {
+                @if page.page > 1 {
+                    a href={ (prefix) "/jobs?" (page_param) "=" (page.page - 1) } { "Previous" }
+                }
+                span class="active" { (page.page) }
+                @if page.page < page.total_pages() {
+                    a href={ (prefix) "/jobs?" (page_param) "=" (page.page + 1) } { "Next" }
+                }
+            }
+        }
+    }
+}
+
+fn job_schedules_card(schedules: &[JobScheduleSummary]) -> Markup {
+    html! {
+        div class="card" {
+            div class="card-header" {
+                span class="card-title" { "Recurring Schedules" }
+            }
+            div class="table-wrap" {
+                table {
+                    thead {
+                        tr {
+                            th { "Name" }
+                            th { "Schedule" }
+                            th { "Next Run At" }
+                            th { "Last Run Status" }
+                        }
+                    }
+                    tbody {
+                        @if schedules.is_empty() {
+                            tr {
+                                td colspan="4" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                    "No scheduled tasks registered."
+                                }
+                            }
+                        }
+                        @for schedule in schedules {
+                            tr {
+                                td { (schedule.name) }
+                                td { (schedule.schedule) }
+                                td { (optional_text(schedule.next_run_at.as_deref())) }
+                                td { (optional_text(schedule.last_run_status.as_deref())) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn optional_text(value: Option<&str>) -> Markup {
+    value.filter(|value| !value.is_empty()).map_or_else(
+        || html! { span style="color: var(--text-muted);" { "—" } },
+        |value| html! { (value) },
+    )
 }
 
 // ── Dashboard ───────────────────────────────────────────────────────
@@ -1347,6 +1689,112 @@ mod tests {
             !html.contains("/actuator/"),
             "must not hardcode /actuator when prefix is /ops: {html}"
         );
+    }
+
+    #[test]
+    fn jobs_page_renders_lists_actions_polling_and_csrf() {
+        use autumn_web::job::{
+            JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
+        };
+
+        let r = dummy_registry();
+        let snapshot = JobAdminSnapshot {
+            enqueued: JobAdminPage::new(
+                vec![JobAdminRecord {
+                    id: "job-enqueued".to_owned(),
+                    name: "send_email".to_owned(),
+                    status: JobAdminStatus::Enqueued,
+                    enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
+                    started_at: None,
+                    finished_at: None,
+                    attempt: 1,
+                    max_attempts: 5,
+                    last_error: None,
+                    principal_id: Some("42".to_owned()),
+                    correlation_id: Some("req-123".to_owned()),
+                }],
+                1,
+                1,
+                25,
+            ),
+            running: JobAdminPage::new(
+                vec![JobAdminRecord {
+                    id: "job-running".to_owned(),
+                    name: "reindex".to_owned(),
+                    status: JobAdminStatus::Running,
+                    enqueued_at: Some("2026-05-07T10:01:00Z".to_owned()),
+                    started_at: Some("2026-05-07T10:02:00Z".to_owned()),
+                    finished_at: None,
+                    attempt: 1,
+                    max_attempts: 3,
+                    last_error: None,
+                    principal_id: None,
+                    correlation_id: None,
+                }],
+                1,
+                1,
+                25,
+            ),
+            completed: JobAdminPage::new(
+                vec![JobAdminRecord {
+                    id: "job-complete".to_owned(),
+                    name: "digest".to_owned(),
+                    status: JobAdminStatus::Completed,
+                    enqueued_at: Some("2026-05-07T09:00:00Z".to_owned()),
+                    started_at: Some("2026-05-07T09:01:00Z".to_owned()),
+                    finished_at: Some("2026-05-07T09:02:00Z".to_owned()),
+                    attempt: 1,
+                    max_attempts: 3,
+                    last_error: None,
+                    principal_id: None,
+                    correlation_id: None,
+                }],
+                1,
+                1,
+                25,
+            ),
+            failed: JobAdminPage::new(
+                vec![JobAdminRecord {
+                    id: "job-failed".to_owned(),
+                    name: "send_email".to_owned(),
+                    status: JobAdminStatus::Failed,
+                    enqueued_at: Some("2026-05-07T08:00:00Z".to_owned()),
+                    started_at: Some("2026-05-07T08:01:00Z".to_owned()),
+                    finished_at: Some("2026-05-07T08:02:00Z".to_owned()),
+                    attempt: 5,
+                    max_attempts: 5,
+                    last_error: Some("smtp refused recipient".repeat(6)),
+                    principal_id: Some("7".to_owned()),
+                    correlation_id: None,
+                }],
+                1,
+                1,
+                25,
+            ),
+            schedules: vec![JobScheduleSummary {
+                name: "send-digest".to_owned(),
+                schedule: "every 1h".to_owned(),
+                next_run_at: None,
+                last_run_status: Some("ok".to_owned()),
+            }],
+            bounded_history_limit: 1_000,
+        };
+
+        let html = jobs_page(&r, &snapshot, &[], "tok-job", "/admin", "/actuator").into_string();
+        assert!(html.contains("Jobs"));
+        assert!(html.contains("Enqueued"));
+        assert!(html.contains("Running"));
+        assert!(html.contains("Completed (last 24h)"));
+        assert!(html.contains("Failed (last 7d)"));
+        assert!(html.contains("send_email"));
+        assert!(html.contains("req-123"));
+        assert!(html.contains(r#"action="/admin/jobs/job-failed/retry""#));
+        assert!(html.contains(r#"action="/admin/jobs/job-failed/discard""#));
+        assert!(html.contains(r#"action="/admin/jobs/job-enqueued/cancel""#));
+        assert!(html.contains(r#"name="_csrf" value="tok-job""#));
+        assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));
+        assert!(html.contains(r#"hx-trigger="load, every 2s""#));
+        assert!(html.contains("send-digest"));
     }
 
     #[test]

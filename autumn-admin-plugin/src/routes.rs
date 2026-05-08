@@ -11,6 +11,7 @@ use std::convert::Infallible;
 use std::sync::LazyLock;
 
 use autumn_web::flash::Flash;
+use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
 use autumn_web::security::CsrfToken;
 use autumn_web::{AppState, AutumnError, AutumnResult};
@@ -104,6 +105,11 @@ pub fn admin_router(
     let router = axum::Router::new()
         // Dashboard
         .route("/", routing::get(dashboard))
+        .route("/jobs", routing::get(jobs_dashboard))
+        .route("/jobs/counters", routing::get(jobs_counters))
+        .route("/jobs/{id}/retry", routing::post(job_retry))
+        .route("/jobs/{id}/discard", routing::post(job_discard))
+        .route("/jobs/{id}/cancel", routing::post(job_cancel))
         // Model routes (dynamic dispatch via slug)
         .route("/{slug}", routing::get(model_list).post(model_create))
         .route("/{slug}/new", routing::get(model_new_form))
@@ -166,8 +172,38 @@ struct ListQuery {
     dir: SortDirection,
 }
 
+#[derive(Debug, Deserialize)]
+struct JobsQuery {
+    #[serde(default = "default_page", rename = "enqueued_page")]
+    enqueued: u64,
+    #[serde(default = "default_page", rename = "running_page")]
+    running: u64,
+    #[serde(default = "default_page", rename = "completed_page")]
+    completed: u64,
+    #[serde(default = "default_page", rename = "failed_page")]
+    failed: u64,
+    #[serde(default = "default_jobs_per_page", rename = "per_page")]
+    per: u64,
+}
+
+impl From<JobsQuery> for JobAdminQuery {
+    fn from(query: JobsQuery) -> Self {
+        Self {
+            enqueued_page: query.enqueued.max(1),
+            running_page: query.running.max(1),
+            completed_page: query.completed.max(1),
+            failed_page: query.failed.max(1),
+            per_page: query.per.clamp(1, 100),
+        }
+    }
+}
+
 const fn default_page() -> u64 {
     1
+}
+
+const fn default_jobs_per_page() -> u64 {
+    25
 }
 
 // ── Shared resolution ───────────────────────────────────────────────
@@ -295,7 +331,112 @@ async fn dashboard(
     )))
 }
 
-/// `GET /admin/{slug}` — Model list view.
+/// `GET /admin/jobs` -- built-in background jobs dashboard.
+async fn jobs_dashboard(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    Query(query): Query<JobsQuery>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let mut snapshot = match job_admin_backend(&state) {
+        Some(backend) => backend.snapshot(query.into()).await?,
+        None => JobAdminSnapshot::empty(),
+    };
+    snapshot.schedules = scheduled_job_summaries(&state);
+    let messages = flash.consume().await;
+
+    Ok(render(templates::jobs_page(
+        &registry,
+        &snapshot,
+        &messages,
+        csrf.token(),
+        &prefix,
+        &actuator_prefix,
+    )))
+}
+
+/// `GET /admin/jobs/counters` -- HTMX counter refresh fragment.
+async fn jobs_counters(
+    State(state): State<AppState>,
+    Query(query): Query<JobsQuery>,
+) -> AutumnResult<Response> {
+    let mut snapshot = match job_admin_backend(&state) {
+        Some(backend) => backend.snapshot(query.into()).await?,
+        None => JobAdminSnapshot::empty(),
+    };
+    snapshot.schedules = scheduled_job_summaries(&state);
+    Ok(render(templates::jobs_counters(&snapshot)))
+}
+
+/// `POST /admin/jobs/{id}/retry` -- retry a failed job.
+async fn job_retry(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.retry(&id).await?;
+    flash.success(format!("Retried job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+/// `POST /admin/jobs/{id}/discard` -- discard a failed job.
+async fn job_discard(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.discard(&id).await?;
+    flash.success(format!("Discarded job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+/// `POST /admin/jobs/{id}/cancel` -- cancel a job that has not started.
+async fn job_cancel(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.cancel(&id).await?;
+    flash.success(format!("Canceled job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+fn scheduled_job_summaries(state: &AppState) -> Vec<JobScheduleSummary> {
+    let mut schedules: Vec<_> = state
+        .task_registry()
+        .snapshot()
+        .into_iter()
+        .map(|(name, status)| {
+            let last_run_status = status
+                .last_error
+                .as_ref()
+                .map(|error| format!("failed: {error}"))
+                .or(status.last_result);
+            JobScheduleSummary {
+                name,
+                schedule: status.schedule,
+                next_run_at: status.next_run_at,
+                last_run_status,
+            }
+        })
+        .collect();
+    schedules.sort_by(|a, b| a.name.cmp(&b.name));
+    schedules
+}
+
+/// `GET /admin/{slug}` -- Model list view.
 #[allow(clippy::too_many_arguments)]
 async fn model_list(
     State(state): State<AppState>,
@@ -721,7 +862,12 @@ fn parse_form_bool(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_web::job::{JobAdminBackendEntry, JobAdminMemoryBackend};
+    use autumn_web::session::Session;
+    use axum::body::Body;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
 
     fn fields(specs: &[(&'static str, AdminFieldKind)]) -> Vec<AdminField> {
         specs
@@ -729,6 +875,56 @@ mod tests {
             .cloned()
             .map(|(name, kind)| AdminField::new(name, kind))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn jobs_route_renders_without_database_pool() {
+        let backend = JobAdminMemoryBackend::new();
+        let state =
+            AppState::for_test().with_extension(JobAdminBackendEntry(std::sync::Arc::new(backend)));
+        state.task_registry().register_scheduled(
+            "cleanup",
+            "every 60s",
+            autumn_web::task::TaskCoordination::Fleet,
+            "local",
+            "replica-a",
+        );
+        state
+            .task_registry()
+            .record_next_run_at("cleanup", "2026-05-08T12:00:00Z");
+        let session = Session::new_for_test("sid".to_owned(), HashMap::new());
+        let app = admin_router(
+            std::sync::Arc::new(AdminRegistry::new()),
+            "/admin",
+            "/actuator".to_owned(),
+            "user_id".to_owned(),
+            None,
+        )
+        .layer(axum::Extension(session))
+        .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/jobs")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(html.contains("Jobs"), "html: {html}");
+        assert!(html.contains("Enqueued"), "html: {html}");
+        assert!(
+            html.contains(r#"hx-get="/admin/jobs/counters""#),
+            "html: {html}"
+        );
+        assert!(html.contains("cleanup"), "html: {html}");
+        assert!(html.contains("2026-05-08T12:00:00Z"), "html: {html}");
     }
 
     #[test]
