@@ -35,6 +35,24 @@ const FLASH_CSS: &str = "\
 /// Admin-specific styles that build on the plugin's shared tokens
 /// ([`TOKENS_CSS`]) and flash styles ([`FLASH_CSS`]).
 const ADMIN_CSS: &str = "
+    /* Skip-to-content link: visually hidden at rest, revealed on keyboard focus. */
+    .admin-skip-link {
+        position: absolute;
+        top: -9999px;
+        left: 0;
+        z-index: 9999;
+        padding: 0.5rem 1rem;
+        background: var(--primary);
+        color: #fff;
+        border-radius: 0 0 0.25rem 0.25rem;
+        font-size: 0.875rem;
+        text-decoration: none;
+    }
+    .admin-skip-link:focus {
+        top: 0;
+        outline: 3px solid var(--primary);
+        outline-offset: 2px;
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
         font-family: var(--font-family);
@@ -365,35 +383,41 @@ pub fn admin_layout(
                 }
             }
             body {
+                // Skip-to-content link — first focusable element for keyboard users.
+                a href="#admin-main" class="admin-skip-link" { "Skip to main content" }
                 div class="admin-layout" {
-                    // Sidebar
-                    nav class="admin-sidebar" {
-                        div class="admin-logo" { "🍂 Autumn Admin" }
-                        ul class="admin-nav" {
-                            li {
-                                a href=(prefix) class=[active_slug.is_none().then_some("active")] {
-                                    "Dashboard"
+                    // Sidebar navigation landmark
+                    header role="banner" {
+                        nav class="admin-sidebar" aria-label="Admin navigation" {
+                            div class="admin-logo" { "🍂 Autumn Admin" }
+                            ul class="admin-nav" {
+                                li {
+                                    a href=(prefix) class=[active_slug.is_none().then_some("active")] {
+                                        "Dashboard"
+                                    }
                                 }
-                            }
-                            @if registry.model_count() > 0 {
-                                li { div class="admin-nav-section" { "Models" } }
-                                @for (slug, model) in registry.iter() {
-                                    li {
-                                        a href={ (prefix) "/" (slug) }
-                                          class=[(active_slug == Some(slug)).then_some("active")] {
-                                            (model.display_name_plural())
+                                @if registry.model_count() > 0 {
+                                    li { div class="admin-nav-section" { "Models" } }
+                                    @for (slug, model) in registry.iter() {
+                                        li {
+                                            a href={ (prefix) "/" (slug) }
+                                              class=[(active_slug == Some(slug)).then_some("active")] {
+                                                (model.display_name_plural())
+                                            }
                                         }
                                     }
                                 }
+                                li { div class="admin-nav-section" { "System" } }
+                                li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
                             }
-                            li { div class="admin-nav-section" { "System" } }
-                            li { a href={ (actuator_prefix) "/ui" } { "Actuator" } }
                         }
                     }
-                    // Main content
-                    main class="admin-main" {
+                    // Main content landmark
+                    main id="admin-main" class="admin-main" {
                         @for msg in messages {
-                            div class={ "flash flash-" (msg.level.as_str()) } { (msg.message) }
+                            div class={ "flash flash-" (msg.level.as_str()) } role="alert" {
+                                (msg.message)
+                            }
                         }
                         (content)
                     }
