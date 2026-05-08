@@ -203,7 +203,7 @@ pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
         ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
         ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
         ("POST", format!("{prefix}/{{slug}}/actions")),
-        ("GET", format!("{prefix}/static/admin.{{hash}}.js")),
+        ("GET", format!("{prefix}{}", &*routes::ADMIN_JS_PATH)),
     ]
     .into_iter()
     .map(|(method, path)| RouteInfo {
