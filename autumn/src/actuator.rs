@@ -1961,6 +1961,34 @@ mod tests {
     }
 
     #[test]
+    fn log_levels_get_current_level_returns_correct_level() {
+        let log_levels = LogLevels::new("trace");
+        assert_eq!(log_levels.current_level(), "trace");
+
+        let log_levels2 = LogLevels::new("debug");
+        assert_eq!(log_levels2.current_level(), "debug");
+    }
+
+    #[test]
+    fn log_levels_set_logger_level_boundary() {
+        let log_levels = LogLevels::new("info");
+
+        // Fill up to exactly 1000 items
+        for i in 0..1000 {
+            let _ = log_levels.set_logger_level(&format!("logger_{i}"), "debug");
+        }
+
+        // At exactly 1000, setting a new key should fail
+        assert_eq!(log_levels.set_logger_level("logger_new", "debug"), None);
+
+        // At exactly 1000, setting an existing key should succeed
+        assert_eq!(
+            log_levels.set_logger_level("logger_0", "trace"),
+            Some("debug".to_string())
+        );
+    }
+
+    #[test]
     fn log_levels_set_and_get() {
         let levels = LogLevels::new("info");
         assert_eq!(levels.current_level(), "info");
@@ -2171,6 +2199,120 @@ mod tests {
     }
 
     #[test]
+    fn job_registry_record_arithmetic() {
+        let registry = JobRegistry::new();
+        registry.register("my_job");
+        registry.record_enqueue("my_job");
+        registry.record_enqueue("my_job");
+
+        let mut snapshot = registry.snapshot();
+        assert_eq!(snapshot.get("my_job").unwrap().queued, 2);
+
+        registry.record_start("my_job");
+        registry.record_start("my_job");
+
+        snapshot = registry.snapshot();
+        assert_eq!(snapshot.get("my_job").unwrap().queued, 0);
+        assert_eq!(snapshot.get("my_job").unwrap().in_flight, 2);
+
+        registry.record_success("my_job");
+        registry.record_success("my_job");
+
+        snapshot = registry.snapshot();
+        assert_eq!(snapshot.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(snapshot.get("my_job").unwrap().total_successes, 2);
+    }
+
+    #[test]
+    fn job_registry_record_failure_retry_arithmetic() {
+        let registry = JobRegistry::new();
+        registry.register("my_job");
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_retry("my_job", "err", 1);
+        registry.record_retry("my_job", "err2", 2);
+
+        let mut snapshot = registry.snapshot();
+        let job = snapshot.get("my_job").unwrap();
+        assert_eq!(job.in_flight, 0);
+        assert_eq!(job.last_error.as_deref(), Some("err2"));
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_failure("my_job", "err".to_string(), true);
+        registry.record_failure("my_job", "err2".to_string(), true);
+
+        snapshot = registry.snapshot();
+        let job = snapshot.get("my_job").unwrap();
+        assert_eq!(job.in_flight, 0);
+        assert_eq!(job.total_failures, 2);
+        assert_eq!(job.dead_letters, 2);
+        assert_eq!(job.last_error.as_deref(), Some("err2"));
+    }
+
+    #[test]
+    fn job_registry_record_enqueue_when_missing() {
+        let registry = JobRegistry::new();
+        registry.record_enqueue("missing_job"); // Shouldn't panic, DOES create it
+        assert!(registry.snapshot().contains_key("missing_job"));
+    }
+
+    #[test]
+    fn job_registry_record_start_when_missing() {
+        let registry = JobRegistry::new();
+        registry.record_start("missing_job"); // Should not create
+        assert!(!registry.snapshot().contains_key("missing_job"));
+    }
+
+    #[test]
+    fn job_registry_record_success_when_missing() {
+        let registry = JobRegistry::new();
+        registry.record_success("missing_job"); // Should not create
+        assert!(!registry.snapshot().contains_key("missing_job"));
+    }
+
+    #[test]
+    fn job_registry_record_retry_when_missing() {
+        let registry = JobRegistry::new();
+        registry.record_retry("missing_job", "err", 1); // Should not create
+        assert!(!registry.snapshot().contains_key("missing_job"));
+    }
+
+    #[test]
+    fn job_registry_record_failure_when_missing() {
+        let registry = JobRegistry::new();
+        registry.record_failure("missing_job", "err".to_string(), true); // Should not create
+        assert!(!registry.snapshot().contains_key("missing_job"));
+    }
+
+    #[test]
+    fn task_registry_record_failure_arithmetic() {
+        let registry = TaskRegistry::new();
+        registry.register("my_task", "every 5m");
+        registry.record_failure("my_task", 100, "err");
+        registry.record_failure("my_task", 50, "err2");
+        let snapshot = registry.snapshot();
+        let task = snapshot.get("my_task").unwrap();
+        assert_eq!(task.total_failures, 2);
+        assert_eq!(task.last_duration_ms, Some(50));
+        assert_eq!(task.last_error.as_deref(), Some("err2"));
+    }
+
+    #[test]
+    fn task_registry_record_success_arithmetic() {
+        let registry = TaskRegistry::new();
+        registry.register("my_task", "every 5m");
+        registry.record_success("my_task", 100);
+        registry.record_success("my_task", 50);
+        let snapshot = registry.snapshot();
+        let task = snapshot.get("my_task").unwrap();
+        assert_eq!(task.total_runs, 2);
+        assert_eq!(task.last_duration_ms, Some(50));
+        assert_eq!(task.last_error, None);
+    }
+
+    #[test]
     fn task_registry_empty_snapshot() {
         let registry = TaskRegistry::new();
         assert!(registry.snapshot().is_empty());
@@ -2250,6 +2392,59 @@ mod tests {
             "custom_profile",
         );
         assert_eq!(props["log.level"].source, "autumn.toml");
+    }
+
+    #[test]
+    fn configprops_tracks_env_override() {
+        // temp_env allows safe thread-local environment manipulation in tests
+        temp_env::with_var("AUTUMN_TEST__PROP", Some("my_val"), || {
+            let mut props = HashMap::new();
+            ConfigProperties::track_property(&mut props, "test.prop", "my_val", "my_val", "dev");
+            assert_eq!(props.get("test.prop").unwrap().source, "AUTUMN_TEST__PROP");
+        });
+    }
+
+    #[test]
+    fn configprops_track_property_boundaries() {
+        let mut props = HashMap::new();
+        // value == default_value => autumn.toml or default? Default.
+        ConfigProperties::track_property(&mut props, "test.prop", "val", "val", "dev");
+        assert_eq!(props.get("test.prop").unwrap().source, "default");
+
+        // value != default_value, profile is prod => profile_default:prod
+        ConfigProperties::track_property(&mut props, "test.prop", "val", "other", "prod");
+        assert_eq!(
+            props.get("test.prop").unwrap().source,
+            "profile_default:prod"
+        );
+
+        // value != default_value, profile is dev => profile_default:dev
+        ConfigProperties::track_property(&mut props, "test.prop", "val", "other", "dev");
+        assert_eq!(
+            props.get("test.prop").unwrap().source,
+            "profile_default:dev"
+        );
+
+        // value != default_value, profile is custom => autumn.toml
+        ConfigProperties::track_property(&mut props, "test.prop", "val", "other", "custom");
+        assert_eq!(props.get("test.prop").unwrap().source, "autumn.toml");
+    }
+
+    #[test]
+    fn configprops_tracks_profile_default_prod() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "test.prop", "my_val", "other_val", "prod");
+        assert_eq!(
+            props.get("test.prop").unwrap().source,
+            "profile_default:prod"
+        );
+    }
+
+    #[test]
+    fn configprops_tracks_autumn_toml_for_other_profiles() {
+        let mut props = HashMap::new();
+        ConfigProperties::track_property(&mut props, "test.prop", "my_val", "other_val", "custom");
+        assert_eq!(props.get("test.prop").unwrap().source, "autumn.toml");
     }
 
     #[test]
