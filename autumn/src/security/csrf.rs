@@ -47,7 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::{Request, Response, StatusCode};
 use http::header::HeaderName;
 
@@ -125,6 +125,20 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             "CSRF token not found in request extensions. Is CsrfLayer enabled?",
         ))
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for CsrfToken
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
     }
 }
 

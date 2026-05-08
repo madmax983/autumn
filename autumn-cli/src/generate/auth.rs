@@ -403,7 +403,7 @@ pub async fn signup_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
             button type="submit" {{ "Sign Up" }}
         }}
         p {{ a href="/login" {{ "Already have an account? Log in" }} }}
-    }})))
+    }}))
 }}
 
 #[derive(Deserialize)]
@@ -480,7 +480,7 @@ pub async fn login_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
         }}
         p {{ a href="/signup" {{ "New here? Create an account" }} }}
         p {{ a href="/forgot-password" {{ "Forgot your password?" }} }}
-    }})))
+    }}))
 }}
 
 #[derive(Deserialize)]
@@ -562,7 +562,7 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>) -> A
             @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
-    }})))
+    }}))
 }}
 
 // ── Forgot Password ───────────────────────────────────────────────────────────
@@ -580,7 +580,7 @@ pub async fn forgot_password_form(csrf: Option<CsrfToken>) -> AutumnResult<Marku
             }}
             button type="submit" {{ "Send Reset Link" }}
         }}
-    }})))
+    }}))
 }}
 
 #[derive(Deserialize)]
@@ -648,7 +648,7 @@ pub async fn forgot_password(
             "If that address is registered you'll receive a reset link shortly."
         }}
         p {{ a href="/login" {{ "Back to login" }} }}
-    }})))
+    }}))
 }}
 
 // ── Reset Password ────────────────────────────────────────────────────────────
@@ -676,7 +676,7 @@ pub async fn reset_password_form(
             }}
             button type="submit" {{ "Set New Password" }}
         }}
-    }})))
+    }}))
 }}
 
 #[derive(Deserialize)]
