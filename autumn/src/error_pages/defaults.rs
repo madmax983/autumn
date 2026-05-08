@@ -31,12 +31,7 @@ impl ErrorPageRenderer for DefaultErrorPages {
                         }
                         " could not be found."
                     }
-                    div class="mt-8" {
-                        a href="/"
-                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go to homepage"
-                        }
-                    }
+                    (home_link())
                 }
             },
         )
@@ -61,12 +56,7 @@ impl ErrorPageRenderer for DefaultErrorPages {
                             "Request ID: " (req_id)
                         }
                     }
-                    div class="mt-8" {
-                        a href="/"
-                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go to homepage"
-                        }
-                    }
+                    (home_link())
                 }
             },
         )
@@ -102,12 +92,7 @@ impl ErrorPageRenderer for DefaultErrorPages {
                             }
                         }
                     }
-                    div class="mt-8" {
-                        a href="/"
-                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go to homepage"
-                        }
-                    }
+                    (home_link())
                 }
             },
         )
@@ -135,12 +120,7 @@ impl ErrorPageRenderer for DefaultErrorPages {
                             "Request ID: " (req_id)
                         }
                     }
-                    div class="mt-8" {
-                        a href="/"
-                          class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
-                            "Go to homepage"
-                        }
-                    }
+                    (home_link())
                 }
             },
         )
@@ -148,6 +128,18 @@ impl ErrorPageRenderer for DefaultErrorPages {
 }
 
 /// Shared HTML layout wrapper for all error pages.
+/// Reusable "Go to homepage" button for error pages
+fn home_link() -> Markup {
+    html! {
+        div class="mt-8" {
+            a href="/"
+              class="inline-block px-4 py-2 text-sm font-medium text-white bg-gray-900 dark:bg-gray-100 dark:text-gray-900 rounded-md hover:bg-gray-700 dark:hover:bg-gray-300 transition-colors" {
+                "Go to homepage"
+            }
+        }
+    }
+}
+
 fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
     let status_code = ctx.status.as_u16();
     let reason = ctx.status.canonical_reason().unwrap_or("Error");
