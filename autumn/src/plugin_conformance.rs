@@ -345,14 +345,16 @@ pub fn check_route_prefix(
     }
 }
 
-/// Canonicalize dynamic route segments so that `{user_id}` and `{id}` both
-/// become `{}`, and `{*rest}` becomes `{*}`. Axum matches routes by shape, not
-/// parameter name, so collision detection must do the same.
+/// Canonicalize dynamic route segments before collision detection.
+///
+/// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
+/// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
+/// same path position as a conflict, so they must map to the same key.
 fn normalize_path_for_collision(path: &str) -> String {
     path.split('/')
         .map(|seg| {
             if seg.starts_with('{') && seg.ends_with('}') {
-                if seg.starts_with("{*") { "{*}" } else { "{}" }
+                "{}"
             } else {
                 seg
             }
@@ -862,12 +864,13 @@ mod tests {
             CheckStatus::Fail,
             "different catch-all names should collide"
         );
-        assert_eq!(diagnostics[0].path, "/files/{*}");
+        assert_eq!(diagnostics[0].path, "/files/{}");
     }
 
     #[test]
-    fn collisions_catchall_vs_param_not_collapsed() {
-        // {*rest} matches multiple segments; {id} matches one — different shapes.
+    fn collisions_catchall_vs_named_param_detected() {
+        // matchit treats {id} and {*rest} at the same position as a conflict:
+        // inserting /src/{file} after /src/{*filepath} returns InsertError::Conflict.
         let routes = vec![
             make_route("GET", "/files/{id}", RouteSource::User),
             make_route("GET", "/files/{*rest}", plugin("storage")),
@@ -875,8 +878,8 @@ mod tests {
         let (result, _) = check_collisions(&routes);
         assert_eq!(
             result.status,
-            CheckStatus::Pass,
-            "catch-all and single-segment params are different shapes"
+            CheckStatus::Fail,
+            "catch-all and named param at same position conflict in matchit"
         );
     }
 
@@ -886,7 +889,7 @@ mod tests {
             normalize_path_for_collision("/users/{user_id}/posts/{post_id}"),
             "/users/{}/posts/{}"
         );
-        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{*}");
+        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{}");
         assert_eq!(
             normalize_path_for_collision("/static/app.js"),
             "/static/app.js"

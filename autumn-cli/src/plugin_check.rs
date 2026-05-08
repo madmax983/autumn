@@ -431,7 +431,7 @@ fn normalize_path_for_collision(path: &str) -> String {
     path.split('/')
         .map(|seg| {
             if seg.starts_with('{') && seg.ends_with('}') {
-                if seg.starts_with("{*") { "{*}" } else { "{}" }
+                "{}"
             } else {
                 seg
             }
@@ -659,7 +659,8 @@ mod tests {
     }
 
     #[test]
-    fn collisions_catchall_vs_param_not_collapsed() {
+    fn collisions_catchall_vs_named_param_detected() {
+        // matchit treats {id} and {*rest} at the same position as a conflict.
         let routes = vec![
             make_route("GET", "/files/{id}", "user"),
             make_route("GET", "/files/{*rest}", "plugin:storage"),
@@ -667,8 +668,8 @@ mod tests {
         let result = check_collisions(&routes);
         assert_eq!(
             result.status,
-            CheckStatus::Pass,
-            "catch-all and single-segment params are different shapes"
+            CheckStatus::Fail,
+            "catch-all and named param at same position conflict in matchit"
         );
     }
 
@@ -678,7 +679,7 @@ mod tests {
             normalize_path_for_collision("/users/{user_id}/posts/{post_id}"),
             "/users/{}/posts/{}"
         );
-        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{*}");
+        assert_eq!(normalize_path_for_collision("/files/{*rest}"), "/files/{}");
         assert_eq!(
             normalize_path_for_collision("/static/app.js"),
             "/static/app.js"
