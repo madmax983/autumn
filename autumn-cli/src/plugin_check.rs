@@ -239,8 +239,11 @@ fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResu
     if plugin_routes.is_empty() {
         return CheckResult {
             name: "route-attribution".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!("No routes attributed to plugin:{plugin_name}"),
+            status: CheckStatus::Fail,
+            message: format!(
+                "No routes attributed to plugin:{plugin_name} — \
+                 check the plugin name or call AppBuilder::declare_plugin_routes"
+            ),
             diagnostics: vec![],
         };
     }
@@ -272,7 +275,10 @@ fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> 
 
     let off_prefix: Vec<String> = plugin_routes
         .iter()
-        .filter(|r| !r.path.starts_with(prefix))
+        .filter(|r| {
+            let p = &r.path;
+            p != prefix && !p.starts_with(&format!("{prefix}/"))
+        })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
 
@@ -495,10 +501,15 @@ mod tests {
     }
 
     #[test]
-    fn attribution_no_plugin_routes_skips() {
+    fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", "user")];
         let result = check_route_attribution("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Skip);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("plugin:admin"),
+            "message should name the plugin: {}",
+            result.message
+        );
     }
 
     #[test]

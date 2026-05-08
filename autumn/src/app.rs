@@ -838,10 +838,10 @@ impl AppBuilder {
     ) -> Self {
         let source = self
             .current_plugin
-            .as_ref()
-            .cloned()
-            .map(crate::route_listing::RouteSource::Plugin)
-            .unwrap_or(crate::route_listing::RouteSource::User);
+            .as_deref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            });
         for mut route in routes {
             route.source = source.clone();
             self.declared_routes.push(route);

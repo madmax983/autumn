@@ -194,7 +194,7 @@ impl Plugin for AdminPlugin {
 /// added or removed from the admin router.
 pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
     [
-        ("GET", format!("{prefix}")),
+        ("GET", prefix.to_string()),
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
         ("GET", format!("{prefix}/{{slug}}/new")),

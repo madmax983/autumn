@@ -181,18 +181,21 @@ pub struct ConformanceReport {
 impl ConformanceReport {
     /// Returns `true` when no check has `CheckStatus::Fail`.
     /// Skipped checks do not count as failures.
+    #[must_use]
     pub fn passed(&self) -> bool {
         self.checks.iter().all(|c| c.status != CheckStatus::Fail)
     }
 
     /// Render the report as a human-readable text string.
+    #[must_use]
     pub fn to_text_report(&self) -> String {
         let mut out = String::new();
         let overall = if self.passed() { "PASS" } else { "FAIL" };
-        out.push_str(&format!(
-            "Plugin conformance: {} — {}\n",
-            self.plugin_name, overall
-        ));
+        out.push_str("Plugin conformance: ");
+        out.push_str(&self.plugin_name);
+        out.push_str(" — ");
+        out.push_str(overall);
+        out.push('\n');
         out.push_str(&"─".repeat(60));
         out.push('\n');
         for check in &self.checks {
@@ -201,12 +204,18 @@ impl ConformanceReport {
                 CheckStatus::Fail => "✗",
                 CheckStatus::Skip => "−",
             };
-            out.push_str(&format!(
-                "{icon} [{}] {}: {}\n",
-                check.status, check.name, check.message
-            ));
+            out.push_str(icon);
+            out.push_str(" [");
+            out.push_str(&check.status.to_string());
+            out.push_str("] ");
+            out.push_str(&check.name);
+            out.push_str(": ");
+            out.push_str(&check.message);
+            out.push('\n');
             for diag in &check.diagnostics {
-                out.push_str(&format!("  → {diag}\n"));
+                out.push_str("  → ");
+                out.push_str(diag);
+                out.push('\n');
             }
         }
         out.push_str(&"─".repeat(60));
@@ -219,7 +228,8 @@ impl ConformanceReport {
                 .iter()
                 .filter(|c| c.status == CheckStatus::Fail)
                 .count();
-            out.push_str(&format!("{fails} check(s) failed.\n"));
+            out.push_str(&fails.to_string());
+            out.push_str(" check(s) failed.\n");
         }
         out
     }
@@ -253,6 +263,7 @@ fn is_sensitive_path(path: &str) -> bool {
 /// `Plugin("<plugin_name>")` source.
 ///
 /// Returns `Skip` when no routes at all are attributed to the plugin.
+#[must_use]
 pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     let plugin_routes: Vec<&RouteInfo> = routes
         .iter()
@@ -283,6 +294,7 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 ///
 /// Routes listed in `intentional_root` (exact path match) are exempt.
 /// Returns `Skip` when no routes are attributed to the plugin.
+#[must_use]
 pub fn check_route_prefix(
     plugin_name: &str,
     prefix: &str,
@@ -389,11 +401,14 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
     }
 }
 
-/// Check that plugin routes with sensitive-sounding paths (containing `admin`,
-/// `debug`, `credential`, `operator`, `secret`, or `metrics`) are declared in
+/// Check that sensitive-sounding plugin routes are declared with an auth mechanism.
+///
+/// "Sensitive" paths contain segments matching `admin`, `debug`, `credential`,
+/// `operator`, `secret`, or `metrics`. Each must appear in
 /// `ConformanceConfig::sensitive_routes` with a non-empty `auth_mechanism`.
 ///
 /// Returns `Pass` when no sensitive-named plugin routes are found.
+#[must_use]
 pub fn check_sensitive_surfaces(
     plugin_name: &str,
     routes: &[RouteInfo],
@@ -463,6 +478,7 @@ pub fn check_sensitive_surfaces(
 /// Detects (method, path) pairs that appear more than once among routes
 /// attributed to the named plugin. Returns `Skip` when no routes are
 /// attributed to the plugin.
+#[must_use]
 pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     use std::collections::HashMap;
 
@@ -529,6 +545,7 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 /// 3. `route-collision` — no two routes share (method, path)
 /// 4. `sensitive-surfaces` — sensitive-named plugin routes are declared with auth
 /// 5. `duplicate-registration` — plugin routes are not registered more than once
+#[must_use]
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();
 
