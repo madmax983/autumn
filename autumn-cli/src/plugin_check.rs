@@ -67,10 +67,11 @@ impl ConformanceReport {
     pub fn to_text_report(&self) -> String {
         let mut out = String::new();
         let overall = if self.passed() { "PASS" } else { "FAIL" };
-        out.push_str(&format!(
-            "Plugin conformance: {} \u{2014} {}\n",
-            self.plugin_name, overall
-        ));
+        out.push_str("Plugin conformance: ");
+        out.push_str(&self.plugin_name);
+        out.push_str(" \u{2014} ");
+        out.push_str(overall);
+        out.push('\n');
         out.push_str(&"\u{2500}".repeat(60));
         out.push('\n');
         for check in &self.checks {
@@ -79,12 +80,18 @@ impl ConformanceReport {
                 CheckStatus::Fail => "\u{2717}",
                 CheckStatus::Skip => "\u{2212}",
             };
-            out.push_str(&format!(
-                "{icon} [{}] {}: {}\n",
-                check.status, check.name, check.message
-            ));
+            out.push_str(icon);
+            out.push_str(" [");
+            out.push_str(&check.status.to_string());
+            out.push_str("] ");
+            out.push_str(&check.name);
+            out.push_str(": ");
+            out.push_str(&check.message);
+            out.push('\n');
             for diag in &check.diagnostics {
-                out.push_str(&format!("  \u{2192} {diag}\n"));
+                out.push_str("  \u{2192} ");
+                out.push_str(diag);
+                out.push('\n');
             }
         }
         out.push_str(&"\u{2500}".repeat(60));
@@ -97,7 +104,8 @@ impl ConformanceReport {
                 .iter()
                 .filter(|c| c.status == CheckStatus::Fail)
                 .count();
-            out.push_str(&format!("{fails} check(s) failed.\n"));
+            out.push_str(&fails.to_string());
+            out.push_str(" check(s) failed.\n");
         }
         out
     }

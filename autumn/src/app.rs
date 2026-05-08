@@ -2032,10 +2032,10 @@ impl AppBuilder {
         } = self;
 
         // Raw Axum routers registered via .merge()/.nest() are opaque: there is
-        // no public API to enumerate their routes. Warn only when no plugin has
-        // called declare_plugin_routes() to cover them.
+        // no public API to enumerate their routes. Always warn so callers know
+        // some routes may be missing even if declare_plugin_routes was used.
         let hidden = merge_routers.len() + nest_routers.len();
-        if hidden > 0 && declared_routes.is_empty() {
+        if hidden > 0 {
             eprintln!(
                 "[autumn routes] warning: {hidden} raw router(s) added via \
                  .merge()/.nest() are not enumerable and are omitted from this listing"

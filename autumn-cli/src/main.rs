@@ -429,6 +429,7 @@ fn main() {
     run_command(cli.command);
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_command(command: Commands) {
     match command {
         Commands::Build { debug, package } => build::run(debug, package.as_deref()),

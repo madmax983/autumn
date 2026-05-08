@@ -273,8 +273,11 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
     if plugin_routes.is_empty() {
         return CheckResult {
             name: "route-attribution".to_owned(),
-            status: CheckStatus::Skip,
-            message: format!("No routes attributed to plugin:{plugin_name}"),
+            status: CheckStatus::Fail,
+            message: format!(
+                "No routes attributed to plugin:{plugin_name} — \
+                 check the plugin name or call AppBuilder::declare_plugin_routes"
+            ),
             diagnostics: vec![],
         };
     }
@@ -315,9 +318,10 @@ pub fn check_route_prefix(
         };
     }
 
+    let under_prefix = |path: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
     let off_prefix: Vec<String> = plugin_routes
         .iter()
-        .filter(|r| !r.path.starts_with(prefix) && !intentional_root.contains(&r.path))
+        .filter(|r| !under_prefix(&r.path) && !intentional_root.contains(&r.path))
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
 
@@ -610,10 +614,15 @@ mod tests {
     }
 
     #[test]
-    fn attribution_no_plugin_routes_skips() {
+    fn attribution_no_plugin_routes_fails() {
         let routes = vec![make_route("GET", "/posts", RouteSource::User)];
         let result = check_route_attribution("admin", &routes);
-        assert_eq!(result.status, CheckStatus::Skip);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("plugin:admin"),
+            "message should name the plugin: {}",
+            result.message
+        );
     }
 
     #[test]
@@ -687,6 +696,24 @@ mod tests {
         ];
         let intentional = vec!["/webhook".to_owned()];
         let result = check_route_prefix("admin", "/admin", &intentional, &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn prefix_sibling_path_with_same_string_prefix_fails() {
+        let routes = vec![make_route("GET", "/administer/settings", plugin("admin"))];
+        let result = check_route_prefix("admin", "/admin", &[], &routes);
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "/administer/settings should not pass /admin prefix check"
+        );
+    }
+
+    #[test]
+    fn prefix_exact_match_passes() {
+        let routes = vec![make_route("GET", "/admin", plugin("admin"))];
+        let result = check_route_prefix("admin", "/admin", &[], &routes);
         assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
     }
 
