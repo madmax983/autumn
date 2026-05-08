@@ -321,9 +321,15 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Collect mailer preview registrations into an `AppBuilder`.
+#[cfg(feature = "mail")]
+pub use autumn_macros::mail_previews;
 /// Generate ergonomic `send_*` and `deliver_later_*` helpers for mailer impls.
 #[cfg(feature = "mail")]
 pub use autumn_macros::mailer;
+/// Register zero-argument mail template previews for the dev mail UI.
+#[cfg(feature = "mail")]
+pub use autumn_macros::mailer_preview;
 /// Set up the Tokio async runtime for an Autumn application.
 ///
 /// A thin wrapper around `#[tokio::main]`. The real framework setup

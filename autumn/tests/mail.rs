@@ -41,6 +41,30 @@ from = "noreply@example.com"
 }
 
 #[test]
+fn prod_profile_rejects_forced_mail_preview() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("autumn.toml"),
+        r#"
+[mail]
+transport = "file"
+preview = true
+"#,
+    )
+    .expect("write config");
+    let env = MockEnv::new()
+        .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap())
+        .with("AUTUMN_PROFILE", "prod");
+
+    let error = AutumnConfig::load_with_env(&env).expect_err("prod preview must fail");
+
+    assert!(
+        error.to_string().contains("mail.preview"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn dev_mail_table_without_transport_defaults_to_log() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(

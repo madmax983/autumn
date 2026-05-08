@@ -1801,6 +1801,7 @@ impl AutumnConfig {
             "AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION",
             &mut self.mail.allow_in_process_deliver_later_in_production,
         );
+        parse_env_bool(env, "AUTUMN_MAIL__PREVIEW", &mut self.mail.preview);
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }

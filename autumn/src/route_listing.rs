@@ -168,6 +168,32 @@ pub(crate) fn append_framework_routes(
         });
     }
 
+    #[cfg(feature = "mail")]
+    if config
+        .mail
+        .preview_routes_enabled(config.profile.as_deref())
+    {
+        for (path, handler) in [
+            (crate::mail::MAIL_PREVIEW_PATH, "mail_preview"),
+            (
+                "/_autumn/mail/messages/{message_id}",
+                "mail_preview_message",
+            ),
+            (
+                "/_autumn/mail/previews/{mailer}/{method}",
+                "mail_preview_template",
+            ),
+        ] {
+            infos.push(RouteInfo {
+                method: "GET".to_owned(),
+                path: path.to_owned(),
+                handler: handler.to_owned(),
+                source: RouteSource::Framework,
+                middleware: Vec::new(),
+            });
+        }
+    }
+
     // Static file serving is unconditionally mounted at /static.
     infos.push(RouteInfo {
         method: "GET".to_owned(),

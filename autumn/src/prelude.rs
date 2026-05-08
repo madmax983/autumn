@@ -26,8 +26,6 @@
 pub use crate::Redirect;
 /// Typed path helper extension trait (`.with_query()`).
 pub use crate::paths::PathExt;
-#[cfg(feature = "mail")]
-pub use autumn_macros::mailer;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
@@ -37,6 +35,8 @@ pub use autumn_macros::{
     patch, paths, post, put, routes, scheduled, secured, service, static_get, static_routes, task,
     tasks,
 };
+#[cfg(feature = "mail")]
+pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 
 // ── Rendering ────────────────────────────────────────────────────
 /// Resolve a logical static asset path to a fingerprinted URL in release builds.
@@ -72,8 +72,8 @@ pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
-    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
-    SmtpConfig, TlsMode, Transport,
+    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
+    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};

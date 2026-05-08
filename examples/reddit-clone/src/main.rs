@@ -8,6 +8,7 @@
 //   Mutation hooks      -> before_create / before_update lifecycle hooks
 //   Authentication      -> Session cookies, bcrypt hashing, session.rotate_id()
 //   Transactional Email -> Mailer extractor + #[mailer] welcome email template
+//   Mail previews       -> dev-only /_autumn/mail preview registration
 //   Authorization       -> #[secured] macro for route protection
 //   CSRF protection     -> CsrfToken extractor in forms
 //   Validation          -> #[validate(length(min, max))] on model fields
@@ -71,6 +72,7 @@ async fn main() {
             repositories::post_api_list,
             repositories::post_api_get,
         ])
+        .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)
         .static_routes(static_routes![routes::about::about])
         .tasks(tasks![
