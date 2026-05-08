@@ -15,17 +15,19 @@
 use std::path::Path;
 
 use super::emit::Plan;
-use super::model::plan_cargo_deps;
+use super::model::ensure_cargo_dependencies;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{add_mod_declaration, append_schema_table, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra Cargo dependencies the auth generator needs on top of the model deps.
 const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
+    ("axum", "\"0.7\""),
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
     ("sha2", "{ version = \"0.10\", features = [] }"),
     ("hex", "\"0.4\""),
     ("rand", "{ version = \"0.9\", features = [\"os_rng\"] }"),
+    ("tracing", "\"0.1\""),
 ];
 
 /// Compute the file actions for `autumn generate auth`.
@@ -127,13 +129,20 @@ pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Pla
     let updated = update_main_rs(&main_existing, &["models", "routes", "schema"], &entries);
     plan.modify(main_path, updated);
 
-    // ── Cargo.toml deps ───────────────────────────────────────────────────
+    // ── Cargo.toml deps + autumn-web/mail feature ─────────────────────────
+    let cargo_toml_path = project_root.join("Cargo.toml");
+    let cargo_existing = read_or_empty(&cargo_toml_path);
     let all_deps: Vec<(&str, &str)> = super::model::MODEL_DEPS
         .iter()
         .copied()
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .collect();
-    plan_cargo_deps(&mut plan, project_root, &all_deps);
+    // Apply dep additions then enable the mail feature in a single write.
+    let with_deps = ensure_cargo_dependencies(&cargo_existing, &all_deps);
+    let final_cargo = ensure_autumn_web_mail_feature(&with_deps);
+    if final_cargo != cargo_existing {
+        plan.modify(cargo_toml_path, final_cargo);
+    }
 
     Ok(plan)
 }
@@ -160,6 +169,123 @@ pub fn run(name: &str, flags: Flags) {
 
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Ensure `autumn-web` in `[dependencies]` has `features = ["mail"]`.
+///
+/// Handles the three common forms a fresh Autumn project may use:
+/// - `autumn-web = "x.y"` (simple string)
+/// - `autumn-web = { version = "x.y", ... }` (inline table)
+/// - `[dependencies.autumn-web]` subtable
+fn ensure_autumn_web_mail_feature(toml: &str) -> String {
+    const CRATE: &str = "autumn-web";
+    const FEATURE: &str = "\"mail\"";
+
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let trailing_newline = toml.ends_with('\n');
+
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            // autumn-web = "0.3"
+            let version = rest.trim_end_matches('"');
+            lines[i] =
+                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if trimmed.contains(FEATURE) {
+                break; // already present
+            }
+            if let Some(feat_bracket) = trimmed.find("features = [") {
+                // Add to existing features list.
+                let list_start = feat_bracket + "features = [".len();
+                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
+                let existing = trimmed[list_start..list_end].trim();
+                let new_list = if existing.is_empty() {
+                    FEATURE.to_owned()
+                } else {
+                    format!("{existing}, {FEATURE}")
+                };
+                lines[i] = format!(
+                    "{indent}{}{}{}",
+                    &trimmed[..list_start],
+                    new_list,
+                    &trimmed[list_end..]
+                );
+            } else {
+                // No features key — insert before closing `}`.
+                let close = trimmed.rfind('}').unwrap();
+                let before_close = trimmed[..close].trim_end();
+                let sep = if before_close.ends_with('{') {
+                    ""
+                } else {
+                    ", "
+                };
+                lines[i] = format!(
+                    "{indent}{}{sep}features = [{FEATURE}]{}",
+                    &trimmed[..close],
+                    &trimmed[close..]
+                );
+            }
+            break;
+        }
+
+        if trimmed == subtable_header {
+            // Scan ahead within the subtable.
+            let mut j = i + 1;
+            let mut found_features = false;
+            while j < lines.len() {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with('[') {
+                    break;
+                }
+                if t.starts_with("features") {
+                    found_features = true;
+                    if !t.contains(FEATURE)
+                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
+                    {
+                        let inner = t[open + 1..close].trim();
+                        let new_inner = if inner.is_empty() {
+                            FEATURE.to_owned()
+                        } else {
+                            format!("{inner}, {FEATURE}")
+                        };
+                        let indent_j: String = lines[j]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if !found_features {
+                lines.insert(i + 1, format!("features = [{FEATURE}]"));
+            }
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 // ── Template rendering ────────────────────────────────────────────────────────
@@ -200,6 +326,7 @@ pub struct {pascal_name} {{
     pub password_digest: String,
     pub reset_token_digest: Option<String>,
     pub reset_token_expires_at: Option<NaiveDateTime>,
+    #[default]
     pub created_at: NaiveDateTime,
 }}
 "
@@ -928,7 +1055,11 @@ mod tests {
 
     fn project_with_main() -> TempDir {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.3\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(
             tmp.path().join("src/main.rs"),
@@ -1282,6 +1413,67 @@ mod tests {
         assert!(
             !tmp.path().join("src/routes/auth.rs").exists(),
             "dry run must not create routes file"
+        );
+    }
+
+    // ── Cargo.toml feature injection ────────────────────────────────────────
+
+    #[test]
+    fn cargo_toml_gets_mail_feature_simple_string_form() {
+        let input = "[dependencies]\nautumn-web = \"0.3\"\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(
+            out.contains("features = [\"mail\"]"),
+            "mail feature missing: {out}"
+        );
+        assert_eq!(out.matches("autumn-web =").count(), 1, "must not duplicate");
+    }
+
+    #[test]
+    fn cargo_toml_gets_mail_feature_inline_table_with_existing_features() {
+        let input = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\"ws\"] }\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert!(out.contains("\"mail\""), "mail missing: {out}");
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must be kept: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_mail_feature_idempotent() {
+        let input = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\"mail\"] }\n";
+        let out = ensure_autumn_web_mail_feature(input);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            1,
+            "must not duplicate feature"
+        );
+    }
+
+    #[test]
+    fn model_file_created_at_is_marked_default() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/user.rs")).unwrap();
+        assert!(
+            model.contains("#[default]"),
+            "created_at must be marked #[default] so NewUser excludes it: {model}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_adds_axum_and_tracing_deps() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("axum"), "axum dep missing: {cargo}");
+        assert!(cargo.contains("tracing"), "tracing dep missing: {cargo}");
+        assert!(
+            cargo.contains("\"mail\""),
+            "autumn-web mail feature missing: {cargo}"
         );
     }
 
