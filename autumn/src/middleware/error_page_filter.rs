@@ -29,8 +29,6 @@ pub struct ErrorPageFilter {
 
 impl ExceptionFilter for ErrorPageFilter {
     fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
-        // Check if the original request wanted HTML (stored in extensions
-        // by the error page middleware layer).
         let wants_html = response
             .extensions()
             .get::<WantsHtml>()
@@ -40,76 +38,16 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
-        let request_id = response
-            .extensions()
-            .get::<ErrorPageRequestContext>()
-            .and_then(|ctx| {
-                ctx.request_id
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-            });
-
-        let path = response
-            .extensions()
-            .get::<ErrorPageRequestContext>()
-            .map(|ctx| ctx.uri.path().to_string())
-            .unwrap_or_default();
-
-        let ctx = ErrorContext {
-            status: error.status,
-            message: error.message.clone(),
-            path,
-            request_id: request_id.clone(),
-            details: error.details.clone(),
-            is_dev: self.is_dev,
-        };
-
+        let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
                 .into_string();
 
-        // In dev mode, inject the error badge before </body>
         if self.is_dev {
-            let badge_ctx = DevBadgeContext {
-                status_code: error.status.as_u16(),
-                status_reason: error
-                    .status
-                    .canonical_reason()
-                    .unwrap_or("Error")
-                    .to_string(),
-                message: error.message.clone(),
-                path: ctx.path,
-                request_id,
-                source_location: None,
-            };
-            let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
-            if let Some(pos) = html_body.rfind("</body>") {
-                html_body.insert_str(pos, &badge);
-            } else {
-                html_body.push_str(&badge);
-            }
+            Self::inject_dev_badge(&mut html_body, error, &ctx);
         }
 
-        let content_length = html_body.len();
-
-        let mut resp = (
-            error.status,
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            html_body,
-        )
-            .into_response();
-
-        // Re-attach error info so downstream filters still see it
-        resp.extensions_mut().insert(error.clone());
-
-        // Ensure content-length is set correctly, as middleware might otherwise
-        // drop it in some environments like fallback routes.
-        resp.headers_mut().insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from(content_length),
-        );
-
-        resp
+        Self::build_html_response(error, html_body)
     }
 }
 
@@ -298,6 +236,82 @@ pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::U
 
     crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
         .into_response()
+}
+
+impl ErrorPageFilter {
+    fn build_error_context(
+        error: &AutumnErrorInfo,
+        response: &Response,
+        is_dev: bool,
+    ) -> ErrorContext {
+        let request_id = response
+            .extensions()
+            .get::<ErrorPageRequestContext>()
+            .and_then(|ctx| {
+                ctx.request_id
+                    .as_ref()
+                    .map(std::string::ToString::to_string)
+            });
+
+        let path = response
+            .extensions()
+            .get::<ErrorPageRequestContext>()
+            .map(|ctx| ctx.uri.path().to_string())
+            .unwrap_or_default();
+
+        ErrorContext {
+            status: error.status,
+            message: error.message.clone(),
+            path,
+            request_id,
+            details: error.details.clone(),
+            is_dev,
+        }
+    }
+
+    fn inject_dev_badge(html_body: &mut String, error: &AutumnErrorInfo, ctx: &ErrorContext) {
+        let badge_ctx = DevBadgeContext {
+            status_code: error.status.as_u16(),
+            status_reason: error
+                .status
+                .canonical_reason()
+                .unwrap_or("Error")
+                .to_string(),
+            message: error.message.clone(),
+            path: ctx.path.clone(),
+            request_id: ctx.request_id.clone(),
+            source_location: None,
+        };
+        let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
+        if let Some(pos) = html_body.rfind("</body>") {
+            html_body.insert_str(pos, &badge);
+        } else {
+            html_body.push_str(&badge);
+        }
+    }
+
+    fn build_html_response(error: &AutumnErrorInfo, html_body: String) -> Response {
+        let content_length = html_body.len();
+
+        let mut resp = (
+            error.status,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html_body,
+        )
+            .into_response();
+
+        // Re-attach error info so downstream filters still see it
+        resp.extensions_mut().insert(error.clone());
+
+        // Ensure content-length is set correctly, as middleware might otherwise
+        // drop it in some environments like fallback routes.
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(content_length),
+        );
+
+        resp
+    }
 }
 
 #[cfg(test)]

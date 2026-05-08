@@ -2848,7 +2848,7 @@ impl StorageBootstrap {
 #[cfg(feature = "storage")]
 #[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
 fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
-    use crate::storage::{LocalBlobStore, SharedBlobStore, StorageBackendPlan, local::SigningKey};
+    use crate::storage::StorageBackendPlan;
 
     let plan = config
         .storage
@@ -2871,69 +2871,14 @@ fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
             mount_path,
             default_url_expiry_secs,
             warn_in_production,
-        } => {
-            if warn_in_production {
-                tracing::warn!(
-                    "prod profile is using the local-disk blob store; \
-                     bytes won't survive replica turnover. Set \
-                     storage.backend=s3 or storage.allow_local_in_production=true \
-                     to acknowledge"
-                );
-            }
-            let signing_key = config
-                .storage
-                .local
-                .signing_key
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map_or_else(
-                    || {
-                        if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                            tracing::warn!(
-                                "no storage.local.signing_key configured in prod; \
-                                 generated URLs won't survive a process restart. \
-                                 Set [storage.local].signing_key or \
-                                 AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
-                            );
-                        }
-                        SigningKey::random()
-                    },
-                    |s| SigningKey::new(s.as_bytes().to_vec()),
-                );
-            let store = match LocalBlobStore::new(
-                provider_id.clone(),
-                root.clone(),
-                mount_path.clone(),
-                std::time::Duration::from_secs(default_url_expiry_secs),
-                signing_key,
-            ) {
-                Ok(store) => store,
-                Err(err) => {
-                    // The operator explicitly chose `storage.backend = "local"`
-                    // — a non-writable root means uploads can't possibly
-                    // work, so abort the boot rather than letting upload
-                    // handlers serve 500s after deploy.
-                    tracing::error!(
-                        error = %err,
-                        root = %root.display(),
-                        "failed to initialize local blob store; aborting startup"
-                    );
-                    std::process::exit(1);
-                }
-            };
-            let serving = crate::storage::local::serve_router(&store);
-            let arc: SharedBlobStore = std::sync::Arc::new(store);
-            tracing::info!(
-                provider = %provider_id,
-                root = %root.display(),
-                mount = %mount_path,
-                "Local blob store mounted"
-            );
-            Some(StorageBootstrap {
-                store: arc,
-                serving: Some(serving),
-            })
-        }
+        } => Some(bootstrap_local_storage(
+            config,
+            &provider_id,
+            &root,
+            &mount_path,
+            default_url_expiry_secs,
+            warn_in_production,
+        )),
         StorageBackendPlan::S3 { .. } => {
             // `storage.backend = "s3"` requires the `autumn-storage-s3` plugin.
             // Construct an `S3BlobStore` and register it with `.with_blob_store()`
@@ -2950,6 +2895,84 @@ fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
     }
 }
 
+#[cfg(feature = "storage")]
+fn bootstrap_local_storage(
+    config: &AutumnConfig,
+    provider_id: &str,
+    root: &std::path::Path,
+    mount_path: &str,
+    default_url_expiry_secs: u64,
+    warn_in_production: bool,
+) -> StorageBootstrap {
+    use crate::storage::{LocalBlobStore, SharedBlobStore, local::SigningKey};
+
+    if warn_in_production {
+        tracing::warn!(
+            "prod profile is using the local-disk blob store; \
+             bytes won't survive replica turnover. Set \
+             storage.backend=s3 or storage.allow_local_in_production=true \
+             to acknowledge"
+        );
+    }
+
+    let signing_key = config
+        .storage
+        .local
+        .signing_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                    tracing::warn!(
+                        "no storage.local.signing_key configured in prod; \
+                         generated URLs won't survive a process restart. \
+                         Set [storage.local].signing_key or \
+                         AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
+                    );
+                }
+                SigningKey::random()
+            },
+            |s| SigningKey::new(s.as_bytes().to_vec()),
+        );
+
+    let store = match LocalBlobStore::new(
+        provider_id.to_string(),
+        root.to_path_buf(),
+        mount_path.to_string(),
+        std::time::Duration::from_secs(default_url_expiry_secs),
+        signing_key,
+    ) {
+        Ok(store) => store,
+        Err(err) => {
+            // The operator explicitly chose `storage.backend = "local"`
+            // — a non-writable root means uploads can't possibly
+            // work, so abort the boot rather than letting upload
+            // handlers serve 500s after deploy.
+            tracing::error!(
+                error = %err,
+                root = %root.display(),
+                "failed to initialize local blob store; aborting startup"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let serving = crate::storage::local::serve_router(&store);
+    let arc: SharedBlobStore = std::sync::Arc::new(store);
+
+    tracing::info!(
+        provider = %provider_id,
+        root = %root.display(),
+        mount = %mount_path,
+        "Local blob store mounted"
+    );
+
+    StorageBootstrap {
+        store: arc,
+        serving: Some(serving),
+    }
+}
 async fn load_config_and_telemetry(
     config_loader: Option<ConfigLoaderFactory>,
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
