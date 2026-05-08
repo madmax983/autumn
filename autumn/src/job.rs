@@ -464,23 +464,14 @@ impl JobAdminMemoryBackend {
         }
     }
 
-    fn mark_retried(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.write()
-            && let Some(record) = inner.records.get_mut(id)
-        {
-            record.status = JobAdminStatus::Retried;
-            record.finished_at = Some(chrono::Utc::now());
-        }
-    }
-
     fn retry_payload(&self, id: &str) -> AutumnResult<(String, Value)> {
-        let inner = self
+        let mut inner = self
             .inner
-            .read()
+            .write()
             .map_err(|_| AutumnError::internal_server_error_msg("job admin store lock poisoned"))?;
         let record = inner
             .records
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| AutumnError::not_found_msg(format!("job '{id}' not found")))?;
         if record.status != JobAdminStatus::Failed {
             return Err(AutumnError::bad_request_msg(
@@ -488,6 +479,8 @@ impl JobAdminMemoryBackend {
             ));
         }
         let retry = (record.name.clone(), record.payload.clone());
+        record.status = JobAdminStatus::Retried;
+        record.finished_at = Some(chrono::Utc::now());
         drop(inner);
         Ok(retry)
     }
@@ -620,12 +613,11 @@ impl JobAdminBackend for JobAdminMemoryBackend {
     fn retry(&self, id: &str) -> JobAdminFuture<'_, ()> {
         let id = id.to_owned();
         Box::pin(async move {
-            let (name, payload) = self.retry_payload(&id)?;
             let client = global_job_client().ok_or_else(|| {
                 AutumnError::service_unavailable_msg("job runtime is not initialized")
             })?;
+            let (name, payload) = self.retry_payload(&id)?;
             client.enqueue(&name, payload).await?;
-            self.mark_retried(&id);
             Ok(())
         })
     }
@@ -2115,6 +2107,8 @@ if ARGV[4] == 'requeue' then
   redis.call('LPUSH', KEYS[3], ARGV[1])
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
+  redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
+  redis.call('LTRIM', KEYS[4], 0, tonumber(ARGV[6]) - 1)
   redis.call('DEL', key)
 else
   return 0
@@ -2136,16 +2130,18 @@ return 1
 
     let applied: usize = redis::cmd("EVAL")
         .arg(STALE_SCRIPT)
-        .arg(4)
+        .arg(5)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&worker_config.queue_key)
         .arg(&worker_config.dead_key)
+        .arg(&worker_config.dead_record_prefix)
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
         .arg(mode)
         .arg(encoded)
+        .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
         .query_async(connection)
         .await?;
 
@@ -2848,6 +2844,67 @@ mod tests {
         assert_eq!(snapshot.enqueued.total, 1);
 
         clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn job_admin_retry_claims_failed_record_before_enqueueing() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let (tx, mut rx) = mpsc::channel(2);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            #[cfg(feature = "redis")]
+            redis: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: backend.clone(),
+            default_max_attempts: 5,
+            default_initial_backoff_ms: 250,
+            per_job_defaults: HashMap::from([("send_email".to_string(), (5, 250))]),
+        });
+
+        let failed_id =
+            backend.record_enqueue_for_test("send_email", serde_json::json!({"user_id": 7}), 2, 5);
+        backend.record_start_for_test(&failed_id, 2);
+        backend.record_failure_for_test(&failed_id, "smtp refused recipient");
+
+        let (first, second) = tokio::join!(backend.retry(&failed_id), backend.retry(&failed_id));
+        assert!(
+            first.is_ok() ^ second.is_ok(),
+            "exactly one concurrent retry should claim the failed job"
+        );
+        let queued = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("one retry should enqueue promptly")
+            .expect("one retry should enqueue a job");
+        assert_eq!(queued.name, "send_email");
+        assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn job_admin_retry_payload_claim_is_single_use() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let failed_id =
+            backend.record_enqueue_for_test("send_email", serde_json::json!({"user_id": 7}), 2, 5);
+        backend.record_start_for_test(&failed_id, 2);
+        backend.record_failure_for_test(&failed_id, "smtp refused recipient");
+
+        let first = backend
+            .retry_payload(&failed_id)
+            .expect("first retry claim should return the payload");
+        assert_eq!(first.0, "send_email");
+        let second = backend
+            .retry_payload(&failed_id)
+            .expect_err("second retry claim must be rejected before enqueue");
+        assert!(
+            second
+                .to_string()
+                .contains("only failed jobs can be retried"),
+            "unexpected second retry error: {second}"
+        );
     }
 
     #[tokio::test]
@@ -3820,6 +3877,57 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("visibility timeout expired"))
         );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_stale_terminal_failure_keeps_retry_discard_metadata() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_a = redis_test_worker_config("autumn:test:stale-dead", "worker-a", 1);
+        let worker_b = redis_test_worker_config("autumn:test:stale-dead", "worker-b", 30_000);
+        redis_enqueue_test_job(&client, &worker_a, 1).await;
+
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let claimed = claim_next_redis_job(&mut connection, &worker_a)
+            .await
+            .unwrap()
+            .expect("first worker should claim the final attempt");
+        assert_eq!(claimed.claimed_by.as_deref(), Some("worker-a"));
+        assert_eq!(claimed.attempt, 1);
+        let failed_id = claimed.id.clone();
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let state = AppState::for_test().with_profile("dev");
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        state.job_registry().register("send_email");
+        recover_stale_redis_jobs(&mut connection, &worker_b, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let dead_record_key = format!("{}{}", worker_b.dead_record_prefix, failed_id);
+        let dead_record: Option<String> = connection.get(&dead_record_key).await.unwrap();
+        assert!(
+            dead_record.is_some(),
+            "stale terminal failures need per-id metadata for admin actions"
+        );
+        let dead_count: usize = connection.llen(&worker_b.dead_key).await.unwrap();
+        assert_eq!(dead_count, 1);
+
+        let backend = redis_admin_test_backend(&client, &worker_b);
+        backend
+            .retry(&failed_id)
+            .await
+            .expect("stale terminal failure should be retryable from the dashboard");
+
+        let queued_count: usize = connection.llen(&worker_b.queue_key).await.unwrap();
+        let dead_count: usize = connection.llen(&worker_b.dead_key).await.unwrap();
+        let dead_record_exists: bool = connection.exists(&dead_record_key).await.unwrap();
+        assert_eq!(queued_count, 1);
+        assert_eq!(dead_count, 0);
+        assert!(!dead_record_exists);
     }
 
     #[tokio::test]
