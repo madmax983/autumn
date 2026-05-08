@@ -24,7 +24,7 @@ pub struct TaskListing {
 /// Run `autumn task`.
 pub fn run(opts: &TaskOptions<'_>) {
     eprintln!("autumn task\n");
-    crate::routes::compile_binary(opts.package);
+    crate::routes::compile_binary(opts.package, opts.bin);
     let binary = crate::routes::find_binary(opts.package, opts.bin);
 
     if opts.list {
