@@ -228,7 +228,7 @@ pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
 
 #[cfg(test)]
 mod conformance_tests {
-    use autumn_web::plugin_conformance::{run_conformance, ConformanceConfig};
+    use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
     use autumn_web::route_listing::{RouteInfo, RouteSource};
 
     const PLUGIN_NAME: &str = "autumn-admin-plugin";
@@ -261,12 +261,8 @@ mod conformance_tests {
     #[test]
     fn admin_plugin_routes_live_under_admin_prefix() {
         let routes = admin_routes("/admin");
-        let result = autumn_web::plugin_conformance::check_route_prefix(
-            PLUGIN_NAME,
-            "/admin",
-            &[],
-            &routes,
-        );
+        let result =
+            autumn_web::plugin_conformance::check_route_prefix(PLUGIN_NAME, "/admin", &[], &routes);
         assert_eq!(
             result.status,
             autumn_web::plugin_conformance::CheckStatus::Pass,
@@ -360,7 +356,11 @@ mod conformance_tests {
         let diag = &diagnostics[0];
         assert_eq!(diag.method, "GET");
         assert_eq!(diag.path, "/admin");
-        let sources: Vec<&str> = diag.contributors.iter().map(|c| c.source.as_str()).collect();
+        let sources: Vec<&str> = diag
+            .contributors
+            .iter()
+            .map(|c| c.source.as_str())
+            .collect();
         assert!(
             sources.contains(&"user"),
             "missing user contributor: {sources:?}"

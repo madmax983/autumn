@@ -1572,9 +1572,13 @@ mod tests {
 
     #[test]
     fn parse_plugin_check_required_plugin_name() {
-        let cli =
-            Cli::try_parse_from(["autumn", "plugin-check", "--plugin-name", "autumn-admin-plugin"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "plugin-check",
+            "--plugin-name",
+            "autumn-admin-plugin",
+        ])
+        .unwrap();
         match cli.command {
             Commands::PluginCheck { plugin_name, .. } => {
                 assert_eq!(plugin_name, "autumn-admin-plugin");
@@ -1669,7 +1673,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::PluginCheck { sensitive_route, .. } => {
+            Commands::PluginCheck {
+                sensitive_route, ..
+            } => {
                 assert_eq!(sensitive_route, vec!["/admin:Role admin required"]);
             }
             _ => panic!("expected PluginCheck"),
@@ -1690,7 +1696,9 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::PluginCheck { sensitive_route, .. } => {
+            Commands::PluginCheck {
+                sensitive_route, ..
+            } => {
                 assert_eq!(sensitive_route.len(), 2);
             }
             _ => panic!("expected PluginCheck"),

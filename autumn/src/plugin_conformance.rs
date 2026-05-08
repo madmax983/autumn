@@ -510,9 +510,7 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
     let mut duplicates: Vec<String> = counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
-        .map(|((method, path), count)| {
-            format!("{method} {path} — appears {count} times")
-        })
+        .map(|((method, path), count)| format!("{method} {path} — appears {count} times"))
         .collect();
     duplicates.sort();
 
@@ -520,9 +518,7 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
         CheckResult {
             name: "duplicate-registration".to_owned(),
             status: CheckStatus::Pass,
-            message: format!(
-                "No duplicate route registrations for plugin:{plugin_name}"
-            ),
+            message: format!("No duplicate route registrations for plugin:{plugin_name}"),
             diagnostics: vec![],
         }
     } else {
@@ -772,7 +768,11 @@ mod tests {
         assert_eq!(diag.method, "POST");
         assert_eq!(diag.path, "/items");
         assert_eq!(diag.contributors.len(), 2);
-        let sources: Vec<&str> = diag.contributors.iter().map(|c| c.source.as_str()).collect();
+        let sources: Vec<&str> = diag
+            .contributors
+            .iter()
+            .map(|c| c.source.as_str())
+            .collect();
         assert!(sources.contains(&"user"), "missing user: {sources:?}");
         assert!(
             sources.contains(&"plugin:inventory"),
@@ -916,7 +916,8 @@ mod tests {
         let result = check_duplicate_registration("admin", &routes);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(
-            result.diagnostics[0].contains("POST") && result.diagnostics[0].contains("/admin/items"),
+            result.diagnostics[0].contains("POST")
+                && result.diagnostics[0].contains("/admin/items"),
             "diagnostic should name route: {:?}",
             result.diagnostics
         );

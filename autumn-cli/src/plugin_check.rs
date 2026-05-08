@@ -18,7 +18,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-use crate::routes::{compile_binary, find_binary, RouteInfo};
+use crate::routes::{RouteInfo, compile_binary, find_binary};
 
 // ── Report types ───────────────────────────────────────────────────────────
 
@@ -241,8 +241,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
 
 fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
-    let plugin_routes: Vec<&RouteInfo> =
-        routes.iter().filter(|r| r.source == expected).collect();
+    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
     if plugin_routes.is_empty() {
         return CheckResult {
@@ -269,8 +268,7 @@ fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResu
 
 fn check_route_prefix(plugin_name: &str, prefix: &str, routes: &[RouteInfo]) -> CheckResult {
     let expected = format!("plugin:{plugin_name}");
-    let plugin_routes: Vec<&RouteInfo> =
-        routes.iter().filter(|r| r.source == expected).collect();
+    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
     if plugin_routes.is_empty() {
         return CheckResult {
@@ -385,8 +383,7 @@ fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> Chec
     use std::collections::HashMap;
 
     let expected = format!("plugin:{plugin_name}");
-    let plugin_routes: Vec<&RouteInfo> =
-        routes.iter().filter(|r| r.source == expected).collect();
+    let plugin_routes: Vec<&RouteInfo> = routes.iter().filter(|r| r.source == expected).collect();
 
     if plugin_routes.is_empty() {
         return CheckResult {
@@ -399,9 +396,7 @@ fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> Chec
 
     let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
     for route in &plugin_routes {
-        *counts
-            .entry((&route.method, &route.path))
-            .or_insert(0) += 1;
+        *counts.entry((&route.method, &route.path)).or_insert(0) += 1;
     }
 
     let mut duplicates: Vec<String> = counts
@@ -656,7 +651,11 @@ mod tests {
             auth_mechanism: String::new(),
         }];
         let result = check_sensitive_surfaces("myplugin", &routes, &declared);
-        assert_eq!(result.status, CheckStatus::Fail, "empty auth_mechanism must fail");
+        assert_eq!(
+            result.status,
+            CheckStatus::Fail,
+            "empty auth_mechanism must fail"
+        );
     }
 
     #[test]
