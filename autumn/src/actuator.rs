@@ -1371,6 +1371,8 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        #[cfg(feature = "system-info")]
+        paths.push(actuator_route_path(prefix, "/ui/system_info"));
         paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
         {
@@ -1456,10 +1458,15 @@ pub(crate) fn actuator_router_with_prefix<
 
         #[cfg(feature = "system-info")]
         {
-            router = router.route(
-                &actuator_route_path(prefix, "/system"),
-                axum::routing::get(crate::system_info::system_info_handler),
-            );
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/system"),
+                    axum::routing::get(crate::system_info::system_info_handler),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/ui/system_info"),
+                    axum::routing::get(ui_system_info),
+                );
         }
 
         #[cfg(feature = "ws")]
@@ -2320,6 +2327,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_ui_system_info_returns_html_or_unimplemented() {
+        let app = actuator_router(true).with_state(test_state());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/ui/system_info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        if cfg!(all(
+            feature = "maud",
+            feature = "htmx",
+            feature = "system-info"
+        )) {
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(
+                res.headers().get("content-type").unwrap(),
+                "text/html; charset=utf-8"
+            );
+        } else {
+            assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+
+    #[tokio::test]
     async fn actuator_ui_tasks_returns_html_or_unimplemented() {
         let app = actuator_router(true).with_state(test_state());
 
@@ -2514,6 +2550,9 @@ async fn ui_dashboard() -> impl IntoResponse {
                     div class="card" hx-get="ui/tasks" hx-trigger="load, every 2s" {
                         "Loading tasks..."
                     }
+                    div class="card" hx-get="ui/system_info" hx-trigger="load" {
+                        "Loading system info..."
+                    }
                 }
             }
         }
@@ -2613,5 +2652,39 @@ async fn ui_tasks<S: ProvideActuatorState>() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         "Maud feature is required for the UI dashboard",
+    )
+}
+
+#[cfg(all(feature = "maud", feature = "htmx", feature = "system-info"))]
+async fn ui_system_info() -> impl IntoResponse {
+    use crate::system_info::system_info_handler;
+    let axum::Json(info) = system_info_handler().await;
+
+    let html = maud::html! {
+        h2 { "System Information" }
+        div class="stat" {
+            span class="stat-label" { "OS" }
+            span class="stat-value" { (info.os) }
+        }
+        div class="stat" {
+            span class="stat-label" { "Architecture" }
+            span class="stat-value" { (info.arch) }
+        }
+        div class="stat" {
+            span class="stat-label" { "Parallelism" }
+            span class="stat-value" { (info.available_parallelism) }
+        }
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html.into_string(),
+    )
+}
+
+#[cfg(not(all(feature = "maud", feature = "htmx", feature = "system-info")))]
+async fn ui_system_info() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "Maud, htmx, and system-info features are required for this dashboard panel",
     )
 }
