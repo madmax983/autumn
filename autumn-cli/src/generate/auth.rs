@@ -22,7 +22,7 @@ use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra Cargo dependencies the auth generator needs on top of the model deps.
 const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
-    ("axum", "\"0.7\""),
+    ("axum", "\"0.8\""),
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
     ("sha2", "{ version = \"0.10\", features = [] }"),
     ("hex", "\"0.4\""),
@@ -599,6 +599,17 @@ pub async fn forgot_password(
     mailer: Mailer,
     Form(form): Form<ForgotPasswordForm>,
 ) -> AutumnResult<Markup> {{
+    // Fail fast when mail is not configured — safe because this check is
+    // independent of the email address lookup and does not leak whether an
+    // address is registered.
+    if mailer.is_disabled() {{
+        return Err(AutumnError::internal_server_error_msg(
+            "Password reset requires mail to be configured. \
+             Set [mail] transport in autumn.toml (e.g. transport = \"smtp\"). \
+             The forgot-password feature is unavailable until mail is set up.",
+        ));
+    }}
+
     let email = form.email.trim().to_lowercase();
 
     // Non-enumerating: silently skip unknown addresses.
@@ -1332,6 +1343,16 @@ mod tests {
         assert!(
             routes.contains("mailer.send(mail).await"),
             "forgot_password must use async mailer.send(): {routes}"
+        );
+        // The is_disabled guard must appear before the DB lookup (maybe_user)
+        // so it fires unconditionally and cannot enumerate registered addresses.
+        // Search within the forgot_password function body, which is identified
+        // by the unique `maybe_user` variable that only appears there.
+        let disabled_pos = routes.find("mailer.is_disabled()").unwrap();
+        let maybe_user_pos = routes.find("let maybe_user").unwrap();
+        assert!(
+            disabled_pos < maybe_user_pos,
+            "is_disabled guard must come before the DB lookup in forgot_password"
         );
     }
 
