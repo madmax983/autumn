@@ -27,6 +27,7 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("sha2", "{ version = \"0.10\", features = [] }"),
     ("hex", "\"0.4\""),
     ("rand", "{ version = \"0.9\", features = [\"os_rng\"] }"),
+    ("tokio", "{ version = \"1\", features = [\"time\"] }"),
     ("tracing", "\"0.1\""),
 ];
 
