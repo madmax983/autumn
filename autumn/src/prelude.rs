@@ -139,6 +139,9 @@ pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped}
 // ── Security ───────────────────────────────────────────────────
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// Configured CSRF form field name; use alongside [`CsrfToken`] to honour
+/// custom `security.csrf.form_field` values in hand-written templates.
+pub use crate::security::CsrfFormField;
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).

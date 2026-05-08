@@ -386,11 +386,11 @@ fn redirect_to(url: &str) -> Response {{
 
 /// `GET /signup` — render the signup form.
 #[get("/signup")]
-pub async fn signup_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
+pub async fn signup_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
     Ok(layout("Sign Up", html! {{
         h1 {{ "Create an Account" }}
         form action="/signup" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -462,11 +462,11 @@ pub async fn signup(
 
 /// `GET /login` — render the login form.
 #[get("/login")]
-pub async fn login_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
+pub async fn login_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
     Ok(layout("Log In", html! {{
         h1 {{ "Log In" }}
         form action="/login" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -541,7 +541,7 @@ pub async fn logout(session: Session) -> AutumnResult<Response> {{
 /// anonymous requests before the handler body runs.
 #[secured]
 #[get("/account")]
-pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
+pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
         .await
@@ -559,7 +559,7 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>) -> A
         h1 {{ "Your Account" }}
         p {{ "Email: " ({snake_name}.email) }}
         form action="/logout" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
     }}))
@@ -569,11 +569,11 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>) -> A
 
 /// `GET /forgot-password` — render the forgot-password form.
 #[get("/forgot-password")]
-pub async fn forgot_password_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
+pub async fn forgot_password_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
     Ok(layout("Forgot Password", html! {{
         h1 {{ "Forgot Your Password?" }}
         form action="/forgot-password" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -663,11 +663,12 @@ pub struct ResetPasswordQuery {{
 pub async fn reset_password_form(
     Query(query): Query<ResetPasswordQuery>,
     csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
     Ok(layout("Reset Password", html! {{
         h1 {{ "Set a New Password" }}
         form action="/reset-password" method="post" {{
-            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="token" value=(query.token);
             div {{
                 label {{ "New Password (8+ characters)" }}
