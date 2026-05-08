@@ -456,6 +456,69 @@ pub fn check_sensitive_surfaces(
     }
 }
 
+/// Check that the plugin's routes are not duplicated, which would indicate the
+/// plugin was registered more than once and the framework's dedup logic was
+/// bypassed.
+///
+/// Detects (method, path) pairs that appear more than once among routes
+/// attributed to the named plugin. Returns `Skip` when no routes are
+/// attributed to the plugin.
+pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
+    use std::collections::HashMap;
+
+    let plugin_routes: Vec<&RouteInfo> = routes
+        .iter()
+        .filter(|r| matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name))
+        .collect();
+
+    if plugin_routes.is_empty() {
+        return CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Skip,
+            message: format!("No routes attributed to plugin:{plugin_name}"),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    for route in &plugin_routes {
+        *counts
+            .entry((route.method.clone(), route.path.clone()))
+            .or_insert(0) += 1;
+    }
+
+    let mut duplicates: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|((method, path), count)| {
+            format!("{method} {path} — appears {count} times")
+        })
+        .collect();
+    duplicates.sort();
+
+    if duplicates.is_empty() {
+        CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Pass,
+            message: format!(
+                "No duplicate route registrations for plugin:{plugin_name}"
+            ),
+            diagnostics: vec![],
+        }
+    } else {
+        CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "{} route(s) registered more than once; plugin:{plugin_name} \
+                 may have been installed twice",
+                duplicates.len()
+            ),
+            diagnostics: duplicates,
+        }
+    }
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────
 
 /// Run all conformance checks and return a `ConformanceReport`.
@@ -465,6 +528,7 @@ pub fn check_sensitive_surfaces(
 /// 2. `route-prefix` — plugin routes live under `config.expected_prefix` (if set)
 /// 3. `route-collision` — no two routes share (method, path)
 /// 4. `sensitive-surfaces` — sensitive-named plugin routes are declared with auth
+/// 5. `duplicate-registration` — plugin routes are not registered more than once
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();
 
@@ -487,6 +551,8 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
         routes,
         &config.sensitive_routes,
     ));
+
+    checks.push(check_duplicate_registration(&config.plugin_name, routes));
 
     ConformanceReport {
         plugin_name: config.plugin_name.clone(),
@@ -771,6 +837,68 @@ mod tests {
         let routes = vec![make_route("GET", "/metrics", plugin("prom"))];
         let result = check_sensitive_surfaces("prom", &routes, &[]);
         assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    // ── check_duplicate_registration ──────────────────────────────────────
+
+    #[test]
+    fn duplicate_registration_no_duplicates_passes() {
+        let routes = vec![
+            make_route("GET", "/admin", plugin("admin")),
+            make_route("POST", "/admin/items", plugin("admin")),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn duplicate_registration_same_route_twice_fails() {
+        let routes = vec![
+            make_route("GET", "/admin", plugin("admin")),
+            make_route("GET", "/admin", plugin("admin")),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Fail, "{}", result.message);
+        assert_eq!(result.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_registration_diagnostic_names_method_path_count() {
+        let routes = vec![
+            make_route("POST", "/admin/items", plugin("admin")),
+            make_route("POST", "/admin/items", plugin("admin")),
+            make_route("POST", "/admin/items", plugin("admin")),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.diagnostics[0].contains("POST") && result.diagnostics[0].contains("/admin/items"),
+            "diagnostic should name route: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.diagnostics[0].contains("3"),
+            "diagnostic should include count: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn duplicate_registration_no_plugin_routes_skips() {
+        let routes = vec![make_route("GET", "/posts", RouteSource::User)];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn duplicate_registration_only_checks_own_plugin() {
+        let routes = vec![
+            make_route("GET", "/harvest/feed", plugin("harvest")),
+            make_route("GET", "/harvest/feed", plugin("harvest")),
+            make_route("GET", "/admin", plugin("admin")),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass);
     }
 
     // ── run_conformance ────────────────────────────────────────────────────

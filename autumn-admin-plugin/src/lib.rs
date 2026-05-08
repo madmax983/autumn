@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
+use autumn_web::route_listing::RouteInfo;
 
 /// The admin panel plugin.
 ///
@@ -178,8 +179,41 @@ impl Plugin for AdminPlugin {
             "🍂 Autumn Admin mounted"
         );
 
-        app.nest(&prefix, router)
+        // Declare routes for `autumn routes` listing. The underlying Axum router
+        // is added via nest() which is opaque to route enumeration, so we
+        // explicitly register route metadata here.
+        let declared = admin_route_infos(&prefix);
+
+        app.nest(&prefix, router).declare_plugin_routes(declared)
     }
+}
+
+/// Generate the route metadata list for this plugin's mounted routes.
+///
+/// Kept in sync with `routes::admin_router` — update here when routes are
+/// added or removed from the admin router.
+pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
+    [
+        ("GET", format!("{prefix}")),
+        ("GET", format!("{prefix}/{{slug}}")),
+        ("POST", format!("{prefix}/{{slug}}")),
+        ("GET", format!("{prefix}/{{slug}}/new")),
+        ("GET", format!("{prefix}/{{slug}}/{{id}}")),
+        ("POST", format!("{prefix}/{{slug}}/{{id}}")),
+        ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
+        ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
+        ("POST", format!("{prefix}/{{slug}}/actions")),
+        ("GET", format!("{prefix}/static/admin.{{hash}}.js")),
+    ]
+    .into_iter()
+    .map(|(method, path)| RouteInfo {
+        method: method.to_owned(),
+        path,
+        handler: format!("admin::{}", method.to_lowercase()),
+        source: autumn_web::route_listing::RouteSource::User, // overwritten by declare_plugin_routes
+        middleware: vec![],
+    })
+    .collect()
 }
 
 // ── Conformance reference tests ────────────────────────────────────────────
@@ -199,32 +233,15 @@ mod conformance_tests {
 
     const PLUGIN_NAME: &str = "autumn-admin-plugin";
 
-    /// Build a representative slice of routes that `AdminPlugin` contributes
-    /// under the default `/admin` prefix.  These mirror the routes declared in
-    /// `routes::admin_router` — kept in sync manually; update here when routes
-    /// are added or removed.
+    /// Build the routes that `AdminPlugin` contributes under `prefix`,
+    /// attributed to the plugin. Reuses `admin_route_infos` from the outer
+    /// module and overrides the source to `Plugin(PLUGIN_NAME)`.
     fn admin_routes(prefix: &str) -> Vec<RouteInfo> {
-        let src = RouteSource::Plugin(PLUGIN_NAME.to_owned());
-        let routes_data = [
-            ("GET", format!("{prefix}")),
-            ("GET", format!("{prefix}/{{slug}}")),
-            ("POST", format!("{prefix}/{{slug}}")),
-            ("GET", format!("{prefix}/{{slug}}/new")),
-            ("GET", format!("{prefix}/{{slug}}/{{id}}")),
-            ("POST", format!("{prefix}/{{slug}}/{{id}}")),
-            ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
-            ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
-            ("POST", format!("{prefix}/{{slug}}/actions")),
-            ("GET", format!("{prefix}/static/admin.{{hash}}.js")),
-        ];
-        routes_data
+        super::admin_route_infos(prefix)
             .into_iter()
-            .map(|(method, path)| RouteInfo {
-                method: method.to_owned(),
-                path,
-                handler: format!("admin::{}", method.to_lowercase()),
-                source: src.clone(),
-                middleware: vec![],
+            .map(|mut r| {
+                r.source = RouteSource::Plugin(PLUGIN_NAME.to_owned());
+                r
             })
             .collect()
     }
@@ -368,6 +385,33 @@ mod conformance_tests {
             report.passed(),
             "AdminPlugin with custom prefix failed conformance:\n{}",
             report.to_text_report()
+        );
+    }
+
+    #[test]
+    fn admin_plugin_double_registration_detected() {
+        // Simulate registering the admin plugin twice — its routes appear twice.
+        let mut routes = admin_routes("/admin");
+        routes.extend(admin_routes("/admin"));
+        let result =
+            autumn_web::plugin_conformance::check_duplicate_registration(PLUGIN_NAME, &routes);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Fail,
+            "expected duplicate-registration FAIL when plugin installed twice"
+        );
+    }
+
+    #[test]
+    fn admin_plugin_single_registration_passes_duplicate_check() {
+        let routes = admin_routes("/admin");
+        let result =
+            autumn_web::plugin_conformance::check_duplicate_registration(PLUGIN_NAME, &routes);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Pass,
+            "single registration should pass: {}",
+            result.message
         );
     }
 }

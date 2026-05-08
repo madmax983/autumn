@@ -181,6 +181,7 @@ This checks:
 | `route-prefix` | Every plugin route lives under the declared prefix |
 | `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
 | `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
+| `duplicate-registration` | No plugin route appears more than once, which would indicate the plugin was installed twice |
 
 Add `--format json` to produce a machine-readable report suitable for CI:
 
@@ -236,7 +237,10 @@ Work through this list before `cargo publish`:
 - [ ] **Route prefix** — all plugin routes live under a documented prefix,
   or any root-level routes are explicitly explained in the README
 - [ ] **Route manifest** — `autumn routes --format json` on a host app shows
-  every plugin route with `"source": "plugin:<your-name>"`
+  every plugin route with `"source": "plugin:<your-name>"`. If your plugin
+  uses `AppBuilder::nest()` (whose routes are opaque to the listing), call
+  `AppBuilder::declare_plugin_routes(routes)` alongside `nest()` to make
+  those routes visible.
 - [ ] **Production exposure gates** — if the plugin mounts admin, debug,
   credential, operator, secret, or metrics surfaces, the README documents
   the auth/profile gating mechanism and conformance passes with

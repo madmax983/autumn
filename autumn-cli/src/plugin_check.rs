@@ -221,6 +221,7 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
         routes,
         opts.sensitive_routes,
     ));
+    checks.push(check_duplicate_registration(opts.plugin_name, routes));
 
     ConformanceReport {
         plugin_name: opts.plugin_name.to_owned(),
@@ -362,6 +363,57 @@ fn check_sensitive_surfaces(
                 undeclared.len()
             ),
             diagnostics: undeclared,
+        }
+    }
+}
+
+fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
+    use std::collections::HashMap;
+
+    let expected = format!("plugin:{plugin_name}");
+    let plugin_routes: Vec<&RouteInfo> =
+        routes.iter().filter(|r| r.source == expected).collect();
+
+    if plugin_routes.is_empty() {
+        return CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Skip,
+            message: format!("No routes attributed to plugin:{plugin_name}"),
+            diagnostics: vec![],
+        };
+    }
+
+    let mut counts: HashMap<(&str, &str), usize> = HashMap::new();
+    for route in &plugin_routes {
+        *counts
+            .entry((&route.method, &route.path))
+            .or_insert(0) += 1;
+    }
+
+    let mut duplicates: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|((method, path), count)| format!("{method} {path} \u{2014} appears {count} times"))
+        .collect();
+    duplicates.sort();
+
+    if duplicates.is_empty() {
+        CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Pass,
+            message: format!("No duplicate route registrations for plugin:{plugin_name}"),
+            diagnostics: vec![],
+        }
+    } else {
+        CheckResult {
+            name: "duplicate-registration".to_owned(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "{} route(s) registered more than once; plugin:{plugin_name} \
+                 may have been installed twice",
+                duplicates.len()
+            ),
+            diagnostics: duplicates,
         }
     }
 }
@@ -736,6 +788,49 @@ mod tests {
     fn normal_paths_not_sensitive() {
         assert!(!is_sensitive_path("/posts"));
         assert!(!is_sensitive_path("/api/users"));
+    }
+
+    // ── check_duplicate_registration ──────────────────────────────────────
+
+    #[test]
+    fn duplicate_no_duplicates_passes() {
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("POST", "/admin/items", "plugin:admin"),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn duplicate_same_route_twice_fails() {
+        let routes = vec![
+            make_route("GET", "/admin", "plugin:admin"),
+            make_route("GET", "/admin", "plugin:admin"),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(result.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_diagnostic_names_route() {
+        let routes = vec![
+            make_route("POST", "/admin/items", "plugin:admin"),
+            make_route("POST", "/admin/items", "plugin:admin"),
+        ];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Fail);
+        let diag = &result.diagnostics[0];
+        assert!(diag.contains("POST"), "missing method: {diag}");
+        assert!(diag.contains("/admin/items"), "missing path: {diag}");
+    }
+
+    #[test]
+    fn duplicate_no_plugin_routes_skips() {
+        let routes = vec![make_route("GET", "/posts", "user")];
+        let result = check_duplicate_registration("admin", &routes);
+        assert_eq!(result.status, CheckStatus::Skip);
     }
 
     // ── build_report ───────────────────────────────────────────────────────
