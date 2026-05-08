@@ -255,7 +255,7 @@ pub fn try_build_router_inner(
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
-    router = mount_framework_routes(router, dev_reload_enabled);
+    router = mount_framework_routes(router, config, dev_reload_enabled);
 
     let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
     router = router_with_probes;
@@ -661,6 +661,15 @@ fn reject_openapi_path_collisions(
         claimed.insert(dev::LIVE_RELOAD_PATH.to_owned());
         claimed.insert(dev::LIVE_RELOAD_SCRIPT_PATH.to_owned());
     }
+    #[cfg(feature = "mail")]
+    if config
+        .mail
+        .preview_routes_enabled(config.profile.as_deref())
+    {
+        claimed.insert(crate::mail::MAIL_PREVIEW_PATH.to_owned());
+        claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
+        claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
+    }
 
     check_openapi_path_against(
         "openapi_json_path",
@@ -766,6 +775,7 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
 
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
     dev_reload_enabled: bool,
 ) -> axum::Router<AppState> {
     // Framework-provided routes
@@ -803,6 +813,20 @@ fn mount_framework_routes(
             state_path = dev::LIVE_RELOAD_PATH,
             script_path = dev::LIVE_RELOAD_SCRIPT_PATH,
             "Mounted dev live reload endpoints"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    if config
+        .mail
+        .preview_routes_enabled(config.profile.as_deref())
+    {
+        router = router.merge(crate::mail::mail_preview_router(
+            config.mail.file_dir.clone(),
+        ));
+        tracing::debug!(
+            path = crate::mail::MAIL_PREVIEW_PATH,
+            "Mounted dev mail preview endpoints"
         );
     }
 
@@ -1779,6 +1803,164 @@ mod tests {
             .unwrap();
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(blocked.headers().get("retry-after").is_some());
+    }
+
+    #[cfg(feature = "mail")]
+    fn dev_mail_preview_config(dir: &std::path::Path) -> AutumnConfig {
+        AutumnConfig {
+            profile: Some("dev".to_owned()),
+            mail: crate::mail::MailConfig {
+                transport: crate::mail::Transport::File,
+                file_dir: dir.to_path_buf(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    async fn response_text(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should collect");
+        String::from_utf8(body.to_vec()).expect("body should be utf8")
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_mounts_dev_mail_preview_empty_state_for_file_transport() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("No captured emails"),
+            "missing empty state: {body}"
+        );
+        assert!(
+            body.contains("mail.transport = &quot;file&quot;"),
+            "empty state should explain capture setup: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_lists_captured_mail_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let older = dir.path().join("older.eml");
+        let newer = dir.path().join("newer.eml");
+        std::fs::write(
+            &older,
+            "To: first@example.com\nSubject: First\nDate: Tue, 05 May 2026 10:00:00 +0000\nMessage-Id: <first@example.com>\n\nfirst body\n",
+        )
+        .expect("write older eml");
+        std::fs::write(
+            &newer,
+            "To: second@example.com\nSubject: Second\nDate: Tue, 05 May 2026 10:01:00 +0000\nMessage-Id: <second@example.com>\n\nsecond body\n",
+        )
+        .expect("write newer eml");
+        filetime::set_file_mtime(&older, filetime::FileTime::from_unix_time(100, 0))
+            .expect("set older mtime");
+        filetime::set_file_mtime(&newer, filetime::FileTime::from_unix_time(200, 0))
+            .expect("set newer mtime");
+
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        let second = body.find("Second").expect("newer subject should render");
+        let first = body.find("First").expect("older subject should render");
+        assert!(second < first, "newest message should render first: {body}");
+        assert!(
+            body.contains("second@example.com"),
+            "missing To column: {body}"
+        );
+        assert!(
+            body.contains("Timestamp"),
+            "missing timestamp column: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_mail_preview_detail_renders_html_in_sandboxed_iframe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("detail.eml"),
+            "From: Autumn <noreply@example.com>\nTo: ada@example.com\nReply-To: support@example.com\nSubject: Reset\nDate: Tue, 05 May 2026 10:00:00 +0000\nMessage-Id: <reset@example.com>\nMIME-Version: 1.0\nContent-Type: multipart/alternative; boundary=\"autumn-mail\"\n\n--autumn-mail\nContent-Type: text/plain; charset=utf-8\n\nPlain reset\n--autumn-mail\nContent-Type: text/html; charset=utf-8\n\n<h1>Hello iframe</h1>\n--autumn-mail--\n",
+        )
+        .expect("write detail eml");
+
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail/messages/detail.eml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("<iframe"), "missing iframe: {body}");
+        assert!(body.contains("sandbox"), "iframe must be sandboxed: {body}");
+        assert!(body.contains("Hello iframe"), "missing html body: {body}");
+        assert!(body.contains("Plain text"), "missing text toggle: {body}");
+        assert!(body.contains("Headers"), "missing headers toggle: {body}");
+        assert!(
+            body.contains("Raw .eml"),
+            "missing raw source toggle: {body}"
+        );
+        assert!(
+            body.contains("Message-Id"),
+            "missing message id header: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_does_not_mount_mail_preview_outside_dev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = dev_mail_preview_config(dir.path());
+        config.profile = Some("prod".to_owned());
+        let router = build_router(Vec::new(), &config, test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

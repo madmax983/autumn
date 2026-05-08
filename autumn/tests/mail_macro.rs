@@ -65,6 +65,19 @@ impl AccountMailer {
     }
 }
 
+#[mailer_preview]
+impl AccountMailer {
+    fn reset_password_preview() -> Mail {
+        Mail::builder()
+            .to("preview@example.com")
+            .subject("Preview reset")
+            .html(html! { p { "Preview token" } })
+            .text("Preview token")
+            .build()
+            .expect("valid preview mail")
+    }
+}
+
 struct GenericAccountMailer<T> {
     marker: std::marker::PhantomData<T>,
 }
@@ -111,6 +124,19 @@ fn mailer_macro_generates_send_helpers() {
             .count(),
         1
     );
+}
+
+#[test]
+fn mailer_preview_macro_registers_zero_arg_methods() {
+    let previews = mail_previews![AccountMailer];
+
+    assert_eq!(previews.len(), 1);
+    assert_eq!(previews[0].mailer(), "AccountMailer");
+    assert_eq!(previews[0].method(), "reset_password_preview");
+
+    let mail = previews[0].render().expect("preview should render");
+    assert_eq!(mail.subject, "Preview reset");
+    assert_eq!(mail.to, ["preview@example.com"]);
 }
 
 #[test]

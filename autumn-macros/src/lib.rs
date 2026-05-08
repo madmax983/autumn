@@ -18,7 +18,9 @@ mod collect;
 mod i18n;
 mod job;
 mod jobs_macro;
+mod mail_previews_macro;
 mod mailer;
+mod mailer_preview;
 mod main_macro;
 mod model;
 mod oauth2_callback;
@@ -233,6 +235,18 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
     mailer::mailer_macro(attr.into(), item.into()).into()
+}
+
+/// Register zero-argument mail preview methods for the dev mail preview UI.
+#[proc_macro_attribute]
+pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
+    mailer_preview::mailer_preview_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[mailer_preview]` impl blocks into runtime preview registrations.
+#[proc_macro]
+pub fn mail_previews(input: TokenStream) -> TokenStream {
+    mail_previews_macro::mail_previews_macro(input.into()).into()
 }
 
 /// Attribute macro for Autumn database models.

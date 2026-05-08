@@ -3,3 +3,6 @@
 
 [database]
 url = "postgres://autumn:autumn@localhost:5432/reddit"
+
+[mail]
+transport = "file"

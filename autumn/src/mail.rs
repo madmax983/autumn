@@ -9,8 +9,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::FromRequestParts;
+use axum::response::{Html, IntoResponse, Response};
 use lettre::message::{Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
@@ -125,6 +127,12 @@ pub struct MailConfig {
     /// Directory for file transport.
     #[serde(default = "default_file_dir")]
     pub file_dir: PathBuf,
+    /// Force-enable the dev mail preview UI.
+    ///
+    /// The UI is auto-enabled in `dev` when `mail.transport = "file"`.
+    /// Setting this flag outside `dev` is rejected at startup.
+    #[serde(default)]
+    pub preview: bool,
     /// SMTP settings.
     #[serde(default)]
     pub smtp: SmtpConfig,
@@ -139,6 +147,7 @@ impl Default for MailConfig {
             allow_log_in_production: false,
             allow_in_process_deliver_later_in_production: false,
             file_dir: default_file_dir(),
+            preview: false,
             smtp: SmtpConfig::default(),
         }
     }
@@ -169,7 +178,18 @@ impl MailConfig {
             ));
         }
 
+        if self.preview && !matches!(profile, Some("dev" | "development")) {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.preview = true is only allowed in dev; refusing to mount /_autumn/mail outside the dev profile".to_owned(),
+            ));
+        }
+
         Ok(())
+    }
+
+    pub(crate) fn preview_routes_enabled(&self, profile: Option<&str>) -> bool {
+        matches!(profile, Some("dev" | "development"))
+            && (self.preview || self.transport == Transport::File)
     }
 }
 
@@ -216,6 +236,119 @@ pub struct Mail {
     pub html: Option<String>,
     /// Plain-text body.
     pub text: Option<String>,
+}
+
+/// Stable root path for the dev mail preview UI.
+pub const MAIL_PREVIEW_PATH: &str = "/_autumn/mail";
+
+const MAIL_PREVIEW_MESSAGE_PATH: &str = "/_autumn/mail/messages/{message_id}";
+const MAIL_PREVIEW_TEMPLATE_PATH: &str = "/_autumn/mail/previews/{mailer}/{method}";
+
+/// A developer-authored, zero-argument mail template preview.
+#[derive(Clone)]
+pub struct MailPreview {
+    mailer: &'static str,
+    method: &'static str,
+    render: fn() -> Mail,
+}
+
+impl std::fmt::Debug for MailPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MailPreview")
+            .field("mailer", &self.mailer)
+            .field("method", &self.method)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MailPreview {
+    /// Register a mail preview for the dev mail preview UI.
+    #[must_use]
+    pub const fn new(mailer: &'static str, method: &'static str, render: fn() -> Mail) -> Self {
+        Self {
+            mailer,
+            method,
+            render,
+        }
+    }
+
+    /// Mailer type label used in preview URLs.
+    #[must_use]
+    pub const fn mailer(&self) -> &'static str {
+        self.mailer
+    }
+
+    /// Preview method label used in preview URLs.
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        self.method
+    }
+
+    /// Render the preview without invoking any configured transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MailPreviewError::PreviewPanicked`] if the preview function
+    /// panics while constructing sample data.
+    pub fn render(&self) -> Result<Mail, MailPreviewError> {
+        std::panic::catch_unwind(|| (self.render)()).map_err(|_| {
+            MailPreviewError::PreviewPanicked {
+                mailer: self.mailer,
+                method: self.method,
+            }
+        })
+    }
+}
+
+/// Collection of registered mail previews stored on [`AppState`].
+#[derive(Debug, Clone, Default)]
+pub struct MailPreviewRegistry {
+    previews: Arc<Vec<MailPreview>>,
+}
+
+impl MailPreviewRegistry {
+    /// Create a registry from preview registrations.
+    #[must_use]
+    pub fn new(previews: Vec<MailPreview>) -> Self {
+        Self {
+            previews: Arc::new(previews),
+        }
+    }
+
+    /// Registered previews.
+    #[must_use]
+    pub fn previews(&self) -> &[MailPreview] {
+        &self.previews
+    }
+
+    fn find(&self, mailer: &str, method: &str) -> Option<MailPreview> {
+        self.previews
+            .iter()
+            .find(|preview| preview.mailer == mailer && preview.method == method)
+            .cloned()
+    }
+}
+
+/// Dev mail preview UI errors.
+#[derive(Debug, Error)]
+pub enum MailPreviewError {
+    /// File transport preview IO failed.
+    #[error("mail preview file IO failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// Requested captured message was not found.
+    #[error("captured mail message not found: {0}")]
+    NotFound(String),
+    /// Requested message id is not a single `.eml` filename.
+    #[error("invalid captured mail message id: {0}")]
+    InvalidMessageId(String),
+    /// Developer-authored preview panicked while rendering sample data.
+    #[error("mail preview {mailer}::{method} panicked while rendering")]
+    PreviewPanicked {
+        /// Mailer label.
+        mailer: &'static str,
+        /// Method label.
+        method: &'static str,
+    },
 }
 
 impl Mail {
@@ -828,6 +961,12 @@ fn render_eml(mail: &Mail) -> String {
         out.push_str(reply_to);
         out.push('\n');
     }
+    out.push_str("Date: ");
+    out.push_str(&chrono::Utc::now().to_rfc2822());
+    out.push('\n');
+    out.push_str("Message-Id: <");
+    out.push_str(&uuid::Uuid::new_v4().to_string());
+    out.push_str("@autumn.local>\n");
     out.push_str("Subject: ");
     out.push_str(&mail.subject);
     out.push_str("\nMIME-Version: 1.0\n");
@@ -854,6 +993,468 @@ fn render_eml(mail: &Mail) -> String {
         out.push('\n');
     }
     out
+}
+
+#[derive(Debug, Clone)]
+struct ParsedMail {
+    headers: Vec<(String, String)>,
+    to: Vec<String>,
+    subject: String,
+    date: Option<String>,
+    html: Option<String>,
+    text: Option<String>,
+    raw: String,
+}
+
+impl ParsedMail {
+    fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedMailSummary {
+    id: String,
+    to: Vec<String>,
+    subject: String,
+    timestamp: String,
+    modified: SystemTime,
+}
+
+pub(crate) fn mail_preview_router(file_dir: PathBuf) -> axum::Router<AppState> {
+    let file_dir = Arc::new(file_dir);
+    axum::Router::new()
+        .route(
+            MAIL_PREVIEW_PATH,
+            axum::routing::get({
+                let file_dir = Arc::clone(&file_dir);
+                move |axum::extract::State(state): axum::extract::State<AppState>| {
+                    let file_dir = Arc::clone(&file_dir);
+                    async move { list_mail_preview(file_dir, state).await }
+                }
+            }),
+        )
+        .route(
+            MAIL_PREVIEW_MESSAGE_PATH,
+            axum::routing::get({
+                let file_dir = Arc::clone(&file_dir);
+                move |axum::extract::Path(message_id): axum::extract::Path<String>| {
+                    let file_dir = Arc::clone(&file_dir);
+                    async move { show_captured_mail(file_dir, message_id).await }
+                }
+            }),
+        )
+        .route(
+            MAIL_PREVIEW_TEMPLATE_PATH,
+            axum::routing::get(
+                |axum::extract::Path((mailer, method)): axum::extract::Path<(String, String)>,
+                 axum::extract::State(state): axum::extract::State<AppState>| async move {
+                    show_template_preview(&state, &mailer, &method)
+                },
+            ),
+        )
+}
+
+async fn list_mail_preview(file_dir: Arc<PathBuf>, state: AppState) -> Response {
+    match captured_messages(&file_dir).await {
+        Ok(messages) => {
+            let previews = state
+                .extension::<MailPreviewRegistry>()
+                .map(|registry| registry.previews().to_vec())
+                .unwrap_or_default();
+            html_response(render_mail_index(&messages, &previews, &file_dir))
+        }
+        Err(error) => preview_error_response(&error),
+    }
+}
+
+async fn show_captured_mail(file_dir: Arc<PathBuf>, message_id: String) -> Response {
+    match read_captured_message(&file_dir, &message_id).await {
+        Ok(parsed) => html_response(render_mail_detail(&parsed, "Captured message")),
+        Err(error) => preview_error_response(&error),
+    }
+}
+
+fn show_template_preview(state: &AppState, mailer: &str, method: &str) -> Response {
+    let preview = state
+        .extension::<MailPreviewRegistry>()
+        .and_then(|registry| registry.find(mailer, method));
+    let Some(preview) = preview else {
+        return preview_error_response(&MailPreviewError::NotFound(format!("{mailer}/{method}")));
+    };
+
+    match preview.render() {
+        Ok(mail) => {
+            let raw = render_eml(&mail);
+            let parsed = parse_eml(&raw);
+            html_response(render_mail_detail(&parsed, "Template preview"))
+        }
+        Err(error) => preview_error_response(&error),
+    }
+}
+
+async fn captured_messages(dir: &Path) -> Result<Vec<CapturedMailSummary>, MailPreviewError> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut messages = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
+        {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let metadata = entry.metadata().await?;
+        let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+        let raw = tokio::fs::read_to_string(&path).await?;
+        let parsed = parse_eml(&raw);
+        messages.push(CapturedMailSummary {
+            id: id.to_owned(),
+            to: parsed.to,
+            subject: parsed.subject,
+            timestamp: parsed.date.unwrap_or_else(|| format_system_time(modified)),
+            modified,
+        });
+    }
+
+    messages.sort_by(|left, right| {
+        right
+            .modified
+            .cmp(&left.modified)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(messages)
+}
+
+async fn read_captured_message(
+    dir: &Path,
+    message_id: &str,
+) -> Result<ParsedMail, MailPreviewError> {
+    if !valid_message_id(message_id) {
+        return Err(MailPreviewError::InvalidMessageId(message_id.to_owned()));
+    }
+    let path = dir.join(message_id);
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MailPreviewError::NotFound(message_id.to_owned()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(parse_eml(&raw))
+}
+
+fn valid_message_id(message_id: &str) -> bool {
+    !message_id.is_empty()
+        && Path::new(message_id)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("eml"))
+        && !message_id.contains('/')
+        && !message_id.contains('\\')
+        && !message_id.contains("..")
+}
+
+fn parse_eml(raw: &str) -> ParsedMail {
+    let normalized = raw.replace("\r\n", "\n");
+    let (headers, body) = split_headers_body(&normalized);
+    let content_type = header_value(&headers, "Content-Type").unwrap_or_default();
+    let (html, text) = parse_mail_body(&content_type, body);
+    let to = header_values(&headers, "To");
+    let subject = header_value(&headers, "Subject").unwrap_or_else(|| "(no subject)".to_owned());
+    let date = header_value(&headers, "Date");
+
+    ParsedMail {
+        headers,
+        to,
+        subject,
+        date,
+        html,
+        text,
+        raw: raw.to_owned(),
+    }
+}
+
+fn split_headers_body(raw: &str) -> (Vec<(String, String)>, &str) {
+    let Some((header_block, body)) = raw.split_once("\n\n") else {
+        return (parse_header_block(raw), "");
+    };
+    (parse_header_block(header_block), body)
+}
+
+fn parse_header_block(header_block: &str) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    let mut current: Option<(String, String)> = None;
+
+    for line in header_block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some((_, value)) = current.as_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            continue;
+        }
+        if let Some(header) = current.take() {
+            headers.push(header);
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            current = Some((name.trim().to_owned(), value.trim().to_owned()));
+        }
+    }
+    if let Some(header) = current {
+        headers.push(header);
+    }
+    headers
+}
+
+fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+fn header_values(headers: &[(String, String)], name: &str) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+fn parse_mail_body(content_type: &str, body: &str) -> (Option<String>, Option<String>) {
+    if content_type
+        .to_ascii_lowercase()
+        .contains("multipart/alternative")
+        && let Some(boundary) = content_type_boundary(content_type)
+    {
+        return parse_multipart_alternative(body, &boundary);
+    }
+
+    if content_type.to_ascii_lowercase().contains("text/html") {
+        (Some(trim_body(body)), None)
+    } else {
+        (None, Some(trim_body(body)))
+    }
+}
+
+fn parse_multipart_alternative(body: &str, boundary: &str) -> (Option<String>, Option<String>) {
+    let marker = format!("--{boundary}");
+    let mut html = None;
+    let mut text = None;
+
+    for segment in body.split(&marker).skip(1) {
+        let segment = segment.trim_start_matches(['\n', '\r']);
+        if segment.starts_with("--") {
+            break;
+        }
+        let (headers, part_body) = split_headers_body(segment);
+        let content_type = header_value(&headers, "Content-Type").unwrap_or_default();
+        if content_type.to_ascii_lowercase().contains("text/html") {
+            html = Some(trim_body(part_body));
+        } else if content_type.to_ascii_lowercase().contains("text/plain") {
+            text = Some(trim_body(part_body));
+        }
+    }
+
+    (html, text)
+}
+
+fn content_type_boundary(content_type: &str) -> Option<String> {
+    content_type.split(';').find_map(|part| {
+        let part = part.trim();
+        let (name, value) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        Some(value.trim().trim_matches('"').to_owned())
+    })
+}
+
+fn trim_body(body: &str) -> String {
+    body.trim_matches(['\r', '\n']).to_owned()
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+    datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn render_mail_index(
+    messages: &[CapturedMailSummary],
+    previews: &[MailPreview],
+    file_dir: &Path,
+) -> String {
+    let mut body = String::new();
+    body.push_str("<h1>Autumn Mail</h1>");
+    body.push_str("<section><h2>Captured messages</h2>");
+    if messages.is_empty() {
+        body.push_str("<p class=\"empty\">No captured emails yet. Set <code>mail.transport = &quot;file&quot;</code>, send an email, then refresh this page. Autumn reads <code>");
+        body.push_str(&escape_html(&file_dir.display().to_string()));
+        body.push_str("</code>.</p>");
+    } else {
+        body.push_str(
+            "<table><thead><tr><th>Timestamp</th><th>To</th><th>Subject</th></tr></thead><tbody>",
+        );
+        for message in messages {
+            body.push_str("<tr><td>");
+            body.push_str(&escape_html(&message.timestamp));
+            body.push_str("</td><td>");
+            body.push_str(&escape_html(&message.to.join(", ")));
+            body.push_str("</td><td><a href=\"");
+            body.push_str(MAIL_PREVIEW_PATH);
+            body.push_str("/messages/");
+            body.push_str(&escape_html(&message.id));
+            body.push_str("\">");
+            body.push_str(&escape_html(&message.subject));
+            body.push_str("</a></td></tr>");
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</section><section><h2>Template previews</h2>");
+    if previews.is_empty() {
+        body.push_str("<p class=\"empty\">No mailer previews registered.</p>");
+    } else {
+        body.push_str("<table><thead><tr><th>Mailer</th><th>Preview</th></tr></thead><tbody>");
+        for preview in previews {
+            body.push_str("<tr><td>");
+            body.push_str(&escape_html(preview.mailer()));
+            body.push_str("</td><td><a href=\"");
+            body.push_str(MAIL_PREVIEW_PATH);
+            body.push_str("/previews/");
+            body.push_str(&escape_html(preview.mailer()));
+            body.push('/');
+            body.push_str(&escape_html(preview.method()));
+            body.push_str("\">");
+            body.push_str(&escape_html(preview.method()));
+            body.push_str("</a></td></tr>");
+        }
+        body.push_str("</tbody></table>");
+    }
+    body.push_str("</section>");
+    render_mail_preview_layout("Autumn Mail", &body)
+}
+
+fn render_mail_detail(parsed: &ParsedMail, label: &str) -> String {
+    let mut body = String::new();
+    body.push_str("<p><a href=\"");
+    body.push_str(MAIL_PREVIEW_PATH);
+    body.push_str("\">Back to mail</a></p><h1>");
+    body.push_str(&escape_html(&parsed.subject));
+    body.push_str("</h1><p class=\"muted\">");
+    body.push_str(&escape_html(label));
+    body.push_str("</p>");
+
+    if let Some(html) = &parsed.html {
+        body.push_str("<iframe title=\"Rendered HTML email\" sandbox srcdoc=\"");
+        body.push_str(&escape_html(html));
+        body.push_str("\"></iframe>");
+    } else {
+        body.push_str("<p class=\"empty\">No HTML body was found for this email.</p>");
+    }
+
+    body.push_str("<details><summary>Plain text</summary><pre>");
+    body.push_str(&escape_html(parsed.text.as_deref().unwrap_or("")));
+    body.push_str("</pre></details>");
+
+    body.push_str("<details><summary>Headers</summary><dl>");
+    for header in ["From", "To", "Reply-To", "Subject", "Date", "Message-Id"] {
+        if let Some(value) = parsed.header_value(header) {
+            body.push_str("<dt>");
+            body.push_str(header);
+            body.push_str("</dt><dd>");
+            body.push_str(&escape_html(value));
+            body.push_str("</dd>");
+        }
+    }
+    body.push_str("</dl></details>");
+
+    body.push_str("<details><summary>Raw .eml</summary><pre>");
+    body.push_str(&escape_html(&parsed.raw));
+    body.push_str("</pre></details>");
+
+    render_mail_preview_layout(&parsed.subject, &body)
+}
+
+fn render_mail_preview_layout(title: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>{}</style></head><body>{}</body></html>",
+        escape_html(title),
+        MAIL_PREVIEW_CSS,
+        body
+    )
+}
+
+const MAIL_PREVIEW_CSS: &str = r#"
+body{margin:0;padding:24px;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#1f2933;background:#f6f8fa}
+h1{margin:0 0 16px;font-size:28px}
+h2{margin:28px 0 12px;font-size:18px}
+table{width:100%;border-collapse:collapse;background:white;border:1px solid #d9e2ec}
+th,td{padding:10px 12px;border-bottom:1px solid #e5eaf0;text-align:left;font-size:14px;vertical-align:top}
+th{background:#edf2f7;color:#394b59;font-weight:650}
+a{color:#0b63ce;text-decoration:none}
+a:hover{text-decoration:underline}
+.empty,.muted{color:#52616f}
+code,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+pre{white-space:pre-wrap;background:#111827;color:#f8fafc;padding:12px;overflow:auto}
+iframe{width:100%;min-height:420px;border:1px solid #cbd5e1;background:white}
+details{margin-top:14px;background:white;border:1px solid #d9e2ec;padding:10px 12px}
+summary{cursor:pointer;font-weight:650}
+dt{font-weight:650;margin-top:8px}
+dd{margin:2px 0 8px}
+"#;
+
+fn html_response(html: String) -> Response {
+    Html(html).into_response()
+}
+
+fn preview_error_response(error: &MailPreviewError) -> Response {
+    let status = match error {
+        MailPreviewError::NotFound(_) | MailPreviewError::InvalidMessageId(_) => {
+            http::StatusCode::NOT_FOUND
+        }
+        MailPreviewError::Io(_) | MailPreviewError::PreviewPanicked { .. } => {
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    (
+        status,
+        Html(render_mail_preview_layout(
+            "Mail preview error",
+            &format!(
+                "<h1>Mail preview error</h1><p>{}</p>",
+                escape_html(&error.to_string())
+            ),
+        )),
+    )
+        .into_response()
+}
+
+fn escape_html(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn parse_mailbox(address: &str) -> Result<Mailbox, MailError> {

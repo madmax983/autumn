@@ -84,6 +84,54 @@ If the route also persists DB state (for example, writing an outbox row plus
 creating a user), wrap the DB side in [`Db::tx`](transactions.md) so your write
 sequence is atomic.
 
+## Previewing Emails In Dev
+
+When the active profile is `dev` and `[mail] transport = "file"`, Autumn mounts
+the mail preview UI at `/_autumn/mail`. The index shows recent `.eml` captures
+from `mail.file_dir` newest-first and links to a detail view with sandboxed HTML,
+plain text, selected headers, and raw source.
+
+Register sample-data previews with `#[mailer_preview]` and `mail_previews![...]`:
+
+```rust
+use autumn_web::prelude::*;
+
+struct AccountMailer;
+
+#[mailer]
+impl AccountMailer {
+    fn reset_password(&self, to: String, token: String) -> Mail {
+        Mail::builder()
+            .to(to)
+            .subject("Reset your password")
+            .html(html! { p { "Token: " (token) } })
+            .text(format!("Token: {token}"))
+            .build()
+            .expect("static template should be valid")
+    }
+}
+
+#[mailer_preview]
+impl AccountMailer {
+    fn reset_password_preview() -> Mail {
+        AccountMailer.reset_password("preview@example.com".into(), "abc123".into())
+    }
+}
+
+autumn_web::app()
+    .mail_previews(mail_previews![AccountMailer])
+    .run()
+    .await;
+```
+
+Preview methods are zero-argument associated functions returning `Mail`; they
+render through the UI without invoking any transport. Adding a new preview method
+and refreshing `/_autumn/mail` is enough after the normal `autumn dev` recompile.
+
+The preview UI is a dev-only surface. Setting `[mail] preview = true` outside the
+`dev` profile fails startup with a `mail.preview` validation error instead of
+silently exposing captured email in production.
+
 ## Deferred Delivery (`deliver_later`)
 
 `Mailer::deliver_later` and the generated `deliver_later_*` helpers do **not**

@@ -14,7 +14,7 @@ struct MailMethod {
     args: Vec<(syn::Ident, Type)>,
 }
 
-fn returns_mail(method: &ImplItemFn) -> bool {
+pub fn returns_mail(method: &ImplItemFn) -> bool {
     let ReturnType::Type(_, ty) = &method.sig.output else {
         return false;
     };

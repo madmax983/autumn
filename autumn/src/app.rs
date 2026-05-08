@@ -107,6 +107,8 @@ pub fn app() -> AppBuilder {
         policy_registrations: Vec::new(),
         #[cfg(feature = "mail")]
         mail_delivery_queue_factory: None,
+        #[cfg(feature = "mail")]
+        mail_previews: Vec::new(),
     }
 }
 
@@ -266,6 +268,9 @@ pub struct AppBuilder {
     /// can capture framework-managed resources (DB pool, channels, etc.).
     #[cfg(feature = "mail")]
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
+    /// Mail template previews registered for the dev preview UI.
+    #[cfg(feature = "mail")]
+    mail_previews: Vec<crate::mail::MailPreview>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -1183,6 +1188,19 @@ impl AppBuilder {
         self
     }
 
+    /// Register mail template previews for the dev mail preview UI.
+    ///
+    /// Pair this with `#[mailer_preview]` and `mail_previews![...]`.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn mail_previews(
+        mut self,
+        previews: impl IntoIterator<Item = crate::mail::MailPreview>,
+    ) -> Self {
+        self.mail_previews.extend(previews);
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -1421,6 +1439,8 @@ impl AppBuilder {
             policy_registrations,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_previews,
         } = self;
 
         let all_routes = routes;
@@ -1543,6 +1563,8 @@ impl AppBuilder {
             tracing::error!(error = %error, "Failed to configure mailer");
             std::process::exit(1);
         });
+        #[cfg(feature = "mail")]
+        state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
@@ -1745,6 +1767,8 @@ impl AppBuilder {
             policy_registrations,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_previews,
         } = self;
 
         let all_routes = routes;
@@ -1854,6 +1878,8 @@ impl AppBuilder {
             eprintln!("Failed to configure mailer: {error}");
             std::process::exit(1);
         });
+        #[cfg(feature = "mail")]
+        state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
 

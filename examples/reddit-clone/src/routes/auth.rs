@@ -37,6 +37,20 @@ impl AccountMailer {
     }
 }
 
+#[mailer_preview]
+impl AccountMailer {
+    fn welcome_preview() -> Mail {
+        AccountMailer.welcome(
+            "preview@example.com".to_owned(),
+            "cool_rustacean".to_owned(),
+        )
+    }
+}
+
+pub fn mail_previews() -> Vec<MailPreview> {
+    mail_previews![AccountMailer]
+}
+
 // ── Register ───────────────────────────────────────────────────
 
 #[get("/register")]
