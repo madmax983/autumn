@@ -740,6 +740,15 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
     assert!(mod_rs.contains("pub mod user;"), "models/mod.rs missing pub mod user");
 
+    // schema.rs entry
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(schema.contains("users (id)"), "schema.rs missing users table block");
+    assert!(schema.contains("email -> Text"), "schema.rs missing email column");
+    assert!(
+        schema.contains("reset_token_digest -> Nullable<Text>"),
+        "schema.rs missing nullable reset_token_digest"
+    );
+
     // Routes file
     let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
     for handler in [

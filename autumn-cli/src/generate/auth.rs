@@ -17,7 +17,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::model::plan_cargo_deps;
 use super::naming::{pascal, pluralize, snake};
-use super::schema_edit::{add_mod_declaration, update_main_rs};
+use super::schema_edit::{add_mod_declaration, append_schema_table, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra Cargo dependencies the auth generator needs on top of the model deps.
@@ -66,6 +66,31 @@ pub fn plan_auth(
     plan.modify(
         model_mod_path.clone(),
         add_mod_declaration(&read_or_empty(&model_mod_path), &snake_name),
+    );
+
+    // ── src/schema.rs entry ────────────────────────────────────────────────
+    // The generated model references `crate::schema::<table>`, so we must
+    // emit a `diesel::table! { }` block just like `generate model` does.
+    // Auth-specific fields (id and created_at are added automatically):
+    //   email            String   → Text      NOT NULL
+    //   password_digest  String   → Text      NOT NULL
+    //   reset_token_digest         Option<String>         → Nullable<Text>
+    //   reset_token_expires_at     Option<NaiveDateTime>  → Nullable<Timestamp>
+    let auth_fields: Vec<super::dsl::Field> = [
+        "email:String",
+        "password_digest:String",
+        "reset_token_digest:Option<String>",
+        "reset_token_expires_at:Option<NaiveDateTime>",
+    ]
+    .iter()
+    .map(|t| super::dsl::parse_field(t).expect("auth field tokens are always valid"))
+    .collect();
+
+    let schema_path = project_root.join("src").join("schema.rs");
+    let schema_existing = read_or_empty(&schema_path);
+    plan.modify(
+        schema_path,
+        append_schema_table(&schema_existing, &table, &auth_fields),
     );
 
     // ── Auth routes ────────────────────────────────────────────────────────
@@ -928,6 +953,7 @@ mod tests {
         for expected in [
             "src/models/user.rs",
             "src/models/mod.rs",
+            "src/schema.rs",
             "migrations/20260508000000_create_users/up.sql",
             "migrations/20260508000000_create_users/down.sql",
             "src/routes/auth.rs",
@@ -983,6 +1009,30 @@ mod tests {
         )
         .unwrap();
         assert!(down.contains("DROP TABLE users"), "missing DROP TABLE: {down}");
+    }
+
+    // ── schema.rs ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn schema_rs_contains_diesel_table_for_auth_table() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("users (id)"), "schema missing table block: {schema}");
+        assert!(schema.contains("email -> Text"), "schema missing email column: {schema}");
+        assert!(
+            schema.contains("password_digest -> Text"),
+            "schema missing password_digest: {schema}"
+        );
+        assert!(
+            schema.contains("reset_token_digest -> Nullable<Text>"),
+            "schema missing nullable reset_token_digest: {schema}"
+        );
+        assert!(
+            schema.contains("reset_token_expires_at -> Nullable<Timestamp>"),
+            "schema missing nullable reset_token_expires_at: {schema}"
+        );
     }
 
     // ── Model file ──────────────────────────────────────────────────────────
