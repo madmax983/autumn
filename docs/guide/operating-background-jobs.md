@@ -34,7 +34,7 @@ The dashboard renders four paginated lists, newest-first:
 - Enqueued jobs waiting for a worker.
 - Running jobs currently executing in this runtime.
 - Completed jobs from the last 24 hours.
-- Failed jobs from the last 7 days.
+- Terminally failed jobs from the last 7 days.
 
 Each row includes the job name, lifecycle timestamps, attempt count, principal
 id, correlation id, and last error. The default backend extracts principal and
@@ -49,9 +49,13 @@ next run time when available, and last run status.
 
 ## Operator actions
 
-Failed jobs can be retried or discarded. Retrying keeps the old failed row as a
-retried lifecycle entry and enqueues a new job with the original payload.
-Discarding removes the job from the active failed list.
+Failed jobs can be retried or discarded only after automatic attempts are
+exhausted. A job attempt that fails with attempts remaining is tracked as
+retrying/delayed work and stays out of the terminal failed list, so operators do
+not accidentally enqueue a duplicate while the framework retry is already
+sleeping. Retrying keeps the old failed row as a retried lifecycle entry and
+enqueues a new job with the original payload. Discarding removes the job from
+the active failed list.
 
 Enqueued jobs can be canceled before a worker starts them. The default local
 runtime checks the cancel marker during its atomic start transition, so a cancel

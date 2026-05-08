@@ -89,6 +89,8 @@ pub enum JobAdminStatus {
     Enqueued,
     /// Currently executing in a worker.
     Running,
+    /// Failed but already scheduled for an automatic retry.
+    Retrying,
     /// Finished successfully.
     Completed,
     /// Finished with a terminal error.
@@ -108,6 +110,7 @@ impl JobAdminStatus {
         match self {
             Self::Enqueued => "enqueued",
             Self::Running => "running",
+            Self::Retrying => "retrying",
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Discarded => "discarded",
@@ -435,7 +438,7 @@ impl JobAdminMemoryBackend {
         if let Ok(mut inner) = self.inner.write()
             && let Some(record) = inner.records.get_mut(id)
         {
-            record.status = JobAdminStatus::Failed;
+            record.status = JobAdminStatus::Retrying;
             record.finished_at = Some(chrono::Utc::now());
             record.last_error = Some(error.to_owned());
         }
@@ -651,7 +654,7 @@ fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
         let is_active = inner.records.get(&id).is_some_and(|record| {
             matches!(
                 record.status,
-                JobAdminStatus::Enqueued | JobAdminStatus::Running
+                JobAdminStatus::Enqueued | JobAdminStatus::Running | JobAdminStatus::Retrying
             )
         });
         if is_active {
@@ -3048,6 +3051,64 @@ mod tests {
         assert!(status.last_error.is_some());
     }
 
+    #[tokio::test]
+    async fn job_admin_local_retriable_failure_is_not_operator_retryable_failed_work() {
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("flaky");
+        state.job_registry().record_enqueue("flaky");
+
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "flaky".to_string(),
+            JobInfo {
+                name: "flaky".to_string(),
+                max_attempts: 2,
+                initial_backoff_ms: 60_000,
+                handler: always_fail_handler,
+            },
+        );
+        let jobs_by_name = Arc::new(RwLock::new(jobs));
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let job_id = job_admin.record_enqueue_for_test("flaky", serde_json::json!({}), 1, 2);
+        execute_local_job(
+            QueuedJob {
+                id: job_id.clone(),
+                name: "flaky".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 2,
+                initial_backoff_ms: 60_000,
+            },
+            &jobs_by_name,
+            &tx,
+            &state,
+            &job_admin,
+        )
+        .await;
+
+        let snapshot = job_admin
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("job admin snapshot");
+        assert!(
+            snapshot.failed.records.is_empty(),
+            "automatic retries must stay out of terminal failed work"
+        );
+        let retry_error = job_admin
+            .retry(&job_id)
+            .await
+            .expect_err("operator retry must reject sleeping automatic retries");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("only failed jobs can be retried"),
+            "unexpected retry error: {retry_error}"
+        );
+        assert!(timeout(Duration::from_millis(25), rx.recv()).await.is_err());
+    }
+
     #[cfg(feature = "redis")]
     fn redis_test_record(attempt: u32, max_attempts: u32) -> RedisJobRecord {
         RedisJobRecord {
@@ -3308,15 +3369,21 @@ mod tests {
     }
 
     #[cfg(feature = "redis")]
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "requires Docker (testcontainers)"]
-    async fn redis_job_admin_dashboard_reads_cluster_storage_and_operates() {
-        use redis::AsyncCommands as _;
+    struct RedisAdminSeedRecords {
+        enqueued: RedisJobRecord,
+        running: RedisJobRecord,
+        completed: RedisJobRecord,
+        failed_retry: RedisJobRecord,
+        failed_discard: RedisJobRecord,
+    }
 
-        let (_container, client) = redis_test_client().await;
-        let worker_config = redis_test_worker_config("autumn:test:admin", "worker-a", 30_000);
-        let admin_connection = new_redis_connection_manager(&client, "test redis admin").unwrap();
-        let backend = RedisJobAdminBackend::new(
+    #[cfg(feature = "redis")]
+    fn redis_admin_test_backend(
+        client: &redis::Client,
+        worker_config: &RedisWorkerConfig,
+    ) -> RedisJobAdminBackend {
+        let admin_connection = new_redis_connection_manager(client, "test redis admin").unwrap();
+        RedisJobAdminBackend::new(
             admin_connection,
             worker_config.queue_key.clone(),
             worker_config.processing_key.clone(),
@@ -3325,131 +3392,181 @@ mod tests {
             worker_config.record_prefix.clone(),
             worker_config.dead_record_prefix.clone(),
             128,
-        );
-        let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
-        let now = now_unix_ms();
+        )
+    }
 
-        let enqueued = RedisJobRecord {
-            id: "job-enqueued".to_string(),
-            name: "send_email".to_string(),
-            payload: serde_json::json!({
-                "user_id": 42,
-                "correlation_id": "req-redis"
-            }),
-            attempt: 1,
-            max_attempts: 5,
-            initial_backoff_ms: 250,
-            enqueued_at_ms: Some(now.saturating_sub(4_000)),
-            started_at_ms: None,
-            finished_at_ms: None,
-            claimed_by: None,
-            claimed_at_ms: None,
-            last_error: None,
-        };
-        let running = RedisJobRecord {
-            id: "job-running".to_string(),
-            name: "reindex".to_string(),
-            payload: serde_json::json!({}),
-            attempt: 1,
-            max_attempts: 3,
-            initial_backoff_ms: 250,
-            enqueued_at_ms: Some(now.saturating_sub(3_000)),
-            started_at_ms: Some(now.saturating_sub(2_000)),
-            finished_at_ms: None,
-            claimed_by: Some("worker-a".to_string()),
-            claimed_at_ms: Some(now.saturating_sub(2_000)),
-            last_error: None,
-        };
-        let completed = RedisJobRecord {
-            id: "job-completed".to_string(),
-            name: "digest".to_string(),
-            payload: serde_json::json!({}),
-            attempt: 1,
-            max_attempts: 3,
-            initial_backoff_ms: 250,
-            enqueued_at_ms: Some(now.saturating_sub(3_000)),
-            started_at_ms: Some(now.saturating_sub(2_000)),
-            finished_at_ms: Some(now.saturating_sub(1_000)),
-            claimed_by: None,
-            claimed_at_ms: None,
-            last_error: None,
-        };
-        let failed_retry = RedisJobRecord {
-            id: "job-failed-retry".to_string(),
-            name: "send_email".to_string(),
-            payload: serde_json::json!({ "user_id": 7 }),
-            attempt: 5,
-            max_attempts: 5,
-            initial_backoff_ms: 250,
-            enqueued_at_ms: Some(now.saturating_sub(4_000)),
-            started_at_ms: Some(now.saturating_sub(3_000)),
-            finished_at_ms: Some(now.saturating_sub(500)),
-            claimed_by: None,
-            claimed_at_ms: None,
-            last_error: Some("smtp refused recipient".to_string()),
-        };
-        let failed_discard = RedisJobRecord {
-            id: "job-failed-discard".to_string(),
-            name: "webhook".to_string(),
-            payload: serde_json::json!({}),
-            attempt: 2,
-            max_attempts: 2,
-            initial_backoff_ms: 250,
-            enqueued_at_ms: Some(now.saturating_sub(4_000)),
-            started_at_ms: Some(now.saturating_sub(3_000)),
-            finished_at_ms: Some(now.saturating_sub(250)),
-            claimed_by: None,
-            claimed_at_ms: None,
-            last_error: Some("endpoint returned 410".to_string()),
-        };
+    #[cfg(feature = "redis")]
+    fn redis_admin_seed_records(now: u64) -> RedisAdminSeedRecords {
+        RedisAdminSeedRecords {
+            enqueued: RedisJobRecord {
+                id: "job-enqueued".to_string(),
+                name: "send_email".to_string(),
+                payload: serde_json::json!({"user_id": 42, "correlation_id": "req-redis"}),
+                attempt: 1,
+                max_attempts: 5,
+                initial_backoff_ms: 250,
+                enqueued_at_ms: Some(now.saturating_sub(4_000)),
+                started_at_ms: None,
+                finished_at_ms: None,
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: None,
+            },
+            running: RedisJobRecord {
+                id: "job-running".to_string(),
+                name: "reindex".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                enqueued_at_ms: Some(now.saturating_sub(3_000)),
+                started_at_ms: Some(now.saturating_sub(2_000)),
+                finished_at_ms: None,
+                claimed_by: Some("worker-a".to_string()),
+                claimed_at_ms: Some(now.saturating_sub(2_000)),
+                last_error: None,
+            },
+            completed: RedisJobRecord {
+                id: "job-completed".to_string(),
+                name: "digest".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 1,
+                max_attempts: 3,
+                initial_backoff_ms: 250,
+                enqueued_at_ms: Some(now.saturating_sub(3_000)),
+                started_at_ms: Some(now.saturating_sub(2_000)),
+                finished_at_ms: Some(now.saturating_sub(1_000)),
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: None,
+            },
+            failed_retry: RedisJobRecord {
+                id: "job-failed-retry".to_string(),
+                name: "send_email".to_string(),
+                payload: serde_json::json!({ "user_id": 7 }),
+                attempt: 5,
+                max_attempts: 5,
+                initial_backoff_ms: 250,
+                enqueued_at_ms: Some(now.saturating_sub(4_000)),
+                started_at_ms: Some(now.saturating_sub(3_000)),
+                finished_at_ms: Some(now.saturating_sub(500)),
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: Some("smtp refused recipient".to_string()),
+            },
+            failed_discard: RedisJobRecord {
+                id: "job-failed-discard".to_string(),
+                name: "webhook".to_string(),
+                payload: serde_json::json!({}),
+                attempt: 2,
+                max_attempts: 2,
+                initial_backoff_ms: 250,
+                enqueued_at_ms: Some(now.saturating_sub(4_000)),
+                started_at_ms: Some(now.saturating_sub(3_000)),
+                finished_at_ms: Some(now.saturating_sub(250)),
+                claimed_by: None,
+                claimed_at_ms: None,
+                last_error: Some("endpoint returned 410".to_string()),
+            },
+        }
+    }
+
+    #[cfg(feature = "redis")]
+    async fn redis_store_active_admin_record(
+        connection: &mut redis::aio::ConnectionManager,
+        worker_config: &RedisWorkerConfig,
+        record: &RedisJobRecord,
+        now: u64,
+    ) {
+        use redis::AsyncCommands as _;
 
         connection
             .set::<_, _, ()>(
-                redis_record_key(&worker_config.record_prefix, &enqueued.id),
-                encode_redis_record(&enqueued).unwrap(),
+                redis_record_key(&worker_config.record_prefix, &record.id),
+                encode_redis_record(record).unwrap(),
             )
             .await
             .unwrap();
-        connection
-            .lpush::<_, _, ()>(&worker_config.queue_key, &enqueued.id)
-            .await
-            .unwrap();
-        connection
-            .set::<_, _, ()>(
-                redis_record_key(&worker_config.record_prefix, &running.id),
-                encode_redis_record(&running).unwrap(),
-            )
-            .await
-            .unwrap();
-        connection
-            .zadd::<_, _, _, ()>(
-                &worker_config.processing_key,
-                &running.id,
-                now.saturating_add(30_000),
-            )
-            .await
-            .unwrap();
-        connection
-            .lpush::<_, _, ()>(
-                &worker_config.completed_key,
-                encode_redis_record(&completed).unwrap(),
-            )
-            .await
-            .unwrap();
-        for failed in [&failed_retry, &failed_discard] {
-            let encoded = encode_redis_record(failed).unwrap();
+        match record.started_at_ms {
+            Some(_) => {
+                connection
+                    .zadd::<_, _, _, ()>(
+                        &worker_config.processing_key,
+                        &record.id,
+                        now.saturating_add(30_000),
+                    )
+                    .await
+                    .unwrap();
+            }
+            None => {
+                connection
+                    .lpush::<_, _, ()>(&worker_config.queue_key, &record.id)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "redis")]
+    async fn redis_store_history_admin_record(
+        connection: &mut redis::aio::ConnectionManager,
+        worker_config: &RedisWorkerConfig,
+        record: &RedisJobRecord,
+        failed: bool,
+    ) {
+        use redis::AsyncCommands as _;
+
+        let encoded = encode_redis_record(record).unwrap();
+        if failed {
             connection
                 .lpush::<_, _, ()>(&worker_config.dead_key, &encoded)
                 .await
                 .unwrap();
             connection
                 .set::<_, _, ()>(
-                    format!("{}{}", worker_config.dead_record_prefix, failed.id),
+                    format!("{}{}", worker_config.dead_record_prefix, record.id),
                     encoded,
                 )
                 .await
                 .unwrap();
+        } else {
+            connection
+                .lpush::<_, _, ()>(&worker_config.completed_key, encoded)
+                .await
+                .unwrap();
         }
+    }
+
+    #[cfg(feature = "redis")]
+    async fn seed_redis_admin_storage(
+        connection: &mut redis::aio::ConnectionManager,
+        worker_config: &RedisWorkerConfig,
+        now: u64,
+    ) -> RedisAdminSeedRecords {
+        let records = redis_admin_seed_records(now);
+        redis_store_active_admin_record(connection, worker_config, &records.enqueued, now).await;
+        redis_store_active_admin_record(connection, worker_config, &records.running, now).await;
+        redis_store_history_admin_record(connection, worker_config, &records.completed, false)
+            .await;
+        redis_store_history_admin_record(connection, worker_config, &records.failed_retry, true)
+            .await;
+        redis_store_history_admin_record(connection, worker_config, &records.failed_discard, true)
+            .await;
+        records
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_job_admin_dashboard_reads_cluster_storage_and_operates() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("autumn:test:admin", "worker-a", 30_000);
+        let backend = redis_admin_test_backend(&client, &worker_config);
+        let mut connection = new_redis_connection_manager(&client, "test redis setup").unwrap();
+        let records =
+            seed_redis_admin_storage(&mut connection, &worker_config, now_unix_ms()).await;
 
         let snapshot = backend
             .snapshot(JobAdminQuery {
@@ -3461,25 +3578,25 @@ mod tests {
             })
             .await
             .expect("redis dashboard snapshot");
-        assert_eq!(snapshot.enqueued.records[0].id, enqueued.id);
+        assert_eq!(snapshot.enqueued.records[0].id, records.enqueued.id);
         assert_eq!(
             snapshot.enqueued.records[0].correlation_id.as_deref(),
             Some("req-redis")
         );
-        assert_eq!(snapshot.running.records[0].id, running.id);
-        assert_eq!(snapshot.completed.records[0].id, completed.id);
+        assert_eq!(snapshot.running.records[0].id, records.running.id);
+        assert_eq!(snapshot.completed.records[0].id, records.completed.id);
         assert_eq!(snapshot.failed.total, 2);
 
         backend
-            .cancel(&enqueued.id)
+            .cancel(&records.enqueued.id)
             .await
             .expect("enqueued redis job should be cancelable");
         backend
-            .retry(&failed_retry.id)
+            .retry(&records.failed_retry.id)
             .await
             .expect("failed redis job should be retryable");
         backend
-            .discard(&failed_discard.id)
+            .discard(&records.failed_discard.id)
             .await
             .expect("failed redis job should be discardable");
 
