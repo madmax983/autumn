@@ -10,6 +10,7 @@
 //! - [`scaffold::run`] — model + repository + HTML routes + smoke test +
 //!   `routes![]` registration
 
+pub mod auth;
 pub mod dsl;
 pub mod emit;
 pub mod migration;
