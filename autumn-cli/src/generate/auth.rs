@@ -40,6 +40,7 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
 /// root, or [`GenerateError::InvalidName`] for a bad resource name.
 pub fn plan_auth(project_root: &Path, name: &str, timestamp: &str) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    super::model::validate_resource_name(name)?;
 
     let pascal_name = pascal(name);
     let snake_name = snake(name);
@@ -385,11 +386,11 @@ fn redirect_to(url: &str) -> Response {{
 
 /// `GET /signup` — render the signup form.
 #[get("/signup")]
-pub async fn signup_form(csrf: CsrfToken) -> AutumnResult<Markup> {{
+pub async fn signup_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
     Ok(layout("Sign Up", html! {{
         h1 {{ "Create an Account" }}
         form action="/signup" method="post" {{
-            input type="hidden" name="_csrf" value=(csrf.token());
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -461,11 +462,11 @@ pub async fn signup(
 
 /// `GET /login` — render the login form.
 #[get("/login")]
-pub async fn login_form(csrf: CsrfToken) -> AutumnResult<Markup> {{
+pub async fn login_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
     Ok(layout("Log In", html! {{
         h1 {{ "Log In" }}
         form action="/login" method="post" {{
-            input type="hidden" name="_csrf" value=(csrf.token());
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -540,7 +541,7 @@ pub async fn logout(session: Session) -> AutumnResult<Response> {{
 /// anonymous requests before the handler body runs.
 #[secured]
 #[get("/account")]
-pub async fn account(session: Session, mut db: Db, csrf: CsrfToken) -> AutumnResult<Markup> {{
+pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
     let {snake_name}_id: i64 = session
         .get("{snake_name}_id")
         .await
@@ -558,7 +559,7 @@ pub async fn account(session: Session, mut db: Db, csrf: CsrfToken) -> AutumnRes
         h1 {{ "Your Account" }}
         p {{ "Email: " ({snake_name}.email) }}
         form action="/logout" method="post" {{
-            input type="hidden" name="_csrf" value=(csrf.token());
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
     }})))
@@ -568,11 +569,11 @@ pub async fn account(session: Session, mut db: Db, csrf: CsrfToken) -> AutumnRes
 
 /// `GET /forgot-password` — render the forgot-password form.
 #[get("/forgot-password")]
-pub async fn forgot_password_form(csrf: CsrfToken) -> AutumnResult<Markup> {{
+pub async fn forgot_password_form(csrf: Option<CsrfToken>) -> AutumnResult<Markup> {{
     Ok(layout("Forgot Password", html! {{
         h1 {{ "Forgot Your Password?" }}
         form action="/forgot-password" method="post" {{
-            input type="hidden" name="_csrf" value=(csrf.token());
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             div {{
                 label {{ "Email" }}
                 input type="email" name="email" required autocomplete="email";
@@ -661,12 +662,12 @@ pub struct ResetPasswordQuery {{
 #[get("/reset-password")]
 pub async fn reset_password_form(
     Query(query): Query<ResetPasswordQuery>,
-    csrf: CsrfToken,
+    csrf: Option<CsrfToken>,
 ) -> AutumnResult<Markup> {{
     Ok(layout("Reset Password", html! {{
         h1 {{ "Set a New Password" }}
         form action="/reset-password" method="post" {{
-            input type="hidden" name="_csrf" value=(csrf.token());
+            @if let Some(ref csrf) = csrf {{ input type="hidden" name="_csrf" value=(csrf.token()); }}
             input type="hidden" name="token" value=(query.token);
             div {{
                 label {{ "New Password (8+ characters)" }}
@@ -985,9 +986,18 @@ password hashing, and mail primitives.
 - **Protected routes**: The `/account` route uses `#[secured]` to reject
   unauthenticated requests before the handler runs.
 
-## Development Mail Flow
+## Mail Configuration
 
-In development, configure file-based mail capture in `autumn.toml`:
+Password-reset emails contain an absolute link built from `APP_BASE_URL`.
+Set this environment variable to your application's public URL:
+
+```sh
+# .env or shell
+APP_BASE_URL=https://example.com
+```
+
+In development, configure file-based mail capture in `autumn.toml` so reset
+links land in `target/mail/` instead of hitting an SMTP server:
 
 ```toml
 [mail]
@@ -995,12 +1005,11 @@ transport = "file"
 from = "Your App <noreply@yourapp.dev>"
 ```
 
-Sent emails are written as `.eml` files to `target/mail/`. Open them with any
-email client to preview the password-reset link.
+Open the `.eml` files with any email client to click the reset link.
 
-If mail is not configured (transport = "disabled"), the forgot-password handler
-returns a clear error message identifying the missing `[mail]` configuration
-and the password-reset feature affected.
+If `[mail]` is not configured (`transport = "disabled"`), the forgot-password
+handler returns an immediate HTTP 500 with a clear configuration message
+rather than silently showing "Check Your Email" when no mail will be sent.
 
 ## Customization Points
 
