@@ -683,7 +683,11 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::task::run(&name, generate::Flags { dry_run, force }),
-        GenerateCommands::Auth { name, dry_run, force } => {
+        GenerateCommands::Auth {
+            name,
+            dry_run,
+            force,
+        } => {
             generate::auth::run(&name, generate::Flags { dry_run, force });
         }
         GenerateCommands::Scaffold {
@@ -1100,7 +1104,11 @@ mod tests {
     #[test]
     fn parse_generate_auth_with_user_name() {
         let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
-        let Commands::Generate(GenerateCommands::Auth { name, dry_run, force }) = cli.command
+        let Commands::Generate(GenerateCommands::Auth {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
         else {
             panic!("expected generate auth");
         };
@@ -1111,8 +1119,7 @@ mod tests {
 
     #[test]
     fn parse_generate_auth_with_dry_run() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "auth", "User", "--dry-run"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--dry-run"]).unwrap();
         let Commands::Generate(GenerateCommands::Auth { dry_run, force, .. }) = cli.command else {
             panic!("expected generate auth");
         };
@@ -1122,8 +1129,7 @@ mod tests {
 
     #[test]
     fn parse_generate_auth_with_force() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "auth", "User", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--force"]).unwrap();
         let Commands::Generate(GenerateCommands::Auth { dry_run, force, .. }) = cli.command else {
             panic!("expected generate auth");
         };
