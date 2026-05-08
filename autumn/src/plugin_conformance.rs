@@ -633,7 +633,7 @@ mod tests {
         ];
         let result = check_route_attribution("admin", &routes);
         assert!(
-            result.message.contains("2"),
+            result.message.contains('2'),
             "expected count in message: {}",
             result.message
         );
@@ -648,7 +648,7 @@ mod tests {
         let result = check_route_attribution("admin", &routes);
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(
-            result.message.contains("1"),
+            result.message.contains('1'),
             "only 1 admin route: {}",
             result.message
         );
@@ -849,7 +849,7 @@ mod tests {
         let routes = vec![make_route("GET", "/admin/users", plugin("myplugin"))];
         let declared = vec![SensitiveRoute {
             path_pattern: "/admin".to_owned(),
-            auth_mechanism: "".to_owned(),
+            auth_mechanism: String::new(),
         }];
         let result = check_sensitive_surfaces("myplugin", &routes, &declared);
         assert_eq!(
@@ -921,7 +921,7 @@ mod tests {
             result.diagnostics
         );
         assert!(
-            result.diagnostics[0].contains("3"),
+            result.diagnostics[0].contains('3'),
             "diagnostic should include count: {:?}",
             result.diagnostics
         );

@@ -527,7 +527,7 @@ mod tests {
             make_route("GET", "/admin/items", "plugin:admin"),
         ];
         let result = check_route_attribution("admin", &routes);
-        assert!(result.message.contains("2"), "{}", result.message);
+        assert!(result.message.contains('2'), "{}", result.message);
     }
 
     // ── check_route_prefix ─────────────────────────────────────────────────
@@ -653,7 +653,7 @@ mod tests {
         let routes = vec![make_route("GET", "/admin/users", "plugin:myplugin")];
         let declared = vec![SensitiveRouteDecl {
             path_pattern: "/admin".to_owned(),
-            auth_mechanism: "".to_owned(),
+            auth_mechanism: String::new(),
         }];
         let result = check_sensitive_surfaces("myplugin", &routes, &declared);
         assert_eq!(result.status, CheckStatus::Fail, "empty auth_mechanism must fail");
