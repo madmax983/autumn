@@ -152,3 +152,117 @@ impl Plugin for MyTelemetryPlugin {
 [`autumn_web::Plugin`]: https://docs.rs/autumn-web/latest/autumn_web/plugin/trait.Plugin.html
 [`Plugin::name`]: https://docs.rs/autumn-web/latest/autumn_web/plugin/trait.Plugin.html#method.name
 [`AppBuilder::has_plugin`]: https://docs.rs/autumn-web/latest/autumn_web/app/struct.AppBuilder.html#method.has_plugin
+
+---
+
+## Plugin conformance and publishing checklist
+
+Before publishing a plugin crate to crates.io, run the Autumn conformance
+flow to prove your plugin is safe to install in a real host app.
+
+### 1. Run conformance against a minimal host app
+
+Create a small example or test binary that installs your plugin, then run:
+
+```bash
+autumn plugin-check \
+  --plugin-name autumn-myplugin-plugin \
+  --prefix /my-prefix \
+  --sensitive-route /my-prefix:"Role: myadmin required" \
+  -p my-conformance-app
+```
+
+This checks:
+
+| Check | What it verifies |
+|-------|-----------------|
+| `installability` | Binary compiles and route manifest is produced |
+| `route-attribution` | Every plugin route carries `plugin:<your-name>` source |
+| `route-prefix` | Every plugin route lives under the declared prefix |
+| `route-collision` | No two routes share (method, path); names the conflicting handlers and sources |
+| `sensitive-surfaces` | Routes with admin/debug/credential/operator/secret/metrics paths are declared with auth mechanisms |
+
+Add `--format json` to produce a machine-readable report suitable for CI:
+
+```bash
+autumn plugin-check --plugin-name autumn-myplugin-plugin --prefix /my-prefix \
+  --sensitive-route /my-prefix:"Role: myadmin required" \
+  --format json | tee conformance-report.json
+```
+
+### 2. Write library-level conformance tests
+
+For tighter integration, use `autumn_web::plugin_conformance` in your
+test suite to verify conformance at `cargo test` time without a separate
+binary step:
+
+```rust
+#[cfg(test)]
+mod conformance_tests {
+    use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
+    use autumn_web::route_listing::{RouteInfo, RouteSource};
+
+    #[test]
+    fn plugin_passes_conformance() {
+        // Simulate the routes your plugin contributes
+        let routes = vec![
+            RouteInfo {
+                method: "GET".to_owned(),
+                path: "/my-prefix".to_owned(),
+                handler: "myplugin::index".to_owned(),
+                source: RouteSource::Plugin("autumn-myplugin-plugin".to_owned()),
+                middleware: vec![],
+            },
+        ];
+
+        let config = ConformanceConfig::new("autumn-myplugin-plugin")
+            .prefix("/my-prefix")
+            .sensitive_route("/my-prefix", "Role: myadmin required");
+
+        let report = run_conformance(&config, &routes);
+        assert!(report.passed(), "conformance failed:\n{}", report.to_text_report());
+    }
+}
+```
+
+### 3. Publishing checklist
+
+Work through this list before `cargo publish`:
+
+- [ ] **Crate name** — follows the `autumn-<name>-plugin` (first-party) or
+  `autumn-plugin-<name>` (third-party) convention
+- [ ] **Install snippet** — README includes a one-line `.plugin(MyPlugin::new())`
+  install example with the correct import path
+- [ ] **Route prefix** — all plugin routes live under a documented prefix,
+  or any root-level routes are explicitly explained in the README
+- [ ] **Route manifest** — `autumn routes --format json` on a host app shows
+  every plugin route with `"source": "plugin:<your-name>"`
+- [ ] **Production exposure gates** — if the plugin mounts admin, debug,
+  credential, operator, secret, or metrics surfaces, the README documents
+  the auth/profile gating mechanism and conformance passes with
+  `--sensitive-route PATH:DESCRIPTION`
+- [ ] **SemVer expectations** — breaking changes to the `Plugin::build`
+  signature or to any mounted route path bump the major version
+- [ ] **Conformance report** — `autumn plugin-check` exits 0 and the
+  CI log shows "All conformance checks passed"
+- [ ] **Duplicate-registration contract** — installing the plugin twice
+  is a no-op (second registration is skipped with a warning); document
+  whether your plugin is designed to be registered more than once
+- [ ] **Existing app compatibility** — downstream apps that only consume
+  the plugin continue to compile and run unchanged after each release
+
+### Reference example: `autumn-admin-plugin`
+
+`autumn-admin-plugin` is the first-party reference for the conformance
+workflow.  See `autumn-admin-plugin/src/lib.rs` for the library-level
+conformance test that runs as part of `cargo test`.
+
+To run the CLI conformance check against the admin plugin's example app:
+
+```bash
+autumn plugin-check \
+  -p bookmarks \
+  --plugin-name autumn-admin-plugin \
+  --prefix /admin \
+  --sensitive-route /admin:"Role: admin required via AdminPlugin::require_role"
+```

@@ -181,3 +181,193 @@ impl Plugin for AdminPlugin {
         app.nest(&prefix, router)
     }
 }
+
+// ── Conformance reference tests ────────────────────────────────────────────
+//
+// These tests are the reference example for the Autumn plugin conformance
+// workflow documented in docs/plugins.md.  They use
+// `autumn_web::plugin_conformance` to verify that the admin plugin's declared
+// routes satisfy all conformance checks before publication.
+//
+// See docs/plugins.md § "Plugin conformance and publishing checklist" for the
+// equivalent `autumn plugin-check` CLI invocation.
+
+#[cfg(test)]
+mod conformance_tests {
+    use autumn_web::plugin_conformance::{run_conformance, ConformanceConfig};
+    use autumn_web::route_listing::{RouteInfo, RouteSource};
+
+    const PLUGIN_NAME: &str = "autumn-admin-plugin";
+
+    /// Build a representative slice of routes that `AdminPlugin` contributes
+    /// under the default `/admin` prefix.  These mirror the routes declared in
+    /// `routes::admin_router` — kept in sync manually; update here when routes
+    /// are added or removed.
+    fn admin_routes(prefix: &str) -> Vec<RouteInfo> {
+        let src = RouteSource::Plugin(PLUGIN_NAME.to_owned());
+        let routes_data = [
+            ("GET", format!("{prefix}")),
+            ("GET", format!("{prefix}/{{slug}}")),
+            ("POST", format!("{prefix}/{{slug}}")),
+            ("GET", format!("{prefix}/{{slug}}/new")),
+            ("GET", format!("{prefix}/{{slug}}/{{id}}")),
+            ("POST", format!("{prefix}/{{slug}}/{{id}}")),
+            ("DELETE", format!("{prefix}/{{slug}}/{{id}}")),
+            ("GET", format!("{prefix}/{{slug}}/{{id}}/edit")),
+            ("POST", format!("{prefix}/{{slug}}/actions")),
+            ("GET", format!("{prefix}/static/admin.{{hash}}.js")),
+        ];
+        routes_data
+            .into_iter()
+            .map(|(method, path)| RouteInfo {
+                method: method.to_owned(),
+                path,
+                handler: format!("admin::{}", method.to_lowercase()),
+                source: src.clone(),
+                middleware: vec![],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn admin_plugin_routes_are_attributed_to_plugin_name() {
+        let routes = admin_routes("/admin");
+        let result = autumn_web::plugin_conformance::check_route_attribution(PLUGIN_NAME, &routes);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Pass,
+            "route attribution failed: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn admin_plugin_routes_live_under_admin_prefix() {
+        let routes = admin_routes("/admin");
+        let result = autumn_web::plugin_conformance::check_route_prefix(
+            PLUGIN_NAME,
+            "/admin",
+            &[],
+            &routes,
+        );
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Pass,
+            "prefix check failed: {}\n{:?}",
+            result.message,
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn admin_plugin_has_no_route_collisions_in_isolation() {
+        let routes = admin_routes("/admin");
+        let (result, _) = autumn_web::plugin_conformance::check_collisions(&routes);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Pass,
+            "unexpected collision: {}\n{:?}",
+            result.message,
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn admin_plugin_sensitive_surfaces_declared_with_role_requirement() {
+        let routes = admin_routes("/admin");
+        let declared = vec![autumn_web::plugin_conformance::SensitiveRoute {
+            path_pattern: "/admin".to_owned(),
+            auth_mechanism: "Role: admin required via AdminPlugin::require_role \
+                             (default) or AdminPlugin::require_role(None) to disable"
+                .to_owned(),
+        }];
+        let result = autumn_web::plugin_conformance::check_sensitive_surfaces(
+            PLUGIN_NAME,
+            &routes,
+            &declared,
+        );
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Pass,
+            "sensitive-surfaces check failed: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn admin_plugin_sensitive_surfaces_fail_without_declaration() {
+        let routes = admin_routes("/admin");
+        let result =
+            autumn_web::plugin_conformance::check_sensitive_surfaces(PLUGIN_NAME, &routes, &[]);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Fail,
+            "expected FAIL when sensitive routes are undeclared"
+        );
+    }
+
+    #[test]
+    fn admin_plugin_passes_full_conformance_with_config() {
+        let routes = admin_routes("/admin");
+        let config = ConformanceConfig::new(PLUGIN_NAME)
+            .prefix("/admin")
+            .sensitive_route(
+                "/admin",
+                "Role: admin required via AdminPlugin::require_role",
+            );
+        let report = run_conformance(&config, &routes);
+        assert!(
+            report.passed(),
+            "AdminPlugin conformance failed:\n{}",
+            report.to_text_report()
+        );
+    }
+
+    #[test]
+    fn admin_plugin_collision_with_host_route_detected() {
+        let mut routes = admin_routes("/admin");
+        // Simulate a host app that accidentally defines GET /admin
+        routes.push(RouteInfo {
+            method: "GET".to_owned(),
+            path: "/admin".to_owned(),
+            handler: "host::admin_redirect".to_owned(),
+            source: RouteSource::User,
+            middleware: vec![],
+        });
+        let (result, diagnostics) = autumn_web::plugin_conformance::check_collisions(&routes);
+        assert_eq!(
+            result.status,
+            autumn_web::plugin_conformance::CheckStatus::Fail,
+            "expected collision to be detected"
+        );
+        let diag = &diagnostics[0];
+        assert_eq!(diag.method, "GET");
+        assert_eq!(diag.path, "/admin");
+        let sources: Vec<&str> = diag.contributors.iter().map(|c| c.source.as_str()).collect();
+        assert!(
+            sources.contains(&"user"),
+            "missing user contributor: {sources:?}"
+        );
+        assert!(
+            sources.contains(&"plugin:autumn-admin-plugin"),
+            "missing plugin contributor: {sources:?}"
+        );
+    }
+
+    #[test]
+    fn admin_plugin_custom_prefix_passes_conformance() {
+        let routes = admin_routes("/backend");
+        let config = ConformanceConfig::new(PLUGIN_NAME)
+            .prefix("/backend")
+            .sensitive_route(
+                "/backend",
+                "Role: admin required via AdminPlugin::require_role",
+            );
+        let report = run_conformance(&config, &routes);
+        assert!(
+            report.passed(),
+            "AdminPlugin with custom prefix failed conformance:\n{}",
+            report.to_text_report()
+        );
+    }
+}
