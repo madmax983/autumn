@@ -429,9 +429,7 @@ fn render_select_kind(spec: &SelectSpec) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!(
-                "SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}",
-            )
+            format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}",)
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -446,17 +444,16 @@ fn render_fields_vec(fields: &[Field], options: &AdminOptions) -> String {
             continue;
         }
         let select_spec = options.select.iter().find(|s| s.field == f.name);
-        let kind_str: String = if options.hidden.contains(&f.name)
-            || matches!(f.kind, FieldKind::Bytea)
-        {
-            "AdminFieldKind::Hidden".into()
-        } else if options.password.contains(&f.name) {
-            "AdminFieldKind::Password".into()
-        } else if let Some(spec) = select_spec {
-            render_select_kind(spec)
-        } else {
-            admin_field_kind(f).into()
-        };
+        let kind_str: String =
+            if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
+                "AdminFieldKind::Hidden".into()
+            } else if options.password.contains(&f.name) {
+                "AdminFieldKind::Password".into()
+            } else if let Some(spec) = select_spec {
+                render_select_kind(spec)
+            } else {
+                admin_field_kind(f).into()
+            };
         let _ = write!(
             out,
             "            AdminField::new(\"{name}\", {kind_str})",
@@ -466,8 +463,7 @@ fn render_fields_vec(fields: &[Field], options: &AdminOptions) -> String {
             let _ = write!(out, "\n                .readonly()");
         }
         // Select and hidden fields are not text-searchable.
-        let is_select_or_hidden =
-            select_spec.is_some() || options.hidden.contains(&f.name);
+        let is_select_or_hidden = select_spec.is_some() || options.hidden.contains(&f.name);
         if is_default_searchable(f) && !is_select_or_hidden {
             let _ = write!(out, "\n                .searchable()");
         }
@@ -863,7 +859,11 @@ mod tests {
         let plan = plan_admin(
             tmp.path(),
             "Post",
-            &["title:String".into(), "body:Text".into(), "published:bool".into()],
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
         )
         .unwrap();
 
@@ -936,7 +936,11 @@ mod tests {
         let plan = plan_admin(
             tmp.path(),
             "Post",
-            &["title:String".into(), "body:Text".into(), "published:bool".into()],
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -950,7 +954,10 @@ mod tests {
         // Slug, display names
         assert!(admin.contains("\"posts\""), "slug must be 'posts'");
         assert!(admin.contains("\"Post\""), "display_name must be 'Post'");
-        assert!(admin.contains("\"Posts\""), "display_name_plural must be 'Posts'");
+        assert!(
+            admin.contains("\"Posts\""),
+            "display_name_plural must be 'Posts'"
+        );
 
         // Id is always hidden + readonly + hidden from list
         assert!(admin.contains("AdminField::new(\"id\", AdminFieldKind::Hidden)"));
@@ -1005,12 +1012,21 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
-        assert!(admin.contains("fn apply_filters"), "must have apply_filters fn");
+        assert!(
+            admin.contains("fn apply_filters"),
+            "must have apply_filters fn"
+        );
         assert!(admin.contains("fn apply_sort"), "must have apply_sort fn");
         // Search on text fields
-        assert!(admin.contains("posts::title.ilike"), "title should be in ilike search");
+        assert!(
+            admin.contains("posts::title.ilike"),
+            "title should be in ilike search"
+        );
         // Bool filter
-        assert!(admin.contains("posts::published.eq(true)"), "published should have bool filter");
+        assert!(
+            admin.contains("posts::published.eq(true)"),
+            "published should have bool filter"
+        );
         // Sort arms for user fields
         assert!(admin.contains("\"title\""), "sort arm for title");
         assert!(admin.contains("\"published\""), "sort arm for published");
@@ -1078,7 +1094,11 @@ mod tests {
     fn dry_run_does_not_write_admin_file() {
         let tmp = project_with_model("post");
         let plan = plan_admin(tmp.path(), "Post", &[]).unwrap();
-        plan.execute(Flags { dry_run: true, force: false }).unwrap();
+        plan.execute(Flags {
+            dry_run: true,
+            force: false,
+        })
+        .unwrap();
         assert!(
             !tmp.path().join("src/admin/post.rs").exists(),
             "dry-run must not create files"
@@ -1135,13 +1155,8 @@ mod tests {
             hidden: vec!["title".into()],
             ..Default::default()
         };
-        let plan = plan_admin_with_options(
-            tmp.path(),
-            "Post",
-            &["title:String".into()],
-            &options,
-        )
-        .unwrap();
+        let plan = plan_admin_with_options(tmp.path(), "Post", &["title:String".into()], &options)
+            .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
@@ -1182,13 +1197,8 @@ mod tests {
             readonly: vec!["title".into()],
             ..Default::default()
         };
-        let plan = plan_admin_with_options(
-            tmp.path(),
-            "Post",
-            &["title:String".into()],
-            &options,
-        )
-        .unwrap();
+        let plan = plan_admin_with_options(tmp.path(), "Post", &["title:String".into()], &options)
+            .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
@@ -1205,7 +1215,10 @@ mod tests {
         let plan = plan_admin(
             tmp.path(),
             "Post",
-            &["created_at:DateTime".into(), "updated_at:NaiveDateTime".into()],
+            &[
+                "created_at:DateTime".into(),
+                "updated_at:NaiveDateTime".into(),
+            ],
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -1293,13 +1306,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let plan = plan_admin_with_options(
-            tmp.path(),
-            "Post",
-            &["status:String".into()],
-            &options,
-        )
-        .unwrap();
+        let plan = plan_admin_with_options(tmp.path(), "Post", &["status:String".into()], &options)
+            .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
@@ -1324,13 +1332,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let plan = plan_admin_with_options(
-            tmp.path(),
-            "Post",
-            &["status:String".into()],
-            &options,
-        )
-        .unwrap();
+        let plan = plan_admin_with_options(tmp.path(), "Post", &["status:String".into()], &options)
+            .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
@@ -1342,14 +1345,10 @@ mod tests {
 
     #[test]
     fn parse_select_specs_parses_field_with_values() {
-        let specs =
-            parse_select_specs(&["status=draft,published,archived".into()]).unwrap();
+        let specs = parse_select_specs(&["status=draft,published,archived".into()]).unwrap();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].field, "status");
-        assert_eq!(
-            specs[0].values,
-            vec!["draft", "published", "archived"]
-        );
+        assert_eq!(specs[0].values, vec!["draft", "published", "archived"]);
     }
 
     #[test]
@@ -1369,13 +1368,20 @@ mod tests {
     fn no_searchable_fields_produces_valid_apply_filters() {
         // A model with only numeric/bool fields — no text-like searchable ones.
         let tmp = project_with_model("counter");
-        let plan =
-            plan_admin(tmp.path(), "counter", &["count:i64".into(), "active:bool".into()]).unwrap();
+        let plan = plan_admin(
+            tmp.path(),
+            "counter",
+            &["count:i64".into(), "active:bool".into()],
+        )
+        .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let admin = fs::read_to_string(tmp.path().join("src/admin/counter.rs")).unwrap();
         // apply_filters must still be present and compile-valid (no ilike calls)
-        assert!(admin.contains("fn apply_filters"), "apply_filters must exist");
+        assert!(
+            admin.contains("fn apply_filters"),
+            "apply_filters must exist"
+        );
         assert!(
             !admin.contains(".ilike("),
             "no ilike when there are no searchable fields"

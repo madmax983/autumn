@@ -747,11 +747,10 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let select_specs =
-                generate::admin::parse_select_specs(&select).unwrap_or_else(|e| {
-                    eprintln!("autumn generate admin: {e}");
-                    std::process::exit(1);
-                });
+            let select_specs = generate::admin::parse_select_specs(&select).unwrap_or_else(|e| {
+                eprintln!("autumn generate admin: {e}");
+                std::process::exit(1);
+            });
             let options = generate::admin::AdminOptions {
                 hidden,
                 readonly,
@@ -1953,9 +1952,15 @@ mod tests {
 
     #[test]
     fn parse_generate_admin_with_dry_run_and_force() {
-        let cli =
-            Cli::try_parse_from(["autumn", "generate", "admin", "Post", "--dry-run", "--force"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "admin",
+            "Post",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
         let Commands::Generate(GenerateCommands::Admin { dry_run, force, .. }) = cli.command else {
             panic!("expected generate admin");
         };
