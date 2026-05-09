@@ -432,7 +432,7 @@ fn render_select_kind(spec: &SelectSpec) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}",)
+            format!("SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}")
         })
         .collect::<Vec<_>>()
         .join(", ");
