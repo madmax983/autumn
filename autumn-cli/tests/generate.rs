@@ -704,3 +704,217 @@ fn generated_scaffold_cargo_checks() {
         String::from_utf8_lossy(&check.stderr),
     );
 }
+
+// ── autumn generate auth integration tests ────────────────────────────────────
+
+#[allow(clippy::too_many_lines)]
+#[test]
+fn generate_auth_in_fresh_project_creates_expected_files() {
+    let (_tmp, project) = fresh_project("auth-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+
+    // Migration directory exists with up.sql and down.sql.
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_users"))
+        .collect();
+    assert_eq!(migrations.len(), 1, "expected one create_users migration");
+    let mig_dir = migrations[0].path();
+    let up = fs::read_to_string(mig_dir.join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE TABLE users"),
+        "up.sql missing CREATE TABLE"
+    );
+    assert!(up.contains("email"), "up.sql missing email column");
+    assert!(
+        up.contains("password_digest"),
+        "up.sql missing password_digest"
+    );
+    assert!(
+        up.contains("reset_token_digest"),
+        "up.sql missing reset_token_digest"
+    );
+    assert!(up.contains("UNIQUE"), "email must be UNIQUE");
+    let down = fs::read_to_string(mig_dir.join("down.sql")).unwrap();
+    assert!(
+        down.contains("DROP TABLE users"),
+        "down.sql missing DROP TABLE"
+    );
+
+    // Model file
+    let model = fs::read_to_string(project.join("src/models/user.rs")).unwrap();
+    assert!(model.contains("pub struct User"), "model missing struct");
+    assert!(
+        model.contains("pub email: String"),
+        "model missing email field"
+    );
+    assert!(
+        model.contains("pub password_digest: String"),
+        "model missing password_digest"
+    );
+    assert!(
+        !model.contains("pub password:"),
+        "raw password must not be stored"
+    );
+
+    // mod.rs declares user module
+    let mod_rs = fs::read_to_string(project.join("src/models/mod.rs")).unwrap();
+    assert!(
+        mod_rs.contains("pub mod user;"),
+        "models/mod.rs missing pub mod user"
+    );
+
+    // schema.rs entry
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("users (id)"),
+        "schema.rs missing users table block"
+    );
+    assert!(
+        schema.contains("email -> Text"),
+        "schema.rs missing email column"
+    );
+    assert!(
+        schema.contains("reset_token_digest -> Nullable<Text>"),
+        "schema.rs missing nullable reset_token_digest"
+    );
+
+    // Routes file
+    let routes = fs::read_to_string(project.join("src/routes/auth.rs")).unwrap();
+    for handler in [
+        "pub async fn signup_form",
+        "pub async fn signup",
+        "pub async fn login_form",
+        "pub async fn login",
+        "pub async fn logout",
+        "pub async fn account",
+        "pub async fn forgot_password_form",
+        "pub async fn forgot_password",
+        "pub async fn reset_password_form",
+        "pub async fn reset_password",
+    ] {
+        assert!(
+            routes.contains(handler),
+            "routes/auth.rs missing: {handler}"
+        );
+    }
+    assert!(
+        routes.contains("#[secured]"),
+        "account route must be protected"
+    );
+    assert!(
+        routes.contains("session.destroy"),
+        "logout must destroy session"
+    );
+    assert!(
+        routes.contains("session.rotate_id"),
+        "login must rotate session id"
+    );
+
+    // routes/mod.rs
+    let route_mod = fs::read_to_string(project.join("src/routes/mod.rs")).unwrap();
+    assert!(
+        route_mod.contains("pub mod auth;"),
+        "routes/mod.rs missing pub mod auth"
+    );
+
+    // Generated tests file
+    let tests = fs::read_to_string(project.join("tests/auth.rs")).unwrap();
+    for flow in [
+        "auth_signup_returns_200",
+        "auth_login_returns_200",
+        "auth_logout_redirects",
+        "auth_forgot_password_returns_200",
+        "auth_reset_password_returns_200",
+        "auth_account_rejects_anonymous",
+    ] {
+        assert!(tests.contains(flow), "tests/auth.rs missing: {flow}");
+    }
+
+    // Documentation
+    assert!(
+        project.join("docs/guide/authentication.md").exists(),
+        "docs/guide/authentication.md must be created"
+    );
+
+    // main.rs registers auth routes
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    for entry in [
+        "routes::auth::signup_form",
+        "routes::auth::login_form",
+        "routes::auth::logout",
+        "routes::auth::account",
+        "routes::auth::forgot_password_form",
+        "routes::auth::reset_password_form",
+    ] {
+        assert!(main.contains(entry), "main.rs missing route: {entry}");
+    }
+}
+
+#[test]
+fn generate_auth_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("auth-dry-app");
+    let (stdout, _) = run_autumn(&project, &["generate", "auth", "User", "--dry-run"]);
+    assert!(
+        stdout.contains("Dry run"),
+        "expected dry-run output; got: {stdout}"
+    );
+    assert!(
+        !project.join("src/models/user.rs").exists(),
+        "dry run must not create model file"
+    );
+    assert!(
+        !project.join("src/routes/auth.rs").exists(),
+        "dry run must not create routes file"
+    );
+    assert!(
+        !project.join("tests/auth.rs").exists(),
+        "dry run must not create tests file"
+    );
+}
+
+#[test]
+fn generate_auth_collision_without_force_fails() {
+    let (_tmp, project) = fresh_project("auth-collide-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    // Re-run without --force should fail with collision error.
+    let (_, stderr, code) = run_autumn_failing(&project, &["generate", "auth", "User"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("would overwrite"),
+        "expected collision message; got stderr: {stderr}"
+    );
+}
+
+#[test]
+fn generate_auth_force_overwrites_existing_files() {
+    let (_tmp, project) = fresh_project("auth-force-app");
+    run_autumn(&project, &["generate", "auth", "User"]);
+    let model_path = project.join("src/models/user.rs");
+    let original = fs::read_to_string(&model_path).unwrap();
+    fs::write(&model_path, "// touched").unwrap();
+    run_autumn(&project, &["generate", "auth", "User", "--force"]);
+    let regenerated = fs::read_to_string(&model_path).unwrap();
+    assert_eq!(
+        regenerated, original,
+        "--force must restore original content"
+    );
+}
+
+#[test]
+fn generate_auth_help_documents_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+    let output = Command::new(autumn_bin)
+        .args(["generate", "auth", "--help"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--dry-run"),
+        "help should mention --dry-run"
+    );
+    assert!(stdout.contains("--force"), "help should mention --force");
+}

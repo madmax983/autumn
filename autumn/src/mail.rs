@@ -621,6 +621,16 @@ impl Mailer {
         self.delivery_queue.is_some()
     }
 
+    /// Returns `true` when the active transport is intentionally a no-op
+    /// (i.e. `transport = "disabled"` in `autumn.toml`).
+    ///
+    /// Handlers that require mail (e.g. forgot-password) can guard against
+    /// silently dropped messages by checking this before attempting to send.
+    #[must_use]
+    pub fn is_disabled(&self) -> bool {
+        self.transport.is_disabled()
+    }
+
     /// Send mail immediately.
     ///
     /// # Errors

@@ -172,7 +172,7 @@ pub(super) fn plan_cargo_deps(plan: &mut Plan, project_root: &Path, deps: &[(&st
 /// section, skipping entries already present. Pure string transformation —
 /// preserves the rest of the file as-is. If the file has no `[dependencies]`
 /// section yet, appends a new one with the requested entries.
-fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
+pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -> String {
     let lines: Vec<&str> = existing.lines().collect();
 
     // Locate the `[dependencies]` table header. Tolerate trailing whitespace

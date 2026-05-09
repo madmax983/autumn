@@ -396,6 +396,27 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a complete browser authentication flow: signup, login, logout,
+    /// account/profile, forgot-password, and reset-password.
+    ///
+    /// The generated code uses Autumn's existing session, CSRF, password
+    /// hashing, and mail primitives. Only password digests and reset-token
+    /// digests are stored — raw secrets are never persisted or logged.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate auth User
+    #[command(verbatim_doc_comment)]
+    Auth {
+        /// Model name (`PascalCase` or `snake_case`, e.g. `User`).
+        name: String,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -662,6 +683,13 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::Auth {
+            name,
+            dry_run,
+            force,
+        } => {
+            generate::auth::run(&name, generate::Flags { dry_run, force });
+        }
         GenerateCommands::Scaffold {
             name,
             fields,
@@ -1071,6 +1099,56 @@ mod tests {
     #[test]
     fn parse_generate_without_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_auth_with_user_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth {
+            name,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate auth");
+        };
+        assert_eq!(name, "User");
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_auth_with_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { dry_run, force, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_auth_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "User", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { dry_run, force, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_auth_snake_case_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "auth", "account"]).unwrap();
+        let Commands::Generate(GenerateCommands::Auth { name, .. }) = cli.command else {
+            panic!("expected generate auth");
+        };
+        assert_eq!(name, "account");
+    }
+
+    #[test]
+    fn parse_generate_auth_without_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate", "auth"]).is_err());
     }
 
     #[test]

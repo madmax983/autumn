@@ -83,6 +83,6 @@ pub use config::{
     CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
     default_content_security_policy,
 };
-pub use csrf::{CsrfLayer, CsrfToken};
+pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;
