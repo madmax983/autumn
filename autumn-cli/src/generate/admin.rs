@@ -185,35 +185,34 @@ fn read_or_empty(path: &Path) -> String {
 
 // ── Field metadata derivation ────────────────────────────────────────────────
 
-fn admin_field_kind(field: &Field) -> &'static str {
+const fn admin_field_kind(field: &Field) -> &'static str {
     match field.kind {
-        FieldKind::String => "AdminFieldKind::Text",
+        FieldKind::String | FieldKind::Uuid => "AdminFieldKind::Text",
         FieldKind::Text => "AdminFieldKind::TextArea",
         FieldKind::I32 | FieldKind::I64 => "AdminFieldKind::Integer",
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
-        FieldKind::Uuid => "AdminFieldKind::Text",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
         FieldKind::Bytea => "AdminFieldKind::Hidden",
     }
 }
 
-fn is_default_searchable(field: &Field) -> bool {
+const fn is_default_searchable(field: &Field) -> bool {
     matches!(field.kind, FieldKind::String | FieldKind::Text)
 }
 
-fn is_default_filterable(field: &Field) -> bool {
+const fn is_default_filterable(field: &Field) -> bool {
     matches!(field.kind, FieldKind::Bool)
 }
 
-fn is_default_readonly(field: &Field) -> bool {
+const fn is_default_readonly(field: &Field) -> bool {
     matches!(
         field.kind,
         FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Uuid
     )
 }
 
-fn is_default_optional(field: &Field) -> bool {
+const fn is_default_optional(field: &Field) -> bool {
     field.nullable || matches!(field.kind, FieldKind::NaiveDateTime | FieldKind::DateTime)
 }
 
@@ -232,6 +231,10 @@ fn is_update_writable(field: &Field, options: &AdminOptions) -> bool {
 
 // ── Template rendering ───────────────────────────────────────────────────────
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Single template function — splitting produces less readable output, not more."
+)]
 fn render_admin_file(
     pascal_name: &str,
     snake_name: &str,
@@ -420,13 +423,12 @@ fn render_select_kind(spec: &SelectSpec) -> String {
         .iter()
         .map(|v| {
             let label = v
-                .split(|c: char| c == '_' || c == '-')
+                .split(['_', '-'])
                 .map(|word| {
                     let mut chars = word.chars();
-                    match chars.next() {
-                        None => String::new(),
-                        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                    }
+                    chars.next().map_or_else(String::new, |c| {
+                        c.to_uppercase().collect::<String>() + chars.as_str()
+                    })
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -532,9 +534,11 @@ fn render_apply_filters(plural: &str, fields: &[Field], options: &AdminOptions) 
     };
 
     let filter_block = if has_filters {
+        use std::fmt::Write;
         let mut arms = String::new();
         for f in &filterable_bool {
-            arms.push_str(&format!(
+            let _ = write!(
+                arms,
                 "                \"{name}\" => match value.as_str() {{\n\
                  \t\t\t\t\t\"true\" | \"1\" | \"yes\" => \
                      query = query.filter({plural}::{name}.eq(true)),\n\
@@ -543,7 +547,7 @@ fn render_apply_filters(plural: &str, fields: &[Field], options: &AdminOptions) 
                  \t\t\t\t\t_ => {{}}\n\
                  \t\t\t\t}},\n",
                 name = f.name
-            ));
+            );
         }
         format!(
             "        for (name, value) in &params.filters {{\n\
@@ -570,6 +574,7 @@ fn render_apply_filters(plural: &str, fields: &[Field], options: &AdminOptions) 
 }
 
 fn render_apply_sort(plural: &str, fields: &[Field], options: &AdminOptions) -> String {
+    use std::fmt::Write;
     let sortable: Vec<&Field> = fields
         .iter()
         .filter(|f| !options.exclude.contains(&f.name))
@@ -577,26 +582,29 @@ fn render_apply_sort(plural: &str, fields: &[Field], options: &AdminOptions) -> 
 
     let mut arms = String::new();
     // id arms always first
-    arms.push_str(&format!(
+    let _ = write!(
+        arms,
         "            (Some(\"id\"), SortDirection::Asc) => \
              query = query.order({plural}::id.asc()),\n\
          \t\t\t(Some(\"id\"), SortDirection::Desc) => \
              query = query.order({plural}::id.desc()),\n"
-    ));
+    );
     for f in &sortable {
-        arms.push_str(&format!(
+        let _ = write!(
+            arms,
             "            (Some(\"{name}\"), SortDirection::Asc) => \
                  query = query.order({plural}::{name}.asc()),\n\
              \t\t\t(Some(\"{name}\"), SortDirection::Desc) => \
                  query = query.order({plural}::{name}.desc()),\n",
             name = f.name
-        ));
+        );
     }
     // Default fallback
-    arms.push_str(&format!(
+    let _ = write!(
+        arms,
         "            (_, SortDirection::Asc) => query = query.order({plural}::id.asc()),\n\
          \t\t\t_ => query = query.order({plural}::id.desc()),\n"
-    ));
+    );
 
     format!(
         "    fn apply_sort<'a>(\n\
@@ -618,6 +626,7 @@ fn render_update_body(
     fields: &[Field],
     options: &AdminOptions,
 ) -> String {
+    use std::fmt::Write;
     let writable: Vec<&Field> = fields
         .iter()
         .filter(|f| is_update_writable(f, options))
@@ -625,10 +634,11 @@ fn render_update_body(
 
     let mut changes_fields = String::new();
     for f in &writable {
-        changes_fields.push_str(&format!(
-            "                {name}: Patch::Set(new_row.{name}),\n",
+        let _ = writeln!(
+            changes_fields,
+            "                {name}: Patch::Set(new_row.{name}),",
             name = f.name
-        ));
+        );
     }
 
     format!(
@@ -652,6 +662,10 @@ fn render_update_body(
     )
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Single template function — splitting produces less readable output, not more."
+)]
 fn render_admin_smoke_test(
     pascal_name: &str,
     snake_name: &str,
