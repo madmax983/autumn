@@ -74,9 +74,10 @@ for crate in "${CRATES[@]}"; do
   elif [[ $exit_code -eq 2 ]]; then
     # Exit code 2 means the crate is not yet published; skip it.
     echo "  SKIP: $crate not yet published on crates.io"
-  else
-    # Breaking changes detected. Allow them through if a migration guide exists —
-    # its presence is the explicit acknowledgement required by the release policy.
+  elif [[ $exit_code -eq 1 ]]; then
+    # Exit code 1 means cargo-semver-checks found actual breaking API changes.
+    # Allow them through only if a migration guide exists — its presence is the
+    # explicit acknowledgement required by the release policy.
     if [[ -f "$migration_guide" ]]; then
       echo "  ADVISORY: $crate has breaking API changes; intentional — migration guide found at $migration_guide"
     else
@@ -85,6 +86,12 @@ for crate in "${CRATES[@]}"; do
       echo "        or fix the API regression before releasing." >&2
       failures=$((failures + 1))
     fi
+  else
+    # Any other non-zero exit code is a tool/invocation error (e.g. rustdoc
+    # crash, registry lookup failure, unsupported flag). Do not treat these as
+    # acknowledged breaks — fail immediately so the error is investigated.
+    echo "  FAIL: $crate — cargo-semver-checks exited with unexpected code $exit_code (tool/invocation error)." >&2
+    failures=$((failures + 1))
   fi
 done
 

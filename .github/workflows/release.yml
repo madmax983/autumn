@@ -44,6 +44,24 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
+      - name: Resolve and validate release tag
+        id: tag
+        run: |
+          RELEASE_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo "error: no exact git tag at HEAD" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "error: tag '${RELEASE_TAG}' is not a semver release tag" >&2
+            exit 1
+          fi
+          echo "name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "$RELEASE_TAG" =~ -(alpha|beta|rc) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
       - name: Generate release notes
@@ -54,10 +72,8 @@ jobs:
         run: |
           git-cliff --config cliff.toml --output CHANGELOG.md
       - name: Commit changelog to trunk
-        # RELEASE_TAG is set as an env var rather than interpolated directly
-        # into the shell command to prevent code injection via a crafted tag name.
         env:
-          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_TAG: ${{ steps.tag.outputs.name }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -71,7 +87,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.event.workflow_run.head_branch }}
+          tag_name: ${{ steps.tag.outputs.name }}
           body_path: RELEASE_NOTES.md
           draft: false
-          prerelease: ${{ contains(github.event.workflow_run.head_branch, '-alpha') || contains(github.event.workflow_run.head_branch, '-beta') || contains(github.event.workflow_run.head_branch, '-rc') }}
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
