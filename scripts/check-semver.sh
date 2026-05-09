@@ -125,6 +125,19 @@ done
 
 echo ""
 if [[ "$failures" -gt 0 ]]; then
+  # On pull requests the SemVer gate is informational: surface the findings so
+  # reviewers can see them, but exit 0 so the check run shows green and does not
+  # block merging.  The gate is a hard blocker only on tag-push releases, where
+  # `continue-on-error` cannot be used because branch-protection rules evaluate
+  # the individual check-run conclusion (which stays "failure" even when
+  # continue-on-error is set at the job level).
+  if [[ "${GITHUB_EVENT_NAME:-}" == "pull_request" ]]; then
+    echo "NOTE: $failures crate(s) have breaking API changes."
+    echo "      These findings are informational on pull requests."
+    echo "      They will block a tag-push release unless a migration guide"
+    echo "      exists at $migration_guide."
+    exit 0
+  fi
   die "$failures crate(s) have unacknowledged breaking public API changes."
 fi
 
