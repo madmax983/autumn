@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Verify that every publishable crate carries the required crates.io metadata
-# fields and a rust-version declaration before a release is cut.
+# fields, a rust-version declaration, and version-pinned intra-workspace
+# dependency edges that match the current workspace version.
 #
 # Required fields per crate:
 #   description, homepage, repository, readme, license, keywords, categories,
 #   rust-version (direct pin or workspace inheritance)
+#
+# Version pin check:
+#   Any dependency on another Autumn crate must pin the exact workspace version
+#   so crates.io consumers get a coherent set (e.g. autumn-admin-plugin must
+#   declare autumn-web = { version = "X.Y.Z" } where X.Y.Z matches [workspace.package].version).
 #
 # Called from the `publish-gate` workflow. Run locally with:
 #
@@ -111,9 +117,65 @@ for entry in "${CRATES[@]}"; do
   $crate_ok && echo "  PASS" || echo "  FAIL"
 done
 
+# ---------------------------------------------------------------------------
+# Inter-crate version pin alignment
+# Every publishable crate that depends on another Autumn crate must pin the
+# exact workspace version so crates.io consumers always get a coherent set.
+# ---------------------------------------------------------------------------
+echo ""
+echo "==> Checking inter-crate Autumn dependency version pins"
+
+workspace_version="$(
+  awk '
+    /^\[workspace\.package\]/ { in_block = 1; next }
+    /^\[/ && in_block         { in_block = 0 }
+    in_block && /^version/    {
+      match($0, /"[^"]+"/)
+      print substr($0, RSTART + 1, RLENGTH - 2)
+      exit
+    }
+  ' Cargo.toml
+)"
+[[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
+echo "workspace version = $workspace_version"
+
+AUTUMN_CRATE_NAMES=(autumn-web autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis)
+
+for entry in "${CRATES[@]}"; do
+  name="${entry%%:*}"
+  manifest="${entry##*:}"
+  [[ -f "$manifest" ]] || continue
+
+  for dep in "${AUTUMN_CRATE_NAMES[@]}"; do
+    [[ "$dep" == "$name" ]] && continue  # skip self-reference
+
+    # Look for the dep in [dependencies] / [dev-dependencies] / [build-dependencies].
+    # We only care about non-path-only declarations (i.e. ones that need a version
+    # for crates.io consumers).
+    dep_line="$(grep -E "^${dep}[[:space:]]*=" "$manifest" 2>/dev/null || true)"
+    if [[ -z "$dep_line" ]]; then
+      # Try table form: dep = { ... }
+      dep_line="$(grep -E "^${dep}[[:space:]]*=" "$manifest" 2>/dev/null || true)"
+    fi
+    [[ -z "$dep_line" ]] && continue  # crate doesn't depend on this Autumn crate
+
+    # Extract the version string if present.
+    pinned_ver="$(echo "$dep_line" | grep -oE 'version[[:space:]]*=[[:space:]]*"[^"]+"' | grep -oE '"[^"]+"' | tr -d '"' || true)"
+    if [[ -z "$pinned_ver" ]]; then
+      warn "  $name: $dep dependency has no version pin (add version = \"$workspace_version\")"
+      failures=$((failures + 1))
+    elif [[ "$pinned_ver" != "$workspace_version" ]]; then
+      warn "  $name: $dep version pin is \"$pinned_ver\" but workspace version is \"$workspace_version\""
+      failures=$((failures + 1))
+    else
+      ok "  $name: $dep = \"$pinned_ver\" matches workspace version"
+    fi
+  done
+done
+
 echo ""
 if [[ "$failures" -gt 0 ]]; then
-  die "$failures metadata field(s) missing across publishable crates. Fix them before publishing."
+  die "$failures issue(s) found across publishable crates. Fix them before publishing."
 fi
 
-echo "Crate metadata OK — all publishable crates have required fields."
+echo "Crate metadata OK — all publishable crates have required fields and coherent version pins."
