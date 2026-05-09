@@ -417,6 +417,45 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Generate an `AdminModel` adapter for an existing model so it can be
+    /// managed through `autumn-admin-plugin`.
+    ///
+    /// Requires the target model to already exist (`src/models/<snake>.rs`).
+    /// Run `autumn generate model` or `autumn generate scaffold` first.
+    ///
+    /// The generator derives sensible field metadata (widget kinds, searchable,
+    /// filterable, readonly) from the field-type DSL and lets you refine
+    /// individual fields with `--hidden`, `--readonly`, `--password`, or
+    /// `--exclude`.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate admin Post title:String body:Text published:bool
+    #[command(verbatim_doc_comment)]
+    Admin {
+        /// Model name (`PascalCase` or `snake_case`, e.g. `Post`).
+        name: String,
+        /// Field DSL tokens, each `name:Type` — same syntax as `scaffold`.
+        fields: Vec<String>,
+        /// Render this field as `AdminFieldKind::Hidden`. Repeatable.
+        #[arg(long, value_name = "FIELD")]
+        hidden: Vec<String>,
+        /// Mark this field as read-only (`.readonly()`). Repeatable.
+        #[arg(long, value_name = "FIELD")]
+        readonly: Vec<String>,
+        /// Render this field as `AdminFieldKind::Password`. Repeatable.
+        #[arg(long, value_name = "FIELD")]
+        password: Vec<String>,
+        /// Exclude this field from the generated adapter entirely. Repeatable.
+        #[arg(long, value_name = "FIELD")]
+        exclude: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -689,6 +728,24 @@ fn run_generate_command(cmd: GenerateCommands) {
             force,
         } => {
             generate::auth::run(&name, generate::Flags { dry_run, force });
+        }
+        GenerateCommands::Admin {
+            name,
+            fields,
+            hidden,
+            readonly,
+            password,
+            exclude,
+            dry_run,
+            force,
+        } => {
+            let options = generate::admin::AdminOptions {
+                hidden,
+                readonly,
+                password,
+                exclude,
+            };
+            generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
         GenerateCommands::Scaffold {
             name,
@@ -1839,5 +1896,103 @@ mod tests {
             }
             _ => panic!("expected PluginCheck"),
         }
+    }
+
+    // ── autumn generate admin tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_generate_admin_with_model_name_and_fields() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "admin",
+            "Post",
+            "title:String",
+            "body:Text",
+            "published:bool",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Admin {
+            name,
+            fields,
+            hidden,
+            readonly,
+            password,
+            exclude,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate admin");
+        };
+        assert_eq!(name, "Post");
+        assert_eq!(fields, vec!["title:String", "body:Text", "published:bool"]);
+        assert!(hidden.is_empty());
+        assert!(readonly.is_empty());
+        assert!(password.is_empty());
+        assert!(exclude.is_empty());
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_admin_with_dry_run_and_force() {
+        let cli =
+            Cli::try_parse_from(["autumn", "generate", "admin", "Post", "--dry-run", "--force"])
+                .unwrap();
+        let Commands::Generate(GenerateCommands::Admin { dry_run, force, .. }) = cli.command else {
+            panic!("expected generate admin");
+        };
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_admin_with_option_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "admin",
+            "User",
+            "email:String",
+            "password_hash:String",
+            "--hidden",
+            "password_hash",
+            "--readonly",
+            "email",
+            "--exclude",
+            "password_hash",
+            "--password",
+            "raw_password",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Admin {
+            hidden,
+            readonly,
+            exclude,
+            password,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected generate admin");
+        };
+        assert_eq!(hidden, vec!["password_hash"]);
+        assert_eq!(readonly, vec!["email"]);
+        assert_eq!(exclude, vec!["password_hash"]);
+        assert_eq!(password, vec!["raw_password"]);
+    }
+
+    #[test]
+    fn parse_generate_admin_snake_case_name() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "admin", "blog_post"]).unwrap();
+        let Commands::Generate(GenerateCommands::Admin { name, .. }) = cli.command else {
+            panic!("expected generate admin");
+        };
+        assert_eq!(name, "blog_post");
+    }
+
+    #[test]
+    fn parse_generate_admin_without_name_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "generate", "admin"]).is_err());
     }
 }
