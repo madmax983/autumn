@@ -155,6 +155,25 @@ fn generated_example_css_is_ignored_and_untracked() {
 }
 
 #[test]
+fn publish_dry_run_script_builds_crate_archives() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-publish-dry-run.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    assert!(
+        script.contains(r#"cargo package -p "$crate" --no-verify --allow-dirty"#),
+        "{} must run the real cargo package dry run so the .crate archive is assembled",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains(r#"cargo package -p "$crate" --list --allow-dirty"#),
+        "{} must not stop at `cargo package --list`; that only enumerates files",
+        script_path.display(),
+    );
+}
+
+#[test]
 fn bookmarks_example_tracks_regenerated_scaffold_layout() {
     let root = workspace_root();
     let bookmarks = root.join("examples/bookmarks");
