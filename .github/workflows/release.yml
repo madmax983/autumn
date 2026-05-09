@@ -15,42 +15,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  validate:
-    name: Validate release
+  release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     # Only proceed when Publish Gate succeeded and was itself triggered by a tag push.
+    # Code quality (fmt, clippy, tests) is already enforced by CI on the source branch
+    # and by the Publish Gate before this workflow runs; re-running those checks here
+    # would require executing user code in a privileged workflow_run context.
     if: |
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
-      - name: Verify HEAD is a semver release tag
-        # Prove the checked-out commit was pushed by a repo maintainer (write
-        # access required to push a tag) before executing any code from it in
-        # this privileged workflow_run context.
-        run: |
-          TAG="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
-          if [[ -z "$TAG" ]]; then
-            echo "error: HEAD has no semver release tag — refusing to run in privileged context" >&2
-            exit 1
-          fi
-          echo "Validated release tag: $TAG"
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace
-
-  release:
-    name: Create GitHub Release
-    needs: validate
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
