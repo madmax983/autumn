@@ -13,5 +13,16 @@ proptest! {
         }
         let snapshot = collector.snapshot();
         assert_eq!(snapshot.http.requests_total, latencies.len() as u64);
+
+        // Verify global percentile invariants
+        let global = snapshot.http.latency_ms;
+        assert!(global.p50 <= global.p95);
+        assert!(global.p95 <= global.p99);
+
+        // Verify per-route percentile invariants
+        if let Some(route_stats) = snapshot.http.by_route.get("GET /test") {
+            assert!(route_stats.p50_ms <= route_stats.p95_ms);
+            assert!(route_stats.p95_ms <= route_stats.p99_ms);
+        }
     }
 }
