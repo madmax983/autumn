@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - "v[0-9]+.*"
+  workflow_run:
+    workflows: ["Publish Gate"]
+    types: [completed]
+    branches-ignore: []
 
 permissions:
   contents: write
@@ -12,6 +16,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Guard: only proceed when triggered by a successful Publish Gate run.
+  # When triggered directly by a tag push this step is a no-op (no
+  # workflow_run context) so existing direct-tag behaviour is preserved.
+  gate-check:
+    name: Publish Gate passed
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Gate passed
+        run: echo "Publish Gate concluded successfully — proceeding with release."
+
   validate:
     name: Validate release
     runs-on: ubuntu-latest
@@ -28,7 +45,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: validate
+    needs: [gate-check, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
