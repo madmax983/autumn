@@ -80,21 +80,28 @@ failures=0
 for crate in "${CRATES[@]}"; do
   echo ""
   echo "==> semver-checks: $crate"
-  # --baseline-root is not used here; cargo-semver-checks fetches the last
-  # published version from crates.io automatically when no baseline is given.
-  # If the crate has never been published the check is skipped gracefully.
+  # Capture output so we can parse it; cargo-semver-checks always exits 0
+  # (compatible) or 1 (any other outcome: breaking changes, no library target,
+  # crate not published, compilation error, registry failure, etc.).
+  # We distinguish these cases by parsing the output rather than relying on
+  # exit codes alone.
   set +e
-  cargo semver-checks check-release --package "$crate" 2>&1
+  crate_output="$(cargo semver-checks check-release --package "$crate" 2>&1)"
   exit_code=$?
   set -e
 
+  echo "$crate_output"
+
   if [[ $exit_code -eq 0 ]]; then
     echo "  PASS: $crate API is semver-compatible with crates.io baseline"
-  elif [[ $exit_code -eq 2 ]]; then
-    # Exit code 2 means the crate is not yet published; skip it.
+  elif echo "$crate_output" | grep -q "no crates with library targets selected"; then
+    # Proc-macro or binary-only crate — no public API surface to semver-check.
+    echo "  SKIP: $crate has no library targets (proc-macro or binary)"
+  elif echo "$crate_output" | grep -q "not found in registry"; then
+    # Crate has never been published on crates.io; nothing to compare against.
     echo "  SKIP: $crate not yet published on crates.io"
-  elif [[ $exit_code -eq 1 ]]; then
-    # Exit code 1 means cargo-semver-checks found actual breaking API changes.
+  elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
+    # Exit 1 with semver-violation output → actual breaking API changes found.
     # Allow them through only when BOTH conditions hold:
     #   1. A migration guide exists (explicit acknowledgement).
     #   2. The version bump type permits breaking changes per release policy
@@ -115,10 +122,10 @@ for crate in "${CRATES[@]}"; do
       failures=$((failures + 1))
     fi
   else
-    # Any other non-zero exit code is a tool/invocation error (e.g. rustdoc
-    # crash, registry lookup failure, unsupported flag). Do not treat these as
-    # acknowledged breaks — fail immediately so the error is investigated.
-    echo "  FAIL: $crate — cargo-semver-checks exited with unexpected code $exit_code (tool/invocation error)." >&2
+    # Exit 1 with unrecognised output → tool/invocation error (compilation
+    # failure, registry timeout, unsupported flag, etc.).  Hard-fail so the
+    # error is investigated rather than silently skipped.
+    echo "  FAIL: $crate — cargo-semver-checks failed with an unexpected error (exit $exit_code)." >&2
     failures=$((failures + 1))
   fi
 done
