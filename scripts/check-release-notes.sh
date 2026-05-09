@@ -37,7 +37,7 @@ workspace_version="$(
   awk '
     /^\[workspace\.package\]/ { in_block = 1; next }
     /^\[/ && in_block         { in_block = 0 }
-    in_block && /^version/    {
+    in_block && /^[[:space:]]*version/    {
       match($0, /"[^"]+"/)
       print substr($0, RSTART + 1, RLENGTH - 2)
       exit
@@ -76,7 +76,11 @@ is_breaking=false
 if [[ "$major" -eq 0 ]]; then
   # Pre-1.0: any bump of the minor component is potentially breaking.
   # Heuristic: if CHANGELOG has "Breaking" under this version, require a guide.
-  if awk "/^## \[$workspace_version\]/,/^## \[/" CHANGELOG.md | grep -qi "breaking"; then
+  # Flag-based awk: skip the heading line itself, collect until the next section.
+  # Uses -v to pass the version so shell special characters are not interpreted.
+  if awk -v ver="$workspace_version" \
+       '$0 ~ "^## \\[" ver "\\]" { p=1; next } /^## \[/ { p=0 } p' \
+       CHANGELOG.md | grep -qi "breaking"; then
     is_breaking=true
   fi
 else
@@ -104,7 +108,9 @@ fi
 # --- Check 4: non-breaking releases must not contain unacknowledged breaking notes ---
 if ! $is_breaking; then
   # Look for a "Breaking" section under the current version in CHANGELOG.
-  if awk "/^## \[$workspace_version\]/,/^## \[/" CHANGELOG.md | grep -qi "### Breaking"; then
+  if awk -v ver="$workspace_version" \
+       '$0 ~ "^## \\[" ver "\\]" { p=1; next } /^## \[/ { p=0 } p' \
+       CHANGELOG.md | grep -qi "### Breaking"; then
     die "CHANGELOG.md has a 'Breaking' section under [$workspace_version] but no migration guide was found. Either remove the breaking changes, bump the version to signal a major release, or add a migration guide at docs/migrations/${workspace_version}.md."
   fi
   ok "no undeclared breaking changes in CHANGELOG.md"

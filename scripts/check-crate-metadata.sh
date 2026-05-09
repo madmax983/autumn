@@ -60,7 +60,7 @@ field_present_in_package() {
   awk -v key="$key" '
     /^\[package\]/               { in_pkg = 1; next }
     /^\[/ && in_pkg              { in_pkg = 0 }
-    in_pkg && $0 ~ "^" key "([. \t]|$)" {
+    in_pkg && $0 ~ "^[[:space:]]*" key "([.[:space:]]|$)" {
       print $0
       exit
     }
@@ -139,7 +139,8 @@ workspace_version="$(
 [[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
 echo "workspace version = $workspace_version"
 
-AUTUMN_CRATE_NAMES=(autumn-web autumn-macros autumn-cli autumn-admin-plugin autumn-storage-s3 autumn-cache-redis)
+# Derived from CRATES to avoid manual duplication.
+AUTUMN_CRATE_NAMES=("${CRATES[@]%%:*}")
 
 for entry in "${CRATES[@]}"; do
   name="${entry%%:*}"
@@ -152,11 +153,7 @@ for entry in "${CRATES[@]}"; do
     # Look for the dep in [dependencies] / [dev-dependencies] / [build-dependencies].
     # We only care about non-path-only declarations (i.e. ones that need a version
     # for crates.io consumers).
-    dep_line="$(grep -E "^${dep}[[:space:]]*=" "$manifest" 2>/dev/null || true)"
-    if [[ -z "$dep_line" ]]; then
-      # Try table form: dep = { ... }
-      dep_line="$(grep -E "^${dep}[[:space:]]*=" "$manifest" 2>/dev/null || true)"
-    fi
+    dep_line="$(grep -E "^[[:space:]]*${dep}[[:space:]]*=" "$manifest" 2>/dev/null || true)"
     [[ -z "$dep_line" ]] && continue  # crate doesn't depend on this Autumn crate
 
     # Extract the version string if present.

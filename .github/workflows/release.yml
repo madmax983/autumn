@@ -1,13 +1,12 @@
 name: Release
 
+# Triggered only when the Publish Gate workflow completes successfully on a
+# tag push.  Removing the direct `push: tags` trigger ensures a GitHub Release
+# is never created while (or before) the compatibility gate has run.
 on:
-  push:
-    tags:
-      - "v[0-9]+.*"
   workflow_run:
     workflows: ["Publish Gate"]
     types: [completed]
-    branches-ignore: []
 
 permissions:
   contents: write
@@ -16,24 +15,17 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Guard: only proceed when triggered by a successful Publish Gate run.
-  # When triggered directly by a tag push this step is a no-op (no
-  # workflow_run context) so existing direct-tag behaviour is preserved.
-  gate-check:
-    name: Publish Gate passed
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name != 'workflow_run' ||
-      github.event.workflow_run.conclusion == 'success'
-    steps:
-      - name: Gate passed
-        run: echo "Publish Gate concluded successfully — proceeding with release."
-
   validate:
     name: Validate release
     runs-on: ubuntu-latest
+    # Only proceed when Publish Gate succeeded and was itself triggered by a tag push.
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -45,11 +37,12 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [gate-check, validate]
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
@@ -65,11 +58,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md
-          git commit -m "docs: update CHANGELOG.md for ${{ github.ref_name }}"
+          git commit -m "docs: update CHANGELOG.md for ${{ github.event.workflow_run.head_branch }}"
           git push origin HEAD:trunk
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.event.workflow_run.head_branch }}
           body_path: RELEASE_NOTES.md
           draft: false
-          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          prerelease: ${{ contains(github.event.workflow_run.head_branch, '-alpha') || contains(github.event.workflow_run.head_branch, '-beta') || contains(github.event.workflow_run.head_branch, '-rc') }}

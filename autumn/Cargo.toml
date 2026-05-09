@@ -129,5 +129,17 @@ temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
 
+# docs.rs feature posture: include all features except those that require
+# system libraries unavailable in the docs.rs sandbox.
+#   telemetry-otlp — requires protoc (grpc-tonic → tonic → prost-build)
+#   test-support   — only meaningful in test binary contexts
+[package.metadata.docs.rs]
+features = [
+  "maud", "htmx", "tailwind", "db", "cache-moka",
+  "ws", "flash", "multipart", "oauth2", "openapi",
+  "redis", "i18n", "storage", "mail", "seed", "system-info",
+]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lints]
 workspace = true
