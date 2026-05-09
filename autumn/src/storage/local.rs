@@ -1409,9 +1409,8 @@ mod tests {
         let path = dir.path().join("some_blob");
         // create a directory so that get_with_meta reading file fails
         tokio::fs::create_dir(&path).await.unwrap();
-        let err = match s.get_with_meta("some_blob").await {
-            Err(e) => e,
-            Ok(_) => panic!("Expected error"),
+        let Err(err) = s.get_with_meta("some_blob").await else {
+            panic!("Expected error");
         };
         assert!(matches!(err, BlobStoreError::Io(_)));
     }
