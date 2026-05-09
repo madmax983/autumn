@@ -646,6 +646,7 @@ fn render_update_body(
          \t\t\t\tserde_json::from_value(data).map_err(Self::validation_error)?;\n\
          \t\t\tlet changes = Update{pascal_name} {{\n\
          {changes_fields}\
+         \t\t\t\t..Default::default()\n\
          \t\t\t}};\n\
          \t\t\tlet diesel_changeset = changes.__to_changeset();\n\
          \t\t\tlet mut conn = pool.get().await.map_err(Self::pool_error)?;\n\
@@ -1065,6 +1066,7 @@ mod tests {
         assert!(admin.contains("let changes = UpdatePost {"));
         assert!(admin.contains("title: Patch::Set(new_row.title)"));
         assert!(admin.contains("published: Patch::Set(new_row.published)"));
+        assert!(admin.contains("..Default::default()"));
         assert!(admin.contains("let diesel_changeset = changes.__to_changeset()"));
         assert!(admin.contains(".set(&diesel_changeset)"));
     }
@@ -1379,7 +1381,7 @@ mod tests {
 
     #[test]
     fn parse_select_specs_rejects_empty_token() {
-        let err = parse_select_specs(&["".into()]).unwrap_err();
+        let err = parse_select_specs(&[String::new()]).unwrap_err();
         assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
