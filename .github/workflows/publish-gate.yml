@@ -175,3 +175,51 @@ jobs:
 
       - name: Smoke test passed
         run: echo "Downstream compile smoke test OK"
+
+  # ---------------------------------------------------------------------------
+  # 7. Prepare release artifacts (tag pushes only)
+  # ---------------------------------------------------------------------------
+  prepare-release:
+    name: Prepare release artifacts
+    runs-on: ubuntu-latest
+    # Only runs on tag pushes; depends on all gate jobs so artifacts are only
+    # produced when every check passes.
+    needs: [semver, release-notes, smoke]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
+      - name: Generate release notes and update CHANGELOG
+        run: |
+          git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
+          git-cliff --config cliff.toml --output CHANGELOG.md
+      - name: Commit CHANGELOG.md to trunk
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if ! git diff --staged --quiet; then
+            git commit -m "docs: update CHANGELOG.md for ${RELEASE_TAG}"
+            git push origin HEAD:trunk
+          else
+            echo "CHANGELOG.md already up to date — skipping commit"
+          fi
+      - name: Record release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: printf '%s' "${RELEASE_TAG}" > release-tag.txt
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            RELEASE_NOTES.md
+            release-tag.txt
+          retention-days: 7
