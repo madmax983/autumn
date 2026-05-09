@@ -83,6 +83,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: package
     if: ${{ github.event.inputs.skip_semver != 'true' }}
+    # On pull requests the SemVer check is informational: breaking changes are
+    # reported but don't block the PR.  On tag pushes (the actual publish gate)
+    # the check is a hard blocker.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
         with:

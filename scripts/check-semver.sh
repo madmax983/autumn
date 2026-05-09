@@ -46,6 +46,25 @@ workspace_version="$(
 [[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
 migration_guide="docs/migrations/${workspace_version}.md"
 
+# Parse version components (strip any pre-release suffix, e.g. -alpha.1).
+_ver="${workspace_version%%-*}"
+IFS='.' read -r _vmaj _vmin _vpatch <<< "$_ver"
+
+# Returns 0 if the version bump type allows breaking API changes per release policy:
+#   post-1.0 major bump  →  X.0.0  (major >= 1, minor == 0, patch == 0)
+#   pre-1.0 minor bump   →  0.Y.0  (major == 0, patch == 0)
+# All other version shapes (patch releases, post-1.0 minor releases) must not
+# contain breaking changes regardless of whether a migration guide exists.
+is_breaking_release_type() {
+  if [[ "$_vmaj" -ge 1 && "$_vmin" -eq 0 && "$_vpatch" -eq 0 ]]; then
+    return 0  # post-1.0 major bump
+  elif [[ "$_vmaj" -eq 0 && "$_vpatch" -eq 0 ]]; then
+    return 0  # pre-1.0 minor bump
+  else
+    return 1  # patch or post-1.0 minor — no breaks allowed
+  fi
+}
+
 # Publishable crates.
 CRATES=(
   autumn-macros
@@ -76,10 +95,19 @@ for crate in "${CRATES[@]}"; do
     echo "  SKIP: $crate not yet published on crates.io"
   elif [[ $exit_code -eq 1 ]]; then
     # Exit code 1 means cargo-semver-checks found actual breaking API changes.
-    # Allow them through only if a migration guide exists — its presence is the
-    # explicit acknowledgement required by the release policy.
-    if [[ -f "$migration_guide" ]]; then
+    # Allow them through only when BOTH conditions hold:
+    #   1. A migration guide exists (explicit acknowledgement).
+    #   2. The version bump type permits breaking changes per release policy
+    #      (post-1.0 major bump X.0.0, or pre-1.0 minor bump 0.Y.0).
+    # A patch release or a post-1.0 minor release must never break even if a
+    # migration stub is present, to prevent an accidental regression slipping
+    # through because an old migration document was lying around.
+    if [[ -f "$migration_guide" ]] && is_breaking_release_type; then
       echo "  ADVISORY: $crate has breaking API changes; intentional — migration guide found at $migration_guide"
+    elif [[ -f "$migration_guide" ]]; then
+      echo "  FAIL: $crate has breaking API changes but $workspace_version is a patch/minor release." >&2
+      echo "        Breaking changes require a major bump (X.0.0, X≥1) or a pre-1.0 minor bump (0.Y.0)." >&2
+      failures=$((failures + 1))
     else
       echo "  FAIL: $crate has unacknowledged breaking API changes." >&2
       echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
