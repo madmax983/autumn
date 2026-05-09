@@ -188,8 +188,29 @@ where
         let this = self.project();
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
+                let status = response.status();
+                let is_empty = axum::body::HttpBody::size_hint(response.body()).exact() == Some(0);
+
+                let error_info = if let Some(info) = response.extensions().get::<AutumnErrorInfo>().cloned() {
+                    Some(info)
+                } else if is_empty && (status == axum::http::StatusCode::NOT_FOUND || status == axum::http::StatusCode::METHOD_NOT_ALLOWED) {
+                    // This handles empty 404s/405s returned by axum nested routers or method router fallbacks
+                    let message = if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+                        "Method not allowed"
+                    } else {
+                        "Page not found"
+                    };
+                    Some(AutumnErrorInfo {
+                        status,
+                        message: message.to_string(),
+                        details: None,
+                    })
+                } else {
+                    None
+                };
+
                 // Check if this response came from AutumnError and clone the info out
-                if let Some(error_info) = response.extensions().get::<AutumnErrorInfo>().cloned() {
+                if let Some(error_info) = error_info {
                     let mut response = response;
                     let filters = this.filters;
                     for filter in filters.iter() {
