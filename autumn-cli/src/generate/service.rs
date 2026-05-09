@@ -25,9 +25,10 @@ pub fn plan_service(project_root: &Path, name: &str) -> Result<Plan, GenerateErr
     );
 
     let mod_path = project_root.join("src").join("services").join("mod.rs");
+    let existing_mod = std::fs::read_to_string(&mod_path).unwrap_or_default();
     plan.modify(
         mod_path,
-        super::schema_edit::add_mod_declaration("", &snake_name),
+        super::schema_edit::add_mod_declaration(&existing_mod, &snake_name),
     );
 
     let main_path = project_root.join("src").join("main.rs");
