@@ -36,6 +36,41 @@ cargo run -p blog
 
 Open <http://localhost:3000>.
 
+## Generated admin adapter
+
+The blog's `PostAdmin` in `src/admin.rs` was built by hand to show the full
+adapter contract. You can regenerate an equivalent adapter with:
+
+```bash
+autumn generate admin Post \
+  title:String \
+  slug:String \
+  body:Text \
+  published:bool \
+  created_at:DateTime \
+  updated_at:DateTime \
+  --readonly slug \
+  --readonly created_at \
+  --readonly updated_at \
+  --dry-run
+```
+
+Remove `--dry-run` to write the file (use `--force` to overwrite the existing
+`src/admin.rs`). The generated adapter supports list with search and filters,
+detail, create, update, delete, and bulk-delete — all wired through the
+`autumn-admin-plugin` CRUD UI at `/backoffice/posts`.
+
+To smoke-test the generated admin resource against a running blog server:
+
+```bash
+AUTUMN_TEST_BASE_URL=http://localhost:3000 \
+AUTUMN_TEST_ADMIN_SESSION=<session_cookie> \
+cargo test -p blog post_admin
+```
+
+See [`docs/guide/admin.md`](../../docs/guide/admin.md) for the full
+walkthrough, customisation flags, and security notes.
+
 ## Try the jobs dashboard
 
 The blog registers a demo `publish_webhook` background job and mounts the

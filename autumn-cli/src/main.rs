@@ -446,6 +446,13 @@ enum GenerateCommands {
         /// Render this field as `AdminFieldKind::Password`. Repeatable.
         #[arg(long, value_name = "FIELD")]
         password: Vec<String>,
+        /// Render this field as a `Select` dropdown. Provide option values as
+        /// `field=val1,val2,…`; the bare `field` form emits an empty
+        /// placeholder. Repeatable.
+        ///
+        /// Example: `--select status=draft,published,archived`
+        #[arg(long, value_name = "FIELD[=VAL1,VAL2,...]")]
+        select: Vec<String>,
         /// Exclude this field from the generated adapter entirely. Repeatable.
         #[arg(long, value_name = "FIELD")]
         exclude: Vec<String>,
@@ -735,14 +742,21 @@ fn run_generate_command(cmd: GenerateCommands) {
             hidden,
             readonly,
             password,
+            select,
             exclude,
             dry_run,
             force,
         } => {
+            let select_specs =
+                generate::admin::parse_select_specs(&select).unwrap_or_else(|e| {
+                    eprintln!("autumn generate admin: {e}");
+                    std::process::exit(1);
+                });
             let options = generate::admin::AdminOptions {
                 hidden,
                 readonly,
                 password,
+                select: select_specs,
                 exclude,
             };
             generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
@@ -1918,6 +1932,7 @@ mod tests {
             hidden,
             readonly,
             password,
+            select,
             exclude,
             dry_run,
             force,
@@ -1930,6 +1945,7 @@ mod tests {
         assert!(hidden.is_empty());
         assert!(readonly.is_empty());
         assert!(password.is_empty());
+        assert!(select.is_empty());
         assert!(exclude.is_empty());
         assert!(!dry_run);
         assert!(!force);
@@ -1989,6 +2005,24 @@ mod tests {
             panic!("expected generate admin");
         };
         assert_eq!(name, "blog_post");
+    }
+
+    #[test]
+    fn parse_generate_admin_with_select_flag() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "admin",
+            "Post",
+            "status:String",
+            "--select",
+            "status=draft,published,archived",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Admin { select, .. }) = cli.command else {
+            panic!("expected generate admin");
+        };
+        assert_eq!(select, vec!["status=draft,published,archived"]);
     }
 
     #[test]

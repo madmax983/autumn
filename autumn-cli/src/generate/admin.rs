@@ -10,7 +10,7 @@
 //!
 //! The generator derives safe field metadata from the supplied field tokens
 //! and lets the user refine it through `--hidden`, `--readonly`, `--password`,
-//! and `--exclude` flags.
+//! `--select`, and `--exclude` flags.
 
 use std::path::Path;
 
@@ -19,6 +19,46 @@ use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
 use super::{Flags, GenerateError, ensure_project_root};
+
+/// A parsed `--select FIELD=val1,val2,...` spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectSpec {
+    /// Field name.
+    pub field: String,
+    /// Ordered list of option values (labels are humanized from values).
+    pub values: Vec<String>,
+}
+
+/// Parse `--select` tokens of the form `field=val1,val2,...` or `field`.
+///
+/// The bare `field` form (no `=`) emits a `Select(vec![])` placeholder so the
+/// user can fill in options without editing generated internals.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] if the token is blank.
+pub fn parse_select_specs(tokens: &[String]) -> Result<Vec<SelectSpec>, GenerateError> {
+    let mut out = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let (field, values) = match token.split_once('=') {
+            Some((f, v)) => (
+                f.trim().to_owned(),
+                v.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>(),
+            ),
+            None => (token.trim().to_owned(), vec![]),
+        };
+        if field.is_empty() {
+            return Err(GenerateError::InvalidField {
+                token: token.clone(),
+                reason: "field name is empty in --select spec".into(),
+            });
+        }
+        out.push(SelectSpec { field, values });
+    }
+    Ok(out)
+}
 
 /// Options specific to `autumn generate admin`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -29,6 +69,9 @@ pub struct AdminOptions {
     pub readonly: Vec<String>,
     /// Field names to render as `AdminFieldKind::Password`.
     pub password: Vec<String>,
+    /// Fields to render as `AdminFieldKind::Select` with fixed option values.
+    /// Each entry is a [`SelectSpec`] parsed from a `field=val1,val2,...` token.
+    pub select: Vec<SelectSpec>,
     /// Field names to omit from the generated `fields()` list entirely.
     pub exclude: Vec<String>,
 }
@@ -367,6 +410,34 @@ impl AdminModel for {pascal_name}Admin {{
     )
 }
 
+fn render_select_kind(spec: &SelectSpec) -> String {
+    if spec.values.is_empty() {
+        return "AdminFieldKind::Select(vec![])".into();
+    }
+    let opts = spec
+        .values
+        .iter()
+        .map(|v| {
+            let label = v
+                .split(|c: char| c == '_' || c == '-')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!(
+                "SelectOption {{ value: \"{v}\".into(), label: \"{label}\".into() }}",
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("AdminFieldKind::Select(vec![{opts}])")
+}
+
 fn render_fields_vec(fields: &[Field], options: &AdminOptions) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -374,25 +445,33 @@ fn render_fields_vec(fields: &[Field], options: &AdminOptions) -> String {
         if options.exclude.contains(&f.name) {
             continue;
         }
-        let kind = if options.hidden.contains(&f.name) || matches!(f.kind, FieldKind::Bytea) {
-            "AdminFieldKind::Hidden"
+        let select_spec = options.select.iter().find(|s| s.field == f.name);
+        let kind_str: String = if options.hidden.contains(&f.name)
+            || matches!(f.kind, FieldKind::Bytea)
+        {
+            "AdminFieldKind::Hidden".into()
         } else if options.password.contains(&f.name) {
-            "AdminFieldKind::Password"
+            "AdminFieldKind::Password".into()
+        } else if let Some(spec) = select_spec {
+            render_select_kind(spec)
         } else {
-            admin_field_kind(f)
+            admin_field_kind(f).into()
         };
         let _ = write!(
             out,
-            "            AdminField::new(\"{name}\", {kind})",
+            "            AdminField::new(\"{name}\", {kind_str})",
             name = f.name
         );
         if options.readonly.contains(&f.name) || is_default_readonly(f) {
             let _ = write!(out, "\n                .readonly()");
         }
-        if is_default_searchable(f) && !options.hidden.contains(&f.name) {
+        // Select and hidden fields are not text-searchable.
+        let is_select_or_hidden =
+            select_spec.is_some() || options.hidden.contains(&f.name);
+        if is_default_searchable(f) && !is_select_or_hidden {
             let _ = write!(out, "\n                .searchable()");
         }
-        if is_default_filterable(f) && !options.hidden.contains(&f.name) {
+        if is_default_filterable(f) && !is_select_or_hidden {
             let _ = write!(out, "\n                .filterable()");
         }
         if is_default_optional(f) {
@@ -1202,6 +1281,88 @@ mod tests {
             admin.contains("title: Some(new_row.title)"),
             "title should appear in UpdatePost"
         );
+    }
+
+    #[test]
+    fn select_option_generates_select_kind_with_options() {
+        let tmp = project_with_model("post");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "status".into(),
+                values: vec!["draft".into(), "published".into(), "archived".into()],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:String".into()],
+            &options,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            admin.contains("AdminFieldKind::Select(vec!["),
+            "select option must emit Select kind"
+        );
+        assert!(admin.contains("\"draft\""), "option values must appear");
+        assert!(admin.contains("\"published\""), "option values must appear");
+        assert!(admin.contains("\"archived\""), "option values must appear");
+        // Labels are humanized from values
+        assert!(admin.contains("\"Draft\""), "labels must be title-cased");
+    }
+
+    #[test]
+    fn select_option_bare_field_emits_empty_select() {
+        let tmp = project_with_model("post");
+        let options = AdminOptions {
+            select: vec![SelectSpec {
+                field: "status".into(),
+                values: vec![],
+            }],
+            ..Default::default()
+        };
+        let plan = plan_admin_with_options(
+            tmp.path(),
+            "Post",
+            &["status:String".into()],
+            &options,
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
+        assert!(
+            admin.contains("AdminFieldKind::Select(vec![])"),
+            "bare --select must emit empty Select placeholder"
+        );
+    }
+
+    #[test]
+    fn parse_select_specs_parses_field_with_values() {
+        let specs =
+            parse_select_specs(&["status=draft,published,archived".into()]).unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].field, "status");
+        assert_eq!(
+            specs[0].values,
+            vec!["draft", "published", "archived"]
+        );
+    }
+
+    #[test]
+    fn parse_select_specs_bare_field_produces_empty_values() {
+        let specs = parse_select_specs(&["status".into()]).unwrap();
+        assert_eq!(specs[0].field, "status");
+        assert!(specs[0].values.is_empty());
+    }
+
+    #[test]
+    fn parse_select_specs_rejects_empty_token() {
+        let err = parse_select_specs(&["".into()]).unwrap_err();
+        assert!(matches!(err, GenerateError::InvalidField { .. }));
     }
 
     #[test]

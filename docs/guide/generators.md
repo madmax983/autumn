@@ -9,6 +9,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
+| `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
 
 The generators only emit code that uses macros and conventions Autumn already
 ships (`#[model]`, `#[repository]`, `#[get]/#[post]`, the `i64`-PK convention,
