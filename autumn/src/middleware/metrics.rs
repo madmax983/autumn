@@ -342,10 +342,20 @@ fn compute_percentiles(latencies: &VecDeque<u64>) -> Percentiles {
     let (_, &mut p99, _) = data.select_nth_unstable(p99_idx);
 
     // We only need to search the left partition for p95 since p95_idx <= p99_idx
-    let (_, &mut p95, _) = data[..=p99_idx].select_nth_unstable(p95_idx);
+    let p95 = if p95_idx == p99_idx {
+        p99
+    } else {
+        let (_, &mut p95_val, _) = data[..=p99_idx].select_nth_unstable(p95_idx);
+        p95_val
+    };
 
     // We only need to search the left partition for p50 since p50_idx <= p95_idx
-    let (_, &mut p50, _) = data[..=p95_idx].select_nth_unstable(p50_idx);
+    let p50 = if p50_idx == p95_idx {
+        p95
+    } else {
+        let (_, &mut p50_val, _) = data[..=p95_idx].select_nth_unstable(p50_idx);
+        p50_val
+    };
 
     Percentiles { p50, p95, p99 }
 }
