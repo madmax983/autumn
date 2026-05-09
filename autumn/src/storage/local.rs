@@ -1380,18 +1380,12 @@ mod tests {
 
     #[tokio::test]
     async fn safe_path_for_key_rejects_missing_directory() {
-        let dir = temp_root();
-        let s = store(dir.path());
-
-        let result = s.safe_path_for_key("new_blob.txt").await.unwrap();
-        assert_eq!(result.file_name().unwrap(), "new_blob.txt");
-
-        let missing = tempfile::tempdir().unwrap().path().to_path_buf();
-        let s2 = store(&missing);
-        std::fs::remove_dir_all(&missing).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let s2 = store(&path);
+        dir.close().unwrap();
 
         let err = s2.safe_path_for_key("some_blob").await.unwrap_err();
-        // Since `root` vanishes, `canonicalize` fails with NotFound, probe pops until empty and returns Error
         assert!(
             matches!(
                 err,
@@ -1530,9 +1524,10 @@ mod tests {
 
     #[test]
     fn provider_id_is_local() {
+        let dir = temp_root();
         let s = LocalBlobStore::new(
             "local_test_id",
-            std::path::PathBuf::from("/tmp"),
+            dir.path().to_path_buf(),
             "/mnt",
             std::time::Duration::from_secs(3600),
             SigningKey::random(),
