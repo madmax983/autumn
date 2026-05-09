@@ -1034,7 +1034,11 @@ struct CapturedMailSummary {
     modified: SystemTime,
 }
 
-pub(crate) fn mail_preview_router(file_dir: PathBuf) -> axum::Router<AppState> {
+pub(crate) fn mail_preview_router<S>(file_dir: PathBuf) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: axum::extract::FromRef<S>,
+{
     let file_dir = Arc::new(file_dir);
     axum::Router::new()
         .route(

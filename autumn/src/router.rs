@@ -837,10 +837,14 @@ fn mount_framework_routes(
     router
 }
 
-fn mount_probe_endpoints(
-    mut router: axum::Router<AppState>,
+fn mount_probe_endpoints<S>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> (std::collections::HashSet<String>, axum::Router<AppState>) {
+) -> (std::collections::HashSet<String>, axum::Router<S>)
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: axum::extract::FromRef<S>,
+{
     // Probe endpoints (auto-mounted)
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
@@ -953,10 +957,10 @@ fn mount_raw_routers(
     router
 }
 
-fn apply_cors_middleware(
-    mut router: axum::Router<AppState>,
-    config: &AutumnConfig,
-) -> axum::Router<AppState> {
+fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -970,10 +974,10 @@ fn apply_cors_middleware(
     router
 }
 
-fn apply_csrf_middleware(
-    mut router: axum::Router<AppState>,
-    config: &AutumnConfig,
-) -> axum::Router<AppState> {
+fn apply_csrf_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
         let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
@@ -983,10 +987,13 @@ fn apply_csrf_middleware(
     router
 }
 
-fn apply_rate_limit_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_rate_limit_middleware<S>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
         let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
@@ -1000,10 +1007,10 @@ fn apply_rate_limit_middleware(
     router
 }
 
-fn apply_upload_middleware(
-    router: axum::Router<AppState>,
-    config: &AutumnConfig,
-) -> axum::Router<AppState> {
+fn apply_upload_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let upload_config = config.security.upload.clone();
     tracing::info!(
         max_request_size_bytes = upload_config.max_request_size_bytes,
