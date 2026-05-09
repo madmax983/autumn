@@ -252,6 +252,7 @@ fn render_admin_file(
 //! Edit freely — once generated, this is ordinary user code.
 
 use autumn_admin_plugin::prelude::*;
+use autumn_web::Patch;
 use diesel::OptionalExtension;
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
@@ -625,7 +626,7 @@ fn render_update_body(
     let mut changes_fields = String::new();
     for f in &writable {
         changes_fields.push_str(&format!(
-            "                {name}: Some(new_row.{name}),\n",
+            "                {name}: Patch::Set(new_row.{name}),\n",
             name = f.name
         ));
     }
@@ -636,9 +637,10 @@ fn render_update_body(
          \t\t\tlet changes = Update{pascal_name} {{\n\
          {changes_fields}\
          \t\t\t}};\n\
+         \t\t\tlet diesel_changeset = changes.__to_changeset();\n\
          \t\t\tlet mut conn = pool.get().await.map_err(Self::pool_error)?;\n\
          \t\t\tlet updated = diesel::update({plural}::table.find(id))\n\
-         \t\t\t\t.set(&changes)\n\
+         \t\t\t\t.set(&diesel_changeset)\n\
          \t\t\t\t.returning({pascal_name}::as_returning())\n\
          \t\t\t\t.get_result::<{pascal_name}>(&mut conn)\n\
          \t\t\t\t.await\n\
@@ -996,6 +998,7 @@ mod tests {
         assert!(admin.contains("fn delete("));
 
         // Model + schema imports
+        assert!(admin.contains("use autumn_web::Patch;"));
         assert!(admin.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
         assert!(admin.contains("use crate::schema::posts;"));
     }
@@ -1046,8 +1049,10 @@ mod tests {
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
         assert!(admin.contains("let new_row: NewPost ="));
         assert!(admin.contains("let changes = UpdatePost {"));
-        assert!(admin.contains("title: Some(new_row.title)"));
-        assert!(admin.contains("published: Some(new_row.published)"));
+        assert!(admin.contains("title: Patch::Set(new_row.title)"));
+        assert!(admin.contains("published: Patch::Set(new_row.published)"));
+        assert!(admin.contains("let diesel_changeset = changes.__to_changeset()"));
+        assert!(admin.contains(".set(&diesel_changeset)"));
     }
 
     #[test]
@@ -1282,16 +1287,16 @@ mod tests {
         let admin = fs::read_to_string(tmp.path().join("src/admin/post.rs")).unwrap();
         // created_at and updated_at are readonly by default → not in UpdatePost
         assert!(
-            !admin.contains("created_at: Some(new_row.created_at)"),
+            !admin.contains("created_at: Patch::Set(new_row.created_at)"),
             "created_at should not appear in UpdatePost (readonly by default)"
         );
         assert!(
-            !admin.contains("updated_at: Some(new_row.updated_at)"),
+            !admin.contains("updated_at: Patch::Set(new_row.updated_at)"),
             "updated_at should not appear in UpdatePost (readonly by default)"
         );
         // title IS writable
         assert!(
-            admin.contains("title: Some(new_row.title)"),
+            admin.contains("title: Patch::Set(new_row.title)"),
             "title should appear in UpdatePost"
         );
     }
