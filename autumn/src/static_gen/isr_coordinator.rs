@@ -227,7 +227,7 @@ impl IsrCoordinator for PostgresIsrCoordinator {
 /// # Examples
 ///
 /// ```rust
-/// use autumn_web::static_gen::isr_coordinator::isr_window_key;
+/// use autumn_web::static_gen::isr_window_key;
 ///
 /// let url_path = "/about";
 /// let revalidate_secs = 60;
@@ -251,9 +251,10 @@ pub fn isr_window_key(url_path: &str, revalidate_secs: u64, now_unix_secs: u64) 
 /// # Examples
 ///
 /// ```rust
-/// use autumn_web::static_gen::isr_coordinator::isr_advisory_lock_key;
+/// use autumn_web::static_gen::{isr_window_key, isr_advisory_lock_key};
 ///
-/// let lock_key = isr_advisory_lock_key("/about", "/about:28333333");
+/// let window_key = isr_window_key("/about", 60, 1_700_000_000);
+/// let lock_key = isr_advisory_lock_key("/about", &window_key);
 /// // The value is a stable 64-bit integer
 /// assert_ne!(lock_key, 0);
 /// ```
