@@ -1,0 +1,13 @@
+[package]
+name = "readme_run"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+autumn-web = { version = "0.3.0", path = "../autumn" }
+
+[lints]
+workspace = true

@@ -146,6 +146,27 @@ where
                     uri: this.uri.clone(),
                     request_id: this.request_id.clone(),
                 });
+
+                if response.status().is_client_error() || response.status().is_server_error() {
+                    if response
+                        .extensions()
+                        .get::<crate::middleware::exception_filter::AutumnErrorInfo>()
+                        .is_none()
+                    {
+                        let reason = response
+                            .status()
+                            .canonical_reason()
+                            .unwrap_or("Error")
+                            .to_string();
+                        let error_info = crate::middleware::exception_filter::AutumnErrorInfo {
+                            status: response.status(),
+                            message: reason,
+                            details: None,
+                        };
+                        response.extensions_mut().insert(error_info);
+                    }
+                }
+
                 std::task::Poll::Ready(Ok(response))
             }
             other => other,
