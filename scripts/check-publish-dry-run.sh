@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# Run `cargo package` for every publishable crate to verify it can be
-# assembled into a .crate archive without network access or actual upload.
+# Verify that every publishable crate's manifest is valid and all referenced
+# source files exist, without uploading to crates.io.
 #
-# This catches: missing files referenced from Cargo.toml, broken include/
-# exclude patterns, workspace-path-dep leakage, and manifest parse errors
-# that would cause a `cargo publish` to fail after a release tag is cut.
+# Uses `cargo package --list` which enumerates the files that would be included
+# in the .crate archive.  This catches: missing files referenced from Cargo.toml,
+# broken include/exclude patterns, and manifest parse errors — without attempting
+# registry dependency resolution.
+#
+# NOTE: We intentionally avoid `cargo package --no-verify` here because that
+# command resolves dependencies against the published registry. Plugin crates
+# (autumn-admin-plugin, autumn-storage-s3, autumn-cache-redis) depend on
+# autumn-web features that may not yet be published at the time this gate runs,
+# which would cause false failures. The `check-crate-metadata.sh` script already
+# verifies inter-crate version pin alignment; the packaging step here focuses on
+# file and manifest integrity.
 #
 # Called from the `publish-gate` workflow. Run locally with:
 #
@@ -21,9 +30,6 @@ die() {
 }
 
 # Publishable crates in dependency order.
-# autumn-macros has no Autumn deps so it publishes first.
-# autumn-web depends on autumn-macros.
-# plugins depend on autumn-web.
 CRATES=(
   autumn-macros
   autumn-web
@@ -37,21 +43,20 @@ failures=0
 
 for crate in "${CRATES[@]}"; do
   echo ""
-  echo "==> cargo package -p $crate"
-  # --no-verify skips running tests inside the packaged crate (we run them
-  # separately in CI).  --allow-dirty lets this run on a working tree with
-  # uncommitted changes during local pre-release checks.
-  if cargo package -p "$crate" --no-verify --allow-dirty 2>&1; then
-    echo "  PASS: $crate packaged successfully"
+  echo "==> cargo package --list -p $crate"
+  # --list enumerates the files that would be in the archive.
+  # --allow-dirty lets this run on a working tree with uncommitted changes.
+  if cargo package -p "$crate" --list --allow-dirty 2>&1; then
+    echo "  PASS: $crate manifest and files are valid"
   else
-    echo "  FAIL: $crate could not be packaged" >&2
+    echo "  FAIL: $crate could not be listed for packaging" >&2
     failures=$((failures + 1))
   fi
 done
 
 echo ""
 if [[ "$failures" -gt 0 ]]; then
-  die "$failures crate(s) failed dry-run packaging."
+  die "$failures crate(s) failed packaging file verification."
 fi
 
-echo "Package dry-run OK — all publishable crates can be assembled."
+echo "Package dry-run OK — all publishable crates have valid manifests and files."

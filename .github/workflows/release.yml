@@ -54,12 +54,20 @@ jobs:
         run: |
           git-cliff --config cliff.toml --output CHANGELOG.md
       - name: Commit changelog to trunk
+        # RELEASE_TAG is set as an env var rather than interpolated directly
+        # into the shell command to prevent code injection via a crafted tag name.
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add CHANGELOG.md
-          git commit -m "docs: update CHANGELOG.md for ${{ github.event.workflow_run.head_branch }}"
-          git push origin HEAD:trunk
+          if ! git diff --staged --quiet; then
+            git commit -m "docs: update CHANGELOG.md for ${RELEASE_TAG}"
+            git push origin HEAD:trunk
+          else
+            echo "CHANGELOG.md already up to date — skipping commit"
+          fi
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:

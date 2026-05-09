@@ -6,13 +6,14 @@
 # The tool is installed automatically if not already present.
 #
 # Patch and minor releases fail if any public API break is detected.
-# For major releases (tag contains a MAJOR bump relative to the previous tag)
-# the check is advisory only — breaking changes are expected and documented
-# in CHANGELOG.md.
+# Intentional breaking releases (major bumps, or pre-1.0 minor bumps) pass
+# the gate automatically when a migration guide exists at
+# docs/migrations/<version>.md — the presence of the guide is proof that the
+# break is documented and acknowledged.
 #
 # Called from the `publish-gate` workflow. Run locally with:
 #
-#     ./scripts/check-semver.sh [--baseline-rev <git-ref>]
+#     ./scripts/check-semver.sh
 
 set -euo pipefail
 
@@ -29,6 +30,21 @@ if ! command -v cargo-semver-checks &>/dev/null; then
   echo "cargo-semver-checks not found — installing..."
   cargo install cargo-semver-checks --locked
 fi
+
+# Workspace version — used to locate the migration guide for intentional breaks.
+workspace_version="$(
+  awk '
+    /^\[workspace\.package\]/ { in_block = 1; next }
+    /^\[/ && in_block         { in_block = 0 }
+    in_block && /^[[:space:]]*version/ {
+      match($0, /"[^"]+"/)
+      print substr($0, RSTART + 1, RLENGTH - 2)
+      exit
+    }
+  ' Cargo.toml
+)"
+[[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
+migration_guide="docs/migrations/${workspace_version}.md"
 
 # Publishable crates.
 CRATES=(
@@ -48,15 +64,25 @@ for crate in "${CRATES[@]}"; do
   # --baseline-root is not used here; cargo-semver-checks fetches the last
   # published version from crates.io automatically when no baseline is given.
   # If the crate has never been published the check is skipped gracefully.
-  if cargo semver-checks check-release --package "$crate" 2>&1; then
+  set +e
+  cargo semver-checks check-release --package "$crate" 2>&1
+  exit_code=$?
+  set -e
+
+  if [[ $exit_code -eq 0 ]]; then
     echo "  PASS: $crate API is semver-compatible with crates.io baseline"
+  elif [[ $exit_code -eq 2 ]]; then
+    # Exit code 2 means the crate is not yet published; skip it.
+    echo "  SKIP: $crate not yet published on crates.io"
   else
-    exit_code=$?
-    if [[ $exit_code -eq 2 ]]; then
-      # Exit code 2 means the crate is not yet published; skip it.
-      echo "  SKIP: $crate not yet published on crates.io"
+    # Breaking changes detected. Allow them through if a migration guide exists —
+    # its presence is the explicit acknowledgement required by the release policy.
+    if [[ -f "$migration_guide" ]]; then
+      echo "  ADVISORY: $crate has breaking API changes; intentional — migration guide found at $migration_guide"
     else
-      echo "  FAIL: $crate has semver-incompatible public API changes" >&2
+      echo "  FAIL: $crate has unacknowledged breaking API changes." >&2
+      echo "        Add a migration guide at $migration_guide to acknowledge an intentional break," >&2
+      echo "        or fix the API regression before releasing." >&2
       failures=$((failures + 1))
     fi
   fi
@@ -64,7 +90,7 @@ done
 
 echo ""
 if [[ "$failures" -gt 0 ]]; then
-  die "$failures crate(s) have unacknowledged breaking public API changes. Either bump the major version, add a CHANGELOG entry, or update STABILITY.md to document the intentional break."
+  die "$failures crate(s) have unacknowledged breaking public API changes."
 fi
 
 echo "SemVer check OK — no unacknowledged breaking API changes."

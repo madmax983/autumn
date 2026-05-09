@@ -510,7 +510,7 @@ pub trait MailTransport: Send + Sync {
 /// return as soon as the handoff is durable. The framework's in-process Tokio
 /// fallback is intentionally not durable; production deployments should
 /// register a real implementation via [`MailDeliveryQueueHandle`] before
-/// [`install_mailer`] runs, or set
+/// `install_mailer` runs, or set
 /// [`MailConfig::allow_in_process_deliver_later_in_production`] to opt into the
 /// fallback explicitly.
 pub trait MailDeliveryQueue: Send + Sync {
