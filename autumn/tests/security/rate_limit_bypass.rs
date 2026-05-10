@@ -38,16 +38,16 @@ async fn eris_rate_limit_bypass_poc() {
 
     // Attacker sends request 1 with spoofed IP "1.1.1.1"
     // The load balancer appends the real IP, so X-Forwarded-For becomes "1.1.1.1, 203.0.113.50"
-    let req1 = make_req("1.1.1.1, 203.0.113.50");
-    let res1 = app.clone().oneshot(req1).await.unwrap();
-    assert_eq!(res1.status(), StatusCode::OK);
+    let request_1 = make_req("1.1.1.1, 203.0.113.50");
+    let response_1 = app.clone().oneshot(request_1).await.unwrap();
+    assert_eq!(response_1.status(), StatusCode::OK);
 
     // Attacker sends request 2 with spoofed IP "2.2.2.2"
     // The load balancer appends the real IP, so X-Forwarded-For becomes "2.2.2.2, 203.0.113.50"
-    let req2 = make_req("2.2.2.2, 203.0.113.50");
-    let res2 = app.clone().oneshot(req2).await.unwrap();
+    let request_2 = make_req("2.2.2.2, 203.0.113.50");
+    let response_2 = app.clone().oneshot(request_2).await.unwrap();
 
     // If vulnerable, the rate limiter uses the spoofed IP and allows the request.
     // If fixed, the rate limiter uses the right-most (or last untrusted) IP and blocks the request.
-    assert_eq!(res2.status(), StatusCode::TOO_MANY_REQUESTS, "Rate limit bypassed via spoofed X-Forwarded-For left-most IP!");
+    assert_eq!(response_2.status(), StatusCode::TOO_MANY_REQUESTS, "Rate limit bypassed via spoofed X-Forwarded-For left-most IP!");
 }
