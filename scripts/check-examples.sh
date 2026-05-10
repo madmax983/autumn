@@ -112,8 +112,8 @@ echo ""
 echo "==> Checking workspace examples/* members are cataloged as supported"
 
 mapfile -t workspace_examples < <(
-  grep -E '"examples/' "$WORKSPACE_MANIFEST" \
-    | grep -oE 'examples/[^"]+' \
+  grep -v '^\s*#' "$WORKSPACE_MANIFEST" \
+    | grep -oE 'examples/[a-zA-Z0-9_-]+' \
     | sed 's|examples/||' \
     | sort
 )
@@ -133,12 +133,13 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "==> Checking README.md Examples table entries appear in catalog"
 
-# Match markdown table cells containing a link like [`examples/foo`](examples/foo)
+# Match the URL portion of markdown links: both [`examples/foo`](...) and [examples/foo](...).
+# Extracting from the URL (not the link text) handles both link styles unambiguously.
 mapfile -t readme_examples < <(
-  grep -oE '\[`examples/[^`]+`\]' "$README" \
-    | grep -oE 'examples/[^`]+' \
+  grep -oE '\(examples/[a-zA-Z0-9_-]+\)' "$README" \
+    | tr -d '()' \
     | sed 's|examples/||' \
-    | sort
+    | sort -u
 )
 
 for ex in "${readme_examples[@]}"; do
@@ -158,7 +159,7 @@ echo "==> Checking docs/guide/ example references appear in catalog"
 DOCS_GUIDE="docs/guide"
 if [[ -d "$DOCS_GUIDE" ]]; then
   mapfile -t docs_examples < <(
-    grep -rhoE 'examples/[a-z_-]+' "$DOCS_GUIDE" \
+    grep -rhoE 'examples/[a-zA-Z0-9_-]+' "$DOCS_GUIDE" \
       | sed 's|examples/||' \
       | sort -u
   )
@@ -207,33 +208,34 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "==> Catalog summary by support tier"
 
-_count_supported=0
+mapfile -t _supported_summary  < <(catalog_names_by_tier "supported"    | sort)
+mapfile -t _exp_summary        < <(catalog_names_by_tier "experimental" | sort)
+mapfile -t _excl_summary       < <(catalog_names_by_tier "excluded"     | sort)
+
+_count_supported=${#_supported_summary[@]}
 echo ""
 echo "  SUPPORTED  (failures here block release):"
-for ex in $(catalog_names_by_tier "supported" | sort); do
+for ex in "${_supported_summary[@]}"; do
   echo "    examples/$ex"
-  _count_supported=$((_count_supported + 1))
 done
 echo "  ($( [[ $_count_supported -eq 0 ]] && echo "none" || echo "$_count_supported example(s)" ))"
 
 echo ""
 echo "  EXPERIMENTAL  (informational; not release-blocking):"
-exp_list="$(catalog_names_by_tier "experimental" | sort)"
-if [[ -z "$exp_list" ]]; then
+if [[ ${#_exp_summary[@]} -eq 0 ]]; then
   echo "    (none)"
 else
-  for ex in $exp_list; do
+  for ex in "${_exp_summary[@]}"; do
     echo "    examples/$ex"
   done
 fi
 
 echo ""
 echo "  EXCLUDED  (intentionally out of adoption path):"
-excl_list="$(catalog_names_by_tier "excluded" | sort)"
-if [[ -z "$excl_list" ]]; then
+if [[ ${#_excl_summary[@]} -eq 0 ]]; then
   echo "    (none)"
 else
-  for ex in $excl_list; do
+  for ex in "${_excl_summary[@]}"; do
     echo "    examples/$ex"
   done
 fi
