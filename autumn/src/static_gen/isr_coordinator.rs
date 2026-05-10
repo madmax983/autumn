@@ -223,6 +223,18 @@ impl IsrCoordinator for PostgresIsrCoordinator {
 /// # Returns
 ///
 /// A string of the form `"{url_path}:{bucket}"` where `bucket = now / interval`.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::static_gen::isr_window_key;
+///
+/// let url_path = "/about";
+/// let revalidate_secs = 60;
+/// let now_unix_secs = 1_700_000_000;
+/// let key = isr_window_key(url_path, revalidate_secs, now_unix_secs);
+/// assert_eq!(key, "/about:28333333");
+/// ```
 #[must_use]
 pub fn isr_window_key(url_path: &str, revalidate_secs: u64, now_unix_secs: u64) -> String {
     let interval = revalidate_secs.max(1);
@@ -235,6 +247,17 @@ pub fn isr_window_key(url_path: &str, revalidate_secs: u64, now_unix_secs: u64) 
 /// Suitable for `pg_try_advisory_lock`. The result is a deterministic hash
 /// of the inputs; different routes or different windows produce different keys
 /// with overwhelming probability.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::static_gen::{isr_window_key, isr_advisory_lock_key};
+///
+/// let window_key = isr_window_key("/about", 60, 1_700_000_000);
+/// let lock_key = isr_advisory_lock_key("/about", &window_key);
+/// // The value is a stable 64-bit integer
+/// assert_ne!(lock_key, 0);
+/// ```
 #[must_use]
 pub fn isr_advisory_lock_key(url_path: &str, window_key: &str) -> i64 {
     let mut hasher = Sha256::new();
