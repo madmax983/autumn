@@ -135,6 +135,16 @@ for member in "${workspace_examples[@]}"; do
     fail "  workspace member examples/$member is NOT cataloged as supported in $CATALOG"
   fi
 done
+
+# Inverse: every supported catalog entry must be a workspace member so it
+# participates in normal compilation and test validation.
+for ex in "${catalog_supported[@]}"; do
+  if printf '%s\n' "${workspace_examples[@]}" | grep -qx "$ex"; then
+    ok "  supported catalog entry '$ex' is a workspace member"
+  else
+    fail "  supported catalog entry '$ex' is NOT in Cargo.toml workspace members (add it or change its catalog tier)"
+  fi
+done
 echo ""
 
 # ---------------------------------------------------------------------------
