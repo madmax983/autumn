@@ -18,3 +18,19 @@ backend = "redis"
 [cache.redis]
 url = "redis://redis:6379"
 key_prefix = "bookmarks:cache"
+
+# Sessions must be stored in Redis so they survive across all three replicas.
+# The signing secret is read from AUTUMN_SECURITY__SIGNING_SECRET at startup;
+# every replica must receive the same value or cookies signed by replica A will
+# be rejected by replica B.
+[session]
+backend = "redis"
+
+[session.redis]
+url = "redis://redis:6379"
+key_prefix = "bookmarks:session"
+
+# Signing secret is required in the docker profile. Supply it via the
+# AUTUMN_SECURITY__SIGNING_SECRET environment variable — see docker-compose.yml.
+[security.signing_secret]
+# secret is read from AUTUMN_SECURITY__SIGNING_SECRET env var at runtime
