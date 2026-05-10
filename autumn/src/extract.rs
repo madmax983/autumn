@@ -20,12 +20,32 @@
 use axum::extract::{FromRequest, FromRequestParts};
 use axum::response::{IntoResponse, Response};
 
+macro_rules! impl_extractor_deref {
+    ($extractor:ident) => {
+        impl<T> std::ops::Deref for $extractor<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl<T> std::ops::DerefMut for $extractor<T> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+    };
+}
+
 /// Deserialize `application/x-www-form-urlencoded` request bodies.
 ///
 /// Wraps [`axum::extract::Form`] so parser failures use Autumn's
 /// Problem Details error contract.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Form<T>(pub T);
+
+impl_extractor_deref!(Form);
 
 impl<S, T> FromRequest<S> for Form<T>
 where
@@ -49,6 +69,8 @@ where
 /// exactly like Axum's `Json<T>`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Json<T>(pub T);
+
+impl_extractor_deref!(Json);
 
 impl<S, T> FromRequest<S> for Json<T>
 where
@@ -81,6 +103,8 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Path<T>(pub T);
 
+impl_extractor_deref!(Path);
+
 impl<S, T> FromRequestParts<S> for Path<T>
 where
     S: Send + Sync,
@@ -106,6 +130,8 @@ where
 /// Problem Details error contract.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Query<T>(pub T);
+
+impl_extractor_deref!(Query);
 
 impl<S, T> FromRequestParts<S> for Query<T>
 where
