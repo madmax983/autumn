@@ -96,6 +96,7 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES` | `security.rate_limit.trusted_proxies` | comma-separated `String` |
 //! | `AUTUMN_ENV` | active profile | `String` |
 //! | `AUTUMN_PROFILE` | active profile (legacy alias) | `String` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
@@ -1642,27 +1643,7 @@ impl AutumnConfig {
             &mut self.security.csrf.cookie_name,
         );
 
-        // Rate limiting
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__RATE_LIMIT__ENABLED",
-            &mut self.security.rate_limit.enabled,
-        );
-        parse_env(
-            env,
-            "AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND",
-            &mut self.security.rate_limit.requests_per_second,
-        );
-        parse_env(
-            env,
-            "AUTUMN_SECURITY__RATE_LIMIT__BURST",
-            &mut self.security.rate_limit.burst,
-        );
-        parse_env_bool(
-            env,
-            "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
-            &mut self.security.rate_limit.trust_forwarded_headers,
-        );
+        self.apply_rate_limit_env_overrides_with_env(env);
 
         // Multipart uploads
         parse_env(
@@ -1694,6 +1675,34 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
             &mut self.security.allow_unauthorized_repository_api,
+        );
+    }
+
+    fn apply_rate_limit_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__ENABLED",
+            &mut self.security.rate_limit.enabled,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND",
+            &mut self.security.rate_limit.requests_per_second,
+        );
+        parse_env(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__BURST",
+            &mut self.security.rate_limit.burst,
+        );
+        parse_env_bool(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS",
+            &mut self.security.rate_limit.trust_forwarded_headers,
+        );
+        parse_env_csv(
+            env,
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
+            &mut self.security.rate_limit.trusted_proxies,
         );
     }
 
@@ -3165,6 +3174,21 @@ path = "/healthz"
         parse_env_csv(&env, "SOME_CSV", &mut target);
         assert_eq!(target, vec!["a", "b", "c"]);
     }
+
+    #[test]
+    fn env_override_rate_limit_trusted_proxies() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
+            "10.0.0.10, 203.0.113.0/24",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.trusted_proxies,
+            vec!["10.0.0.10", "203.0.113.0/24"]
+        );
+    }
+
     #[test]
     fn env_override_server_host() {
         let env = MockEnv::new().with("AUTUMN_SERVER__HOST", "0.0.0.0");
