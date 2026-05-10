@@ -70,6 +70,26 @@ pub const HTMX_VERSION: &str = "2.0.4";
 /// Extracts the standard `hx-*` headers sent by htmx requests, enabling
 /// conditional rendering (e.g. sending back partials instead of full pages).
 ///
+/// ## Examples
+///
+/// Using [`HxRequest`] in an Axum handler to serve partials:
+///
+/// ```rust
+/// use axum::routing::get;
+/// use axum::Router;
+/// use autumn_web::prelude::HxRequest;
+///
+/// async fn dashboard(hx: HxRequest) -> &'static str {
+///     if hx.is_htmx {
+///         "<div>Partial Dashboard</div>"
+///     } else {
+///         "<html><body><div>Full Dashboard</div></body></html>"
+///     }
+/// }
+///
+/// let app = Router::<()>::new().route("/", get(dashboard));
+/// ```
+///
 /// See <https://htmx.org/reference/#request_headers> for more details.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
@@ -126,6 +146,21 @@ where
 ///
 /// This trait provides a fluent API for controlling htmx behavior from the server.
 /// If an invalid header value is provided, it is gracefully ignored.
+///
+/// ## Examples
+///
+/// Triggering client-side events after a successful operation:
+///
+/// ```rust
+/// use axum::response::IntoResponse;
+/// use autumn_web::prelude::HxResponseExt;
+///
+/// async fn update_item() -> impl IntoResponse {
+///     "Item updated successfully"
+///         .hx_trigger("item-updated")
+///         .hx_push_url("/items/1")
+/// }
+/// ```
 ///
 /// See <https://htmx.org/reference/#response_headers> for more details.
 pub trait HxResponseExt: IntoResponse + Sized {
