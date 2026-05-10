@@ -155,6 +155,30 @@ fn generated_example_css_is_ignored_and_untracked() {
 }
 
 #[test]
+fn publish_dry_run_script_uses_list_not_no_verify() {
+    let root = workspace_root();
+    let script_path = root.join("scripts/check-publish-dry-run.sh");
+    let script = std::fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
+
+    // --list enumerates the files that would be in the archive and validates
+    // the manifest without touching the registry.  --no-verify is intentionally
+    // avoided because it rewrites workspace path deps to their pinned registry
+    // versions and resolves them against crates.io, which causes false failures
+    // for plugin crates that depend on autumn-web features not yet published.
+    assert!(
+        script.contains(r#"cargo package -p "$crate" --list --allow-dirty"#),
+        "{} must use `cargo package --list` for manifest/file verification",
+        script_path.display(),
+    );
+    assert!(
+        !script.contains(r#"cargo package -p "$crate" --no-verify --allow-dirty"#),
+        "{} must not use `--no-verify`; that triggers registry resolution and causes false failures for plugin crates",
+        script_path.display(),
+    );
+}
+
+#[test]
 fn bookmarks_example_tracks_regenerated_scaffold_layout() {
     let root = workspace_root();
     let bookmarks = root.join("examples/bookmarks");

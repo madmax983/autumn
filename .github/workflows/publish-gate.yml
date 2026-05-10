@@ -1,0 +1,225 @@
+name: Publish Gate
+
+# Runs on every release tag and can be triggered manually from any branch/PR.
+# All jobs must pass before the companion `release` workflow creates a GitHub Release.
+#
+# Jobs:
+#   metadata      — required crates.io metadata fields present in every crate
+#   package       — cargo package dry-run (no upload) for every crate
+#   docs          — docs.rs-compatible documentation build, no broken links
+#   semver        — public API SemVer compatibility vs last crates.io version
+#   release-notes — workspace version / CHANGELOG / tag alignment
+#   smoke         — fresh downstream project compiles against the candidate crate set
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  pull_request:
+    branches: [trunk, trunk-dev]
+  workflow_dispatch:
+    inputs:
+      skip_semver:
+        description: "Skip the SemVer check (e.g. for a known-breaking release)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Crate metadata
+  # ---------------------------------------------------------------------------
+  metadata:
+    name: Crate metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required crates.io metadata fields
+        run: ./scripts/check-crate-metadata.sh
+
+  # ---------------------------------------------------------------------------
+  # 2. Package dry-run (no upload)
+  # ---------------------------------------------------------------------------
+  package:
+    name: Package dry-run
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify every publishable crate can be packaged
+        run: ./scripts/check-publish-dry-run.sh
+
+  # ---------------------------------------------------------------------------
+  # 3. Documentation build (docs.rs posture)
+  # ---------------------------------------------------------------------------
+  docs:
+    name: Documentation build
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rust-docs
+      - uses: Swatinem/rust-cache@v2
+      - name: Build docs (all features, no broken links)
+        run: ./scripts/check-docs.sh
+
+  # ---------------------------------------------------------------------------
+  # 4. SemVer compatibility
+  # ---------------------------------------------------------------------------
+  semver:
+    name: SemVer check
+    runs-on: ubuntu-latest
+    needs: package
+    if: ${{ github.event.inputs.skip_semver != 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+      - name: Check public API SemVer compatibility
+        # GITHUB_EVENT_NAME is set by the runner automatically, but pass it
+        # explicitly so the script can distinguish PR (informational) from
+        # tag-push (hard gate) runs.
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: ./scripts/check-semver.sh
+
+  # ---------------------------------------------------------------------------
+  # 5. Release notes alignment (tags only)
+  # ---------------------------------------------------------------------------
+  release-notes:
+    name: Release notes alignment
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate version / CHANGELOG / tag agreement
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: ./scripts/check-release-notes.sh
+
+  # ---------------------------------------------------------------------------
+  # 6. Downstream smoke test
+  # ---------------------------------------------------------------------------
+  smoke:
+    name: Downstream smoke test
+    runs-on: ubuntu-latest
+    needs: [package, docs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create smoke project
+        run: |
+          SMOKE_DIR="$(mktemp -d)"
+          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
+
+          cat > "$SMOKE_DIR/Cargo.toml" <<'TOML'
+          [package]
+          name    = "smoke-app"
+          version = "0.0.0"
+          edition = "2024"
+
+          [dependencies]
+          autumn-web = { path = "__AUTUMN_WEB_PATH__", default-features = false, features = ["maud", "htmx"] }
+          tokio      = { version = "1", features = ["full"] }
+          TOML
+
+          # Substitute the local path to autumn-web so we test the candidate
+          # crate set without workspace path overrides.
+          AUTUMN_WEB_PATH="$(pwd)/autumn"
+          sed -i "s|__AUTUMN_WEB_PATH__|$AUTUMN_WEB_PATH|g" "$SMOKE_DIR/Cargo.toml"
+
+          mkdir -p "$SMOKE_DIR/src"
+          cat > "$SMOKE_DIR/src/main.rs" <<'RUST'
+          use autumn_web::prelude::*;
+
+          #[get("/")]
+          async fn index() -> impl IntoResponse {
+              "smoke ok"
+          }
+
+          #[autumn_web::main]
+          async fn main() {
+              autumn_web::app()
+                  .routes(routes![index])
+                  .run()
+                  .await;
+          }
+          RUST
+
+          echo "Smoke project written to $SMOKE_DIR"
+
+      - name: Compile smoke project
+        run: |
+          cd "$SMOKE_DIR"
+          cargo build 2>&1
+
+      - name: Smoke test passed
+        run: echo "Downstream compile smoke test OK"
+
+  # ---------------------------------------------------------------------------
+  # 7. Prepare release artifacts (tag pushes only)
+  # ---------------------------------------------------------------------------
+  prepare-release:
+    name: Prepare release artifacts
+    runs-on: ubuntu-latest
+    # Only runs on tag pushes; depends on all gate jobs so artifacts are only
+    # produced when every check passes.
+    needs: [semver, release-notes, smoke]
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
+      - name: Generate release notes and update CHANGELOG
+        run: |
+          git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
+          git-cliff --config cliff.toml --output CHANGELOG.md
+      - name: Commit CHANGELOG.md to trunk
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if ! git diff --staged --quiet; then
+            git commit -m "docs: update CHANGELOG.md for ${RELEASE_TAG}"
+            git push origin HEAD:trunk
+          else
+            echo "CHANGELOG.md already up to date — skipping commit"
+          fi
+      - name: Record release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: printf '%s' "${RELEASE_TAG}" > release-tag.txt
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            RELEASE_NOTES.md
+            release-tag.txt
+          retention-days: 7
