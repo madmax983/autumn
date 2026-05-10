@@ -44,6 +44,8 @@
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 
 // ── Signing secret contract ────────────────────────────────────────────────
@@ -207,6 +209,108 @@ pub fn validate_signing_secret(
         });
     }
     Ok(())
+}
+
+// ── Resolved signing key material ─────────────────────────────────────────
+
+/// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
+pub(crate) fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    let bytes = mac.finalize().into_bytes();
+    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Constant-time string comparison for HMAC verification.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Generate a random 32-byte ephemeral key from two UUID v4 values.
+fn generate_ephemeral_key() -> Vec<u8> {
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    let mut bytes = vec![0u8; 32];
+    bytes[..16].copy_from_slice(a.as_bytes());
+    bytes[16..].copy_from_slice(b.as_bytes());
+    bytes
+}
+
+/// Resolved signing keys for a running Autumn instance.
+///
+/// Created once at startup from [`SigningSecretConfig`] via [`resolve_signing_keys`]
+/// and shared via `Arc` across session, CSRF, and local storage signing.
+///
+/// - `current` signs new tokens.
+/// - `previous` are accepted during a rotation grace window.
+#[derive(Clone, Debug)]
+pub struct ResolvedSigningKeys {
+    /// Key used to sign new tokens.
+    pub current: Arc<[u8]>,
+    /// Former keys accepted during a rotation grace window. New signatures always
+    /// use `current`; tokens carrying a `previous` HMAC continue to verify until
+    /// removed (see docs/guide/signing-secrets.md).
+    pub previous: Vec<Arc<[u8]>>,
+}
+
+impl ResolvedSigningKeys {
+    /// Build from raw byte vectors.
+    pub fn new(current: Vec<u8>, previous: Vec<Vec<u8>>) -> Self {
+        Self {
+            current: current.into(),
+            previous: previous.into_iter().map(|v: Vec<u8>| v.into()).collect(),
+        }
+    }
+
+    /// HMAC-SHA256 of `message` under the current key, hex-encoded.
+    pub fn sign(&self, message: &[u8]) -> String {
+        hmac_sha256_hex(&self.current, message)
+    }
+
+    /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
+    /// any key (current first, then previous). All comparisons are constant-time.
+    pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
+        if ct_eq_str(&hmac_sha256_hex(&self.current, message), hex_sig) {
+            return true;
+        }
+        for prev in &self.previous {
+            if ct_eq_str(&hmac_sha256_hex(prev, message), hex_sig) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Resolve signing keys from a [`SigningSecretConfig`].
+///
+/// - When `secret` is set, its bytes become the current key.
+/// - When `secret` is absent (dev/test), an ephemeral random key is generated.
+///   This means signed tokens do not survive process restarts.
+/// - `previous_secrets` are always included for rotation grace-window verification.
+///
+/// Production boot validation (requiring `secret` to be non-empty, long enough,
+/// and not a demo value) is a separate step via [`validate_signing_secret`].
+pub fn resolve_signing_keys(config: &SigningSecretConfig) -> ResolvedSigningKeys {
+    let current = config
+        .secret
+        .as_deref()
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_else(generate_ephemeral_key);
+    let previous = config
+        .previous_secrets
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    ResolvedSigningKeys::new(current, previous)
 }
 
 /// Top-level security configuration section.
@@ -957,5 +1061,76 @@ mod tests {
         assert_eq!(config.upload.max_request_size_bytes, 4096);
         assert_eq!(config.upload.max_file_size_bytes, 1024);
         assert_eq!(config.upload.allowed_mime_types, vec!["text/plain"]);
+    }
+
+    // ── ResolvedSigningKeys + resolve_signing_keys (RED phase) ─────────────
+
+    #[test]
+    fn resolve_signing_keys_dev_generates_non_empty_ephemeral() {
+        let config = SigningSecretConfig::default();
+        let keys = resolve_signing_keys(&config);
+        assert!(keys.current.len() >= MIN_SECRET_LEN);
+    }
+
+    #[test]
+    fn resolve_signing_keys_prod_uses_secret_bytes() {
+        let secret = "a".repeat(MIN_SECRET_LEN);
+        let config = SigningSecretConfig {
+            secret: Some(secret.clone()),
+            previous_secrets: vec![],
+        };
+        let keys = resolve_signing_keys(&config);
+        assert_eq!(keys.current.as_ref(), secret.as_bytes());
+    }
+
+    #[test]
+    fn resolve_signing_keys_includes_previous_secrets() {
+        let config = SigningSecretConfig {
+            secret: Some("a".repeat(MIN_SECRET_LEN)),
+            previous_secrets: vec!["b".repeat(MIN_SECRET_LEN)],
+        };
+        let keys = resolve_signing_keys(&config);
+        assert_eq!(keys.previous.len(), 1);
+        assert_eq!(keys.previous[0].as_ref(), "b".repeat(MIN_SECRET_LEN).as_bytes());
+    }
+
+    #[test]
+    fn resolved_keys_sign_and_verify_current() {
+        let keys = ResolvedSigningKeys::new(b"current-key-32-bytes-xxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys.sign(b"test-message");
+        assert!(keys.verify(b"test-message", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_rejects_wrong_message() {
+        let keys = ResolvedSigningKeys::new(b"current-key-32-bytes-xxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys.sign(b"message-a");
+        assert!(!keys.verify(b"message-b", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_previous_key_passes() {
+        let old_key = b"old-key-32-bytes-xxxxxxxxxxxx!x".to_vec();
+        let new_key = b"new-key-32-bytes-xxxxxxxxxxxx!x".to_vec();
+        let old_keys = ResolvedSigningKeys::new(old_key.clone(), vec![]);
+        let old_sig = old_keys.sign(b"session-id");
+        let new_keys = ResolvedSigningKeys::new(new_key, vec![old_key]);
+        assert!(new_keys.verify(b"session-id", &old_sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_wrong_key_fails() {
+        let keys_a = ResolvedSigningKeys::new(b"key-a-32-bytes-xxxxxxxxxxxxxxxx".to_vec(), vec![]);
+        let keys_b = ResolvedSigningKeys::new(b"key-b-32-bytes-xxxxxxxxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys_a.sign(b"message");
+        assert!(!keys_b.verify(b"message", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_sign_produces_64_char_hex() {
+        let keys = ResolvedSigningKeys::new(b"key".to_vec(), vec![]);
+        let sig = keys.sign(b"msg");
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

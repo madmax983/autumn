@@ -3019,26 +3019,38 @@ fn bootstrap_local_storage(
         );
     }
 
-    let signing_key = config
-        .storage
-        .local
-        .signing_key
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map_or_else(
-            || {
-                if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                    tracing::warn!(
-                        "no storage.local.signing_key configured in prod; \
-                         generated URLs won't survive a process restart. \
-                         Set [storage.local].signing_key or \
-                         AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
-                    );
-                }
-                SigningKey::random()
-            },
-            |s| SigningKey::new(s.as_bytes().to_vec()),
-        );
+    // Signing key precedence:
+    // 1. security.signing_secret (canonical, shared with session/CSRF)
+    // 2. storage.local.signing_key (legacy override — still respected)
+    // 3. Random ephemeral key (dev only — warns in prod)
+    let (signing_key, previous_signing_keys) =
+        if let Some(secret) = config.security.signing_secret.secret.as_deref().filter(|s| !s.is_empty()) {
+            let current = SigningKey::new(secret.as_bytes().to_vec());
+            let previous = config
+                .security
+                .signing_secret
+                .previous_secrets
+                .iter()
+                .map(|s| SigningKey::new(s.as_bytes().to_vec()))
+                .collect::<Vec<_>>();
+            (current, previous)
+        } else if let Some(legacy) = config
+            .storage
+            .local
+            .signing_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            (SigningKey::new(legacy.as_bytes().to_vec()), vec![])
+        } else {
+            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                tracing::warn!(
+                    "no signing secret configured in prod; blob URL signatures won't survive \
+                     a process restart. Set AUTUMN_SECURITY__SIGNING_SECRET."
+                );
+            }
+            (SigningKey::random(), vec![])
+        };
 
     let store = match LocalBlobStore::new(
         provider_id.to_string(),
@@ -3046,6 +3058,7 @@ fn bootstrap_local_storage(
         mount_path.to_string(),
         std::time::Duration::from_secs(default_url_expiry_secs),
         signing_key,
+        previous_signing_keys,
     ) {
         Ok(store) => store,
         Err(err) => {

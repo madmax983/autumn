@@ -974,13 +974,20 @@ where
     router
 }
 
-fn apply_csrf_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+fn apply_csrf_middleware<S>(
+    mut router: axum::Router<S>,
+    config: &AutumnConfig,
+    signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
+) -> axum::Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
-        let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        if let Some(keys) = signing_keys {
+            csrf_layer = csrf_layer.with_signing_keys(keys);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
@@ -1043,8 +1050,23 @@ fn apply_middleware(
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
     router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
 
+    // Resolve signing keys once; shared across session and CSRF layers.
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let signing_keys = std::sync::Arc::new(
+        crate::security::config::resolve_signing_keys(&config.security.signing_secret),
+    );
+    // Only thread signing keys when a secret is configured (or in production where
+    // fail_fast already ensures one is present). In dev without a configured secret
+    // the ephemeral key is generated per-process — useful but not required.
+    let signing_keys_opt: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>> =
+        if config.security.signing_secret.secret.is_some() || is_production {
+            Some(signing_keys)
+        } else {
+            None
+        };
+
     router = apply_cors_middleware(router, config);
-    router = apply_csrf_middleware(router, config);
+    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     router = apply_rate_limit_middleware(router, config);
     router = apply_upload_middleware(router, config);
 
@@ -1074,6 +1096,7 @@ fn apply_middleware(
         &config.session,
         config.profile.as_deref(),
         session_store,
+        signing_keys_opt,
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
@@ -1740,7 +1763,7 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+        let router = apply_csrf_middleware(base, &config, None).with_state(test_state());
 
         // Without CSRF the POST should pass through with no CSRF-specific response
         let response = router
@@ -1981,7 +2004,7 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+        let router = apply_csrf_middleware(base, &config, None).with_state(test_state());
 
         // POST without CSRF token should be rejected
         let response = router

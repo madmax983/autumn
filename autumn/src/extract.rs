@@ -580,6 +580,7 @@ mod tests {
             "/blobs",
             Duration::from_secs(3600),
             SigningKey::random(),
+            vec![],
         )
         .unwrap();
 
@@ -620,6 +621,7 @@ mod tests {
             "/blobs",
             Duration::from_secs(3600),
             SigningKey::random(),
+            vec![],
         )
         .unwrap();
 
