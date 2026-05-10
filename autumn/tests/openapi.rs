@@ -647,7 +647,7 @@ fn generated_spec_reuses_problem_details_schema_for_errors() {
     );
 
     let op = spec.paths["/protected"].get.as_ref().unwrap();
-    for status in ["400", "401", "403", "404", "422", "500", "503"] {
+    for status in ["400", "401", "403", "404", "413", "422", "500", "503"] {
         let response = op
             .responses
             .get(status)

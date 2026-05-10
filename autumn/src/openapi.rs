@@ -743,7 +743,7 @@ fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&
 
 #[cfg(feature = "openapi")]
 fn insert_problem_responses(responses: &mut BTreeMap<String, Response>) {
-    for status in [400_u16, 401, 403, 404, 409, 422, 500, 503] {
+    for status in [400_u16, 401, 403, 404, 409, 413, 422, 500, 503] {
         responses.entry(status.to_string()).or_insert_with(|| {
             let mut content = BTreeMap::new();
             content.insert(
