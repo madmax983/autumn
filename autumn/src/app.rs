@@ -2916,6 +2916,29 @@ fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
         );
         std::process::exit(1);
     }
+
+    // Previous secrets accepted during rotation must meet the same bar as the
+    // current secret — a weak previous key can still be used to forge tokens.
+    if is_production {
+        for (i, prev) in config
+            .security
+            .signing_secret
+            .previous_secrets
+            .iter()
+            .enumerate()
+        {
+            if let Err(error) = validate_signing_secret(Some(prev.as_str()), true) {
+                eprintln!(
+                    "Invalid signing secret configuration: previous_secrets[{i}]: {error}"
+                );
+                eprintln!(
+                    "  hint: every previous secret must meet the same entropy requirement \
+                     as the current secret"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 /// Constructed [`BlobStore`](crate::storage::BlobStore) plus the
@@ -3023,34 +3046,46 @@ fn bootstrap_local_storage(
     // 1. security.signing_secret (canonical, shared with session/CSRF)
     // 2. storage.local.signing_key (legacy override — still respected)
     // 3. Random ephemeral key (dev only — warns in prod)
-    let (signing_key, previous_signing_keys) =
-        if let Some(secret) = config.security.signing_secret.secret.as_deref().filter(|s| !s.is_empty()) {
-            let current = SigningKey::new(secret.as_bytes().to_vec());
-            let previous = config
-                .security
-                .signing_secret
-                .previous_secrets
-                .iter()
-                .map(|s| SigningKey::new(s.as_bytes().to_vec()))
-                .collect::<Vec<_>>();
-            (current, previous)
-        } else if let Some(legacy) = config
-            .storage
-            .local
-            .signing_key
-            .as_deref()
-            .filter(|s| !s.is_empty())
-        {
-            (SigningKey::new(legacy.as_bytes().to_vec()), vec![])
-        } else {
-            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                tracing::warn!(
-                    "no signing secret configured in prod; blob URL signatures won't survive \
-                     a process restart. Set AUTUMN_SECURITY__SIGNING_SECRET."
-                );
-            }
-            (SigningKey::random(), vec![])
-        };
+    let (signing_key, previous_signing_keys) = config
+        .security
+        .signing_secret
+        .secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                config
+                    .storage
+                    .local
+                    .signing_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || {
+                            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                                tracing::warn!(
+                                    "no signing secret configured in prod; blob URL signatures \
+                                     won't survive a process restart. Set \
+                                     AUTUMN_SECURITY__SIGNING_SECRET."
+                                );
+                            }
+                            (SigningKey::random(), vec![])
+                        },
+                        |legacy| (SigningKey::new(legacy.as_bytes().to_vec()), vec![]),
+                    )
+            },
+            |secret| {
+                let current = SigningKey::new(secret.as_bytes().to_vec());
+                let previous = config
+                    .security
+                    .signing_secret
+                    .previous_secrets
+                    .iter()
+                    .map(|s| SigningKey::new(s.as_bytes().to_vec()))
+                    .collect::<Vec<_>>();
+                (current, previous)
+            },
+        );
 
     let store = match LocalBlobStore::new(
         provider_id.to_string(),

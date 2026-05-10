@@ -72,6 +72,16 @@ pub fn run(action: ReleaseAction) {
                     for f in &files {
                         println!("  Created {f}");
                     }
+
+                    // Smoke gate: verify the generated production config does
+                    // not contain a committed signing secret literal.
+                    let config_path = cwd.join("autumn.production.toml.example");
+                    if let Ok(content) = std::fs::read_to_string(&config_path)
+                        && let Err(e) = check_production_config_signing_secret(&content)
+                    {
+                        eprintln!("Warning: smoke gate failed for generated config: {e}");
+                    }
+
                     println!();
                     println!("Next steps:");
                     println!("  1. Generate and set your signing secret (REQUIRED before production boot):");
