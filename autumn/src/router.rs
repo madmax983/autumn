@@ -1023,6 +1023,7 @@ fn apply_upload_middleware(
     ))
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
