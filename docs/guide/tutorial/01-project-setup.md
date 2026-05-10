@@ -9,12 +9,16 @@ compiles, runs, and responds to HTTP requests at `http://localhost:3000`.
 
 Before you start, make sure you have:
 
-- **Rust** (edition 2024) — install from <https://rustup.rs> if you haven't already
-- **The Autumn CLI** — install from this workspace with `cargo install --path autumn-cli`
+- **Rust 1.88.0+** (edition 2024) â€” install from <https://rustup.rs> if you haven't already
+- **The Autumn CLI** â€” install the published CLI with
+  `cargo install autumn-cli --version 0.3.0`
 - A terminal and a text editor
 
 Docker is not needed until Chapter 3 (Database Setup). For now, you only need
 Rust and the Autumn CLI.
+
+If you are contributing from an Autumn source checkout, `cargo install --path
+autumn-cli` is the local development only install path.
 
 ## Scaffold the Project
 
@@ -60,13 +64,13 @@ todo-app/
 +-- autumn.toml
 +-- build.rs
 +-- src/
-¦   +-- main.rs
+|   +-- main.rs
 +-- static/
-¦   +-- css/
-¦       +-- input.css
+|   +-- css/
+|       +-- input.css
 +-- tailwind.config.js
 +-- migrations/
-¦   +-- .gitkeep
+|   +-- .gitkeep
 +-- .gitignore
 ```
 
@@ -81,7 +85,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = "0.1.0"
+autumn-web = "0.3"
 ```
 
 This is a standard Rust project manifest. The only dependency is `autumn-web`
@@ -90,12 +94,16 @@ you don't manage those crates directly.
 
 ### `src/main.rs`
 
-```rust
-use autumn_web::{get, routes};
+The full generated file also defines the shared `layout(...)` helper and
+embedded migration constant. The route core looks like this:
 
+```rust
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to todo-app!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]
@@ -112,6 +120,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
@@ -119,20 +128,22 @@ async fn main() {
 
 There is a lot happening in a small file. Here is what each piece does:
 
-- **`#[get("/")]`** — a route macro that registers `index` as a GET handler
+- **`#[get("/")]`** â€” a route macro that registers `index` as a GET handler
   for the root path. Autumn provides `#[get]`, `#[post]`, `#[put]`, and
   `#[delete]` macros.
-- **`#[get("/hello/{name}")]`** — a route with a path parameter. The `{name}`
+- **`#[get("/hello/{name}")]`** â€” a route with a path parameter. The `{name}`
   segment is extracted into the handler's `Path<String>` argument.
-- **`autumn_web::extract::Path`** — an extractor that pulls typed values from the
+- **`autumn_web::extract::Path`** â€” an extractor that pulls typed values from the
   URL path. Autumn re-exports Axum's extractors so you don't need `axum` as a
   direct dependency.
-- **`#[autumn_web::main]`** — sets up the Tokio async runtime. This is equivalent
+- **`#[autumn_web::main]`** â€” sets up the Tokio async runtime. This is equivalent
   to `#[tokio::main]` with Autumn's preferred configuration.
-- **`autumn_web::app()`** — creates an application builder. You register routes
+- **`autumn_web::app()`** â€” creates an application builder. You register routes
   with `.routes()` and start the server with `.run().await`.
-- **`routes![index, hello, hello_name]`** — a macro that collects route
+- **`routes![index, hello, hello_name]`** â€” a macro that collects route
   handlers into a `Vec<Route>` for the app builder.
+- **`.migrations(MIGRATIONS)`** â€” embeds the app's Diesel migrations so Autumn
+  can apply them when a database is configured.
 
 The pattern is always the same: define handlers with route macros, collect
 them with `routes![]`, and pass them to `autumn_web::app().routes(...).run()`.
@@ -141,7 +152,7 @@ them with `routes![]`, and pass them to `autumn_web::app().routes(...).run()`.
 
 ```toml
 # Autumn configuration
-# All values shown are defaults — uncomment and change as needed.
+# All values shown are defaults â€” uncomment and change as needed.
 
 [server]
 host = "127.0.0.1"
@@ -164,12 +175,12 @@ path = "/health"
 
 Autumn uses a five-layer configuration system:
 
-1. **Framework defaults** — compiled into the binary (port 3000, log level
+1. **Framework defaults** â€” compiled into the binary (port 3000, log level
    info, etc.)
-2. **Profile smart defaults** — built-in `dev` / `prod` behavior
-3. **`autumn.toml`** — project-level overrides (this file)
-4. **`autumn-{profile}.toml`** — profile-specific overrides
-5. **`AUTUMN_*` environment variables** — deployment overrides (e.g.,
+2. **Profile smart defaults** â€” built-in `dev` / `prod` behavior
+3. **`autumn.toml`** â€” project-level overrides (this file)
+4. **`autumn-{profile}.toml`** â€” profile-specific overrides
+5. **`AUTUMN_*` environment variables** â€” deployment overrides (e.g.,
    `AUTUMN_SERVER__PORT=8080`)
 
 Every value has a sensible default. You can delete `autumn.toml` entirely and
@@ -273,7 +284,7 @@ This downloads the Tailwind CLI to `target/autumn/tailwindcss` (or
 is about 50 MB.
 
 If you prefer to install Tailwind globally or already have it on your PATH,
-you can skip this step — `build.rs` checks both locations.
+you can skip this step â€” `build.rs` checks both locations.
 
 ## Run the Application
 
@@ -291,23 +302,23 @@ dependencies. Subsequent builds are fast. You will see output like:
   INFO Listening addr=127.0.0.1:3000
 ```
 
-The "Database not configured" message is expected — you have not set up
+The "Database not configured" message is expected â€” you have not set up
 Postgres yet.
 
 Open your browser and visit <http://localhost:3000>. You should see:
 
 ```
-Welcome to Autumn!
+Welcome to todo-app!
 ```
 
 Try the other routes:
 
-- <http://localhost:3000/hello> — "Hello, Autumn!"
-- <http://localhost:3000/hello/world> — "Hello, world!"
-- <http://localhost:3000/health> — a JSON health check response (auto-mounted
+- <http://localhost:3000/hello> â€” "Hello, Autumn!"
+- <http://localhost:3000/hello/world> â€” "Hello, world!"
+- <http://localhost:3000/health> â€” a JSON health check response (auto-mounted
   by the framework)
-- <http://localhost:3000/actuator/health> — the actuator health view
-- <http://localhost:3000/actuator/info> — build and runtime information
+- <http://localhost:3000/actuator/health> â€” the actuator health view
+- <http://localhost:3000/actuator/info> â€” build and runtime information
 
 Press `Ctrl+C` in your terminal to stop the server. You will see:
 
@@ -316,7 +327,7 @@ Press `Ctrl+C` in your terminal to stop the server. You will see:
   INFO Server shut down cleanly
 ```
 
-Autumn handles graceful shutdown automatically — in-flight requests drain
+Autumn handles graceful shutdown automatically â€” in-flight requests drain
 before the process exits.
 
 ## What Just Happened
@@ -328,7 +339,7 @@ Here is what Autumn did when you called `.run().await`:
 2. **Initialized structured logging** based on the `[log]` section
 3. **Skipped database pool creation** (no `[database]` section configured)
 4. **Built an Axum router** from the routes you registered with `.routes()`
-5. **Mounted framework routes** — the health check endpoint, actuator
+5. **Mounted framework routes** â€” the health check endpoint, actuator
    endpoints, and the bundled htmx JavaScript
 6. **Served static files** from the `static/` directory
 7. **Bound to `127.0.0.1:3000`** and started accepting connections
@@ -346,17 +357,17 @@ todo-app/
 +-- autumn.toml
 +-- build.rs
 +-- src/
-¦   +-- main.rs
+|   +-- main.rs
 +-- static/
-¦   +-- css/
-¦       +-- input.css
-¦       +-- autumn.css   ? generated by build.rs
+|   +-- css/
+|       +-- input.css
+|       +-- autumn.css   (generated by build.rs)
 +-- tailwind.config.js
 +-- migrations/
-¦   +-- .gitkeep
+|   +-- .gitkeep
 +-- target/
-¦   +-- autumn/
-¦       +-- tailwindcss  ? downloaded by `autumn setup`
+|   +-- autumn/
+|       +-- tailwindcss  (downloaded by `autumn setup`)
 +-- .gitignore
 ```
 
@@ -369,4 +380,4 @@ routes with the beginnings of a todo application.
 
 ---
 
-Next: [Chapter 2 — Routes and Handlers](02-routes.md)
+Next: [Chapter 2 â€” Routes and Handlers](02-routes.md)

@@ -48,9 +48,8 @@ moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
-# Pin time to a range that is compatible with MSRV 1.86.0. Without this,
-# bollard (pulled in by testcontainers dev/optional deps) resolves
-# bollard-stubs -> time@0.3.46+ which requires rustc 1.88.0.
+# Keep time on the 0.3 release line for the testcontainers/bollard dependency
+# graph used by integration tests.
 time = { version = ">=0.3, <0.4" }
 
 # Proc macro

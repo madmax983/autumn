@@ -1,8 +1,8 @@
 # Getting Started with Autumn
 
 This guide takes you from zero to a running Autumn web app with routes, a
-database, HTML templates, interactive UI, and the current post-`v0.1.0`
-framework surface on `trunk`. Budget about 30 minutes.
+database, HTML templates, interactive UI, and the published `autumn-web` 0.3
+release line. Budget about 30 minutes.
 
 Autumn is a convention-over-configuration web framework for Rust, built on
 [Axum](https://github.com/tokio-rs/axum). It bundles Diesel (database), Maud
@@ -10,16 +10,16 @@ Autumn is a convention-over-configuration web framework for Rust, built on
 profile-aware configuration, and newer CLI workflows behind a Spring Boot-style
 developer experience.
 
-> **Version note:** `v0.1.0` was tagged on 2026-03-26. This guide tracks the
-> current `trunk` branch, which already includes unreleased post-`v0.1.0`
-> features like `autumn dev`, `autumn build`, profiles, actuator, and static
-> generation.
+> **Version note:** This is the published-user path for `autumn-web` 0.3.x and
+> `autumn-cli` 0.3.x as of 2026-05-10. If you are contributing from a source
+> checkout, use the local development commands below only after confirming the
+> workspace version still matches this guide.
 
 ---
 
 ## Prerequisites
 
-- **Rust 1.86.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
+- **Rust 1.88.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
 - **PostgreSQL** -- only needed if you want database features; Autumn runs
   fine without one
 - A terminal and a text editor
@@ -27,7 +27,7 @@ developer experience.
 Verify your Rust toolchain:
 
 ```bash
-rustc --version   # 1.85.0 or later
+rustc --version   # 1.88.0 or later
 cargo --version
 ```
 
@@ -35,8 +35,15 @@ cargo --version
 
 ## Install the CLI
 
-Autumn ships a small CLI for project scaffolding and tooling setup. Install it
-from source (crates.io publication is not yet available):
+Autumn ships a small CLI for project scaffolding and tooling setup. Install the
+published CLI from crates.io:
+
+```bash
+cargo install autumn-cli --version 0.3.0
+```
+
+For local development only, from an Autumn source checkout, install the CLI you
+just built instead:
 
 ```bash
 cargo install --path autumn-cli
@@ -147,14 +154,16 @@ The files that matter right now:
 
 ## Your First Route
 
-Open `src/main.rs`. The scaffolded code looks like this:
+Open `src/main.rs`. The scaffolded app includes a Maud layout, embedded
+migrations, and these starter routes:
 
 ```rust
-use autumn_web::{get, routes};
-
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to my-app!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]
@@ -171,6 +180,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
@@ -183,6 +193,8 @@ The key pieces:
 - **`routes![...]`** -- collects annotated handlers into a `Vec<Route>`.
 - **`autumn_web::app().routes(...).run().await`** -- the app builder. Load config,
   create the database pool, mount routes, start the server.
+- **`.migrations(MIGRATIONS)`** -- embeds and applies the app's Diesel
+  migrations when a database is configured.
 - **`#[autumn_web::main]`** -- sets up the Tokio async runtime. It is a thin
   wrapper around `#[tokio::main]`.
 
@@ -212,7 +224,7 @@ You will see log output like:
 ```
 
 Visit [http://localhost:3000](http://localhost:3000) -- you should see
-"Welcome to Autumn!". Try
+"Welcome to my-app!". Try
 [http://localhost:3000/hello/world](http://localhost:3000/hello/world) for the
 path parameter route.
 
@@ -227,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.1.0" }
+{ "status": "ok", "version": "0.3.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -427,7 +439,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.1.0"
+autumn-web = "0.3"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
