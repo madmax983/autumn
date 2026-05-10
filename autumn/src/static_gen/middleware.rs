@@ -186,8 +186,7 @@ impl StaticFileLayer {
         // This prevents this process from spawning more than one task per route.
         if route_state
             .in_flight
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
+            .swap(true, Ordering::AcqRel)
         {
             // Another task is already regenerating this route in this process
             return;

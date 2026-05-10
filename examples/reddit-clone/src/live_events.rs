@@ -346,11 +346,11 @@ impl LiveEventBusListener {
         if redis.is_none() && postgres.is_none() {
             None
         } else {
-            let label = match (redis.is_some(), postgres.is_some()) {
-                (true, true) => "redis+postgres",
-                (true, false) => "redis",
-                (false, true) => "postgres",
-                (false, false) => "polling",
+            let label = match (&redis, &postgres) {
+                (Some(_), Some(_)) => "redis+postgres",
+                (Some(_), None) => "redis",
+                (None, Some(_)) => "postgres",
+                (None, None) => "polling",
             };
             Some(Self {
                 label: label.to_owned(),

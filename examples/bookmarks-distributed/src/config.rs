@@ -26,44 +26,35 @@ pub struct DistributedDatabaseConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MissingDistributedDatabaseUrls {
-    missing_primary: bool,
-    missing_replica: bool,
+pub enum MissingDistributedDatabaseUrls {
+    PrimaryAndReplica,
+    Primary,
+    Replica,
 }
 
 impl MissingDistributedDatabaseUrls {
     #[must_use]
     pub fn primary_and_replica() -> Self {
-        Self {
-            missing_primary: true,
-            missing_replica: true,
-        }
+        Self::PrimaryAndReplica
     }
 
     #[must_use]
     pub fn primary() -> Self {
-        Self {
-            missing_primary: true,
-            missing_replica: false,
-        }
+        Self::Primary
     }
 
     #[must_use]
     pub fn replica() -> Self {
-        Self {
-            missing_primary: false,
-            missing_replica: true,
-        }
+        Self::Replica
     }
 }
 
 impl fmt::Display for MissingDistributedDatabaseUrls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.missing_primary, self.missing_replica) {
-            (true, true) => f.write_str("primary and replica database URLs are required"),
-            (true, false) => f.write_str("primary database URL is required"),
-            (false, true) => f.write_str("replica database URL is required"),
-            (false, false) => f.write_str("database URLs are required"),
+        match self {
+            Self::PrimaryAndReplica => f.write_str("primary and replica database URLs are required"),
+            Self::Primary => f.write_str("primary database URL is required"),
+            Self::Replica => f.write_str("replica database URL is required"),
         }
     }
 }

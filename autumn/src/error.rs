@@ -649,7 +649,7 @@ fn validation_errors(
     errors
 }
 
-fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
     if has_validation_errors {
         return "https://autumn.dev/problems/validation-failed";
     }
@@ -689,7 +689,7 @@ fn problem_title_for(status: StatusCode, has_validation_errors: bool) -> &'stati
     }
 }
 
-fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+const fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
     if has_validation_errors {
         return "autumn.validation_failed";
     }
@@ -705,9 +705,11 @@ fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static
         StatusCode::INTERNAL_SERVER_ERROR => "autumn.internal_server_error",
         StatusCode::NOT_IMPLEMENTED => "autumn.not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "autumn.service_unavailable",
-        _ if status.is_client_error() => "autumn.client_error",
-        _ if status.is_server_error() => "autumn.server_error",
-        _ => "autumn.error",
+        status => match status.as_u16() {
+            400..=499 => "autumn.client_error",
+            500..=599 => "autumn.server_error",
+            _ => "autumn.error",
+        }
     }
 }
 
