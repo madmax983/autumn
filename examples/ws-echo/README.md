@@ -9,6 +9,13 @@ Minimal real-time Autumn example covering:
 - `/events` - SSE subscription through `autumn_web::sse::stream`
 - `/notify` - script-friendly Maud list-item broadcast used by the smoke test
 
+## Prerequisites
+
+- Rust 1.88.0+ (local run)
+- Docker and Docker Compose (Redis fan-out smoke test)
+
+## Quick start
+
 Run one local replica:
 
 ```powershell

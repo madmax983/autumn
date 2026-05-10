@@ -13,6 +13,11 @@ without hand-writing the CRUD boilerplate twice.
 - Embedded migrations on startup
 - Framework health and actuator endpoints
 
+## Prerequisites
+
+- Rust 1.88.0+
+- PostgreSQL (via Docker Compose below)
+
 ## Quick start
 
 From the workspace root:
