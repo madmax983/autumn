@@ -2,8 +2,8 @@
 //!
 //! Because the CLI cannot embed the user's application-specific migrations
 //! (they live in the user's crate via `embed_migrations!`), this module
-//! delegates to the `diesel` CLI tool. It reads the database URL from
-//! `autumn.toml` + environment variables, then shells out to
+//! delegates to the `diesel` CLI tool. It reads the primary/write database URL
+//! from `autumn.toml` + environment variables, then shells out to
 //! `diesel migration run` or `diesel migration pending`.
 //!
 //! The user's application binary is the canonical way to run embedded
@@ -45,12 +45,14 @@ pub fn run(action: MigrateAction) {
     }
 }
 
-/// Resolve the database URL from autumn.toml and environment variables.
+/// Resolve the primary/write database URL from autumn.toml and environment variables.
 ///
 /// Precedence (highest to lowest):
-/// 1. `AUTUMN_DATABASE__URL` environment variable
-/// 2. `DATABASE_URL` environment variable
-/// 3. `database.url` from `autumn.toml`
+/// 1. `AUTUMN_DATABASE__PRIMARY_URL` environment variable
+/// 2. `AUTUMN_DATABASE__URL` environment variable
+/// 3. `DATABASE_URL` environment variable
+/// 4. `database.primary_url` from `autumn.toml`
+/// 5. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
     resolve_database_url_with_env(|key| std::env::var(key))
 }
@@ -59,38 +61,58 @@ fn resolve_database_url_with_env<F>(env_var: F) -> String
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    // Check env overrides first
-    if let Ok(url) = env_var("AUTUMN_DATABASE__URL")
-        && !url.is_empty()
-    {
+    let config_table = read_autumn_toml_table();
+    if let Some(url) = resolve_primary_database_url_from_sources(env_var, config_table.as_ref()) {
         return url;
-    }
-    if let Ok(url) = env_var("DATABASE_URL")
-        && !url.is_empty()
-    {
-        return url;
-    }
-
-    // Try loading from autumn.toml
-    let config_path = Path::new("autumn.toml");
-    if config_path.exists()
-        && let Ok(contents) = std::fs::read_to_string(config_path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
-    {
-        let value = toml::Value::Table(table);
-        if let Some(url) = value
-            .get("database")
-            .and_then(|db: &toml::Value| db.get("url"))
-            .and_then(|u: &toml::Value| u.as_str())
-            && !url.is_empty()
-        {
-            return url.to_string();
-        }
     }
 
     eprintln!("\u{2717} No database URL found.");
-    eprintln!("  Set database.url in autumn.toml, or set AUTUMN_DATABASE__URL / DATABASE_URL.");
+    eprintln!(
+        "  Set database.primary_url (or database.url) in autumn.toml, or set AUTUMN_DATABASE__PRIMARY_URL / AUTUMN_DATABASE__URL / DATABASE_URL."
+    );
     std::process::exit(1);
+}
+
+fn read_autumn_toml_table() -> Option<toml::Table> {
+    let config_path = Path::new("autumn.toml");
+    if !config_path.exists() {
+        return None;
+    }
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+}
+
+fn resolve_primary_database_url_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    for var in [
+        "AUTUMN_DATABASE__PRIMARY_URL",
+        "AUTUMN_DATABASE__URL",
+        "DATABASE_URL",
+    ] {
+        if let Ok(url) = env_var(var)
+            && !url.is_empty()
+        {
+            return Some(url);
+        }
+    }
+
+    let database = table?.get("database").and_then(toml::Value::as_table)?;
+    for key in ["primary_url", "url"] {
+        if let Some(url) = database
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_owned());
+        }
+    }
+    None
 }
 
 /// Resolve the migrations directory (default: `./migrations/`).
@@ -212,5 +234,41 @@ mod tests {
         };
         let url = resolve_database_url_with_env(env_var);
         assert_eq!(url, "postgres://fallback:5432/db");
+    }
+
+    #[test]
+    fn database_topology_primary_env_wins_for_migrations() {
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            match key {
+                "AUTUMN_DATABASE__PRIMARY_URL" => Ok("postgres://primary:5432/app".to_string()),
+                "AUTUMN_DATABASE__URL" => Ok("postgres://legacy:5432/app".to_string()),
+                "DATABASE_URL" => Ok("postgres://database-url:5432/app".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            }
+        };
+
+        let url = resolve_primary_database_url_from_sources(env_var, None).unwrap();
+
+        assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    #[test]
+    fn database_topology_toml_primary_wins_over_legacy_url() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[database]
+url = "postgres://legacy:5432/app"
+primary_url = "postgres://primary:5432/app"
+replica_url = "postgres://replica:5432/app"
+"#,
+        )
+        .unwrap();
+        let env_var = |_key: &str| -> Result<String, std::env::VarError> {
+            Err(std::env::VarError::NotPresent)
+        };
+
+        let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
+
+        assert_eq!(url, "postgres://primary:5432/app");
     }
 }

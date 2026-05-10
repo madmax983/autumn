@@ -6,6 +6,8 @@
 //! - startup stays unavailable until startup hooks complete
 
 use std::sync::Arc;
+#[cfg(feature = "db")]
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::extract::State;
@@ -76,6 +78,29 @@ pub trait ProvideProbeState {
 pub struct ProbeState {
     startup_complete: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    #[cfg(feature = "db")]
+    replica_dependency: Arc<RwLock<ReplicaDependency>>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplicaDependency {
+    configured: bool,
+    fallback: crate::config::ReplicaFallback,
+    ready: bool,
+    detail: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl Default for ReplicaDependency {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            fallback: crate::config::ReplicaFallback::default(),
+            ready: true,
+            detail: None,
+        }
+    }
 }
 
 impl ProbeState {
@@ -124,6 +149,43 @@ impl ProbeState {
         self.shutting_down.store(draining, Ordering::Relaxed);
     }
 
+    /// Configure runtime readiness behavior for a read replica.
+    #[cfg(feature = "db")]
+    pub fn configure_replica_dependency(&self, fallback: crate::config::ReplicaFallback) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        *dependency = ReplicaDependency {
+            configured: true,
+            fallback,
+            ready: true,
+            detail: None,
+        };
+    }
+
+    /// Mark the configured read replica as ready.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_ready(&self) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.ready = true;
+        dependency.detail = None;
+    }
+
+    /// Mark the configured read replica as unavailable or stale.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_unready(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.ready = false;
+        dependency.detail = Some(detail.into());
+    }
+
     /// Returns whether startup completed successfully.
     #[must_use]
     pub fn is_startup_complete(&self) -> bool {
@@ -140,6 +202,31 @@ impl ProbeState {
     #[must_use]
     pub fn draining(&self) -> bool {
         self.is_shutting_down()
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_allows_readiness(&self) -> bool {
+        let dependency = self
+            .replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned");
+        !dependency.configured
+            || dependency.ready
+            || matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn should_route_reads_to_replica(&self) -> bool {
+        let dependency = self
+            .replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned");
+        !dependency.configured
+            || dependency.ready
+            || matches!(
+                dependency.fallback,
+                crate::config::ReplicaFallback::FailReadiness
+            )
     }
 }
 
@@ -174,24 +261,32 @@ pub(crate) struct PoolStatus {
 fn dependency_readiness<S: ProvideProbeState>(state: &S) -> (bool, Option<PoolStatus>) {
     #[cfg(feature = "db")]
     {
-        if let Some(pool) = state.pool() {
+        let replica_ready_for_policy = state.probes().replica_allows_readiness();
+        let (pool_ready, pool_status) = if let Some(pool) = state.pool() {
             let status = pool.status();
             let available = status.available as u64;
             let size = status.max_size as u64;
             let waiting = status.waiting as u64;
 
-            return (
+            (
                 available > 0 || waiting == 0,
                 Some(PoolStatus {
                     size,
                     available,
                     waiting,
                 }),
-            );
-        }
+            )
+        } else {
+            (true, None)
+        };
+
+        return (pool_ready && replica_ready_for_policy, pool_status);
     }
 
-    (true, None)
+    #[cfg(not(feature = "db"))]
+    {
+        (true, None)
+    }
 }
 
 fn probe_response<S: ProvideProbeState>(
@@ -360,6 +455,42 @@ mod tests {
         let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn ready_fails_when_replica_is_unready_and_policy_is_fail_readiness() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn ready_allows_primary_fallback_when_replica_is_unready() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::Primary);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
     }
 
     #[tokio::test]

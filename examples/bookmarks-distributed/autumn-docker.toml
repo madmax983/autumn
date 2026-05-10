@@ -3,14 +3,12 @@ host = "0.0.0.0"
 port = 3000
 
 [database]
-url = "postgres://autumn:autumn@postgres-primary:5432/bookmarks_distributed"
-pool_size = 8
-
-[distributed.database]
 primary_url = "postgres://autumn:autumn@postgres-primary:5432/bookmarks_distributed"
 replica_url = "postgres://autumn:autumn@postgres-replica:5432/bookmarks_distributed"
 primary_pool_size = 8
 replica_pool_size = 8
+replica_fallback = "fail_readiness"
+auto_migrate_in_production = false
 
 [cache]
 backend = "redis"
@@ -19,7 +17,7 @@ backend = "redis"
 url = "redis://redis:6379"
 key_prefix = "bookmarks:cache"
 
-# Sessions must be stored in Redis so they survive across all three replicas.
+# Sessions must be stored in Redis so they survive across all web replicas.
 # The signing secret is read from AUTUMN_SECURITY__SIGNING_SECRET at startup;
 # every replica must receive the same value or cookies signed by replica A will
 # be rejected by replica B.

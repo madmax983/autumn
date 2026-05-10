@@ -169,8 +169,12 @@ path = "/health"
 # Uncomment to configure database:
 # [database]
 # url = "postgres://user:pass@localhost:5432/todo_app"
+# primary_url = "postgres://user:pass@localhost:5432/todo_app"
+# replica_url = "postgres://user:pass@localhost:5433/todo_app"
 # pool_size = 10
+# replica_fallback = "fail_readiness"
 # connect_timeout_secs = 5
+# auto_migrate_in_production = false
 ```
 
 Autumn uses a five-layer configuration system:

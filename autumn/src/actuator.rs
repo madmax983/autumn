@@ -585,12 +585,47 @@ impl ConfigProperties {
         profile_str: &str,
     ) {
         let db_url = config.database.url.as_deref().unwrap_or("").to_string();
+        let primary_url = config
+            .database
+            .primary_url
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let replica_url = config
+            .database
+            .replica_url
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
         Self::track_property(props, "database.url", &db_url, "", profile_str);
+        Self::track_property(props, "database.primary_url", &primary_url, "", profile_str);
+        Self::track_property(props, "database.replica_url", &replica_url, "", profile_str);
         Self::track_property(
             props,
             "database.pool_size",
             &config.database.pool_size.to_string(),
             &defaults.database.pool_size.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.primary_pool_size",
+            &config.database.effective_primary_pool_size().to_string(),
+            &defaults.database.effective_primary_pool_size().to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.replica_pool_size",
+            &config.database.effective_replica_pool_size().to_string(),
+            &defaults.database.effective_replica_pool_size().to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.replica_fallback",
+            &format!("{:?}", config.database.replica_fallback),
+            &format!("{:?}", defaults.database.replica_fallback),
             profile_str,
         );
     }

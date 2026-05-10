@@ -92,19 +92,22 @@ pub fn run(action: ReleaseAction) {
                     );
                     println!("     Smoke-gate check — the app must refuse to start without it:");
                     println!("       AUTUMN_ENV=prod docker run --rm \\");
-                    println!("         -e DATABASE_URL=... \\");
+                    println!("         -e AUTUMN_DATABASE__PRIMARY_URL=... \\");
                     println!("         {project_name} 2>&1 | grep -i 'signing secret'");
                     println!("     And must start with it:");
                     println!("       AUTUMN_ENV=prod docker run --rm \\");
-                    println!("         -e DATABASE_URL=... \\");
+                    println!("         -e AUTUMN_DATABASE__PRIMARY_URL=... \\");
                     println!(
                         "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
                     );
                     println!("         {project_name}");
                     println!();
-                    println!("  2. Build and run:");
+                    println!("  2. Build, migrate the primary once, then run web replicas:");
                     println!("       docker build -t {project_name} .");
-                    println!("       docker run --rm -p 3000:3000 -e DATABASE_URL=... \\");
+                    println!("       AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate");
+                    println!(
+                        "       docker run --rm -p 3000:3000 -e AUTUMN_DATABASE__PRIMARY_URL=... \\"
+                    );
                     println!(
                         "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
                     );
@@ -401,21 +404,18 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_runs_migrations_before_serving() {
+    fn dockerfile_defers_migrations_to_one_shot_primary_job() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
-            content.contains("migrate"),
-            "Dockerfile CMD must run migrations before serving"
+            !content.contains("auto_migrate_in_production = true"),
+            "Dockerfile must not enable startup migrations for every web replica"
         );
-        // The migration step must come before exec in the CMD
-        let migrate_pos = content.find("migrate").unwrap();
-        let exec_pos = content.find("exec").unwrap_or(content.len());
         assert!(
-            migrate_pos < exec_pos,
-            "migration must run before exec in the CMD"
+            content.contains("autumn migrate"),
+            "Dockerfile must document the explicit primary-role migration job"
         );
     }
 
@@ -844,15 +844,22 @@ previous_secrets = []
     // ── auto-migration config ─────────────────────────────────────────────────
 
     #[test]
-    fn production_config_enables_auto_migrate_in_production() {
+    fn production_config_disables_startup_migrations_by_default() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
-            content.contains("auto_migrate_in_production = true"),
-            "production config must set auto_migrate_in_production = true so the \
-             framework runs migrations at startup and calls exit(1) on failure"
+            content.contains("auto_migrate_in_production = false"),
+            "production config must leave web replicas out of migration ownership"
+        );
+        assert!(
+            content.contains("primary_url"),
+            "production config must name the primary/write database role"
+        );
+        assert!(
+            content.contains("autumn migrate"),
+            "production config must point operators at the one-shot migration command"
         );
     }
 

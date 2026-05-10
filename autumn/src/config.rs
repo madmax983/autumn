@@ -41,7 +41,12 @@
 //! | `AUTUMN_SERVER__HOST` | `server.host` | `String` |
 //! | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__URL` | `database.url` | `String` |
+//! | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` | `String` |
+//! | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` | `String` |
 //! | `AUTUMN_DATABASE__POOL_SIZE` | `database.pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` | `database.primary_pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__REPLICA_POOL_SIZE` | `database.replica_pool_size` | `usize` |
+//! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_LOG__LEVEL` | `log.level` | tracing filter directive |
@@ -1243,6 +1248,11 @@ impl AutumnConfig {
     /// - `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` → `server.shutdown_timeout_secs` (u64)
     ///
     /// # Database
+    /// - `AUTUMN_DATABASE__PRIMARY_URL` -> `database.primary_url` (String)
+    /// - `AUTUMN_DATABASE__REPLICA_URL` -> `database.replica_url` (String)
+    /// - `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` -> `database.primary_pool_size` (usize)
+    /// - `AUTUMN_DATABASE__REPLICA_POOL_SIZE` -> `database.replica_pool_size` (usize)
+    /// - `AUTUMN_DATABASE__REPLICA_FALLBACK` -> `database.replica_fallback` (`fail_readiness` | `primary`)
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
@@ -1316,10 +1326,35 @@ impl AutumnConfig {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
         }
+        parse_env_option_string(
+            env,
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            &mut self.database.primary_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_DATABASE__REPLICA_URL",
+            &mut self.database.replica_url,
+        );
         parse_env(
             env,
             "AUTUMN_DATABASE__POOL_SIZE",
             &mut self.database.pool_size,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_DATABASE__PRIMARY_POOL_SIZE",
+            &mut self.database.primary_pool_size,
+        );
+        parse_env_option(
+            env,
+            "AUTUMN_DATABASE__REPLICA_POOL_SIZE",
+            &mut self.database.replica_pool_size,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__REPLICA_FALLBACK",
+            &mut self.database.replica_fallback,
         );
         parse_env(
             env,
@@ -1896,6 +1931,30 @@ pub struct ServerConfig {
     pub shutdown_timeout_secs: u64,
 }
 
+/// Behavior when a configured read replica is unavailable or stale.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReplicaFallback {
+    /// Readiness should fail when the configured replica cannot safely serve reads.
+    #[default]
+    FailReadiness,
+    /// Read paths may use the primary when the replica is unavailable or stale.
+    Primary,
+}
+
+impl std::str::FromStr for ReplicaFallback {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_readiness" | "fail-readiness" | "fail" => Ok(Self::FailReadiness),
+            "primary" | "fallback_to_primary" | "fallback-to-primary" => Ok(Self::Primary),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Database connection configuration.
 ///
 /// When `url` is `None` (the default), the application runs without a
@@ -1908,7 +1967,12 @@ pub struct ServerConfig {
 /// | Field | Default |
 /// |-------|---------|
 /// | `url` | `None` |
+/// | `primary_url` | `None` |
+/// | `replica_url` | `None` |
 /// | `pool_size` | `10` |
+/// | `primary_pool_size` | `None` |
+/// | `replica_pool_size` | `None` |
+/// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
 /// | `auto_migrate_in_production` | `false` |
 ///
@@ -1925,13 +1989,46 @@ pub struct ServerConfig {
 pub struct DatabaseConfig {
     /// Postgres connection URL. `None` means no database is configured.
     ///
+    /// Compatibility alias for the primary/write role. New multi-role
+    /// deployments should prefer [`primary_url`](Self::primary_url).
+    ///
     /// Must start with `postgres://` or `postgresql://` when present.
     #[serde(default)]
     pub url: Option<String>,
 
+    /// Postgres URL for the primary/write role.
+    ///
+    /// All writes, transactions, advisory locks, and migrations use this role.
+    /// When unset, [`url`](Self::url) remains the single-primary fallback.
+    #[serde(default)]
+    pub primary_url: Option<String>,
+
+    /// Optional Postgres URL for the read/replica role.
+    ///
+    /// Read-only paths may use this pool when configured. If omitted, read
+    /// paths use the primary role.
+    #[serde(default)]
+    pub replica_url: Option<String>,
+
     /// Maximum number of connections in the pool. Default: `10`.
+    ///
+    /// Compatibility/default pool size used for both roles unless a
+    /// role-specific size is set.
     #[serde(default = "default_pool_size")]
     pub pool_size: usize,
+
+    /// Optional primary/write role pool size.
+    #[serde(default)]
+    pub primary_pool_size: Option<usize>,
+
+    /// Optional read/replica role pool size.
+    #[serde(default)]
+    pub replica_pool_size: Option<usize>,
+
+    /// Deterministic behavior for configured replicas that cannot safely serve
+    /// reads. Default: fail readiness.
+    #[serde(default)]
+    pub replica_fallback: ReplicaFallback,
 
     /// Seconds to wait while acquiring a pooled connection, including
     /// creating a new connection when the pool grows.
@@ -1949,19 +2046,54 @@ pub struct DatabaseConfig {
 }
 
 impl DatabaseConfig {
+    /// Resolved primary/write database URL.
+    #[must_use]
+    pub fn effective_primary_url(&self) -> Option<&str> {
+        self.primary_url.as_deref().or(self.url.as_deref())
+    }
+
+    /// Resolved primary/write role pool size.
+    #[must_use]
+    pub fn effective_primary_pool_size(&self) -> usize {
+        self.primary_pool_size.unwrap_or(self.pool_size)
+    }
+
+    /// Resolved read/replica role pool size.
+    #[must_use]
+    pub fn effective_replica_pool_size(&self) -> usize {
+        self.replica_pool_size.unwrap_or(self.pool_size)
+    }
+
     /// Validate database configuration.
     ///
     /// # Errors
     ///
     /// Returns a validation error if the URL has an invalid scheme.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if let Some(ref url) = self.url
-            && !url.starts_with("postgres://")
-            && !url.starts_with("postgresql://")
-        {
-            return Err(ConfigError::Validation(format!(
-                "Invalid database URL: must start with postgres:// or postgresql://, got {url:?}"
-            )));
+        for (field, url) in [
+            ("database.url", self.url.as_deref()),
+            ("database.primary_url", self.primary_url.as_deref()),
+            ("database.replica_url", self.replica_url.as_deref()),
+        ] {
+            if let Some(url) = url
+                && !url.starts_with("postgres://")
+                && !url.starts_with("postgresql://")
+            {
+                let label = if field == "database.url" {
+                    "database URL"
+                } else {
+                    field
+                };
+                return Err(ConfigError::Validation(format!(
+                    "Invalid {label}: must start with postgres:// or postgresql://, got {url:?}"
+                )));
+            }
+        }
+
+        if self.replica_url.is_some() && self.effective_primary_url().is_none() {
+            return Err(ConfigError::Validation(
+                "database.replica_url requires database.primary_url or database.url".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -2300,6 +2432,19 @@ fn parse_env_option_string(env: &dyn Env, key: &str, target: &mut Option<String>
     }
 }
 
+fn parse_env_option<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut Option<T>) {
+    if let Ok(val) = env.var(key) {
+        if val.is_empty() {
+            *target = None;
+        } else {
+            match val.parse::<T>() {
+                Ok(v) => *target = Some(v),
+                Err(_) => eprintln!("Warning: {key}={val:?} is not valid, ignoring"),
+            }
+        }
+    }
+}
+
 fn parse_env_string(env: &dyn Env, key: &str, target: &mut String) {
     if let Ok(val) = env.var(key) {
         *target = val;
@@ -2392,7 +2537,12 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             url: None,
+            primary_url: None,
+            replica_url: None,
             pool_size: default_pool_size(),
+            primary_pool_size: None,
+            replica_pool_size: None,
+            replica_fallback: ReplicaFallback::default(),
             connect_timeout_secs: default_connect_timeout(),
             auto_migrate_in_production: false,
         }
@@ -2660,6 +2810,101 @@ mod tests {
         } else {
             panic!("Expected ConfigError::Validation");
         }
+    }
+
+    #[test]
+    fn database_topology_deserializes_primary_and_replica_urls() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+[database]
+primary_url = "postgres://primary.example/app"
+replica_url = "postgres://replica.example/app"
+primary_pool_size = 12
+replica_pool_size = 4
+replica_fallback = "primary"
+"#,
+        )
+        .expect("database topology config should parse");
+
+        assert_eq!(
+            config.database.primary_url.as_deref(),
+            Some("postgres://primary.example/app")
+        );
+        assert_eq!(
+            config.database.replica_url.as_deref(),
+            Some("postgres://replica.example/app")
+        );
+        assert_eq!(config.database.primary_pool_size, Some(12));
+        assert_eq!(config.database.replica_pool_size, Some(4));
+        assert_eq!(config.database.replica_fallback, ReplicaFallback::Primary);
+        assert_eq!(
+            config.database.effective_primary_url(),
+            Some("postgres://primary.example/app")
+        );
+        assert_eq!(config.database.effective_primary_pool_size(), 12);
+        assert_eq!(config.database.effective_replica_pool_size(), 4);
+    }
+
+    #[test]
+    fn database_topology_keeps_url_as_single_primary_compatibility_path() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+[database]
+url = "postgres://single.example/app"
+pool_size = 7
+"#,
+        )
+        .expect("legacy database.url config should parse");
+
+        assert_eq!(
+            config.database.effective_primary_url(),
+            Some("postgres://single.example/app")
+        );
+        assert_eq!(config.database.effective_primary_pool_size(), 7);
+        assert_eq!(config.database.effective_replica_pool_size(), 7);
+        assert!(config.database.replica_url.is_none());
+    }
+
+    #[test]
+    fn database_topology_rejects_replica_without_primary() {
+        let config = DatabaseConfig {
+            replica_url: Some("postgres://replica.example/app".to_owned()),
+            ..Default::default()
+        };
+
+        let result = config.validate();
+
+        assert!(result.is_err());
+        let Err(ConfigError::Validation(message)) = result else {
+            panic!("expected database topology validation error");
+        };
+        assert!(message.contains("database.replica_url"));
+        assert!(message.contains("database.primary_url"));
+    }
+
+    #[test]
+    fn database_topology_env_overrides_role_fields() {
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__PRIMARY_URL", "postgres://primary.env/app")
+            .with("AUTUMN_DATABASE__REPLICA_URL", "postgres://replica.env/app")
+            .with("AUTUMN_DATABASE__PRIMARY_POOL_SIZE", "9")
+            .with("AUTUMN_DATABASE__REPLICA_POOL_SIZE", "3")
+            .with("AUTUMN_DATABASE__REPLICA_FALLBACK", "primary");
+        let mut config = AutumnConfig::default();
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.database.primary_url.as_deref(),
+            Some("postgres://primary.env/app")
+        );
+        assert_eq!(
+            config.database.replica_url.as_deref(),
+            Some("postgres://replica.env/app")
+        );
+        assert_eq!(config.database.primary_pool_size, Some(9));
+        assert_eq!(config.database.replica_pool_size, Some(3));
+        assert_eq!(config.database.replica_fallback, ReplicaFallback::Primary);
     }
 
     #[test]

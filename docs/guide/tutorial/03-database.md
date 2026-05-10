@@ -21,7 +21,8 @@ verifying the installation.
 ### Configuring the Database Connection
 
 Uncommenting the `[database]` section in `autumn.toml` and setting the
-connection URL. How Autumn's config system loads the database URL.
+primary/write connection URL. How Autumn's config system keeps legacy
+single-URL apps valid while also supporting explicit primary/replica topology.
 
 ### Creating Your First Migration
 

@@ -1,4 +1,4 @@
-//! Seed context for populating databases with representative data.
+﻿//! Seed context for populating databases with representative data.
 //!
 //! Enabled with the `seed` cargo feature (off by default). Include in your
 //! project's `Cargo.toml` to use it in a seed binary:
@@ -33,7 +33,7 @@ use diesel_async::pooled_connection::deadpool::{Object, Pool};
 pub enum SeedContextError {
     /// No database URL was found in the environment or `autumn.toml`.
     #[error(
-        "no database URL configured; set AUTUMN_DATABASE__URL or `database.url` in autumn.toml"
+        "no primary database URL configured; set AUTUMN_DATABASE__PRIMARY_URL, AUTUMN_DATABASE__URL, or `database.primary_url` in autumn.toml"
     )]
     NoDatabaseUrl,
 
@@ -49,7 +49,7 @@ pub enum SeedContextError {
 /// Context provided to a seed binary.
 ///
 /// Holds the database connection pool and the active profile, both resolved
-/// from the project's `autumn.toml` and environment variables — the same
+/// from the project's `autumn.toml` and environment variables â€” the same
 /// sources the main application uses.
 ///
 /// # Usage
@@ -79,9 +79,11 @@ impl SeedContext {
     /// 3. Defaults to `"dev"`
     ///
     /// Database URL resolution order (first wins):
-    /// 1. `AUTUMN_DATABASE__URL` env var
-    /// 2. `DATABASE_URL` env var
-    /// 3. `database.url` in `autumn.toml`
+    /// 1. `AUTUMN_DATABASE__PRIMARY_URL` env var
+    /// 2. `AUTUMN_DATABASE__URL` env var
+    /// 3. `DATABASE_URL` env var
+    /// 4. `database.primary_url` in `autumn.toml`
+    /// 5. `database.url` in `autumn.toml`
     ///
     /// # Errors
     ///
@@ -93,7 +95,7 @@ impl SeedContext {
         let db_url = resolve_database_url(&profile).ok_or(SeedContextError::NoDatabaseUrl)?;
 
         let config = DatabaseConfig {
-            url: Some(db_url),
+            primary_url: Some(db_url),
             ..DatabaseConfig::default()
         };
 
@@ -136,11 +138,19 @@ fn resolve_profile() -> String {
 /// Resolve the database URL from environment variables and `autumn.toml`.
 ///
 /// Resolution order (first non-empty value wins):
-/// 1. `AUTUMN_DATABASE__URL` env var
-/// 2. `DATABASE_URL` env var
-/// 3. `[profile.<profile>.database.url]` in `autumn.toml`
-/// 4. `[database.url]` in `autumn.toml`
+/// 1. `AUTUMN_DATABASE__PRIMARY_URL` env var
+/// 2. `AUTUMN_DATABASE__URL` env var
+/// 3. `DATABASE_URL` env var
+/// 4. `[profile.<profile>.database.primary_url]` in `autumn.toml`
+/// 5. `[profile.<profile>.database.url]` in `autumn.toml`
+/// 6. `[database.primary_url]` in `autumn.toml`
+/// 7. `[database.url]` in `autumn.toml`
 fn resolve_database_url(profile: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("AUTUMN_DATABASE__PRIMARY_URL")
+        && !url.is_empty()
+    {
+        return Some(url);
+    }
     if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL")
         && !url.is_empty()
     {
@@ -162,29 +172,36 @@ fn resolve_database_url_from_toml(profile: &str, config_path: &Path) -> Option<S
     {
         let value = toml::Value::Table(table);
 
-        // Profile-specific override: [profile.<name>.database.url]
-        if let Some(url) = value
-            .get("profile")
-            .and_then(|p| p.get(profile))
-            .and_then(|p| p.get("database"))
-            .and_then(|db| db.get("url"))
-            .and_then(|u| u.as_str())
-            .filter(|u| !u.is_empty())
-        {
-            return Some(url.to_string());
+        // Profile-specific override: [profile.<name>.database.primary_url/url]
+        if let Some(url) = first_database_url(
+            value
+                .get("profile")
+                .and_then(|p| p.get(profile))
+                .and_then(|p| p.get("database")),
+        ) {
+            return Some(url);
         }
 
-        // Top-level fallback: [database.url]
-        if let Some(url) = value
-            .get("database")
-            .and_then(|db: &toml::Value| db.get("url"))
-            .and_then(|u: &toml::Value| u.as_str())
+        // Top-level fallback: [database.primary_url/url]
+        if let Some(url) = first_database_url(value.get("database")) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+fn first_database_url(database: Option<&toml::Value>) -> Option<String> {
+    let database = database?;
+    for key in ["primary_url", "url"] {
+        if let Some(url) = database
+            .get(key)
+            .and_then(toml::Value::as_str)
             .filter(|u| !u.is_empty())
         {
             return Some(url.to_string());
         }
     }
-
     None
 }
 
@@ -192,7 +209,7 @@ fn resolve_database_url_from_toml(profile: &str, config_path: &Path) -> Option<S
 mod tests {
     use super::*;
 
-    // ── resolve_profile ────────────────────────────────────────────────────
+    // â”€â”€ resolve_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn resolve_profile_defaults_to_dev() {
@@ -234,14 +251,18 @@ mod tests {
         );
     }
 
-    // ── resolve_database_url ───────────────────────────────────────────────
+    // â”€â”€ resolve_database_url â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
-    fn resolve_database_url_prefers_autumn_database_url() {
+    fn resolve_database_url_prefers_autumn_database_primary_url() {
         temp_env::with_vars(
             [
-                ("AUTUMN_DATABASE__URL", Some("postgres://primary:5432/db")),
-                ("DATABASE_URL", Some("postgres://secondary:5432/db")),
+                (
+                    "AUTUMN_DATABASE__PRIMARY_URL",
+                    Some("postgres://primary:5432/db"),
+                ),
+                ("AUTUMN_DATABASE__URL", Some("postgres://legacy:5432/db")),
+                ("DATABASE_URL", Some("postgres://fallback:5432/db")),
             ],
             || {
                 assert_eq!(
@@ -256,6 +277,7 @@ mod tests {
     fn resolve_database_url_falls_back_to_database_url() {
         temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", Some("postgres://fallback:5432/db")),
             ],
@@ -272,6 +294,7 @@ mod tests {
     fn resolve_database_url_returns_none_when_nothing_configured() {
         temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", None::<&str>),
             ],
@@ -292,6 +315,7 @@ mod tests {
     fn resolve_database_url_ignores_empty_autumn_database_url() {
         temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", Some("")),
                 ("DATABASE_URL", Some("postgres://real:5432/db")),
             ],
@@ -313,12 +337,13 @@ mod tests {
 url = "postgres://default:5432/db"
 
 [profile.demo.database]
-url = "postgres://demo:5432/demo_db"
+primary_url = "postgres://demo:5432/demo_db"
 "#;
         std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
 
         let result = temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", None::<&str>),
             ],
@@ -334,12 +359,13 @@ url = "postgres://demo:5432/demo_db"
         let tmp = TempDir::new().unwrap();
         let toml_content = r#"
 [database]
-url = "postgres://default:5432/db"
+primary_url = "postgres://default:5432/db"
 "#;
         std::fs::write(tmp.path().join("autumn.toml"), toml_content).unwrap();
 
         let result = temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", None::<&str>),
             ],
@@ -349,13 +375,13 @@ url = "postgres://default:5432/db"
         assert_eq!(result.as_deref(), Some("postgres://default:5432/db"));
     }
 
-    // ── SeedContextError messages ──────────────────────────────────────────
+    // â”€â”€ SeedContextError messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     #[test]
     fn no_database_url_error_message_is_actionable() {
         let msg = SeedContextError::NoDatabaseUrl.to_string();
         assert!(
-            msg.contains("AUTUMN_DATABASE__URL") || msg.contains("autumn.toml"),
+            msg.contains("AUTUMN_DATABASE__PRIMARY_URL") || msg.contains("autumn.toml"),
             "error should be actionable, got: {msg}"
         );
     }

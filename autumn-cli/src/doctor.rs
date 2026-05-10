@@ -715,39 +715,167 @@ fn tcp_reachable(host: &str, port: u16) -> bool {
         .any(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok())
 }
 
-fn check_db_connectivity(database_url: &str) -> CheckResult {
-    // Parse host and port from a Postgres URL: postgres://user:pass@host:port/db
-    let parsed = parse_db_host_port(database_url);
-    match parsed {
-        None => CheckResult {
-            name: "db_connectivity",
-            status: CheckStatus::Warn,
-            detail: Some("cannot parse database URL to extract host:port".into()),
-            hint: Some("Ensure database.url in autumn.toml is a valid PostgreSQL URL"),
-        },
-        Some((host, port)) => {
-            if tcp_reachable(&host, port) {
-                CheckResult {
-                    name: "db_connectivity",
-                    status: CheckStatus::Pass,
-                    detail: Some(format!("Postgres reachable at {host}:{port}")),
-                    hint: None,
-                }
-            } else {
-                CheckResult {
-                    name: "db_connectivity",
-                    status: CheckStatus::Fail,
-                    detail: Some(format!("cannot connect to Postgres at {host}:{port}")),
-                    hint: Some("Start Postgres and verify database.url in autumn.toml"),
-                }
-            }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorReplicaFallback {
+    FailReadiness,
+    Primary,
+}
+
+impl DoctorReplicaFallback {
+    fn from_config_value(value: Option<&str>) -> Self {
+        match value.unwrap_or("fail_readiness") {
+            "primary" | "fallback_to_primary" | "fallback-to-primary" => Self::Primary,
+            _ => Self::FailReadiness,
         }
     }
 }
 
-fn check_pending_migrations() -> CheckResult {
+#[derive(Debug, Clone, Default)]
+pub struct DoctorDatabaseTopology {
+    pub primary_url: Option<String>,
+    pub replica_url: Option<String>,
+    pub auto_migrate_in_production: bool,
+    pub replica_fallback: DoctorReplicaFallback,
+}
+
+impl Default for DoctorReplicaFallback {
+    fn default() -> Self {
+        Self::FailReadiness
+    }
+}
+
+fn check_database_topology_contract(
+    topology: &DoctorDatabaseTopology,
+    is_production: bool,
+) -> CheckResult {
+    if topology.replica_url.is_some() && topology.primary_url.is_none() {
+        return CheckResult {
+            name: "database_topology",
+            status: CheckStatus::Fail,
+            detail: Some("replica role configured without a primary/write role".into()),
+            hint: Some("Set database.primary_url or remove database.replica_url"),
+        };
+    }
+
+    if is_production && topology.replica_url.is_some() && topology.auto_migrate_in_production {
+        return CheckResult {
+            name: "database_topology",
+            status: CheckStatus::Fail,
+            detail: Some(
+                "unsafe migration ownership: production primary/replica topology cannot run migrations from every web replica"
+                    .into(),
+            ),
+            hint: Some("Run `autumn migrate` as one primary-role job before starting web replicas"),
+        };
+    }
+
+    if topology.primary_url.is_some() && topology.replica_url.is_some() {
+        CheckResult {
+            name: "database_topology",
+            status: CheckStatus::Pass,
+            detail: Some("primary and replica database roles configured".into()),
+            hint: None,
+        }
+    } else if topology.primary_url.is_some() {
+        CheckResult {
+            name: "database_topology",
+            status: CheckStatus::Pass,
+            detail: Some("single primary database role configured".into()),
+            hint: None,
+        }
+    } else {
+        CheckResult {
+            name: "database_topology",
+            status: CheckStatus::Pass,
+            detail: Some("database not configured".into()),
+            hint: None,
+        }
+    }
+}
+
+fn check_replica_migration_versions(
+    primary_latest: Option<&str>,
+    replica_latest: Option<&str>,
+    fallback: DoctorReplicaFallback,
+) -> CheckResult {
+    match (primary_latest, replica_latest) {
+        (Some(primary), Some(replica)) if primary == replica => CheckResult {
+            name: "replica_migrations",
+            status: CheckStatus::Pass,
+            detail: Some(format!("replica replayed latest migration {primary}")),
+            hint: None,
+        },
+        (Some(primary), Some(replica)) => {
+            let detail = format!(
+                "replica migration version {replica} is behind primary migration version {primary}"
+            );
+            match fallback {
+                DoctorReplicaFallback::FailReadiness => CheckResult {
+                    name: "replica_migrations",
+                    status: CheckStatus::Fail,
+                    detail: Some(detail),
+                    hint: Some(
+                        "Wait for the replica to replay the latest migration before admitting traffic",
+                    ),
+                },
+                DoctorReplicaFallback::Primary => CheckResult {
+                    name: "replica_migrations",
+                    status: CheckStatus::Warn,
+                    detail: Some(format!("{detail}; reads may fall back to primary")),
+                    hint: Some(
+                        "Restore replica replay or set replica_fallback = \"fail_readiness\" for stricter rollout gates",
+                    ),
+                },
+            }
+        }
+        _ => CheckResult {
+            name: "replica_migrations",
+            status: CheckStatus::Warn,
+            detail: Some("could not determine primary and replica migration versions".into()),
+            hint: Some("Ensure both roles expose __diesel_schema_migrations"),
+        },
+    }
+}
+
+fn check_db_role_connectivity(
+    role: &'static str,
+    database_url: &str,
+    reachable: impl Fn(&str, u16) -> bool,
+) -> CheckResult {
+    match parse_db_host_port(database_url) {
+        None => CheckResult {
+            name: "db_connectivity",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot parse {role} database URL to extract host:port"
+            )),
+            hint: Some("Ensure database URLs in autumn.toml use postgres:// or postgresql://"),
+        },
+        Some((host, port)) if reachable(&host, port) => CheckResult {
+            name: "db_connectivity",
+            status: CheckStatus::Pass,
+            detail: Some(format!("{role} database reachable at {host}:{port}")),
+            hint: None,
+        },
+        Some((host, port)) => CheckResult {
+            name: "db_connectivity",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "cannot connect to {role} database at {host}:{port}"
+            )),
+            hint: Some("Start Postgres and verify the configured database role URL"),
+        },
+    }
+}
+
+fn check_db_connectivity(database_url: &str) -> CheckResult {
+    check_db_role_connectivity("primary", database_url, tcp_reachable)
+}
+
+fn check_pending_migrations(database_url: &str) -> CheckResult {
     match std::process::Command::new("diesel")
         .args(["migration", "pending"])
+        .env("DATABASE_URL", database_url)
         .output()
     {
         Err(_) => CheckResult {
@@ -784,6 +912,49 @@ fn check_pending_migrations() -> CheckResult {
             hint: Some("Run `autumn migrate` to apply pending migrations"),
         },
     }
+}
+
+fn check_replica_migrations(
+    primary_url: &str,
+    replica_url: &str,
+    fallback: DoctorReplicaFallback,
+) -> CheckResult {
+    let primary_latest = latest_applied_migration_version(primary_url);
+    let replica_latest = latest_applied_migration_version(replica_url);
+    check_replica_migration_versions(
+        primary_latest.as_deref(),
+        replica_latest.as_deref(),
+        fallback,
+    )
+}
+
+fn latest_applied_migration_version(database_url: &str) -> Option<String> {
+    let output = std::process::Command::new("diesel")
+        .args(["migration", "list"])
+        .env("DATABASE_URL", database_url)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    parse_latest_applied_migration_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_latest_applied_migration_version(output: &str) -> Option<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let version = trimmed
+                .strip_prefix("[X]")
+                .or_else(|| trimmed.strip_prefix("[x]"))?
+                .split_whitespace()
+                .next()?;
+            Some(version.to_owned())
+        })
+        .max()
 }
 
 /// Parse (host, port) from a Postgres connection URL.
@@ -825,26 +996,93 @@ fn resolve_server_port() -> u16 {
         .unwrap_or(3000)
 }
 
-/// Resolve the optional database URL from env and `autumn.toml`.
-fn resolve_optional_db_url() -> Option<String> {
-    for var in ["AUTUMN_DATABASE__URL", "DATABASE_URL"] {
-        if let Ok(url) = std::env::var(var)
-            && !url.is_empty()
-        {
-            return Some(url);
-        }
-    }
-
+fn read_autumn_toml_table() -> Option<toml::Table> {
     std::fs::read_to_string("autumn.toml")
         .ok()
-        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
-        .and_then(|t| {
-            t.get("database")
-                .and_then(|db| db.get("url"))
-                .and_then(toml::Value::as_str)
-                .filter(|u| !u.is_empty())
-                .map(std::borrow::ToOwned::to_owned)
-        })
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+}
+
+fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
+    resolve_database_topology_from_sources(
+        |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
+        table,
+    )
+}
+
+fn resolve_database_topology_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> DoctorDatabaseTopology
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let database = table
+        .and_then(|t| t.get("database"))
+        .and_then(toml::Value::as_table);
+
+    let primary_url = first_env(
+        &env_var,
+        &[
+            "AUTUMN_DATABASE__PRIMARY_URL",
+            "AUTUMN_DATABASE__URL",
+            "DATABASE_URL",
+        ],
+    )
+    .or_else(|| first_toml_string(database, &["primary_url", "url"]));
+
+    let replica_url = first_env(&env_var, &["AUTUMN_DATABASE__REPLICA_URL"])
+        .or_else(|| first_toml_string(database, &["replica_url"]));
+
+    let auto_migrate_in_production =
+        first_env(&env_var, &["AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION"])
+            .as_deref()
+            .and_then(parse_config_bool)
+            .or_else(|| database?.get("auto_migrate_in_production")?.as_bool())
+            .unwrap_or(false);
+
+    let replica_fallback = DoctorReplicaFallback::from_config_value(
+        first_env(&env_var, &["AUTUMN_DATABASE__REPLICA_FALLBACK"])
+            .or_else(|| first_toml_string(database, &["replica_fallback"]))
+            .as_deref(),
+    );
+
+    DoctorDatabaseTopology {
+        primary_url,
+        replica_url,
+        auto_migrate_in_production,
+        replica_fallback,
+    }
+}
+
+fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    keys.iter().find_map(|key| {
+        env_var(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn first_toml_string(database: Option<&toml::Table>, keys: &[&str]) -> Option<String> {
+    let database = database?;
+    keys.iter().find_map(|key| {
+        database
+            .get(*key)
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(std::borrow::ToOwned::to_owned)
+    })
+}
+
+fn parse_config_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// Resolve the signing secret from the environment or `autumn.toml`.
@@ -925,7 +1163,12 @@ pub fn run(opts: DoctorOptions) {
     let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
     let web_ver = read_autumn_web_version();
     let toml_result = std::fs::read_to_string("autumn.toml");
-    let db_url = resolve_optional_db_url();
+    let toml_table = toml_result
+        .as_deref()
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Table>(content).ok())
+        .or_else(read_autumn_toml_table);
+    let db_topology = resolve_database_topology(toml_table.as_ref());
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
@@ -953,10 +1196,34 @@ pub fn run(opts: DoctorOptions) {
         })),
     }
 
-    // 4 & 5. Database (only when configured)
-    if let Some(url) = db_url {
+    // 4+. Database topology and role-specific checks.
+    let topology_for_check = db_topology.clone();
+    tasks.push(Box::new(move || {
+        check_database_topology_contract(&topology_for_check, is_production)
+    }));
+
+    if let Some(url) = db_topology.primary_url.clone() {
+        let primary_for_pending = url.clone();
         tasks.push(Box::new(move || check_db_connectivity(&url)));
-        tasks.push(Box::new(check_pending_migrations));
+        tasks.push(Box::new(move || {
+            check_pending_migrations(&primary_for_pending)
+        }));
+    }
+
+    if let Some(url) = db_topology.replica_url.clone() {
+        tasks.push(Box::new(move || {
+            check_db_role_connectivity("replica", &url, tcp_reachable)
+        }));
+    }
+
+    if let (Some(primary_url), Some(replica_url)) = (
+        db_topology.primary_url.clone(),
+        db_topology.replica_url.clone(),
+    ) {
+        let fallback = db_topology.replica_fallback;
+        tasks.push(Box::new(move || {
+            check_replica_migrations(&primary_url, &replica_url, fallback)
+        }));
     }
 
     // 6. Port bindable
@@ -1446,6 +1713,98 @@ foo = "bar"
     }
 
     // ── check_tailwind_binary_at ─────────────────────────────────────────────
+
+    #[test]
+    fn database_topology_doctor_fails_replica_without_primary() {
+        let topology = DoctorDatabaseTopology {
+            primary_url: None,
+            replica_url: Some("postgres://user:secret@replica:5432/app".to_owned()),
+            auto_migrate_in_production: false,
+            replica_fallback: DoctorReplicaFallback::FailReadiness,
+        };
+
+        let result = check_database_topology_contract(&topology, true);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("replica"));
+        assert!(result.hint.unwrap_or_default().contains("primary"));
+    }
+
+    #[test]
+    fn database_topology_doctor_fails_prod_replica_with_startup_migrations() {
+        let topology = DoctorDatabaseTopology {
+            primary_url: Some("postgres://user:secret@primary:5432/app".to_owned()),
+            replica_url: Some("postgres://user:secret@replica:5432/app".to_owned()),
+            auto_migrate_in_production: true,
+            replica_fallback: DoctorReplicaFallback::FailReadiness,
+        };
+
+        let result = check_database_topology_contract(&topology, true);
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("migration"));
+        assert!(!detail.contains("secret"));
+    }
+
+    #[test]
+    fn database_topology_doctor_fails_stale_replica_when_readiness_must_fail() {
+        let result = check_replica_migration_versions(
+            Some("20260510000000"),
+            Some("20260509000000"),
+            DoctorReplicaFallback::FailReadiness,
+        );
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.detail.unwrap_or_default().contains("replica"));
+        assert!(result.hint.unwrap_or_default().contains("replay"));
+    }
+
+    #[test]
+    fn database_topology_doctor_warns_stale_replica_when_falling_back_to_primary() {
+        let result = check_replica_migration_versions(
+            Some("20260510000000"),
+            Some("20260509000000"),
+            DoctorReplicaFallback::Primary,
+        );
+
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.detail.unwrap_or_default().contains("primary"));
+    }
+
+    #[test]
+    fn database_topology_parses_latest_applied_migration_version() {
+        let output = r#"
+            [X] 20260509000000_create_widgets
+            [ ] 20260510000000_add_widget_index
+            [X] 20260508000000_create_users
+        "#;
+
+        assert_eq!(
+            parse_latest_applied_migration_version(output).as_deref(),
+            Some("20260509000000_create_widgets")
+        );
+    }
+
+    #[test]
+    fn database_topology_connectivity_names_role_without_credentials() {
+        let result = check_db_role_connectivity(
+            "primary",
+            "postgres://user:secret@db:5432/app",
+            |host, port| {
+                assert_eq!(host, "db");
+                assert_eq!(port, 5432);
+                false
+            },
+        );
+
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("primary"));
+        assert!(detail.contains("db:5432"));
+        assert!(!detail.contains("user"));
+        assert!(!detail.contains("secret"));
+    }
 
     fn temp_tailwind_path(temp: &tempfile::TempDir) -> std::path::PathBuf {
         let tailwind_name = if cfg!(windows) {

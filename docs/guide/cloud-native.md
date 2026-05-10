@@ -181,7 +181,45 @@ For multi-replica deployments, do not rely on each web process racing to apply
 migrations. Run migrations once as a dedicated job, then start the web
 deployment after it succeeds.
 
-The distributed bookmarks example uses this shape explicitly.
+The migration job must target the primary/write role:
+
+```bash
+AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@primary:5432/app" autumn migrate
+```
+
+`DATABASE_URL` still works for single-primary apps, but naming
+`AUTUMN_DATABASE__PRIMARY_URL` keeps the deployment contract explicit. Keep
+`auto_migrate_in_production = false` on web replicas unless you are deliberately
+running a single-process deployment.
+
+## Database Topology
+
+Use the `[database]` section to declare the shape:
+
+```toml
+[database]
+primary_url = "postgres://user:pass@primary:5432/app"
+replica_url = "postgres://user:pass@replica:5432/app" # optional
+primary_pool_size = 10
+replica_pool_size = 5
+replica_fallback = "fail_readiness" # or "primary"
+auto_migrate_in_production = false
+```
+
+`Db`, transactions, advisory locks, scheduled-task coordination, and migrations
+use the primary role. Read-oriented code may use the replica pool when one is
+configured; if the replica is missing or stale, choose one deterministic
+behavior: fail readiness (`fail_readiness`) or explicitly fall back to the
+primary (`primary`).
+
+`autumn doctor --strict` checks the topology contract: missing primary role,
+unreachable primary/replica endpoints, unsafe production migration ownership,
+and stale replica migration versions. Diagnostics name the failing role and
+redact credentials.
+
+The distributed bookmarks example uses this shape explicitly with a primary,
+streaming replica, one migration job, two web replicas, and a readiness gate
+that fails while the replica has not replayed the latest Diesel migration.
 
 ## Shared Cache
 

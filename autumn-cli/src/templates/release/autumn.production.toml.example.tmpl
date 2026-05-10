@@ -16,14 +16,23 @@ path = "/health"
 # live_path = "/live"
 # ready_path = "/ready"
 
-# Database: prefer DATABASE_URL environment variable in production.
+# Database topology:
+# - primary_url is the write role used by Db, transactions, advisory locks, and migrations.
+# - replica_url is optional; use it only for read replicas that have replayed migrations.
+# - database.url and DATABASE_URL remain valid single-primary compatibility paths.
+# Prefer AUTUMN_DATABASE__PRIMARY_URL for real production secrets.
 [database]
-url = "postgres://user:CHANGE_ME@localhost:5432/{{project_name}}_prod"
+primary_url = "postgres://user:CHANGE_ME@localhost:5432/{{project_name}}_prod"
+# replica_url = "postgres://user:CHANGE_ME@replica:5432/{{project_name}}_prod"
 pool_size = 10
+# primary_pool_size = 10
+# replica_pool_size = 5
+replica_fallback = "fail_readiness" # fail_readiness | primary
 connect_timeout_secs = 5
-# Run pending migrations at startup; exit(1) on failure stops the container.
-# Requires .migrations(MIGRATIONS) to be registered in main.rs.
-auto_migrate_in_production = true
+# Production migrations belong to one explicit primary-role job:
+#   AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate
+# Keep web replicas out of migration ownership.
+auto_migrate_in_production = false
 
 # ── Signing secret (REQUIRED in production) ─────────────────────────────────
 #

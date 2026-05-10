@@ -25,8 +25,8 @@
 //! }
 //! ```
 
-use diesel::Connection;
 use diesel::migration::Migration;
+use diesel::{Connection, RunQueryDsl};
 use diesel_migrations::{HarnessWithOutput, MigrationHarness};
 
 /// Re-export `EmbeddedMigrations` so users can reference it without adding
@@ -54,6 +54,51 @@ pub enum MigrationError {
     /// A migration failed to apply.
     #[error("migration failed: {0}")]
     Migration(String),
+}
+
+#[derive(diesel::QueryableByName)]
+struct AppliedMigrationVersion {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    version: String,
+}
+
+/// Runtime readiness state for a configured read replica's schema version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReplicaMigrationReadiness {
+    /// Primary and replica report the same applied migration versions.
+    Ready,
+    /// The replica is reachable but has not applied the same migrations.
+    Stale {
+        primary_latest: Option<String>,
+        replica_latest: Option<String>,
+    },
+    /// The framework could not determine replica migration state.
+    Unknown(String),
+}
+
+impl ReplicaMigrationReadiness {
+    /// Returns whether the replica can safely receive read traffic.
+    #[must_use]
+    pub(crate) const fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Human-readable reason used in runtime readiness state.
+    #[must_use]
+    pub(crate) fn detail(&self) -> Option<String> {
+        match self {
+            Self::Ready => None,
+            Self::Stale {
+                primary_latest,
+                replica_latest,
+            } => Some(format!(
+                "replica migrations lag primary (primary_latest={}, replica_latest={})",
+                primary_latest.as_deref().unwrap_or("<none>"),
+                replica_latest.as_deref().unwrap_or("<none>")
+            )),
+            Self::Unknown(error) => Some(format!("replica migration readiness unknown: {error}")),
+        }
+    }
 }
 
 /// Run all pending migrations against the given database URL.
@@ -107,6 +152,56 @@ pub fn pending_migrations(
         .iter()
         .map(|m| m.name().version().to_string())
         .collect())
+}
+
+pub(crate) fn compare_replica_migration_versions(
+    primary: &[String],
+    replica: &[String],
+) -> ReplicaMigrationReadiness {
+    let primary_versions: std::collections::BTreeSet<_> = primary.iter().collect();
+    let replica_versions: std::collections::BTreeSet<_> = replica.iter().collect();
+
+    if primary_versions == replica_versions {
+        ReplicaMigrationReadiness::Ready
+    } else {
+        ReplicaMigrationReadiness::Stale {
+            primary_latest: primary_versions
+                .iter()
+                .next_back()
+                .map(|version| (*version).clone()),
+            replica_latest: replica_versions
+                .iter()
+                .next_back()
+                .map(|version| (*version).clone()),
+        }
+    }
+}
+
+fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, MigrationError> {
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    let rows = diesel::sql_query("SELECT version FROM __diesel_schema_migrations ORDER BY version")
+        .load::<AppliedMigrationVersion>(&mut conn)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    Ok(rows.into_iter().map(|row| row.version).collect())
+}
+
+pub(crate) fn check_replica_migration_readiness(
+    primary_url: &str,
+    replica_url: &str,
+) -> ReplicaMigrationReadiness {
+    let primary = match applied_migration_versions(primary_url) {
+        Ok(versions) => versions,
+        Err(error) => return ReplicaMigrationReadiness::Unknown(error.to_string()),
+    };
+    let replica = match applied_migration_versions(replica_url) {
+        Ok(versions) => versions,
+        Err(error) => return ReplicaMigrationReadiness::Unknown(error.to_string()),
+    };
+
+    compare_replica_migration_versions(&primary, &replica)
 }
 
 fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
@@ -218,6 +313,22 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("migration failed"));
         assert!(msg.contains("syntax error"));
+    }
+
+    #[test]
+    fn replica_migration_comparison_detects_stale_replica() {
+        let primary = vec!["00000000000001".to_owned(), "00000000000002".to_owned()];
+        let replica = vec!["00000000000001".to_owned()];
+
+        let readiness = compare_replica_migration_versions(&primary, &replica);
+
+        assert!(!readiness.is_ready());
+        assert!(
+            readiness
+                .detail()
+                .expect("stale detail")
+                .contains("00000000000002")
+        );
     }
 
     #[test]

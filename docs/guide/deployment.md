@@ -1,4 +1,4 @@
-# Deploying an Autumn App
+﻿# Deploying an Autumn App
 
 This guide walks you from a fresh `autumn new` project to a production-shaped
 container running against a real Postgres database. Every command is verbatim;
@@ -12,13 +12,13 @@ internet connection.
 ## Prerequisites
 
 - **Rust 1.88.0+** with `cargo`
-- **Docker** (or Docker Desktop) — `docker --version`
+- **Docker** (or Docker Desktop) â€” `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
 - The `autumn` CLI - `cargo install autumn-cli --version 0.3.0`
 
 ---
 
-## Step 1 — Create the project
+## Step 1 â€” Create the project
 
 ```bash
 autumn new myapp
@@ -29,7 +29,7 @@ This scaffolds a working Autumn application with a dev-oriented `Dockerfile`.
 
 ---
 
-## Step 2 — Generate production deployment files
+## Step 2 â€” Generate production deployment files
 
 ```bash
 autumn release init --force
@@ -43,20 +43,20 @@ The command emits three files at the project root:
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Multi-stage image: cargo-chef dep cache → release binary → debian-slim runtime |
+| `Dockerfile` | Multi-stage image: cargo-chef dep cache â†’ release binary â†’ debian-slim runtime |
 | `.dockerignore` | Keeps `target/`, `.git/`, `node_modules/`, `dist/` out of the build context |
-| `autumn.production.toml.example` | Production config template with placeholder values — no real secrets |
+| `autumn.production.toml.example` | Production config template with placeholder values â€” no real secrets |
 
 > **What changed in the Dockerfile?**
 > The production Dockerfile adds cargo-chef dependency caching (so rebuilds only
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
-> slim runtime, copies compiled Tailwind assets from `static/`, runs migrations
-> before the server starts, and wires the `/health` endpoint as the container
+> slim runtime, copies compiled Tailwind assets from `static/`, leaves
+> migrations to an explicit primary-role job, and wires the `/health` endpoint as the container
 > `HEALTHCHECK`.
 
 ---
 
-## Step 3 — Build the image
+## Step 3 â€” Build the image
 
 ```bash
 docker build -t myapp .
@@ -79,37 +79,41 @@ Successfully tagged myapp:latest
 
 ---
 
-## Step 4 — Run the container
+## Step 4 â€” Migrate, Then Run the Container
 
-Provide your Postgres connection string as the `DATABASE_URL` environment
-variable. The container will run pending migrations and then start the server:
+Provide your primary/write Postgres connection string as
+`AUTUMN_DATABASE__PRIMARY_URL`. Run migrations once against that primary role
+before starting web replicas:
+
+```bash
+AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" autumn migrate
+```
+
+Then start the web container:
 
 ```bash
 docker run --rm \
   -p 3000:3000 \
-  -e DATABASE_URL="postgres://user:pass@host:5432/myapp_prod" \
+  -e AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" \
   myapp
 ```
 
 You should see something like:
 
 ```
-Running migrations...
-  Applying 20240101000000_create_users ... OK
 INFO autumn: Listening addr=0.0.0.0:3000
 ```
 
-Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
+Visit [http://localhost:3000/health](http://localhost:3000/health) â€” a healthy
 response looks like:
 
 ```json
 { "status": "ok", "version": "0.3.0" }
 ```
 
-> **Migration failure stops the container.** If `DATABASE_URL` is wrong or the
-> database is unreachable, the migration step exits non-zero and the container
-> stops immediately — nothing silently degrades. Fix the connection string and
-> rerun.
+> **Migration failure stops the rollout.** If the primary URL is wrong or the
+> database is unreachable, `autumn migrate` exits non-zero and you do not roll
+> the web tier. Fix the connection string and rerun the one-shot job.
 
 ---
 
@@ -117,18 +121,18 @@ response looks like:
 
 ```
 rust:1.88-bookworm (chef stage)
-  └─ cargo chef prepare          # snapshot dependency graph
-       └─ cargo chef cook        # build all dependencies (cached layer)
-            └─ cargo build --release
-                 └─ debian:bookworm-slim (runtime stage)
+  â””â”€ cargo chef prepare          # snapshot dependency graph
+       â””â”€ cargo chef cook        # build all dependencies (cached layer)
+            â””â”€ cargo build --release
+                 â””â”€ debian:bookworm-slim (runtime stage)
                        libpq5, tini, ca-certificates, curl
-                       /usr/local/bin/myapp     ← your binary
-                       /app/static/             ← compiled Tailwind + assets
-                       /app/migrations/         ← SQL migration files
-                       /app/autumn.toml         ← production config (host=0.0.0.0)
+                       /usr/local/bin/myapp     â† your binary
+                       /app/static/             â† compiled Tailwind + assets
+                       /app/migrations/         â† SQL migration files
+                       /app/autumn.toml         â† production config (host=0.0.0.0)
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/bin/sh", "-c", "myapp migrate run && exec myapp"]
+CMD ["/usr/local/bin/myapp"]
 ```
 
 Key design decisions:
@@ -137,9 +141,9 @@ Key design decisions:
   handler reuses cached dependencies; only your crate recompiles.
 - **tini** is the PID 1 init process. It reaps zombie processes and forwards
   signals (SIGTERM, SIGINT) so the server shuts down gracefully.
-- **`migrate run && exec`** — migrations run first; `&&` means any migration
-  failure aborts the start. `exec` replaces the shell with the server process so
-  signals reach the binary directly.
+- **Explicit migration ownership** -- migrations run once through
+  `AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate` before web replicas roll.
+  The web image starts only the server, so replicas do not race schema changes.
 - **`autumn.production.toml.example` is copied as `/app/autumn.toml`** so the
   binary binds to `0.0.0.0` (all interfaces) instead of the dev default
   `127.0.0.1`. Override any value at runtime via `AUTUMN_*` environment
@@ -166,20 +170,23 @@ level = "info"
 format = "Json"        # structured JSON for log aggregators
 
 [database]
-url = "postgres://user:CHANGE_ME@localhost:5432/myapp_prod"
+primary_url = "postgres://user:CHANGE_ME@localhost:5432/myapp_prod"
+# replica_url = "postgres://user:CHANGE_ME@replica:5432/myapp_prod"
 pool_size = 10
+replica_fallback = "fail_readiness"
+auto_migrate_in_production = false
 ```
 
 Sensitive values (database password, SMTP credentials) should **never** be in
 this file. Pass them as environment variables at runtime:
 
 ```bash
--e DATABASE_URL="postgres://user:realpass@host:5432/myapp_prod"
+-e AUTUMN_DATABASE__PRIMARY_URL="postgres://user:realpass@host:5432/myapp_prod"
 -e AUTUMN_LOG__LEVEL=debug
 ```
 
 `AUTUMN_*` environment variables override `autumn.toml` at the highest
-priority layer — see the
+priority layer â€” see the
 [config reference](getting-started.md#environment-variable-overrides).
 
 ---
@@ -198,12 +205,14 @@ Deploy:
 
 ```bash
 fly launch --no-deploy          # creates the app on fly.io
-fly secrets set DATABASE_URL="postgres://user:pass@host:5432/myapp_prod"
+fly secrets set AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod"
+AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@host:5432/myapp_prod" autumn migrate
 fly deploy
 ```
 
-The container entrypoint runs migrations on every deploy before traffic is
-forwarded to the new instance, so your schema is always up to date.
+Run the migration step once before `fly deploy`. If you add a read replica,
+configure `AUTUMN_DATABASE__REPLICA_URL` separately and gate readiness until the
+replica has replayed the latest Diesel migration.
 
 ---
 
@@ -221,9 +230,9 @@ Start both services:
 docker compose up --build
 ```
 
-The `docker-compose.yml` sets `DATABASE_URL` pointing at the `db` service and
-waits for Postgres to pass its healthcheck before starting the app. No manual
-Postgres setup is needed.
+The `docker-compose.yml` sets `AUTUMN_DATABASE__PRIMARY_URL` pointing at the
+`db` service and waits for Postgres to pass its healthcheck before starting the
+app. No manual Postgres setup is needed.
 
 To reset the database:
 
@@ -239,7 +248,7 @@ docker compose up --build
 By default `autumn release init` refuses to overwrite existing files:
 
 ```
-Error: 'Dockerfile' already exists — run with --force to overwrite
+Error: 'Dockerfile' already exists â€” run with --force to overwrite
 ```
 
 Use `--force` to regenerate everything, or delete individual files first if you
@@ -253,16 +262,16 @@ Before the server will bind in the `prod` profile, you must set a stable signing
 secret. It protects sessions, CSRF tokens, and signed storage URLs:
 
 ```bash
-# Generate once, store securely (e.g. Fly secrets, AWS Secrets Manager, …)
+# Generate once, store securely (e.g. Fly secrets, AWS Secrets Manager, â€¦)
 export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 ```
 
-**Smoke-gate check** — the app must refuse to boot _without_ the secret:
+**Smoke-gate check** â€” the app must refuse to boot _without_ the secret:
 
 ```bash
 docker run --rm \
   -e AUTUMN_ENV=prod \
-  -e DATABASE_URL=... \
+  -e AUTUMN_DATABASE__PRIMARY_URL=... \
   myapp 2>&1 | grep -i "signing secret"
 # Expected: "Invalid signing secret configuration: signing secret is required in production"
 ```
@@ -272,7 +281,7 @@ And must start successfully _with_ a valid secret:
 ```bash
 docker run --rm -p 3000:3000 \
   -e AUTUMN_ENV=prod \
-  -e DATABASE_URL=... \
+  -e AUTUMN_DATABASE__PRIMARY_URL=... \
   -e AUTUMN_SECURITY__SIGNING_SECRET="$AUTUMN_SECURITY__SIGNING_SECRET" \
   myapp
 ```
@@ -294,16 +303,16 @@ SECRET=$(openssl rand -hex 32)
 # Replica 1
 docker run --rm -p 3000:3000 \
   -e AUTUMN_ENV=prod \
-  -e DATABASE_URL=postgres://... \
+  -e AUTUMN_DATABASE__PRIMARY_URL=postgres://... \
   -e AUTUMN_SECURITY__SIGNING_SECRET="$SECRET" \
   -e AUTUMN_SESSION__BACKEND=redis \
   -e AUTUMN_SESSION__REDIS__URL=redis://redis:6379 \
   myapp &
 
-# Replica 2 — identical secret and Redis URL
+# Replica 2 â€” identical secret, primary URL, and Redis URL
 docker run --rm -p 3001:3000 \
   -e AUTUMN_ENV=prod \
-  -e DATABASE_URL=postgres://... \
+  -e AUTUMN_DATABASE__PRIMARY_URL=postgres://... \
   -e AUTUMN_SECURITY__SIGNING_SECRET="$SECRET" \
   -e AUTUMN_SESSION__BACKEND=redis \
   -e AUTUMN_SESSION__REDIS__URL=redis://redis:6379 \

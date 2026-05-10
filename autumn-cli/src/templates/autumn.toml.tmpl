@@ -26,10 +26,19 @@ path = "/health"
 # protocol = "Grpc"  # Grpc | HttpProtobuf
 
 # Uncomment to configure database:
+# Single-primary apps can use url. Multi-role deployments should use
+# primary_url for writes/migrations and optional replica_url for reads.
 # [database]
 # url = "postgres://user:pass@localhost:5432/{{crate_name}}"
+# primary_url = "postgres://user:pass@localhost:5432/{{crate_name}}"
+# replica_url = "postgres://user:pass@localhost:5433/{{crate_name}}"
 # pool_size = 10
+# primary_pool_size = 10
+# replica_pool_size = 5
+# replica_fallback = "fail_readiness"  # fail_readiness | primary
 # connect_timeout_secs = 5  # pool wait/create timeout in seconds
+# Production web replicas should not run migrations. Use a one-shot
+# primary-role `autumn migrate` job before rolling the web tier.
 # auto_migrate_in_production = false
 
 # Uncomment to send transactional email in production:

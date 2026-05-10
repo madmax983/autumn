@@ -119,24 +119,11 @@ services:
       redis:
         condition: service_healthy
 
-  bookmarks-3:
-    <<: *bookmarks-base
-    depends_on:
-      bookmarks-migrate:
-        condition: service_completed_successfully
-      postgres-primary:
-        condition: service_healthy
-      postgres-replica:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
   load-balancer:
     image: nginx:1.27-alpine
     depends_on:
       - bookmarks-1
       - bookmarks-2
-      - bookmarks-3
     ports:
       - "3000:3000"
     volumes:
