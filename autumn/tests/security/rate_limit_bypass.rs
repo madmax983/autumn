@@ -1,13 +1,13 @@
 use autumn_web::security::{RateLimitConfig, RateLimitLayer};
+use axum::extract::ConnectInfo;
 use axum::{
     Router,
     body::Body,
     http::{Request, StatusCode},
     routing::get,
 };
-use tower::ServiceExt;
 use std::net::SocketAddr;
-use axum::extract::ConnectInfo;
+use tower::ServiceExt;
 
 #[tokio::test]
 async fn eris_rate_limit_bypass_poc() {
@@ -49,5 +49,9 @@ async fn eris_rate_limit_bypass_poc() {
 
     // If vulnerable, the rate limiter uses the spoofed IP and allows the request.
     // If fixed, the rate limiter uses the right-most (or last untrusted) IP and blocks the request.
-    assert_eq!(response_2.status(), StatusCode::TOO_MANY_REQUESTS, "Rate limit bypassed via spoofed X-Forwarded-For left-most IP!");
+    assert_eq!(
+        response_2.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "Rate limit bypassed via spoofed X-Forwarded-For left-most IP!"
+    );
 }
