@@ -277,6 +277,37 @@ async fn csrf_failures_use_problem_details_for_json_clients() {
     assert_eq!(json["detail"], "CSRF token missing or invalid");
 }
 
+#[tokio::test]
+async fn csrf_failures_honor_json_accept_quality_over_html() {
+    let config = AutumnConfig {
+        profile: Some("test".to_owned()),
+        security: SecurityConfig {
+            csrf: CsrfConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![csrf_target])
+        .build();
+
+    for accept in [
+        "application/json, text/html;q=0",
+        "application/json;q=1, text/html;q=0.1",
+    ] {
+        let response = client.post("/csrf").header("accept", accept).send().await;
+
+        let json = problem_json(&response, 403, "autumn.csrf");
+        assert_eq!(json["instance"], "/csrf");
+        assert_eq!(json["request_id"], response.header("x-request-id").unwrap());
+    }
+}
+
 #[test]
 fn problem_details_schema_fixture_defines_contract_keys() {
     let schema: serde_json::Value = serde_json::from_str(include_str!(

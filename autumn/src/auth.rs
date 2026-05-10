@@ -1166,29 +1166,33 @@ where
                 .map(str::to_owned);
 
             let Some(raw_token) = raw_token else {
-                return Ok(api_token_unauthorized_response());
+                let (request_id, instance) = api_token_problem_context(&req);
+                return Ok(api_token_unauthorized_response(request_id, instance));
             };
 
-            match store.verify(&raw_token).await {
-                Ok(Some(principal_id)) => {
-                    req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
-                    inner.call(req).await
-                }
-                _ => Ok(api_token_unauthorized_response()),
+            if let Ok(Some(principal_id)) = store.verify(&raw_token).await {
+                req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
+                inner.call(req).await
+            } else {
+                let (request_id, instance) = api_token_problem_context(&req);
+                Ok(api_token_unauthorized_response(request_id, instance))
             }
         })
     }
 }
 
 /// Build a `401 Unauthorized` response using the standard Problem Details body.
-fn api_token_unauthorized_response<ResBody: From<String> + Default>() -> Response<ResBody> {
+fn api_token_unauthorized_response<ResBody: From<String> + Default>(
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
     let body = crate::error::problem_details_json_string(
         StatusCode::UNAUTHORIZED,
         "authentication required",
         None,
         None,
-        None,
-        None,
+        request_id,
+        instance,
         true,
     );
     Response::builder()
@@ -1196,6 +1200,15 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>() -> Respons
         .header(http::header::CONTENT_TYPE, "application/problem+json")
         .body(ResBody::from(body))
         .unwrap_or_default()
+}
+
+fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, Option<String>) {
+    (
+        req.extensions()
+            .get::<crate::middleware::RequestId>()
+            .map(std::string::ToString::to_string),
+        Some(req.uri().path().to_owned()),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2606,6 +2619,43 @@ mod api_token_tests {
         assert_eq!(json["status"], 401);
         assert_eq!(json["code"], "autumn.unauthorized");
         assert!(json["detail"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_401_problem_details_include_request_context() {
+        use crate::middleware::RequestIdLayer;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/api/private", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store))
+            .layer(RequestIdLayer);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request id header should be present")
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["request_id"], request_id);
+        assert_eq!(json["instance"], "/api/private");
     }
 
     // ── ApiToken extractor ───────────────────────────────────────────────────

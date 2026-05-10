@@ -165,8 +165,12 @@ where
 /// Returns `true` for typical browser requests (`text/html` or `*/*`),
 /// `false` for API requests (`application/json`).
 fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
-    let accept = req
-        .headers()
+    accept_prefers_html(req.headers())
+}
+
+/// Check whether an Accept header prefers an HTML response over JSON.
+pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -201,6 +205,9 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
             {
                 q = parsed.clamp(0.0, 1.0);
             }
+        }
+        if q <= 0.0 {
+            continue;
         }
 
         match mime {

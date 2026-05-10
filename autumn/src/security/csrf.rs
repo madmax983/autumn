@@ -385,10 +385,7 @@ where
 }
 
 fn wants_problem_details(headers: &http::HeaderMap) -> bool {
-    headers
-        .get(http::header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_none_or(|accept| !accept.contains("text/html"))
+    !crate::middleware::error_page_filter::accept_prefers_html(headers)
 }
 
 fn csrf_problem_response<ResBody: From<String> + Default>(
