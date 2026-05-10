@@ -1121,7 +1121,9 @@ mod tests {
 
     #[tokio::test]
     async fn csrf_previous_key_signed_token_accepted() {
-        use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys};
+        use crate::security::config::{
+            ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys,
+        };
         use std::sync::Arc;
 
         let old_secret = "old-key".repeat(5); // 35 bytes

@@ -35,6 +35,7 @@ async fn survives_process_restart() {
             "/_blobs",
             Duration::from_secs(300),
             key.clone(),
+            vec![],
         )
         .unwrap();
         let blob = store
@@ -57,6 +58,7 @@ async fn survives_process_restart() {
             "/_blobs",
             Duration::from_secs(300),
             key,
+            vec![],
         )
         .unwrap();
         let bytes = store.get("avatars/me.png").await.unwrap();
@@ -79,6 +81,7 @@ async fn presigned_url_round_trip_via_serving_route() {
         "/_blobs",
         Duration::from_secs(60),
         key,
+        vec![],
     )
     .unwrap();
     let blob = store
@@ -125,6 +128,7 @@ async fn tampered_signature_is_rejected() {
         "/_blobs",
         Duration::from_secs(60),
         SigningKey::new(b"the-key".to_vec()),
+        vec![],
     )
     .unwrap();
     store

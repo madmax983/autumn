@@ -1052,9 +1052,9 @@ fn apply_middleware(
 
     // Resolve signing keys once; shared across session and CSRF layers.
     let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
-    let signing_keys = std::sync::Arc::new(
-        crate::security::config::resolve_signing_keys(&config.security.signing_secret),
-    );
+    let signing_keys = std::sync::Arc::new(crate::security::config::resolve_signing_keys(
+        &config.security.signing_secret,
+    ));
     // Only thread signing keys when a secret is configured (or in production where
     // fail_fast already ensures one is present). In dev without a configured secret
     // the ephemeral key is generated per-process — useful but not required.

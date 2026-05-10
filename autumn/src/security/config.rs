@@ -217,8 +217,7 @@ pub fn validate_signing_secret(
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     let bytes = mac.finalize().into_bytes();
     bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
@@ -300,7 +299,10 @@ impl ResolvedSigningKeys {
 /// Production boot validation (requiring `secret` to be non-empty, long enough,
 /// and not a demo value) is a separate step via [`validate_signing_secret`].
 pub fn resolve_signing_keys(config: &SigningSecretConfig) -> ResolvedSigningKeys {
-    let current = config.secret.as_deref().map_or_else(generate_ephemeral_key, |s| s.as_bytes().to_vec());
+    let current = config
+        .secret
+        .as_deref()
+        .map_or_else(generate_ephemeral_key, |s| s.as_bytes().to_vec());
     let previous = config
         .previous_secrets
         .iter()
@@ -823,7 +825,7 @@ mod tests {
             required: 32,
         };
         let s = err.to_string();
-        assert!(s.contains("8"));
+        assert!(s.contains('8'));
         assert!(s.contains("32"));
     }
 
@@ -1087,7 +1089,10 @@ mod tests {
         };
         let keys = resolve_signing_keys(&config);
         assert_eq!(keys.previous.len(), 1);
-        assert_eq!(keys.previous[0].as_ref(), "b".repeat(MIN_SECRET_LEN).as_bytes());
+        assert_eq!(
+            keys.previous[0].as_ref(),
+            "b".repeat(MIN_SECRET_LEN).as_bytes()
+        );
     }
 
     #[test]

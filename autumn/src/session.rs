@@ -1387,7 +1387,10 @@ mod tests {
                     "ok"
                 }),
             )
-            .layer(SessionLayer::new(MemoryStore::new(), SessionConfig::default()).with_signing_keys(keys));
+            .layer(
+                SessionLayer::new(MemoryStore::new(), SessionConfig::default())
+                    .with_signing_keys(keys),
+            );
 
         let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1456,7 +1459,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_accepts_previous_key_signed_cookie() {
-        use crate::security::config::{ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys};
+        use crate::security::config::{
+            ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys,
+        };
         use std::sync::Arc;
 
         let old_secret = "old-key".repeat(5); // 35 bytes
@@ -1495,6 +1500,10 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
-        assert_eq!(&body[..], b"bob", "previous-key-signed cookie must load session");
+        assert_eq!(
+            &body[..],
+            b"bob",
+            "previous-key-signed cookie must load session"
+        );
     }
 }

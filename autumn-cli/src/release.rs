@@ -84,8 +84,12 @@ pub fn run(action: ReleaseAction) {
 
                     println!();
                     println!("Next steps:");
-                    println!("  1. Generate and set your signing secret (REQUIRED before production boot):");
-                    println!("       export AUTUMN_SECURITY__SIGNING_SECRET=\"$(openssl rand -hex 32)\"");
+                    println!(
+                        "  1. Generate and set your signing secret (REQUIRED before production boot):"
+                    );
+                    println!(
+                        "       export AUTUMN_SECURITY__SIGNING_SECRET=\"$(openssl rand -hex 32)\""
+                    );
                     println!("     Smoke-gate check — the app must refuse to start without it:");
                     println!("       AUTUMN_ENV=prod docker run --rm \\");
                     println!("         -e DATABASE_URL=... \\");
@@ -93,16 +97,22 @@ pub fn run(action: ReleaseAction) {
                     println!("     And must start with it:");
                     println!("       AUTUMN_ENV=prod docker run --rm \\");
                     println!("         -e DATABASE_URL=... \\");
-                    println!("         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\");
+                    println!(
+                        "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
+                    );
                     println!("         {project_name}");
                     println!();
                     println!("  2. Build and run:");
                     println!("       docker build -t {project_name} .");
                     println!("       docker run --rm -p 3000:3000 -e DATABASE_URL=... \\");
-                    println!("         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\");
+                    println!(
+                        "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
+                    );
                     println!("         {project_name}");
                     println!();
-                    println!("  See docs/guide/deployment.md and docs/guide/signing-secrets.md for the full walkthrough.");
+                    println!(
+                        "  See docs/guide/deployment.md and docs/guide/signing-secrets.md for the full walkthrough."
+                    );
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -504,8 +514,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
             "production config template must document the signing-secret env var"
@@ -517,8 +526,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("openssl rand -hex 32"),
             "production config template must show the secret generation command"
@@ -530,8 +538,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
-        let content =
-            fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
         assert!(
             content.contains("signing-secrets.md"),
             "production config template must link to the signing-secrets guide"
@@ -570,10 +577,10 @@ secret = "my-actual-secret-value-here"
 
     #[test]
     fn smoke_gate_passes_for_empty_previous_secrets() {
-        let content = r#"
+        let content = "
 [security.signing_secret]
 previous_secrets = []
-"#;
+";
         assert!(check_production_config_signing_secret(content).is_ok());
     }
 

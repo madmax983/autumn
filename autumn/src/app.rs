@@ -2928,9 +2928,7 @@ fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
             .enumerate()
         {
             if let Err(error) = validate_signing_secret(Some(prev.as_str()), true) {
-                eprintln!(
-                    "Invalid signing secret configuration: previous_secrets[{i}]: {error}"
-                );
+                eprintln!("Invalid signing secret configuration: previous_secrets[{i}]: {error}");
                 eprintln!(
                     "  hint: every previous secret must meet the same entropy requirement \
                      as the current secret"
