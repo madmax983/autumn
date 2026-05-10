@@ -1,58 +1,62 @@
 name: Release
 
+# Triggered only when the Publish Gate workflow completes successfully on a
+# tag push.  All gate jobs (including prepare-release) must pass before this
+# workflow runs.  The release artifacts (RELEASE_NOTES.md and the tag name)
+# are produced by the prepare-release job inside Publish Gate and downloaded
+# here — no checkout of user-controlled code is needed in this privileged
+# workflow_run context.
 on:
-  push:
-    tags:
-      - "v[0-9]+.*"
+  workflow_run:
+    workflows: ["Publish Gate"]
+    types: [completed]
 
 permissions:
   contents: write
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  validate:
-    name: Validate release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace
-
   release:
     name: Create GitHub Release
-    needs: validate
     runs-on: ubuntu-latest
+    # Only proceed when Publish Gate succeeded and was itself triggered by a tag push.
+    if: |
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
     steps:
-      - uses: actions/checkout@v4
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-      - name: Install git-cliff
-        uses: taiki-e/install-action@git-cliff
-      - name: Generate release notes
-        id: release-notes
+          name: release-artifacts
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Read and validate release tag
+        id: tag
         run: |
-          git-cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
-      - name: Update CHANGELOG.md
-        run: |
-          git-cliff --config cliff.toml --output CHANGELOG.md
-      - name: Commit changelog to trunk
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add CHANGELOG.md
-          git commit -m "docs: update CHANGELOG.md for ${{ github.ref_name }}"
-          git push origin HEAD:trunk
+          RELEASE_TAG="$(cat release-tag.txt)"
+          if [[ -z "$RELEASE_TAG" ]]; then
+            echo "error: release-tag.txt is empty" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "error: tag '${RELEASE_TAG}' is not a semver release tag" >&2
+            exit 1
+          fi
+          echo "name=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          if [[ "$RELEASE_TAG" =~ -(alpha|beta|rc) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.tag.outputs.name }}
           body_path: RELEASE_NOTES.md
           draft: false
-          prerelease: ${{ contains(github.ref, '-alpha') || contains(github.ref, '-beta') || contains(github.ref, '-rc') }}
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}

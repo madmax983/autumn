@@ -155,7 +155,7 @@ impl Cache for RedisCache {
     /// For arbitrary serde types — including structs and collections — use
     /// [`insert_raw_bytes`] (called automatically by
     /// [`autumn_web::cache::insert_cached`]) instead. Unknown types are
-    /// silently skipped here because [`insert_cached`] will have already
+    /// silently skipped here because [`autumn_web::cache::insert_cached`] will have already
     /// written the serialized form via [`insert_raw_bytes`].
     ///
     /// [`insert_raw_bytes`]: Cache::insert_raw_bytes

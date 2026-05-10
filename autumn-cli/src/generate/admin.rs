@@ -94,7 +94,7 @@ pub fn plan_admin(
 /// Compute the file actions for `autumn generate admin`, with full options.
 ///
 /// # Errors
-/// Same as [`plan_admin`], plus options-level errors (unknown field names).
+/// Same as `plan_admin`, plus options-level errors (unknown field names).
 pub fn plan_admin_with_options(
     project_root: &Path,
     name: &str,

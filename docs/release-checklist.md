@@ -1,6 +1,148 @@
 # Autumn Release Checklist
+vvvvvv
+This document is the canonical pre-publish checklist for every Autumn release.
+It records the crates we publish, the required publication order, the version
+compatibility rule for each crate, and the automated gates that must pass before
+a tag triggers a GitHub Release.
 
-Use this checklist before tagging an `autumn-web` or `autumn-cli` release.
+See also [`STABILITY.md`](../STABILITY.md) for the full stability policy and
+SemVer contract.
+
+---
+
+## Published Crates
+
+| Crate | Directory | Publish Order | Notes |
+|---|---|---|---|
+| `autumn-macros` | `autumn-macros/` | 1 | No Autumn runtime deps; must publish first. |
+| `autumn-web` | `autumn/` | 2 | Depends on `autumn-macros`. |
+| `autumn-cli` | `autumn-cli/` | 3 | Independent of `autumn-web` at crate level. |
+| `autumn-admin-plugin` | `autumn-admin-plugin/` | 4 | Depends on `autumn-web`. |
+| `autumn-storage-s3` | `autumn-storage-s3/` | 4 | Depends on `autumn-web`. |
+| `autumn-cache-redis` | `autumn-cache-redis/` | 4 | Depends on `autumn-web`. |
+
+All crates share a single workspace version (`[workspace.package].version` in
+`Cargo.toml`). They are always released together at the same version.
+
+### Version Compatibility Rules
+
+- Every crate's `version` field inherits from `[workspace.package].version`.
+- Crates that depend on other published Autumn crates pin the **exact workspace
+  version** (e.g. `autumn-web = { version = "0.3.0", ... }`). A workspace
+  version bump must update these pins in lockstep.
+- The `[patch.crates-io]` override in the root `Cargo.toml` redirects
+  `autumn-web` to the local workspace path during development. **Remove or
+  comment this section** if you ever need to test against a published version
+  locally.
+
+---
+
+## Autumn Harvest Compatibility Boundary
+
+[Autumn Harvest](https://github.com/madmax983/autumn-harvest) is a companion
+repository that provides starter templates, the scaffold generator registry, and
+generated application CI. It is maintained on its own release train.
+
+**Checks that belong in this repo:**
+
+- Autumn framework crate packaging, docs.rs build, and SemVer gate.
+- CLI commands shipped by `autumn-cli`.
+- Generated application smoke test (see [Downstream Smoke Test](#downstream-smoke-test)).
+
+**Checks that belong in the Harvest repo:**
+
+- Template rendering correctness and starter project CI.
+- Harvest-specific CLI flags and template version pins.
+- Integration tests that use the Harvest template registry API.
+
+When an Autumn release changes the generated-app contract (config schema,
+generated file structure, CLI flags), open a companion PR in the Harvest repo
+before tagging the Autumn release.
+
+---
+
+## Automated Gates (`publish-gate` Workflow)
+
+The `.github/workflows/publish-gate.yml` workflow runs these jobs. Each must
+pass before the release is announced.
+
+### 1 · Crate Metadata (`metadata` job)
+
+Script: `scripts/check-crate-metadata.sh`
+
+Fails if any publishable crate is missing:
+
+- `description`, `homepage`, `repository`, `readme`, `license`,
+  `keywords`, `categories`, `rust-version`
+- The `readme` file referenced in the manifest actually exists on disk.
+
+### 2 · Package Dry-Run (`package` job)
+
+Script: `scripts/check-publish-dry-run.sh`
+
+Runs `cargo package -p <crate> --no-verify --allow-dirty` for every publishable
+crate in dependency order. Fails if `cargo` cannot assemble the `.crate` archive
+(missing files, bad manifest, workspace-path leakage, etc.).
+
+This check does **not** upload anything to crates.io.
+
+### 3 · Documentation Build (`docs` job)
+
+Script: `scripts/check-docs.sh`
+
+Builds the full workspace documentation with:
+
+```text
+RUSTDOCFLAGS="-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links"
+cargo doc --workspace --all-features --no-deps
+```
+
+Fails on any rustdoc warning or broken intra-doc link.
+
+**docs.rs feature posture:** docs.rs builds each crate with the feature set
+declared in `[package.metadata.docs.rs]` (if present), or with no extra features
+otherwise. We use `--all-features` here to surface problems across the entire
+feature matrix. If a feature is incompatible with docs.rs, add a
+`[package.metadata.docs.rs]` section to that crate's `Cargo.toml` listing only
+the features docs.rs should enable, and update `check-docs.sh` to build that
+crate with the restricted set.
+
+### 4 · SemVer Check (`semver` job)
+
+Script: `scripts/check-semver.sh`
+
+Uses [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
+to compare the public API surface of each publishable crate against the last
+version published on crates.io.
+
+- **Patch / minor releases:** any breaking change fails the gate.
+- **Major releases (or breaking pre-1.0 minor):** failures are expected.
+  The release operator must ensure a migration guide exists at
+  `docs/migrations/<version>.md` before the gate passes.
+
+Crates that have never been published are skipped.
+
+### 5 · Release Notes Alignment (`release-notes` job)
+
+Script: `scripts/check-release-notes.sh`
+
+Fails if:
+
+- The release tag version does not match `[workspace.package].version` in
+  `Cargo.toml`.
+- `CHANGELOG.md` has no entry for the current workspace version.
+- The release contains breaking changes (detected via `### Breaking` in the
+  CHANGELOG entry) but no migration guide exists at
+  `docs/migrations/<version>.md`.
+
+### 6 · Downstream Smoke Test (`smoke` job)
+
+Defined inline in `publish-gate.yml`.
+
+Creates a temporary directory outside the workspace, generates a minimal Autumn
+app skeleton, substitutes the candidate crate set (by path, simulating a crates.io
+install), and verifies it compiles. This proves the published `autumn-web` is
+usable from a fresh project without workspace path dependencies.
 
 ## Version Alignment
 
@@ -28,3 +170,41 @@ Use this checklist before tagging an `autumn-web` or `autumn-cli` release.
 - [ ] If the smoke is temporarily run before crates.io publication, record the
   workspace-prepublish reason in release notes and rerun the published
   docs-smoke before announcing the release.
+
+---
+
+## Manual Pre-Tag Steps
+
+Before pushing the release tag:
+
+1. **Bump the workspace version** in `Cargo.toml` under `[workspace.package]`.
+2. **Update internal version pins** for inter-crate dependencies
+   (e.g. `autumn-web = { version = "X.Y.Z", path = "../autumn" }`).
+3. **Update `CHANGELOG.md`** — move unreleased items under a `## [X.Y.Z]` heading.
+   Add a `### Breaking Changes` section and migration guide stub if needed.
+4. **Run all gate scripts locally** to catch problems before CI sees the tag:
+   ```bash
+   ./scripts/check-crate-metadata.sh
+   ./scripts/check-release-notes.sh
+   ./scripts/check-docs.sh
+   ./scripts/check-semver.sh   # requires network; skip offline
+   ```
+5. **Tag and push:**
+   ```bash
+   git tag v0.4.0
+   git push origin v0.4.0
+   ```
+   The `publish-gate` workflow runs automatically. The `release` workflow runs
+   only after `publish-gate` succeeds.
+6. **Publish to crates.io** (in dependency order, after the gate passes):
+   ```bash
+   cargo publish -p autumn-macros
+   cargo publish -p autumn-web
+   cargo publish -p autumn-cli
+   cargo publish -p autumn-admin-plugin
+   cargo publish -p autumn-storage-s3
+   cargo publish -p autumn-cache-redis
+   ```
+
+> Publishing to crates.io is a manual step; no crates.io credentials are stored
+> in CI. See the Out of Scope section in [issue #594](https://github.com/madmax983/autumn/issues/594).
