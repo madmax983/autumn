@@ -184,10 +184,7 @@ impl StaticFileLayer {
 
         // Try to claim the in-flight flag (CAS: false -> true).
         // This prevents this process from spawning more than one task per route.
-        if route_state
-            .in_flight
-            .swap(true, Ordering::AcqRel)
-        {
+        if route_state.in_flight.swap(true, Ordering::AcqRel) {
             // Another task is already regenerating this route in this process
             return;
         }

@@ -52,7 +52,9 @@ impl MissingDistributedDatabaseUrls {
 impl fmt::Display for MissingDistributedDatabaseUrls {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::PrimaryAndReplica => f.write_str("primary and replica database URLs are required"),
+            Self::PrimaryAndReplica => {
+                f.write_str("primary and replica database URLs are required")
+            }
             Self::Primary => f.write_str("primary database URL is required"),
             Self::Replica => f.write_str("replica database URL is required"),
         }

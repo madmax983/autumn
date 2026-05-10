@@ -709,7 +709,7 @@ const fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'
             400..=499 => "autumn.client_error",
             500..=599 => "autumn.server_error",
             _ => "autumn.error",
-        }
+        },
     }
 }
 
