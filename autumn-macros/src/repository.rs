@@ -209,6 +209,7 @@ fn generate_derived_query(
 }
 
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
+#[allow(clippy::cognitive_complexity)]
 pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let config = match parse_repo_args(attr) {
         Ok(c) => c,

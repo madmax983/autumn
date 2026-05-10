@@ -2093,6 +2093,7 @@ impl AppBuilder {
     ///
     /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
     async fn run_one_off_task_mode(self, requested_name: String) {
         let Self {
             one_off_tasks,
@@ -2510,6 +2511,7 @@ async fn execute_task_result_with_optional_lease_ttl(
 }
 
 /// Handle the execution of a single fixed-delay task.
+#[allow(clippy::cognitive_complexity)]
 async fn execute_fixed_delay_task(
     name: String,
     state: AppState,
@@ -2588,6 +2590,7 @@ async fn execute_fixed_delay_task(
 }
 
 /// Handle the execution of a single cron task.
+#[allow(clippy::cognitive_complexity)]
 async fn execute_cron_task(
     name: String,
     state: AppState,
@@ -2698,6 +2701,7 @@ fn run_cron_scheduler(
     }
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn run_cron_task_loop(
     task: CronTaskSpec,
     state: AppState,
@@ -3435,6 +3439,7 @@ fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
     s
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn validate_repository_policies_registered(
     routes: &[Route],
     scoped_groups: &[ScopedGroup],

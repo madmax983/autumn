@@ -668,6 +668,7 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
             content: response_content,
         },
     );
+    insert_problem_responses(&mut responses);
 
     insert_problem_responses(&mut responses);
 

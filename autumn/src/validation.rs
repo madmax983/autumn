@@ -179,6 +179,13 @@ impl<T> AsValidatable for axum::extract::Query<T> {
     }
 }
 
+impl<T> AsValidatable for crate::extract::Query<T> {
+    type Inner = T;
+    fn as_validatable(&self) -> &T {
+        &self.0
+    }
+}
+
 /// Convert `validator::ValidationErrors` into a field → messages map.
 impl<T> AsValidatable for crate::extract::Query<T> {
     type Inner = T;

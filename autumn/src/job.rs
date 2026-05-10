@@ -2380,6 +2380,7 @@ fn spawn_redis_worker(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::cognitive_complexity)]
 async fn settle_failed_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -2491,6 +2492,7 @@ async fn dead_letter_invalid_redis_job(
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::cognitive_complexity)]
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,

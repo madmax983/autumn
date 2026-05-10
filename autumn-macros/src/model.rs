@@ -266,6 +266,7 @@ fn emit_schema_fn_body_ext(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity)]
 pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input: DeriveInput = match syn::parse2(item) {
         Ok(input) => input,

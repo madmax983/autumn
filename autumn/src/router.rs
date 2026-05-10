@@ -776,6 +776,7 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
+#[allow(clippy::cognitive_complexity)]
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -1039,6 +1040,7 @@ where
     ))
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
