@@ -187,13 +187,6 @@ impl<T> AsValidatable for crate::extract::Query<T> {
 }
 
 /// Convert `validator::ValidationErrors` into a field → messages map.
-impl<T> AsValidatable for crate::extract::Query<T> {
-    type Inner = T;
-    fn as_validatable(&self) -> &T {
-        &self.0
-    }
-}
-
 fn validation_errors_to_map(errors: &validator::ValidationErrors) -> HashMap<String, Vec<String>> {
     errors
         .field_errors()
