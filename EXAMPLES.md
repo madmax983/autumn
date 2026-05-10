@@ -1,0 +1,204 @@
+# Autumn Examples Catalog
+
+Every directory under `examples/` is listed here with its support tier,
+target persona, demonstrated journey, key capabilities, prerequisites,
+exact run command, and the first successful response that proves it works.
+
+The `scripts/check-examples.sh` drift gate reads the machine-readable markers
+on each entry and fails a release if the catalog, workspace membership, and
+`README.md` Examples table drift out of sync.
+
+Marker format used by the drift gate (HTML comment on its own line inside each entry):
+
+    &lt;!-- catalog:example name=&lt;dir&gt; tier=supported|experimental|excluded --&gt;
+
+---
+
+## Supported Examples
+
+Supported examples participate in normal workspace validation, have a documented
+journey, and each carries a README quickstart. A failure in any supported example
+blocks publishing `autumn-web` or `autumn-cli`.
+
+---
+
+### `examples/hello` — First Route
+
+<!-- catalog:example name=hello tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer evaluating Autumn for the first time |
+| **Journey** | First route: install CLI, run the app, see a response |
+| **Key capabilities** | `#[get]`, `routes![]`, `#[autumn_web::main]`, built-in `/health` |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p hello` |
+| **Success proof** | `curl http://localhost:3000/hello` returns `Hello, Autumn!` |
+
+---
+
+### `examples/todo-app` — Classic CRUD App
+
+<!-- catalog:example name=todo-app tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a full-stack Rust web application |
+| **Journey** | CRUD app: routes, Diesel model, Maud templates, htmx interactions, JSON API |
+| **Key capabilities** | `#[model]`, Diesel migrations, Maud, htmx, Tailwind, JSON endpoints |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p todo-app` |
+| **Success proof** | `curl http://localhost:3000/` returns the todo list HTML page |
+
+---
+
+### `examples/blog` — Admin UI and Static Pre-rendering
+
+<!-- catalog:example name=blog tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a content site with an admin interface |
+| **Journey** | Admin/static rendering: content CRUD, form validation, pre-rendered public pages |
+| **Key capabilities** | `#[static_get]`, `static_routes![]`, `autumn build`, admin UI, input validation |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p blog` |
+| **Success proof** | `curl http://localhost:3000/` returns the blog index page |
+
+---
+
+### `examples/bookmarks` — Profiles, Repository Macro, and Scheduled Tasks
+
+<!-- catalog:example name=bookmarks tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer adding operational features to an existing Autumn app |
+| **Journey** | Profiles/tasks: generated CRUD API, actuator endpoints, profile-based config, hourly scheduled task |
+| **Key capabilities** | `#[repository]`, `#[scheduled]`, actuator (`/actuator/health`, `/actuator/tasks`), profile layering |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p bookmarks` |
+| **Success proof** | `curl http://localhost:3000/actuator/health` returns `{"status":"UP"}` |
+
+---
+
+### `examples/bookmarks-distributed` — Distributed Deployment
+
+<!-- catalog:example name=bookmarks-distributed tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer deploying an Autumn app at production scale with read replicas |
+| **Journey** | Distributed deployment: primary/replica Postgres, Redis-optional, multi-replica web tier behind nginx, one-shot migrator |
+| **Key capabilities** | Explicit repository seam, partitioned `#[scheduled]` with advisory locks, `autumn-{profile}.toml` layering, Docker Compose topology |
+| **Prerequisites** | Docker and Docker Compose |
+| **Run command** | `docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --build` |
+| **Success proof** | `curl http://localhost:3000/api/bookmarks` returns `[]` after the stack is healthy |
+
+---
+
+### `examples/wiki` — Mutation Hooks and Revision History
+
+<!-- catalog:example name=wiki tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer adding audit trails and lifecycle hooks to a content model |
+| **Journey** | Hooks/revisions: slug lifecycle, before/after-save hooks, full revision history, REST API |
+| **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p wiki` |
+| **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
+
+---
+
+### `examples/reddit-clone` — Full-Stack Application
+
+<!-- catalog:example name=reddit-clone tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer building a production-shaped Autumn application with auth and real-time features |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
+| **Run command** | `cargo run -p reddit-clone` |
+| **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
+
+---
+
+### `examples/custom_config_loader` — Custom Configuration Loading
+
+<!-- catalog:example name=custom_config_loader tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer integrating Autumn with a non-standard configuration source (Vault, AWS Secrets Manager, JSON file) |
+| **Journey** | Custom config loading: replace the default TOML + env loader with a JSON-file loader via the `ConfigLoader` trait |
+| **Key capabilities** | `ConfigLoader` trait, `AppBuilder::with_config_loader`, custom JSON config |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p custom-config-loader-example` |
+| **Success proof** | `curl http://127.0.0.1:4567/` returns a greeting confirming the JSON config booted the app |
+
+---
+
+### `examples/ws-echo` — WebSocket and SSE
+
+<!-- catalog:example name=ws-echo tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer adding real-time features to an Autumn application |
+| **Journey** | WebSocket echo: echo server, fan-out channels, SSE stream, Redis-backed multi-replica pub/sub |
+| **Key capabilities** | `#[ws]`, `AppState::channels()`, SSE via `autumn_web::sse::stream`, Redis pub/sub fan-out, Docker Compose smoke test |
+| **Prerequisites** | Rust 1.88.0+ (local); Docker and Docker Compose (Redis fan-out smoke test) |
+| **Run command** | `cargo run -p ws-echo` |
+| **Success proof** | `curl -N http://127.0.0.1:3000/events` holds an SSE connection open; `curl -X POST http://127.0.0.1:3000/notify` delivers an event to that stream |
+
+---
+
+## Journey Map
+
+The table below maps each example to a distinct learning journey so evaluators
+can pick the closest starting point without overlap.
+
+| Journey | Example | One-line summary |
+|---------|---------|-----------------|
+| First route | `hello` | Simplest possible Autumn app — three routes, no database |
+| CRUD app | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, and a JSON API |
+| Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
+| Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
+| Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
+| Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
+| Full-stack clone | `reddit-clone` | Auth, sessions, jobs, channels, email — the complete server-first stack |
+| Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
+| WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
+
+---
+
+## Release Checklist — Example Drift Gate
+
+Before publishing `autumn-web` or `autumn-cli`, the CI `publish-gate` workflow
+runs `scripts/check-examples.sh`. The gate catches:
+
+- Any directory under `examples/` that has no catalog entry (orphan detection).
+- Any workspace `examples/*` member that is not cataloged as `supported`.
+- Any example listed in `README.md`'s Examples table that is absent from the catalog.
+- Any supported example whose `README.md` is missing required quickstart sections.
+
+To add a new example:
+
+1. Create the directory under `examples/` and add a `README.md` with at least
+   `## Prerequisites` and `## Quick start` sections.
+2. Add it to `[workspace] members` in `Cargo.toml` (if it participates in
+   normal validation) or mark it `tier=experimental` or `tier=excluded` here.
+3. Add a catalog entry with the machine-readable marker to this file.
+4. Add a row to the README.md Examples table.
+5. Run `./scripts/check-examples.sh` locally to confirm zero failures.
+
+To retire an example:
+
+1. Either delete the directory or change its tier to `excluded` with a rationale.
+2. Remove it from `Cargo.toml` workspace members if it was a member.
+3. Remove it from the README.md Examples table.
+4. Run `./scripts/check-examples.sh` to confirm zero failures.

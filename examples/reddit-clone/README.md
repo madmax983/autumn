@@ -30,7 +30,12 @@ showcasing the framework's major features in a single cohesive application.
 | Tailwind CSS styling | All templates |
 | Static asset serving (`/static/css/`, `/static/js/htmx.min.js`) | Auto-mounted |
 
-## Running
+## Prerequisites
+
+- Rust 1.88.0+
+- PostgreSQL and Redis (via Docker Compose below)
+
+## Quick start
 
 ```bash
 # Start PostgreSQL + Redis

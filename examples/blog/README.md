@@ -19,6 +19,12 @@ htmx, embedded migrations, and the new hybrid-rendering pipeline.
   with **compile-time key validation**, automatic fallback, and a
   locale switcher in the layout (visit `/greet`)
 
+## Prerequisites
+
+- Rust 1.88.0+
+- PostgreSQL (via Docker Compose below)
+- Tailwind CSS binary (downloaded by `autumn setup`)
+
 ## Quick start
 
 From the workspace root:

@@ -148,14 +148,19 @@ async fn main() {
 
 ## Examples
 
+See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, prerequisites, run commands, and success proofs.
+
 | Example | Description |
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
 | [`examples/todo-app`](examples/todo-app) | Classic full-stack CRUD app with Diesel, Maud, htmx, Tailwind, and JSON endpoints |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
+| [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, transactional email, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[job]`, `#[static_get]`, `#[ws]` channels, Redis-capable background jobs and live-feed wakeups, htmx voting, and profiles. It uses built-in jobs instead of Harvest so Autumn Web releases do not depend on the companion workflow crate. |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, and profiles |
+| [`examples/custom_config_loader`](examples/custom_config_loader) | Replace the default TOML + env config loader with a custom `ConfigLoader` (JSON file, Vault, Secrets Manager, etc.) |
+| [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
 
 ## Documentation
 
