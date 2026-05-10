@@ -67,6 +67,7 @@ struct Limiter {
     burst: f64,
     burst_header: HeaderValue,
     trust_forwarded_headers: bool,
+    trusted_proxies_configured: bool,
     trusted_proxies: Vec<TrustedProxy>,
     buckets: Mutex<LruCache<String, Bucket>>,
 }
@@ -148,6 +149,7 @@ impl Limiter {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
+        let trusted_proxies_configured = !config.trusted_proxies.is_empty();
         let trusted_proxies = config
             .trusted_proxies
             .iter()
@@ -166,6 +168,7 @@ impl Limiter {
             burst,
             burst_header,
             trust_forwarded_headers: config.trust_forwarded_headers,
+            trusted_proxies_configured,
             trusted_proxies,
             buckets: Mutex::new(LruCache::new(
                 NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
@@ -276,7 +279,7 @@ impl Limiter {
     }
 
     fn forwarded_headers_allowed<B>(&self, req: &Request<B>) -> bool {
-        if self.trusted_proxies.is_empty() {
+        if !self.trusted_proxies_configured {
             return true;
         }
 
@@ -284,7 +287,7 @@ impl Limiter {
     }
 
     fn client_ip_from_x_forwarded_for(&self, header: &str) -> Option<String> {
-        if self.trusted_proxies.is_empty() {
+        if !self.trusted_proxies_configured {
             return header
                 .rsplit(',')
                 .next()
@@ -665,6 +668,18 @@ mod tests {
     }
 
     #[test]
+    fn client_ip_falls_back_to_peer_when_all_trusted_proxies_are_invalid() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "192.0.2.44:4000");
+
+        assert_eq!(
+            limiter_with_trusted_proxies(&["203.0.113.10:443", "198.51.100.0/999"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("192.0.2.44")
+        );
+    }
+
+    #[test]
     fn client_ip_trims_whitespace_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "  9.9.9.9  ")
@@ -891,5 +906,45 @@ mod tests {
                 "requests with configured trusted proxies but no peer must not trust forwarded headers"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_trusted_proxies_do_not_reopen_forwarded_header_trust() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.001,
+            burst: 1,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10:443".to_owned(), "198.51.100.0/999".to_owned()],
+        };
+        let app = app(&config);
+        let peer: SocketAddr = "192.0.2.44:4000"
+            .parse()
+            .expect("test peer socket address parses");
+
+        let make_req = |xff: &str| {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("X-Forwarded-For", xff)
+                .body(Body::empty())
+                .expect("infallible response builder");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let first = app
+            .clone()
+            .oneshot(make_req("198.51.100.77"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let blocked = app
+            .clone()
+            .oneshot(make_req("198.51.100.88"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }
