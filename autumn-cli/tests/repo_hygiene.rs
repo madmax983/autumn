@@ -10,11 +10,36 @@ const GENERATED_EXAMPLE_CSS: &[&str] = &[
     "examples/wiki/static/css/autumn.css",
 ];
 
+const FIRST_RUN_DOCS: &[&str] = &[
+    "README.md",
+    "docs/guide/getting-started.md",
+    "docs/guide/tutorial/01-project-setup.md",
+    "docs/guide/tutorial/12-whats-next.md",
+    "docs/guide/macro-transparency.md",
+];
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("autumn-cli should live under the workspace root")
         .to_path_buf()
+}
+
+fn workspace_package_value(root_toml: &toml::Value, key: &str) -> String {
+    root_toml
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get(key))
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("workspace.package.{key} should be set"))
+        .to_owned()
+}
+
+fn read_workspace_manifest(root: &Path) -> toml::Value {
+    let root_manifest_path = root.join("Cargo.toml");
+    let root_manifest = std::fs::read_to_string(&root_manifest_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", root_manifest_path.display()));
+    toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML")
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -41,13 +66,100 @@ fn member_manifest_forbids_unsafe_code(manifest_toml: &toml::Value) -> bool {
 }
 
 #[test]
+fn first_run_docs_match_current_release_line() {
+    let root = workspace_root();
+    let root_toml = read_workspace_manifest(&root);
+    let current_version = workspace_package_value(&root_toml, "version");
+    let current_series = current_version
+        .rsplit_once('.')
+        .map_or(current_version.as_str(), |(series, _)| series);
+    let rust_version = workspace_package_value(&root_toml, "rust-version");
+
+    for doc in FIRST_RUN_DOCS {
+        let path = root.join(doc);
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+
+        for stale in [
+            "Rust 1.85",
+            "Rust 1.86",
+            "rustc 1.85",
+            "rustc 1.86",
+            "rust:1.86",
+            "autumn-web = \"0.1.0\"",
+            "version=\"0.1.0\"",
+            "\"version\": \"0.1.0\"",
+            "v0.1.0",
+            "crates.io publication is not yet available",
+        ] {
+            assert!(
+                !content.contains(stale),
+                "{doc} still references stale first-run release/MSRV text: {stale}",
+            );
+        }
+
+        if content.contains("cargo install --path autumn-cli") {
+            assert!(
+                content
+                    .to_ascii_lowercase()
+                    .contains("local development only"),
+                "{doc} uses `cargo install --path autumn-cli` without clearly marking it as local development only",
+            );
+        }
+    }
+
+    for doc in [
+        "README.md",
+        "docs/guide/getting-started.md",
+        "docs/guide/tutorial/01-project-setup.md",
+    ] {
+        let content = std::fs::read_to_string(root.join(doc))
+            .unwrap_or_else(|err| panic!("failed to read {doc}: {err}"));
+        assert!(
+            content.contains(&format!("Rust {rust_version}+")),
+            "{doc} must state the workspace MSRV Rust {rust_version}+",
+        );
+    }
+
+    for doc in [
+        "docs/guide/getting-started.md",
+        "docs/guide/tutorial/01-project-setup.md",
+    ] {
+        let content = std::fs::read_to_string(root.join(doc))
+            .unwrap_or_else(|err| panic!("failed to read {doc}: {err}"));
+        assert!(
+            content.contains(&format!("autumn-web = \"{current_series}\""))
+                || content.contains(&format!("autumn-web = \"{current_version}\"")),
+            "{doc} must show the current autumn-web release line ({current_series} or {current_version})",
+        );
+    }
+}
+
+#[test]
+fn release_checklist_includes_docs_smoke_gate() {
+    let root = workspace_root();
+    let checklist_path = root.join("docs/release-checklist.md");
+    let checklist = std::fs::read_to_string(&checklist_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", checklist_path.display()));
+
+    for required in [
+        "docs-smoke",
+        "docs/guide/docs-smoke.md",
+        "autumn-web",
+        "autumn-cli",
+        "release blocker",
+    ] {
+        assert!(
+            checklist.contains(required),
+            "release checklist must include `{required}` as part of the first-run docs smoke gate",
+        );
+    }
+}
+
+#[test]
 fn workspace_forbids_unsafe_code_for_all_members() {
     let root = workspace_root();
-    let root_manifest_path = root.join("Cargo.toml");
-    let root_manifest = std::fs::read_to_string(&root_manifest_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", root_manifest_path.display()));
-    let root_toml: toml::Value =
-        toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML");
+    let root_toml = read_workspace_manifest(&root);
 
     let unsafe_code_lint = root_toml
         .get("workspace")

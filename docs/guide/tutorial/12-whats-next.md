@@ -3,6 +3,10 @@
 **Goal:** By the end of this chapter, you will have a complete, working todo
 application and a clear picture of where to go from here.
 
+This tutorial tracks the published Autumn 0.3.x line and Rust 1.88.0+ as of
+2026-05-10. If you are following `trunk` from a checkout, confirm the
+workspace version before copying dependency snippets.
+
 ---
 
 ## Sections
@@ -25,20 +29,20 @@ tutorial omitted. Then branch out into the newer example apps:
 
 ### Ideas for Extending the App
 
-- **Authentication** � add user accounts with session cookies
-- **Actuator hardening** � tune which operational endpoints stay visible in prod
-- **Background work** � add a `#[scheduled]` task for cleanup or polling
-- **Categories** � associate todos with categories (a second table, foreign keys)
-- **Search** � add a search bar with `ILIKE` queries
-- **Pagination** � limit the list with `.limit()` and `.offset()`
+- **Authentication** -- add user accounts with session cookies
+- **Actuator hardening** -- tune which operational endpoints stay visible in prod
+- **Background work** -- add a `#[scheduled]` task for cleanup or polling
+- **Categories** -- associate todos with categories (a second table, foreign keys)
+- **Search** -- add a search bar with `ILIKE` queries
+- **Pagination** -- limit the list with `.limit()` and `.offset()`
 - **Testing** — see [Chapter 11](11-testing.md) for the integration testing walkthrough
 
 ### Further Reading
 
-- [API Reference](https://docs.rs/autumn-web) � generated Rust docs for every public type
-- [Getting Started Guide](../getting-started.md) � quick overview of all features
-- [Example App](../../../examples/todo-app/) � the reference implementation
-- [Autumn on crates.io](https://crates.io/crates/autumn-web) � versioned releases
+- [API Reference](https://docs.rs/autumn-web) -- generated Rust docs for every public type
+- [Getting Started Guide](../getting-started.md) -- quick overview of all features
+- [Example App](../../../examples/todo-app/) -- the reference implementation
+- [Autumn on crates.io](https://crates.io/crates/autumn-web) -- versioned releases
 
 ### Community
 
