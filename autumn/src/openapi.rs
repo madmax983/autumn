@@ -743,7 +743,7 @@ fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&
 
 #[cfg(feature = "openapi")]
 fn insert_problem_responses(responses: &mut BTreeMap<String, Response>) {
-    for status in [400_u16, 401, 403, 404, 409, 413, 422, 500, 503] {
+    for status in [400_u16, 401, 403, 404, 409, 413, 415, 422, 500, 503] {
         responses.entry(status.to_string()).or_insert_with(|| {
             let mut content = BTreeMap::new();
             content.insert(
@@ -848,6 +848,7 @@ const fn status_description(status: u16) -> &'static str {
         404 => "Not Found",
         409 => "Conflict",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
@@ -1170,8 +1171,11 @@ mod tests {
         assert_eq!(status_description(403), "Forbidden");
         assert_eq!(status_description(404), "Not Found");
         assert_eq!(status_description(409), "Conflict");
+        assert_eq!(status_description(413), "Payload Too Large");
+        assert_eq!(status_description(415), "Unsupported Media Type");
         assert_eq!(status_description(422), "Unprocessable Entity");
         assert_eq!(status_description(500), "Internal Server Error");
+        assert_eq!(status_description(503), "Service Unavailable");
         assert_eq!(status_description(418), "Response");
     }
 
