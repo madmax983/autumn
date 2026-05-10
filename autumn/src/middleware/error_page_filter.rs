@@ -60,7 +60,7 @@ pub struct WantsHtml(pub bool);
 #[derive(Clone, Debug)]
 pub struct ErrorPageRequestContext {
     pub uri: axum::http::Uri,
-    pub request_id: Option<crate::middleware::RequestId>,
+    pub request_id: Option<String>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -105,7 +105,7 @@ where
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .cloned();
+            .map(std::string::ToString::to_string);
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -122,7 +122,7 @@ pin_project_lite::pin_project! {
         inner: F,
         wants_html: bool,
         uri: axum::http::Uri,
-        request_id: Option<crate::middleware::RequestId>,
+        request_id: Option<String>,
     }
 }
 
@@ -142,9 +142,16 @@ where
                 response
                     .extensions_mut()
                     .insert(WantsHtml(*this.wants_html));
+                let request_id = this.request_id.clone().or_else(|| {
+                    response
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                });
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
-                    request_id: this.request_id.clone(),
+                    request_id,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -158,8 +165,12 @@ where
 /// Returns `true` for typical browser requests (`text/html` or `*/*`),
 /// `false` for API requests (`application/json`).
 fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
-    let accept = req
-        .headers()
+    accept_prefers_html(req.headers())
+}
+
+/// Check whether an Accept header prefers an HTML response over JSON.
+pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -195,12 +206,17 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
                 q = parsed.clamp(0.0, 1.0);
             }
         }
+        if q <= 0.0 {
+            continue;
+        }
 
         match mime {
             "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
                 html = Some((q, index));
             }
-            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+            "application/json" | "application/problem+json"
+                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
                 json = Some((q, index));
             }
             "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
@@ -247,11 +263,7 @@ impl ErrorPageFilter {
         let request_id = response
             .extensions()
             .get::<ErrorPageRequestContext>()
-            .and_then(|ctx| {
-                ctx.request_id
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-            });
+            .and_then(|ctx| ctx.request_id.clone());
 
         let path = response
             .extensions()
@@ -375,6 +387,15 @@ mod tests {
     fn prefers_json_when_json_has_higher_q() {
         let req = Request::builder()
             .header("accept", "text/html;q=0.4, application/json;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_problem_json_when_problem_json_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "application/problem+json, text/html;q=0.1")
             .body(Body::empty())
             .unwrap();
         assert!(!accepts_html(&req));
@@ -516,14 +537,15 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            ct.contains("application/json"),
-            "JSON API should get JSON response, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON API should get Problem Details response, got: {ct}"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 404);
+        assert_eq!(json["status"], 404);
+        assert_eq!(json["code"], "autumn.not_found");
     }
 
     #[tokio::test]
@@ -676,8 +698,8 @@ mod tests {
             .to_str()
             .expect("content-type should be valid UTF-8");
         assert!(
-            ct.contains("application/json"),
-            "JSON requests should still get JSON, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON requests should still get Problem Details, got: {ct}"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

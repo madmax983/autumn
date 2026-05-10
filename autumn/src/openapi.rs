@@ -493,6 +493,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
     for (name, schema) in &config.additional_schemas {
         registry.insert(name.clone(), schema.clone());
     }
+    registry.insert("ProblemDetails", problem_details_schema());
 
     // Collect every named schema reference produced by any operation so
     // we can back-fill component entries for types the user didn't
@@ -668,6 +669,8 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
         },
     );
 
+    insert_problem_responses(&mut responses);
+
     // Security requirement — emit BearerAuth when the route is `#[secured]`.
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();
@@ -740,6 +743,91 @@ fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&
 }
 
 #[cfg(feature = "openapi")]
+fn insert_problem_responses(responses: &mut BTreeMap<String, Response>) {
+    for status in [400_u16, 401, 403, 404, 409, 413, 415, 422, 500, 503] {
+        responses.entry(status.to_string()).or_insert_with(|| {
+            let mut content = BTreeMap::new();
+            content.insert(
+                "application/problem+json".to_owned(),
+                MediaType {
+                    schema: serde_json::json!({
+                        "$ref": "#/components/schemas/ProblemDetails",
+                    }),
+                },
+            );
+            Response {
+                description: status_description(status).to_owned(),
+                content,
+            }
+        });
+    }
+}
+
+#[cfg(feature = "openapi")]
+fn problem_details_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "type",
+            "title",
+            "status",
+            "detail",
+            "instance",
+            "code",
+            "request_id",
+            "errors",
+        ],
+        "properties": {
+            "type": {
+                "type": "string",
+                "format": "uri-reference",
+            },
+            "title": {
+                "type": "string",
+            },
+            "status": {
+                "type": "integer",
+                "minimum": 400,
+                "maximum": 599,
+            },
+            "detail": {
+                "type": "string",
+            },
+            "instance": {
+                "type": ["string", "null"],
+            },
+            "code": {
+                "type": "string",
+                "pattern": "^autumn\\.[a-z0-9_]+$",
+            },
+            "request_id": {
+                "type": ["string", "null"],
+            },
+            "errors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["field", "messages"],
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                        },
+                        "messages": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
+}
+
+#[cfg(feature = "openapi")]
 fn default_tag(path: &str) -> Option<&str> {
     path.trim_start_matches('/')
         .split('/')
@@ -760,8 +848,11 @@ const fn status_description(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Response",
     }
 }
@@ -1081,8 +1172,11 @@ mod tests {
         assert_eq!(status_description(403), "Forbidden");
         assert_eq!(status_description(404), "Not Found");
         assert_eq!(status_description(409), "Conflict");
+        assert_eq!(status_description(413), "Payload Too Large");
+        assert_eq!(status_description(415), "Unsupported Media Type");
         assert_eq!(status_description(422), "Unprocessable Entity");
         assert_eq!(status_description(500), "Internal Server Error");
+        assert_eq!(status_description(503), "Service Unavailable");
         assert_eq!(status_description(418), "Response");
     }
 

@@ -773,8 +773,8 @@ pub use maud::html;
 /// When returned from a handler, serializes the value as JSON with
 /// `Content-Type: application/json`.
 ///
-/// Re-exported from [Axum](https://docs.rs/axum). See
-/// [`axum::Json`] for full documentation.
+/// Wraps [Axum](https://docs.rs/axum)'s JSON extractor so parse failures use
+/// Autumn's Problem Details error contract.
 ///
 /// # Examples
 ///
@@ -799,8 +799,8 @@ pub use crate::extract::Json;
 ///
 /// Extract typed path parameters from the URL.
 ///
-/// Re-exported from [Axum](https://docs.rs/axum). See
-/// [`axum::extract::Path`] for full documentation.
+/// Wraps [Axum](https://docs.rs/axum)'s path extractor so parse failures use
+/// Autumn's Problem Details error contract.
 ///
 /// # Examples
 ///

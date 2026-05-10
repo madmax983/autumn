@@ -240,16 +240,7 @@ pub struct AuthRejection;
 
 impl IntoResponse for AuthRejection {
     fn into_response(self) -> Response {
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "status": 401,
-                    "message": "authentication required"
-                }
-            })),
-        )
-            .into_response()
+        crate::AutumnError::unauthorized_msg("authentication required").into_response()
     }
 }
 
@@ -347,18 +338,21 @@ where
             if is_authenticated {
                 inner.call(req).await
             } else {
-                let body = serde_json::json!({
-                    "error": {
-                        "status": 401,
-                        "message": "authentication required"
-                    }
-                });
+                let body = crate::error::problem_details_json_string(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication required",
+                    None,
+                    None,
+                    req.extensions()
+                        .get::<crate::middleware::RequestId>()
+                        .map(std::string::ToString::to_string),
+                    Some(req.uri().path().to_owned()),
+                    true,
+                );
                 let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(ResBody::from(
-                        serde_json::to_string(&body).unwrap_or_default(),
-                    ))
+                    .header(http::header::CONTENT_TYPE, "application/problem+json")
+                    .body(ResBody::from(body))
                     .unwrap_or_default();
                 Ok(response)
             }
@@ -1087,7 +1081,8 @@ where
 /// On success the verified principal ID is inserted into request extensions
 /// so handlers can retrieve it via the [`ApiToken`] extractor.
 /// Requests with a missing, malformed, or revoked token are rejected with
-/// `401 Unauthorized` using the same JSON error envelope as [`AuthRejection`].
+/// `401 Unauthorized` using the same Problem Details contract as
+/// [`AuthRejection`].
 ///
 /// Composes with [`RequireAuth`] and session middleware without conflict.
 ///
@@ -1171,32 +1166,49 @@ where
                 .map(str::to_owned);
 
             let Some(raw_token) = raw_token else {
-                return Ok(api_token_unauthorized_response());
+                let (request_id, instance) = api_token_problem_context(&req);
+                return Ok(api_token_unauthorized_response(request_id, instance));
             };
 
-            match store.verify(&raw_token).await {
-                Ok(Some(principal_id)) => {
-                    req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
-                    inner.call(req).await
-                }
-                _ => Ok(api_token_unauthorized_response()),
+            if let Ok(Some(principal_id)) = store.verify(&raw_token).await {
+                req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
+                inner.call(req).await
+            } else {
+                let (request_id, instance) = api_token_problem_context(&req);
+                Ok(api_token_unauthorized_response(request_id, instance))
             }
         })
     }
 }
 
-/// Build a `401 Unauthorized` response using the standard JSON error envelope.
-fn api_token_unauthorized_response<ResBody: From<String> + Default>() -> Response<ResBody> {
-    let body = serde_json::json!({
-        "error": { "status": 401, "message": "authentication required" }
-    });
+/// Build a `401 Unauthorized` response using the standard Problem Details body.
+fn api_token_unauthorized_response<ResBody: From<String> + Default>(
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let body = crate::error::problem_details_json_string(
+        StatusCode::UNAUTHORIZED,
+        "authentication required",
+        None,
+        None,
+        request_id,
+        instance,
+        true,
+    );
     Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(ResBody::from(
-            serde_json::to_string(&body).unwrap_or_default(),
-        ))
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
         .unwrap_or_default()
+}
+
+fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, Option<String>) {
+    (
+        req.extensions()
+            .get::<crate::middleware::RequestId>()
+            .map(std::string::ToString::to_string),
+        Some(req.uri().path().to_owned()),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2248,8 +2260,9 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 401);
-        assert_eq!(json["error"]["message"], "authentication required");
+        assert_eq!(json["status"], 401);
+        assert_eq!(json["detail"], "authentication required");
+        assert_eq!(json["code"], "autumn.unauthorized");
     }
 
     #[test]
@@ -2572,7 +2585,7 @@ mod api_token_tests {
     }
 
     #[tokio::test]
-    async fn require_api_token_401_response_has_json_error_envelope() {
+    async fn require_api_token_401_response_has_problem_details() {
         use axum::body::Body;
         use tower::ServiceExt;
 
@@ -2592,12 +2605,57 @@ mod api_token_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("application/problem+json")
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 401);
-        assert!(json["error"]["message"].as_str().is_some());
+        assert_eq!(json["status"], 401);
+        assert_eq!(json["code"], "autumn.unauthorized");
+        assert!(json["detail"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_401_problem_details_include_request_context() {
+        use crate::middleware::RequestIdLayer;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/api/private", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store))
+            .layer(RequestIdLayer);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request id header should be present")
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["request_id"], request_id);
+        assert_eq!(json["instance"], "/api/private");
     }
 
     // ── ApiToken extractor ───────────────────────────────────────────────────
