@@ -1517,6 +1517,111 @@ pub(crate) fn actuator_router_with_prefix<
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
+
+    #[test]
+    fn task_registry_flow() {
+        let registry = TaskRegistry::new();
+
+        registry.register_scheduled(
+            "my_task",
+            "0 * * * * *",
+            crate::task::TaskCoordination::Fleet,
+            "mock",
+            "node-1",
+        );
+        let snap1 = registry.snapshot();
+        assert_eq!(snap1.get("my_task").unwrap().total_runs, 0);
+
+        registry.record_leader("my_task", "node-1", "mock_tick");
+        let snap3 = registry.snapshot();
+        assert_eq!(
+            snap3.get("my_task").unwrap().current_leader.as_deref(),
+            Some("node-1")
+        );
+
+        registry.record_start("my_task");
+        let snap4 = registry.snapshot();
+        assert_eq!(snap4.get("my_task").unwrap().status, "running");
+
+        registry.record_next_run_at("my_task", "tomorrow");
+        let snap5 = registry.snapshot();
+        assert_eq!(
+            snap5.get("my_task").unwrap().next_run_at.as_deref(),
+            Some("tomorrow")
+        );
+
+        registry.record_success("my_task", 100);
+        let snap6 = registry.snapshot();
+        assert_eq!(snap6.get("my_task").unwrap().total_runs, 1);
+        assert_eq!(snap6.get("my_task").unwrap().last_error, None);
+
+        registry.record_failure("my_task", 150, "error message");
+        let snap7 = registry.snapshot();
+        assert_eq!(snap7.get("my_task").unwrap().total_runs, 2);
+        assert_eq!(snap7.get("my_task").unwrap().total_failures, 1);
+        assert_eq!(
+            snap7.get("my_task").unwrap().last_error.as_deref(),
+            Some("error message")
+        );
+
+        let registry2 = TaskRegistry::default();
+        assert!(registry2.snapshot().is_empty());
+    }
+    #[test]
+    fn job_registry_flow() {
+        let registry = JobRegistry::new();
+
+        registry.register("my_job");
+        let snap1 = registry.snapshot();
+        assert_eq!(snap1.get("my_job").unwrap().queued, 0);
+
+        registry.record_enqueue("my_job");
+        let snap2 = registry.snapshot();
+        assert_eq!(snap2.get("my_job").unwrap().queued, 1);
+
+        registry.record_start("my_job");
+        let snap3 = registry.snapshot();
+        assert_eq!(snap3.get("my_job").unwrap().queued, 0);
+        assert_eq!(snap3.get("my_job").unwrap().in_flight, 1);
+
+        registry.record_retry("my_job", "timeout", 1);
+        let snap4 = registry.snapshot();
+        assert_eq!(snap4.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(
+            snap4.get("my_job").unwrap().last_error.as_deref(),
+            Some("timeout")
+        );
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_success("my_job");
+        let snap5 = registry.snapshot();
+        assert_eq!(snap5.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(snap5.get("my_job").unwrap().total_successes, 1);
+        assert_eq!(snap5.get("my_job").unwrap().last_error, None);
+
+        registry.record_enqueue("my_job");
+        registry.record_cancel("my_job");
+        let snap6 = registry.snapshot();
+        assert_eq!(snap6.get("my_job").unwrap().queued, 0);
+        assert_eq!(snap6.get("my_job").unwrap().in_flight, 0);
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_failure("my_job", "failure".to_string(), true);
+        let snap7 = registry.snapshot();
+        assert_eq!(snap7.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(snap7.get("my_job").unwrap().total_failures, 1);
+        assert_eq!(snap7.get("my_job").unwrap().dead_letters, 1);
+        assert_eq!(
+            snap7.get("my_job").unwrap().last_error.as_deref(),
+            Some("failure")
+        );
+
+        let registry2 = JobRegistry::default();
+        let snap8 = registry2.snapshot();
+        assert!(snap8.is_empty());
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
