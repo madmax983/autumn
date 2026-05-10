@@ -389,7 +389,12 @@ async fn validation_error_structured_details() {
         "field2": "short"
     });
 
-    let response = client.post("/test-validation").json(&payload).send().await;
+    let response = client
+        .post("/test-validation")
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await;
 
     response.assert_status(422);
 

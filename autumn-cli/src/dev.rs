@@ -40,7 +40,7 @@ const WATCH_FILES: &[&str] = &[
 ];
 
 /// Directories that are always watched recursively, regardless of config.
-const DEFAULT_WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations", "views"];
+const DEFAULT_WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
 
 /// Path of the project config file relative to the dev server's working directory.
 const AUTUMN_TOML: &str = "autumn.toml";
@@ -1838,14 +1838,9 @@ watch_dirs = ["views", "locales"]
     #[test]
     fn sanitize_drops_default_dirs() {
         let dirs = sanitize_custom_watch_dirs(DevConfig {
-            watch_dirs: vec![
-                "src".into(),
-                "static".into(),
-                "views".into(),
-                "locales".into(),
-            ],
+            watch_dirs: vec!["src".into(), "static".into(), "views".into()],
         });
-        assert_eq!(dirs, vec!["locales"]);
+        assert_eq!(dirs, vec!["views"]);
     }
 
     #[test]
@@ -1853,13 +1848,13 @@ watch_dirs = ["views", "locales"]
         let dirs = sanitize_custom_watch_dirs(DevConfig {
             watch_dirs: vec![
                 "  ".into(),
-                "locales".into(),
-                "locales".into(),
-                "  other  ".into(),
+                "views".into(),
+                "views".into(),
+                "  locales  ".into(),
                 String::new(),
             ],
         });
-        assert_eq!(dirs, vec!["locales", "other"]);
+        assert_eq!(dirs, vec!["views", "locales"]);
     }
 
     // ── classify_change with custom dirs ───────────────────────────
@@ -2145,11 +2140,11 @@ watch_dirs = ["views", "locales"]
             watch_dirs: vec![
                 "../escape".into(),
                 "target".into(),
-                "other".into(),
+                "views".into(),
                 "./locales".into(),
             ],
         });
         let expected_locales = "locales".to_owned();
-        assert_eq!(dirs, vec!["other".to_owned(), expected_locales]);
+        assert_eq!(dirs, vec!["views".to_owned(), expected_locales]);
     }
 }
