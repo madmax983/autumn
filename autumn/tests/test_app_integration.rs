@@ -395,24 +395,37 @@ async fn validation_error_structured_details() {
 
     let json: serde_json::Value = response.json::<serde_json::Value>();
 
-    let details = &json["error"]["details"];
+    assert_eq!(json["status"], 422);
+    assert_eq!(json["code"], "autumn.validation_failed");
+
+    let errors = json["errors"]
+        .as_array()
+        .expect("errors should be an array of field-level validation failures");
     assert!(
-        details.is_object(),
-        "Details should be an object mapping fields to errors"
+        !errors.is_empty(),
+        "errors should preserve field-level validation failures"
     );
 
-    let field1_errors = details["field1"]
+    let field1 = errors
+        .iter()
+        .find(|error| error["field"] == "field1")
+        .expect("field1 should have an error entry");
+    let field1_errors = field1["messages"]
         .as_array()
-        .expect("field1 should have an array of errors");
+        .expect("field1 should have an array of messages");
     assert!(!field1_errors.is_empty(), "field1 should have errors");
     assert_eq!(
         field1_errors[0].as_str().unwrap(),
         "Custom validation failed"
     );
 
-    let field2_errors = details["field2"]
+    let field2 = errors
+        .iter()
+        .find(|error| error["field"] == "field2")
+        .expect("field2 should have an error entry");
+    let field2_errors = field2["messages"]
         .as_array()
-        .expect("field2 should have an array of errors");
+        .expect("field2 should have an array of messages");
     assert!(!field2_errors.is_empty(), "field2 should have errors");
     assert_eq!(
         field2_errors[0].as_str().unwrap(),

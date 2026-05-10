@@ -13,7 +13,9 @@ use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
-use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
+use crate::middleware::exception_filter::{
+    ExceptionFilter, ExceptionFilterLayer, ProblemDetailsFilter,
+};
 use crate::route::Route;
 use crate::state::AppState;
 use axum::middleware::Next;
@@ -1089,9 +1091,13 @@ fn apply_middleware(
     let error_page_filter =
         crate::middleware::error_page_filter::ErrorPageFilter { renderer, is_dev };
 
-    // Combine the error page filter with user exception filters.
-    // The error page filter runs first (innermost), then user filters.
-    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![Arc::new(error_page_filter)];
+    // Combine the Problem Details normalizer and error page filter with user
+    // exception filters. Problem Details runs first so HTML negotiation can
+    // still replace the JSON response for browser requests.
+    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![
+        Arc::new(ProblemDetailsFilter { is_dev }),
+        Arc::new(error_page_filter),
+    ];
     all_filters.extend(exception_filters);
 
     let count = all_filters.len();

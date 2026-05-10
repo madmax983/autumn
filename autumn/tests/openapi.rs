@@ -619,3 +619,48 @@ fn all_refs_in_spec_are_backed_by_component_schemas() {
     let schemas = spec.components.map(|c| c.schemas).unwrap_or_default();
     assert_all_refs_defined(&spec_json, &schemas);
 }
+
+#[test]
+fn generated_spec_reuses_problem_details_schema_for_errors() {
+    let routes: Vec<Route> = routes![hello, protected_handler];
+    let docs: Vec<&ApiDoc> = routes.iter().map(|r| &r.api_doc).collect();
+    let config = OpenApiConfig::new("Test API", "0.1.0");
+    let spec = autumn_web::openapi::generate_spec(&config, &docs);
+    let components = spec.components.expect("components must be present");
+
+    let problem = components
+        .schemas
+        .get("ProblemDetails")
+        .expect("canonical ProblemDetails schema must be registered");
+    assert_eq!(problem["required"][0], "type");
+    assert!(
+        problem["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"code".into())
+    );
+    assert!(
+        problem["required"]
+            .as_array()
+            .unwrap()
+            .contains(&"errors".into())
+    );
+
+    let op = spec.paths["/protected"].get.as_ref().unwrap();
+    for status in [
+        "400", "401", "403", "404", "413", "415", "422", "500", "503",
+    ] {
+        let response = op
+            .responses
+            .get(status)
+            .unwrap_or_else(|| panic!("missing shared ProblemDetails response {status}"));
+        let media = response
+            .content
+            .get("application/problem+json")
+            .unwrap_or_else(|| panic!("{status} must use application/problem+json"));
+        assert_eq!(
+            media.schema["$ref"], "#/components/schemas/ProblemDetails",
+            "{status} must reference the canonical schema"
+        );
+    }
+}

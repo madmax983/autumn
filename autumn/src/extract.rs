@@ -17,75 +17,144 @@
 //! For the full set of Axum extractors, use
 //! `autumn_web::reexports::axum::extract`.
 
+use axum::extract::{FromRequest, FromRequestParts};
+use axum::response::{IntoResponse, Response};
+
+macro_rules! impl_extractor_deref {
+    ($extractor:ident) => {
+        impl<T> std::ops::Deref for $extractor<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl<T> std::ops::DerefMut for $extractor<T> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+    };
+}
+
 /// Deserialize `application/x-www-form-urlencoded` request bodies.
 ///
-/// Re-exported from [`axum::extract::Form`]. Commonly used with
-/// HTML `<form>` submissions.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use autumn_web::prelude::*;
-/// use serde::Deserialize;
-///
-/// #[derive(Deserialize)]
-/// struct Login { username: String, password: String }
-///
-/// #[post("/login")]
-/// async fn login(Form(input): Form<Login>) -> String {
-///     format!("Welcome, {}!", input.username)
-/// }
-/// ```
-pub use axum::extract::Form;
+/// Wraps [`axum::extract::Form`] so parser failures use Autumn's
+/// Problem Details error contract.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Form<T>(pub T);
+
+impl_extractor_deref!(Form);
+
+impl<S, T> FromRequest<S> for Form<T>
+where
+    S: Send + Sync,
+    axum::extract::Form<T>: FromRequest<S, Rejection = axum::extract::rejection::FormRejection>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Form::from_request(req, state)
+            .await
+            .map(|axum::extract::Form(value)| Self(value))
+            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+    }
+}
 
 /// Deserialize and serialize JSON request/response bodies.
 ///
-/// Re-exported from [`axum::extract::Json`]. As an extractor, parses the
-/// request body. As a return type, serializes the value with
-/// `Content-Type: application/json`.
-///
-/// Also available at the crate root as [`autumn_web::Json`](crate::Json).
-pub use axum::extract::Json;
+/// Wraps [`axum::extract::Json`] so JSON parse failures use Autumn's
+/// Problem Details error contract while successful responses still serialize
+/// exactly like Axum's `Json<T>`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Json<T>(pub T);
+
+impl_extractor_deref!(Json);
+
+impl<S, T> FromRequest<S> for Json<T>
+where
+    S: Send + Sync,
+    axum::extract::Json<T>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Json::from_request(req, state)
+            .await
+            .map(|axum::extract::Json(value)| Self(value))
+            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+    }
+}
+
+impl<T> IntoResponse for Json<T>
+where
+    axum::Json<T>: IntoResponse,
+{
+    fn into_response(self) -> Response {
+        axum::Json(self.0).into_response()
+    }
+}
 
 /// Extract typed path parameters from the URL.
 ///
-/// Re-exported from [`axum::extract::Path`]. Use with route patterns
-/// like `/users/{id}`.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use autumn_web::prelude::*;
-/// use autumn_web::extract::Path;
-///
-/// #[get("/users/{id}")]
-/// async fn get_user(Path(id): Path<i32>) -> String {
-///     format!("User {id}")
-/// }
-/// ```
-pub use axum::extract::Path;
+/// Wraps [`axum::extract::Path`] so path parse failures use Autumn's
+/// Problem Details error contract.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Path<T>(pub T);
+
+impl_extractor_deref!(Path);
+
+impl<S, T> FromRequestParts<S> for Path<T>
+where
+    S: Send + Sync,
+    axum::extract::Path<T>:
+        FromRequestParts<S, Rejection = axum::extract::rejection::PathRejection>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Path::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(value)| Self(value))
+            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+    }
+}
 
 /// Deserialize URL query string parameters.
 ///
-/// Re-exported from [`axum::extract::Query`]. Parses the query string
-/// into a typed struct.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use autumn_web::prelude::*;
-/// use autumn_web::extract::Query;
-/// use serde::Deserialize;
-///
-/// #[derive(Deserialize)]
-/// struct Pagination { page: u32, limit: u32 }
-///
-/// #[get("/items")]
-/// async fn list_items(Query(params): Query<Pagination>) -> String {
-///     format!("Page {} (limit {})", params.page, params.limit)
-/// }
-/// ```
-pub use axum::extract::Query;
+/// Wraps [`axum::extract::Query`] so query parse failures use Autumn's
+/// Problem Details error contract.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Query<T>(pub T);
+
+impl_extractor_deref!(Query);
+
+impl<S, T> FromRequestParts<S> for Query<T>
+where
+    S: Send + Sync,
+    axum::extract::Query<T>:
+        FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+{
+    type Rejection = crate::AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(value)| Self(value))
+            .map_err(|err| rejection_to_error(err.status(), err.body_text()))
+    }
+}
+
+fn rejection_to_error(status: http::StatusCode, body_text: String) -> crate::AutumnError {
+    crate::AutumnError::bad_request_msg(body_text).with_status(status)
+}
 
 /// Multipart form-data extractor with Autumn upload policy integration.
 ///
