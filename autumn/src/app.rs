@@ -1511,7 +1511,11 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
-        // 4d. Provision the configured BlobStore *before* `setup_database`.
+        // 4d. Validate signing secret — production must have a stable, private,
+        // entropy-meeting secret before the server binds. Dev/test are exempt.
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // 4e. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
         // root) and the storage code may `process::exit(1)` on failure
         // (unwritable root, or `storage.backend = "s3"` with no plugin).
@@ -1855,6 +1859,7 @@ impl AppBuilder {
         // was installed. Symmetrical to the same check in run() so static
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
         // Static routes can read presigned URLs out of `BlobStoreState`
@@ -2149,6 +2154,7 @@ impl AppBuilder {
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
 
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
@@ -2887,6 +2893,27 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
     if let Err(error) = config.session.backend_plan(config.profile.as_deref()) {
         eprintln!("Invalid session backend config: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Fail immediately if the signing secret is misconfigured for the active profile.
+///
+/// In production, a missing, too-short, or demo-valued signing secret is a
+/// hard failure — the server must not bind. In dev/test the check is skipped
+/// so zero-config local development continues to work.
+fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
+    use crate::security::config::validate_signing_secret;
+
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let secret = config.security.signing_secret.secret.as_deref();
+
+    if let Err(error) = validate_signing_secret(secret, is_production) {
+        eprintln!("Invalid signing secret configuration: {error}");
+        eprintln!(
+            "  hint: generate a secret with `openssl rand -hex 32` and set \
+             AUTUMN_SECURITY__SIGNING_SECRET"
+        );
         std::process::exit(1);
     }
 }
