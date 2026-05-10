@@ -151,6 +151,32 @@ done
 echo ""
 
 # ---------------------------------------------------------------------------
+# 3b. Every examples/* path referenced in docs/guide/ must appear in the catalog
+# ---------------------------------------------------------------------------
+echo "==> Checking docs/guide/ example references appear in catalog"
+
+DOCS_GUIDE="docs/guide"
+if [[ -d "$DOCS_GUIDE" ]]; then
+  mapfile -t docs_examples < <(
+    grep -rhoE 'examples/[a-z_-]+' "$DOCS_GUIDE" \
+      | sed 's|examples/||' \
+      | sort -u
+  )
+  for ex in "${docs_examples[@]}"; do
+    # Skip references that are just path fragments matching no real directory.
+    [[ -d "$EXAMPLES_DIR/$ex" ]] || continue
+    if printf '%s\n' "${catalog_all[@]}" | grep -qx "$ex"; then
+      ok "  docs/guide/ reference '$ex' found in catalog"
+    else
+      fail "  docs/guide/ reference 'examples/$ex' is NOT in the catalog"
+    fi
+  done
+else
+  warn "docs/guide/ directory not found — skipping guide reference check"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
 # 4. Every supported example must have a README.md with required sections
 # ---------------------------------------------------------------------------
 echo "==> Checking supported examples have README.md with required sections"
