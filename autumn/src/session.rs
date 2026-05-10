@@ -647,8 +647,9 @@ impl<S: SessionStore> SessionLayer<S> {
     ///
     /// When set, the cookie value becomes `{session_id}.{hmac_hex}`. Cookies
     /// without a valid HMAC are treated as absent (new session started).
-    /// `previous` keys in [`ResolvedSigningKeys`] are tried during verification
+    /// Previous keys (see `ResolvedSigningKeys`) are tried during verification
     /// so existing sessions remain valid across a key rotation.
+    #[must_use]
     pub fn with_signing_keys(
         mut self,
         keys: Arc<crate::security::config::ResolvedSigningKeys>,
@@ -762,12 +763,10 @@ where
                     return Ok(session_store_unavailable_response(&error));
                 }
                 // Sign the session ID when signing keys are active
-                let cookie_value = if let Some(ref keys) = signing_keys {
-                    let sig = keys.sign(sid.as_bytes());
-                    format!("{sid}.{sig}")
-                } else {
-                    sid.clone()
-                };
+                let cookie_value = signing_keys.as_ref().map_or_else(
+                    || sid.clone(),
+                    |keys| format!("{sid}.{}", keys.sign(sid.as_bytes())),
+                );
                 if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }

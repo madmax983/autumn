@@ -273,7 +273,7 @@ pub trait JobAdminBackend: Send + Sync + 'static {
     fn cancel(&self, id: &str) -> JobAdminFuture<'_, ()>;
 }
 
-/// Typed [`AppState`](crate::AppState) extension carrying a job-admin backend.
+/// Typed [`AppState`] extension carrying a job-admin backend.
 #[derive(Clone)]
 pub struct JobAdminBackendEntry(pub Arc<dyn JobAdminBackend>);
 

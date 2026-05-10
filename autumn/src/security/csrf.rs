@@ -222,7 +222,7 @@ impl CsrfLayer {
     /// Attach signing keys so CSRF tokens are HMAC-signed.
     ///
     /// When set, tokens are in `{uuid}.{hmac_hex}` format. Unsigned tokens are
-    /// rejected. `previous` keys in [`ResolvedSigningKeys`] allow tokens signed
+    /// rejected. Previous keys (see `ResolvedSigningKeys`) allow tokens signed
     /// with an old key to remain valid during a rotation grace window.
     #[must_use]
     pub fn with_signing_keys(
@@ -338,7 +338,15 @@ where
             .iter()
             .any(|prefix| path.starts_with(prefix.as_str()));
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
-        let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
+        let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
+
+        // When signing is active, discard any cookie that fails HMAC verification
+        // (unsigned pre-upgrade cookies, removed-key cookies, etc.) so a fresh signed
+        // token is minted and the Set-Cookie header refreshes the browser value.
+        let cookie_token = match (&raw_cookie_token, &self.settings.signing_keys) {
+            (Some(tok), Some(_)) if !validate_cookie_token_hmac(tok, &self.settings) => None,
+            _ => raw_cookie_token.clone(),
+        };
 
         // Generate a new token if none exists in the cookie.
         // When signing keys are active, the token is {uuid}.{hmac_hex}.

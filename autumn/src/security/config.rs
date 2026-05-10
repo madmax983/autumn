@@ -214,7 +214,7 @@ pub fn validate_signing_secret(
 // ── Resolved signing key material ─────────────────────────────────────────
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
-pub(crate) fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac =
@@ -300,11 +300,7 @@ impl ResolvedSigningKeys {
 /// Production boot validation (requiring `secret` to be non-empty, long enough,
 /// and not a demo value) is a separate step via [`validate_signing_secret`].
 pub fn resolve_signing_keys(config: &SigningSecretConfig) -> ResolvedSigningKeys {
-    let current = config
-        .secret
-        .as_deref()
-        .map(|s| s.as_bytes().to_vec())
-        .unwrap_or_else(generate_ephemeral_key);
+    let current = config.secret.as_deref().map_or_else(generate_ephemeral_key, |s| s.as_bytes().to_vec());
     let previous = config
         .previous_secrets
         .iter()
