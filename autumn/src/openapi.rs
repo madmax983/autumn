@@ -670,6 +670,8 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
     );
     insert_problem_responses(&mut responses);
 
+    insert_problem_responses(&mut responses);
+
     // Security requirement — emit BearerAuth when the route is `#[secured]`.
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();

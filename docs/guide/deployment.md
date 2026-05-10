@@ -247,6 +247,79 @@ only want to regenerate a subset.
 
 ---
 
+## Signing secret (required before production boot)
+
+Before the server will bind in the `prod` profile, you must set a stable signing
+secret. It protects sessions, CSRF tokens, and signed storage URLs:
+
+```bash
+# Generate once, store securely (e.g. Fly secrets, AWS Secrets Manager, …)
+export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
+```
+
+**Smoke-gate check** — the app must refuse to boot _without_ the secret:
+
+```bash
+docker run --rm \
+  -e AUTUMN_ENV=prod \
+  -e DATABASE_URL=... \
+  myapp 2>&1 | grep -i "signing secret"
+# Expected: "Invalid signing secret configuration: signing secret is required in production"
+```
+
+And must start successfully _with_ a valid secret:
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e AUTUMN_ENV=prod \
+  -e DATABASE_URL=... \
+  -e AUTUMN_SECURITY__SIGNING_SECRET="$AUTUMN_SECURITY__SIGNING_SECRET" \
+  myapp
+```
+
+See [docs/guide/signing-secrets.md](signing-secrets.md) for rotation instructions
+and the full multi-replica setup guide.
+
+---
+
+## Multi-replica setup
+
+To run multiple replicas behind a load balancer, every replica **must use the
+same signing secret and the same Redis session backend**. A session established
+on replica A must be readable by replica B.
+
+```bash
+SECRET=$(openssl rand -hex 32)
+
+# Replica 1
+docker run --rm -p 3000:3000 \
+  -e AUTUMN_ENV=prod \
+  -e DATABASE_URL=postgres://... \
+  -e AUTUMN_SECURITY__SIGNING_SECRET="$SECRET" \
+  -e AUTUMN_SESSION__BACKEND=redis \
+  -e AUTUMN_SESSION__REDIS__URL=redis://redis:6379 \
+  myapp &
+
+# Replica 2 — identical secret and Redis URL
+docker run --rm -p 3001:3000 \
+  -e AUTUMN_ENV=prod \
+  -e DATABASE_URL=postgres://... \
+  -e AUTUMN_SECURITY__SIGNING_SECRET="$SECRET" \
+  -e AUTUMN_SESSION__BACKEND=redis \
+  -e AUTUMN_SESSION__REDIS__URL=redis://redis:6379 \
+  myapp &
+```
+
+With this setup:
+
+- A user who logs in via replica 1 is authenticated on replica 2 without
+  re-logging in (sessions live in Redis, signed with the shared secret).
+- Signed blob URLs generated on replica 1 are served correctly by replica 2
+  (same HMAC key).
+- CSRF tokens validate regardless of which replica handles the form submission.
+
+---
+
 ## Next steps
 
 Once the container is running:

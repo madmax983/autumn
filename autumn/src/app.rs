@@ -1511,7 +1511,11 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
-        // 4d. Provision the configured BlobStore *before* `setup_database`.
+        // 4d. Validate signing secret — production must have a stable, private,
+        // entropy-meeting secret before the server binds. Dev/test are exempt.
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // 4e. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
         // root) and the storage code may `process::exit(1)` on failure
         // (unwritable root, or `storage.backend = "s3"` with no plugin).
@@ -1855,6 +1859,7 @@ impl AppBuilder {
         // was installed. Symmetrical to the same check in run() so static
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
 
         // Preflight the configured BlobStore the same way `run()` does.
         // Static routes can read presigned URLs out of `BlobStoreState`
@@ -2150,6 +2155,7 @@ impl AppBuilder {
             resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
 
         #[cfg(feature = "storage")]
         let storage_bootstrap = blob_store.map_or_else(
@@ -2895,6 +2901,48 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
+/// Fail immediately if the signing secret is misconfigured for the active profile.
+///
+/// In production, a missing, too-short, or demo-valued signing secret is a
+/// hard failure — the server must not bind. In dev/test the check is skipped
+/// so zero-config local development continues to work.
+fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
+    use crate::security::config::validate_signing_secret;
+
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let secret = config.security.signing_secret.secret.as_deref();
+
+    if let Err(error) = validate_signing_secret(secret, is_production) {
+        eprintln!("Invalid signing secret configuration: {error}");
+        eprintln!(
+            "  hint: generate a secret with `openssl rand -hex 32` and set \
+             AUTUMN_SECURITY__SIGNING_SECRET"
+        );
+        std::process::exit(1);
+    }
+
+    // Previous secrets accepted during rotation must meet the same bar as the
+    // current secret — a weak previous key can still be used to forge tokens.
+    if is_production {
+        for (i, prev) in config
+            .security
+            .signing_secret
+            .previous_secrets
+            .iter()
+            .enumerate()
+        {
+            if let Err(error) = validate_signing_secret(Some(prev.as_str()), true) {
+                eprintln!("Invalid signing secret configuration: previous_secrets[{i}]: {error}");
+                eprintln!(
+                    "  hint: every previous secret must meet the same entropy requirement \
+                     as the current secret"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
 /// Constructed [`BlobStore`](crate::storage::BlobStore) plus the
 /// optional axum router that serves signed URLs for the Local backend.
 /// Returned by [`preflight_storage`] before any DB side effects so a
@@ -2996,25 +3044,49 @@ fn bootstrap_local_storage(
         );
     }
 
-    let signing_key = config
-        .storage
-        .local
-        .signing_key
+    // Signing key precedence:
+    // 1. security.signing_secret (canonical, shared with session/CSRF)
+    // 2. storage.local.signing_key (legacy override — still respected)
+    // 3. Random ephemeral key (dev only — warns in prod)
+    let (signing_key, previous_signing_keys) = config
+        .security
+        .signing_secret
+        .secret
         .as_deref()
         .filter(|s| !s.is_empty())
         .map_or_else(
             || {
-                if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                    tracing::warn!(
-                        "no storage.local.signing_key configured in prod; \
-                         generated URLs won't survive a process restart. \
-                         Set [storage.local].signing_key or \
-                         AUTUMN_STORAGE__LOCAL__SIGNING_KEY"
-                    );
-                }
-                SigningKey::random()
+                config
+                    .storage
+                    .local
+                    .signing_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || {
+                            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                                tracing::warn!(
+                                    "no signing secret configured in prod; blob URL signatures \
+                                     won't survive a process restart. Set \
+                                     AUTUMN_SECURITY__SIGNING_SECRET."
+                                );
+                            }
+                            (SigningKey::random(), vec![])
+                        },
+                        |legacy| (SigningKey::new(legacy.as_bytes().to_vec()), vec![]),
+                    )
             },
-            |s| SigningKey::new(s.as_bytes().to_vec()),
+            |secret| {
+                let current = SigningKey::new(secret.as_bytes().to_vec());
+                let previous = config
+                    .security
+                    .signing_secret
+                    .previous_secrets
+                    .iter()
+                    .map(|s| SigningKey::new(s.as_bytes().to_vec()))
+                    .collect::<Vec<_>>();
+                (current, previous)
+            },
         );
 
     let store = match LocalBlobStore::new(
@@ -3023,6 +3095,7 @@ fn bootstrap_local_storage(
         mount_path.to_string(),
         std::time::Duration::from_secs(default_url_expiry_secs),
         signing_key,
+        previous_signing_keys,
     ) {
         Ok(store) => store,
         Err(err) => {

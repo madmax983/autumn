@@ -25,6 +25,25 @@ connect_timeout_secs = 5
 # Requires .migrations(MIGRATIONS) to be registered in main.rs.
 auto_migrate_in_production = true
 
+# ── Signing secret (REQUIRED in production) ─────────────────────────────────
+#
+# The signing secret protects sessions, CSRF tokens, flash/signed-cookie state,
+# and local-storage signed URLs. Production startup will refuse to bind if this
+# is missing, shorter than 32 bytes, or matches a known demo value.
+#
+# Generate:  openssl rand -hex 32
+# Set via environment variable — NEVER commit the actual value here:
+#
+#   export AUTUMN_SECURITY__SIGNING_SECRET="<generated-value>"
+#
+# All replicas must use the same value. See docs/guide/signing-secrets.md for
+# the full contract including rotation and multi-replica setup.
+#
+# Rotation grace window: add the old secret here while deploying the new one.
+# Remove it after session.max_age_secs has elapsed.
+# [security.signing_secret]
+# previous_secrets = []
+
 # Uncomment for OpenTelemetry / OTLP tracing:
 # [telemetry]
 # enabled = true

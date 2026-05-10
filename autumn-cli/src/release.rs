@@ -72,12 +72,47 @@ pub fn run(action: ReleaseAction) {
                     for f in &files {
                         println!("  Created {f}");
                     }
+
+                    // Smoke gate: verify the generated production config does
+                    // not contain a committed signing secret literal.
+                    let config_path = cwd.join("autumn.production.toml.example");
+                    if let Ok(content) = std::fs::read_to_string(&config_path)
+                        && let Err(e) = check_production_config_signing_secret(&content)
+                    {
+                        eprintln!("Warning: smoke gate failed for generated config: {e}");
+                    }
+
                     println!();
                     println!("Next steps:");
-                    println!("  docker build -t {project_name} .");
-                    println!("  docker run --rm -p 3000:3000 -e DATABASE_URL=... {project_name}");
+                    println!(
+                        "  1. Generate and set your signing secret (REQUIRED before production boot):"
+                    );
+                    println!(
+                        "       export AUTUMN_SECURITY__SIGNING_SECRET=\"$(openssl rand -hex 32)\""
+                    );
+                    println!("     Smoke-gate check — the app must refuse to start without it:");
+                    println!("       AUTUMN_ENV=prod docker run --rm \\");
+                    println!("         -e DATABASE_URL=... \\");
+                    println!("         {project_name} 2>&1 | grep -i 'signing secret'");
+                    println!("     And must start with it:");
+                    println!("       AUTUMN_ENV=prod docker run --rm \\");
+                    println!("         -e DATABASE_URL=... \\");
+                    println!(
+                        "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
+                    );
+                    println!("         {project_name}");
                     println!();
-                    println!("See docs/guide/deployment.md for the full walkthrough.");
+                    println!("  2. Build and run:");
+                    println!("       docker build -t {project_name} .");
+                    println!("       docker run --rm -p 3000:3000 -e DATABASE_URL=... \\");
+                    println!(
+                        "         -e AUTUMN_SECURITY__SIGNING_SECRET=\"$AUTUMN_SECURITY__SIGNING_SECRET\" \\"
+                    );
+                    println!("         {project_name}");
+                    println!();
+                    println!(
+                        "  See docs/guide/deployment.md and docs/guide/signing-secrets.md for the full walkthrough."
+                    );
                 }
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -86,6 +121,45 @@ pub fn run(action: ReleaseAction) {
             }
         }
     }
+}
+
+/// Validate a generated production config file for signing-secret compliance.
+///
+/// Returns `Ok(())` when the config file correctly documents the signing
+/// secret via an environment variable reference (not a committed literal value).
+/// Returns `Err` with a human-readable explanation when the file contains a
+/// committed secret literal.
+///
+/// Used by the release checklist smoke gate to verify that generated
+/// deployment files obey the "never commit secrets" rule.
+///
+/// # Errors
+///
+/// Returns a string error message when a raw signing secret literal is found
+/// in a non-comment line of `content`.
+pub fn check_production_config_signing_secret(content: &str) -> Result<(), String> {
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        // A non-comment line containing a `secret =` assignment with a non-empty
+        // RHS is a committed secret literal — a critical misconfiguration.
+        if let Some(rest) = trimmed.strip_prefix("secret") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let value = rest.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() && value != "[]" {
+                    return Err(format!(
+                        "line {}: production config contains a committed signing secret literal \
+                         at `secret = ...`; use AUTUMN_SECURITY__SIGNING_SECRET env var instead",
+                        line_num + 1,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
@@ -431,6 +505,83 @@ mod tests {
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join(".dockerignore")).unwrap();
         assert!(content.contains("dist"), ".dockerignore must exclude dist/");
+    }
+
+    // ── signing-secret smoke gate ─────────────────────────────────────────────
+
+    #[test]
+    fn production_config_template_documents_signing_secret_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        assert!(
+            content.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
+            "production config template must document the signing-secret env var"
+        );
+    }
+
+    #[test]
+    fn production_config_template_documents_openssl_rand_command() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        assert!(
+            content.contains("openssl rand -hex 32"),
+            "production config template must show the secret generation command"
+        );
+    }
+
+    #[test]
+    fn production_config_template_mentions_signing_secrets_guide() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("autumn.production.toml.example")).unwrap();
+        assert!(
+            content.contains("signing-secrets.md"),
+            "production config template must link to the signing-secrets guide"
+        );
+    }
+
+    #[test]
+    fn smoke_gate_passes_for_valid_config() {
+        let content = r#"
+# This is a comment with secret = "ignored"
+[server]
+port = 3000
+"#;
+        assert!(check_production_config_signing_secret(content).is_ok());
+    }
+
+    #[test]
+    fn smoke_gate_fails_when_secret_literal_committed() {
+        let content = r#"
+[security.signing_secret]
+secret = "my-actual-secret-value-here"
+"#;
+        let err = check_production_config_signing_secret(content).unwrap_err();
+        assert!(err.contains("committed signing secret literal"));
+    }
+
+    #[test]
+    fn smoke_gate_ignores_commented_secret_lines() {
+        // Comments are allowed to mention the key name for documentation.
+        let content = r#"
+# secret = "example-value-for-docs"
+# Set AUTUMN_SECURITY__SIGNING_SECRET instead
+"#;
+        assert!(check_production_config_signing_secret(content).is_ok());
+    }
+
+    #[test]
+    fn smoke_gate_passes_for_empty_previous_secrets() {
+        let content = "
+[security.signing_secret]
+previous_secrets = []
+";
+        assert!(check_production_config_signing_secret(content).is_ok());
     }
 
     // ── production config content ─────────────────────────────────────────────

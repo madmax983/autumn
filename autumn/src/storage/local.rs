@@ -83,6 +83,8 @@ struct LocalInner {
     mount_path: String,
     default_expiry: Duration,
     signing_key: SigningKey,
+    /// Former signing keys accepted during a rotation grace window.
+    previous_signing_keys: Vec<SigningKey>,
 }
 
 impl LocalBlobStore {
@@ -101,6 +103,7 @@ impl LocalBlobStore {
         mount_path: impl Into<String>,
         default_expiry: Duration,
         signing_key: SigningKey,
+        previous_signing_keys: Vec<SigningKey>,
     ) -> Result<Self, BlobStoreError> {
         let mount_path = mount_path.into();
         // axum panics with `Paths must start with a '/'` if we hand it a
@@ -128,6 +131,7 @@ impl LocalBlobStore {
                 mount_path,
                 default_expiry,
                 signing_key,
+                previous_signing_keys,
             }),
         })
     }
@@ -753,6 +757,38 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// Verify a signed blob URL against `current` and each `previous` key.
+///
+/// Expiry is checked first (same for all keys). The signature is then compared
+/// against every key using constant-time comparison; the first match wins.
+/// This enables a rotation grace window: sign new URLs with `current` while
+/// URLs that were signed with an old key continue to serve until their expiry.
+pub(crate) fn verify_with_rotation(
+    current: &SigningKey,
+    previous: &[SigningKey],
+    blob_key: &str,
+    expires_at: u64,
+    signature: &str,
+) -> Result<(), BlobStoreError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if expires_at < now {
+        return Err(BlobStoreError::Signature("signed url expired".into()));
+    }
+    let expected_current = sign(current.as_bytes(), blob_key, expires_at);
+    if constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
+        return Ok(());
+    }
+    for prev in previous {
+        let expected = sign(prev.as_bytes(), blob_key, expires_at);
+        if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+            return Ok(());
+        }
+    }
+    Err(BlobStoreError::Signature("signature mismatch".into()))
+}
+
 // ── Serving route ──────────────────────────────────────────────
 
 /// Build the axum router that serves signed local-blob URLs.
@@ -774,7 +810,13 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     let handler = move |Path(blob_key): Path<String>, Query(q): Query<SignedQuery>| {
         let store = store_for_route.clone();
         async move {
-            if let Err(err) = verify(store.signing_key().as_bytes(), &blob_key, q.exp, &q.sig) {
+            if let Err(err) = verify_with_rotation(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                &blob_key,
+                q.exp,
+                &q.sig,
+            ) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
             match store.get_with_meta(&blob_key).await {
@@ -811,6 +853,7 @@ mod tests {
             "/_blobs",
             Duration::from_secs(60),
             SigningKey::new(b"test-key".to_vec()),
+            vec![],
         )
         .unwrap()
     }
@@ -891,6 +934,7 @@ mod tests {
             "_blobs", // missing leading slash
             Duration::from_secs(60),
             SigningKey::new(b"k".to_vec()),
+            vec![],
         )
         .unwrap_err();
         assert!(matches!(err, BlobStoreError::InvalidInput(_)));
@@ -1532,6 +1576,7 @@ mod tests {
             "/mnt",
             std::time::Duration::from_secs(3600),
             SigningKey::random(),
+            vec![],
         )
         .unwrap();
         assert_eq!(s.provider_id(), "local_test_id");
@@ -1543,5 +1588,64 @@ mod tests {
         let dbg = format!("{key:?}");
         assert!(!dbg.contains("super-secret"));
         assert!(dbg.contains("len"));
+    }
+
+    // ── Previous-key rotation (RED phase) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn blob_url_signed_with_previous_key_still_verifies() {
+        let dir = temp_root();
+        let old_key = SigningKey::new(b"old-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
+        let new_key = SigningKey::new(b"new-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
+
+        // Store is built with new key + old key as previous
+        let store = LocalBlobStore::new(
+            "test",
+            dir.path(),
+            "/_blobs",
+            Duration::from_secs(60),
+            new_key,
+            vec![old_key.clone()],
+        )
+        .unwrap();
+
+        store
+            .put("a/b.txt", "text/plain", bytes::Bytes::from_static(b"hi"))
+            .await
+            .unwrap();
+
+        // Sign a URL with the old key directly
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let old_sig = sign(old_key.as_bytes(), "a/b.txt", exp);
+
+        // The store should accept it via its previous-key list
+        assert!(
+            verify_with_rotation(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                "a/b.txt",
+                exp,
+                &old_sig
+            )
+            .is_ok(),
+            "old-key signed URL must verify during grace window"
+        );
+    }
+
+    #[test]
+    fn blob_url_expired_with_previous_key_still_rejects() {
+        let old_key = SigningKey::new(b"old-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
+        let new_key = SigningKey::new(b"new-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
+        let expired_exp = 1u64; // Unix epoch + 1s — already expired
+        let old_sig = sign(old_key.as_bytes(), "a/b.txt", expired_exp);
+        let result = verify_with_rotation(&new_key, &[old_key], "a/b.txt", expired_exp, &old_sig);
+        assert!(
+            result.is_err(),
+            "expired URL must be rejected even with valid previous key"
+        );
     }
 }

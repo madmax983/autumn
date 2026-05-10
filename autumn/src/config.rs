@@ -103,6 +103,7 @@
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
 //! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
 //! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
+//! | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` | `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -1588,6 +1589,7 @@ impl AutumnConfig {
     }
 
     /// Apply `AUTUMN_SECURITY__*` environment variable overrides.
+    #[allow(clippy::too_many_lines)]
     fn apply_security_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_string(
             env,
@@ -1694,6 +1696,13 @@ impl AutumnConfig {
             env,
             "AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API",
             &mut self.security.allow_unauthorized_repository_api,
+        );
+
+        // Signing secret (canonical env var documented in deployment guide)
+        parse_env_option_string(
+            env,
+            "AUTUMN_SECURITY__SIGNING_SECRET",
+            &mut self.security.signing_secret.secret,
         );
     }
 

@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security — production signing-secret gate (#597):** Autumn now validates
+  the signing secret before the server binds. All framework-owned signed
+  surfaces — sessions, CSRF tokens, flash/signed-cookie state, and
+  local-storage signed URLs — share one secret configured via
+  `AUTUMN_SECURITY__SIGNING_SECRET`.
+
+  **Behaviour by profile:**
+  - `dev` / `test`: zero-config — an ephemeral per-process key is generated
+    automatically. Sessions and signed URLs do *not* survive restarts; this
+    is expected and documented.
+  - `prod` / `production`: the server **refuses to start** if the secret is
+    missing, shorter than 32 bytes, or matches a known demo/template value
+    (e.g. `"changeme"`, `"secret"`).
+
+  **Rotation:** set `secret` to the new value and move the previous value to
+  `previous_secrets`. New signatures use `secret`; existing tokens signed with
+  any `previous_secrets` entry continue to validate during the grace window.
+  Remove old entries after the maximum relevant cookie/token lifetime elapses.
+
+  **`autumn doctor`** now includes a `signing_secret` check that reports
+  readiness in human-readable and JSON output; `--strict` treats production
+  secret problems as failures.
+
+  **Migration** (pre-1.0 production deployments): generate a secret with
+  `openssl rand -hex 32`, then set `AUTUMN_SECURITY__SIGNING_SECRET` before
+  upgrading. Without it, production startup will fail.
+
 - **generators:** `autumn generate scaffold` now accepts repeatable
   `--index`, `--validate`, `--default`, and `--query` flags so generated
   resources can include field indexes, validator attributes, SQL defaults,
