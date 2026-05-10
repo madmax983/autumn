@@ -15,7 +15,7 @@
 //! ([`ConnectInfo<SocketAddr>`]) by default. When
 //! [`RateLimitConfig::trust_forwarded_headers`] is `true` — which should
 //! only be set behind a reverse proxy that strips and rewrites these
-//! headers — the limiter consults `X-Forwarded-For` (first entry) and
+//! headers — the limiter consults `X-Forwarded-For` (last entry) and
 //! `X-Real-IP` first, falling back to the peer address.
 //!
 //! Requests with no identifiable client (no trusted forwarding header
@@ -154,7 +154,7 @@ impl Limiter {
     /// the static site generator and `Router::oneshot`-style test
     /// harnesses fall into this path.
     ///
-    /// When `trust_forwarded_headers` is `true`, the first entry of
+    /// When `trust_forwarded_headers` is `true`, the last entry of
     /// `X-Forwarded-For` and then `X-Real-IP` are consulted before
     /// [`ConnectInfo<SocketAddr>`]. Otherwise only the peer address is
     /// used.
@@ -164,7 +164,7 @@ impl Limiter {
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.rsplit(',').next())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned);
@@ -440,12 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_x_forwarded_for_first_entry_when_trusted() {
+    fn client_ip_prevents_spoofing() {
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "attacker_spoofed_ip, real_client_ip")
+            .body(())
+            .expect("infallible response builder");
+        assert_eq!(
+            limiter(true).client_ip(&req).as_deref(),
+            Some("real_client_ip")
+        );
+    }
+
+    #[test]
+    fn client_ip_prefers_x_forwarded_for_last_entry_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .expect("infallible response builder");
-        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("1.2.3.4"));
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("5.6.7.8"));
     }
 
     #[test]
@@ -494,11 +506,11 @@ mod tests {
     #[test]
     fn client_ip_empty_xff_falls_through_to_x_real_ip_when_trusted() {
         let req: Request<()> = Request::builder()
-            .header("X-Forwarded-For", " , 5.5.5.5")
+            .header("X-Forwarded-For", "5.5.5.5,  ")
             .header("X-Real-IP", "8.8.8.8")
             .body(())
             .expect("infallible response builder");
-        // First XFF entry is empty after trim, so we fall back to X-Real-IP.
+        // Last XFF entry is empty after trim, so we fall back to X-Real-IP.
         assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("8.8.8.8"));
     }
 
