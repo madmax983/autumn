@@ -126,9 +126,7 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
                  sessions and signed URLs will not survive restarts or be shared across replicas)"
                     .into(),
             ),
-            hint: Some(
-                "Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production",
-            ),
+            hint: Some("Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production"),
         },
         Some(s) if is_production => {
             // Demo-value check first: "changeme" is more informative than "too short".
@@ -137,9 +135,7 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
                 return CheckResult {
                     name: "signing_secret",
                     status: CheckStatus::Fail,
-                    detail: Some(
-                        "signing secret matches a known demo/template value".into(),
-                    ),
+                    detail: Some("signing secret matches a known demo/template value".into()),
                     hint: Some("Generate a new secret: `openssl rand -hex 32`"),
                 };
             }
@@ -158,9 +154,7 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
             CheckResult {
                 name: "signing_secret",
                 status: CheckStatus::Pass,
-                detail: Some(
-                    "signing secret is present and meets entropy requirements".into(),
-                ),
+                detail: Some("signing secret is present and meets entropy requirements".into()),
                 hint: None,
             }
         }

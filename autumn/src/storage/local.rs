@@ -809,7 +809,13 @@ pub fn serve_router(store: &LocalBlobStore) -> axum::Router<crate::AppState> {
     let handler = move |Path(blob_key): Path<String>, Query(q): Query<SignedQuery>| {
         let store = store_for_route.clone();
         async move {
-            if let Err(err) = verify_with_rotation(&store.inner.signing_key, &store.inner.previous_signing_keys, &blob_key, q.exp, &q.sig) {
+            if let Err(err) = verify_with_rotation(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                &blob_key,
+                q.exp,
+                &q.sig,
+            ) {
                 return (StatusCode::FORBIDDEN, err.to_string()).into_response();
             }
             match store.get_with_meta(&blob_key).await {
@@ -1617,7 +1623,14 @@ mod tests {
 
         // The store should accept it via its previous-key list
         assert!(
-            verify_with_rotation(&store.inner.signing_key, &store.inner.previous_signing_keys, "a/b.txt", exp, &old_sig).is_ok(),
+            verify_with_rotation(
+                &store.inner.signing_key,
+                &store.inner.previous_signing_keys,
+                "a/b.txt",
+                exp,
+                &old_sig
+            )
+            .is_ok(),
             "old-key signed URL must verify during grace window"
         );
     }
@@ -1628,13 +1641,10 @@ mod tests {
         let new_key = SigningKey::new(b"new-key-32-bytes-xxxxxxxxxxxxxxx".to_vec());
         let expired_exp = 1u64; // Unix epoch + 1s — already expired
         let old_sig = sign(old_key.as_bytes(), "a/b.txt", expired_exp);
-        let result = verify_with_rotation(
-            &new_key,
-            &[old_key],
-            "a/b.txt",
-            expired_exp,
-            &old_sig,
+        let result = verify_with_rotation(&new_key, &[old_key], "a/b.txt", expired_exp, &old_sig);
+        assert!(
+            result.is_err(),
+            "expired URL must be rejected even with valid previous key"
         );
-        assert!(result.is_err(), "expired URL must be rejected even with valid previous key");
     }
 }
