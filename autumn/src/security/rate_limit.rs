@@ -15,8 +15,13 @@
 //! ([`ConnectInfo<SocketAddr>`]) by default. When
 //! [`RateLimitConfig::trust_forwarded_headers`] is `true` — which should
 //! only be set behind a reverse proxy that strips and rewrites these
-//! headers — the limiter consults `X-Forwarded-For` (first entry) and
-//! `X-Real-IP` first, falling back to the peer address.
+//! headers — the limiter consults `X-Forwarded-For` and `X-Real-IP` first,
+//! falling back to the peer address. If
+//! [`RateLimitConfig::trusted_proxies`] is configured, trusted proxy
+//! addresses at the right side of the `X-Forwarded-For` chain are skipped,
+//! but only when the request peer address is present and trusted, so
+//! appended proxy chains still key on the nearest untrusted client without
+//! trusting spoofable headers from direct callers.
 //!
 //! Requests with no identifiable client (no trusted forwarding header
 //! AND no `ConnectInfo`) bypass rate limiting entirely. In-process
@@ -37,7 +42,7 @@
 
 use lru::LruCache;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 
@@ -62,6 +67,8 @@ struct Limiter {
     burst: f64,
     burst_header: HeaderValue,
     trust_forwarded_headers: bool,
+    trusted_proxies_configured: bool,
+    trusted_proxies: Vec<TrustedProxy>,
     buckets: Mutex<LruCache<String, Bucket>>,
 }
 
@@ -69,6 +76,65 @@ struct Limiter {
 struct Bucket {
     tokens: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrustedProxy {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    fn parse(value: &str) -> Option<Self> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (addr, prefix_len) = if let Some((addr, prefix)) = trimmed.split_once('/') {
+            let addr = addr.trim().parse::<IpAddr>().ok()?;
+            let prefix_len = prefix.trim().parse::<u8>().ok()?;
+            (addr, prefix_len)
+        } else {
+            let addr = trimmed.parse::<IpAddr>().ok()?;
+            let prefix_len = match addr {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            (addr, prefix_len)
+        };
+
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+
+        (prefix_len <= max_prefix).then_some(Self {
+            network: addr,
+            prefix_len,
+        })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        if self.prefix_len == 0 {
+            return matches!(
+                (self.network, ip),
+                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_))
+            );
+        }
+
+        match (self.network, ip) {
+            (IpAddr::V4(network), IpAddr::V4(candidate)) => {
+                let shift = 32_u8.saturating_sub(self.prefix_len);
+                (u32::from(network) >> shift) == (u32::from(candidate) >> shift)
+            }
+            (IpAddr::V6(network), IpAddr::V6(candidate)) => {
+                let shift = 128_u8.saturating_sub(self.prefix_len);
+                (u128::from(network) >> shift) == (u128::from(candidate) >> shift)
+            }
+            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+        }
+    }
 }
 
 /// Outcome of consuming one token from a bucket.
@@ -83,11 +149,27 @@ impl Limiter {
         let burst = f64::from(config.burst.max(1));
         let refill_per_sec = config.requests_per_second.max(f64::MIN_POSITIVE);
         let burst_header = HeaderValue::from(config.burst.max(1));
+        let trusted_proxies_configured = !config.trusted_proxies.is_empty();
+        let trusted_proxies = config
+            .trusted_proxies
+            .iter()
+            .filter_map(|proxy| {
+                TrustedProxy::parse(proxy).or_else(|| {
+                    tracing::warn!(
+                        trusted_proxy = %proxy,
+                        "ignoring invalid rate limit trusted proxy"
+                    );
+                    None
+                })
+            })
+            .collect();
         Self {
             refill_per_sec,
             burst,
             burst_header,
             trust_forwarded_headers: config.trust_forwarded_headers,
+            trusted_proxies_configured,
+            trusted_proxies,
             buckets: Mutex::new(LruCache::new(
                 NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
             )),
@@ -154,20 +236,21 @@ impl Limiter {
     /// the static site generator and `Router::oneshot`-style test
     /// harnesses fall into this path.
     ///
-    /// When `trust_forwarded_headers` is `true`, the first entry of
-    /// `X-Forwarded-For` and then `X-Real-IP` are consulted before
-    /// [`ConnectInfo<SocketAddr>`]. Otherwise only the peer address is
-    /// used.
+    /// When `trust_forwarded_headers` is `true`, `X-Forwarded-For` and
+    /// then `X-Real-IP` are consulted before [`ConnectInfo<SocketAddr>`].
+    /// If trusted proxies are configured, the `X-Forwarded-For` chain is
+    /// walked from right to left and configured proxy IPs/CIDRs are
+    /// skipped, but only when the request peer is present and trusted.
+    /// Without a trusted proxy list, the last non-empty XFF entry is used
+    /// for backward compatibility with single-proxy setups where the final
+    /// proxy overwrites the forwarding header.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
-        if self.trust_forwarded_headers {
+        if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
             let xff_ip = req
                 .headers()
                 .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned);
+                .and_then(|s| self.client_ip_from_x_forwarded_for(s));
 
             if xff_ip.is_some() {
                 return xff_ip;
@@ -186,9 +269,50 @@ impl Limiter {
             }
         }
 
+        Self::peer_ip(req).map(|ip| ip.to_string())
+    }
+
+    fn peer_ip<B>(req: &Request<B>) -> Option<IpAddr> {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
-            .map(|ConnectInfo(addr)| addr.ip().to_string())
+            .map(|ConnectInfo(addr)| addr.ip())
+    }
+
+    fn forwarded_headers_allowed<B>(&self, req: &Request<B>) -> bool {
+        if !self.trusted_proxies_configured {
+            return true;
+        }
+
+        Self::peer_ip(req).is_some_and(|peer_ip| self.is_trusted_proxy(peer_ip))
+    }
+
+    fn client_ip_from_x_forwarded_for(&self, header: &str) -> Option<String> {
+        if !self.trusted_proxies_configured {
+            return header
+                .rsplit(',')
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+        }
+
+        for entry in header.rsplit(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Ok(ip) = entry.parse::<IpAddr>() else {
+                continue;
+            };
+
+            if !self.is_trusted_proxy(ip) {
+                return Some(ip.to_string());
+            }
+        }
+
+        None
+    }
+
+    fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies
+            .iter()
+            .any(|trusted_proxy| trusted_proxy.contains(ip))
     }
 }
 
@@ -301,6 +425,7 @@ mod tests {
             // Tests exercise the key-by-IP path via X-Forwarded-For so
             // they don't need a real TCP listener.
             trust_forwarded_headers: true,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -325,7 +450,28 @@ mod tests {
             requests_per_second: 10.0,
             burst: 5,
             trust_forwarded_headers: trust,
+            trusted_proxies: Vec::new(),
         })
+    }
+
+    fn limiter_with_trusted_proxies(proxies: &[&str]) -> Limiter {
+        Limiter::from_config(&RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: true,
+            trusted_proxies: proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
+        })
+    }
+
+    fn req_with_connect_info(xff: &str, peer: &str) -> Request<()> {
+        let mut req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", xff)
+            .body(())
+            .expect("infallible response builder");
+        let addr: SocketAddr = peer.parse().expect("test peer socket address parses");
+        req.extensions_mut().insert(ConnectInfo(addr));
+        req
     }
 
     #[tokio::test]
@@ -440,12 +586,97 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_prefers_x_forwarded_for_first_entry_when_trusted() {
+    fn client_ip_prevents_spoofing() {
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "attacker_spoofed_ip, real_client_ip")
+            .body(())
+            .expect("infallible response builder");
+        assert_eq!(
+            limiter(true).client_ip(&req).as_deref(),
+            Some("real_client_ip")
+        );
+    }
+
+    #[test]
+    fn client_ip_prefers_x_forwarded_for_last_entry_when_trusted() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .expect("infallible response builder");
-        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("1.2.3.4"));
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("5.6.7.8"));
+    }
+
+    #[test]
+    fn client_ip_skips_configured_trusted_proxy_chain_entries() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "203.0.113.10:4000");
+        assert_eq!(
+            limiter_with_trusted_proxies(&["203.0.113.10"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("198.51.100.77")
+        );
+    }
+
+    #[test]
+    fn client_ip_skips_configured_trusted_proxy_cidr_entries() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10, 10.0.0.5", "10.0.0.5:4000");
+        assert_eq!(
+            limiter_with_trusted_proxies(&["203.0.113.0/24", "10.0.0.5"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("198.51.100.77")
+        );
+    }
+
+    #[test]
+    fn client_ip_accepts_forwarded_chain_from_configured_trusted_peer() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "10.0.0.5:4000");
+
+        assert_eq!(
+            limiter_with_trusted_proxies(&["10.0.0.5", "203.0.113.10"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("198.51.100.77")
+        );
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_chain_from_untrusted_peer() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "192.0.2.44:4000");
+
+        assert_eq!(
+            limiter_with_trusted_proxies(&["203.0.113.10"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("192.0.2.44")
+        );
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_without_peer_when_trusted_proxies_configured() {
+        let req: Request<()> = Request::builder()
+            .header("X-Forwarded-For", "198.51.100.77, 203.0.113.10")
+            .header("X-Real-IP", "198.51.100.88")
+            .body(())
+            .expect("infallible response builder");
+
+        assert!(
+            limiter_with_trusted_proxies(&["203.0.113.10"])
+                .client_ip(&req)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_peer_when_all_trusted_proxies_are_invalid() {
+        let req = req_with_connect_info("198.51.100.77, 203.0.113.10", "192.0.2.44:4000");
+
+        assert_eq!(
+            limiter_with_trusted_proxies(&["203.0.113.10:443", "198.51.100.0/999"])
+                .client_ip(&req)
+                .as_deref(),
+            Some("192.0.2.44")
+        );
     }
 
     #[test]
@@ -494,11 +725,11 @@ mod tests {
     #[test]
     fn client_ip_empty_xff_falls_through_to_x_real_ip_when_trusted() {
         let req: Request<()> = Request::builder()
-            .header("X-Forwarded-For", " , 5.5.5.5")
+            .header("X-Forwarded-For", "5.5.5.5,  ")
             .header("X-Real-IP", "8.8.8.8")
             .body(())
             .expect("infallible response builder");
-        // First XFF entry is empty after trim, so we fall back to X-Real-IP.
+        // Last XFF entry is empty after trim, so we fall back to X-Real-IP.
         assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("8.8.8.8"));
     }
 
@@ -530,6 +761,7 @@ mod tests {
             requests_per_second: 0.1,
             burst: 1,
             trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
         };
         let app = app(&config);
         let peer: SocketAddr = "198.51.100.1:2000"
@@ -563,6 +795,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwarded_header_chains_keep_independent_client_buckets() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10".to_owned()],
+        };
+        let app = app(&config);
+
+        let req_with_chain = |client_ip: &str| {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("X-Forwarded-For", format!("{client_ip}, 203.0.113.10"))
+                .body(Body::empty())
+                .expect("infallible response builder");
+            let peer: SocketAddr = "203.0.113.10:4000"
+                .parse()
+                .expect("test peer socket address parses");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let first_a = app
+            .clone()
+            .oneshot(req_with_chain("198.51.100.77"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(first_a.status(), StatusCode::OK);
+
+        let blocked_a = app
+            .clone()
+            .oneshot(req_with_chain("198.51.100.77"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(blocked_a.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let first_b = app
+            .clone()
+            .oneshot(req_with_chain("198.51.100.88"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(first_b.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn requests_without_connect_info_bypass_rate_limit() {
         // Static site generation and `Router::oneshot`-style callers
         // don't set ConnectInfo. The limiter must pass them through so
@@ -572,6 +851,7 @@ mod tests {
             requests_per_second: 0.001,
             burst: 1,
             trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
         };
         let app = app(&config);
 
@@ -593,5 +873,78 @@ mod tests {
                 "bypassed requests should not carry rate-limit headers"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn requests_without_connect_info_bypass_when_trusted_proxies_configured() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.001,
+            burst: 1,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10".to_owned()],
+        };
+        let app = app(&config);
+
+        for _ in 0..3 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/")
+                        .header("X-Forwarded-For", "198.51.100.77, 203.0.113.10")
+                        .header("X-Real-IP", "198.51.100.88")
+                        .body(Body::empty())
+                        .expect("infallible response builder"),
+                )
+                .await
+                .expect("infallible response builder");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers().get("x-ratelimit-limit").is_none(),
+                "requests with configured trusted proxies but no peer must not trust forwarded headers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_trusted_proxies_do_not_reopen_forwarded_header_trust() {
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.001,
+            burst: 1,
+            trust_forwarded_headers: true,
+            trusted_proxies: vec!["203.0.113.10:443".to_owned(), "198.51.100.0/999".to_owned()],
+        };
+        let app = app(&config);
+        let peer: SocketAddr = "192.0.2.44:4000"
+            .parse()
+            .expect("test peer socket address parses");
+
+        let make_req = |xff: &str| {
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header("X-Forwarded-For", xff)
+                .body(Body::empty())
+                .expect("infallible response builder");
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let first = app
+            .clone()
+            .oneshot(make_req("198.51.100.77"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let blocked = app
+            .clone()
+            .oneshot(make_req("198.51.100.88"))
+            .await
+            .expect("infallible response builder");
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

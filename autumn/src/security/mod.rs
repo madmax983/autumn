@@ -50,6 +50,8 @@
 //! enabled = true                       # per-IP token bucket
 //! requests_per_second = 10.0
 //! burst = 20
+//! trust_forwarded_headers = true       # only behind trusted proxies
+//! trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
 //! ```
 //!
 //! ## Quick start

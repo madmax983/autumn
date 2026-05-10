@@ -37,6 +37,7 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES` | `security.rate_limit.trusted_proxies` | comma-separated `String` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
@@ -575,6 +576,7 @@ impl Default for CsrfConfig {
 /// | `requests_per_second` | `10.0` |
 /// | `burst` | `20` |
 /// | `trust_forwarded_headers` | `false` |
+/// | `trusted_proxies` | `[]` |
 ///
 /// # Client IP resolution
 ///
@@ -584,6 +586,11 @@ impl Default for CsrfConfig {
 /// sits behind a trusted reverse proxy that strips and rewrites
 /// forwarding headers on every request.
 ///
+/// If trusted upstream proxies append to `X-Forwarded-For`, configure
+/// `trusted_proxies` with the trusted proxy IPs or CIDR ranges. Autumn
+/// then walks the header from right to left, skips those trusted proxy
+/// hops, and keys the bucket on the nearest untrusted client IP.
+///
 /// # Examples
 ///
 /// ```toml
@@ -592,6 +599,7 @@ impl Default for CsrfConfig {
 /// requests_per_second = 5.0
 /// burst = 10
 /// trust_forwarded_headers = false
+/// trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
@@ -616,6 +624,17 @@ pub struct RateLimitConfig {
     /// can rotate header values to bypass throttling.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+
+    /// Trusted proxy IP addresses or CIDR ranges to skip at the right
+    /// side of an appended `X-Forwarded-For` chain.
+    ///
+    /// This is only used when `trust_forwarded_headers = true`. Include
+    /// the immediate peer proxy when `ConnectInfo` is available; forwarded
+    /// headers from non-trusted peers, or requests without peer metadata,
+    /// are ignored. Invalid entries are ignored; if every configured
+    /// entry is invalid, forwarded headers are ignored rather than trusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for RateLimitConfig {
@@ -625,6 +644,7 @@ impl Default for RateLimitConfig {
             requests_per_second: default_rps(),
             burst: default_burst(),
             trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -981,21 +1001,24 @@ mod tests {
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
+        assert!(config.trusted_proxies.is_empty());
     }
 
     #[test]
     fn rate_limit_config_deserialize() {
-        let toml_str = r"
+        let toml_str = r#"
             enabled = true
             requests_per_second = 5.0
             burst = 100
             trust_forwarded_headers = true
-        ";
+            trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+        "#;
         let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert!((config.requests_per_second - 5.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 100);
         assert!(config.trust_forwarded_headers);
+        assert_eq!(config.trusted_proxies, vec!["10.0.0.10", "203.0.113.0/24"]);
     }
 
     #[test]
@@ -1006,6 +1029,7 @@ mod tests {
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
+        assert!(config.trusted_proxies.is_empty());
     }
 
     #[test]
