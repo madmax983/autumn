@@ -32,7 +32,8 @@ async fn eris_rate_limit_bypass_poc() {
             .header("X-Forwarded-For", spoofed_xff)
             .body(Body::empty())
             .unwrap();
-        req.headers_mut().append("X-Forwarded-For", proxy_xff.parse().unwrap());
+        req.headers_mut()
+            .append("X-Forwarded-For", proxy_xff.parse().unwrap());
         req.extensions_mut().insert(ConnectInfo(peer_addr));
         req
     };
