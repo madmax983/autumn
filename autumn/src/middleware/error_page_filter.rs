@@ -60,7 +60,7 @@ pub struct WantsHtml(pub bool);
 #[derive(Clone, Debug)]
 pub struct ErrorPageRequestContext {
     pub uri: axum::http::Uri,
-    pub request_id: Option<crate::middleware::RequestId>,
+    pub request_id: Option<String>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -105,7 +105,7 @@ where
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .cloned();
+            .map(std::string::ToString::to_string);
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -122,7 +122,7 @@ pin_project_lite::pin_project! {
         inner: F,
         wants_html: bool,
         uri: axum::http::Uri,
-        request_id: Option<crate::middleware::RequestId>,
+        request_id: Option<String>,
     }
 }
 
@@ -142,9 +142,16 @@ where
                 response
                     .extensions_mut()
                     .insert(WantsHtml(*this.wants_html));
+                let request_id = this.request_id.clone().or_else(|| {
+                    response
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                });
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
-                    request_id: this.request_id.clone(),
+                    request_id,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -247,11 +254,7 @@ impl ErrorPageFilter {
         let request_id = response
             .extensions()
             .get::<ErrorPageRequestContext>()
-            .and_then(|ctx| {
-                ctx.request_id
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-            });
+            .and_then(|ctx| ctx.request_id.clone());
 
         let path = response
             .extensions()
@@ -516,14 +519,15 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            ct.contains("application/json"),
-            "JSON API should get JSON response, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON API should get Problem Details response, got: {ct}"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 404);
+        assert_eq!(json["status"], 404);
+        assert_eq!(json["code"], "autumn.not_found");
     }
 
     #[tokio::test]
@@ -676,8 +680,8 @@ mod tests {
             .to_str()
             .expect("content-type should be valid UTF-8");
         assert!(
-            ct.contains("application/json"),
-            "JSON requests should still get JSON, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON requests should still get Problem Details, got: {ct}"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

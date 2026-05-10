@@ -163,10 +163,68 @@ Important: HTML overrides apply only when the request prefers `text/html`.
 
 ---
 
-## The JSON Error Response Format
+## Problem Details JSON Error Contract
 
-`AutumnError` serializes to `{ "error": { "status": 404, "message": "..." } }`.
-Consistent error shape for both HTML and JSON consumers.
+Framework-generated JSON/API errors use Problem Details semantics and the
+`application/problem+json` media type. The stable contract is:
+
+```json
+{
+  "type": "https://autumn.dev/problems/not-found",
+  "title": "Not Found",
+  "status": 404,
+  "detail": "No route matches /missing",
+  "instance": "/missing",
+  "code": "autumn.not_found",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": []
+}
+```
+
+Clients may depend on `type`, `title`, `status`, `detail`, `instance`,
+`code`, `request_id`, and `errors`. Validation failures put field-level
+details in `errors`:
+
+```json
+{
+  "type": "https://autumn.dev/problems/validation-failed",
+  "title": "Validation Failed",
+  "status": 422,
+  "detail": "Validation failed",
+  "instance": "/todos",
+  "code": "autumn.validation_failed",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": [
+    { "field": "title", "messages": ["validation failed: length"] }
+  ]
+}
+```
+
+Production-profile 5xx responses use a client-safe `detail` such as
+`"Internal server error"` and rely on `request_id` for support correlation.
+Development profile includes the original diagnostic detail in JSON, while
+logs retain the operator-facing cause in both profiles.
+
+| Scenario | Status | `code` |
+|----------|--------|--------|
+| Malformed path/query/body | 400 | `autumn.bad_request` |
+| Authentication required | 401 | `autumn.unauthorized` |
+| Authorization denied | 403 or 404 | `autumn.forbidden` or `autumn.not_found` |
+| Route not found | 404 | `autumn.not_found` |
+| Repository conflict | 409 | `autumn.conflict` |
+| Validation failure | 422 | `autumn.validation_failed` |
+| Internal error | 500 | `autumn.internal_server_error` |
+| Missing service dependency | 503 | `autumn.service_unavailable` |
+
+Content negotiation stays explicit: requests preferring `text/html` continue
+through the HTML error-page renderer, while JSON/API requests receive Problem
+Details. htmx/form helpers keep their existing form-oriented flow unless they
+ask for JSON.
+
+Migration note: pre-1.0 clients that parsed
+`{ "error": { "status": ..., "message": ... } }` should switch to `status`,
+`detail`, and `code` at the top level. OpenAPI generation publishes a shared
+`ProblemDetails` schema so generated clients can use one error type.
 
 ---
 

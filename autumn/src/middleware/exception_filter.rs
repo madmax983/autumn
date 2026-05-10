@@ -45,6 +45,7 @@ use std::task::{Context, Poll};
 
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use http::HeaderValue;
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
@@ -61,24 +62,84 @@ pub struct AutumnErrorInfo {
     pub message: String,
     /// Optional field-level validation details (for 422 responses).
     pub details: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Optional explicit Problem Details type URI.
+    pub problem_type: Option<&'static str>,
 }
 
 impl AutumnErrorInfo {
-    /// Build the default JSON error response from this info.
+    /// Build the default Problem Details JSON error response from this info.
     ///
     /// Useful when a filter wants to log or enrich but keep the standard
     /// response format.
     #[must_use]
     pub fn into_default_response(self) -> Response {
-        let body = serde_json::json!({
-            "error": {
-                "status": self.status.as_u16(),
-                "message": self.message,
-                "details": self.details,
-            }
-        });
-        (self.status, axum::Json(body)).into_response()
+        problem_response_from_info(&self, None, None, true)
     }
+}
+
+/// Exception filter that rebuilds framework errors as request-aware Problem
+/// Details responses before HTML error-page negotiation runs.
+pub struct ProblemDetailsFilter {
+    pub is_dev: bool,
+}
+
+impl ExceptionFilter for ProblemDetailsFilter {
+    fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
+        let context = response
+            .extensions()
+            .get::<crate::middleware::error_page_filter::ErrorPageRequestContext>();
+        let request_id = context.and_then(|ctx| ctx.request_id.clone()).or_else(|| {
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        });
+        let instance = context.map(|ctx| ctx.uri.path().to_owned());
+        let mut out = problem_response_from_info(error, request_id, instance, self.is_dev);
+
+        if let Some(value) = response.headers().get("HX-Trigger").cloned() {
+            out.headers_mut().insert("HX-Trigger", value);
+        }
+        if let Some(value) = response.headers().get("x-request-id").cloned() {
+            out.headers_mut().insert("x-request-id", value);
+        }
+        if let Some(wants_html) = response
+            .extensions()
+            .get::<crate::middleware::error_page_filter::WantsHtml>()
+            .cloned()
+        {
+            out.extensions_mut().insert(wants_html);
+        }
+        if let Some(ctx) = context.cloned() {
+            out.extensions_mut().insert(ctx);
+        }
+        out.extensions_mut().insert(error.clone());
+        out
+    }
+}
+
+fn problem_response_from_info(
+    error: &AutumnErrorInfo,
+    request_id: Option<String>,
+    instance: Option<String>,
+    is_dev: bool,
+) -> Response {
+    let body = crate::error::problem_details(
+        error.status,
+        error.message.clone(),
+        error.details.as_ref(),
+        error.problem_type,
+        request_id,
+        instance,
+        is_dev,
+    );
+    let mut response = (error.status, axum::Json(body)).into_response();
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    response
 }
 
 /// Trait for global exception filters.
@@ -347,6 +408,7 @@ mod tests {
             status: StatusCode::NOT_FOUND,
             message: "not found".into(),
             details: None,
+            problem_type: None,
         };
         let response = info.into_default_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);

@@ -151,6 +151,13 @@ impl<T> AsValidatable for axum::Json<T> {
     }
 }
 
+impl<T> AsValidatable for crate::extract::Json<T> {
+    type Inner = T;
+    fn as_validatable(&self) -> &T {
+        &self.0
+    }
+}
+
 impl<T> AsValidatable for axum::extract::Form<T> {
     type Inner = T;
     fn as_validatable(&self) -> &T {
@@ -158,7 +165,21 @@ impl<T> AsValidatable for axum::extract::Form<T> {
     }
 }
 
+impl<T> AsValidatable for crate::extract::Form<T> {
+    type Inner = T;
+    fn as_validatable(&self) -> &T {
+        &self.0
+    }
+}
+
 impl<T> AsValidatable for axum::extract::Query<T> {
+    type Inner = T;
+    fn as_validatable(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> AsValidatable for crate::extract::Query<T> {
     type Inner = T;
     fn as_validatable(&self) -> &T {
         &self.0

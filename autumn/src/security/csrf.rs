@@ -304,7 +304,7 @@ where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    ResBody: From<&'static str> + Send + 'static,
+    ResBody: From<&'static str> + From<String> + Default + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -352,6 +352,15 @@ where
 
         Box::pin(async move {
             if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
+                let request_id = req
+                    .extensions()
+                    .get::<crate::middleware::RequestId>()
+                    .map(std::string::ToString::to_string);
+                let instance = Some(req.uri().path().to_owned());
+                if wants_problem_details(req.headers()) {
+                    return Ok(csrf_problem_response(request_id, instance));
+                }
+
                 let mut response = Response::new(ResBody::from(CSRF_FORBIDDEN_MESSAGE));
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 response.headers_mut().insert(
@@ -373,6 +382,36 @@ where
             Ok(response)
         })
     }
+}
+
+fn wants_problem_details(headers: &http::HeaderMap) -> bool {
+    headers
+        .get(http::header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|accept| !accept.contains("text/html"))
+}
+
+fn csrf_problem_response<ResBody: From<String> + Default>(
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let mut problem = crate::error::problem_details(
+        StatusCode::FORBIDDEN,
+        CSRF_FORBIDDEN_MESSAGE.to_owned(),
+        None,
+        Some("https://autumn.dev/problems/csrf"),
+        request_id,
+        instance,
+        true,
+    );
+    "autumn.csrf".clone_into(&mut problem.code);
+    let body = crate::error::problem_details_to_json_string(&problem);
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
+        .unwrap_or_default()
 }
 
 async fn verify_csrf_token(
@@ -535,6 +574,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/submit")
+                    .header(http::header::ACCEPT, "text/html")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -555,6 +595,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/submit")
+                    .header(http::header::ACCEPT, "text/html")
                     .body(Body::empty())
                     .unwrap(),
             )
