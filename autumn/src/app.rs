@@ -2089,7 +2089,7 @@ impl AppBuilder {
     /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
-async fn run_one_off_task_mode(self, requested_name: String) {
+    async fn run_one_off_task_mode(self, requested_name: String) {
         let Self {
             one_off_tasks,
             jobs,

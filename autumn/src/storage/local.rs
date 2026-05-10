@@ -626,6 +626,7 @@ fn meta_sidecar_path(path: &std::path::Path) -> std::path::PathBuf {
 /// failure callers should delete any pre-existing sidecar so
 /// `head` / serving don't return stale `content_type` for the freshly
 /// committed bytes.
+#[allow(clippy::cognitive_complexity)]
 async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) -> Result<(), ()> {
     use tokio::io::AsyncWriteExt as _;
 
