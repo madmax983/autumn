@@ -97,14 +97,17 @@ impl ExceptionFilter for ProblemDetailsFilter {
                 .map(str::to_owned)
         });
         let instance = context.map(|ctx| ctx.uri.path().to_owned());
-        let mut out = problem_response_from_info(error, request_id, instance, self.is_dev);
+        let mut preserved_headers = response.headers().clone();
+        preserved_headers.remove(http::header::CONTENT_TYPE);
+        preserved_headers.remove(http::header::CONTENT_LENGTH);
 
-        if let Some(value) = response.headers().get("HX-Trigger").cloned() {
-            out.headers_mut().insert("HX-Trigger", value);
-        }
-        if let Some(value) = response.headers().get("x-request-id").cloned() {
-            out.headers_mut().insert("x-request-id", value);
-        }
+        let mut out = problem_response_from_info(error, request_id, instance, self.is_dev);
+        out.headers_mut().extend(preserved_headers);
+        out.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+
         if let Some(wants_html) = response
             .extensions()
             .get::<crate::middleware::error_page_filter::WantsHtml>()
@@ -339,6 +342,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"custom error page");
+    }
+
+    #[tokio::test]
+    async fn problem_details_filter_preserves_existing_response_headers() {
+        let error = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "database unavailable".into(),
+            details: None,
+            problem_type: None,
+        };
+        let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "old error body").into_response();
+        original.headers_mut().insert(
+            "access-control-allow-origin",
+            http::HeaderValue::from_static("https://client.example"),
+        );
+        original
+            .headers_mut()
+            .insert("x-frame-options", http::HeaderValue::from_static("DENY"));
+        original.headers_mut().insert(
+            "content-security-policy",
+            http::HeaderValue::from_static("default-src 'self'"),
+        );
+        original.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+
+        let response = ProblemDetailsFilter { is_dev: false }.filter(&error, original);
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://client.example"
+        );
+        assert_eq!(response.headers()["x-frame-options"], "DENY");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "default-src 'self'"
+        );
+        assert_eq!(
+            response.headers()[http::header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["detail"], "Internal server error");
     }
 
     #[tokio::test]
