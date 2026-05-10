@@ -80,7 +80,7 @@ if [[ "$major" -eq 0 ]]; then
   # Uses -v to pass the version so shell special characters are not interpreted.
   if awk -v ver="$workspace_version" \
        '$0 ~ "^## \\[" ver "\\]" { p=1; next } /^## \[/ { p=0 } p' \
-       CHANGELOG.md | grep -qi "breaking"; then
+       CHANGELOG.md | grep -qi "^### Breaking"; then
     is_breaking=true
   fi
 else
