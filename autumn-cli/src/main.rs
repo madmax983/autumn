@@ -9,6 +9,7 @@ mod generate;
 mod migrate;
 mod monitor;
 mod new;
+mod openapi;
 mod plugin_check;
 mod release;
 mod routes;
@@ -287,6 +288,21 @@ enum Commands {
         #[arg(long)]
         user_only: bool,
     },
+    /// Export the application's `OpenAPI` specification.
+    ///
+    /// Compiles the application (debug profile) and extracts its `OpenAPI`
+    /// specification without starting the HTTP server or connecting to a database.
+    Openapi {
+        /// Package to inspect (for workspaces).
+        #[arg(short, long)]
+        package: Option<String>,
+        /// Binary target to inspect (for packages with multiple bin targets).
+        #[arg(long, value_name = "BIN")]
+        bin: Option<String>,
+        /// Output format: `json` or `yaml`.
+        #[arg(long, default_value = "json", value_name = "FORMAT")]
+        format: String,
+    },
 }
 
 /// Subcommands for `autumn migrate`.
@@ -558,6 +574,11 @@ fn run_command(command: Commands) {
             &method,
             user_only,
         ),
+        Commands::Openapi {
+            package,
+            bin,
+            format,
+        } => run_openapi_command(package.as_deref(), bin.as_deref(), &format),
         Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
             TokenCommands::Issue { principal_id } => token::run_issue(&principal_id),
@@ -693,6 +714,18 @@ fn run_routes_command(
         filter: effective_filter,
         methods: method,
         user_only,
+    });
+}
+
+fn run_openapi_command(package: Option<&str>, bin: Option<&str>, format: &str) {
+    let fmt = format.parse().unwrap_or_else(|e| {
+        eprintln!("autumn openapi: {e}");
+        std::process::exit(1);
+    });
+    openapi::run(&openapi::OpenApiOptions {
+        package,
+        bin,
+        format: fmt,
     });
 }
 
@@ -1522,6 +1555,34 @@ mod tests {
                 assert_eq!(prefix.as_deref(), Some("/api"));
             }
             _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "openapi"]).unwrap();
+        match cli.command {
+            Commands::Openapi {
+                format,
+                package,
+                bin,
+            } => {
+                assert_eq!(format, "json");
+                assert!(package.is_none());
+                assert!(bin.is_none());
+            }
+            _ => panic!("expected Openapi command"),
+        }
+    }
+
+    #[test]
+    fn parse_openapi_yaml() {
+        let cli = Cli::try_parse_from(["autumn", "openapi", "--format", "yaml"]).unwrap();
+        match cli.command {
+            Commands::Openapi { format, .. } => {
+                assert_eq!(format, "yaml");
+            }
+            _ => panic!("expected Openapi command"),
         }
     }
 

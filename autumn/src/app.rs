@@ -1421,6 +1421,14 @@ impl AppBuilder {
             return;
         }
 
+        // ── OpenAPI dump mode ──────────────────────────────────────────
+        // When AUTUMN_DUMP_OPENAPI=1, print the OpenAPI spec and exit.
+        // This is triggered by `autumn openapi` to extract the spec offline.
+        if is_dump_openapi_mode() {
+            self.run_dump_openapi_mode().await;
+            return;
+        }
+
         if is_list_one_off_tasks_mode() {
             self.run_list_one_off_tasks_mode();
             return;
@@ -2011,6 +2019,61 @@ impl AppBuilder {
         }
     }
 
+    /// Dump the application's `OpenAPI` spec and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_OPENAPI=1` is set (by `autumn openapi`).
+    async fn run_dump_openapi_mode(self) {
+        #[cfg(not(feature = "openapi"))]
+        {
+            eprintln!("Error: The 'openapi' feature is not enabled in autumn-web.");
+            std::process::exit(1);
+        }
+
+        #[cfg(feature = "openapi")]
+        {
+            let Self {
+                config_loader_factory,
+                telemetry_provider,
+                openapi,
+                routes,
+                ..
+            } = self;
+
+            let (_config, _telemetry_guard) =
+                load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+            let Some(oa_config) = openapi else {
+                eprintln!(
+                    "Error: OpenAPI is not configured. Did you forget to call `.with_openapi(...)`?"
+                );
+                std::process::exit(1);
+            };
+
+            let mut docs = vec![];
+            for r in &routes {
+                docs.push(&r.api_doc);
+            }
+            let spec = crate::openapi::generate_spec(&oa_config, &docs);
+
+            let format =
+                std::env::var("AUTUMN_OPENAPI_FORMAT").unwrap_or_else(|_| "json".to_string());
+            let output = if format == "yaml" {
+                serde_yaml::to_string(&spec).unwrap_or_else(|e| {
+                    eprintln!("Failed to serialize OpenAPI spec to YAML: {e}");
+                    std::process::exit(1);
+                })
+            } else {
+                serde_json::to_string_pretty(&spec).unwrap_or_else(|e| {
+                    eprintln!("Failed to serialize OpenAPI spec to JSON: {e}");
+                    std::process::exit(1);
+                })
+            };
+
+            println!("{output}");
+            std::process::exit(0);
+        }
+    }
+
     /// Dump the application's route listing as JSON and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
@@ -2252,6 +2315,10 @@ pub(crate) fn is_static_build_mode() -> bool {
 
 pub(crate) fn is_dump_routes_mode() -> bool {
     std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_dump_openapi_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_OPENAPI").as_deref() == Ok("1")
 }
 
 pub(crate) fn is_list_one_off_tasks_mode() -> bool {
