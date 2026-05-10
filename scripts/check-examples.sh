@@ -112,7 +112,16 @@ echo ""
 echo "==> Checking workspace examples/* members are cataloged as supported"
 
 mapfile -t workspace_examples < <(
-  grep -v '^\s*#' "$WORKSPACE_MANIFEST" \
+  # Extract only paths from the [workspace] members array, not from exclude or
+  # other sections. awk tracks section and key boundaries so that an
+  # "examples/foo" entry under `exclude` is not misread as a workspace member.
+  awk '
+    /^\[workspace\]/                    { in_ws = 1; in_members = 0; next }
+    /^\[/                               { in_ws = 0; in_members = 0 }
+    in_ws && /^members/                 { in_members = 1 }
+    in_ws && /^[a-z]/ && !/^members/   { in_members = 0 }
+    in_members && /examples\//          { print }
+  ' "$WORKSPACE_MANIFEST" \
     | grep -oE 'examples/[a-zA-Z0-9_-]+' \
     | sed 's|examples/||' \
     | sort
