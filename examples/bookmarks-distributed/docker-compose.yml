@@ -10,7 +10,7 @@ x-bookmarks-base: &bookmarks-base
     # Generate once: openssl rand -hex 32
     # Then export it before running docker compose:
     #   export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
-    AUTUMN_SECURITY__SIGNING_SECRET: ${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required — run: export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"}
+    AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required. Generate with: openssl rand -hex 32}"
   restart: unless-stopped
 
 services:
