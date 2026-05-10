@@ -108,7 +108,7 @@ blocks publishing `autumn-web` or `autumn-cli`.
 | **Key capabilities** | `#[model]` hooks, revision tracking, slug generation, generated REST API |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p wiki` |
-| **Success proof** | `curl http://localhost:3000/api/articles` returns `[]` |
+| **Success proof** | `curl http://localhost:3000/api/v1/pages` returns `[]` |
 
 ---
 

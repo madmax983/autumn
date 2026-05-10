@@ -149,6 +149,15 @@ for ex in "${readme_examples[@]}"; do
     fail "  README example '$ex' is NOT in the catalog"
   fi
 done
+
+# Inverse: every supported catalog entry must also have a README table row.
+for ex in "${catalog_supported[@]}"; do
+  if printf '%s\n' "${readme_examples[@]}" | grep -qx "$ex"; then
+    ok "  supported catalog entry '$ex' is listed in README table"
+  else
+    fail "  supported catalog entry '$ex' is NOT in the README Examples table (add a row)"
+  fi
+done
 echo ""
 
 # ---------------------------------------------------------------------------
