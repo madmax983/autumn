@@ -356,7 +356,8 @@ pub struct RateLimitConfig {
     ///
     /// This is only used when `trust_forwarded_headers = true`. Include
     /// the immediate peer proxy when `ConnectInfo` is available; forwarded
-    /// headers from non-trusted peers are ignored.
+    /// headers from non-trusted peers, or requests without peer metadata,
+    /// are ignored.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 }
