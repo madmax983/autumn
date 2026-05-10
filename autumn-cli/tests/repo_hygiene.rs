@@ -13,6 +13,9 @@ const GENERATED_EXAMPLE_CSS: &[&str] = &[
 const FIRST_RUN_DOCS: &[&str] = &[
     "README.md",
     "docs/guide/getting-started.md",
+    "docs/guide/docs-smoke.md",
+    "docs/guide/deployment.md",
+    "docs/guide/websockets.md",
     "docs/guide/tutorial/01-project-setup.md",
     "docs/guide/tutorial/12-whats-next.md",
     "docs/guide/macro-transparency.md",
@@ -40,6 +43,18 @@ fn read_workspace_manifest(root: &Path) -> toml::Value {
     let root_manifest = std::fs::read_to_string(&root_manifest_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", root_manifest_path.display()));
     toml::from_str(&root_manifest).expect("workspace Cargo.toml should parse as TOML")
+}
+
+fn read_docs_once(root: &Path) -> Vec<(&'static str, String)> {
+    FIRST_RUN_DOCS
+        .iter()
+        .map(|doc| {
+            let path = root.join(doc);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            (*doc, content)
+        })
+        .collect()
 }
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -74,12 +89,10 @@ fn first_run_docs_match_current_release_line() {
         .rsplit_once('.')
         .map_or(current_version.as_str(), |(series, _)| series);
     let rust_version = workspace_package_value(&root_toml, "rust-version");
+    let current_health_json = format!(r#"{{ "status": "ok", "version": "{current_version}" }}"#);
+    let docs = read_docs_once(&root);
 
-    for doc in FIRST_RUN_DOCS {
-        let path = root.join(doc);
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
-
+    for (doc, content) in &docs {
         for stale in [
             "Rust 1.85",
             "Rust 1.86",
@@ -94,7 +107,7 @@ fn first_run_docs_match_current_release_line() {
         ] {
             assert!(
                 !content.contains(stale),
-                "{doc} still references stale first-run release/MSRV text: {stale}",
+                "{doc} still references stale first-run release/MSRV text: {stale}"
             );
         }
 
@@ -106,33 +119,54 @@ fn first_run_docs_match_current_release_line() {
                 "{doc} uses `cargo install --path autumn-cli` without clearly marking it as local development only",
             );
         }
+
+        if content.contains("Rust ") {
+            assert!(
+                content.contains(&format!("Rust {rust_version}+")),
+                "{doc} must state the workspace MSRV Rust {rust_version}+"
+            );
+        }
+
+        if content.contains("cargo install autumn-cli") {
+            assert!(
+                content.contains(&format!(
+                    "cargo install autumn-cli --version {current_version}"
+                )),
+                "{doc} must show the published CLI install command for autumn-cli {current_version}"
+            );
+        }
+
+        if content.contains("autumn-web =") {
+            assert!(
+                content.contains(&format!("autumn-web = \"{current_series}\""))
+                    || content.contains(&format!("autumn-web = \"{current_version}\""))
+                    || content.contains(&format!("version = \"{current_series}\""))
+                    || content.contains(&format!("version = \"{current_version}\"")),
+                "{doc} must show the current autumn-web release line ({current_series} or {current_version})",
+            );
+        }
+
+        if content.contains(r#""status": "ok""#) {
+            assert!(
+                content.contains(&current_health_json),
+                "{doc} must show the current JSON health version {current_version}"
+            );
+        }
     }
 
-    for doc in [
-        "README.md",
-        "docs/guide/getting-started.md",
-        "docs/guide/tutorial/01-project-setup.md",
-    ] {
-        let content = std::fs::read_to_string(root.join(doc))
-            .unwrap_or_else(|err| panic!("failed to read {doc}: {err}"));
-        assert!(
-            content.contains(&format!("Rust {rust_version}+")),
-            "{doc} must state the workspace MSRV Rust {rust_version}+",
-        );
-    }
-
-    for doc in [
-        "docs/guide/getting-started.md",
-        "docs/guide/tutorial/01-project-setup.md",
-    ] {
-        let content = std::fs::read_to_string(root.join(doc))
-            .unwrap_or_else(|err| panic!("failed to read {doc}: {err}"));
-        assert!(
-            content.contains(&format!("autumn-web = \"{current_series}\""))
-                || content.contains(&format!("autumn-web = \"{current_version}\"")),
-            "{doc} must show the current autumn-web release line ({current_series} or {current_version})",
-        );
-    }
+    let docs_smoke = docs
+        .iter()
+        .find(|(doc, _)| *doc == "docs/guide/docs-smoke.md")
+        .map(|(_, content)| content)
+        .expect("docs smoke guide should be included in FIRST_RUN_DOCS");
+    assert!(
+        docs_smoke.contains("`/` returns `Welcome to smoke-app!`"),
+        "docs-smoke must expect the root page generated by `autumn new smoke-app`"
+    );
+    assert!(
+        docs_smoke.contains(&current_health_json),
+        "docs-smoke must show the exact health JSON with version {current_version}"
+    );
 }
 
 #[test]

@@ -154,14 +154,16 @@ The files that matter right now:
 
 ## Your First Route
 
-Open `src/main.rs`. The scaffolded code looks like this:
+Open `src/main.rs`. The scaffolded app includes a Maud layout, embedded
+migrations, and these starter routes:
 
 ```rust
-use autumn_web::{get, routes};
-
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to my-app!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]
@@ -178,6 +180,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
@@ -190,6 +193,8 @@ The key pieces:
 - **`routes![...]`** -- collects annotated handlers into a `Vec<Route>`.
 - **`autumn_web::app().routes(...).run().await`** -- the app builder. Load config,
   create the database pool, mount routes, start the server.
+- **`.migrations(MIGRATIONS)`** -- embeds and applies the app's Diesel
+  migrations when a database is configured.
 - **`#[autumn_web::main]`** -- sets up the Tokio async runtime. It is a thin
   wrapper around `#[tokio::main]`.
 
@@ -219,7 +224,7 @@ You will see log output like:
 ```
 
 Visit [http://localhost:3000](http://localhost:3000) -- you should see
-"Welcome to Autumn!". Try
+"Welcome to my-app!". Try
 [http://localhost:3000/hello/world](http://localhost:3000/hello/world) for the
 path parameter route.
 

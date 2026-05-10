@@ -94,12 +94,16 @@ you don't manage those crates directly.
 
 ### `src/main.rs`
 
-```rust
-use autumn_web::{get, routes};
+The full generated file also defines the shared `layout(...)` helper and
+embedded migration constant. The route core looks like this:
 
+```rust
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to todo-app!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]
@@ -116,6 +120,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
@@ -137,6 +142,8 @@ There is a lot happening in a small file. Here is what each piece does:
   with `.routes()` and start the server with `.run().await`.
 - **`routes![index, hello, hello_name]`** — a macro that collects route
   handlers into a `Vec<Route>` for the app builder.
+- **`.migrations(MIGRATIONS)`** — embeds the app's Diesel migrations so Autumn
+  can apply them when a database is configured.
 
 The pattern is always the same: define handlers with route macros, collect
 them with `routes![]`, and pass them to `autumn_web::app().routes(...).run()`.
@@ -301,7 +308,7 @@ Postgres yet.
 Open your browser and visit <http://localhost:3000>. You should see:
 
 ```
-Welcome to Autumn!
+Welcome to todo-app!
 ```
 
 Try the other routes:

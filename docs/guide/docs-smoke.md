@@ -28,9 +28,13 @@ curl -fsS http://127.0.0.1:3000/health
 
 Passing output:
 
-- `/` returns `Welcome to Autumn!`.
+- `/` returns `Welcome to smoke-app!`.
 - `/hello/world` returns `Hello, world!`.
-- `/health` returns JSON with `"status":"ok"` and version `0.3.0`.
+- `/health` returns:
+
+  ```json
+  { "status": "ok", "version": "0.3.0" }
+  ```
 
 Do not add `[patch.crates-io]`, path dependencies, or `cargo install --path`
 when certifying the published-user path. Those are contributor-mode shortcuts,
