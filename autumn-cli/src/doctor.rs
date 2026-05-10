@@ -6,6 +6,37 @@
 
 use serde::Serialize;
 
+// ── Signing secret validation constants (mirrored from autumn-web) ────────────
+
+/// Minimum byte length for a valid production signing secret.
+const SIGNING_SECRET_MIN_LEN: usize = 32;
+
+/// Known demo / template values that must never reach production.
+const SIGNING_SECRET_DEMO_VALUES: &[&str] = &[
+    "changeme",
+    "change_me",
+    "change-me",
+    "secret",
+    "supersecret",
+    "super-secret",
+    "super_secret",
+    "your-secret-here",
+    "your_secret_here",
+    "insert-secret-here",
+    "replace-this",
+    "replace_me",
+    "todo",
+    "fixme",
+    "example",
+    "placeholder",
+    "dev_only",
+    "dev-only",
+    "test_secret",
+    "test-secret",
+    "test",
+    "password",
+];
+
 /// Known top-level keys in a valid `autumn.toml`.
 const KNOWN_TOML_SECTIONS: &[&str] = &[
     "server",
@@ -69,6 +100,77 @@ pub struct DoctorOptions {
 #[allow(dead_code)]
 pub trait Check {
     fn run(&self) -> CheckResult;
+}
+
+/// Check signing-secret readiness (pure, injectable for tests).
+///
+/// - **Dev/test** (`is_production = false`): warns when no secret is configured
+///   (an ephemeral per-process key is in use) and passes when a secret is set.
+/// - **Production** (`is_production = true`): fails when the secret is missing,
+///   below the minimum entropy floor, or matches a known demo/template value.
+pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> CheckResult {
+    match secret {
+        None if is_production => CheckResult {
+            name: "signing_secret",
+            status: CheckStatus::Fail,
+            detail: Some("no signing secret configured in production".into()),
+            hint: Some(
+                "Set AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)",
+            ),
+        },
+        None => CheckResult {
+            name: "signing_secret",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "using an ephemeral per-process signing secret (dev/test only; \
+                 sessions and signed URLs will not survive restarts or be shared across replicas)"
+                    .into(),
+            ),
+            hint: Some(
+                "Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production",
+            ),
+        },
+        Some(s) if is_production => {
+            // Demo-value check first: "changeme" is more informative than "too short".
+            let lower = s.to_ascii_lowercase();
+            if SIGNING_SECRET_DEMO_VALUES.iter().any(|&d| lower == d) {
+                return CheckResult {
+                    name: "signing_secret",
+                    status: CheckStatus::Fail,
+                    detail: Some(
+                        "signing secret matches a known demo/template value".into(),
+                    ),
+                    hint: Some("Generate a new secret: `openssl rand -hex 32`"),
+                };
+            }
+            let byte_len = s.len();
+            if byte_len < SIGNING_SECRET_MIN_LEN {
+                return CheckResult {
+                    name: "signing_secret",
+                    status: CheckStatus::Fail,
+                    detail: Some(format!(
+                        "signing secret too short: {byte_len} bytes \
+                         (minimum {SIGNING_SECRET_MIN_LEN})"
+                    )),
+                    hint: Some("Generate a longer secret: `openssl rand -hex 32`"),
+                };
+            }
+            CheckResult {
+                name: "signing_secret",
+                status: CheckStatus::Pass,
+                detail: Some(
+                    "signing secret is present and meets entropy requirements".into(),
+                ),
+                hint: None,
+            }
+        }
+        Some(_) => CheckResult {
+            name: "signing_secret",
+            status: CheckStatus::Pass,
+            detail: Some("signing secret is configured".into()),
+            hint: None,
+        },
+    }
 }
 
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
@@ -751,6 +853,48 @@ fn resolve_optional_db_url() -> Option<String> {
         })
 }
 
+/// Resolve the signing secret from the environment or `autumn.toml`.
+///
+/// Priority:
+/// 1. `AUTUMN_SECURITY__SIGNING_SECRET` env var
+/// 2. `[security] signing_secret` in `autumn.toml`
+fn resolve_optional_signing_secret() -> Option<String> {
+    if let Ok(val) = std::env::var("AUTUMN_SECURITY__SIGNING_SECRET")
+        && !val.is_empty()
+    {
+        return Some(val);
+    }
+    std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        .and_then(|t| {
+            t.get("security")
+                .and_then(|s| s.get("signing_secret"))
+                .and_then(|ss| ss.get("secret"))
+                .and_then(toml::Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        })
+}
+
+/// Resolve whether the active profile is production from the environment or
+/// `autumn.toml`.
+fn resolve_is_production() -> bool {
+    for var in ["AUTUMN_ENV", "AUTUMN_PROFILE"] {
+        if let Ok(val) = std::env::var(var) {
+            let v = val.trim().to_ascii_lowercase();
+            if v == "prod" || v == "production" {
+                return true;
+            }
+            if !v.is_empty() {
+                return false;
+            }
+        }
+    }
+    // Fall back to build-mode detection: release binary implies prod
+    false
+}
+
 /// Check whether Tailwind is enabled in `autumn.toml`.
 ///
 /// Falls back to a heuristic: if `build.rs` exists the project is assumed to
@@ -790,6 +934,8 @@ pub fn run(opts: DoctorOptions) {
     let db_url = resolve_optional_db_url();
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
+    let signing_secret = resolve_optional_signing_secret();
+    let is_production = resolve_is_production();
 
     // ── Phase 2: build tasks in display order ────────────────────────────────
     let mut tasks: Vec<Task> = Vec::new();
@@ -827,7 +973,12 @@ pub fn run(opts: DoctorOptions) {
         tasks.push(Box::new(check_tailwind_binary));
     }
 
-    // 8. Stale artifacts (warn only, never fail)
+    // 8. Signing-secret readiness (warn in dev, fail in prod when missing/weak)
+    tasks.push(Box::new(move || {
+        check_signing_secret_impl(signing_secret.as_deref(), is_production)
+    }));
+
+    // 9. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
@@ -1414,6 +1565,68 @@ foo = "bar"
         let r = check_tailwind_binary_at(&tailwind_path);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.as_deref().unwrap_or("").contains("broken symlink"));
+    }
+
+    // ── check_signing_secret_impl (RED phase) ────────────────────────────────
+
+    #[test]
+    fn check_signing_secret_impl_name_is_signing_secret() {
+        let r = check_signing_secret_impl(None, false);
+        assert_eq!(r.name, "signing_secret");
+    }
+
+    #[test]
+    fn check_signing_secret_impl_dev_no_secret_warns() {
+        let r = check_signing_secret_impl(None, false);
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.detail.as_deref().unwrap_or("").contains("ephemeral"));
+    }
+
+    #[test]
+    fn check_signing_secret_impl_dev_with_valid_secret_passes() {
+        let r = check_signing_secret_impl(Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"), false);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn check_signing_secret_impl_prod_missing_fails() {
+        let r = check_signing_secret_impl(None, true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn check_signing_secret_impl_prod_too_short_fails() {
+        let r = check_signing_secret_impl(Some("short"), true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.as_deref().unwrap_or("").contains("short"));
+    }
+
+    #[test]
+    fn check_signing_secret_impl_prod_demo_value_fails() {
+        let r = check_signing_secret_impl(Some("changeme"), true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.hint.is_some());
+    }
+
+    #[test]
+    fn check_signing_secret_impl_prod_valid_secret_passes() {
+        let secret = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4";
+        let r = check_signing_secret_impl(Some(secret), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn check_signing_secret_impl_prod_hint_mentions_openssl() {
+        let r = check_signing_secret_impl(None, true);
+        let hint = r.hint.unwrap_or("");
+        assert!(hint.contains("openssl") || hint.contains("rand"));
+    }
+
+    #[test]
+    fn check_signing_secret_impl_dev_warn_has_hint() {
+        let r = check_signing_secret_impl(None, false);
+        assert!(r.hint.is_some());
     }
 
     // ── to_json_output ───────────────────────────────────────────────────────

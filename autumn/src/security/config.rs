@@ -46,6 +46,169 @@
 
 use serde::Deserialize;
 
+// ── Signing secret contract ────────────────────────────────────────────────
+
+/// Minimum byte length for a valid production signing secret (32 bytes / 256 bits).
+///
+/// A hex-encoded 32-byte value is 64 characters. Anything shorter is rejected
+/// at production startup.
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// Known demo / template / placeholder values that must never reach production.
+const DEMO_VALUES: &[&str] = &[
+    "changeme",
+    "change_me",
+    "change-me",
+    "secret",
+    "supersecret",
+    "super-secret",
+    "super_secret",
+    "your-secret-here",
+    "your_secret_here",
+    "insert-secret-here",
+    "replace-this",
+    "replace_me",
+    "todo",
+    "fixme",
+    "example",
+    "placeholder",
+    "dev_only",
+    "dev-only",
+    "test_secret",
+    "test-secret",
+    "test",
+    "password",
+];
+
+/// Signing-secret configuration for HMAC-signed framework surfaces.
+///
+/// The signing secret is the shared key used to sign sessions, CSRF tokens,
+/// flash/signed-cookie state, and local-storage signed URLs.
+///
+/// # Development and test
+///
+/// Leave `secret` unset. An ephemeral per-process key is generated automatically.
+/// This means sessions and signed URLs do **not** survive process restarts and
+/// replicas cannot share state — acceptable in dev, unacceptable in production.
+///
+/// # Production
+///
+/// Set `secret` via the `AUTUMN_SECURITY__SIGNING_SECRET` environment variable
+/// (or `[security] signing_secret` in `autumn.toml`). The secret must be:
+/// - At least [`MIN_SECRET_LEN`] bytes long.
+/// - Not a known template/demo value.
+/// - Stable across restarts and identical on every replica.
+///
+/// Generate a secret: `openssl rand -hex 32`
+///
+/// # Rotation
+///
+/// When rotating, move the current secret to `previous_secrets` and set the
+/// new value in `secret`. New signatures use `secret`; tokens signed with any
+/// entry in `previous_secrets` continue to validate during the grace window.
+/// Remove expired entries from `previous_secrets` after the maximum relevant
+/// cookie/token lifetime has elapsed.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security]
+/// # secret set via AUTUMN_SECURITY__SIGNING_SECRET env var (never commit this)
+///
+/// # rotation grace window — leave populated until all existing tokens expire:
+/// # previous_secrets = ["oldsecretvalue..."]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SigningSecretConfig {
+    /// The current signing secret. In production, must come from an environment
+    /// variable or external secrets manager — never a committed literal.
+    pub secret: Option<String>,
+
+    /// Previous signing secrets accepted during a rotation grace window.
+    ///
+    /// New signatures always use `secret`. Tokens signed with an entry here
+    /// remain valid until removed. Remove entries after the maximum relevant
+    /// cookie/token lifetime has elapsed (e.g. `session.max_age_secs`).
+    #[serde(default)]
+    pub previous_secrets: Vec<String>,
+}
+
+/// Error returned when a signing secret fails production validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningSecretError {
+    /// No secret is configured but the production profile requires one.
+    MissingInProduction,
+    /// The secret is too short to meet the minimum entropy requirement.
+    TooShort {
+        /// Actual byte length of the supplied secret.
+        actual: usize,
+        /// Minimum required byte length ([`MIN_SECRET_LEN`]).
+        required: usize,
+    },
+    /// The secret matches a known insecure demo or template value.
+    KnownWeakValue(String),
+}
+
+impl std::fmt::Display for SigningSecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingInProduction => write!(
+                f,
+                "signing secret is required in production; set \
+                 AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)"
+            ),
+            Self::TooShort { actual, required } => write!(
+                f,
+                "signing secret is too short ({actual} bytes, minimum {required}); \
+                 generate one with `openssl rand -hex 32`"
+            ),
+            Self::KnownWeakValue(v) => write!(
+                f,
+                "signing secret looks like a template/demo value ({v:?}); \
+                 generate one with `openssl rand -hex 32`"
+            ),
+        }
+    }
+}
+
+/// Validate a signing secret for production use.
+///
+/// In development and test the check is skipped — any value (including `None`)
+/// is accepted so zero-config local development continues to work.
+///
+/// In production:
+/// - `None` → [`SigningSecretError::MissingInProduction`]
+/// - Shorter than [`MIN_SECRET_LEN`] bytes → [`SigningSecretError::TooShort`]
+/// - Matches a known demo/template string → [`SigningSecretError::KnownWeakValue`]
+///
+/// # Errors
+///
+/// Returns [`SigningSecretError`] when production validation fails.
+pub fn validate_signing_secret(
+    secret: Option<&str>,
+    is_production: bool,
+) -> Result<(), SigningSecretError> {
+    if !is_production {
+        return Ok(());
+    }
+    let secret = secret.ok_or(SigningSecretError::MissingInProduction)?;
+    // Demo-value check first: "changeme" is more informative than "too short".
+    let lower = secret.to_ascii_lowercase();
+    for &demo in DEMO_VALUES {
+        if lower == demo {
+            return Err(SigningSecretError::KnownWeakValue(secret.to_owned()));
+        }
+    }
+    let byte_len = secret.len();
+    if byte_len < MIN_SECRET_LEN {
+        return Err(SigningSecretError::TooShort {
+            actual: byte_len,
+            required: MIN_SECRET_LEN,
+        });
+    }
+    Ok(())
+}
+
 /// Top-level security configuration section.
 ///
 /// Groups security headers and CSRF protection under `[security]`
@@ -98,6 +261,15 @@ pub struct SecurityConfig {
     /// genuinely intended (e.g. a fully-public read-only API).
     #[serde(default)]
     pub allow_unauthorized_repository_api: bool,
+
+    /// Signing-secret configuration for HMAC-signed framework surfaces.
+    ///
+    /// Covers sessions, CSRF tokens, flash/signed-cookie state, and
+    /// local-storage signed URLs. In dev the framework generates an
+    /// ephemeral per-process key; production MUST set a stable, private
+    /// secret via `AUTUMN_SECURITY__SIGNING_SECRET`.
+    #[serde(default)]
+    pub signing_secret: SigningSecretConfig,
 }
 
 /// Security response headers configuration.
@@ -476,6 +648,132 @@ const fn default_max_file_size_bytes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_signing_secret (RED phase) ─────────────────────────────────
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_none() {
+        assert!(validate_signing_secret(None, false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_weak_value() {
+        assert!(validate_signing_secret(Some("changeme"), false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_short_value() {
+        assert!(validate_signing_secret(Some("short"), false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_prod_missing_is_error() {
+        let err = validate_signing_secret(None, true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::MissingInProduction));
+    }
+
+    #[test]
+    fn signing_secret_prod_too_short_is_error() {
+        let short = "a".repeat(MIN_SECRET_LEN - 1);
+        let err = validate_signing_secret(Some(&short), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::TooShort { .. }));
+    }
+
+    #[test]
+    fn signing_secret_prod_exact_min_length_passes() {
+        let exactly_min = "a".repeat(MIN_SECRET_LEN);
+        assert!(validate_signing_secret(Some(&exactly_min), true).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_prod_known_demo_value_is_error() {
+        let err = validate_signing_secret(Some("changeme"), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::KnownWeakValue(_)));
+    }
+
+    #[test]
+    fn signing_secret_prod_demo_value_case_insensitive() {
+        let err = validate_signing_secret(Some("CHANGEME"), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::KnownWeakValue(_)));
+    }
+
+    #[test]
+    fn signing_secret_prod_valid_64char_hex_passes() {
+        let secret = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        assert!(validate_signing_secret(Some(secret), true).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_config_defaults_to_none() {
+        let config = SigningSecretConfig::default();
+        assert!(config.secret.is_none());
+        assert!(config.previous_secrets.is_empty());
+    }
+
+    #[test]
+    fn signing_secret_error_missing_display_mentions_env_var() {
+        let err = SigningSecretError::MissingInProduction;
+        assert!(err.to_string().contains("AUTUMN_SECURITY__SIGNING_SECRET"));
+    }
+
+    #[test]
+    fn signing_secret_error_too_short_display_shows_lengths() {
+        let err = SigningSecretError::TooShort {
+            actual: 8,
+            required: 32,
+        };
+        let s = err.to_string();
+        assert!(s.contains("8"));
+        assert!(s.contains("32"));
+    }
+
+    #[test]
+    fn signing_secret_error_weak_value_display_mentions_demo() {
+        let err = SigningSecretError::KnownWeakValue("changeme".to_owned());
+        assert!(err.to_string().contains("template/demo"));
+    }
+
+    #[test]
+    fn signing_secret_prod_too_short_error_reports_actual_length() {
+        let short = "tooshort"; // 8 bytes
+        let err = validate_signing_secret(Some(short), true).unwrap_err();
+        if let SigningSecretError::TooShort { actual, required } = err {
+            assert_eq!(actual, 8);
+            assert_eq!(required, MIN_SECRET_LEN);
+        } else {
+            panic!("expected TooShort error");
+        }
+    }
+
+    #[test]
+    fn signing_secret_prod_secret_key_demo_value_fails() {
+        assert!(matches!(
+            validate_signing_secret(Some("secret"), true),
+            Err(SigningSecretError::KnownWeakValue(_))
+        ));
+    }
+
+    #[test]
+    fn signing_secret_prod_supersecret_demo_value_fails() {
+        assert!(matches!(
+            validate_signing_secret(Some("supersecret"), true),
+            Err(SigningSecretError::KnownWeakValue(_))
+        ));
+    }
+
+    #[test]
+    fn signing_secret_config_deserialize_from_toml() {
+        let toml_str = r#"
+            secret = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+            previous_secrets = ["oldsecret01234567890123456789012"]
+        "#;
+        let config: SigningSecretConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.secret.as_deref(),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4")
+        );
+        assert_eq!(config.previous_secrets.len(), 1);
+    }
 
     #[test]
     fn security_config_defaults() {
