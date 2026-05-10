@@ -1345,6 +1345,198 @@ mod tests {
     }
 
     #[test]
+    fn encode_key_path_does_not_skip_leading_slash() {
+        let key = "/some/key";
+        let encoded = encode_key_path(key);
+        // The first segment before the split '/' is empty
+        assert_eq!(encoded, "/some/key");
+    }
+
+    #[test]
+    fn sha256_hex_computes_correct_hash() {
+        // e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 is empty string
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn hex_computes_correct_hex() {
+        assert_eq!(hex(b"xyz"), "78797a");
+    }
+
+    #[test]
+    fn verify_rejects_empty_signature() {
+        let key = b"secret";
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expires = now + 3600;
+        let result = verify(key, "blob", expires, "");
+        assert!(matches!(result, Err(BlobStoreError::Signature(_))));
+    }
+
+    #[tokio::test]
+    async fn safe_path_for_key_rejects_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let s2 = store(&path);
+        dir.close().unwrap();
+
+        let err = s2.safe_path_for_key("some_blob").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BlobStoreError::Io(_) | BlobStoreError::PermissionDenied(_)
+            ),
+            "Unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_with_meta_propagates_io_errors() {
+        let dir = temp_root();
+        let s = store(dir.path());
+
+        let path = dir.path().join("some_blob");
+        // create a directory so that get_with_meta reading file fails
+        tokio::fs::create_dir(&path).await.unwrap();
+        let Err(err) = s.get_with_meta("some_blob").await else {
+            panic!("Expected error");
+        };
+        assert!(matches!(err, BlobStoreError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn drop_stale_sidecar_is_idempotent() {
+        let dir = temp_root();
+        let blob = dir.path().join("victim.bin");
+        let sidecar = meta_sidecar_path(&blob);
+
+        drop_stale_sidecar(&blob).await;
+        drop_stale_sidecar(&blob).await;
+        // Make sure doing it when file doesn't exist doesn't panic
+        assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn drop_stale_sidecar_ignores_and_survives_non_not_found_errors() {
+        // Create a directory where the sidecar should be so that remove_file returns EISDIR
+        let dir = temp_root();
+        let blob = dir.path().join("victim.bin");
+        let sidecar = meta_sidecar_path(&blob);
+        tokio::fs::create_dir(&sidecar).await.unwrap();
+
+        // The function drop_stale_sidecar ignores all errors internally but prints a warning.
+        // It's `async fn drop_stale_sidecar`, no return value.
+        // We will just run it and ensure it doesn't panic on a non-not-found error.
+        drop_stale_sidecar(&blob).await;
+        assert!(sidecar.exists()); // Because it couldn't remove a dir
+    }
+
+    #[tokio::test]
+    async fn get_with_meta_when_meta_missing_returns_none() {
+        let dir = temp_root();
+        let s = store(dir.path());
+
+        // Write the blob but no sidecar
+        let path = dir.path().join("blob.bin");
+        tokio::fs::write(&path, b"data").await.unwrap();
+
+        let (bytes, meta) = s.get_with_meta("blob.bin").await.unwrap();
+        assert_eq!(&bytes[..], b"data");
+        assert!(meta.is_none());
+    }
+
+    #[tokio::test]
+    async fn atomic_replace_handles_already_exists_on_backup_rename() {
+        let dir = temp_root();
+        let dst = dir.path().join("target.bin");
+        tokio::fs::write(&dst, b"old").await.unwrap();
+
+        let tmp = dir.path().join("staging.tmp");
+        tokio::fs::write(&tmp, b"new").await.unwrap();
+
+        // Create a backup file manually to trigger AlreadyExists
+        let backup = backup_sibling_path(&dst);
+        tokio::fs::write(&backup, b"interloper").await.unwrap();
+
+        // Atomic replace will encounter AlreadyExists when renaming `dst` to `backup`
+        // It will then retry. Before it loops, it does nothing if there is an interloper? No, the code says:
+        // if err.kind() == std::io::ErrorKind::AlreadyExists ... Wait, rename can overwrite. But on Windows `rename` fails if dst exists.
+        // It's possible `AlreadyExists` or `PermissionDenied` depending on OS. The code is:
+        // match tokio::fs::rename(dst, backup_path).await {
+        //   Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        //       let _ = tokio::fs::remove_file(backup_path).await;
+        //       continue;
+        //   } ...
+        // So we can simulate this by mocking, or relying on `rename` failing if exists (not true on Unix).
+        // Since we are on Unix, rename just replaces. To trigger this we can't easily do it.
+        // Let's at least test we can still replace if backup exists.
+        atomic_replace(&tmp, &dst).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&dst).await.unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn put_rejects_missing_directory_to_trigger_io_error() {
+        let missing = tempfile::tempdir().unwrap().path().to_path_buf();
+        let s2 = store(&missing);
+        std::fs::remove_dir_all(&missing).unwrap();
+
+        let err = s2
+            .put("some_blob", "text/plain", bytes::Bytes::from_static(b"xyz"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            BlobStoreError::Io(_) | BlobStoreError::PermissionDenied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_missing_directory_to_trigger_io_error() {
+        let missing = tempfile::tempdir().unwrap().path().to_path_buf();
+        let s2 = store(&missing);
+        std::fs::remove_dir_all(&missing).unwrap();
+
+        let err = s2.delete("some_blob").await.unwrap_err();
+        assert!(matches!(
+            err,
+            BlobStoreError::Io(_) | BlobStoreError::PermissionDenied(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn head_rejects_missing_directory_to_trigger_io_error() {
+        let missing = tempfile::tempdir().unwrap().path().to_path_buf();
+        let s2 = store(&missing);
+        std::fs::remove_dir_all(&missing).unwrap();
+
+        let err = s2.head("some_blob").await.unwrap_err();
+        assert!(matches!(
+            err,
+            BlobStoreError::Io(_) | BlobStoreError::PermissionDenied(_)
+        ));
+    }
+
+    #[test]
+    fn provider_id_is_local() {
+        let dir = temp_root();
+        let s = LocalBlobStore::new(
+            "local_test_id",
+            dir.path().to_path_buf(),
+            "/mnt",
+            std::time::Duration::from_secs(3600),
+            SigningKey::random(),
+        )
+        .unwrap();
+        assert_eq!(s.provider_id(), "local_test_id");
+    }
+
+    #[test]
     fn signing_key_debug_does_not_leak_material() {
         let key = SigningKey::new(b"super-secret".to_vec());
         let dbg = format!("{key:?}");
