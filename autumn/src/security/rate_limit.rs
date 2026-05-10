@@ -162,8 +162,10 @@ impl Limiter {
         if self.trust_forwarded_headers {
             let xff_ip = req
                 .headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .next_back()
                 .and_then(|s| s.rsplit(',').next())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
