@@ -249,6 +249,19 @@ async fn html_requests_still_use_html_error_pages() {
 }
 
 #[tokio::test]
+async fn problem_json_accept_prevents_html_error_page_replacement() {
+    let response = client()
+        .get("/boom")
+        .header("accept", "application/problem+json, text/html;q=0.1")
+        .send()
+        .await;
+
+    let json = problem_json(&response, 500, "autumn.internal_server_error");
+    assert_eq!(json["instance"], "/boom");
+    assert!(!response.text().contains("<!DOCTYPE html>"));
+}
+
+#[tokio::test]
 async fn csrf_failures_use_problem_details_for_json_clients() {
     let config = AutumnConfig {
         profile: Some("test".to_owned()),

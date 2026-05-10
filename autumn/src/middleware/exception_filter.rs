@@ -70,10 +70,11 @@ impl AutumnErrorInfo {
     /// Build the default Problem Details JSON error response from this info.
     ///
     /// Useful when a filter wants to log or enrich but keep the standard
-    /// response format.
+    /// response format. Server-error details are sanitized because this helper
+    /// does not know whether the current profile is development or production.
     #[must_use]
     pub fn into_default_response(self) -> Response {
-        problem_response_from_info(&self, None, None, true)
+        problem_response_from_info(&self, None, None, false)
     }
 }
 
@@ -412,5 +413,23 @@ mod tests {
         };
         let response = info.into_default_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn default_response_hides_internal_error_detail() {
+        let info = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "database password leaked".into(),
+            details: None,
+            problem_type: None,
+        };
+        let response = info.into_default_response();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["detail"], "Internal server error");
     }
 }

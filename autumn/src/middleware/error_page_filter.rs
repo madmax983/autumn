@@ -214,7 +214,9 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
             "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
                 html = Some((q, index));
             }
-            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+            "application/json" | "application/problem+json"
+                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
                 json = Some((q, index));
             }
             "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
@@ -385,6 +387,15 @@ mod tests {
     fn prefers_json_when_json_has_higher_q() {
         let req = Request::builder()
             .header("accept", "text/html;q=0.4, application/json;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_problem_json_when_problem_json_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "application/problem+json, text/html;q=0.1")
             .body(Body::empty())
             .unwrap();
         assert!(!accepts_html(&req));
