@@ -649,7 +649,7 @@ fn validation_errors(
     errors
 }
 
-fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
     if has_validation_errors {
         return "https://autumn.dev/problems/validation-failed";
     }
