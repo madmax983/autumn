@@ -9,6 +9,7 @@ services:
     environment:
       AUTUMN_PROFILE: prod
       AUTUMN_DATABASE__PRIMARY_URL: postgres://autumn:autumn@db:5432/{{project_name}}_prod
+      AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?set it first}"
     depends_on:
       db:
         condition: service_healthy

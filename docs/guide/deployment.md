@@ -120,7 +120,7 @@ response looks like:
 ## How the production image works
 
 ```
-rust:1.88-bookworm (chef stage)
+rust:1.88.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
             └─ cargo build --release
@@ -228,13 +228,15 @@ autumn release init --force --target docker-compose
 Start both services:
 
 ```bash
+export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 docker compose up --build
 ```
 
 The `docker-compose.yml` sets `AUTUMN_DATABASE__PRIMARY_URL` pointing at the
 `db` service, waits for Postgres to pass its healthcheck, runs `autumn migrate`
-once, and starts the app only after that job exits successfully. No manual
-Postgres setup is needed.
+once, passes `AUTUMN_SECURITY__SIGNING_SECRET` into the app service, and starts
+the app only after that job exits successfully. No manual Postgres setup is
+needed.
 
 To reset the database:
 

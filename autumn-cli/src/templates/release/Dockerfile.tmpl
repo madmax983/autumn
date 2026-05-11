@@ -1,6 +1,8 @@
 # ── Stage 1: cargo-chef planner ──────────────────────────────────────────────
-FROM lukemathwalker/cargo-chef:latest-rust-1.86-bookworm AS chef
+FROM rust:{{rust_version}}-bookworm AS chef
 WORKDIR /app
+
+RUN cargo install cargo-chef --locked
 
 FROM chef AS planner
 COPY . .

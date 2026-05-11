@@ -222,6 +222,10 @@ pub fn init(
 fn render(template: &str, project_name: &str) -> String {
     template
         .replace("{{project_name}}", project_name)
+        .replace(
+            "{{rust_version}}",
+            option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        )
         .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
         .replace("{{diesel_cli_version}}", "2.3.8")
 }
@@ -321,6 +325,24 @@ mod tests {
         assert!(
             content.contains("cargo chef cook"),
             "Dockerfile must run 'cargo chef cook'"
+        );
+    }
+
+    #[test]
+    fn dockerfile_uses_declared_msrv_for_rust_build_image() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+
+        assert!(
+            content.contains(&format!("FROM rust:{msrv}-bookworm AS chef")),
+            "Dockerfile build stage must use the declared MSRV {msrv}: {content}"
+        );
+        assert!(
+            !content.contains("rust-1.86") && !content.contains("rust:1.86"),
+            "Dockerfile must not pin an older Rust image than the declared MSRV: {content}"
         );
     }
 
@@ -825,6 +847,21 @@ previous_secrets = []
         assert!(
             content.contains("depends_on"),
             "docker-compose.yml app service must depend_on the db"
+        );
+    }
+
+    #[test]
+    fn docker_compose_app_requires_signing_secret_env() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
+
+        assert!(
+            content.contains(
+                r#"AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?set it first}""#
+            ),
+            "app service must pass the required production signing secret: {content}"
         );
     }
 
