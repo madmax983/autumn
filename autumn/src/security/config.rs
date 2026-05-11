@@ -102,7 +102,7 @@ const DEMO_VALUES: &[&str] = &[
 /// # Production
 ///
 /// Set `secret` via the `AUTUMN_SECURITY__SIGNING_SECRET` environment variable
-/// (or `[security] signing_secret` in `autumn.toml`). The secret must be:
+/// (or `[security.signing_secret] secret` in `autumn.toml`). The secret must be:
 /// - At least [`MIN_SECRET_LEN`] bytes long.
 /// - Not a known template/demo value.
 /// - Stable across restarts and identical on every replica.
@@ -120,11 +120,11 @@ const DEMO_VALUES: &[&str] = &[
 /// # `autumn.toml` example
 ///
 /// ```toml
-/// [security]
+/// [security.signing_secret]
 /// # secret set via AUTUMN_SECURITY__SIGNING_SECRET env var (never commit this)
 ///
 /// # rotation grace window — leave populated until all existing tokens expire:
-/// # previous_secrets = ["oldsecretvalue..."]
+/// previous_secrets = ["oldsecretvalue..."]
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SigningSecretConfig {
