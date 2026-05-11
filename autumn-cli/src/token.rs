@@ -67,38 +67,68 @@ fn os_random_bytes() -> [u8; 32] {
 /// Resolve the database URL from autumn.toml and environment variables.
 ///
 /// Precedence (highest to lowest):
-/// 1. `AUTUMN_DATABASE__URL` environment variable
-/// 2. `DATABASE_URL` environment variable
-/// 3. `database.url` from `autumn.toml`
+/// 1. `AUTUMN_DATABASE__PRIMARY_URL` environment variable
+/// 2. `AUTUMN_DATABASE__URL` environment variable
+/// 3. `DATABASE_URL` environment variable
+/// 4. `database.primary_url` from `autumn.toml`
+/// 5. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
-    if let Ok(url) = std::env::var("AUTUMN_DATABASE__URL")
-        && !url.is_empty()
+    let config_table = read_autumn_toml_table();
+    if let Some(url) =
+        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
     {
         return url;
     }
-    if let Ok(url) = std::env::var("DATABASE_URL")
-        && !url.is_empty()
-    {
-        return url;
-    }
+
+    eprintln!("\u{2717} No database URL found.");
+    eprintln!(
+        "  Set database.primary_url (or database.url) in autumn.toml, or set AUTUMN_DATABASE__PRIMARY_URL / AUTUMN_DATABASE__URL / DATABASE_URL."
+    );
+    std::process::exit(1);
+}
+
+fn read_autumn_toml_table() -> Option<toml::Table> {
     let config_path = Path::new("autumn.toml");
-    if config_path.exists()
-        && let Ok(contents) = std::fs::read_to_string(config_path)
-        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
-    {
-        let value = toml::Value::Table(table);
-        if let Some(url) = value
-            .get("database")
-            .and_then(|db| db.get("url"))
-            .and_then(|u| u.as_str())
+    if !config_path.exists() {
+        return None;
+    }
+
+    std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+}
+
+fn resolve_primary_database_url_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Option<String>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    for var in [
+        "AUTUMN_DATABASE__PRIMARY_URL",
+        "AUTUMN_DATABASE__URL",
+        "DATABASE_URL",
+    ] {
+        if let Ok(url) = env_var(var)
             && !url.is_empty()
         {
-            return url.to_string();
+            return Some(url);
         }
     }
-    eprintln!("\u{2717} No database URL found.");
-    eprintln!("  Set database.url in autumn.toml, or set AUTUMN_DATABASE__URL / DATABASE_URL.");
-    std::process::exit(1);
+
+    let database = table?.get("database").and_then(toml::Value::as_table)?;
+    for key in ["primary_url", "url"] {
+        if let Some(url) = database
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_owned());
+        }
+    }
+
+    None
 }
 
 fn check_psql() {
@@ -178,6 +208,7 @@ mod tests {
     fn resolve_prefers_autumn_database_url_over_database_url() {
         let url = temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", Some("postgres://autumn-primary")),
                 ("DATABASE_URL", Some("postgres://fallback")),
             ],
@@ -190,12 +221,43 @@ mod tests {
     fn resolve_falls_back_to_database_url_when_autumn_unset() {
         let url = temp_env::with_vars(
             [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
                 ("AUTUMN_DATABASE__URL", None::<&str>),
                 ("DATABASE_URL", Some("postgres://fallback")),
             ],
             resolve_database_url,
         );
         assert_eq!(url, "postgres://fallback");
+    }
+
+    #[test]
+    fn resolve_prefers_primary_database_url_env() {
+        let env = |key: &str| match key {
+            "AUTUMN_DATABASE__PRIMARY_URL" => Ok("postgres://primary-env".to_owned()),
+            "AUTUMN_DATABASE__URL" => Ok("postgres://legacy-env".to_owned()),
+            "DATABASE_URL" => Ok("postgres://fallback-env".to_owned()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let url = resolve_primary_database_url_from_sources(env, None).unwrap();
+        assert_eq!(url, "postgres://primary-env");
+    }
+
+    #[test]
+    fn resolve_reads_primary_database_url_from_toml() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+            [database]
+            primary_url = "postgres://primary-toml"
+            url = "postgres://legacy-toml"
+            "#,
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+
+        let url = resolve_primary_database_url_from_sources(env, Some(&table)).unwrap();
+
+        assert_eq!(url, "postgres://primary-toml");
     }
 
     #[test]
