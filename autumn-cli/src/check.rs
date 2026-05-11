@@ -89,13 +89,14 @@ fn fetch_html(url: &str) -> Result<String, String> {
 
 /// Analyse a raw HTML string and return all detected violations.
 pub fn analyse_html(html: &str) -> Vec<A11yViolation> {
+    let html = strip_html_comments(html).to_ascii_lowercase();
     let mut violations = Vec::new();
-    check_lang(html, &mut violations);
-    check_skip_link(html, &mut violations);
-    check_landmark_main(html, &mut violations);
-    check_images_alt(html, &mut violations);
-    check_inputs_have_labels(html, &mut violations);
-    check_buttons_accessible_name(html, &mut violations);
+    check_lang(&html, &mut violations);
+    check_skip_link(&html, &mut violations);
+    check_landmark_main(&html, &mut violations);
+    check_images_alt(&html, &mut violations);
+    check_inputs_have_labels(&html, &mut violations);
+    check_buttons_accessible_name(&html, &mut violations);
     violations
 }
 
@@ -103,16 +104,11 @@ pub fn analyse_html(html: &str) -> Vec<A11yViolation> {
 ///
 /// WCAG 2.1 SC 3.1.1 (Level A) — axe-core rule `html-has-lang`.
 fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
-    // Use " lang=" (space prefix) to avoid matching "data-lang=" or similar.
-    // Also verify the value is non-empty — lang="" fails WCAG just as much as no lang.
-    let has_lang = html_lower.find("<html").is_some_and(|start| {
-        let tag_end = html_lower[start..].find('>').unwrap_or(0);
-        let tag = &html_lower[start..start + tag_end];
-        tag.find(" lang=").is_some_and(|lang_pos| {
-            let val = extract_attr_value(&tag[lang_pos + 6..]); // 6 = len(" lang=")
-            !val.is_empty()
-        })
+    // Verify the value is non-empty: lang="" fails WCAG just as much as no lang.
+    let has_lang = html.find("<html").is_some_and(|start| {
+        let tag_end = html[start..].find('>').unwrap_or(0);
+        let tag = &html[start..start + tag_end];
+        attr_value(tag, "lang").is_some_and(|val| !val.is_empty())
     });
 
     if !has_lang {
@@ -129,10 +125,8 @@ fn check_lang(html: &str, out: &mut Vec<A11yViolation>) {
 ///
 /// WCAG 2.1 SC 2.4.1 (Level A) — axe-core rule `bypass`.
 fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
-
-    let body_start = html_lower.find("<body").unwrap_or(0);
-    let body_content = &html_lower[body_start..];
+    let body_start = html.find("<body").unwrap_or(0);
+    let body_content = &html[body_start..];
 
     // The skip link must be the FIRST focusable link in the document; a skip
     // link that comes after navigation links doesn't help keyboard users.
@@ -141,9 +135,10 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
         let rest = &body_content[a_pos..];
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
+        let href = attr_value(tag, "href");
         tag.contains("skip-link")
-            || tag.contains(r##"href="#main-content""##)
-            || tag.contains(r##"href="#main""##)
+            || href.as_deref() == Some("#main-content")
+            || href.as_deref() == Some("#main")
     });
 
     if !has_skip_link {
@@ -160,25 +155,21 @@ fn check_skip_link(html: &str, out: &mut Vec<A11yViolation>) {
 ///
 /// WCAG 2.1 SC 1.3.6 (Level AAA) / best practice — axe-core rule `landmark-one-main`.
 fn check_landmark_main(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
-
-    // Count <main> elements.
-    let main_tag_count = html_lower.matches("<main").count();
+    let main_tag_count = count_opening_tags(html, "main");
 
     // Count role="main" only on non-<main> elements to avoid double-counting
     // the common pattern <main role="main">.
     let mut extra_role_main = 0usize;
     let mut offset = 0usize;
-    while let Some(rel) = html_lower[offset..].find("role=\"main\"") {
+    while let Some(rel) = html[offset..].find('<') {
         let abs = offset + rel;
-        let before = &html_lower[..abs];
-        if before
-            .rfind('<')
-            .is_some_and(|s| !html_lower[s..].starts_with("<main"))
-        {
+        let rest = &html[abs..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if !opening_tag_matches(tag, "main") && attr_value(tag, "role").as_deref() == Some("main") {
             extra_role_main += 1;
         }
-        offset = abs + 11; // 11 = len("role=\"main\"")
+        offset = abs + tag_end.saturating_add(1);
     }
 
     let main_count = main_tag_count + extra_role_main;
@@ -209,8 +200,7 @@ fn check_landmark_main(html: &str, out: &mut Vec<A11yViolation>) {
 ///
 /// WCAG 2.1 SC 1.1.1 (Level A) — axe-core rule `image-alt`.
 fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
-    let mut search = html_lower.as_str();
+    let mut search = html;
     let mut count = 0u32;
 
     while let Some(img_pos) = search.find("<img") {
@@ -218,8 +208,7 @@ fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
 
-        // Use " alt=" (space prefix) to avoid matching "data-alt=".
-        if !tag.contains(" alt=") {
+        if attr_value(tag, "alt").is_none() {
             count += 1;
         }
         search = &search[img_pos + 4..];
@@ -240,22 +229,17 @@ fn check_images_alt(html: &str, out: &mut Vec<A11yViolation>) {
 /// Covers `<input>`, `<textarea>`, and `<select>`.
 /// WCAG 2.1 SC 1.3.1 / 3.3.2 (Level A) — axe-core rule `label`.
 fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
     let mut unlabelled = 0u32;
 
-    // Collect all `for=` values from `<label` tags.  Use "<label" to avoid
-    // matching the word "label" in text content, and " for=" (space prefix) to
-    // avoid matching "data-for=".
+    // Collect all `for=` values from `<label` tags.
     let mut labelled_ids: Vec<String> = Vec::new();
-    let mut lsearch = html_lower.as_str();
+    let mut lsearch = html;
     while let Some(pos) = lsearch.find("<label") {
         let rest = &lsearch[pos..];
-        if let Some(for_pos) = rest.find(" for=") {
-            let after_for = &rest[for_pos + 5..]; // 5 = len(" for=")
-            let id = extract_attr_value(after_for);
-            if !id.is_empty() {
-                labelled_ids.push(id);
-            }
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if let Some(id) = attr_value(tag, "for").filter(|id| !id.is_empty()) {
+            labelled_ids.push(id);
         }
         lsearch = &lsearch[pos + 6..];
         if lsearch.is_empty() {
@@ -265,22 +249,20 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
 
     // Collect byte ranges of wrapped <label>…</label> blocks so that controls
     // implicitly associated by containment (no for=/id pair needed) pass.
-    let label_regions = label_regions(&html_lower);
+    let label_regions = label_regions(html);
 
     // Check <input>, <textarea>, and <select> — all require an accessible label.
     for (tag_name, skip_len) in &[("<input", 6usize), ("<textarea", 9), ("<select", 7)] {
         let mut offset = 0usize;
-        while let Some(rel_pos) = html_lower[offset..].find(tag_name) {
+        while let Some(rel_pos) = html[offset..].find(tag_name) {
             let abs_pos = offset + rel_pos;
-            let rest = &html_lower[abs_pos..];
+            let rest = &html[abs_pos..];
             let tag_end = rest.find('>').unwrap_or(rest.len());
             let tag = &rest[..tag_end];
 
             // For <input>, skip types that don't need a visible label.
             let skip = if *tag_name == "<input" {
-                let input_type = tag
-                    .find("type=")
-                    .map_or_else(String::new, |t| extract_attr_value(&tag[t + 5..]));
+                let input_type = attr_value(tag, "type").unwrap_or_default();
                 ["hidden", "submit", "button", "reset", "image"].contains(&input_type.as_str())
             } else {
                 false
@@ -288,22 +270,15 @@ fn check_inputs_have_labels(html: &str, out: &mut Vec<A11yViolation>) {
 
             if !skip {
                 // Require non-empty aria-label values and resolve aria-labelledby IDs.
-                let has_aria = tag
-                    .find("aria-label=")
-                    .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
-                    || tag.find("aria-labelledby=").is_some_and(|p| {
-                        let ids = extract_attr_value(&tag[p + 16..]);
-                        !ids.is_empty() && aria_labelledby_resolves(&html_lower, &ids)
-                    });
-                let has_for = tag.find(" id=").is_some_and(|id_pos| {
-                    let id_val = extract_attr_value(&tag[id_pos + 4..]);
-                    !id_val.is_empty() && labelled_ids.contains(&id_val)
-                });
+                let has_aria = attr_value(tag, "aria-label").is_some_and(|label| !label.is_empty())
+                    || attr_value(tag, "aria-labelledby")
+                        .is_some_and(|ids| !ids.is_empty() && aria_labelledby_resolves(html, &ids));
+                let has_for = attr_value(tag, "id")
+                    .is_some_and(|id_val| !id_val.is_empty() && labelled_ids.contains(&id_val));
                 // A wrapping <label> only provides an accessible name when it
                 // contains visible text; <label><input></label> still fails.
                 let is_wrapped = label_regions.iter().any(|r| {
-                    r.contains(&abs_pos)
-                        && !strip_html_tags(&html_lower[r.clone()]).trim().is_empty()
+                    r.contains(&abs_pos) && !strip_html_tags(&html[r.clone()]).trim().is_empty()
                 });
 
                 if !has_aria && !has_for && !is_wrapped {
@@ -346,9 +321,8 @@ fn label_regions(html: &str) -> Vec<std::ops::Range<usize>> {
 ///
 /// WCAG 2.1 SC 4.1.2 (Level A) — axe-core rule `button-name`.
 fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
-    let html_lower = html.to_lowercase();
     let mut nameless = 0u32;
-    let mut search = html_lower.as_str();
+    let mut search = html;
 
     while let Some(pos) = search.find("<button") {
         let rest = &search[pos..];
@@ -360,13 +334,9 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
         let tag = &rest[..tag_end];
 
         // Require non-empty aria-label values and resolve aria-labelledby IDs.
-        let has_aria_label = tag
-            .find("aria-label=")
-            .is_some_and(|p| !extract_attr_value(&tag[p + 11..]).is_empty())
-            || tag.find("aria-labelledby=").is_some_and(|p| {
-                let ids = extract_attr_value(&tag[p + 16..]);
-                !ids.is_empty() && aria_labelledby_resolves(&html_lower, &ids)
-            });
+        let has_aria_label = attr_value(tag, "aria-label").is_some_and(|label| !label.is_empty())
+            || attr_value(tag, "aria-labelledby")
+                .is_some_and(|ids| !ids.is_empty() && aria_labelledby_resolves(html, &ids));
         let inner = if close > tag_end {
             &button_html[tag_end + 1..close]
         } else {
@@ -402,16 +372,12 @@ fn check_buttons_accessible_name(html: &str, out: &mut Vec<A11yViolation>) {
 ///
 /// Used to recognise icon buttons whose accessible name comes from the child image.
 fn img_alt_text(html: &str) -> bool {
-    let lower = html.to_lowercase();
-    let mut search = lower.as_str();
+    let mut search = html;
     while let Some(img_pos) = search.find("<img") {
         let rest = &search[img_pos..];
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
-        if tag
-            .find(" alt=")
-            .is_some_and(|alt_pos| !extract_attr_value(&tag[alt_pos + 5..]).is_empty())
-        {
+        if attr_value(tag, "alt").is_some_and(|alt| !alt.is_empty()) {
             return true;
         }
         search = &search[img_pos + 4..];
@@ -426,38 +392,214 @@ fn img_alt_text(html: &str) -> bool {
 /// that at least one referenced element exists and has non-empty text.
 fn aria_labelledby_resolves(html: &str, ids: &str) -> bool {
     ids.split_whitespace().any(|id| {
-        let search = format!(" id=\"{id}\"");
-        html.find(&search).is_some_and(|pos| {
-            // Advance past the opening tag to its content.
-            let after_tag = html[pos..].find('>').map_or(html.len(), |t| pos + t + 1);
-            // Grab up to 500 chars of inner content (enough for typical labels).
-            let content_end = (after_tag + 500).min(html.len());
-            let inner_raw = &html[after_tag..content_end];
-            // Stop at the first closing tag boundary.
-            let inner = &inner_raw[..inner_raw.find("</").unwrap_or(inner_raw.len())];
-            !strip_html_tags(inner).trim().is_empty()
-        })
+        let mut offset = 0usize;
+        while let Some(rel_pos) = html[offset..].find('<') {
+            let tag_start = offset + rel_pos;
+            let rest = &html[tag_start..];
+            let tag_end_rel = rest.find('>').unwrap_or(rest.len());
+            let tag_end = tag_start + tag_end_rel;
+            let tag = &html[tag_start..tag_end];
+
+            if attr_value(tag, "id").as_deref() == Some(id) {
+                let after_tag = (tag_end + 1).min(html.len());
+                let content_end = (after_tag + 500).min(html.len());
+                let inner_raw = &html[after_tag..content_end];
+                let inner = &inner_raw[..inner_raw.find("</").unwrap_or(inner_raw.len())];
+                return !strip_html_tags(inner).trim().is_empty();
+            }
+
+            offset = tag_end.saturating_add(1);
+        }
+        false
     })
 }
 
 /// Remove all HTML tags from `s`, leaving only text nodes.
 fn strip_html_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(c),
-            _ => {}
+    let without_raw_text = strip_raw_text_element(&strip_raw_text_element(s, "script"), "style");
+    let mut result = String::with_capacity(without_raw_text.len());
+    let mut i = 0usize;
+
+    while i < without_raw_text.len() {
+        if without_raw_text.as_bytes()[i] == b'<'
+            && looks_like_tag_start_at(&without_raw_text, i)
+            && let Some(tag_end) = without_raw_text[i..].find('>')
+        {
+            i += tag_end + 1;
+            continue;
+        }
+
+        if let Some(ch) = without_raw_text[i..].chars().next() {
+            result.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
         }
     }
+
+    decode_basic_html_entities(&result)
+}
+
+fn strip_html_comments(html: &str) -> String {
+    let mut result = String::with_capacity(html.len());
+    let mut rest = html;
+
+    while let Some(start) = rest.find("<!--") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 4..];
+        if let Some(end) = after_open.find("-->") {
+            rest = &after_open[end + 3..];
+        } else {
+            return result;
+        }
+    }
+
+    result.push_str(rest);
     result
+}
+
+fn count_opening_tags(html: &str, name: &str) -> usize {
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while let Some(rel_pos) = html[offset..].find('<') {
+        let tag_start = offset + rel_pos;
+        let rest = &html[tag_start..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        if opening_tag_matches(tag, name) {
+            count += 1;
+        }
+        offset = tag_start + tag_end.saturating_add(1);
+    }
+    count
+}
+
+fn opening_tag_matches(tag: &str, name: &str) -> bool {
+    let bytes = tag.as_bytes();
+    let name = name.as_bytes();
+    if bytes.first() != Some(&b'<') || bytes.get(1) == Some(&b'/') {
+        return false;
+    }
+    if bytes.get(1..1 + name.len()) != Some(name) {
+        return false;
+    }
+    bytes
+        .get(1 + name.len())
+        .is_none_or(|b| b.is_ascii_whitespace() || matches!(*b, b'>' | b'/'))
+}
+
+fn attr_value(tag: &str, attr: &str) -> Option<String> {
+    let bytes = tag.as_bytes();
+    let attr = attr.as_bytes();
+    let mut i = 0usize;
+
+    while i + attr.len() <= bytes.len() {
+        if bytes[i..].starts_with(attr)
+            && attr_boundary_before(bytes, i)
+            && attr_boundary_after(bytes, i + attr.len())
+        {
+            let mut pos = i + attr.len();
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+            if bytes.get(pos) != Some(&b'=') {
+                i += 1;
+                continue;
+            }
+            pos += 1;
+            while bytes.get(pos).is_some_and(u8::is_ascii_whitespace) {
+                pos += 1;
+            }
+
+            return Some(match bytes.get(pos) {
+                Some(b'"' | b'\'') => {
+                    let quote = bytes[pos];
+                    let start = pos + 1;
+                    let end = bytes[start..]
+                        .iter()
+                        .position(|b| *b == quote)
+                        .map_or(bytes.len(), |rel| start + rel);
+                    tag[start..end].to_owned()
+                }
+                Some(_) => {
+                    let start = pos;
+                    let end = bytes[start..]
+                        .iter()
+                        .position(|b| b.is_ascii_whitespace() || *b == b'>')
+                        .map_or(bytes.len(), |rel| start + rel);
+                    tag[start..end].to_owned()
+                }
+                None => String::new(),
+            });
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn attr_boundary_before(bytes: &[u8], pos: usize) -> bool {
+    pos == 0 || bytes[pos - 1].is_ascii_whitespace() || matches!(bytes[pos - 1], b'<' | b'/')
+}
+
+fn attr_boundary_after(bytes: &[u8], pos: usize) -> bool {
+    bytes
+        .get(pos)
+        .is_none_or(|b| b.is_ascii_whitespace() || matches!(*b, b'=' | b'>' | b'/'))
+}
+
+fn strip_raw_text_element(html: &str, name: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut result = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = lower[cursor..].find(&open) {
+        let start = cursor + rel_start;
+        let rest = &lower[start..];
+        let Some(tag_end_rel) = rest.find('>') else {
+            break;
+        };
+        let tag_end = start + tag_end_rel + 1;
+        if !opening_tag_matches(&lower[start..tag_end], name) {
+            result.push_str(&html[cursor..=start]);
+            cursor = start + 1;
+            continue;
+        }
+
+        result.push_str(&html[cursor..start]);
+        if let Some(close_rel) = lower[tag_end..].find(&close) {
+            cursor = tag_end + close_rel + close.len();
+        } else {
+            cursor = html.len();
+            break;
+        }
+    }
+
+    result.push_str(&html[cursor..]);
+    result
+}
+
+fn looks_like_tag_start_at(s: &str, pos: usize) -> bool {
+    s.as_bytes()
+        .get(pos + 1)
+        .is_some_and(|b| b.is_ascii_alphabetic() || matches!(*b, b'/' | b'!' | b'?'))
+}
+
+fn decode_basic_html_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Extract the value of an attribute from HTML text starting just after `attr=`.
 ///
 /// Handles both quoted (`attr="val"`, `attr='val'`) and unquoted forms.
+#[cfg(test)]
 fn extract_attr_value(s: &str) -> String {
     let s = s.trim_start();
     match s.chars().next() {
@@ -593,6 +735,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn html_lang_allows_spaces_around_equals() {
+        let html = r#"<html lang = "en"><body><main></main></body></html>"#;
+        assert!(
+            !violation_ids(html).contains(&"html-has-lang"),
+            "valid attribute whitespace must not hide lang"
+        );
+    }
+
     // ── bypass (skip link) ─────────────────────────────────────────
 
     #[test]
@@ -668,6 +819,15 @@ mod tests {
     }
 
     #[test]
+    fn landmark_in_comment_is_ignored() {
+        let html = r##"<html lang="en"><body><a href="#main">Skip</a><!-- <main id="main"></main> --><div>content</div></body></html>"##;
+        assert!(
+            violation_ids(html).contains(&"landmark-one-main"),
+            "commented-out landmarks must not satisfy the main-landmark rule"
+        );
+    }
+
+    #[test]
     fn multiple_main_landmarks_fails() {
         let html = r#"<html lang="en"><body><main>A</main><main>B</main></body></html>"#;
         assert!(violation_ids(html).contains(&"landmark-one-main"));
@@ -720,6 +880,15 @@ mod tests {
         assert!(violation_ids(html).contains(&"image-alt"));
     }
 
+    #[test]
+    fn image_in_comment_is_ignored() {
+        let html = clean_page(r#"<!-- <img src="x.png"> -->"#);
+        assert!(
+            !violation_ids(&html).contains(&"image-alt"),
+            "commented-out images must not be analysed"
+        );
+    }
+
     // ── label ─────────────────────────────────────────────────────
 
     #[test]
@@ -729,6 +898,18 @@ mod tests {
             !violation_ids(&html).contains(&"label"),
             "{:?}",
             violation_ids(&html)
+        );
+    }
+
+    #[test]
+    fn input_label_for_allows_attribute_whitespace() {
+        let html = clean_page(
+            r#"<label
+                for = "name">Name</label><input type = "text" id = "name">"#,
+        );
+        assert!(
+            !violation_ids(&html).contains(&"label"),
+            "valid whitespace around attributes must not break label association"
         );
     }
 
@@ -911,6 +1092,15 @@ mod tests {
     }
 
     #[test]
+    fn button_with_script_only_fails() {
+        let html = clean_page("<button><script>save</script></button>");
+        assert!(
+            violation_ids(&html).contains(&"button-name"),
+            "script contents must not count as an accessible button name"
+        );
+    }
+
+    #[test]
     fn button_aria_labelledby_resolving_id_passes() {
         let html = clean_page(
             r#"<span id="close-label">Close</span><button aria-labelledby="close-label"></button>"#,
@@ -978,6 +1168,29 @@ mod tests {
     #[test]
     fn strip_html_tags_empty_tag_only() {
         assert_eq!(strip_html_tags("<img src=\"x.png\">").trim(), "");
+    }
+
+    #[test]
+    fn strip_html_tags_removes_script_and_style_content() {
+        let mut html = String::from("<style>.hidden");
+        html.push('{');
+        html.push_str("display:none");
+        html.push('}');
+        html.push_str("</style><script>alert('x')</script>Visible");
+        assert_eq!(strip_html_tags(&html), "Visible");
+    }
+
+    #[test]
+    fn strip_html_tags_decodes_basic_entities() {
+        assert_eq!(
+            strip_html_tags("Fish &amp; Chips &lt; Menu &gt;"),
+            "Fish & Chips < Menu >"
+        );
+    }
+
+    #[test]
+    fn strip_html_tags_preserves_literal_angle_text() {
+        assert_eq!(strip_html_tags("2 < 3 and 5 > 4"), "2 < 3 and 5 > 4");
     }
 
     // ── extract_attr_value ─────────────────────────────────────────

@@ -420,13 +420,18 @@ pub struct SignupForm {{
 #[post("/signup")]
 pub async fn signup(
     mut db: Db,
+    State(state): State<AppState>,
     session: Session,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {{
     let email = form.email.trim().to_lowercase();
     // Same message for invalid format and duplicate email — non-enumerating.
     let account_err = || AutumnError::unprocessable_msg("Unable to create account. Please try a different email.");
-    if !email.contains('@') || !email[email.find('@').unwrap() + 1..].contains('.') {{
+    if let Some((_, domain)) = email.split_once('@') {{
+        if !domain.contains('.') {{
+            return Err(account_err());
+        }}
+    }} else {{
         return Err(account_err());
     }}
     if form.password.len() < 8 {{
@@ -454,8 +459,8 @@ pub async fn signup(
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
-    // "user_id" is the key checked by the `#[secured]` attribute.
-    session.insert("user_id", {snake_name}.id.to_string()).await;
+    // Use the same session key checked by `#[secured]` / `#[authorize]`.
+    session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -497,6 +502,7 @@ pub struct LoginForm {{
 #[post("/login")]
 pub async fn login(
     mut db: Db,
+    State(state): State<AppState>,
     session: Session,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {{
@@ -527,8 +533,8 @@ pub async fn login(
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
-    // "user_id" is the key checked by the `#[secured]` attribute.
-    session.insert("user_id", {snake_name}.id.to_string()).await;
+    // Use the same session key checked by `#[secured]` / `#[authorize]`.
+    session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -716,6 +722,7 @@ pub struct ResetPasswordForm {{
 #[post("/reset-password")]
 pub async fn reset_password(
     mut db: Db,
+    State(state): State<AppState>,
     session: Session,
     Form(form): Form<ResetPasswordForm>,
 ) -> AutumnResult<Response> {{
@@ -752,8 +759,8 @@ pub async fn reset_password(
     session.rotate_id().await;
     session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
-    // "user_id" is the key checked by the `#[secured]` attribute.
-    session.insert("user_id", {snake_name}.id.to_string()).await;
+    // Use the same session key checked by `#[secured]` / `#[authorize]`.
+    session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
     Ok(redirect_to("/account"))
 }}
 
@@ -1335,6 +1342,23 @@ mod tests {
         assert!(
             routes.contains("session.rotate_id"),
             "login must rotate the session ID to prevent fixation: {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_file_uses_configured_auth_session_key_for_policy_identity() {
+        let routes = render_routes_file("Account", "account", "accounts");
+        assert!(
+            routes.contains("State(state): State<AppState>"),
+            "auth routes must receive AppState: {routes}"
+        );
+        assert!(
+            routes.contains("session.insert(state.auth_session_key()"),
+            "auth routes must populate the same session key used by policy context: {routes}"
+        );
+        assert!(
+            !routes.contains("session.insert(\"user_id\""),
+            "non-User auth routes must not hard-code user_id as the policy session key: {routes}"
         );
     }
 

@@ -77,6 +77,11 @@ pub struct RedisCache {
     key_prefix: String,
 }
 
+fn ttl_millis_for_redis(ttl: std::time::Duration) -> u64 {
+    let millis = ttl.as_millis().max(1);
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 impl RedisCache {
     /// Connect using an explicit URL and key prefix.
     ///
@@ -127,9 +132,13 @@ impl RedisCache {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 if let Some(ttl) = ttl {
-                    // Round sub-second TTLs up to 1 s to avoid a zero-second expiry.
-                    let secs = ttl.as_secs().max(1);
-                    let _: Result<(), _> = conn.set_ex(&prefixed, bytes, secs).await;
+                    let millis = ttl_millis_for_redis(ttl);
+                    let _: Result<(), _> = redis::cmd("PSETEX")
+                        .arg(&prefixed)
+                        .arg(millis)
+                        .arg(bytes)
+                        .query_async(&mut conn)
+                        .await;
                 } else {
                     let _: Result<(), _> = conn.set(&prefixed, bytes).await;
                 }
@@ -195,8 +204,8 @@ impl Cache for RedisCache {
     /// types, including structs and collections that `insert_value` cannot
     /// serialize from an erased `Arc<dyn Any>`.
     ///
-    /// When `ttl` is `Some`, the entry is stored with `SET EX` so Redis expires
-    /// it automatically — matching the TTL declared on `#[cached(ttl = "…")]`.
+    /// When `ttl` is `Some`, the entry is stored with millisecond precision so
+    /// Redis expires it automatically, matching the TTL declared on `#[cached]`.
     fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, ttl: Option<std::time::Duration>) {
         self.redis_set(key, bytes, ttl);
         debug!(key, "RedisCache: inserted via insert_raw_bytes");
@@ -301,6 +310,23 @@ mod tests {
     use autumn_web::cache::{get_cached, insert_cached};
     use testcontainers::runners::AsyncRunner;
     use testcontainers_modules::redis::Redis as RedisImage;
+
+    #[test]
+    fn redis_ttl_millis_preserves_subsecond_precision() {
+        assert_eq!(
+            ttl_millis_for_redis(std::time::Duration::from_millis(100)),
+            100
+        );
+        assert_eq!(
+            ttl_millis_for_redis(std::time::Duration::from_millis(1_500)),
+            1_500
+        );
+    }
+
+    #[test]
+    fn redis_ttl_millis_never_uses_zero() {
+        assert_eq!(ttl_millis_for_redis(std::time::Duration::ZERO), 1);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]

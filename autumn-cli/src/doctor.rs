@@ -967,13 +967,26 @@ pub fn parse_db_host_port(url: &str) -> Option<(String, u16)> {
         .rfind('@')
         .map_or(authority, |at| &authority[at + 1..]);
 
-    // Split host:port.
-    if let Some(colon) = host_port.rfind(':') {
-        let host = &host_port[..colon];
-        let port: u16 = host_port[colon + 1..].parse().ok()?;
-        Some((host.to_owned(), port))
-    } else {
-        Some((host_port.to_owned(), 5432))
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let close = rest.find(']')?;
+        let host = &rest[..close];
+        let after_bracket = &rest[close + 1..];
+        let port = if let Some(port) = after_bracket.strip_prefix(':') {
+            port.parse().ok()?
+        } else if after_bracket.is_empty() {
+            5432
+        } else {
+            return None;
+        };
+        return Some((host.to_owned(), port));
+    }
+
+    match host_port.matches(':').count() {
+        1 => {
+            let (host, port) = host_port.split_once(':')?;
+            Some((host.to_owned(), port.parse().ok()?))
+        }
+        _ => Some((host_port.to_owned(), 5432)),
     }
 }
 
@@ -1692,6 +1705,20 @@ foo = "bar"
     fn parse_db_host_port_custom_port() {
         let (host, port) = parse_db_host_port("postgres://localhost:6543/test").unwrap();
         assert_eq!(host, "localhost");
+        assert_eq!(port, 6543);
+    }
+
+    #[test]
+    fn parse_db_host_port_unbracketed_ipv6_defaults_port() {
+        let (host, port) = parse_db_host_port("postgres://::1/db").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn parse_db_host_port_bracketed_ipv6_custom_port() {
+        let (host, port) = parse_db_host_port("postgres://[::1]:6543/db").unwrap();
+        assert_eq!(host, "::1");
         assert_eq!(port, 6543);
     }
 

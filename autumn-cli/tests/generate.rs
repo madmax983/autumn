@@ -811,6 +811,27 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
         routes.contains("session.rotate_id"),
         "login must rotate session id"
     );
+    assert!(
+        routes.contains("State(state): State<AppState>"),
+        "auth routes must receive AppState so sessions use the configured auth key"
+    );
+    assert!(
+        routes.contains("session.insert(state.auth_session_key()"),
+        "auth routes must populate the configured auth session key"
+    );
+    assert_eq!(
+        routes.matches("session.insert(\"user_id\"").count(),
+        3,
+        "User auth routes should only write user_id as the generated account id key"
+    );
+    assert!(
+        routes.contains("email.split_once('@')"),
+        "signup email validation should use split_once"
+    );
+    assert!(
+        !routes.contains("email.find('@').unwrap()"),
+        "signup email validation should not search for @ repeatedly"
+    );
 
     // routes/mod.rs
     let route_mod = fs::read_to_string(project.join("src/routes/mod.rs")).unwrap();
