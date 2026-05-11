@@ -40,6 +40,16 @@ impl PathExt for String {
     }
 }
 
+/// Percent-encode one dynamic route path segment.
+///
+/// Route macro helpers use this before interpolating path parameters so
+/// Display values like `a/b` remain a single segment (`a%2Fb`).
+#[doc(hidden)]
+#[must_use]
+pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
+    percent_encode(&value.to_string())
+}
+
 /// Percent-encode a query component per RFC 3986.
 ///
 /// Unreserved characters (ALPHA / DIGIT / `-` / `_` / `.` / `~`) are left

@@ -1072,7 +1072,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #[doc(hidden)]
             #vis fn #get_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
-                format!("{}/{id}", #api_path)
+                format!("{}/{}", #api_path, ::autumn_web::paths::encode_path_segment(id))
             }
 
             #[doc(hidden)]
@@ -1082,12 +1082,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #[doc(hidden)]
             #vis fn #update_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
-                format!("{}/{id}", #api_path)
+                format!("{}/{}", #api_path, ::autumn_web::paths::encode_path_segment(id))
             }
 
             #[doc(hidden)]
             #vis fn #delete_path_fn(id: impl ::std::fmt::Display) -> ::std::string::String {
-                format!("{}/{id}", #api_path)
+                format!("{}/{}", #api_path, ::autumn_web::paths::encode_path_segment(id))
             }
         }
     } else {

@@ -229,11 +229,15 @@ fn emit_path_helper(
     // Rust keywords (you cannot write `format!("{type}")` in generated code).
     let format_str = positional_format_string(&path.value());
     let format_lit = LitStr::new(&format_str, path.span());
+    let encoded_params: Vec<TokenStream> = param_idents
+        .iter()
+        .map(|ident| quote! { ::autumn_web::paths::encode_path_segment(#ident) })
+        .collect();
 
     quote! {
         #[doc(hidden)]
         pub fn #helper_name(#(#param_idents: impl ::std::fmt::Display),*) -> ::std::string::String {
-            format!(#format_lit, #(#param_idents),*)
+            format!(#format_lit, #(#encoded_params),*)
         }
     }
 }

@@ -61,6 +61,19 @@ fn get_route_returns_single_widget_ref() {
 }
 
 #[test]
+fn repository_api_path_helpers_percent_encode_ids() {
+    assert_eq!(__autumn_path_widget_api_get("a/b"), "/api/widgets/a%2Fb");
+    assert_eq!(
+        __autumn_path_widget_api_update("hello world/é"),
+        "/api/widgets/hello%20world%2F%C3%A9"
+    );
+    assert_eq!(
+        __autumn_path_widget_api_delete("a?b#c"),
+        "/api/widgets/a%3Fb%23c"
+    );
+}
+
+#[test]
 fn create_route_takes_new_widget_returns_widget() {
     let route = __autumn_route_info_widget_api_create();
     assert_eq!(route.api_doc.method, "POST");

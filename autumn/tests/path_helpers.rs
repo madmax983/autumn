@@ -172,6 +172,19 @@ fn path_helper_accepts_string_id() {
 }
 
 #[test]
+fn path_helper_percent_encodes_reserved_segment_chars() {
+    assert_eq!(__autumn_path_show_post("a/b"), "/posts/a%2Fb");
+}
+
+#[test]
+fn path_helper_percent_encodes_spaces_and_non_ascii() {
+    assert_eq!(
+        __autumn_path_show_post_by_year_slug(2024, "hello world/é"),
+        "/posts/2024/hello%20world%2F%C3%A9"
+    );
+}
+
+#[test]
 fn path_helper_accepts_u32_id() {
     let id: u32 = 10;
     assert_eq!(__autumn_path_show_post(id), "/posts/10");

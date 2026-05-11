@@ -805,14 +805,22 @@ fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
         let Some(value) = obj.get_mut(field.name) else {
             continue;
         };
-        coerce_form_value(value, &field.kind);
+        coerce_form_value(value, field);
     }
 
     data
 }
 
-fn coerce_form_value(value: &mut Value, kind: &AdminFieldKind) {
-    match kind {
+fn coerce_form_value(value: &mut Value, field: &AdminField) {
+    if !field.required
+        && matches!(field.kind, AdminFieldKind::Integer | AdminFieldKind::Float)
+        && matches!(value, Value::String(raw) if raw.trim().is_empty())
+    {
+        *value = Value::Null;
+        return;
+    }
+
+    match &field.kind {
         AdminFieldKind::Boolean => {
             if let Value::String(raw) = value
                 && let Some(parsed) = parse_form_bool(raw)
@@ -1001,6 +1009,17 @@ mod tests {
                 "settings": {"published": true}
             })
         );
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_blank_optional_numeric_strings_to_null() {
+        let fields = vec![
+            AdminField::new("count", AdminFieldKind::Integer).optional(),
+            AdminField::new("rating", AdminFieldKind::Float).optional(),
+        ];
+        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields);
+
+        assert_eq!(out, json!({"count": null, "rating": null}));
     }
 
     #[test]
