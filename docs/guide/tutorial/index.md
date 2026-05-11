@@ -35,6 +35,10 @@ stuck, compare your code against the example.
 > [i18n guide](../i18n.md) for the opt-in Project Fluent integration —
 > file convention, `Locale` extractor, and the `t!()` macro.
 
+> **Accepting third-party callbacks?** See the
+> [signed webhook guide](../signed-webhooks.md) for Stripe/GitHub/Slack-style
+> HMAC verification and replay protection.
+
 ## How to Use This Tutorial
 
 Each chapter builds on the previous one. Start from Chapter 1 and work

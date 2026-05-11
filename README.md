@@ -181,10 +181,12 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, and profiles |
 | [`examples/custom_config_loader`](examples/custom_config_loader) | Replace the default TOML + env config loader with a custom `ConfigLoader` (JSON file, Vault, Secrets Manager, etc.) |
 | [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
+| [`examples/signed-webhooks`](examples/signed-webhooks) | Signed webhook intake with provider-shaped HMAC verification, replay protection, and fixture tests |
 
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Signed Webhook Intake](docs/guide/signed-webhooks.md)
 - [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
 - [Release Checklist](docs/release-checklist.md)
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`

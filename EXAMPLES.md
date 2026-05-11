@@ -157,6 +157,21 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/signed-webhooks` - Signed Webhook Intake
+
+<!-- catalog:example name=signed-webhooks tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer integrating payment, Git, chat, or CMS callbacks |
+| **Journey** | Signed intake: configure a provider preset, verify raw-body HMAC, reject stale/tampered/replayed deliveries |
+| **Key capabilities** | `SignedWebhook`, Stripe-style signatures, raw-body verification, replay protection, Problem Details failures |
+| **Prerequisites** | Rust 1.88.0+ |
+| **Run command** | `cargo run -p signed-webhooks-example` |
+| **Success proof** | `cargo test -p signed-webhooks-example` passes valid, tampered-body, stale-timestamp, bad-signature, and duplicate-delivery fixtures |
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
@@ -173,6 +188,7 @@ can pick the closest starting point without overlap.
 | Full-stack clone | `reddit-clone` | Auth, sessions, jobs, channels, email — the complete server-first stack |
 | Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
 | WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
+| Signed intake | `signed-webhooks` | Provider-shaped webhook HMAC verification and replay rejection |
 
 ---
 

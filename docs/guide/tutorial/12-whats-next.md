@@ -26,12 +26,14 @@ tutorial omitted. Then branch out into the newer example apps:
 - `examples/blog/` for hybrid rendering and a richer admin UI
 - `examples/bookmarks/` for repository macros, generated CRUD APIs, and scheduled tasks
 - `examples/wiki/` for mutation hooks and revision history
+- `examples/signed-webhooks/` for signed third-party callback intake and replay fixtures
 
 ### Ideas for Extending the App
 
 - **Authentication** -- add user accounts with session cookies
 - **Actuator hardening** -- tune which operational endpoints stay visible in prod
 - **Background work** -- add a `#[scheduled]` task for cleanup or polling
+- **Third-party callbacks** -- add signed Stripe/GitHub/Slack-style webhooks
 - **Categories** -- associate todos with categories (a second table, foreign keys)
 - **Search** -- add a search bar with `ILIKE` queries
 - **Pagination** -- limit the list with `.limit()` and `.offset()`
@@ -41,6 +43,7 @@ tutorial omitted. Then branch out into the newer example apps:
 
 - [API Reference](https://docs.rs/autumn-web) -- generated Rust docs for every public type
 - [Getting Started Guide](../getting-started.md) -- quick overview of all features
+- [Signed Webhook Intake](../signed-webhooks.md) -- raw-body HMAC verification and replay protection
 - [Example App](../../../examples/todo-app/) -- the reference implementation
 - [Autumn on crates.io](https://crates.io/crates/autumn-web) -- versioned releases
 
