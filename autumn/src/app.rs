@@ -1573,7 +1573,7 @@ impl AppBuilder {
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -1903,7 +1903,7 @@ impl AppBuilder {
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -2198,7 +2198,7 @@ impl AppBuilder {
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -3953,7 +3953,7 @@ mod validate_repository_api_policies_tests {
 
 fn build_state(
     config: &AutumnConfig,
-    #[cfg(feature = "db")] database_topology: Option<crate::db::DatabaseTopology>,
+    #[cfg(feature = "db")] database_topology: Option<&crate::db::DatabaseTopology>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
     #[cfg(feature = "ws")]
@@ -3973,13 +3973,9 @@ fn build_state(
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
-        pool: database_topology
-            .as_ref()
-            .map(|topology| topology.primary().clone()),
+        pool: database_topology.map(|topology| topology.primary().clone()),
         #[cfg(feature = "db")]
-        replica_pool: database_topology
-            .as_ref()
-            .and_then(|topology| topology.replica().cloned()),
+        replica_pool: database_topology.and_then(|topology| topology.replica().cloned()),
         profile: config.profile.clone(),
         started_at: std::time::Instant::now(),
         health_detailed: config.health.detailed,
@@ -4285,7 +4281,7 @@ mod tests {
 
         let state = build_state(
             &config,
-            Some(topology),
+            Some(&topology),
             #[cfg(feature = "ws")]
             None,
         );
@@ -4308,7 +4304,7 @@ mod tests {
 
         let state = build_state(
             &config,
-            Some(topology),
+            Some(&topology),
             #[cfg(feature = "ws")]
             None,
         );
@@ -4336,7 +4332,7 @@ mod tests {
             .expect("database should be configured");
         let state = build_state(
             &config,
-            Some(topology),
+            Some(&topology),
             #[cfg(feature = "ws")]
             None,
         );

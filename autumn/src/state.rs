@@ -526,7 +526,7 @@ impl DbState for AppState {
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
-        AppState::read_pool(self)
+        Self::read_pool(self)
     }
 }
 

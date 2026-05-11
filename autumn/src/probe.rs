@@ -170,6 +170,10 @@ impl ProbeState {
     }
 
     /// Configure runtime readiness behavior for a read replica.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn configure_replica_dependency(&self, fallback: crate::config::ReplicaFallback) {
         let mut dependency = self
@@ -204,6 +208,10 @@ impl ProbeState {
     }
 
     /// Mark the configured read replica as reachable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn mark_replica_connection_ready(&self) {
         let mut dependency = self
@@ -217,6 +225,10 @@ impl ProbeState {
     }
 
     /// Mark the configured read replica as unreachable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn mark_replica_connection_unready(&self, detail: impl Into<String>) {
         let mut dependency = self
@@ -228,6 +240,10 @@ impl ProbeState {
     }
 
     /// Mark the configured read replica's migration state as current.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn mark_replica_migrations_ready(&self) {
         let mut dependency = self
@@ -252,6 +268,10 @@ impl ProbeState {
     }
 
     /// Mark the configured read replica as ready.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn mark_replica_ready(&self) {
         let mut dependency = self
@@ -264,6 +284,10 @@ impl ProbeState {
     }
 
     /// Mark the configured read replica as unavailable or stale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
     #[cfg(feature = "db")]
     pub fn mark_replica_unready(&self, detail: impl Into<String>) {
         let mut dependency = self

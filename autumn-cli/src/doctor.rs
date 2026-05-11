@@ -715,8 +715,9 @@ fn tcp_reachable(host: &str, port: u16) -> bool {
         .any(|addr| std::net::TcpStream::connect_timeout(addr, Duration::from_secs(1)).is_ok())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DoctorReplicaFallback {
+    #[default]
     FailReadiness,
     Primary,
 }
@@ -736,12 +737,6 @@ pub struct DoctorDatabaseTopology {
     pub replica_url: Option<String>,
     pub auto_migrate_in_production: bool,
     pub replica_fallback: DoctorReplicaFallback,
-}
-
-impl Default for DoctorReplicaFallback {
-    fn default() -> Self {
-        Self::FailReadiness
-    }
 }
 
 fn check_database_topology_contract(
@@ -1774,11 +1769,11 @@ foo = "bar"
 
     #[test]
     fn database_topology_parses_latest_applied_migration_version() {
-        let output = r#"
+        let output = r"
             [X] 20260509000000_create_widgets
             [ ] 20260510000000_add_widget_index
             [X] 20260508000000_create_users
-        "#;
+        ";
 
         assert_eq!(
             parse_latest_applied_migration_version(output).as_deref(),
