@@ -701,12 +701,25 @@ pub struct WebhookReplayStoreError {
     message: String,
 }
 
+impl WebhookReplayStoreError {
+    /// Create a replay-store failure with a human-readable diagnostic.
+    ///
+    /// Custom [`WebhookReplayStore`] implementations should return this when
+    /// their durable backend is unavailable or cannot complete the atomic
+    /// delivery-ID claim. Autumn surfaces the failure as `503 Service
+    /// Unavailable` before the webhook handler runs.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
 #[cfg(feature = "redis")]
 impl WebhookReplayStoreError {
     fn backend(operation: &'static str, error: impl std::fmt::Display) -> Self {
-        Self {
-            message: format!("webhook replay store {operation} failed: {error}"),
-        }
+        Self::new(format!("webhook replay store {operation} failed: {error}"))
     }
 }
 

@@ -7,7 +7,8 @@ use autumn_web::security::{CsrfConfig, SecurityConfig};
 use autumn_web::test::{TestApp, TestResponse};
 use autumn_web::webhook::{
     InMemoryWebhookReplayStore, SignedWebhook, WebhookEndpointConfig, WebhookProvider,
-    WebhookRegistry, WebhookReplayBackend, WebhookReplayStore, hmac_sha256_hex,
+    WebhookRegistry, WebhookReplayBackend, WebhookReplayFuture, WebhookReplayStore,
+    WebhookReplayStoreError, hmac_sha256_hex,
 };
 use serde_json::json;
 
@@ -16,6 +17,24 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const CURRENT_SECRET: &str = "current-webhook-secret-32-bytes!!";
 const PREVIOUS_SECRET: &str = "previous-webhook-secret-32-bytes!";
+
+#[derive(Debug)]
+struct UnavailableReplayStore;
+
+impl WebhookReplayStore for UnavailableReplayStore {
+    fn check_and_insert<'a>(
+        &'a self,
+        _key: &'a str,
+        _received_at: SystemTime,
+        _window: Duration,
+    ) -> WebhookReplayFuture<'a> {
+        Box::pin(async {
+            Err(WebhookReplayStoreError::new(
+                "custom replay backend offline",
+            ))
+        })
+    }
+}
 
 #[post("/webhooks/stripe")]
 async fn stripe_webhook(webhook: SignedWebhook) -> Json<serde_json::Value> {
@@ -94,6 +113,16 @@ fn client(endpoints: Vec<WebhookEndpointConfig>) -> autumn_web::test::TestClient
             generic_webhook
         ])
         .build()
+}
+
+fn client_with_registry(registry: WebhookRegistry) -> autumn_web::test::TestClient {
+    let state = autumn_web::AppState::for_test().with_extension(registry);
+    let mut route_defs = routes![github_webhook];
+    let route = route_defs.remove(0);
+    let router = axum::Router::new()
+        .route(route.path, route.handler)
+        .with_state(state);
+    TestApp::from_router(router)
 }
 
 fn endpoint(
@@ -481,6 +510,46 @@ async fn duplicate_delivery_ids_are_rejected_deterministically() {
             .is_some_and(|detail| detail.contains("duplicate"))
     );
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn custom_replay_store_failures_are_reported_as_service_unavailable() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let config = autumn_web::webhook::WebhookConfig {
+        endpoints: vec![endpoint(
+            WebhookProvider::Github,
+            "/webhooks/github",
+            "github",
+        )],
+        ..Default::default()
+    };
+    let registry = WebhookRegistry::from_config_with_replay_store(&config, UnavailableReplayStore)
+        .expect("custom replay store should be installable");
+    let client = client_with_registry(registry);
+    let body = br#"{"action":"opened"}"#;
+
+    let response = client
+        .post("/webhooks/github")
+        .header(
+            "x-hub-signature-256",
+            &github_signature(CURRENT_SECRET, body),
+        )
+        .header("x-github-delivery", "store-outage-delivery")
+        .header("x-github-event", "pull_request")
+        .body(body.as_slice())
+        .send()
+        .await;
+
+    response.assert_status(503);
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["status"], 503);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("custom replay backend offline"))
+    );
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
