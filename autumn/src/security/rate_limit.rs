@@ -246,11 +246,21 @@ impl Limiter {
     /// proxy overwrites the forwarding header.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
-            let xff_ip = req
-                .headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| self.client_ip_from_x_forwarded_for(s));
+            // Combine all X-Forwarded-For headers into a single chain.
+            // When multiple headers exist, they are conceptually a single comma-separated list.
+            let xff_ip = {
+                let headers: Vec<&str> = req
+                    .headers()
+                    .get_all("x-forwarded-for")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect();
+                if headers.is_empty() {
+                    None
+                } else {
+                    self.client_ip_from_x_forwarded_for(&headers.join(", "))
+                }
+            };
 
             if xff_ip.is_some() {
                 return xff_ip;

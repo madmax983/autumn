@@ -10,5 +10,6 @@ pub mod csrf_path_traversal;
 pub mod csrf_timing;
 pub mod ctf;
 pub mod fallback_middleware_bypass;
+pub mod eris_xff_spoofing;
 pub mod session_exhaustion;
 pub mod session_fixation;
