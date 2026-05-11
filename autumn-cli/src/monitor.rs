@@ -166,6 +166,7 @@ const SPARKLINE_DEPTH: usize = 120;
 
 struct DashboardState {
     base_url: String,
+    is_replay: bool,
     health: HealthResponse,
     metrics: MetricsResponse,
     tasks: TasksResponse,
@@ -196,6 +197,7 @@ struct DashboardState {
 impl DashboardState {
     fn new(base_url: String) -> Self {
         Self {
+            is_replay: false,
             base_url,
             health: HealthResponse::default(),
             metrics: MetricsResponse::default(),
@@ -365,6 +367,45 @@ pub fn run(url: &str, poll_secs: u64) {
     }
 }
 
+pub fn run_replay(file_path: &str) {
+    let file = std::fs::File::open(file_path).unwrap_or_else(|e| {
+        eprintln!("Failed to open replay file '{file_path}': {e}");
+        std::process::exit(1);
+    });
+    let snapshot: serde_json::Value = serde_json::from_reader(file).unwrap_or_else(|e| {
+        eprintln!("Failed to parse replay file '{file_path}': {e}");
+        std::process::exit(1);
+    });
+
+    let mut state = DashboardState::new(snapshot["url"].as_str().unwrap_or("unknown").to_string());
+    state.is_replay = true;
+    state.health = serde_json::from_value(snapshot["health"].clone()).unwrap_or_default();
+    state.metrics = serde_json::from_value(snapshot["metrics"].clone()).unwrap_or_default();
+    state.tasks = serde_json::from_value(snapshot["tasks"].clone()).unwrap_or_default();
+    state.loggers = serde_json::from_value(snapshot["loggers"].clone()).unwrap_or_default();
+    state.channels = serde_json::from_value(snapshot["channels"].clone()).unwrap_or_default();
+    state.connected = true;
+
+    // Populate static charts if needed, or leave history empty for replay mode.
+    if state.metrics.http.requests_total > 0 {
+        state
+            .throughput_history
+            .push_back(state.metrics.http.requests_total);
+    }
+
+    terminal::enable_raw_mode().expect("failed to enable raw mode");
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, cursor::Hide).expect("failed to setup terminal");
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("failed to create terminal");
+
+    let _ = run_loop(&mut terminal, &mut state, Duration::from_secs(60));
+
+    terminal::disable_raw_mode().expect("failed to disable raw mode");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
+        .expect("failed to restore terminal");
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut DashboardState,
@@ -410,7 +451,10 @@ fn run_loop(
 
         // Poll actuator endpoints
         if state.last_poll.elapsed() >= poll_interval {
-            state.poll();
+            if !state.is_replay {
+                state.poll();
+            }
+            state.last_poll = Instant::now();
         }
     }
 }

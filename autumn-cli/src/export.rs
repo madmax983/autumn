@@ -26,6 +26,7 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
     let metrics = fetch_endpoint(&client, base_url, "/actuator/metrics");
     let tasks = fetch_endpoint(&client, base_url, "/actuator/tasks");
     let loggers = fetch_endpoint(&client, base_url, "/actuator/loggers");
+    let channels = fetch_endpoint(&client, base_url, "/actuator/channels");
 
     // If any endpoint returns an error, fail the export
     for (name, val) in [
@@ -33,6 +34,7 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
         ("metrics", &metrics),
         ("tasks", &tasks),
         ("loggers", &loggers),
+        ("channels", &channels),
     ] {
         if let Some(err) = val.get("error") {
             return Err(format!(
@@ -56,6 +58,7 @@ pub fn run_inner(url: &str, output: &str) -> Result<(), String> {
         "metrics": metrics,
         "tasks": tasks,
         "loggers": loggers,
+        "channels": channels,
     });
 
     match File::create(output) {
@@ -173,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_run_inner_success() {
-        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
+        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 5);
 
         let output_file = tempfile::NamedTempFile::new().unwrap();
         let output_path = output_file.path().to_str().unwrap();
@@ -189,6 +192,7 @@ mod tests {
         assert_eq!(json["metrics"]["status"], "ok");
         assert_eq!(json["tasks"]["status"], "ok");
         assert_eq!(json["loggers"]["status"], "ok");
+        assert_eq!(json["channels"]["status"], "ok");
     }
 
     #[test]
@@ -207,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_run_inner_file_creation_error() {
-        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 4);
+        let url = spawn_mock_server("HTTP/1.1 200 OK", r#"{"status": "ok"}"#, 5);
 
         // Use an invalid path that cannot be created
         let result = run_inner(&url, "/invalid/path/that/does/not/exist/diag.json");
