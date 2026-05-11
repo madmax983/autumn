@@ -3272,7 +3272,7 @@ async fn setup_database(
             config.database.replica_url.as_deref(),
         ) {
             (Some(primary_url), Some(replica_url)) => Some(
-                check_replica_migration_readiness_blocking(
+                crate::migrate::check_replica_migration_readiness_blocking(
                     primary_url.to_owned(),
                     replica_url.to_owned(),
                 )
@@ -3291,22 +3291,6 @@ async fn setup_database(
 }
 
 #[cfg(feature = "db")]
-async fn check_replica_migration_readiness_blocking(
-    primary_url: String,
-    replica_url: String,
-) -> crate::migrate::ReplicaMigrationReadiness {
-    tokio::task::spawn_blocking(move || {
-        crate::migrate::check_replica_migration_readiness(&primary_url, &replica_url)
-    })
-    .await
-    .unwrap_or_else(|error| {
-        crate::migrate::ReplicaMigrationReadiness::Unknown(format!(
-            "replica migration readiness task failed: {error}"
-        ))
-    })
-}
-
-#[cfg(feature = "db")]
 fn apply_replica_migration_readiness(
     state: &AppState,
     readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
@@ -3318,7 +3302,7 @@ fn apply_replica_migration_readiness(
     if readiness.is_ready() {
         state.probes().mark_replica_migrations_ready();
     } else if let Some(detail) = readiness.detail() {
-        state.probes().mark_replica_unready(detail);
+        state.probes().mark_replica_migrations_unready(detail);
     }
 }
 
@@ -4019,6 +4003,14 @@ fn build_state(
         state
             .probes()
             .configure_replica_dependency(config.database.replica_fallback);
+        if let (Some(primary_url), Some(replica_url)) = (
+            config.database.effective_primary_url(),
+            config.database.replica_url.as_deref(),
+        ) {
+            state
+                .probes()
+                .configure_replica_migration_check(primary_url, replica_url);
+        }
     }
     state.insert_extension(config.clone());
     state
@@ -4305,6 +4297,32 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
+    #[test]
+    fn build_state_configures_replica_migration_recheck_urls() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+
+        let state = build_state(
+            &config,
+            Some(topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+
+        let check = state
+            .probes()
+            .replica_migration_check()
+            .expect("replica migration check should be configured");
+
+        assert_eq!(check.primary_url, "postgres://localhost/primary");
+        assert_eq!(check.replica_url, "postgres://localhost/replica");
+    }
+
+    #[cfg(feature = "db")]
     #[tokio::test]
     async fn replica_migration_readiness_marks_ready_endpoint_degraded() {
         let mut config = AutumnConfig::default();
@@ -4339,7 +4357,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn blocking_replica_migration_readiness_reports_unknown_connection_errors() {
-        let readiness = check_replica_migration_readiness_blocking(
+        let readiness = crate::migrate::check_replica_migration_readiness_blocking(
             "not-a-primary-url".to_owned(),
             "not-a-replica-url".to_owned(),
         )

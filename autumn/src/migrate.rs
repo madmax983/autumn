@@ -204,6 +204,21 @@ pub(crate) fn check_replica_migration_readiness(
     compare_replica_migration_versions(&primary, &replica)
 }
 
+pub(crate) async fn check_replica_migration_readiness_blocking(
+    primary_url: String,
+    replica_url: String,
+) -> ReplicaMigrationReadiness {
+    tokio::task::spawn_blocking(move || {
+        check_replica_migration_readiness(&primary_url, &replica_url)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        ReplicaMigrationReadiness::Unknown(format!(
+            "replica migration readiness task failed: {error}"
+        ))
+    })
+}
+
 fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
     let profile_name = profile.unwrap_or("none");
     matches!(profile_name, "dev" | "development")
