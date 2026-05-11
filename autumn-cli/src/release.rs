@@ -220,7 +220,9 @@ pub fn init(
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn render(template: &str, project_name: &str) -> String {
-    template.replace("{{project_name}}", project_name)
+    template
+        .replace("{{project_name}}", project_name)
+        .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -416,6 +418,20 @@ mod tests {
         assert!(
             content.contains("autumn migrate"),
             "Dockerfile must document the explicit primary-role migration job"
+        );
+    }
+
+    #[test]
+    fn dockerfile_installs_autumn_cli_for_migration_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert!(
+            content.contains("cargo install")
+                && content.contains("autumn-cli")
+                && content.contains("/usr/local/bin/autumn"),
+            "Dockerfile must include the autumn CLI used by one-shot migration jobs"
         );
     }
 
@@ -788,6 +804,27 @@ previous_secrets = []
         assert!(
             content.contains("depends_on"),
             "docker-compose.yml app service must depend_on the db"
+        );
+    }
+
+    #[test]
+    fn docker_compose_runs_one_shot_migration_before_app() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::DockerCompose).unwrap();
+        let content = fs::read_to_string(dir.join("docker-compose.yml")).unwrap();
+
+        assert!(
+            content.contains("migrate:"),
+            "docker-compose.yml must include a one-shot migration service"
+        );
+        assert!(
+            content.contains("autumn migrate"),
+            "migration service must run autumn migrate"
+        );
+        assert!(
+            content.contains("condition: service_completed_successfully"),
+            "app service must wait for the migration job to complete successfully"
         );
     }
 

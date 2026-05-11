@@ -1,4 +1,4 @@
-﻿# Autumn Bookmarks Distributed Example
+# Autumn Bookmarks Distributed Example
 
 A bookmark manager copied from `bookmarks` as a clean baseline for the future
 distributed retrofit. It keeps the same bookmark domain and user-facing surface
@@ -45,17 +45,17 @@ docker compose -f examples/bookmarks-distributed/docker-compose.yml up -d --buil
 
 `docker-compose.yml` passes `AUTUMN_SECURITY__SIGNING_SECRET` from your shell
 into every web replica via the `x-bookmarks-base` anchor. Compose will refuse
-to start if the variable is unset â€” that mirrors the hard startup failure you
+to start if the variable is unset — that mirrors the hard startup failure you
 would see in a production Autumn app.
 
 `autumn-docker.toml` wires three additional things:
 - `[database] primary_url` / `replica_url` -- the same first-class topology
   contract used by Autumn itself. The old `[distributed.database]` shape is
   still accepted by the example loader only as a migration bridge.
-- `[session] backend = "redis"` â€” sessions are stored in the shared Redis
+- `[session] backend = "redis"` — sessions are stored in the shared Redis
   instance so a session established by `bookmarks-1` is readable by
   `bookmarks-2`.
-- `[security.signing_secret]` â€” the runtime secret comes from the env var
+- `[security.signing_secret]` — the runtime secret comes from the env var
   above; the comment reminds you not to hardcode a value in the TOML file.
 
 That stack brings up:
@@ -160,7 +160,7 @@ curl -X PUT http://localhost:3000/api/bookmarks/1 \
 ## Verifying cross-replica session consistency
 
 Once the stack is up, you can confirm that a session established on one replica
-is honoured by the others â€” which is the practical test of a shared signing
+is honoured by the others — which is the practical test of a shared signing
 secret plus a shared session store:
 
 ```bash
@@ -192,6 +192,6 @@ page), regardless of which replica handles it.
   might reduce ceremony without hiding the runtime truth.
 - Signing secrets must be provisioned before `docker compose up`. The compose
   file uses `${AUTUMN_SECURITY__SIGNING_SECRET:?...}` syntax so that Compose
-  itself fails loudly if the variable is missing â€” rather than silently starting
+  itself fails loudly if the variable is missing — rather than silently starting
   replicas with per-process ephemeral keys that would cause every session cookie
   to be invalid on any replica other than the one that set it.

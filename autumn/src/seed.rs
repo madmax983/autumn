@@ -1,4 +1,4 @@
-﻿//! Seed context for populating databases with representative data.
+//! Seed context for populating databases with representative data.
 //!
 //! Enabled with the `seed` cargo feature (off by default). Include in your
 //! project's `Cargo.toml` to use it in a seed binary:
@@ -49,7 +49,7 @@ pub enum SeedContextError {
 /// Context provided to a seed binary.
 ///
 /// Holds the database connection pool and the active profile, both resolved
-/// from the project's `autumn.toml` and environment variables â€” the same
+/// from the project's `autumn.toml` and environment variables — the same
 /// sources the main application uses.
 ///
 /// # Usage
@@ -209,7 +209,7 @@ fn first_database_url(database: Option<&toml::Value>) -> Option<String> {
 mod tests {
     use super::*;
 
-    // â”€â”€ resolve_profile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── resolve_profile ────────────────────────────────────────────────────
 
     #[test]
     fn resolve_profile_defaults_to_dev() {
@@ -251,7 +251,7 @@ mod tests {
         );
     }
 
-    // â”€â”€ resolve_database_url â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── resolve_database_url ───────────────────────────────────────────────
 
     #[test]
     fn resolve_database_url_prefers_autumn_database_primary_url() {
@@ -375,7 +375,7 @@ primary_url = "postgres://default:5432/db"
         assert_eq!(result.as_deref(), Some("postgres://default:5432/db"));
     }
 
-    // â”€â”€ SeedContextError messages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    // ── SeedContextError messages ──────────────────────────────────────────
 
     #[test]
     fn no_database_url_error_message_is_actionable() {

@@ -197,6 +197,10 @@ impl AppState {
     {
         if self.replica_pool.is_some() && self.probes.should_route_reads_to_replica() {
             self.replica_pool.as_ref()
+        } else if self.replica_pool.is_some() && self.probes.should_fallback_reads_to_primary() {
+            self.pool.as_ref()
+        } else if self.replica_pool.is_some() {
+            None
         } else {
             self.pool.as_ref()
         }
@@ -550,6 +554,14 @@ impl crate::probe::ProvideProbeState for AppState {
     {
         self.pool.as_ref()
     }
+
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
 }
 
 impl crate::actuator::ProvideActuatorState for AppState {
@@ -734,7 +746,36 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
-    fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
+    fn read_pool_does_not_route_to_unready_replica_when_policy_fails_readiness() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
         let primary_config = config::DatabaseConfig {
             url: Some("postgres://localhost/primary".into()),
             pool_size: 5,
@@ -758,7 +799,7 @@ mod tests {
             .probes()
             .mark_replica_unready("replica migrations lag primary");
 
-        let (status, _) = crate::probe::readiness_response(&state);
+        let (status, _) = crate::probe::readiness_response(&state).await;
 
         assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
     }

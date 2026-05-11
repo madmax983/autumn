@@ -10,6 +10,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 ARG TAILWIND_VERSION=v4.1.4
+ARG AUTUMN_CLI_VERSION={{autumn_cli_version}}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -32,6 +33,7 @@ RUN mkdir -p target/autumn \
 
 COPY . .
 RUN cargo build --release
+RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -49,6 +51,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
 COPY --chown=autumn:autumn --from=builder /app/static /app/static
 COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
 # Use the production config example as the runtime autumn.toml.

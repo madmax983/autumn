@@ -1,4 +1,4 @@
-﻿# Chapter 10: Configuration and Production Defaults
+# Chapter 10: Configuration and Production Defaults
 
 **Goal:** By the end of this chapter, you will understand Autumn's profile-aware
 configuration system, know how to override settings with environment variables,

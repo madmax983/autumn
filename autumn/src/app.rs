@@ -3263,21 +3263,46 @@ async fn setup_database(
         }
     }
 
-    let replica_readiness = topology.as_ref().and_then(|topology| {
-        if !check_replica_migrations || topology.replica().is_none() {
-            return None;
+    let replica_readiness = if topology
+        .as_ref()
+        .is_some_and(|topology| check_replica_migrations && topology.replica().is_some())
+    {
+        match (
+            config.database.effective_primary_url(),
+            config.database.replica_url.as_deref(),
+        ) {
+            (Some(primary_url), Some(replica_url)) => Some(
+                check_replica_migration_readiness_blocking(
+                    primary_url.to_owned(),
+                    replica_url.to_owned(),
+                )
+                .await,
+            ),
+            _ => None,
         }
-        let primary_url = config.database.effective_primary_url()?;
-        let replica_url = config.database.replica_url.as_deref()?;
-        Some(crate::migrate::check_replica_migration_readiness(
-            primary_url,
-            replica_url,
-        ))
-    });
+    } else {
+        None
+    };
 
     Ok(DatabaseBootstrap {
         topology,
         replica_readiness,
+    })
+}
+
+#[cfg(feature = "db")]
+async fn check_replica_migration_readiness_blocking(
+    primary_url: String,
+    replica_url: String,
+) -> crate::migrate::ReplicaMigrationReadiness {
+    tokio::task::spawn_blocking(move || {
+        crate::migrate::check_replica_migration_readiness(&primary_url, &replica_url)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        crate::migrate::ReplicaMigrationReadiness::Unknown(format!(
+            "replica migration readiness task failed: {error}"
+        ))
     })
 }
 
@@ -3291,7 +3316,7 @@ fn apply_replica_migration_readiness(
     };
 
     if readiness.is_ready() {
-        state.probes().mark_replica_ready();
+        state.probes().mark_replica_migrations_ready();
     } else if let Some(detail) = readiness.detail() {
         state.probes().mark_replica_unready(detail);
     }
@@ -4280,8 +4305,8 @@ mod tests {
     }
 
     #[cfg(feature = "db")]
-    #[test]
-    fn replica_migration_readiness_marks_ready_endpoint_degraded() {
+    #[tokio::test]
+    async fn replica_migration_readiness_marks_ready_endpoint_degraded() {
         let mut config = AutumnConfig::default();
         config.database.primary_url = Some("postgres://localhost/primary".to_owned());
         config.database.primary_pool_size = Some(5);
@@ -4306,9 +4331,24 @@ mod tests {
             }),
         );
 
-        let (status, _) = crate::probe::readiness_response(&state);
+        let (status, _) = crate::probe::readiness_response(&state).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn blocking_replica_migration_readiness_reports_unknown_connection_errors() {
+        let readiness = check_replica_migration_readiness_blocking(
+            "not-a-primary-url".to_owned(),
+            "not-a-replica-url".to_owned(),
+        )
+        .await;
+
+        assert!(matches!(
+            readiness,
+            crate::migrate::ReplicaMigrationReadiness::Unknown(_)
+        ));
     }
 
     #[cfg(feature = "ws")]

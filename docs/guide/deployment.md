@@ -1,4 +1,4 @@
-﻿# Deploying an Autumn App
+# Deploying an Autumn App
 
 This guide walks you from a fresh `autumn new` project to a production-shaped
 container running against a real Postgres database. Every command is verbatim;
@@ -12,13 +12,13 @@ internet connection.
 ## Prerequisites
 
 - **Rust 1.88.0+** with `cargo`
-- **Docker** (or Docker Desktop) â€” `docker --version`
+- **Docker** (or Docker Desktop) — `docker --version`
 - **PostgreSQL** accessible at a connection string you control (local or remote)
 - The `autumn` CLI - `cargo install autumn-cli --version 0.3.0`
 
 ---
 
-## Step 1 â€” Create the project
+## Step 1 — Create the project
 
 ```bash
 autumn new myapp
@@ -29,7 +29,7 @@ This scaffolds a working Autumn application with a dev-oriented `Dockerfile`.
 
 ---
 
-## Step 2 â€” Generate production deployment files
+## Step 2 — Generate production deployment files
 
 ```bash
 autumn release init --force
@@ -43,9 +43,9 @@ The command emits three files at the project root:
 
 | File | Purpose |
 |---|---|
-| `Dockerfile` | Multi-stage image: cargo-chef dep cache â†’ release binary â†’ debian-slim runtime |
+| `Dockerfile` | Multi-stage image: cargo-chef dep cache → release binary → debian-slim runtime |
 | `.dockerignore` | Keeps `target/`, `.git/`, `node_modules/`, `dist/` out of the build context |
-| `autumn.production.toml.example` | Production config template with placeholder values â€” no real secrets |
+| `autumn.production.toml.example` | Production config template with placeholder values — no real secrets |
 
 > **What changed in the Dockerfile?**
 > The production Dockerfile adds cargo-chef dependency caching (so rebuilds only
@@ -56,7 +56,7 @@ The command emits three files at the project root:
 
 ---
 
-## Step 3 â€” Build the image
+## Step 3 — Build the image
 
 ```bash
 docker build -t myapp .
@@ -79,7 +79,7 @@ Successfully tagged myapp:latest
 
 ---
 
-## Step 4 â€” Migrate, Then Run the Container
+## Step 4 — Migrate, Then Run the Container
 
 Provide your primary/write Postgres connection string as
 `AUTUMN_DATABASE__PRIMARY_URL`. Run migrations once against that primary role
@@ -104,7 +104,7 @@ You should see something like:
 INFO autumn: Listening addr=0.0.0.0:3000
 ```
 
-Visit [http://localhost:3000/health](http://localhost:3000/health) â€” a healthy
+Visit [http://localhost:3000/health](http://localhost:3000/health) — a healthy
 response looks like:
 
 ```json
@@ -121,15 +121,15 @@ response looks like:
 
 ```
 rust:1.88-bookworm (chef stage)
-  â””â”€ cargo chef prepare          # snapshot dependency graph
-       â””â”€ cargo chef cook        # build all dependencies (cached layer)
-            â””â”€ cargo build --release
-                 â””â”€ debian:bookworm-slim (runtime stage)
+  └─ cargo chef prepare          # snapshot dependency graph
+       └─ cargo chef cook        # build all dependencies (cached layer)
+            └─ cargo build --release
+                 └─ debian:bookworm-slim (runtime stage)
                        libpq5, tini, ca-certificates, curl
-                       /usr/local/bin/myapp     â† your binary
-                       /app/static/             â† compiled Tailwind + assets
-                       /app/migrations/         â† SQL migration files
-                       /app/autumn.toml         â† production config (host=0.0.0.0)
+                       /usr/local/bin/myapp     ← your binary
+                       /app/static/             ← compiled Tailwind + assets
+                       /app/migrations/         ← SQL migration files
+                       /app/autumn.toml         ← production config (host=0.0.0.0)
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/myapp"]
@@ -186,7 +186,7 @@ this file. Pass them as environment variables at runtime:
 ```
 
 `AUTUMN_*` environment variables override `autumn.toml` at the highest
-priority layer â€” see the
+priority layer — see the
 [config reference](getting-started.md#environment-variable-overrides).
 
 ---
@@ -218,7 +218,8 @@ replica has replayed the latest Diesel migration.
 
 ## Run locally with Docker Compose (app + Postgres)
 
-Scaffold a `docker-compose.yml` with an app service and a managed Postgres:
+Scaffold a `docker-compose.yml` with an app service, a one-shot migration job,
+and a managed Postgres:
 
 ```bash
 autumn release init --force --target docker-compose
@@ -231,8 +232,9 @@ docker compose up --build
 ```
 
 The `docker-compose.yml` sets `AUTUMN_DATABASE__PRIMARY_URL` pointing at the
-`db` service and waits for Postgres to pass its healthcheck before starting the
-app. No manual Postgres setup is needed.
+`db` service, waits for Postgres to pass its healthcheck, runs `autumn migrate`
+once, and starts the app only after that job exits successfully. No manual
+Postgres setup is needed.
 
 To reset the database:
 
@@ -248,7 +250,7 @@ docker compose up --build
 By default `autumn release init` refuses to overwrite existing files:
 
 ```
-Error: 'Dockerfile' already exists â€” run with --force to overwrite
+Error: 'Dockerfile' already exists — run with --force to overwrite
 ```
 
 Use `--force` to regenerate everything, or delete individual files first if you
@@ -262,11 +264,11 @@ Before the server will bind in the `prod` profile, you must set a stable signing
 secret. It protects sessions, CSRF tokens, and signed storage URLs:
 
 ```bash
-# Generate once, store securely (e.g. Fly secrets, AWS Secrets Manager, â€¦)
+# Generate once, store securely (e.g. Fly secrets, AWS Secrets Manager, …)
 export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 ```
 
-**Smoke-gate check** â€” the app must refuse to boot _without_ the secret:
+**Smoke-gate check** — the app must refuse to boot _without_ the secret:
 
 ```bash
 docker run --rm \
@@ -309,7 +311,7 @@ docker run --rm -p 3000:3000 \
   -e AUTUMN_SESSION__REDIS__URL=redis://redis:6379 \
   myapp &
 
-# Replica 2 â€” identical secret, primary URL, and Redis URL
+# Replica 2 — identical secret, primary URL, and Redis URL
 docker run --rm -p 3001:3000 \
   -e AUTUMN_ENV=prod \
   -e AUTUMN_DATABASE__PRIMARY_URL=postgres://... \
