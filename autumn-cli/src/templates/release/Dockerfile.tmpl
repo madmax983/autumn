@@ -11,9 +11,10 @@ FROM chef AS builder
 
 ARG TAILWIND_VERSION=v4.1.4
 ARG AUTUMN_CLI_VERSION={{autumn_cli_version}}
+ARG DIESEL_CLI_VERSION={{diesel_cli_version}}
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libpq-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-build dependencies — this layer is cached unless Cargo.lock changes.
@@ -34,6 +35,10 @@ RUN mkdir -p target/autumn \
 COPY . .
 RUN cargo build --release
 RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
+RUN cargo install diesel_cli \
+    --version "${DIESEL_CLI_VERSION}" \
+    --no-default-features \
+    --features postgres
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -52,6 +57,7 @@ WORKDIR /app
 
 COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
 COPY --chown=autumn:autumn --from=builder /app/static /app/static
 COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
 # Use the production config example as the runtime autumn.toml.

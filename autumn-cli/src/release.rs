@@ -223,6 +223,7 @@ fn render(template: &str, project_name: &str) -> String {
     template
         .replace("{{project_name}}", project_name)
         .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{diesel_cli_version}}", "2.3.8")
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -436,6 +437,22 @@ mod tests {
     }
 
     #[test]
+    fn dockerfile_installs_diesel_cli_for_migration_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let dir = make_project(&tmp, "my-app");
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert!(
+            content.contains("cargo install")
+                && content.contains("diesel_cli")
+                && content.contains("libpq-dev")
+                && content.contains("--features postgres")
+                && content.contains("/usr/local/bin/diesel"),
+            "Dockerfile must include the diesel CLI used by autumn migrate"
+        );
+    }
+
+    #[test]
     fn dockerfile_has_healthcheck() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
@@ -476,6 +493,10 @@ mod tests {
         assert!(
             !content.contains("{{project_name}}"),
             "Dockerfile must not contain unsubstituted {{{{project_name}}}}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "Dockerfile must not contain any unsubstituted template placeholders"
         );
     }
 
