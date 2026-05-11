@@ -358,14 +358,6 @@ impl ProbeState {
     }
 
     #[cfg(feature = "db")]
-    pub(crate) fn replica_migrations_ready(&self) -> bool {
-        self.replica_dependency
-            .read()
-            .expect("replica dependency lock poisoned")
-            .migrations_ready
-    }
-
-    #[cfg(feature = "db")]
     pub(crate) fn replica_migration_check(&self) -> Option<ReplicaMigrationCheck> {
         self.replica_dependency
             .read()
@@ -459,19 +451,27 @@ async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
 
 #[cfg(feature = "db")]
 async fn refresh_replica_migration_readiness<S: ProvideProbeState + Sync>(state: &S) {
-    if state.probes().replica_migrations_ready() {
-        return;
-    }
+    refresh_replica_migration_readiness_with(state, |check| {
+        crate::migrate::check_replica_migration_readiness_blocking(
+            check.primary_url,
+            check.replica_url,
+        )
+    })
+    .await;
+}
 
+#[cfg(feature = "db")]
+async fn refresh_replica_migration_readiness_with<S, F, Fut>(state: &S, check_readiness: F)
+where
+    S: ProvideProbeState + Sync,
+    F: FnOnce(ReplicaMigrationCheck) -> Fut,
+    Fut: std::future::Future<Output = crate::migrate::ReplicaMigrationReadiness>,
+{
     let Some(check) = state.probes().replica_migration_check() else {
         return;
     };
 
-    let readiness = crate::migrate::check_replica_migration_readiness_blocking(
-        check.primary_url,
-        check.replica_url,
-    )
-    .await;
+    let readiness = check_readiness(check).await;
 
     if readiness.is_ready() {
         state.probes().mark_replica_migrations_ready();
@@ -721,6 +721,38 @@ mod tests {
 
         assert_eq!(check.primary_url, "postgres://localhost/primary");
         assert_eq!(check.replica_url, "postgres://localhost/replica");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_migration_readiness_rechecks_after_initial_ready_state() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        state.probes().configure_replica_migration_check(
+            "postgres://localhost/primary",
+            "postgres://localhost/replica",
+        );
+        state.probes().mark_replica_connection_ready();
+        state.probes().mark_replica_migrations_ready();
+
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        refresh_replica_migration_readiness_with(&state, |check| {
+            checks.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(check.primary_url, "postgres://localhost/primary");
+            assert_eq!(check.replica_url, "postgres://localhost/replica");
+            std::future::ready(crate::migrate::ReplicaMigrationReadiness::Stale {
+                primary_latest: Some("20260511000000".to_owned()),
+                replica_latest: Some("20260510000000".to_owned()),
+            })
+        })
+        .await;
+
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+        assert!(!state.probes().replica_allows_readiness());
+        assert!(!state.probes().should_route_reads_to_replica());
     }
 
     #[cfg(feature = "db")]

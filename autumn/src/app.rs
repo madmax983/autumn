@@ -1547,6 +1547,8 @@ impl AppBuilder {
         let pool = database.topology;
         #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         #[cfg(feature = "db")]
         if pool.is_some() {
@@ -1577,6 +1579,8 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
@@ -1899,6 +1903,8 @@ impl AppBuilder {
         let pool = database.topology;
         #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         let mut state = build_state(
             &config,
@@ -1907,6 +1913,8 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
@@ -2194,6 +2202,8 @@ impl AppBuilder {
         let pool = database.topology;
         #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         let mut state = build_state(
             &config,
@@ -2202,6 +2212,8 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
         #[cfg(feature = "db")]
         apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
@@ -3229,6 +3241,7 @@ fn install_i18n_bundle_layer(
 struct DatabaseBootstrap {
     topology: Option<crate::db::DatabaseTopology>,
     replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+    replica_migration_check: Option<(String, String)>,
 }
 
 #[cfg(feature = "db")]
@@ -3263,7 +3276,7 @@ async fn setup_database(
         }
     }
 
-    let replica_readiness = if topology
+    let (replica_readiness, replica_migration_check) = if topology
         .as_ref()
         .is_some_and(|topology| check_replica_migrations && topology.replica().is_some())
     {
@@ -3271,22 +3284,26 @@ async fn setup_database(
             config.database.effective_primary_url(),
             config.database.replica_url.as_deref(),
         ) {
-            (Some(primary_url), Some(replica_url)) => Some(
-                crate::migrate::check_replica_migration_readiness_blocking(
-                    primary_url.to_owned(),
-                    replica_url.to_owned(),
+            (Some(primary_url), Some(replica_url)) => {
+                let primary_url = primary_url.to_owned();
+                let replica_url = replica_url.to_owned();
+                let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+                    primary_url.clone(),
+                    replica_url.clone(),
                 )
-                .await,
-            ),
-            _ => None,
+                .await;
+                (Some(readiness), Some((primary_url, replica_url)))
+            }
+            _ => (None, None),
         }
     } else {
-        None
+        (None, None)
     };
 
     Ok(DatabaseBootstrap {
         topology,
         replica_readiness,
+        replica_migration_check,
     })
 }
 
@@ -3304,6 +3321,17 @@ fn apply_replica_migration_readiness(
     } else if let Some(detail) = readiness.detail() {
         state.probes().mark_replica_migrations_unready(detail);
     }
+}
+
+#[cfg(feature = "db")]
+fn configure_replica_migration_check(state: &AppState, check: Option<(String, String)>) {
+    let Some((primary_url, replica_url)) = check else {
+        return;
+    };
+
+    state
+        .probes()
+        .configure_replica_migration_check(primary_url, replica_url);
 }
 
 /// Refuse to start when a `#[repository(api = ...)]`-mounted route
@@ -3999,14 +4027,6 @@ fn build_state(
         state
             .probes()
             .configure_replica_dependency(config.database.replica_fallback);
-        if let (Some(primary_url), Some(replica_url)) = (
-            config.database.effective_primary_url(),
-            config.database.replica_url.as_deref(),
-        ) {
-            state
-                .probes()
-                .configure_replica_migration_check(primary_url, replica_url);
-        }
     }
     state.insert_extension(config.clone());
     state
@@ -4294,7 +4314,7 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
-    fn build_state_configures_replica_migration_recheck_urls() {
+    fn configure_replica_migration_check_stores_recheck_urls() {
         let mut config = AutumnConfig::default();
         config.database.primary_url = Some("postgres://localhost/primary".to_owned());
         config.database.replica_url = Some("postgres://localhost/replica".to_owned());
@@ -4307,6 +4327,19 @@ mod tests {
             Some(&topology),
             #[cfg(feature = "ws")]
             None,
+        );
+
+        assert!(
+            state.probes().replica_migration_check().is_none(),
+            "build_state should not enable migration checks without registered migrations"
+        );
+
+        configure_replica_migration_check(
+            &state,
+            Some((
+                "postgres://localhost/primary".to_owned(),
+                "postgres://localhost/replica".to_owned(),
+            )),
         );
 
         let check = state
