@@ -1509,7 +1509,12 @@ impl AppBuilder {
         // entropy-meeting secret before the server binds. Dev/test are exempt.
         fail_fast_on_invalid_signing_secret(&config);
 
-        // 4e. Provision the configured BlobStore *before* `setup_database`.
+        // 4e. Signed webhook configs must resolve to usable key material
+        // before the app binds. Missing secrets should fail before a real
+        // provider retry loop starts hammering a broken endpoint.
+        fail_fast_on_invalid_webhook_config(&config);
+
+        // 4f. Provision the configured BlobStore *before* `setup_database`.
         // `LocalBlobStore::new` does real IO (creates + canonicalizes the
         // root) and the storage code may `process::exit(1)` on failure
         // (unwritable root, or `storage.backend = "s3"` with no plugin).
@@ -1619,6 +1624,7 @@ impl AppBuilder {
         // into the user's router below.
         #[cfg(feature = "storage")]
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+        install_webhook_registry(&state, &config);
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -2966,6 +2972,23 @@ fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if let Err(error) = config.security.webhooks.validate(is_production) {
+        eprintln!("Invalid signed webhook configuration: {error}");
+        std::process::exit(1);
+    }
+}
+
+pub(crate) fn install_webhook_registry(state: &AppState, config: &AutumnConfig) {
+    if let Err(error) =
+        crate::webhook::install_registry_from_config(state, &config.security.webhooks)
+    {
+        eprintln!("Invalid signed webhook configuration: {error}");
+        std::process::exit(1);
     }
 }
 

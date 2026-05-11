@@ -110,6 +110,10 @@
 //! | `AUTUMN_SECURITY__FORBIDDEN_RESPONSE` | `security.forbidden_response` | `"403"` or `"404"` |
 //! | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` | `bool` |
 //! | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` | `memory` / `redis` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
 
 use std::path::{Path, PathBuf};
 
@@ -1224,6 +1228,11 @@ impl AutumnConfig {
         self.database.validate()?;
         self.cors.validate()?;
         self.scheduler.validate()?;
+        let is_production = matches!(self.profile.as_deref(), Some("prod" | "production"));
+        self.security
+            .webhooks
+            .validate(is_production)
+            .map_err(|error| ConfigError::Validation(error.to_string()))?;
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
         // Session backend validation deliberately lives in
@@ -1288,6 +1297,12 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    ///
+    /// # Signed webhooks
+    /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` -> `security.webhooks.replay.backend` (`memory` / `redis`)
+    /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` -> `security.webhooks.replay.redis.url` (`String`)
+    /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` -> `security.webhooks.replay.redis.key_prefix` (`String`)
+    /// - `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` -> `security.webhooks.replay.allow_memory_in_production` (`bool`)
     pub fn apply_env_overrides(&mut self) {
         self.apply_env_overrides_with_env(&OsEnv);
     }
@@ -1721,6 +1736,8 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__SIGNING_SECRET",
             &mut self.security.signing_secret.secret,
         );
+
+        self.security.webhooks.apply_env_overrides_with_env(env);
     }
 
     fn apply_rate_limit_env_overrides_with_env(&mut self, env: &dyn Env) {

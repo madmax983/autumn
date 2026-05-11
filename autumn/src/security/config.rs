@@ -41,6 +41,11 @@
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` | `memory` / `redis` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
+//! | per-endpoint `secret_env` | `security.webhooks.endpoints[*].secret` | environment variable name |
 //!
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
@@ -215,6 +220,12 @@ pub fn validate_signing_secret(
 // ── Resolved signing key material ─────────────────────────────────────────
 
 /// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
+///
+/// # Panics
+///
+/// This should not panic because HMAC accepts keys of any length. A panic would
+/// indicate a broken crypto crate invariant.
+#[must_use]
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -345,6 +356,10 @@ pub struct SecurityConfig {
     /// Multipart upload safeguards and validation policy.
     #[serde(default)]
     pub upload: UploadConfig,
+
+    /// Signed webhook intake endpoints.
+    #[serde(default)]
+    pub webhooks: crate::webhook::WebhookConfig,
 
     /// HTTP status returned when a [`Policy`](crate::authorization::Policy)
     /// denies a record-level action. Defaults to `"404"` to mirror the

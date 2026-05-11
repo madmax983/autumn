@@ -142,6 +142,11 @@ pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped}
 pub use crate::security::CsrfFormField;
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// Signed webhook extractor and configuration helpers.
+pub use crate::webhook::{
+    SignedWebhook, WebhookEndpointConfig, WebhookProvider, WebhookReplayBackend,
+    WebhookReplayConfig,
+};
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).

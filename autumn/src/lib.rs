@@ -164,6 +164,7 @@ pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
 pub mod validation;
+pub mod webhook;
 #[cfg(feature = "ws")]
 pub mod ws;
 

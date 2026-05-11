@@ -378,6 +378,7 @@ impl TestApp {
         for register in self.policy_registrations {
             register(state.policy_registry());
         }
+        crate::app::install_webhook_registry(&state, &self.config);
 
         let router = crate::router::try_build_router_inner(
             self.routes,
