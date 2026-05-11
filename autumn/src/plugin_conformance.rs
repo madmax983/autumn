@@ -87,6 +87,17 @@ impl ConformanceConfig {
 }
 
 /// Declaration of a sensitive route and its auth/profile gating mechanism.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::SensitiveRoute;
+///
+/// let route = SensitiveRoute {
+///     path_pattern: "/admin".to_string(),
+///     auth_mechanism: "Role: admin required".to_string(),
+/// };
+/// ```
 #[derive(Debug, Clone)]
 pub struct SensitiveRoute {
     /// Path prefix that matches sensitive routes (e.g. `"/admin"`).
@@ -99,6 +110,15 @@ pub struct SensitiveRoute {
 // ── Report types ───────────────────────────────────────────────────────────
 
 /// Status of an individual conformance check.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::CheckStatus;
+///
+/// let status = CheckStatus::Pass;
+/// assert_eq!(status, CheckStatus::Pass);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -121,6 +141,20 @@ impl std::fmt::Display for CheckStatus {
 }
 
 /// Result of a single conformance check.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{CheckResult, CheckStatus};
+///
+/// let result = CheckResult {
+///     name: "route-attribution".to_string(),
+///     status: CheckStatus::Pass,
+///     message: "All routes properly attributed".to_string(),
+///     diagnostics: vec![],
+/// };
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     /// Short check identifier (e.g. `"route-attribution"`).
@@ -134,6 +168,27 @@ pub struct CheckResult {
 }
 
 /// Information about two or more routes that collide on the same (method, path).
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{CollisionDiagnostic, RouteContributor};
+///
+/// let collision = CollisionDiagnostic {
+///     method: "GET".to_string(),
+///     path: "/users".to_string(),
+///     contributors: vec![
+///         RouteContributor {
+///             source: "plugin:a".to_string(),
+///             handler: "get_users".to_string(),
+///         },
+///         RouteContributor {
+///             source: "plugin:b".to_string(),
+///             handler: "fetch_users".to_string(),
+///         },
+///     ],
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollisionDiagnostic {
     /// HTTP method of the collision.
@@ -161,6 +216,17 @@ impl CollisionDiagnostic {
 }
 
 /// A single route that contributes to a collision.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::RouteContributor;
+///
+/// let contributor = RouteContributor {
+///     source: "plugin:admin".to_string(),
+///     handler: "posts::create".to_string(),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteContributor {
     /// Registration source (e.g. `"user"`, `"plugin:admin"`, `"framework"`).
@@ -170,6 +236,18 @@ pub struct RouteContributor {
 }
 
 /// The full conformance report for a plugin.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::ConformanceReport;
+///
+/// let report = ConformanceReport {
+///     plugin_name: "my-plugin".to_string(),
+///     checks: vec![],
+/// };
+/// assert!(report.passed());
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConformanceReport {
     /// The plugin name this report covers.
@@ -181,12 +259,51 @@ pub struct ConformanceReport {
 impl ConformanceReport {
     /// Returns `true` when no check has `CheckStatus::Fail`.
     /// Skipped checks do not count as failures.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::plugin_conformance::{ConformanceReport, CheckResult, CheckStatus};
+    ///
+    /// let mut report = ConformanceReport {
+    ///     plugin_name: "test".to_string(),
+    ///     checks: vec![],
+    /// };
+    /// assert!(report.passed());
+    ///
+    /// report.checks.push(CheckResult {
+    ///     name: "test-check".to_string(),
+    ///     status: CheckStatus::Fail,
+    ///     message: "failed".to_string(),
+    ///     diagnostics: vec![],
+    /// });
+    /// assert!(!report.passed());
+    /// ```
     #[must_use]
     pub fn passed(&self) -> bool {
         self.checks.iter().all(|c| c.status != CheckStatus::Fail)
     }
 
     /// Render the report as a human-readable text string.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::plugin_conformance::{ConformanceReport, CheckResult, CheckStatus};
+    ///
+    /// let report = ConformanceReport {
+    ///     plugin_name: "test-plugin".to_string(),
+    ///     checks: vec![CheckResult {
+    ///         name: "route-attribution".to_string(),
+    ///         status: CheckStatus::Pass,
+    ///         message: "All routes attributed".to_string(),
+    ///         diagnostics: vec![],
+    ///     }],
+    /// };
+    ///
+    /// let text = report.to_text_report();
+    /// assert!(text.contains("PASS  route-attribution: All routes attributed"));
+    /// ```
     #[must_use]
     pub fn to_text_report(&self) -> String {
         let mut out = String::new();
@@ -263,6 +380,25 @@ fn is_sensitive_path(path: &str) -> bool {
 /// `Plugin("<plugin_name>")` source.
 ///
 /// Returns `Skip` when no routes at all are attributed to the plugin.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{check_route_attribution, CheckStatus};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/admin".to_string(),
+///         handler: "admin_index".to_string(),
+///         source: RouteSource::Plugin("admin-plugin".to_string()),
+///     }
+/// ];
+///
+/// let result = check_route_attribution("admin-plugin", &routes);
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// ```
 #[must_use]
 pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     let plugin_routes: Vec<&RouteInfo> = routes
@@ -297,6 +433,25 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 ///
 /// Routes listed in `intentional_root` (exact path match) are exempt.
 /// Returns `Skip` when no routes are attributed to the plugin.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{check_route_prefix, CheckStatus};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/admin/dashboard".to_string(),
+///         handler: "dashboard".to_string(),
+///         source: RouteSource::Plugin("admin-plugin".to_string()),
+///     }
+/// ];
+///
+/// let result = check_route_prefix("admin-plugin", "/admin", &[], &routes);
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// ```
 #[must_use]
 pub fn check_route_prefix(
     plugin_name: &str,
@@ -372,6 +527,26 @@ fn normalize_path_for_collision(path: &str) -> String {
 ///
 /// Returns both a `CheckResult` and the full list of `CollisionDiagnostic` values
 /// so callers can serialize detailed collision info in JSON output.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{check_collisions, CheckStatus};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/users".to_string(),
+///         handler: "get_users".to_string(),
+///         source: RouteSource::Plugin("my-plugin".to_string()),
+///     }
+/// ];
+///
+/// let (result, diagnostics) = check_collisions(&routes);
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// assert!(diagnostics.is_empty());
+/// ```
 pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiagnostic>) {
     use std::collections::HashMap;
 
@@ -438,6 +613,31 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
 /// `ConformanceConfig::sensitive_routes` with a non-empty `auth_mechanism`.
 ///
 /// Returns `Pass` when no sensitive-named plugin routes are found.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{check_sensitive_surfaces, SensitiveRoute, CheckStatus};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/admin".to_string(),
+///         handler: "admin_index".to_string(),
+///         source: RouteSource::Plugin("admin-plugin".to_string()),
+///     }
+/// ];
+/// let declared = vec![
+///     SensitiveRoute {
+///         path_pattern: "/admin".to_string(),
+///         auth_mechanism: "Role: admin".to_string(),
+///     }
+/// ];
+///
+/// let result = check_sensitive_surfaces("admin-plugin", &routes, &declared);
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// ```
 #[must_use]
 pub fn check_sensitive_surfaces(
     plugin_name: &str,
@@ -508,6 +708,25 @@ pub fn check_sensitive_surfaces(
 /// Detects (method, path) pairs that appear more than once among routes
 /// attributed to the named plugin. Returns `Skip` when no routes are
 /// attributed to the plugin.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{check_duplicate_registration, CheckStatus};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/test".to_string(),
+///         handler: "test_handler".to_string(),
+///         source: RouteSource::Plugin("my-plugin".to_string()),
+///     }
+/// ];
+///
+/// let result = check_duplicate_registration("my-plugin", &routes);
+/// assert_eq!(result.status, CheckStatus::Pass);
+/// ```
 #[must_use]
 pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
     use std::collections::HashMap;
@@ -571,6 +790,26 @@ pub fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> 
 /// 3. `route-collision` — no two routes share (method, path)
 /// 4. `sensitive-surfaces` — sensitive-named plugin routes are declared with auth
 /// 5. `duplicate-registration` — plugin routes are not registered more than once
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::plugin_conformance::{ConformanceConfig, run_conformance};
+/// use autumn_web::route_listing::{RouteInfo, RouteSource};
+///
+/// let config = ConformanceConfig::new("test-plugin").prefix("/test");
+/// let routes = vec![
+///     RouteInfo {
+///         method: "GET".to_string(),
+///         path: "/test/hello".to_string(),
+///         handler: "hello".to_string(),
+///         source: RouteSource::Plugin("test-plugin".to_string()),
+///     }
+/// ];
+///
+/// let report = run_conformance(&config, &routes);
+/// assert!(report.passed());
+/// ```
 #[must_use]
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();

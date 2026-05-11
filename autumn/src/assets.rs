@@ -67,12 +67,15 @@ fn load_manifest() -> &'static Option<AssetManifest> {
 ///   Falls back to `/static/{path}` when the manifest is absent or the path
 ///   is not listed, so the app keeps serving without fingerprinted assets.
 ///
-/// # Example
+/// # Examples
 ///
-/// ```rust,ignore
-/// link rel="stylesheet" href=(asset_url("css/autumn.css"));
-/// // debug:   /static/css/autumn.css
-/// // release: /static/css/autumn.a1b2c3d4.css
+/// ```rust
+/// use autumn_web::assets::asset_url;
+///
+/// // Note: the generated URL depends on whether it's a debug or release build,
+/// // and whether a `manifest.json` exists containing the path mapping.
+/// let url = asset_url("css/autumn.css");
+/// assert!(url.starts_with("/static/css/autumn"));
 /// ```
 #[must_use]
 pub fn asset_url(path: &str) -> String {

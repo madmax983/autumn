@@ -134,6 +134,23 @@ fn build_pool(
 ///
 /// Returns [`PoolError`] if the pool cannot be built (e.g., invalid
 /// max-size configuration).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::db::create_pool;
+/// use autumn_web::config::DatabaseConfig;
+///
+/// # async fn run() -> Result<(), autumn_web::db::PoolError> {
+/// let config = DatabaseConfig {
+///     url: Some("postgres://user:pass@localhost/db".to_string()),
+///     ..Default::default()
+/// };
+/// let pool = create_pool(&config)?;
+/// assert!(pool.is_some());
+/// # Ok(())
+/// # }
+/// ```
 pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
     let Some(url) = config.effective_primary_url() else {
         return Ok(None);
@@ -156,6 +173,23 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnect
 /// # Errors
 ///
 /// Returns [`PoolError`] if either configured role cannot be built.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::db::create_topology;
+/// use autumn_web::config::DatabaseConfig;
+///
+/// # async fn run() -> Result<(), autumn_web::db::PoolError> {
+/// let config = DatabaseConfig {
+///     url: Some("postgres://user:pass@localhost/db".to_string()),
+///     ..Default::default()
+/// };
+/// let topology = create_topology(&config)?;
+/// assert!(topology.is_some());
+/// # Ok(())
+/// # }
+/// ```
 pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopology>, PoolError> {
     let Some(primary_url) = config.effective_primary_url() else {
         return Ok(None);
