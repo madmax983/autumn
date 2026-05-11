@@ -3,8 +3,8 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the published Autumn 0.3.x line and Rust 1.88.0+
-as of 2026-05-10.
+Examples in this guide track the published Autumn 0.4.x line and Rust 1.88.0+
+as of 2026-05-11.
 
 ---
 
@@ -14,7 +14,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.3.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -23,7 +23,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.3.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -50,7 +50,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.3.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos

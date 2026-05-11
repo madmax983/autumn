@@ -10,8 +10,8 @@ cache instead of the default in-process Moka store.
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.3", features = ["redis"] }
-autumn-cache-redis = "0.3"
+autumn-web        = { version = "0.4", features = ["redis"] }
+autumn-cache-redis = "0.4"
 ```
 
 ## Quick Start

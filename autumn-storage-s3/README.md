@@ -9,8 +9,8 @@ by any S3-compatible object storage service (AWS S3, MinIO, Tigris, Cloudflare R
 
 ```toml
 [dependencies]
-autumn-web        = { version = "0.3", features = ["storage"] }
-autumn-storage-s3 = "0.3"
+autumn-web        = { version = "0.4", features = ["storage"] }
+autumn-storage-s3 = "0.4"
 ```
 
 ## Quick Start

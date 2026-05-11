@@ -1,5 +1,5 @@
 # Autumn Release Checklist
-vvvvvv
+
 This document is the canonical pre-publish checklist for every Autumn release.
 It records the crates we publish, the required publication order, the version
 compatibility rule for each crate, and the automated gates that must pass before
@@ -28,7 +28,7 @@ All crates share a single workspace version (`[workspace.package].version` in
 
 - Every crate's `version` field inherits from `[workspace.package].version`.
 - Crates that depend on other published Autumn crates pin the **exact workspace
-  version** (e.g. `autumn-web = { version = "0.3.0", ... }`). A workspace
+  version** (e.g. `autumn-web = { version = "0.4.0", ... }`). A workspace
   version bump must update these pins in lockstep.
 - The `[patch.crates-io]` override in the root `Cargo.toml` redirects
   `autumn-web` to the local workspace path during development. **Remove or

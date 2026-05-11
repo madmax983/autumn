@@ -2,8 +2,9 @@
 
 `#[scheduled]` defaults to the original in-process behavior: every running
 replica owns its own timer. That is convenient in development and preserves
-existing `0.3.x` behavior, but it is not safe for tasks that send emails, call
-paid APIs, expire tokens, charge cards, or mutate shared state.
+the local-compatible behavior of earlier releases, but it is not safe for tasks
+that send emails, call paid APIs, expire tokens, charge cards, or mutate shared
+state.
 
 For multi-replica deployments, configure the scheduler backend to `postgres`.
 Autumn then derives a global tick key for each scheduled task invocation and

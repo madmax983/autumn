@@ -95,8 +95,8 @@ metrics, config properties, loggers, and task visibility based on the
 
 ## Telemetry
 
-For production, treat telemetry as a first-class config section instead of a
-future TODO:
+For production, treat telemetry as a first-class config section rather than a
+later chore:
 
 ```toml
 [telemetry]

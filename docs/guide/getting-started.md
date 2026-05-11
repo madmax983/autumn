@@ -1,7 +1,7 @@
 # Getting Started with Autumn
 
 This guide takes you from zero to a running Autumn web app with routes, a
-database, HTML templates, interactive UI, and the published `autumn-web` 0.3
+database, HTML templates, interactive UI, and the published `autumn-web` 0.4
 release line. Budget about 30 minutes.
 
 Autumn is a convention-over-configuration web framework for Rust, built on
@@ -10,8 +10,8 @@ Autumn is a convention-over-configuration web framework for Rust, built on
 profile-aware configuration, and newer CLI workflows behind a Spring Boot-style
 developer experience.
 
-> **Version note:** This is the published-user path for `autumn-web` 0.3.x and
-> `autumn-cli` 0.3.x as of 2026-05-10. If you are contributing from a source
+> **Version note:** This is the published-user path for `autumn-web` 0.4.x and
+> `autumn-cli` 0.4.x as of 2026-05-11. If you are contributing from a source
 > checkout, use the local development commands below only after confirming the
 > workspace version still matches this guide.
 
@@ -39,7 +39,7 @@ Autumn ships a small CLI for project scaffolding and tooling setup. Install the
 published CLI from crates.io:
 
 ```bash
-cargo install autumn-cli --version 0.3.0
+cargo install autumn-cli --version 0.4.0
 ```
 
 For local development only, from an Autumn source checkout, install the CLI you
@@ -80,7 +80,7 @@ Sample output on a healthy system:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.3.0 matches autumn-web 0.3.0
+✅ version_compat — autumn-cli 0.4.0 matches autumn-web 0.4.0
 ✅ autumn_toml — autumn.toml is valid
 ✅ db_connectivity — Postgres reachable at localhost:5432
 ✅ pending_migrations — no pending migrations
@@ -239,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.3.0" }
+{ "status": "ok", "version": "0.4.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -456,7 +456,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.3"
+autumn-web = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }

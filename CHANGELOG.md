@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-11
+
+### Breaking Changes
+
+- **security:** Production profiles now require a stable signing secret before
+  the server binds. Set `AUTUMN_SECURITY__SIGNING_SECRET` to a generated
+  32-byte-or-longer value, and use `previous_secrets` for rotation windows.
+- **storage:** The `storage-s3` cargo feature was removed from `autumn-web`.
+  S3-compatible storage now lives in the separate `autumn-storage-s3` crate.
+- **authorization:** `#[repository(api = "...")]` now requires `policy = ...`
+  in `prod`/`production` unless
+  `[security] allow_unauthorized_repository_api = true` is set explicitly.
+- **mail:** Production `deliver_later` requires a durable
+  `MailDeliveryQueue`, a disabled transport, or the explicit
+  `mail.allow_in_process_deliver_later_in_production = true` acknowledgement.
+
 ### Added
 
 - **security — production signing-secret gate (#597):** Autumn now validates
@@ -66,7 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   # After:
   autumn-web        = { version = "0.4", features = ["storage"] }
-  autumn-storage-s3 = "0.3"
+  autumn-storage-s3 = "0.4"
   ```
 
   Wire up in `main`:

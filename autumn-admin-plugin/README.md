@@ -20,8 +20,8 @@ Add the plugin alongside `autumn-web`:
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.3", features = ["db", "flash", "htmx", "maud"] }
-autumn-admin-plugin = "0.3"
+autumn-web = { version = "0.4", features = ["db", "flash", "htmx", "maud"] }
+autumn-admin-plugin = "0.4"
 ```
 
 `autumn-admin-plugin` expects a configured Autumn database pool for registered
