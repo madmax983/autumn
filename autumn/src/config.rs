@@ -1325,6 +1325,7 @@ impl AutumnConfig {
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
         if let Ok(val) = env.var("AUTUMN_DATABASE__URL") {
             self.database.url = Some(val);
+            self.database.primary_url = None;
         }
         parse_env_option_string(
             env,
@@ -3135,6 +3136,41 @@ path = "/healthz"
         assert_eq!(
             config.database.url.as_deref(),
             Some("postgres://override:5432/test")
+        );
+    }
+
+    #[test]
+    fn env_override_database_url_wins_over_file_primary_url() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__URL", "postgres://env.example/app");
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://file.example/app".to_owned());
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.database.effective_primary_url(),
+            Some("postgres://env.example/app")
+        );
+        assert!(config.database.primary_url.is_none());
+    }
+
+    #[test]
+    fn env_override_database_primary_url_wins_over_legacy_database_url() {
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__URL", "postgres://legacy.env/app")
+            .with("AUTUMN_DATABASE__PRIMARY_URL", "postgres://primary.env/app");
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://file.example/app".to_owned());
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(
+            config.database.effective_primary_url(),
+            Some("postgres://primary.env/app")
+        );
+        assert_eq!(
+            config.database.url.as_deref(),
+            Some("postgres://legacy.env/app")
         );
     }
 
