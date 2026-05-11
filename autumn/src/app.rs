@@ -135,14 +135,7 @@ type PoolProviderFactory = Box<
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<
-                            Option<
-                                diesel_async::pooled_connection::deadpool::Pool<
-                                    diesel_async::AsyncPgConnection,
-                                >,
-                            >,
-                            crate::db::PoolError,
-                        >,
+                        Output = Result<Option<crate::db::DatabaseTopology>, crate::db::PoolError>,
                     > + Send,
             >,
         > + Send,
@@ -1034,7 +1027,7 @@ impl AppBuilder {
         }
         self.pool_provider_factory =
             Some(Box::new(move |config: crate::config::DatabaseConfig| {
-                Box::pin(async move { provider.create_pool(&config).await })
+                Box::pin(async move { provider.create_topology(&config).await })
             }));
         self
     }
@@ -3252,9 +3245,7 @@ async fn setup_database(
 ) -> Result<DatabaseBootstrap, String> {
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
-        Some(factory) => factory(config.database.clone())
-            .await
-            .map(|pool| pool.map(crate::db::DatabaseTopology::primary_only)),
+        Some(factory) => factory(config.database.clone()).await,
         None => crate::db::create_topology(&config.database),
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
@@ -4310,6 +4301,68 @@ mod tests {
             .mark_replica_unready("replica migrations lag primary");
 
         assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn custom_pool_provider_preserves_configured_replica_topology() {
+        struct PassthroughPoolProvider;
+
+        impl crate::db::DatabasePoolProvider for PassthroughPoolProvider {
+            async fn create_pool(
+                &self,
+                config: &crate::config::DatabaseConfig,
+            ) -> Result<
+                Option<
+                    diesel_async::pooled_connection::deadpool::Pool<
+                        diesel_async::AsyncPgConnection,
+                    >,
+                >,
+                crate::db::PoolError,
+            > {
+                crate::db::create_pool(config)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::FailReadiness;
+        let AppBuilder {
+            pool_provider_factory,
+            ..
+        } = app().with_pool_provider(PassthroughPoolProvider);
+
+        let database = setup_database(&config, Vec::new(), pool_provider_factory)
+            .await
+            .expect("custom provider should build database topology");
+        let topology = database.topology.expect("database should be configured");
+
+        assert_eq!(topology.primary().status().max_size, 5);
+        assert_eq!(
+            topology
+                .replica()
+                .expect("custom provider should create replica pool")
+                .status()
+                .max_size,
+            2
+        );
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        state
+            .probes()
+            .mark_replica_connection_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+        let (status, _) = crate::probe::readiness_response(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[cfg(feature = "db")]

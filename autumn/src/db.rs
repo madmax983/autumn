@@ -69,6 +69,18 @@ pub struct DatabaseTopology {
 }
 
 impl DatabaseTopology {
+    /// Build a topology from explicit primary and optional replica pools.
+    ///
+    /// This is useful for custom [`DatabasePoolProvider`] implementations that
+    /// need to create or decorate both roles themselves.
+    #[must_use]
+    pub const fn from_pools(
+        primary: Pool<AsyncPgConnection>,
+        replica: Option<Pool<AsyncPgConnection>>,
+    ) -> Self {
+        Self { primary, replica }
+    }
+
     /// Build a topology from a primary pool only.
     #[must_use]
     pub const fn primary_only(primary: Pool<AsyncPgConnection>) -> Self {
@@ -388,6 +400,12 @@ where
 /// (e.g. `MySQL`, `SQLite`) would require generic `Pool<C>` propagation through
 /// `Db` / `DbState` / `AppState` and is intentionally out of scope.
 ///
+/// Providers that only implement [`DatabasePoolProvider::create_pool`] still
+/// participate in primary/replica topology: the default
+/// [`DatabasePoolProvider::create_topology`] uses the custom primary pool and
+/// builds the configured replica role with Autumn's deadpool factory. Override
+/// `create_topology` when both roles need custom construction.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -418,6 +436,39 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
         &self,
         config: &DatabaseConfig,
     ) -> impl std::future::Future<Output = Result<Option<Pool<AsyncPgConnection>>, PoolError>> + Send;
+
+    /// Create primary and optional replica pools from the resolved
+    /// [`DatabaseConfig`].
+    ///
+    /// The default implementation preserves the provider's custom primary pool
+    /// and builds a replica pool when `database.replica_url` is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] if either configured role cannot be built.
+    fn create_topology(
+        &self,
+        config: &DatabaseConfig,
+    ) -> impl std::future::Future<Output = Result<Option<DatabaseTopology>, PoolError>> + Send {
+        async move {
+            let Some(primary) = self.create_pool(config).await? else {
+                return Ok(None);
+            };
+            let replica = config
+                .replica_url
+                .as_deref()
+                .map(|url| {
+                    build_pool(
+                        url,
+                        config.effective_replica_pool_size(),
+                        config.connect_timeout_secs,
+                    )
+                })
+                .transpose()?;
+
+            Ok(Some(DatabaseTopology::from_pools(primary, replica)))
+        }
+    }
 }
 
 /// Default [`DatabasePoolProvider`] — the `deadpool + diesel-async` factory.
