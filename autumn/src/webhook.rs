@@ -107,6 +107,7 @@ impl WebhookConfig {
         for endpoint in &self.endpoints {
             endpoint.validate(is_production)?;
         }
+        validate_unique_endpoint_paths(&self.endpoints)?;
         if self
             .endpoints
             .iter()
@@ -503,6 +504,19 @@ pub enum WebhookConfigError {
         /// Validation message.
         message: String,
     },
+    /// Two endpoints declare the same route path.
+    #[error(
+        "duplicate webhook endpoint path {path:?}: endpoints {first_name:?} and \
+         {duplicate_name:?} would shadow each other"
+    )]
+    DuplicatePath {
+        /// Shared endpoint path.
+        path: String,
+        /// Name of the first endpoint using the path.
+        first_name: String,
+        /// Name of the later endpoint using the same path.
+        duplicate_name: String,
+    },
     /// Current production secret is weak or malformed.
     #[error("webhook endpoint {name:?} has invalid secret: {reason}")]
     InvalidSecret {
@@ -595,6 +609,7 @@ impl WebhookRegistry {
         config: &WebhookConfig,
         replay_store: Arc<dyn WebhookReplayStore>,
     ) -> Result<Self, WebhookConfigError> {
+        validate_unique_endpoint_paths(&config.endpoints)?;
         let mut endpoints_by_path = HashMap::new();
         for endpoint in &config.endpoints {
             let mut endpoint = endpoint.clone();
@@ -630,6 +645,23 @@ impl WebhookRegistry {
     fn endpoint_for_path(&self, path: &str) -> Option<Arc<ResolvedWebhookEndpoint>> {
         self.endpoints_by_path.get(path).cloned()
     }
+}
+
+fn validate_unique_endpoint_paths(
+    endpoints: &[WebhookEndpointConfig],
+) -> Result<(), WebhookConfigError> {
+    let mut seen_paths = HashMap::new();
+    for endpoint in endpoints {
+        if let Some(first_name) = seen_paths.insert(endpoint.path.as_str(), endpoint.name.as_str())
+        {
+            return Err(WebhookConfigError::DuplicatePath {
+                path: endpoint.path.clone(),
+                first_name: first_name.to_owned(),
+                duplicate_name: endpoint.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Boxed replay store operation future.

@@ -155,6 +155,17 @@ fn problem_json(response: &TestResponse, status: u16) -> serde_json::Value {
     json
 }
 
+fn assert_duplicate_path_error(error: impl std::fmt::Display) {
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate")
+            && message.contains("/webhooks/duplicate")
+            && message.contains("stripe")
+            && message.contains("github"),
+        "duplicate path error should identify both endpoints and the shared path, got: {message}"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn provider_presets_verify_valid_requests_and_expose_metadata() {
     let _guard = TEST_LOCK.lock().await;
@@ -311,6 +322,23 @@ async fn slack_url_verification_json_body_uses_challenge_as_replay_id() {
     assert_eq!(json["delivery_id"], "challenge-123");
     assert_eq!(json["event_type"], "url_verification");
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn duplicate_webhook_paths_are_rejected_before_registry_construction() {
+    let config = webhook_config(vec![
+        endpoint(WebhookProvider::Stripe, "/webhooks/duplicate", "stripe"),
+        endpoint(WebhookProvider::Github, "/webhooks/duplicate", "github"),
+    ]);
+
+    let error = config
+        .validate()
+        .expect_err("duplicate webhook paths must fail app config validation");
+    assert_duplicate_path_error(error);
+
+    let error = WebhookRegistry::from_config(&config.security.webhooks)
+        .expect_err("duplicate webhook paths must fail direct registry construction");
+    assert_duplicate_path_error(error);
 }
 
 #[tokio::test(flavor = "current_thread")]
