@@ -250,8 +250,12 @@ pub fn try_build_router_inner(
     // Build the OpenAPI spec BEFORE moving the routes into axum, because
     // group_and_mount_routes consumes the Route list.
     #[cfg(feature = "openapi")]
-    let openapi_router =
-        build_openapi_router(&route_list, &ctx.scoped_groups, ctx.openapi.as_ref())?;
+    let openapi_router = build_openapi_router(
+        &route_list,
+        &ctx.scoped_groups,
+        ctx.openapi.as_ref(),
+        &config.session.cookie_name,
+    )?;
 
     let mut router = group_and_mount_routes(route_list);
 
@@ -343,10 +347,13 @@ fn build_openapi_router(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
+    session_cookie_name: &str,
 ) -> Result<Option<axum::Router<AppState>>, RouterBuildError> {
     let Some(config) = openapi_config else {
         return Ok(None);
     };
+    let mut config = config.clone();
+    session_cookie_name.clone_into(&mut config.session_cookie_name);
 
     // Validate user-provided paths up front so a typo like
     // `"openapi.json"` surfaces as a recoverable RouterBuildError
@@ -403,7 +410,7 @@ fn build_openapi_router(
     }
 
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
-    let spec = crate::openapi::generate_spec(config, &refs);
+    let spec = crate::openapi::generate_spec(&config, &refs);
     let spec_json = serde_json::to_string_pretty(&spec)
         .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
 
@@ -2161,7 +2168,7 @@ mod tests {
         };
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
-        let router = super::build_openapi_router(&[], &[group], Some(&config))
+        let router = super::build_openapi_router(&[], &[group], Some(&config), "autumn.sid")
             .expect("openapi sub-router builds")
             .expect("openapi sub-router present when config is Some");
         let state = test_state();
@@ -2193,11 +2200,69 @@ mod tests {
     }
 
     #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn openapi_documents_configured_session_cookie_name() {
+        use crate::openapi::{ApiDoc, OpenApiConfig};
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        let route = Route {
+            method: http::Method::GET,
+            path: "/protected",
+            handler: axum::routing::get(handler),
+            name: "protected",
+            api_doc: ApiDoc {
+                method: "GET",
+                path: "/protected",
+                operation_id: "protected",
+                success_status: 200,
+                secured: true,
+                ..Default::default()
+            },
+            repository: None,
+        };
+
+        let protected_routes = vec![route];
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let docs_router =
+            super::build_openapi_router(&protected_routes, &[], Some(&config), "demo.sid")
+                .expect("openapi sub-router builds")
+                .expect("openapi sub-router present when config is Some");
+        let docs_router = docs_router.with_state(test_state());
+
+        let response = docs_router
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let schemes = &spec["components"]["securitySchemes"];
+
+        assert_eq!(schemes["SessionAuth"]["type"], "apiKey");
+        assert_eq!(schemes["SessionAuth"]["in"], "cookie");
+        assert_eq!(schemes["SessionAuth"]["name"], "demo.sid");
+        assert!(
+            schemes.get("BearerAuth").is_none(),
+            "secured routes must not be documented as bearer JWT routes"
+        );
+    }
+
+    #[cfg(feature = "openapi")]
     #[test]
     fn openapi_rejects_json_path_without_leading_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("openapi.json");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -2215,7 +2280,7 @@ mod tests {
         // endpoints are static. Catch it before axum panics.
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id}");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("captures should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2225,7 +2290,7 @@ mod tests {
     fn openapi_rejects_path_with_unbalanced_brace() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("unbalanced brace should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2235,7 +2300,7 @@ mod tests {
     fn openapi_rejects_path_with_wildcard() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/*rest");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("wildcard should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2245,7 +2310,7 @@ mod tests {
     fn openapi_rejects_path_with_double_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("//docs");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("double-slash should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2255,7 +2320,7 @@ mod tests {
     fn openapi_rejects_swagger_ui_path_without_leading_slash() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .swagger_ui_path(Some("docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -2270,7 +2335,7 @@ mod tests {
     #[test]
     fn openapi_rejects_empty_json_path() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("empty path should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -2281,7 +2346,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/api-docs")
             .swagger_ui_path(Some("/ui".to_owned()));
-        let out = super::build_openapi_router(&[], &[], Some(&config))
+        let out = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect("valid paths must not error");
         assert!(out.is_some());
     }
@@ -2292,7 +2357,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/docs")
             .swagger_ui_path(Some("/docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("colliding paths should be rejected before axum panics");
         assert!(matches!(
             err,

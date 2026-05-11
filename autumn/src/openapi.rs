@@ -164,6 +164,11 @@ pub struct OpenApiConfig {
     /// Path serving the Swagger UI HTML. Defaults to `/swagger-ui`. Set
     /// to `None` to disable the UI while still exposing the JSON.
     pub swagger_ui_path: Option<String>,
+    /// Session cookie name used by secured route security docs.
+    ///
+    /// Runtime OpenAPI mounting replaces this with `session.cookie_name`
+    /// from the loaded app config.
+    pub session_cookie_name: String,
     /// User-registered component schemas keyed by schema name.
     pub additional_schemas: BTreeMap<String, serde_json::Value>,
 }
@@ -179,6 +184,7 @@ impl OpenApiConfig {
             description: None,
             openapi_json_path: "/openapi.json".to_owned(),
             swagger_ui_path: Some("/swagger-ui".to_owned()),
+            session_cookie_name: "autumn.sid".to_owned(),
             additional_schemas: BTreeMap::new(),
         }
     }
@@ -201,6 +207,13 @@ impl OpenApiConfig {
     #[must_use]
     pub fn swagger_ui_path(mut self, path: Option<String>) -> Self {
         self.swagger_ui_path = path;
+        self
+    }
+
+    /// Override the session cookie name documented for secured routes.
+    #[must_use]
+    pub fn session_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.session_cookie_name = name.into();
         self
     }
 
@@ -445,7 +458,7 @@ pub struct MediaType {
 pub struct Components {
     /// Reusable Schema Objects.
     pub schemas: BTreeMap<String, serde_json::Value>,
-    /// Security scheme definitions (e.g. BearerAuth).
+    /// Security scheme definitions (e.g. SessionAuth).
     #[serde(rename = "securitySchemes", skip_serializing_if = "BTreeMap::is_empty")]
     pub security_schemes: BTreeMap<String, serde_json::Value>,
 }
@@ -556,15 +569,16 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
         }
     }
 
-    // Register BearerAuth security scheme when any visible route is secured.
+    // Register the same cookie-backed session auth that `#[secured]` uses at runtime.
     let mut security_schemes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     if any_secured {
         security_schemes.insert(
-            "BearerAuth".to_owned(),
+            "SessionAuth".to_owned(),
             serde_json::json!({
-                "type": "http",
-                "scheme": "bearer",
-                "bearerFormat": "JWT",
+                "type": "apiKey",
+                "in": "cookie",
+                "name": config.session_cookie_name.clone(),
+                "description": "Autumn session cookie. Secured routes check the configured auth.session_key inside the server-side session.",
             }),
         );
     }
@@ -672,10 +686,10 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
 
     insert_problem_responses(&mut responses);
 
-    // Security requirement — emit BearerAuth when the route is `#[secured]`.
+    // Security requirement: `#[secured]` is backed by the Autumn session cookie.
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();
-        req.insert("BearerAuth".to_owned(), Vec::new());
+        req.insert("SessionAuth".to_owned(), Vec::new());
         vec![req]
     } else {
         Vec::new()
@@ -997,13 +1011,36 @@ mod tests {
         let config = OpenApiConfig::new("Demo", "1.0.0")
             .description("A cool API")
             .openapi_json_path("/api.json")
-            .swagger_ui_path(None);
+            .swagger_ui_path(None)
+            .session_cookie_name("demo.sid");
 
         assert_eq!(config.title, "Demo");
         assert_eq!(config.version, "1.0.0");
         assert_eq!(config.description.unwrap(), "A cool API");
         assert_eq!(config.openapi_json_path, "/api.json");
         assert_eq!(config.swagger_ui_path, None);
+        assert_eq!(config.session_cookie_name, "demo.sid");
+    }
+
+    #[test]
+    fn secured_spec_uses_configured_session_cookie_name() {
+        let mut doc = make_doc();
+        doc.path = "/protected";
+        doc.operation_id = "protected";
+        doc.path_params = &[];
+        doc.secured = true;
+
+        let config = OpenApiConfig::new("Demo", "1.0.0").session_cookie_name("demo.sid");
+        let spec = generate_spec(&config, &[&doc]);
+        let scheme = &spec
+            .components
+            .as_ref()
+            .expect("secured routes emit security components")
+            .security_schemes["SessionAuth"];
+
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["in"], "cookie");
+        assert_eq!(scheme["name"], "demo.sid");
     }
 
     #[test]

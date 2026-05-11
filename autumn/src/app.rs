@@ -2022,6 +2022,8 @@ impl AppBuilder {
         // can retrieve a machine-readable API contract alongside the HTML.
         #[cfg(feature = "openapi")]
         if let Some(openapi_config) = openapi {
+            let openapi_config =
+                openapi_config.session_cookie_name(config.session.cookie_name.clone());
             let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
             let spec = crate::openapi::generate_spec(&openapi_config, &docs);
             match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {

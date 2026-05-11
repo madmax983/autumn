@@ -536,13 +536,17 @@ fn secured_operation_carries_security_requirement() {
     );
     let req = &op.security[0];
     assert!(
-        req.contains_key("BearerAuth"),
-        "security requirement must reference BearerAuth"
+        req.contains_key("SessionAuth"),
+        "security requirement must reference session-cookie auth"
+    );
+    assert!(
+        !req.contains_key("BearerAuth"),
+        "secured routes use sessions, not bearer JWTs"
     );
 }
 
 #[test]
-fn secured_spec_includes_bearer_auth_scheme() {
+fn secured_spec_includes_session_cookie_auth_scheme() {
     let route = __autumn_route_info_protected_handler();
     let config = OpenApiConfig::new("Demo", "1.0.0");
     let spec = autumn_web::openapi::generate_spec(&config, &[&route.api_doc]);
@@ -551,12 +555,17 @@ fn secured_spec_includes_bearer_auth_scheme() {
         .as_ref()
         .expect("components must be present");
     assert!(
-        comps.security_schemes.contains_key("BearerAuth"),
-        "BearerAuth security scheme must be registered when any route is secured"
+        comps.security_schemes.contains_key("SessionAuth"),
+        "SessionAuth security scheme must be registered when any route is secured"
     );
-    let scheme = &comps.security_schemes["BearerAuth"];
-    assert_eq!(scheme["type"], "http");
-    assert_eq!(scheme["scheme"], "bearer");
+    assert!(
+        !comps.security_schemes.contains_key("BearerAuth"),
+        "secured routes must not be documented as bearer JWT routes"
+    );
+    let scheme = &comps.security_schemes["SessionAuth"];
+    assert_eq!(scheme["type"], "apiKey");
+    assert_eq!(scheme["in"], "cookie");
+    assert_eq!(scheme["name"], "autumn.sid");
 }
 
 #[test]
