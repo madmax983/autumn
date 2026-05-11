@@ -1,4 +1,4 @@
-//! S3-compatible [`BlobStore`](autumn_web::storage::BlobStore) plugin for autumn-web.
+//! S3-compatible [`BlobStore`] plugin for autumn-web.
 //!
 //! # Quick start
 //!
@@ -80,7 +80,7 @@ struct S3Options {
     public_base_url: Option<String>,
 }
 
-/// S3-compatible [`BlobStore`](autumn_web::storage::BlobStore) backed by
+/// S3-compatible [`BlobStore`] backed by
 /// `aws-sdk-s3`.
 ///
 /// Supports AWS S3, Cloudflare R2, `MinIO`, `DigitalOcean` Spaces, and Wasabi.

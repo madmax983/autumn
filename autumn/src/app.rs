@@ -1014,7 +1014,7 @@ impl AppBuilder {
         self
     }
 
-    /// Install a custom [`DatabasePoolProvider`],
+    /// Install a custom [`crate::db::DatabasePoolProvider`],
     /// replacing the default `deadpool + diesel-async` pool factory.
     ///
     /// Useful for adding metrics/circuit-breaker wrappers, switching to a
