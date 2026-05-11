@@ -177,7 +177,7 @@ pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
 
     // If no Accept header, default to JSON (API-first).
     if accept.is_empty() {
-        return false;
+        return true;
     }
 
     let mut html: Option<(f32, usize)> = None;
@@ -351,9 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_html_for_empty_accept() {
+    fn accepts_html_for_empty_accept() {
         let req = Request::builder().body(Body::empty()).unwrap();
-        assert!(!accepts_html(&req));
+        assert!(accepts_html(&req));
     }
 
     #[test]

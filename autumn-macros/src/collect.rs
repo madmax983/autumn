@@ -34,9 +34,9 @@ pub fn collect_companions(input: TokenStream, prefix: &str) -> TokenStream {
             // errors on the user's identifier, not just the generated macro prefix.
             quote! {
                 {
-                    #[allow(clippy::no_effect)]
+                    #[allow(clippy::let_unit_value, clippy::no_effect)]
                     {
-                        let _ = #path;
+                        let _autumn_dummy = &#path;
                     }
                     #companion()
                 }
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(
             tokens_to_string(&result),
             tokens_to_string(
-                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = handler; } __prefix_handler() }] }
+                &quote! { vec![{ #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &handler; } __prefix_handler() }] }
             )
         );
     }
@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(
             tokens_to_string(&result),
             tokens_to_string(
-                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = a; } __prefix_a() }, { #[allow(clippy::no_effect)] { let _ = b; } __prefix_b() }, { #[allow(clippy::no_effect)] { let _ = c; } __prefix_c() }] }
+                &quote! { vec![{ #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &a; } __prefix_a() }, { #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &b; } __prefix_b() }, { #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &c; } __prefix_c() }] }
             )
         );
     }
@@ -99,7 +99,7 @@ mod tests {
         assert_eq!(
             tokens_to_string(&result),
             tokens_to_string(
-                &quote! { vec![{ #[allow(clippy::no_effect)] { let _ = users::list; } users::__prefix_list() }, { #[allow(clippy::no_effect)] { let _ = auth::login; } auth::__prefix_login() }] }
+                &quote! { vec![{ #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &users::list; } users::__prefix_list() }, { #[allow(clippy::let_unit_value, clippy::no_effect)] { let _autumn_dummy = &auth::login; } auth::__prefix_login() }] }
             )
         );
     }

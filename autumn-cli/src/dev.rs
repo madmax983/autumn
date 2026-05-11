@@ -792,7 +792,7 @@ fn restart_server(
 fn tailwind_build() -> bool {
     let Some(mut cmd) = build_tailwind_command() else {
         eprintln!(
-            "  \u{2717} Tailwind CSS CLI not found. Run `autumn setup` or install `tailwindcss`."
+            "  \u{2717} Tailwind CSS CLI not found. CSS will not be compiled. Run `autumn setup` to install it."
         );
         return false;
     };

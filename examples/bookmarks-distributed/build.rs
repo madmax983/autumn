@@ -8,7 +8,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AUTUMN_REQUIRE_TAILWIND");
 
     let Some(tailwind) = find_tailwind_cli() else {
-        handle_tailwind_unavailable("Tailwind CSS CLI not found");
         return;
     };
 
