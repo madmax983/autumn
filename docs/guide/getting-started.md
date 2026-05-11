@@ -344,11 +344,28 @@ pool_size = 10
 connect_timeout_secs = 5
 ```
 
-You can also set the URL via environment variable, which takes precedence over
-the TOML file:
+`url` is the single-primary compatibility field. For production-shaped config,
+name the write role explicitly:
+
+```toml
+[database]
+primary_url = "postgres://localhost/my_app"
+# replica_url = "postgres://localhost:5433/my_app"
+primary_pool_size = 10
+replica_pool_size = 5
+replica_fallback = "fail_readiness"
+auto_migrate_in_production = false
+```
+
+`Db`, transactions, advisory locks, and `autumn migrate` use the primary role.
+The optional replica role is for read paths that can tolerate replica replay
+lag according to `replica_fallback`.
+
+You can also set the primary URL via environment variable, which takes
+precedence over the TOML file:
 
 ```bash
-export AUTUMN_DATABASE__URL="postgres://localhost/my_app"
+export AUTUMN_DATABASE__PRIMARY_URL="postgres://localhost/my_app"
 ```
 
 (Note the double underscore `__` separating section from field.)
@@ -837,9 +854,15 @@ port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
 
 [database]
-url = "postgres://user:pass@localhost:5432/my_app"
-pool_size = 10               # default, max connections
+primary_url = "postgres://user:pass@localhost:5432/my_app"
+# url = "postgres://user:pass@localhost:5432/my_app" # legacy single-primary alias
+# replica_url = "postgres://user:pass@localhost:5433/my_app"
+pool_size = 10               # default, max connections per role
+# primary_pool_size = 10
+# replica_pool_size = 5
+replica_fallback = "fail_readiness" # or "primary"
 connect_timeout_secs = 5     # default
+auto_migrate_in_production = false
 
 [log]
 level = "info"               # default, supports tracing filter syntax
@@ -863,7 +886,12 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_SERVER__HOST`                | `server.host`          |
 | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` |
 | `AUTUMN_DATABASE__URL`               | `database.url`         |
+| `AUTUMN_DATABASE__PRIMARY_URL`       | `database.primary_url` |
+| `AUTUMN_DATABASE__REPLICA_URL`       | `database.replica_url` |
 | `AUTUMN_DATABASE__POOL_SIZE`         | `database.pool_size`   |
+| `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` | `database.primary_pool_size` |
+| `AUTUMN_DATABASE__REPLICA_POOL_SIZE` | `database.replica_pool_size` |
+| `AUTUMN_DATABASE__REPLICA_FALLBACK`  | `database.replica_fallback` |
 | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` |
 | `AUTUMN_LOG__LEVEL`                  | `log.level`            |
 | `AUTUMN_LOG__FORMAT`                 | `log.format`           |
@@ -890,8 +918,8 @@ deployment with env vars.
 
 ### Running without a database
 
-If you omit the `[database]` section (or leave `url` unset), Autumn starts
-without a database pool. Handlers that use `Db` will return 503 Service
+If you omit the `[database]` section (or leave both `primary_url` and `url`
+unset), Autumn starts without a database pool. Handlers that use `Db` will return 503 Service
 Unavailable. This is useful for static sites, APIs that do not need a
 database, or during early development.
 

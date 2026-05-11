@@ -10,9 +10,11 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS builder
 
 ARG TAILWIND_VERSION=v4.1.4
+ARG AUTUMN_CLI_VERSION={{autumn_cli_version}}
+ARG DIESEL_CLI_VERSION={{diesel_cli_version}}
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl libpq-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-build dependencies — this layer is cached unless Cargo.lock changes.
@@ -32,6 +34,11 @@ RUN mkdir -p target/autumn \
 
 COPY . .
 RUN cargo build --release
+RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
+RUN cargo install diesel_cli \
+    --version "${DIESEL_CLI_VERSION}" \
+    --no-default-features \
+    --features postgres
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -49,10 +56,13 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
 COPY --chown=autumn:autumn --from=builder /app/static /app/static
 COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
 # Use the production config example as the runtime autumn.toml.
-# It sets host = "0.0.0.0" and auto_migrate_in_production = true.
+# It sets host = "0.0.0.0" and leaves migration ownership to an explicit
+# one-shot primary-role job.
 COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /app/autumn.toml
 
 ENV AUTUMN_PROFILE=prod
@@ -63,8 +73,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 USER autumn
 
-# Migrations run automatically at startup via auto_migrate_in_production = true
-# in autumn.toml (or AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION=true env var).
-# On migration failure the framework calls exit(1), stopping the container.
+# Run migrations once before rolling web replicas, targeting only the primary:
+#   AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate
+# Then start this image as the web process. Replica lag should fail readiness
+# or fall back to primary according to database.replica_fallback.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/{{project_name}}"]

@@ -12,12 +12,12 @@ runtime seams pulled into the open instead of hidden behind happy-path defaults.
 
 | Feature | Where | What it does |
 |---------|-------|--------------|
-| **Profiles** | `autumn.toml` + `autumn-dev.toml` + `autumn-docker.toml` | Local dev and Docker deployment use different runtime wiring without touching framework internals |
+| **Profiles** | `autumn.toml` + `autumn-dev.toml` + `autumn-docker.toml` | Local dev and Docker deployment use canonical `[database]` primary/replica wiring without touching framework internals |
 | **`#[model]`** | `models.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
 | **Explicit repository** | `repositories.rs` | Routes reads to replica, writes to primary, and defines `/api/bookmarks` handlers by hand |
 | **Partitioned scheduled task** | `tasks.rs` | `#[scheduled(every = "1h")]` link checker partitions work into fixed shards and uses Postgres advisory locks for ownership |
 | **Explicit migrator** | `src/bin/migrate.rs` | Runs embedded migrations once against the primary before web replicas start |
-| **Compose deployment** | `docker-compose.yml` + `docker/` | Primary + streaming replica + one-shot migrator + 3 web replicas + nginx |
+| **Compose deployment** | `docker-compose.yml` + `docker/` | Primary + streaming replica + one-shot migrator + 2 web replicas + nginx |
 | **Shared signing secret** | `docker-compose.yml` + `autumn-docker.toml` | All replicas share `AUTUMN_SECURITY__SIGNING_SECRET` so sessions and CSRF tokens survive load-balanced requests |
 | **Redis session backend** | `autumn-docker.toml` | Sessions stored in Redis so any replica can read a session established by another |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
@@ -34,7 +34,7 @@ runtime seams pulled into the open instead of hidden behind happy-path defaults.
 From the **workspace root** (`autumn/`):
 
 ```bash
-# 1. Generate a stable signing secret shared by all three web replicas.
+# 1. Generate a stable signing secret shared by both web replicas.
 #    All replicas must use the same value or session cookies signed by one
 #    replica will be rejected by the others.
 export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
@@ -48,10 +48,13 @@ into every web replica via the `x-bookmarks-base` anchor. Compose will refuse
 to start if the variable is unset — that mirrors the hard startup failure you
 would see in a production Autumn app.
 
-`autumn-docker.toml` wires two additional things:
+`autumn-docker.toml` wires three additional things:
+- `[database] primary_url` / `replica_url` -- the same first-class topology
+  contract used by Autumn itself. The old `[distributed.database]` shape is
+  still accepted by the example loader only as a migration bridge.
 - `[session] backend = "redis"` — sessions are stored in the shared Redis
   instance so a session established by `bookmarks-1` is readable by
-  `bookmarks-2` and `bookmarks-3`.
+  `bookmarks-2`.
 - `[security.signing_secret]` — the runtime secret comes from the env var
   above; the comment reminds you not to hardcode a value in the TOML file.
 
@@ -60,7 +63,7 @@ That stack brings up:
 - `postgres-primary` on `localhost:5432`
 - `postgres-replica` on `localhost:5433`
 - `bookmarks-migrate` as a one-shot embedded-migration runner
-- `bookmarks-1`, `bookmarks-2`, `bookmarks-3`
+- `bookmarks-1`, `bookmarks-2`
 - `load-balancer` on <http://localhost:3000>
 
 Generated `static/css/autumn.css` is intentionally ignored. You do not need to
@@ -68,7 +71,8 @@ run `autumn setup` just to compile or test the example; the build skips CSS
 regeneration when Tailwind is unavailable. Set `AUTUMN_REQUIRE_TAILWIND=true`
 when you explicitly want missing or broken Tailwind to fail the build.
 The web replicas wait until the standby has replayed the latest Diesel migration
-version before they start serving traffic.
+version before they start serving traffic. If the replica is stale, the replica
+healthcheck fails and Compose never admits the web tier.
 
 Useful follow-ups:
 
@@ -163,13 +167,13 @@ secret plus a shared session store:
 # 1. Open a session on whichever replica nginx selects first
 SESSION=$(curl -s -c /tmp/bm-cookies.txt http://localhost:3000/ > /dev/null && cat /tmp/bm-cookies.txt | grep session | awk '{print $NF}')
 
-# 2. Hit the load balancer several times — nginx round-robins across the three
+# 2. Hit the load balancer several times: nginx round-robins across the two
 #    replicas, so at least one request will land on a different process.
 for i in 1 2 3 4 5; do curl -s -b /tmp/bm-cookies.txt http://localhost:3000/ | grep -c "bookmarks" ; done
 ```
 
 Each request should return bookmark data (rather than a redirect to a sign-in
-page), regardless of which of the three replicas handles it.
+page), regardless of which replica handles it.
 
 ## Pain points surfaced on purpose
 

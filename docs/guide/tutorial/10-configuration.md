@@ -1,4 +1,4 @@
-﻿# Chapter 10: Configuration and Production Defaults
+# Chapter 10: Configuration and Production Defaults
 
 **Goal:** By the end of this chapter, you will understand Autumn's profile-aware
 configuration system, know how to override settings with environment variables,
@@ -53,7 +53,8 @@ understanding are:
 - `[health]` for `/health`, `/live`, `/ready`, and `/startup`
 - `[telemetry]` for OTLP export and service metadata
 - `[session]` and `[session.redis]` when you move beyond a single process
-- `[database]` for connection URL, pool size, and connect timeout
+- `[database]` for primary/write URL, optional replica/read URL, pool sizes,
+  replica fallback behavior, and connect timeout
 - `[actuator]` for prefix and sensitive endpoint exposure
 
 ## Environment Variable Overrides

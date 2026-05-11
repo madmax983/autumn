@@ -57,9 +57,15 @@ pub struct AppState {
     /// state has been constructed.
     pub(crate) extensions: Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
 
-    /// Database connection pool, or `None` when no `database.url` is configured.
+    /// Primary/write database connection pool, or `None` when no
+    /// `database.primary_url` or legacy `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+
+    /// Read-replica connection pool, or `None` when no replica role is configured.
+    #[cfg(feature = "db")]
+    pub(crate) replica_pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -172,6 +178,34 @@ impl AppState {
         self.pool.as_ref()
     }
 
+    /// Returns the read-replica database connection pool, if configured.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
+
+    /// Returns the pool used for read-only work.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn read_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        if self.replica_pool.is_some() && self.probes.should_route_reads_to_replica() {
+            self.replica_pool.as_ref()
+        } else if self.replica_pool.is_some() && self.probes.should_fallback_reads_to_primary() {
+            self.pool.as_ref()
+        } else if self.replica_pool.is_some() {
+            None
+        } else {
+            self.pool.as_ref()
+        }
+    }
+
     /// Returns the metrics collector.
     #[must_use]
     pub const fn metrics(&self) -> &middleware::MetricsCollector {
@@ -226,6 +260,17 @@ impl AppState {
         pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    /// Sets the read-replica database pool.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_replica_pool(
+        mut self,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    ) -> Self {
+        self.replica_pool = Some(pool);
         self
     }
 
@@ -430,6 +475,8 @@ impl AppState {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -467,6 +514,20 @@ impl DbState for AppState {
     {
         self.pool.as_ref()
     }
+
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
+
+    fn read_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        Self::read_pool(self)
+    }
 }
 
 impl crate::probe::ProvideProbeState for AppState {
@@ -492,6 +553,14 @@ impl crate::probe::ProvideProbeState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
+    }
+
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
     }
 }
 
@@ -605,6 +674,134 @@ mod tests {
         let state = AppState::for_test().with_pool(pool);
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn database_topology_state_exposes_replica_as_read_pool() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+
+        assert_eq!(state.pool().expect("primary pool").status().max_size, 5);
+        assert_eq!(
+            state
+                .replica_pool()
+                .expect("replica pool")
+                .status()
+                .max_size,
+            2
+        );
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 2);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn read_pool_uses_primary_when_replica_is_unready_and_policy_allows_fallback() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::Primary);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+        assert_eq!(
+            db::DbState::read_pool(&state)
+                .expect("trait read pool")
+                .status()
+                .max_size,
+            5
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn read_pool_does_not_route_to_unready_replica_when_policy_fails_readiness() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, _) = crate::probe::readiness_response(&state).await;
+
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

@@ -70,7 +70,7 @@ async fn warm_local_cache(_state: AppState) -> AutumnResult<()> {
 ## Verify With Three Replicas
 
 With a Docker Compose file that has a `db` service and a `web` service using
-the same `DATABASE_URL`, run three web replicas:
+the same `AUTUMN_DATABASE__PRIMARY_URL`, run three web replicas:
 
 ```bash
 docker compose up --build --scale web=3

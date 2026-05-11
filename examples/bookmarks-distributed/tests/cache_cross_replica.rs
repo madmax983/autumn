@@ -1,7 +1,7 @@
 //! Integration test: two replicas sharing a Redis backend see the same cached
 //! data and invalidations within one round-trip.
 //!
-//! Mirrors the production topology: three `bookmarks-distributed` replicas
+//! Mirrors the production topology: two `bookmarks-distributed` replicas
 //! share a single Redis instance (see `docker-compose.yml`). Any write to the
 //! cache on replica A must be readable by replica B, and any invalidation from
 //! replica A must immediately remove the entry on replica B.
@@ -18,7 +18,7 @@ async fn cross_replica_cached_count_consistency() {
     let port = container.get_host_port_ipv4(6379).await.unwrap();
     let url = format!("redis://127.0.0.1:{port}");
 
-    // Two "replicas" that share the same Redis namespace, just like the three
+    // Two "replicas" that share the same Redis namespace, just like the two
     // bookmarks-distributed replicas behind the nginx load-balancer.
     let replica_a = RedisCache::connect(&url, "bookmarks:cache").await.unwrap();
     let replica_b = RedisCache::connect(&url, "bookmarks:cache").await.unwrap();

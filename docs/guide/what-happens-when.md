@@ -90,9 +90,9 @@ Not an error. Autumn uses its compiled-in defaults:
 | `server.host` | 127.0.0.1         |
 | `log.level`   | info              |
 | `log.format`  | Auto              |
-| `database.url`| (none -- no DB)   |
+| `database.primary_url` / `database.url` | (none -- no DB) |
 
-### No `[database]` section (or no `url`)
+### No `[database]` section (or no primary URL)
 
 Autumn starts without a database pool. Handlers that inject `Db` return 503:
 
@@ -132,12 +132,12 @@ matching) and falls back to defaults:
 WARN autumn: Unknown profile "dvv", did you mean "dev"?
 ```
 
-### Invalid `database.url` scheme
+### Invalid database URL scheme
 
 Configuration validation catches it immediately:
 
 ```
-Failed to load configuration: database.url must start with postgres:// or postgresql://
+Failed to load configuration: database.primary_url must start with postgres:// or postgresql://
 ```
 
 ### Environment variable overrides
@@ -379,8 +379,8 @@ health check will report the database as unhealthy.
 
 ## What Happens When You Use `Db` Without a Database?
 
-If no `database.url` is configured, the pool is `None`. The `Db` extractor
-returns 503 immediately:
+If neither `database.primary_url` nor the legacy `database.url` is configured,
+the primary/write pool is `None`. The `Db` extractor returns 503 immediately:
 
 ```json
 {

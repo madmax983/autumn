@@ -167,6 +167,8 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
+    #[cfg(feature = "db")]
+    replica_pool: Option<Pool<AsyncPgConnection>>,
     /// Deferred policy / scope registrations applied during
     /// [`TestApp::build`].
     policy_registrations: Vec<TestPolicyRegistration>,
@@ -197,6 +199,8 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             policy_registrations: Vec::new(),
             forbidden_response_override: None,
         }
@@ -348,6 +352,8 @@ impl TestApp {
             )),
             #[cfg(feature = "db")]
             pool: self.pool,
+            #[cfg(feature = "db")]
+            replica_pool: self.replica_pool,
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,

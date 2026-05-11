@@ -34,8 +34,6 @@ use futures::FutureExt as _;
 use tracing::Instrument as _;
 
 use crate::config::{AutumnConfig, ConfigLoader};
-#[cfg(feature = "db")]
-use crate::db::DatabasePoolProvider;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -137,14 +135,7 @@ type PoolProviderFactory = Box<
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<
-                            Option<
-                                diesel_async::pooled_connection::deadpool::Pool<
-                                    diesel_async::AsyncPgConnection,
-                                >,
-                            >,
-                            crate::db::PoolError,
-                        >,
+                        Output = Result<Option<crate::db::DatabaseTopology>, crate::db::PoolError>,
                     > + Send,
             >,
         > + Send,
@@ -1016,7 +1007,7 @@ impl AppBuilder {
         self
     }
 
-    /// Install a custom [`DatabasePoolProvider`],
+    /// Install a custom [`crate::db::DatabasePoolProvider`],
     /// replacing the default `deadpool + diesel-async` pool factory.
     ///
     /// Useful for adding metrics/circuit-breaker wrappers, switching to a
@@ -1036,7 +1027,7 @@ impl AppBuilder {
         }
         self.pool_provider_factory =
             Some(Box::new(move |config: crate::config::DatabaseConfig| {
-                Box::pin(async move { provider.create_pool(&config).await })
+                Box::pin(async move { provider.create_topology(&config).await })
             }));
         self
     }
@@ -1355,9 +1346,12 @@ impl AppBuilder {
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
+    /// - They always target the primary/write database role
+    ///   (`database.primary_url`, falling back to legacy `database.url`).
     /// - In **dev** mode, pending migrations run automatically on startup.
     /// - In **prod** mode, pending migrations are logged as warnings but
-    ///   not applied -- use `autumn migrate` to apply them explicitly.
+    ///   not applied -- use a one-shot `autumn migrate` job before rolling web
+    ///   replicas.
     ///
     /// # Examples
     ///
@@ -1536,18 +1530,26 @@ impl AppBuilder {
 
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations, pool_provider_factory)
+        let database = setup_database(&config, migrations, pool_provider_factory)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("{e}");
                 std::process::exit(1);
             });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         #[cfg(feature = "db")]
         if pool.is_some() {
             tracing::info!(
-                max_connections = config.database.pool_size,
-                "Database pool configured"
+                primary_max_connections = config.database.effective_primary_pool_size(),
+                replica_configured = config.database.replica_url.is_some(),
+                replica_max_connections = config.database.effective_replica_pool_size(),
+                "Database topology configured"
             );
         } else {
             tracing::info!("Database not configured");
@@ -1566,10 +1568,14 @@ impl AppBuilder {
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
@@ -1880,20 +1886,30 @@ impl AppBuilder {
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, vec![], pool_provider_factory)
+        let database = setup_database(&config, vec![], pool_provider_factory)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1);
             });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
@@ -2169,20 +2185,30 @@ impl AppBuilder {
         );
 
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations, pool_provider_factory)
+        let database = setup_database(&config, migrations, pool_provider_factory)
             .await
             .unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
         if let Some(cache) = cache_backend {
             crate::cache::set_global_cache(cache.clone());
             state.shared_cache = Some(cache);
@@ -3205,21 +3231,22 @@ fn install_i18n_bundle_layer(
 }
 
 #[cfg(feature = "db")]
+struct DatabaseBootstrap {
+    topology: Option<crate::db::DatabaseTopology>,
+    replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+    replica_migration_check: Option<(String, String)>,
+}
+
+#[cfg(feature = "db")]
 async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     pool_provider: Option<PoolProviderFactory>,
-) -> Result<
-    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
-    String,
-> {
-    let pool = match pool_provider {
+) -> Result<DatabaseBootstrap, String> {
+    let check_replica_migrations = !migrations.is_empty();
+    let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
-        None => {
-            crate::db::DieselDeadpoolPoolProvider::new()
-                .create_pool(&config.database)
-                .await
-        }
+        None => crate::db::create_topology(&config.database),
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
@@ -3227,8 +3254,8 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some()
-        && let Some(url) = &config.database.url
+    if topology.is_some()
+        && let Some(url) = config.database.effective_primary_url()
     {
         for mig in migrations {
             crate::migrate::auto_migrate(
@@ -3240,7 +3267,62 @@ async fn setup_database(
         }
     }
 
-    Ok(pool)
+    let (replica_readiness, replica_migration_check) = if topology
+        .as_ref()
+        .is_some_and(|topology| check_replica_migrations && topology.replica().is_some())
+    {
+        match (
+            config.database.effective_primary_url(),
+            config.database.replica_url.as_deref(),
+        ) {
+            (Some(primary_url), Some(replica_url)) => {
+                let primary_url = primary_url.to_owned();
+                let replica_url = replica_url.to_owned();
+                let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+                    primary_url.clone(),
+                    replica_url.clone(),
+                )
+                .await;
+                (Some(readiness), Some((primary_url, replica_url)))
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(DatabaseBootstrap {
+        topology,
+        replica_readiness,
+        replica_migration_check,
+    })
+}
+
+#[cfg(feature = "db")]
+fn apply_replica_migration_readiness(
+    state: &AppState,
+    readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+) {
+    let Some(readiness) = readiness else {
+        return;
+    };
+
+    if readiness.is_ready() {
+        state.probes().mark_replica_migrations_ready();
+    } else if let Some(detail) = readiness.detail() {
+        state.probes().mark_replica_migrations_unready(detail);
+    }
+}
+
+#[cfg(feature = "db")]
+fn configure_replica_migration_check(state: &AppState, check: Option<(String, String)>) {
+    let Some((primary_url, replica_url)) = check else {
+        return;
+    };
+
+    state
+        .probes()
+        .configure_replica_migration_check(primary_url, replica_url);
 }
 
 /// Refuse to start when a `#[repository(api = ...)]`-mounted route
@@ -3890,9 +3972,7 @@ mod validate_repository_api_policies_tests {
 
 fn build_state(
     config: &AutumnConfig,
-    #[cfg(feature = "db")] pool: Option<
-        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-    >,
+    #[cfg(feature = "db")] database_topology: Option<&crate::db::DatabaseTopology>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
     #[cfg(feature = "ws")]
@@ -3912,7 +3992,9 @@ fn build_state(
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
-        pool,
+        pool: database_topology.map(|topology| topology.primary().clone()),
+        #[cfg(feature = "db")]
+        replica_pool: database_topology.and_then(|topology| topology.replica().cloned()),
         profile: config.profile.clone(),
         started_at: std::time::Instant::now(),
         health_detailed: config.health.detailed,
@@ -3931,6 +4013,12 @@ fn build_state(
         auth_session_key: config.auth.session_key.clone(),
         shared_cache: None,
     };
+    #[cfg(feature = "db")]
+    if state.replica_pool.is_some() {
+        state
+            .probes()
+            .configure_replica_dependency(config.database.replica_fallback);
+    }
     state.insert_extension(config.clone());
     state
 }
@@ -4037,9 +4125,19 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
 /// Build the configuration summary string.
 fn format_config_summary(config: &AutumnConfig) -> String {
     let profile = config.profile.as_deref().unwrap_or("none");
-    let db_status = config.database.url.as_deref().map_or_else(
+    let db_status = config.database.effective_primary_url().map_or_else(
         || "not configured".to_owned(),
-        |url| mask_database_url(url, config.database.pool_size),
+        |url| {
+            let primary = mask_database_url(url, config.database.effective_primary_pool_size());
+            if config.database.replica_url.is_some() {
+                format!(
+                    "primary={primary}, replica=configured (pool_size={})",
+                    config.database.effective_replica_pool_size()
+                )
+            } else {
+                primary
+            }
+        },
     );
     let telemetry_status = if config.telemetry.enabled {
         let endpoint = config
@@ -4156,6 +4254,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -4175,6 +4275,180 @@ mod tests {
             shared_cache: None,
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn build_state_applies_replica_fallback_policy_to_read_routing() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::Primary;
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn custom_pool_provider_preserves_configured_replica_topology() {
+        struct PassthroughPoolProvider;
+
+        impl crate::db::DatabasePoolProvider for PassthroughPoolProvider {
+            async fn create_pool(
+                &self,
+                config: &crate::config::DatabaseConfig,
+            ) -> Result<
+                Option<
+                    diesel_async::pooled_connection::deadpool::Pool<
+                        diesel_async::AsyncPgConnection,
+                    >,
+                >,
+                crate::db::PoolError,
+            > {
+                crate::db::create_pool(config)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::FailReadiness;
+        let AppBuilder {
+            pool_provider_factory,
+            ..
+        } = app().with_pool_provider(PassthroughPoolProvider);
+
+        let database = setup_database(&config, Vec::new(), pool_provider_factory)
+            .await
+            .expect("custom provider should build database topology");
+        let topology = database.topology.expect("database should be configured");
+
+        assert_eq!(topology.primary().status().max_size, 5);
+        assert_eq!(
+            topology
+                .replica()
+                .expect("custom provider should create replica pool")
+                .status()
+                .max_size,
+            2
+        );
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        state
+            .probes()
+            .mark_replica_connection_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+        let (status, _) = crate::probe::readiness_response(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn configure_replica_migration_check_stores_recheck_urls() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+
+        assert!(
+            state.probes().replica_migration_check().is_none(),
+            "build_state should not enable migration checks without registered migrations"
+        );
+
+        configure_replica_migration_check(
+            &state,
+            Some((
+                "postgres://localhost/primary".to_owned(),
+                "postgres://localhost/replica".to_owned(),
+            )),
+        );
+
+        let check = state
+            .probes()
+            .replica_migration_check()
+            .expect("replica migration check should be configured");
+
+        assert_eq!(check.primary_url, "postgres://localhost/primary");
+        assert_eq!(check.replica_url, "postgres://localhost/replica");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_migration_readiness_marks_ready_endpoint_degraded() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::FailReadiness;
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+
+        apply_replica_migration_readiness(
+            &state,
+            Some(crate::migrate::ReplicaMigrationReadiness::Stale {
+                primary_latest: Some("00000000000002".to_owned()),
+                replica_latest: Some("00000000000001".to_owned()),
+            }),
+        );
+
+        let (status, _) = crate::probe::readiness_response(&state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn blocking_replica_migration_readiness_reports_unknown_connection_errors() {
+        let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+            "not-a-primary-url".to_owned(),
+            "not-a-replica-url".to_owned(),
+        )
+        .await;
+
+        assert!(matches!(
+            readiness,
+            crate::migrate::ReplicaMigrationReadiness::Unknown(_)
+        ));
     }
 
     #[cfg(feature = "ws")]
@@ -4671,6 +4945,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -4770,6 +5046,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -4843,6 +5121,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5129,6 +5409,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5429,6 +5711,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5573,6 +5857,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5615,6 +5901,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5867,6 +6155,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -5933,6 +6223,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,

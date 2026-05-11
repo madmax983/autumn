@@ -45,7 +45,7 @@ use axum::response::IntoResponse;
 pub async fn handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
-    crate::probe::readiness_response(&state)
+    crate::probe::readiness_response(&state).await
 }
 
 #[cfg(test)]

@@ -169,6 +169,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             pool: None,
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,

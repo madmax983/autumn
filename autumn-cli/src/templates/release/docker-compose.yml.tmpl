@@ -8,11 +8,24 @@ services:
       - "3000:3000"
     environment:
       AUTUMN_PROFILE: prod
-      DATABASE_URL: postgres://autumn:autumn@db:5432/{{project_name}}_prod
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://autumn:autumn@db:5432/{{project_name}}_prod
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["sh", "-lc", "autumn migrate"]
+    environment:
+      AUTUMN_PROFILE: prod
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://autumn:autumn@db:5432/{{project_name}}_prod
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
 
   db:
     image: postgres:16-alpine

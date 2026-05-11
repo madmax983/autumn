@@ -523,7 +523,7 @@ pub trait MailDeliveryQueue: Send + Sync {
 
 /// Cloneable handle to a [`MailDeliveryQueue`].
 ///
-/// Designed for storage on [`AppState`](crate::AppState) extensions. Plugins
+/// Designed for storage on [`AppState`] extensions. Plugins
 /// (Harvest, custom Redis, etc.) install this before `install_mailer` runs and
 /// the mailer picks it up.
 #[derive(Clone)]

@@ -19,7 +19,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Pre-rendering pages to static HTML** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
 - **Application builder** - `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
-- **Database ergonomics** - async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
+- **Database ergonomics** - async Postgres primary/replica pools, `Db` extractor for the primary/write role, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
@@ -94,6 +94,26 @@ multi-replica deployment":
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
 done.
+
+## Database Topologies
+
+Autumn supports three explicit database shapes:
+
+- **Single primary**: set `database.url` or `database.primary_url`. Writes,
+  transactions, advisory locks, and `autumn migrate` use that primary role.
+- **Primary plus read replica**: set `database.primary_url` and
+  `database.replica_url`, with optional `primary_pool_size`,
+  `replica_pool_size`, and `replica_fallback = "fail_readiness"` or
+  `"primary"`.
+- **One-shot migrator path**: run `autumn migrate` once against the primary
+  before rolling web replicas. Production web replicas should keep
+  `auto_migrate_in_production = false`.
+
+`database.url` and `DATABASE_URL` remain valid for existing single-URL apps.
+For new production config, prefer `AUTUMN_DATABASE__PRIMARY_URL` so the write
+role is named plainly. `autumn doctor --strict` reports missing primaries,
+unsafe production startup migrations, role connectivity failures, and stale
+replica migrations without printing credentials.
 
 ## Autumn Harvest
 

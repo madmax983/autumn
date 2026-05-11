@@ -1,5 +1,11 @@
 //! Repository error types for framework-generated CRUD operations.
 //!
+//! Framework-generated repositories use the [`Db`](crate::Db) extractor, which
+//! is bound to the primary/write database role. If an application wants a
+//! primary/replica read split, use an explicit repository seam and route reads
+//! through [`crate::AppState::read_pool`] while keeping writes on
+//! [`crate::AppState::pool`].
+//!
 //! [`RepositoryError`] surfaces typed errors that arise during repository
 //! operations — most notably optimistic-lock conflicts when two replicas
 //! write the same row concurrently.

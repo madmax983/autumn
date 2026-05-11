@@ -57,10 +57,13 @@ fn find_package_dir(package: &str) -> Option<PathBuf> {
 /// the process working directory so that workspace invocations are correct.
 ///
 /// Precedence (highest to lowest):
-/// 1. `AUTUMN_DATABASE__URL` env var
-/// 2. `DATABASE_URL` env var
-/// 3. `[profile.<profile>.database.url]` in `<base_dir>/autumn.toml`
-/// 4. `[database.url]` in `<base_dir>/autumn.toml`
+/// 1. `AUTUMN_DATABASE__PRIMARY_URL` env var
+/// 2. `AUTUMN_DATABASE__URL` env var
+/// 3. `DATABASE_URL` env var
+/// 4. `[profile.<profile>.database.primary_url]` in `<base_dir>/autumn.toml`
+/// 5. `[profile.<profile>.database.url]` in `<base_dir>/autumn.toml`
+/// 6. `[database.primary_url]` in `<base_dir>/autumn.toml`
+/// 7. `[database.url]` in `<base_dir>/autumn.toml`
 fn resolve_database_url_with_env<F>(
     env_var: F,
     base_dir: &Path,
@@ -69,15 +72,16 @@ fn resolve_database_url_with_env<F>(
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
-    if let Ok(url) = env_var("AUTUMN_DATABASE__URL")
-        && !url.is_empty()
-    {
-        return Ok(url);
-    }
-    if let Ok(url) = env_var("DATABASE_URL")
-        && !url.is_empty()
-    {
-        return Ok(url);
+    for var in [
+        "AUTUMN_DATABASE__PRIMARY_URL",
+        "AUTUMN_DATABASE__URL",
+        "DATABASE_URL",
+    ] {
+        if let Ok(url) = env_var(var)
+            && !url.is_empty()
+        {
+            return Ok(url);
+        }
     }
 
     let config_path = base_dir.join("autumn.toml");
@@ -87,30 +91,39 @@ where
     {
         let value = toml::Value::Table(table);
 
-        // Profile-specific override: [profile.<name>.database.url]
-        if let Some(url) = value
+        // Profile-specific override: [profile.<name>.database]
+        let profile_database = value
             .get("profile")
             .and_then(|p| p.get(profile))
             .and_then(|p| p.get("database"))
-            .and_then(|db| db.get("url"))
-            .and_then(|u| u.as_str())
-            .filter(|u| !u.is_empty())
-        {
-            return Ok(url.to_string());
+            .and_then(toml::Value::as_table);
+        if let Some(url) = first_database_url(profile_database) {
+            return Ok(url);
         }
 
-        // Top-level fallback: [database.url]
-        if let Some(url) = value
-            .get("database")
-            .and_then(|db: &toml::Value| db.get("url"))
-            .and_then(|u: &toml::Value| u.as_str())
-            .filter(|u| !u.is_empty())
-        {
-            return Ok(url.to_string());
+        // Top-level fallback: [database]
+        let database = value.get("database").and_then(toml::Value::as_table);
+        if let Some(url) = first_database_url(database) {
+            return Ok(url);
         }
     }
 
     Err(SeedError::MissingSeedBinary)
+}
+
+fn first_database_url(database: Option<&toml::Table>) -> Option<String> {
+    let database = database?;
+    for key in ["primary_url", "url"] {
+        if let Some(url) = database
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_owned());
+        }
+    }
+
+    None
 }
 
 /// Resolve the database URL using the real environment, a given base dir, and profile.
@@ -287,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn resolve_db_url_prefers_primary_database_url_env() {
+        let env = |key: &str| match key {
+            "AUTUMN_DATABASE__PRIMARY_URL" => Ok("postgres://primary:5432/db".to_string()),
+            "AUTUMN_DATABASE__URL" => Ok("postgres://legacy:5432/db".to_string()),
+            "DATABASE_URL" => Ok("postgres://plain:5432/db".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let url = resolve_database_url_with_env(env, Path::new("."), "dev").unwrap();
+        assert_eq!(url, "postgres://primary:5432/db");
+    }
+
+    #[test]
     fn resolve_db_url_falls_back_to_database_url() {
         let env = |key: &str| match key {
             "DATABASE_URL" => Ok("postgres://fallback:5432/db".to_string()),
@@ -330,6 +355,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_db_url_reads_primary_url_from_base_dir_toml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://primary-toml:5432/db\"\n\
+             url = \"postgres://legacy-toml:5432/db\"\n",
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        let url = resolve_database_url_with_env(env, tmp.path(), "dev").unwrap();
+        assert_eq!(url, "postgres://primary-toml:5432/db");
+    }
+
+    #[test]
     fn resolve_db_url_ignores_toml_in_wrong_base_dir() {
         // autumn.toml exists only in a different directory; base_dir has none.
         let tmp_with_toml = TempDir::new().unwrap();
@@ -352,6 +392,21 @@ mod tests {
             tmp.path().join("autumn.toml"),
             "[database]\nurl = \"postgres://default:5432/db\"\n\
              [profile.demo.database]\nurl = \"postgres://demo:5432/demo_db\"\n",
+        )
+        .unwrap();
+        let env =
+            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
+        let url = resolve_database_url_with_env(env, tmp.path(), "demo").unwrap();
+        assert_eq!(url, "postgres://demo:5432/demo_db");
+    }
+
+    #[test]
+    fn resolve_db_url_uses_profile_specific_primary_url_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://default:5432/db\"\n\
+             [profile.demo.database]\nprimary_url = \"postgres://demo:5432/demo_db\"\n",
         )
         .unwrap();
         let env =

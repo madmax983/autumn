@@ -6,6 +6,8 @@
 //! - startup stays unavailable until startup hooks complete
 
 use std::sync::Arc;
+#[cfg(feature = "db")]
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::extract::State;
@@ -42,6 +44,15 @@ pub trait ProvideProbeState {
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
 
+    /// Returns an optional read-replica pool for readiness checks.
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        None
+    }
+
     /// Helper method to mark the application startup as complete.
     ///
     /// Delegates to [`ProbeState::mark_startup_complete`].
@@ -76,6 +87,40 @@ pub trait ProvideProbeState {
 pub struct ProbeState {
     startup_complete: Arc<AtomicBool>,
     shutting_down: Arc<AtomicBool>,
+    #[cfg(feature = "db")]
+    replica_dependency: Arc<RwLock<ReplicaDependency>>,
+}
+
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplicaMigrationCheck {
+    pub(crate) primary_url: String,
+    pub(crate) replica_url: String,
+}
+
+#[cfg(feature = "db")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReplicaDependency {
+    configured: bool,
+    fallback: crate::config::ReplicaFallback,
+    connection_ready: bool,
+    migrations_ready: bool,
+    migration_check: Option<ReplicaMigrationCheck>,
+    detail: Option<String>,
+}
+
+#[cfg(feature = "db")]
+impl Default for ReplicaDependency {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            fallback: crate::config::ReplicaFallback::default(),
+            connection_ready: true,
+            migrations_ready: true,
+            migration_check: None,
+            detail: None,
+        }
+    }
 }
 
 impl ProbeState {
@@ -124,6 +169,136 @@ impl ProbeState {
         self.shutting_down.store(draining, Ordering::Relaxed);
     }
 
+    /// Configure runtime readiness behavior for a read replica.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn configure_replica_dependency(&self, fallback: crate::config::ReplicaFallback) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        *dependency = ReplicaDependency {
+            configured: true,
+            fallback,
+            connection_ready: false,
+            migrations_ready: true,
+            migration_check: None,
+            detail: Some("replica has not passed a readiness check".to_owned()),
+        };
+    }
+
+    /// Store URLs needed to retry replica migration readiness checks.
+    #[cfg(feature = "db")]
+    pub(crate) fn configure_replica_migration_check(
+        &self,
+        primary_url: impl Into<String>,
+        replica_url: impl Into<String>,
+    ) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.migration_check = Some(ReplicaMigrationCheck {
+            primary_url: primary_url.into(),
+            replica_url: replica_url.into(),
+        });
+    }
+
+    /// Mark the configured read replica as reachable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_connection_ready(&self) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.connection_ready = true;
+        if dependency.migrations_ready {
+            dependency.detail = None;
+        }
+    }
+
+    /// Mark the configured read replica as unreachable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_connection_unready(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.connection_ready = false;
+        dependency.detail = Some(detail.into());
+    }
+
+    /// Mark the configured read replica's migration state as current.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_migrations_ready(&self) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.migrations_ready = true;
+        if dependency.connection_ready {
+            dependency.detail = None;
+        }
+    }
+
+    /// Mark the configured read replica's migration state as stale.
+    #[cfg(feature = "db")]
+    pub(crate) fn mark_replica_migrations_unready(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.migrations_ready = false;
+        dependency.detail = Some(detail.into());
+    }
+
+    /// Mark the configured read replica as ready.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_ready(&self) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.connection_ready = true;
+        dependency.migrations_ready = true;
+        dependency.detail = None;
+    }
+
+    /// Mark the configured read replica as unavailable or stale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replica dependency lock is poisoned.
+    #[cfg(feature = "db")]
+    pub fn mark_replica_unready(&self, detail: impl Into<String>) {
+        let mut dependency = self
+            .replica_dependency
+            .write()
+            .expect("replica dependency lock poisoned");
+        dependency.connection_ready = false;
+        dependency.migrations_ready = false;
+        dependency.detail = Some(detail.into());
+    }
+
     /// Returns whether startup completed successfully.
     #[must_use]
     pub fn is_startup_complete(&self) -> bool {
@@ -140,6 +315,55 @@ impl ProbeState {
     #[must_use]
     pub fn draining(&self) -> bool {
         self.is_shutting_down()
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_allows_readiness(&self) -> bool {
+        let dependency = self
+            .replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned");
+        let ready = dependency.connection_ready && dependency.migrations_ready;
+        !dependency.configured
+            || ready
+            || matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn should_route_reads_to_replica(&self) -> bool {
+        let dependency = self
+            .replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned");
+        !dependency.configured || (dependency.connection_ready && dependency.migrations_ready)
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn should_fallback_reads_to_primary(&self) -> bool {
+        let dependency = self
+            .replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned");
+        dependency.configured
+            && !(dependency.connection_ready && dependency.migrations_ready)
+            && matches!(dependency.fallback, crate::config::ReplicaFallback::Primary)
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_configured(&self) -> bool {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .configured
+    }
+
+    #[cfg(feature = "db")]
+    pub(crate) fn replica_migration_check(&self) -> Option<ReplicaMigrationCheck> {
+        self.replica_dependency
+            .read()
+            .expect("replica dependency lock poisoned")
+            .migration_check
+            .clone()
     }
 }
 
@@ -174,24 +398,86 @@ pub(crate) struct PoolStatus {
 fn dependency_readiness<S: ProvideProbeState>(state: &S) -> (bool, Option<PoolStatus>) {
     #[cfg(feature = "db")]
     {
-        if let Some(pool) = state.pool() {
+        let replica_ready_for_policy = state.probes().replica_allows_readiness();
+        let (pool_ready, pool_status) = state.pool().map_or((true, None), |pool| {
             let status = pool.status();
             let available = status.available as u64;
             let size = status.max_size as u64;
             let waiting = status.waiting as u64;
 
-            return (
+            (
                 available > 0 || waiting == 0,
                 Some(PoolStatus {
                     size,
                     available,
                     waiting,
                 }),
-            );
-        }
+            )
+        });
+
+        (pool_ready && replica_ready_for_policy, pool_status)
     }
 
-    (true, None)
+    #[cfg(not(feature = "db"))]
+    {
+        (true, None)
+    }
+}
+
+#[cfg(feature = "db")]
+async fn refresh_replica_readiness<S: ProvideProbeState + Sync>(state: &S) {
+    if !state.probes().replica_configured() {
+        return;
+    }
+
+    let Some(replica_pool) = state.replica_pool() else {
+        state
+            .probes()
+            .mark_replica_connection_unready("replica pool is not available");
+        return;
+    };
+
+    match replica_pool.get().await {
+        Ok(conn) => {
+            drop(conn);
+            state.probes().mark_replica_connection_ready();
+            refresh_replica_migration_readiness(state).await;
+        }
+        Err(error) => state
+            .probes()
+            .mark_replica_connection_unready(format!("replica connection failed: {error}")),
+    }
+}
+
+#[cfg(feature = "db")]
+async fn refresh_replica_migration_readiness<S: ProvideProbeState + Sync>(state: &S) {
+    refresh_replica_migration_readiness_with(state, |check| {
+        crate::migrate::check_replica_migration_readiness_blocking(
+            check.primary_url,
+            check.replica_url,
+        )
+    })
+    .await;
+}
+
+#[cfg(feature = "db")]
+async fn refresh_replica_migration_readiness_with<S, F, Fut>(state: &S, check_readiness: F)
+where
+    S: ProvideProbeState + Sync,
+    F: FnOnce(ReplicaMigrationCheck) -> Fut,
+    Fut: std::future::Future<Output = crate::migrate::ReplicaMigrationReadiness>,
+{
+    let Some(check) = state.probes().replica_migration_check() else {
+        return;
+    };
+
+    let readiness = check_readiness(check).await;
+
+    if readiness.is_ready() {
+        state.probes().mark_replica_migrations_ready();
+    } else if let Some(detail) = readiness.detail() {
+        state.probes().mark_replica_migrations_unready(detail);
+    }
 }
 
 fn probe_response<S: ProvideProbeState>(
@@ -247,6 +533,8 @@ pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
 pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "db")]
+    refresh_replica_readiness(&state).await;
     probe_response(&state, ProbeKind::Ready)
 }
 
@@ -258,9 +546,11 @@ pub async fn startup_handler<S: ProvideProbeState + Send + Sync + 'static>(
 }
 
 /// Compatibility alias for the legacy `/health` endpoint.
-pub(crate) fn readiness_response<S: ProvideProbeState>(
+pub(crate) async fn readiness_response<S: ProvideProbeState + Sync>(
     state: &S,
 ) -> (StatusCode, Json<ProbeResponse>) {
+    #[cfg(feature = "db")]
+    refresh_replica_readiness(state).await;
     probe_response(state, ProbeKind::Ready)
 }
 
@@ -360,6 +650,127 @@ mod tests {
         let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn ready_fails_when_replica_is_unready_and_policy_is_fail_readiness() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn ready_fails_when_replica_is_configured_but_not_checked() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+
+        let (status, Json(response)) = readiness_response(&state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn replica_migration_lag_can_recover_without_resetting_connection_readiness() {
+        let probes = ProbeState::ready_for_test();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.mark_replica_connection_ready();
+        probes.mark_replica_migrations_unready("replica migrations lag primary");
+
+        assert!(!probes.replica_allows_readiness());
+        assert!(!probes.should_route_reads_to_replica());
+
+        probes.mark_replica_connection_ready();
+        assert!(!probes.replica_allows_readiness());
+        assert!(!probes.should_route_reads_to_replica());
+
+        probes.mark_replica_migrations_ready();
+        assert!(probes.replica_allows_readiness());
+        assert!(probes.should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn replica_migration_retry_urls_are_stored_for_readiness_rechecks() {
+        let probes = ProbeState::ready_for_test();
+        probes.configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        probes.configure_replica_migration_check(
+            "postgres://localhost/primary",
+            "postgres://localhost/replica",
+        );
+
+        let check = probes
+            .replica_migration_check()
+            .expect("migration check should be configured");
+
+        assert_eq!(check.primary_url, "postgres://localhost/primary");
+        assert_eq!(check.replica_url, "postgres://localhost/replica");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_migration_readiness_rechecks_after_initial_ready_state() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::FailReadiness);
+        state.probes().configure_replica_migration_check(
+            "postgres://localhost/primary",
+            "postgres://localhost/replica",
+        );
+        state.probes().mark_replica_connection_ready();
+        state.probes().mark_replica_migrations_ready();
+
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        refresh_replica_migration_readiness_with(&state, |check| {
+            checks.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(check.primary_url, "postgres://localhost/primary");
+            assert_eq!(check.replica_url, "postgres://localhost/replica");
+            std::future::ready(crate::migrate::ReplicaMigrationReadiness::Stale {
+                primary_latest: Some("20260511000000".to_owned()),
+                replica_latest: Some("20260510000000".to_owned()),
+            })
+        })
+        .await;
+
+        assert_eq!(checks.load(Ordering::Relaxed), 1);
+        assert!(!state.probes().replica_allows_readiness());
+        assert!(!state.probes().should_route_reads_to_replica());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn ready_allows_primary_fallback_when_replica_is_unready() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        state
+            .probes()
+            .configure_replica_dependency(crate::config::ReplicaFallback::Primary);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready);
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response.status, "ok");
     }
 
     #[tokio::test]
