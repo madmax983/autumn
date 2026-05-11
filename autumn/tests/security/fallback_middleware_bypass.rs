@@ -1,6 +1,6 @@
 use autumn_web::security::CsrfLayer;
-use autumn_web::{config::AutumnConfig, AppState};
-use axum::{body::Body, extract::Request, http::StatusCode, routing::get, Router};
+use autumn_web::{AppState, config::AutumnConfig};
+use axum::{Router, body::Body, extract::Request, http::StatusCode, routing::get};
 use tower::ServiceExt; // for oneshot()
 
 #[tokio::test]

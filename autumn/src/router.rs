@@ -957,7 +957,8 @@ fn mount_raw_routers(
         tracing::debug!(prefix = %prefix, "Nested raw Axum router");
         // We explicitly apply the fallback to the nested router before nesting,
         // so that unmatched routes within this prefix are protected by global middleware.
-        let nested_router = raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        let nested_router =
+            raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
         router = router.nest(&prefix, nested_router);
     }
     router
