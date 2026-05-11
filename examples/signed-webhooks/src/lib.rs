@@ -4,17 +4,17 @@ use autumn_web::webhook::{WebhookConfig, WebhookEndpointConfig, WebhookProvider}
 pub const STRIPE_SECRET: &str = "dev-stripe-webhook-secret-32-bytes";
 
 #[post("/webhooks/stripe")]
-async fn stripe(webhook: SignedWebhook) -> Json<serde_json::Value> {
-    let payload = webhook
-        .json::<serde_json::Value>()
-        .unwrap_or(serde_json::Value::Null);
-    Json(serde_json::json!({
+async fn stripe(webhook: SignedWebhook) -> AutumnResult<Json<serde_json::Value>> {
+    let payload = webhook.json::<serde_json::Value>().map_err(|error| {
+        AutumnError::bad_request_msg(format!("invalid webhook JSON payload: {error}"))
+    })?;
+    Ok(Json(serde_json::json!({
         "accepted": true,
         "provider": webhook.provider(),
         "delivery_id": webhook.delivery_id(),
         "event_type": webhook.event_type(),
         "payload": payload,
-    }))
+    })))
 }
 
 pub fn routes() -> Vec<autumn_web::Route> {

@@ -1,13 +1,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use autumn_web::config::{AutumnConfig, MockEnv};
 use autumn_web::prelude::*;
 use autumn_web::security::{CsrfConfig, SecurityConfig};
 use autumn_web::test::{TestApp, TestResponse};
 use autumn_web::webhook::{
-    SignedWebhook, WebhookEndpointConfig, WebhookProvider, WebhookRegistry, WebhookReplayBackend,
-    hmac_sha256_hex,
+    InMemoryWebhookReplayStore, SignedWebhook, WebhookEndpointConfig, WebhookProvider,
+    WebhookRegistry, WebhookReplayBackend, WebhookReplayStore, hmac_sha256_hex,
 };
 use serde_json::json;
 
@@ -120,7 +120,11 @@ fn github_signature(secret: &str, body: &[u8]) -> String {
 }
 
 fn slack_signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
-    let mut signed_payload = format!("v0:{timestamp}:").into_bytes();
+    let timestamp = timestamp.to_string();
+    let mut signed_payload = Vec::with_capacity(3 + timestamp.len() + 1 + body.len());
+    signed_payload.extend_from_slice(b"v0:");
+    signed_payload.extend_from_slice(timestamp.as_bytes());
+    signed_payload.push(b':');
     signed_payload.extend_from_slice(body);
     format!("v0={}", hmac_sha256_hex(secret.as_bytes(), &signed_payload))
 }
@@ -137,10 +141,17 @@ fn problem_json(response: &TestResponse, status: u16) -> serde_json::Value {
     assert!(
         json["detail"]
             .as_str()
-            .is_some_and(|detail| !detail.is_empty())
+            .is_some_and(|detail| !detail.is_empty()),
+        "Problem+JSON response should include a detail message"
     );
-    assert!(json["instance"].as_str().is_some());
-    assert!(json["request_id"].as_str().is_some());
+    assert!(
+        json["instance"].as_str().is_some(),
+        "Problem+JSON response should include an instance path"
+    );
+    assert!(
+        json["request_id"].as_str().is_some(),
+        "Problem+JSON response should include a request_id"
+    );
     json
 }
 
@@ -192,24 +203,23 @@ async fn provider_presets_verify_valid_requests_and_expose_metadata() {
     assert_eq!(github["delivery_id"], "gh-delivery-1");
     assert_eq!(github["event_type"], "pull_request");
 
-    let slack_body = b"token=ignored&team_id=T123&api_app_id=A123";
+    let slack_body = br#"{"type":"event_callback","event":{"type":"message"},"event_id":"Ev-provider-preset","event_time":1234567890}"#;
     let response = client
         .post("/webhooks/slack")
+        .header("content-type", "application/json")
         .header("x-slack-request-timestamp", &now.to_string())
         .header(
             "x-slack-signature",
             &slack_signature(CURRENT_SECRET, now, slack_body),
         )
-        .header("x-slack-request-id", "slack-delivery-1")
-        .header("x-slack-event-type", "url_verification")
         .body(slack_body.as_slice())
         .send()
         .await;
     response.assert_ok();
     let slack: serde_json::Value = response.json();
     assert_eq!(slack["provider"], "slack");
-    assert_eq!(slack["delivery_id"], "slack-delivery-1");
-    assert_eq!(slack["event_type"], "url_verification");
+    assert_eq!(slack["delivery_id"], "Ev-provider-preset");
+    assert_eq!(slack["event_type"], "event_callback");
 
     let generic_body = br#"{"kind":"cms.updated"}"#;
     let response = client
@@ -230,6 +240,77 @@ async fn provider_presets_verify_valid_requests_and_expose_metadata() {
     assert_eq!(generic["event_type"], "cms.updated");
 
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn slack_events_api_json_body_uses_event_id_for_replay_protection() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Slack,
+        "/webhooks/slack",
+        "slack",
+    )]);
+    let now = unix_now();
+    let body = br#"{"type":"event_callback","event":{"type":"app_mention"},"event_id":"Ev123ABC456","event_time":1234567890}"#;
+    let signature = slack_signature(CURRENT_SECRET, now, body);
+
+    let first = client
+        .post("/webhooks/slack")
+        .header("content-type", "application/json")
+        .header("x-slack-request-timestamp", &now.to_string())
+        .header("x-slack-signature", &signature)
+        .body(body.as_slice())
+        .send()
+        .await;
+    first.assert_ok();
+    let json: serde_json::Value = first.json();
+    assert_eq!(json["provider"], "slack");
+    assert_eq!(json["delivery_id"], "Ev123ABC456");
+    assert_eq!(json["event_type"], "event_callback");
+
+    let second = client
+        .post("/webhooks/slack")
+        .header("content-type", "application/json")
+        .header("x-slack-request-timestamp", &now.to_string())
+        .header("x-slack-signature", &signature)
+        .body(body.as_slice())
+        .send()
+        .await;
+    problem_json(&second, 409);
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn slack_url_verification_json_body_uses_challenge_as_replay_id() {
+    let _guard = TEST_LOCK.lock().await;
+    HANDLER_CALLS.store(0, Ordering::SeqCst);
+    let client = client(vec![endpoint(
+        WebhookProvider::Slack,
+        "/webhooks/slack",
+        "slack",
+    )]);
+    let now = unix_now();
+    let body =
+        br#"{"token":"deprecated-token","challenge":"challenge-123","type":"url_verification"}"#;
+
+    let response = client
+        .post("/webhooks/slack")
+        .header("content-type", "application/json")
+        .header("x-slack-request-timestamp", &now.to_string())
+        .header(
+            "x-slack-signature",
+            &slack_signature(CURRENT_SECRET, now, body),
+        )
+        .body(body.as_slice())
+        .send()
+        .await;
+    response.assert_ok();
+    let json: serde_json::Value = response.json();
+    assert_eq!(json["provider"], "slack");
+    assert_eq!(json["delivery_id"], "challenge-123");
+    assert_eq!(json["event_type"], "url_verification");
+    assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -307,6 +388,19 @@ async fn rejects_missing_malformed_stale_and_bad_signatures_with_problem_details
         .await;
     problem_json(&stale, 401);
 
+    let future_timestamp = now + 301;
+    let future = client
+        .post("/webhooks/stripe")
+        .header("content-type", "application/json")
+        .header(
+            "stripe-signature",
+            &stripe_signature(CURRENT_SECRET, future_timestamp, body),
+        )
+        .body(body.as_slice())
+        .send()
+        .await;
+    problem_json(&future, 401);
+
     let bad = client
         .post("/webhooks/stripe")
         .header("content-type", "application/json")
@@ -359,6 +453,40 @@ async fn duplicate_delivery_ids_are_rejected_deterministically() {
             .is_some_and(|detail| detail.contains("duplicate"))
     );
     assert_eq!(HANDLER_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn in_memory_replay_store_rejects_duplicates_until_window_expires() {
+    let store = InMemoryWebhookReplayStore::default();
+    let received_at = UNIX_EPOCH + Duration::from_secs(1_000);
+    let window = Duration::from_secs(300);
+
+    assert!(
+        store
+            .check_and_insert("stripe:stripe:evt_replay", received_at, window)
+            .await
+            .expect("in-memory replay store should not fail")
+    );
+    assert!(
+        !store
+            .check_and_insert(
+                "stripe:stripe:evt_replay",
+                received_at + Duration::from_secs(299),
+                window,
+            )
+            .await
+            .expect("in-memory replay store should not fail")
+    );
+    assert!(
+        store
+            .check_and_insert(
+                "stripe:stripe:evt_replay",
+                received_at + Duration::from_secs(301),
+                window,
+            )
+            .await
+            .expect("in-memory replay store should not fail")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

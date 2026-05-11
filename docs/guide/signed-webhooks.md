@@ -42,13 +42,19 @@ Provider presets:
 |----------|-----------------|------------------|-----------|-------------------------|
 | `stripe` | `{timestamp}.{raw_body}` | `Stripe-Signature: t=...,v1=...` | from signature header | JSON `id` and `type` |
 | `github` | raw body | `X-Hub-Signature-256: sha256=...` | none | `X-GitHub-Delivery`, `X-GitHub-Event` |
-| `slack` | `v0:{timestamp}:{raw_body}` | `X-Slack-Signature: v0=...` | `X-Slack-Request-Timestamp` | `X-Slack-Request-Id`, `X-Slack-Event-Type` |
+| `slack` | `v0:{timestamp}:{raw_body}` | `X-Slack-Signature: v0=...` | `X-Slack-Request-Timestamp` | JSON `event_id` and `type`; URL verification falls back to JSON `challenge` |
 | `generic` | raw body | `X-Webhook-Signature: sha256=...` | optional | `X-Webhook-Delivery`, `X-Webhook-Event` |
 
 Secrets can be set directly with `secret = "..."` for local fixtures, but use
 `secret_env` in real deployments. During rotation, move the old value to
 `previous_secrets` or `previous_secret_envs`; new signatures use `secret`, while
 old signatures verify until you remove the previous value.
+
+For Slack Events API callbacks, replay protection uses the `event_id` field in
+the JSON callback body. URL verification requests do not include `event_id`, so
+Autumn uses their `challenge` value as the one-shot replay key. For Slack-style
+sources outside Events API, set `delivery_id_header` and `event_type_header`
+explicitly if those identifiers arrive in headers.
 
 Production config validation fails when a configured endpoint has no secret or
 uses a weak/template value. Apps with no configured signed webhooks are

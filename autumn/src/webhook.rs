@@ -21,6 +21,8 @@ pub use crate::security::config::hmac_sha256_hex;
 const DEFAULT_TIMESTAMP_TOLERANCE_SECS: u64 = 300;
 const DEFAULT_REPLAY_WINDOW_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+const IN_MEMORY_REPLAY_CLEANUP_INTERVAL: usize = 128;
+const IN_MEMORY_REPLAY_CLEANUP_HIGH_WATER: usize = 16 * 1024;
 
 /// Provider preset for signed webhook verification.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
@@ -409,8 +411,6 @@ impl WebhookEndpointConfig {
                 config.signature_header = Some("X-Slack-Signature".to_owned());
                 config.signature_prefix = Some("v0=".to_owned());
                 config.timestamp_header = Some("X-Slack-Request-Timestamp".to_owned());
-                config.delivery_id_header = Some("X-Slack-Request-Id".to_owned());
-                config.event_type_header = Some("X-Slack-Event-Type".to_owned());
             }
             WebhookProvider::Generic => {
                 config.signature_header = Some("X-Webhook-Signature".to_owned());
@@ -684,25 +684,52 @@ impl WebhookReplayStoreError {
 /// multi-replica production fleet should configure the Redis replay backend.
 #[derive(Debug, Default)]
 pub struct InMemoryWebhookReplayStore {
-    seen: Mutex<HashMap<String, SystemTime>>,
+    state: Mutex<InMemoryWebhookReplayState>,
+}
+
+#[derive(Debug, Default)]
+struct InMemoryWebhookReplayState {
+    seen: HashMap<String, SystemTime>,
+    checks_since_cleanup: usize,
 }
 
 impl InMemoryWebhookReplayStore {
     fn check_and_insert_sync(&self, key: &str, received_at: SystemTime, window: Duration) -> bool {
-        let mut seen = self
-            .seen
-            .lock()
-            .expect("webhook replay store lock poisoned");
-        seen.retain(|_, first_seen| {
-            received_at
-                .duration_since(*first_seen)
-                .map_or(true, |age| age <= window)
-        });
-        if seen.contains_key(key) {
-            return false;
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("webhook replay store lock poisoned");
+            state.checks_since_cleanup = state.checks_since_cleanup.saturating_add(1);
+
+            if let Some(expires_at) = state.seen.get(key).copied() {
+                if expires_at.duration_since(received_at).is_ok() {
+                    Self::cleanup_if_due(&mut state, received_at);
+                    drop(state);
+                    return false;
+                }
+                state.seen.remove(key);
+            }
+
+            let expires_at = received_at.checked_add(window).unwrap_or(received_at);
+            state.seen.insert(key.to_owned(), expires_at);
+            Self::cleanup_if_due(&mut state, received_at);
+            drop(state);
         }
-        seen.insert(key.to_owned(), received_at);
         true
+    }
+
+    fn cleanup_if_due(state: &mut InMemoryWebhookReplayState, received_at: SystemTime) {
+        if state.checks_since_cleanup < IN_MEMORY_REPLAY_CLEANUP_INTERVAL
+            && state.seen.len() <= IN_MEMORY_REPLAY_CLEANUP_HIGH_WATER
+        {
+            return;
+        }
+
+        state.checks_since_cleanup = 0;
+        state
+            .seen
+            .retain(|_, expires_at| expires_at.duration_since(received_at).is_ok());
     }
 }
 
@@ -933,7 +960,8 @@ async fn verify_request(
         WebhookProvider::Slack => verify_slack(endpoint, headers, &body, received_at)?,
     }
 
-    let delivery_id = resolve_delivery_id(&endpoint.config, headers, &body);
+    let json_body = serde_json::from_slice::<serde_json::Value>(&body).ok();
+    let delivery_id = resolve_delivery_id(&endpoint.config, headers, json_body.as_ref());
     if endpoint.config.replay_protection {
         let delivery_id = delivery_id
             .as_deref()
@@ -958,7 +986,7 @@ async fn verify_request(
         provider: endpoint.config.provider,
         endpoint: endpoint.config.name.clone(),
         delivery_id,
-        event_type: resolve_event_type(&endpoint.config, headers, &body),
+        event_type: resolve_event_type(&endpoint.config, headers, json_body.as_ref()),
         received_at,
         raw_body: body,
     })
@@ -978,7 +1006,9 @@ fn verify_stripe(
         endpoint.config.timestamp_tolerance_secs,
     )?;
 
-    let mut signed_payload = timestamp.to_string().into_bytes();
+    let timestamp = timestamp.to_string();
+    let mut signed_payload = Vec::with_capacity(timestamp.len() + 1 + body.len());
+    signed_payload.extend_from_slice(timestamp.as_bytes());
     signed_payload.push(b'.');
     signed_payload.extend_from_slice(body);
 
@@ -1012,7 +1042,11 @@ fn verify_slack(
         endpoint.config.timestamp_tolerance_secs,
     )?;
 
-    let mut signed_payload = format!("v0:{timestamp}:").into_bytes();
+    let timestamp = timestamp.to_string();
+    let mut signed_payload = Vec::with_capacity(3 + timestamp.len() + 1 + body.len());
+    signed_payload.extend_from_slice(b"v0:");
+    signed_payload.extend_from_slice(timestamp.as_bytes());
+    signed_payload.push(b':');
     signed_payload.extend_from_slice(body);
     verify_body_hmac(
         endpoint,
@@ -1115,7 +1149,7 @@ fn verify_timestamp(
             .as_secs(),
     )
     .map_err(|_| WebhookVerifyError::MalformedTimestamp)?;
-    let skew = now.saturating_sub(timestamp).unsigned_abs();
+    let skew = now.abs_diff(timestamp);
     if skew > tolerance_secs {
         return Err(WebhookVerifyError::StaleTimestamp);
     }
@@ -1125,26 +1159,32 @@ fn verify_timestamp(
 fn resolve_delivery_id(
     config: &WebhookEndpointConfig,
     headers: &HeaderMap,
-    body: &[u8],
+    json_body: Option<&serde_json::Value>,
 ) -> Option<String> {
-    config
+    let header = config
         .delivery_id_header
         .as_deref()
-        .and_then(|header| optional_header(headers, header))
-        .or_else(|| json_string_field(body, "id"))
+        .and_then(|header| optional_header(headers, header));
+
+    match config.provider {
+        WebhookProvider::Slack => header
+            .or_else(|| slack_delivery_id(json_body))
+            .or_else(|| json_string_field(json_body, "id")),
+        _ => header.or_else(|| json_string_field(json_body, "id")),
+    }
 }
 
 fn resolve_event_type(
     config: &WebhookEndpointConfig,
     headers: &HeaderMap,
-    body: &[u8],
+    json_body: Option<&serde_json::Value>,
 ) -> Option<String> {
     config
         .event_type_header
         .as_deref()
         .and_then(|header| optional_header(headers, header))
-        .or_else(|| json_string_field(body, "type"))
-        .or_else(|| nested_json_string_field(body, "event", "type"))
+        .or_else(|| json_string_field(json_body, "type"))
+        .or_else(|| nested_json_string_field(json_body, "event", "type"))
 }
 
 fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -1155,16 +1195,34 @@ fn optional_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn json_string_field(body: &[u8], field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+fn slack_delivery_id(json_body: Option<&serde_json::Value>) -> Option<String> {
+    json_string_field(json_body, "event_id").or_else(|| {
+        let value = json_body?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("url_verification") {
+            value
+                .get("challenge")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        }
+    })
+}
+
+fn json_string_field(value: Option<&serde_json::Value>, field: &str) -> Option<String> {
+    let value = value?;
     value
         .get(field)
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
 
-fn nested_json_string_field(body: &[u8], parent: &str, field: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+fn nested_json_string_field(
+    value: Option<&serde_json::Value>,
+    parent: &str,
+    field: &str,
+) -> Option<String> {
+    let value = value?;
     value
         .get(parent)
         .and_then(|parent_value| parent_value.get(field))

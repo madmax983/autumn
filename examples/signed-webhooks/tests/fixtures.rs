@@ -13,7 +13,9 @@ fn unix_now() -> i64 {
 }
 
 fn stripe_signature(secret: &str, timestamp: i64, body: &[u8]) -> String {
-    let mut signed_payload = timestamp.to_string().into_bytes();
+    let timestamp = timestamp.to_string();
+    let mut signed_payload = Vec::with_capacity(timestamp.len() + 1 + body.len());
+    signed_payload.extend_from_slice(timestamp.as_bytes());
     signed_payload.push(b'.');
     signed_payload.extend_from_slice(body);
     let signature = hmac_sha256_hex(secret.as_bytes(), &signed_payload);
@@ -29,6 +31,20 @@ fn problem_json(response: &TestResponse, status: u16) -> serde_json::Value {
     response.assert_header_contains("content-type", "application/problem+json");
     let json: serde_json::Value = response.json();
     assert_eq!(json["status"], status);
+    assert!(
+        json["detail"]
+            .as_str()
+            .is_some_and(|detail| !detail.is_empty()),
+        "Problem+JSON response should include a detail message"
+    );
+    assert!(
+        json["instance"].as_str().is_some(),
+        "Problem+JSON response should include an instance path"
+    );
+    assert!(
+        json["request_id"].as_str().is_some(),
+        "Problem+JSON response should include a request_id"
+    );
     json
 }
 
