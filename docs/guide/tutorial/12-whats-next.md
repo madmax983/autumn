@@ -3,8 +3,8 @@
 **Goal:** By the end of this chapter, you will have a complete, working todo
 application and a clear picture of where to go from here.
 
-This tutorial tracks the published Autumn 0.3.x line and Rust 1.88.0+ as of
-2026-05-10. If you are following `trunk` from a checkout, confirm the
+This tutorial tracks the published Autumn 0.4.x line and Rust 1.88.0+ as of
+2026-05-11. If you are following `trunk` from a checkout, confirm the
 workspace version before copying dependency snippets.
 
 ---

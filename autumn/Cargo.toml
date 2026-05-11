@@ -55,7 +55,7 @@ seed = ["db"]
 system-info = []
 
 [dependencies]
-autumn-macros = { version = "0.3.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"

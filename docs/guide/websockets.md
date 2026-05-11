@@ -32,7 +32,7 @@ async fn main() {
 Enable the feature in your `Cargo.toml`:
 
 ```toml
-autumn-web = { version = "0.3", features = ["ws"] }
+autumn-web = { version = "0.4", features = ["ws"] }
 ```
 
 ## The two-function pattern
