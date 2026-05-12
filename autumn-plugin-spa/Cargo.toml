@@ -1,6 +1,6 @@
 [package]
-name = "autumn-plugin-sppl"
-description = "SPPL static asset serving plugin for autumn-web applications"
+name = "autumn-plugin-spa"
+description = "Embed and serve a pre-built SPA (Vite, SvelteKit, Astro, …) from an autumn-web application"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -8,13 +8,14 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/madmax983/autumn"
 readme = "README.md"
-keywords = ["web", "svelte", "sveltekit", "spa", "axum"]
+keywords = ["web", "spa", "static", "axum", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [dependencies]
 autumn-web = { version = "0.4.0", path = "../autumn" }
-sppl = { git = "https://github.com/neutral-engineering/sppl", default-features = false }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
+flate2 = "1"
 axum = { workspace = true }
 http = { workspace = true }
 tracing = { workspace = true }
