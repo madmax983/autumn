@@ -306,6 +306,8 @@ fn generate_scaffold_full_e2e_post() {
             "published:bool",
             "subtitle:Option<String>",
             "views:Option<i64>",
+            "published_at:Option<NaiveDateTime>",
+            "token:Option<Uuid>",
         ],
     );
 
@@ -680,6 +682,8 @@ fn generated_scaffold_cargo_checks() {
             "published:bool",
             "subtitle:Option<String>",
             "views:Option<i64>",
+            "published_at:Option<NaiveDateTime>",
+            "token:Option<Uuid>",
         ],
     );
 
@@ -692,6 +696,8 @@ fn generated_scaffold_cargo_checks() {
         "maud",
         "serde",
         "serde_json",
+        "serde_urlencoded",
+        "url",
     ] {
         assert!(
             cargo_toml_after.contains(&format!("{dep} =")),
