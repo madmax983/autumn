@@ -554,7 +554,14 @@ impl RequestBuilder {
 
         let request = builder.body(self.body).expect("failed to build request");
 
-        let response = self.router.oneshot(request).await.expect("request failed");
+        // Wrap the router with MethodOverrideLayer the same way the production
+        // serve site does, so a POST with a `_method=DELETE` form field reaches
+        // the declared DELETE handler in tests too. The layer is a no-op for
+        // non-POST methods and non-form bodies, so it's safe to apply
+        // unconditionally.
+        let service =
+            tower::Layer::layer(&crate::middleware::MethodOverrideLayer::new(), self.router);
+        let response = service.oneshot(request).await.expect("request failed");
 
         let status = response.status();
         let headers: Vec<(String, String)> = response
@@ -1047,5 +1054,54 @@ mod tests {
     #[tokio::test]
     async fn test_client_default() {
         let _app = TestApp::default();
+    }
+
+    /// End-to-end acceptance for issue #605: a plain `<form method="post">`
+    /// carrying `_method=DELETE` reaches the declared DELETE handler when
+    /// dispatched through the same router/middleware stack the production
+    /// app builder uses.
+    #[tokio::test]
+    async fn test_app_routes_html_method_override_to_delete() {
+        use axum::routing;
+        async fn deleted() -> &'static str {
+            "deleted"
+        }
+        let routes = vec![Route {
+            method: Method::DELETE,
+            path: "/items/{id}",
+            handler: routing::delete(deleted),
+            name: "items_delete",
+            api_doc: crate::openapi::ApiDoc {
+                method: "DELETE",
+                path: "/items/{id}",
+                operation_id: "items_delete",
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+        }];
+        let client = TestApp::new().routes(routes).build();
+
+        client
+            .post("/items/1")
+            .form("_method=DELETE")
+            .send()
+            .await
+            .assert_ok()
+            .assert_body_eq("deleted");
+    }
+
+    /// Companion to the override test: an invalid `_method` value rejects
+    /// with `400 Bad Request` before reaching any handler.
+    #[tokio::test]
+    async fn test_app_routes_invalid_method_override_rejected() {
+        let client = TestApp::new().routes(test_routes()).build();
+
+        client
+            .post("/create")
+            .form("_method=BREW")
+            .send()
+            .await
+            .assert_status(400);
     }
 }
