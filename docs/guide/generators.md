@@ -179,6 +179,45 @@ Everything `model` produces, plus:
   API routes (`GET /api/<plural>` and `GET /api/<plural>/{id}`) by default;
   mount `POST`/`PUT`/`DELETE` handlers only after adding a repository policy.
 
+### No-JavaScript edit and delete flows
+
+The scaffolded HTML routes accept ordinary browser form submissions
+because Autumn's [method-override middleware](./middleware.md) rewrites
+a `POST` carrying `_method=PUT|PATCH|DELETE` into the declared method
+**before route matching**. That means you can keep your generated
+handlers as `#[put]` / `#[delete]` and still serve clients with
+JavaScript disabled — no parallel POST-only routes required.
+
+Use [`autumn_web::form::method_input`](../../autumn/src/form.rs)
+(or `ChangesetForm::form_tag` with `"delete"` / `"put"` /
+`"patch"`) inside generated edit views and any custom edit/delete
+buttons you add later:
+
+```rust,ignore
+use autumn_web::form::method_input;
+use autumn_web::security::CsrfToken;
+
+#[get("/bookmarks/{id}/edit")]
+async fn edit_form(id: Path<i64>, csrf: Option<CsrfToken>) -> Markup {
+    html! {
+        // Delete button as a plain HTML form — works without htmx.
+        form method="post" action=(format!("/bookmarks/{}", *id)) {
+            (method_input("DELETE"))
+            @if let Some(token) = csrf.as_ref() {
+                input type="hidden" name="_csrf" value=(token.token());
+            }
+            button type="submit" { "Delete" }
+        }
+    }
+}
+```
+
+`autumn routes` and `/actuator/routes` keep reporting the declared
+method (`PUT`, `PATCH`, or `DELETE`); the rewrite is a transport
+concession, not a routing one. CSRF protection still treats the
+overridden mutation as unsafe and rejects submissions without a valid
+token with `403 Forbidden`.
+
 Metadata flags let you keep common model and repository polish in the
 generation step:
 
