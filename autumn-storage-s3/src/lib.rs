@@ -74,10 +74,6 @@ pub enum S3BlobStoreError {
 struct S3Options {
     provider_id: String,
     bucket: String,
-    /// When set, the scheme+authority of SDK-generated presigned URLs is
-    /// replaced with this base so end-users receive public-facing links even
-    /// when the S3 API endpoint is private/internal.
-    public_base_url: Option<String>,
 }
 
 /// S3-compatible [`BlobStore`] backed by
@@ -88,6 +84,7 @@ struct S3Options {
 #[derive(Debug, Clone)]
 pub struct S3BlobStore {
     client: Client,
+    presign_client: Client,
     options: Arc<S3Options>,
 }
 
@@ -129,7 +126,8 @@ impl S3BlobStore {
             return Err(S3BlobStoreError::PartialCredentialConfig);
         }
 
-        let client = if let (Some(key_env), Some(secret_env)) =
+        let presign_endpoint = cfg.public_base_url.as_deref().or(cfg.endpoint.as_deref());
+        let (client, presign_client) = if let (Some(key_env), Some(secret_env)) =
             (&cfg.access_key_id_env, &cfg.secret_access_key_env)
         {
             let key =
@@ -144,13 +142,23 @@ impl S3BlobStore {
             let creds = Credentials::new(key, secret, None, None, "autumn-storage-s3");
             let mut builder = aws_sdk_s3::Config::builder()
                 .behavior_version(BehaviorVersion::latest())
-                .region(Region::new(region))
-                .credentials_provider(creds)
+                .region(Region::new(region.clone()))
+                .credentials_provider(creds.clone())
                 .force_path_style(cfg.force_path_style);
             if let Some(endpoint) = &cfg.endpoint {
                 builder = builder.endpoint_url(endpoint);
             }
-            Client::from_conf(builder.build())
+            let client = Client::from_conf(builder.build());
+
+            let mut presign_builder = aws_sdk_s3::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new(region))
+                .credentials_provider(creds)
+                .force_path_style(cfg.force_path_style);
+            if let Some(endpoint) = presign_endpoint {
+                presign_builder = presign_builder.endpoint_url(endpoint);
+            }
+            (client, Client::from_conf(presign_builder.build()))
         } else {
             let shared = aws_config::defaults(BehaviorVersion::latest())
                 .region(Region::new(region))
@@ -161,15 +169,22 @@ impl S3BlobStore {
             if let Some(endpoint) = &cfg.endpoint {
                 builder = builder.endpoint_url(endpoint);
             }
-            Client::from_conf(builder.build())
+            let client = Client::from_conf(builder.build());
+
+            let mut presign_builder =
+                aws_sdk_s3::config::Builder::from(&shared).force_path_style(cfg.force_path_style);
+            if let Some(endpoint) = presign_endpoint {
+                presign_builder = presign_builder.endpoint_url(endpoint);
+            }
+            (client, Client::from_conf(presign_builder.build()))
         };
 
         Ok(Self {
             client,
+            presign_client,
             options: Arc::new(S3Options {
                 provider_id: "s3".to_owned(),
                 bucket,
-                public_base_url: cfg.public_base_url.clone(),
             }),
         })
     }
@@ -475,50 +490,22 @@ impl BlobStore for S3BlobStore {
             let presigning = PresigningConfig::expires_in(expires_in)
                 .map_err(|e| BlobStoreError::backend(e.to_string()))?;
             let req = self
-                .client
+                .presign_client
                 .get_object()
                 .bucket(&self.options.bucket)
                 .key(key)
                 .presigned(presigning)
                 .await
                 .map_err(|e| BlobStoreError::backend(e.to_string()))?;
-            let uri = req.uri().to_string();
-            if let Some(ref base) = self.options.public_base_url {
-                Ok(rewrite_url_authority(&uri, base))
-            } else {
-                Ok(uri)
-            }
+            Ok(req.uri().to_string())
         })
     }
-}
-
-/// Replace the scheme+authority of `url` with `public_base`, keeping the
-/// path and query string intact.
-///
-/// ```text
-/// rewrite_url_authority(
-///     "https://internal:9000/bucket/key?sig=...",
-///     "https://cdn.example.com",
-/// ) == "https://cdn.example.com/bucket/key?sig=..."
-/// ```
-fn rewrite_url_authority(url: &str, public_base: &str) -> String {
-    // Find the first '/' that begins the path, i.e. the one after the
-    // scheme+authority (`https://host:port/…`). If there is no `://`, treat
-    // the whole input as a path and just prepend the base.
-    let path_start = url
-        .find("://")
-        .and_then(|scheme_end| url[scheme_end + 3..].find('/').map(|i| scheme_end + 3 + i))
-        .unwrap_or(0);
-    format!(
-        "{}{}",
-        public_base.trim_end_matches('/'),
-        &url[path_start..]
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     fn s3_config(bucket: Option<&str>, region: Option<&str>) -> StorageS3Config {
         StorageS3Config {
@@ -526,6 +513,67 @@ mod tests {
             region: region.map(str::to_owned),
             ..StorageS3Config::default()
         }
+    }
+
+    fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+        let query = url.split_once('?')?.1;
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == name).then_some(value)
+        })
+    }
+
+    fn authority(url: &str) -> Option<&str> {
+        let rest = url.split_once("://")?.1;
+        Some(rest.split('/').next().unwrap_or(rest))
+    }
+
+    fn parse_amz_date(value: &str) -> SystemTime {
+        assert_eq!(value.len(), 16, "unexpected X-Amz-Date format");
+        assert_eq!(&value[8..9], "T", "unexpected X-Amz-Date format");
+        assert_eq!(&value[15..16], "Z", "unexpected X-Amz-Date format");
+        let year = value[0..4].parse::<i32>().expect("year");
+        let month = value[4..6].parse::<u32>().expect("month");
+        let day = value[6..8].parse::<u32>().expect("day");
+        let hour = value[9..11].parse::<u64>().expect("hour");
+        let minute = value[11..13].parse::<u64>().expect("minute");
+        let second = value[13..15].parse::<u64>().expect("second");
+
+        let days = days_since_unix_epoch(year, month, day);
+        assert!(days >= 0, "X-Amz-Date before unix epoch");
+        let days = u64::try_from(days).expect("nonnegative day count");
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    }
+
+    fn days_since_unix_epoch(year: i32, month: u32, day: u32) -> i64 {
+        let year = year - i32::from(month <= 2);
+        let era = if year >= 0 { year } else { year - 399 } / 400;
+        let year_of_era = year - era * 400;
+        let month = i32::try_from(month).expect("month fits i32");
+        let day = i32::try_from(day).expect("day fits i32");
+        let month_prime = month + if month > 2 { -3 } else { 9 };
+        let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        i64::from(era) * 146_097 + i64::from(day_of_era) - 719_468
+    }
+
+    fn test_client(endpoint: &str) -> Client {
+        Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new("us-east-1"))
+                .credentials_provider(Credentials::new(
+                    "AKIAIOSFODNN7EXAMPLE",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    None,
+                    None,
+                    "test",
+                ))
+                .force_path_style(true)
+                .endpoint_url(endpoint)
+                .build(),
+        )
     }
 
     #[tokio::test]
@@ -674,35 +722,58 @@ mod tests {
         .await;
     }
 
-    #[test]
-    fn rewrite_url_authority_replaces_host() {
-        assert_eq!(
-            rewrite_url_authority(
-                "https://internal:9000/bucket/avatars/42.bin?X-Amz-Algo=foo&sig=bar",
-                "https://cdn.example.com",
-            ),
-            "https://cdn.example.com/bucket/avatars/42.bin?X-Amz-Algo=foo&sig=bar"
-        );
-    }
+    #[tokio::test]
+    async fn public_base_url_is_used_for_presigning_host() {
+        let cfg = StorageS3Config {
+            bucket: Some("test-bucket".into()),
+            region: Some("us-east-1".into()),
+            endpoint: Some("https://internal.example.local".into()),
+            public_base_url: Some("https://public.example.com".into()),
+            force_path_style: true,
+            access_key_id_env: Some("__AUTUMN_S3_PRESIGN_KEY__".into()),
+            secret_access_key_env: Some("__AUTUMN_S3_PRESIGN_SECRET__".into()),
+            ..StorageS3Config::default()
+        };
 
-    #[test]
-    fn rewrite_url_authority_strips_trailing_slash_from_base() {
-        assert_eq!(
-            rewrite_url_authority(
-                "https://internal/bucket/key?sig=x",
-                "https://public.example.com/",
-            ),
-            "https://public.example.com/bucket/key?sig=x"
-        );
-    }
+        Box::pin(temp_env::async_with_vars(
+            [
+                ("__AUTUMN_S3_PRESIGN_KEY__", Some("AKIAIOSFODNN7EXAMPLE")),
+                (
+                    "__AUTUMN_S3_PRESIGN_SECRET__",
+                    Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+                ),
+            ],
+            async {
+                let store = S3BlobStore::from_config(&cfg).await.expect("build store");
+                let actual = store
+                    .presigned_url("avatars/42.bin", Duration::from_secs(900))
+                    .await
+                    .expect("presign URL");
 
-    #[test]
-    fn rewrite_url_authority_no_op_without_scheme() {
-        let url = "/bucket/key?sig=x";
-        assert_eq!(
-            rewrite_url_authority(url, "https://cdn.example.com"),
-            "https://cdn.example.com/bucket/key?sig=x"
-        );
+                let amz_date = query_param(&actual, "X-Amz-Date").expect("X-Amz-Date");
+                let expected_presigning = PresigningConfig::builder()
+                    .start_time(parse_amz_date(amz_date))
+                    .expires_in(Duration::from_secs(900))
+                    .build()
+                    .expect("fixed presigning config");
+                let expected = test_client("https://public.example.com")
+                    .get_object()
+                    .bucket("test-bucket")
+                    .key("avatars/42.bin")
+                    .presigned(expected_presigning)
+                    .await
+                    .expect("expected presigned URL")
+                    .uri()
+                    .to_string();
+
+                assert_eq!(authority(&actual), Some("public.example.com"));
+                assert_eq!(
+                    query_param(&actual, "X-Amz-Signature"),
+                    query_param(&expected, "X-Amz-Signature")
+                );
+            },
+        ))
+        .await;
     }
 
     #[test]

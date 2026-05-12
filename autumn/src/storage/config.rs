@@ -140,9 +140,11 @@ pub struct StorageS3Config {
     #[serde(default)]
     pub endpoint: Option<String>,
 
-    /// Public base URL used as the prefix for
-    /// [`presigned_url`](super::BlobStore::presigned_url). Defaults to
-    /// the configured `endpoint` when set, otherwise the SDK default.
+    /// Public endpoint used when signing
+    /// [`presigned_url`](super::BlobStore::presigned_url) links. Because
+    /// `SigV4` signs the `Host` value, this is configured before presigning
+    /// instead of rewriting generated URLs afterward. Defaults to the
+    /// configured `endpoint` when set, otherwise the SDK default.
     #[serde(default)]
     pub public_base_url: Option<String>,
 
