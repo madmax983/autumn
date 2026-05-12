@@ -122,8 +122,8 @@ pub fn plan_model_with_options(
     );
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
-    // for `diesel`, `serde`, `serde_json`, and `chrono`, none of which are in the
-    // freshly-`autumn new`-ed project.
+    // for `diesel`, `serde`, `serde_json`, `chrono`, and supported field crates
+    // such as `uuid`, none of which are in the freshly-`autumn new`-ed project.
     let mut deps: Vec<(&str, &str)> = MODEL_DEPS.to_vec();
     if metadata.has_validator_rules() {
         deps.push((
@@ -141,7 +141,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
     (
         "diesel",
-        "{ version = \"2\", features = [\"postgres\", \"chrono\"] }",
+        "{ version = \"2\", features = [\"postgres\", \"chrono\", \"uuid\"] }",
     ),
     (
         "diesel-async",
@@ -154,6 +154,7 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
     ("diesel_migrations", "\"2\""),
     ("serde", "{ version = \"1\", features = [\"derive\"] }"),
     ("serde_json", "\"1\""),
+    ("uuid", "{ version = \"1\", features = [\"serde\"] }"),
 ];
 
 /// Append a `Modify` action to `plan` that ensures every `(crate, version_spec)`
@@ -1074,5 +1075,37 @@ autumn-web = \"0.3\"\n";
                 "missing '{dep}' in Cargo.toml after `generate model`:\n{cargo_toml}"
             );
         }
+    }
+
+    #[test]
+    fn execute_adds_uuid_dependencies_for_uuid_fields() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nedition = \"2024\"\n\n\
+[dependencies]\nautumn-web = \"0.3\"\n",
+        )
+        .unwrap();
+
+        let plan = plan_model(
+            tmp.path(),
+            "ApiToken",
+            &["token:Uuid".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let cargo_toml = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo_toml.contains("uuid = { version = \"1\", features = [\"serde\"] }"),
+            "uuid::Uuid fields need a direct uuid dependency with serde support:\n{cargo_toml}"
+        );
+        assert!(
+            cargo_toml.contains(
+                "diesel = { version = \"2\", features = [\"postgres\", \"chrono\", \"uuid\"] }"
+            ),
+            "Diesel schema Uuid fields need diesel's uuid feature:\n{cargo_toml}"
+        );
     }
 }
