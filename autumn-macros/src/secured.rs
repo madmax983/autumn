@@ -49,24 +49,15 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Build the roles slice expression
-    let check_call = if roles.is_empty() {
-        quote! {
-            ::autumn_web::auth::__check_secured_with_key(
-                &__autumn_session,
-                __autumn_state.auth_session_key(),
-                &[],
-            ).await?;
-        }
-    } else {
-        let role_literals = roles.iter().map(|r| quote! { #r });
-        quote! {
-            ::autumn_web::auth::__check_secured_with_key(
-                &__autumn_session,
-                __autumn_state.auth_session_key(),
-                &[#(#role_literals),*],
-            ).await?;
-        }
+    let role_literals = roles.iter().map(|role| quote! { #role });
+    let check_call = quote! {
+        // Route macros read this marker when #[secured] expands before #[get]/#[post]/etc.
+        const __AUTUMN_SECURED_ROLES: &[&str] = &[#(#role_literals),*];
+        ::autumn_web::auth::__check_secured_with_key(
+            &__autumn_session,
+            __autumn_state.auth_session_key(),
+            __AUTUMN_SECURED_ROLES,
+        ).await?;
     };
 
     // Inject hidden State<AppState> and Session parameters at the start of
