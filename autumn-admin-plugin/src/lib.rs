@@ -195,6 +195,11 @@ impl Plugin for AdminPlugin {
 pub(crate) fn admin_route_infos(prefix: &str) -> Vec<RouteInfo> {
     [
         ("GET", prefix.to_string()),
+        ("GET", format!("{prefix}/jobs")),
+        ("GET", format!("{prefix}/jobs/counters")),
+        ("POST", format!("{prefix}/jobs/{{id}}/retry")),
+        ("POST", format!("{prefix}/jobs/{{id}}/discard")),
+        ("POST", format!("{prefix}/jobs/{{id}}/cancel")),
         ("GET", format!("{prefix}/{{slug}}")),
         ("POST", format!("{prefix}/{{slug}}")),
         ("GET", format!("{prefix}/{{slug}}/new")),
@@ -270,6 +275,28 @@ mod conformance_tests {
             result.message,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn admin_plugin_declares_builtin_job_routes() {
+        let routes = admin_routes("/admin");
+        let declared: std::collections::HashSet<(&str, &str)> = routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect();
+
+        for (method, path) in [
+            ("GET", "/admin/jobs"),
+            ("GET", "/admin/jobs/counters"),
+            ("POST", "/admin/jobs/{id}/retry"),
+            ("POST", "/admin/jobs/{id}/discard"),
+            ("POST", "/admin/jobs/{id}/cancel"),
+        ] {
+            assert!(
+                declared.contains(&(method, path)),
+                "missing declared admin job route {method} {path}"
+            );
+        }
     }
 
     #[test]
