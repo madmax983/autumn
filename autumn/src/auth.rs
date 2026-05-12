@@ -1276,9 +1276,11 @@ fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, O
 
 /// Embedded Diesel migrations for the `api_tokens` table.
 ///
-/// Include this in your application's `.migrations()` call so that the
-/// `api_tokens` table is created and kept up-to-date alongside your own
-/// migrations:
+/// Include this in your application's `.migrations()` call so that dev/test
+/// startup migration checks can create and validate the `api_tokens` table
+/// alongside your own migrations. In production, `autumn migrate` applies the
+/// matching framework migration before token commands or `DbApiTokenStore`
+/// need the table:
 ///
 /// ```rust,ignore
 /// use autumn_web::auth::API_TOKEN_MIGRATIONS;
@@ -1334,8 +1336,10 @@ mod db_store {
     ///
     /// # Setup
     ///
-    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so the
-    /// `api_tokens` table is created automatically:
+    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so dev/test
+    /// startup migration checks can create and validate the `api_tokens`
+    /// table automatically. In production, run `autumn migrate`; the CLI
+    /// applies the matching framework migration explicitly.
     ///
     /// ```rust,ignore
     /// use autumn_web::auth::{API_TOKEN_MIGRATIONS, DbApiTokenStore};

@@ -1,9 +1,2 @@
-CREATE TABLE api_tokens (
-    id BIGSERIAL PRIMARY KEY,
-    token_hash TEXT NOT NULL UNIQUE,
-    principal_id TEXT NOT NULL,
-    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-    revoked_at TIMESTAMP
-);
-
-CREATE INDEX idx_api_tokens_hash ON api_tokens (token_hash);
+-- Compatibility shim for old runtime-embedded API token migration paths.
+-- The real api_tokens schema migration is 20260512000000_create_api_tokens.

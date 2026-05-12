@@ -1,1 +1,1 @@
-DROP TABLE IF EXISTS api_tokens;
+-- No-op compatibility shim; see up.sql.

@@ -170,8 +170,9 @@ enum Commands {
 
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
-    /// Requires the `api_tokens` table to exist (run `autumn migrate` first,
-    /// with `API_TOKEN_MIGRATIONS` included in your app's migration set).
+    /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
+    /// it applies both your app migrations and Autumn's framework migration
+    /// for the token table.
     /// The database URL is read from `autumn.toml` or the `DATABASE_URL` /
     /// `AUTUMN_DATABASE__URL` environment variables.
     ///
