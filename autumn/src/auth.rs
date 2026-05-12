@@ -1170,12 +1170,19 @@ where
                 return Ok(api_token_unauthorized_response(request_id, instance));
             };
 
-            if let Ok(Some(principal_id)) = store.verify(&raw_token).await {
-                req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
-                inner.call(req).await
-            } else {
-                let (request_id, instance) = api_token_problem_context(&req);
-                Ok(api_token_unauthorized_response(request_id, instance))
+            match store.verify(&raw_token).await {
+                Ok(Some(principal_id)) => {
+                    req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
+                    inner.call(req).await
+                }
+                Ok(None) => {
+                    let (request_id, instance) = api_token_problem_context(&req);
+                    Ok(api_token_unauthorized_response(request_id, instance))
+                }
+                Err(err) => {
+                    let (request_id, instance) = api_token_problem_context(&req);
+                    Ok(api_token_error_response(&err, request_id, instance))
+                }
             }
         })
     }
@@ -1200,6 +1207,39 @@ fn api_token_unauthorized_response<ResBody: From<String> + Default>(
         .header(http::header::CONTENT_TYPE, "application/problem+json")
         .body(ResBody::from(body))
         .unwrap_or_default()
+}
+
+/// Build a Problem Details response from the API token store error.
+fn api_token_error_response<ResBody: From<String> + Default>(
+    err: &crate::AutumnError,
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let status = err.status();
+    let message = err.to_string();
+    let body = crate::error::problem_details_json_string(
+        status,
+        message.clone(),
+        None,
+        None,
+        request_id,
+        instance,
+        true,
+    );
+    let mut response = Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
+        .unwrap_or_default();
+    response
+        .extensions_mut()
+        .insert(crate::middleware::AutumnErrorInfo {
+            status,
+            message,
+            details: None,
+            problem_type: None,
+        });
+    response
 }
 
 fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, Option<String>) {
@@ -2383,6 +2423,48 @@ mod api_token_tests {
         issue_api_token, revoke_api_token,
     };
 
+    struct FailingApiTokenStore;
+
+    impl ApiTokenStore for FailingApiTokenStore {
+        fn issue<'a>(
+            &'a self,
+            _principal_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<String>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+
+        fn verify<'a>(
+            &'a self,
+            _raw_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            _raw_token: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+    }
+
     // ── hash_api_token ───────────────────────────────────────────────────────
 
     #[test]
@@ -2547,6 +2629,45 @@ mod api_token_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_propagates_store_verify_errors() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(FailingApiTokenStore);
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, "Bearer valid_client_token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .map(|value| value.to_str().unwrap_or_default()),
+            Some("application/problem+json")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], 503);
+        assert_eq!(json["code"], "autumn.service_unavailable");
+        assert_eq!(json["detail"], "api token store unavailable");
     }
 
     #[tokio::test]
