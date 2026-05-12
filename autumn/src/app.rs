@@ -1667,103 +1667,16 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and initialize pre-serve runtime dependencies. Once those
-        // are ready, start listening before startup hooks finish so `/startup`
-        // can honestly report startup progress.
-        let addr = format!("{}:{}", config.server.host, config.server.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(addr = %addr, "Failed to bind: {e}");
-                std::process::exit(1);
-            });
-
-        let shutdown_timeout = config.server.shutdown_timeout_secs;
-        let server_shutdown = tokio_util::sync::CancellationToken::new();
-
-        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
-            tracing::error!(error = %error, "job runtime initialization failed");
-            std::process::exit(1);
-        }
-
-        tracing::info!(addr = %addr, "Listening");
-
-        let server_shutdown_wait = server_shutdown.clone();
-        let server_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async move {
-                server_shutdown_wait.cancelled().await;
-            })
-            .await
-        });
-
-        let shutdown_state = state.clone();
-        let shutdown_signal_token = server_shutdown.clone();
-        #[cfg(feature = "ws")]
-        let websocket_shutdown = state.shutdown.clone();
-
-        let shutdown_task = tokio::spawn(async move {
-            shutdown_signal().await;
-            shutdown_state.begin_shutdown();
-
-            #[cfg(feature = "ws")]
-            websocket_shutdown.cancel();
-
-            if shutdown_timeout > 5 {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        shutdown_timeout.saturating_sub(5),
-                    ))
-                    .await;
-                    tracing::warn!(
-                        timeout_secs = shutdown_timeout,
-                        "Shutdown draining near timeout, force-kill may be imminent"
-                    );
-                });
-            }
-
-            run_shutdown_hooks(&shutdown_hooks).await;
-            shutdown_signal_token.cancel();
-        });
-
-        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
-            tracing::error!(error = %error, "startup hook failed");
-            server_shutdown.cancel();
-            server_task.abort();
-            std::process::exit(1);
-        }
-
-        if !state.probes().is_shutting_down() {
-            if !tasks.is_empty()
-                && let Err(error) = start_task_scheduler_with_config(
-                    tasks,
-                    &state,
-                    &server_shutdown,
-                    &config.scheduler,
-                )
-            {
-                tracing::error!(error = %error, "scheduled task runtime initialization failed");
-                server_shutdown.cancel();
-                server_task.abort();
-                std::process::exit(1);
-            }
-            state.probes().mark_startup_complete();
-        }
-
-        let server_result = server_task.await.unwrap_or_else(|e| {
-            tracing::error!("Server task join error: {e}");
-            std::process::exit(1);
-        });
-        shutdown_task.abort();
-        server_result.unwrap_or_else(|e| {
-            tracing::error!("Server error: {e}");
-            std::process::exit(1);
-        });
-
-        tracing::info!("Server shut down cleanly");
+        run_server_with_graceful_shutdown(
+            router,
+            state,
+            config,
+            tasks,
+            jobs,
+            startup_hooks,
+            shutdown_hooks,
+        )
+        .await;
     }
 
     /// Render all registered static routes to `dist/` and exit.
@@ -6946,4 +6859,109 @@ mod tests {
             "second route should be re-attributed to outer plugin after nested build"
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_server_with_graceful_shutdown(
+    router: axum::Router,
+    state: crate::state::AppState,
+    config: crate::config::AutumnConfig,
+    tasks: Vec<crate::task::TaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
+    startup_hooks: Vec<StartupHook>,
+    shutdown_hooks: Vec<ShutdownHook>,
+) {
+    // 7. Bind and initialize pre-serve runtime dependencies. Once those
+    // are ready, start listening before startup hooks finish so `/startup`
+    // can honestly report startup progress.
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(addr = %addr, "Failed to bind: {e}");
+            std::process::exit(1);
+        });
+
+    let shutdown_timeout = config.server.shutdown_timeout_secs;
+    let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+    if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+        tracing::error!(error = %error, "job runtime initialization failed");
+        std::process::exit(1);
+    }
+
+    tracing::info!(addr = %addr, "Listening");
+
+    let server_shutdown_wait = server_shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            server_shutdown_wait.cancelled().await;
+        })
+        .await
+    });
+
+    let shutdown_state = state.clone();
+    let shutdown_signal_token = server_shutdown.clone();
+    #[cfg(feature = "ws")]
+    let websocket_shutdown = state.shutdown.clone();
+
+    let shutdown_task = tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_state.begin_shutdown();
+
+        #[cfg(feature = "ws")]
+        websocket_shutdown.cancel();
+
+        if shutdown_timeout > 5 {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    shutdown_timeout.saturating_sub(5),
+                ))
+                .await;
+                tracing::warn!(
+                    timeout_secs = shutdown_timeout,
+                    "Shutdown draining near timeout, force-kill may be imminent"
+                );
+            });
+        }
+
+        run_shutdown_hooks(&shutdown_hooks).await;
+        shutdown_signal_token.cancel();
+    });
+
+    if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+        tracing::error!(error = %error, "startup hook failed");
+        server_shutdown.cancel();
+        server_task.abort();
+        std::process::exit(1);
+    }
+
+    if !state.probes().is_shutting_down() {
+        if !tasks.is_empty()
+            && let Err(error) =
+                start_task_scheduler_with_config(tasks, &state, &server_shutdown, &config.scheduler)
+        {
+            tracing::error!(error = %error, "scheduled task runtime initialization failed");
+            server_shutdown.cancel();
+            server_task.abort();
+            std::process::exit(1);
+        }
+        state.probes().mark_startup_complete();
+    }
+
+    let server_result = server_task.await.unwrap_or_else(|e| {
+        tracing::error!("Server task join error: {e}");
+        std::process::exit(1);
+    });
+    shutdown_task.abort();
+    server_result.unwrap_or_else(|e| {
+        tracing::error!("Server error: {e}");
+        std::process::exit(1);
+    });
+
+    tracing::info!("Server shut down cleanly");
 }
