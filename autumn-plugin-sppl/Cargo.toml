@@ -1,0 +1,23 @@
+[package]
+name = "autumn-plugin-sppl"
+description = "SPPL static asset serving plugin for autumn-web applications"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/madmax983/autumn"
+readme = "README.md"
+keywords = ["web", "svelte", "sveltekit", "spa", "axum"]
+categories = ["web-programming", "web-programming::http-server"]
+
+[dependencies]
+autumn-web = { version = "0.4.0", path = "../autumn" }
+sppl = { git = "https://github.com/neutral-engineering/sppl", default-features = false }
+mime_guess = "2"
+axum = { workspace = true }
+http = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true
