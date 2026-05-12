@@ -79,6 +79,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
 
     let crate_name = name.replace('-', "_");
     let autumn_version = env!("CARGO_PKG_VERSION");
+    let rust_version = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
 
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
@@ -93,6 +94,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
             .replace("{{project_name}}", name)
             .replace("{{crate_name}}", &crate_name)
             .replace("{{autumn_version}}", autumn_version)
+            .replace("{{rust_version}}", rust_version)
     };
 
     let cargo_toml = render_cargo_toml(
