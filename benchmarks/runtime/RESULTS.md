@@ -30,6 +30,19 @@
 | Phoenix | |
 | Loco | |
 
+## Warm Restart Time
+
+Send `SIGTERM` to the running container; time until `/health` returns 200 again.
+
+| Framework | Warm restart time |
+|-----------|-----------------|
+| Autumn | |
+| Spring Boot | |
+| Rails | |
+| Django | |
+| Phoenix | |
+| Loco | |
+
 ## Idle RSS (after 30 s idle)
 
 | Framework | RSS |
@@ -107,16 +120,16 @@
 | Phoenix | | |
 | Loco | | |
 
-## Build Time
+## Build Time and Test Time (DX signals)
 
-| Framework | `docker compose build` |
-|-----------|----------------------|
-| Autumn | |
-| Spring Boot | |
-| Rails | |
-| Django | |
-| Phoenix | |
-| Loco | |
+| Framework | `docker compose build` | Test suite time |
+|-----------|----------------------|----------------|
+| Autumn | | |
+| Spring Boot | | |
+| Rails | | |
+| Django | | |
+| Phoenix | | |
+| Loco | | |
 
 ## Notes and Caveats
 
