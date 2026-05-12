@@ -304,6 +304,8 @@ fn generate_scaffold_full_e2e_post() {
             "title:String",
             "body:Text",
             "published:bool",
+            "subtitle:Option<String>",
+            "views:Option<i64>",
         ],
     );
 
@@ -676,6 +678,8 @@ fn generated_scaffold_cargo_checks() {
             "title:String",
             "body:Text",
             "published:bool",
+            "subtitle:Option<String>",
+            "views:Option<i64>",
         ],
     );
 
