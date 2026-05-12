@@ -41,8 +41,20 @@ changelog_entry_for_version() {
 
 changelog_has_breaking_section() {
   local version="$1"
-  changelog_entry_for_version "$version" |
-    grep -Eqi '^[[:space:]]*###[[:space:]]+Breaking([[:space:]]|$)'
+  # Keep this in one awk process. `awk | grep -q` is flaky under `pipefail`:
+  # grep exits after the first match, awk can receive SIGPIPE while writing the
+  # rest of a long changelog entry, and the pipeline reports a false negative.
+  awk -v ver="$version" '
+    $0 ~ "^## \\[" ver "\\]" { in_version = 1; next }
+    /^## \[/                 { in_version = 0 }
+    in_version {
+      line = tolower($0)
+      if (line ~ /^[[:space:]]*###[[:space:]]+breaking([[:space:]]|$)/) {
+        found = 1
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' CHANGELOG.md
 }
 
 # Workspace version (canonical version for all published crates).
