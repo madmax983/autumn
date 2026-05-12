@@ -1,9 +1,9 @@
 //! Shared helpers for attribute macros that inject hidden extractor
 //! parameters (`#[secured]`, `#[authorize]`).
 //!
-//! Both macros want to add `__autumn_session: Session` (and
-//! `#[authorize]` additionally `__autumn_state: AppState`) to a
-//! handler's argument list. Stacking them is the documented common
+//! Both macros want to add `__autumn_session: Session` and
+//! `__autumn_state: State<AppState>` to a handler's argument list.
+//! Stacking them is the documented common
 //! pattern (`#[secured]` answers "are you in?", `#[authorize]`
 //! answers "are you allowed?"), but each macro must avoid double-
 //! injecting a parameter that the other already added — duplicate
@@ -12,13 +12,13 @@
 //! Both attribute orderings need to work:
 //!
 //! - `#[secured]` outer / `#[authorize]` inner: `#[secured]` runs
-//!   first, injects `__autumn_session`. `#[authorize]` then runs
-//!   on the modified function, sees the existing parameter, and
-//!   skips re-injection.
+//!   first, injects `__autumn_session` and `__autumn_state`.
+//!   `#[authorize]` then runs on the modified function, sees the
+//!   existing parameters, and skips re-injection.
 //! - `#[authorize]` outer / `#[secured]` inner: `#[authorize]`
-//!   runs first, injects `__autumn_session`. `#[secured]` then
-//!   runs on the modified function, sees the existing parameter,
-//!   and skips re-injection.
+//!   runs first, injects `__autumn_session` and `__autumn_state`.
+//!   `#[secured]` then runs on the modified function, sees the
+//!   existing parameters, and skips re-injection.
 
 use syn::ItemFn;
 

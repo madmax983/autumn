@@ -167,8 +167,22 @@ pub async fn __check_secured(
     session: &crate::session::Session,
     roles: &[&str],
 ) -> crate::AutumnResult<()> {
+    __check_secured_with_key(session, "user_id", roles).await
+}
+
+/// Runtime check used by `#[secured]` when `AppState` is available.
+///
+/// Accepts the configured auth session key so generated login/signup/reset
+/// handlers and `#[secured]` resolve authentication through the same session
+/// entry.
+#[doc(hidden)]
+pub async fn __check_secured_with_key(
+    session: &crate::session::Session,
+    auth_session_key: &str,
+    roles: &[&str],
+) -> crate::AutumnResult<()> {
     // Check authentication: session must contain the auth key
-    if session.get("user_id").await.is_none() {
+    if session.get(auth_session_key).await.is_none() {
         return Err(crate::AutumnError::unauthorized_msg(
             "authentication required",
         ));
@@ -2027,6 +2041,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn secured_macro_honors_configured_auth_session_key() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
+
+        #[autumn_macros::secured]
+        async fn account_handler() -> crate::AutumnResult<&'static str> {
+            Ok("account")
+        }
+
+        let store = MemoryStore::new();
+        store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([
+                    ("uid".into(), "42".into()),
+                    ("account_id".into(), "42".into()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "uid".to_owned(),
+            shared_cache: None,
+        };
+
+        let app = Router::new()
+            .route("/account", get(account_handler))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/account")
+                    .header(COOKIE, "autumn.sid=sess1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "account");
     }
 
     #[tokio::test]

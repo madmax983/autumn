@@ -1,8 +1,8 @@
 //! `#[secured]` proc macro implementation.
 //!
 //! Generates an authentication/authorization guard that runs before
-//! the handler body. Injects a hidden `Session` extractor and prepends
-//! a call to the runtime check function.
+//! the handler body. Injects hidden `Session` and `AppState` extractors
+//! and prepends a call to the runtime check function.
 //!
 //! ## Forms
 //!
@@ -52,21 +52,36 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build the roles slice expression
     let check_call = if roles.is_empty() {
         quote! {
-            ::autumn_web::auth::__check_secured(&__autumn_session, &[]).await?;
+            ::autumn_web::auth::__check_secured_with_key(
+                &__autumn_session,
+                __autumn_state.auth_session_key(),
+                &[],
+            ).await?;
         }
     } else {
         let role_literals = roles.iter().map(|r| quote! { #r });
         quote! {
-            ::autumn_web::auth::__check_secured(&__autumn_session, &[#(#role_literals),*]).await?;
+            ::autumn_web::auth::__check_secured_with_key(
+                &__autumn_session,
+                __autumn_state.auth_session_key(),
+                &[#(#role_literals),*],
+            ).await?;
         }
     };
 
-    // Inject the hidden Session parameter at the start of the parameter
-    // list — but only if no other macro (typically `#[authorize]`) has
-    // already injected one. Without this guard, stacking
+    // Inject hidden State<AppState> and Session parameters at the start of
+    // the parameter list, but only if no other macro (typically `#[authorize]`) has
+    // already injected them. Without these guards, stacking
     // `#[authorize]` + `#[secured]` in either attribute order would
-    // produce duplicate `__autumn_session` parameters and fail to
+    // produce duplicate hidden parameters and fail to
     // compile.
+    if !has_input_named(&input_fn, "__autumn_state") {
+        let state_param: syn::FnArg = syn::parse_quote! {
+            ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
+        };
+        input_fn.sig.inputs.insert(0, state_param);
+    }
     if !has_input_named(&input_fn, "__autumn_session") {
         let session_param: syn::FnArg = syn::parse_quote! {
             __autumn_session: ::autumn_web::session::Session
