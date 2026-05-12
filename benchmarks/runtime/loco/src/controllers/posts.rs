@@ -59,8 +59,9 @@ pub async fn show(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     match PostEntity::find_by_id(id).one(&ctx.db).await {
-        Ok(Some(p)) => (StatusCode::OK, Json(serde_json::to_value(p).unwrap())).into_response(),
-        _           => (StatusCode::NOT_FOUND, Json(ErrBody { error: "not found".into() })).into_response(),
+        Ok(Some(p)) => Json(p).into_response(),
+        Ok(None)    => (StatusCode::NOT_FOUND, Json(ErrBody { error: "not found".into() })).into_response(),
+        Err(e)      => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrBody { error: e.to_string() })).into_response(),
     }
 }
 
@@ -69,8 +70,7 @@ pub async fn create(
     Json(body): Json<CreatePost>,
 ) -> impl IntoResponse {
     if let Err(msg) = validate_create(&body) {
-        return (StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": msg}))).into_response();
+        return validation_error(msg).into_response();
     }
     let model = ActiveModel {
         title:     ActiveValue::Set(body.title),
@@ -159,13 +159,19 @@ pub async fn html_list(State(ctx): State<AppContext>) -> impl IntoResponse {
         .await
         .unwrap_or_default();
 
-    let rows: String = posts.iter().map(|p| {
-        format!(
-            r#"<li><a href="/posts/{}">{}</a> &mdash; {}{}</li>"#,
-            p.id, p.title, p.author,
-            if !p.published { " <em>[draft]</em>" } else { "" }
-        )
-    }).collect();
+    let mut rows = String::with_capacity(posts.len() * 128);
+    for p in &posts {
+        rows.push_str("<li><a href=\"/posts/");
+        rows.push_str(&p.id.to_string());
+        rows.push_str("\">");
+        rows.push_str(&p.title);
+        rows.push_str("</a> &mdash; ");
+        rows.push_str(&p.author);
+        if !p.published {
+            rows.push_str(" <em>[draft]</em>");
+        }
+        rows.push_str("</li>");
+    }
 
     let body = format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>Posts</title></head>\

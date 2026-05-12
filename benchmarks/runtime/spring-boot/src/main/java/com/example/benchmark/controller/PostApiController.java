@@ -45,10 +45,10 @@ public class PostApiController {
     @PatchMapping("/{id}")
     public ResponseEntity<Post> update(@PathVariable Long id, @RequestBody Post patch) {
         return posts.findById(id).map(p -> {
-            if (patch.getTitle() != null) p.setTitle(patch.getTitle());
-            if (patch.getBody() != null)  p.setBody(patch.getBody());
-            if (patch.getAuthor() != null) p.setAuthor(patch.getAuthor());
-            p.setPublished(patch.isPublished());
+            if (patch.getTitle() != null)     p.setTitle(patch.getTitle());
+            if (patch.getBody() != null)      p.setBody(patch.getBody());
+            if (patch.getAuthor() != null)    p.setAuthor(patch.getAuthor());
+            if (patch.getPublished() != null) p.setPublished(patch.getPublished());
             return ResponseEntity.ok(posts.save(p));
         }).orElse(ResponseEntity.notFound().build());
     }

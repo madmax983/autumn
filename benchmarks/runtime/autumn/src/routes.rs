@@ -128,12 +128,12 @@ pub async fn api_protected(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
-        .ok_or_else(|| err_json("missing or invalid Authorization header"))?;
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(ErrBody { error: "missing or invalid Authorization header".into() })))?;
 
     let principal = ApiToken::verify(token, &mut db)
         .await
-        .map_err(|e| err_json(e.to_string()))?
-        .ok_or_else(|| err_json("invalid token"))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrBody { error: e.to_string() })))?
+        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(ErrBody { error: "invalid token".into() })))?;
 
     #[derive(Serialize)]
     struct Stats {

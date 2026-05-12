@@ -23,7 +23,7 @@ public class Post {
     private String body;
 
     @Column(nullable = false)
-    private boolean published = false;
+    private Boolean published = false;
 
     @NotBlank(message = "author must not be blank")
     @Column(nullable = false)
@@ -52,8 +52,8 @@ public class Post {
     public void setTitle(String title) { this.title = title; }
     public String getBody() { return body; }
     public void setBody(String body) { this.body = body; }
-    public boolean isPublished() { return published; }
-    public void setPublished(boolean published) { this.published = published; }
+    public Boolean getPublished() { return published; }
+    public void setPublished(Boolean published) { this.published = published; }
     public String getAuthor() { return author; }
     public void setAuthor(String author) { this.author = author; }
     public OffsetDateTime getCreatedAt() { return createdAt; }
