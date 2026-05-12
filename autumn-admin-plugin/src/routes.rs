@@ -813,7 +813,13 @@ fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
 
 fn coerce_form_value(value: &mut Value, field: &AdminField) {
     if !field.required
-        && matches!(field.kind, AdminFieldKind::Integer | AdminFieldKind::Float)
+        && matches!(
+            field.kind,
+            AdminFieldKind::Integer
+                | AdminFieldKind::Float
+                | AdminFieldKind::Date
+                | AdminFieldKind::DateTime
+        )
         && matches!(value, Value::String(raw) if raw.trim().is_empty())
     {
         *value = Value::Null;
@@ -1020,6 +1026,17 @@ mod tests {
         let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields);
 
         assert_eq!(out, json!({"count": null, "rating": null}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_blank_optional_date_strings_to_null() {
+        let fields = vec![
+            AdminField::new("published_on", AdminFieldKind::Date).optional(),
+            AdminField::new("starts_at", AdminFieldKind::DateTime).optional(),
+        ];
+        let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
+
+        assert_eq!(out, json!({"published_on": null, "starts_at": null}));
     }
 
     #[test]
