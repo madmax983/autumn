@@ -32,11 +32,51 @@ use tower::{Layer, Service};
 use super::Cache;
 
 /// A cached HTTP response: status, headers, and body bytes.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 struct CachedResponse {
-    status: StatusCode,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+    status: u16,
+    headers: Vec<CachedHeader>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+struct CachedHeader {
+    name: String,
+    value: Vec<u8>,
+}
+
+fn cached_response_from_parts(
+    parts: &http::response::Parts,
+    body: &bytes::Bytes,
+) -> CachedResponse {
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| CachedHeader {
+            name: name.as_str().to_owned(),
+            value: value.as_bytes().to_vec(),
+        })
+        .collect();
+
+    CachedResponse {
+        status: parts.status.as_u16(),
+        headers,
+        body: body.to_vec(),
+    }
+}
+
+fn cached_response_into_response(cached: CachedResponse) -> Option<axum::response::Response> {
+    let status = StatusCode::from_u16(cached.status).ok()?;
+    let mut builder = axum::response::Response::builder().status(status);
+    let headers = builder.headers_mut()?;
+
+    for cached_header in cached.headers {
+        let name = http::HeaderName::from_bytes(cached_header.name.as_bytes()).ok()?;
+        let value = http::HeaderValue::from_bytes(&cached_header.value).ok()?;
+        headers.append(name, value);
+    }
+
+    builder.body(Body::from(cached.body)).ok()
 }
 
 /// Tower layer that caches HTTP GET responses.
@@ -137,26 +177,16 @@ where
 
         let cache_hit = if cache_key_str.is_empty() {
             // Fallback for very long URIs
-            super::get::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
+            super::get_cached::<CachedResponse>(store.as_ref(), &format!("http:{}", req.uri()))
         } else {
-            super::get::<CachedResponse>(store.as_ref(), cache_key_str)
+            super::get_cached::<CachedResponse>(store.as_ref(), cache_key_str)
         };
 
         // Check for a cache hit
-        if let Some(cached) = cache_hit {
-            return Box::pin(async move {
-                let mut builder = axum::response::Response::builder().status(cached.status);
-                if let Some(headers) = builder.headers_mut() {
-                    headers.extend(cached.headers);
-                }
-                let resp = builder.body(Body::from(cached.body)).unwrap_or_else(|_| {
-                    axum::response::Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Body::empty())
-                        .expect("infallible response builder")
-                });
-                Ok(resp)
-            });
+        if let Some(cached) = cache_hit
+            && let Some(resp) = cached_response_into_response(cached)
+        {
+            return Box::pin(async move { Ok(resp) });
         }
 
         // Cache miss — call the inner service
@@ -188,12 +218,8 @@ where
             let body_bytes = collected.to_bytes();
 
             // Store in cache
-            let cached = CachedResponse {
-                status: parts.status,
-                headers: parts.headers.clone(),
-                body: body_bytes.clone(),
-            };
-            super::insert(store.as_ref(), &cache_key, cached);
+            let cached = cached_response_from_parts(&parts, &body_bytes);
+            super::insert_cached(store.as_ref(), &cache_key, cached, None);
 
             // Reconstruct the response
             let response = axum::response::Response::from_parts(parts, Body::from(body_bytes));
@@ -205,8 +231,50 @@ where
 #[cfg(all(test, feature = "cache-moka"))]
 mod tests {
     use super::*;
+    use crate::cache::RawCacheBytes;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::{ServiceBuilder, ServiceExt};
+
+    #[derive(Default)]
+    struct RawOnlyCache {
+        entries: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl Cache for RawOnlyCache {
+        fn get_value(&self, key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            self.entries
+                .lock()
+                .expect("raw cache lock poisoned")
+                .get(key)
+                .cloned()
+                .map(|bytes| Arc::new(RawCacheBytes(bytes)) as Arc<dyn std::any::Any + Send + Sync>)
+        }
+
+        fn insert_value(&self, _key: &str, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+
+        fn insert_raw_bytes(&self, key: &str, bytes: Vec<u8>, _ttl: Option<std::time::Duration>) {
+            self.entries
+                .lock()
+                .expect("raw cache lock poisoned")
+                .insert(key.to_owned(), bytes);
+        }
+
+        fn invalidate(&self, key: &str) {
+            self.entries
+                .lock()
+                .expect("raw cache lock poisoned")
+                .remove(key);
+        }
+
+        fn clear(&self) {
+            self.entries
+                .lock()
+                .expect("raw cache lock poisoned")
+                .clear();
+        }
+    }
 
     /// Build a test service that returns a fixed body and counts calls.
     fn counting_service(
@@ -283,6 +351,74 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "inner should not be called again"
+        );
+    }
+
+    #[tokio::test]
+    async fn caches_get_responses_with_raw_byte_backends() {
+        let store = Arc::new(RawOnlyCache::default());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let inner = {
+            let counter = counter.clone();
+            tower::service_fn(move |_req: Request<Body>| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Infallible>(
+                        axum::response::Response::builder()
+                            .status(StatusCode::OK)
+                            .header("x-cache-test", "persisted")
+                            .body(Body::from("redis-like"))
+                            .expect("infallible response builder"),
+                    )
+                }
+            })
+        };
+
+        let mut svc = ServiceBuilder::new()
+            .layer(CacheResponseLayer::from_shared(store))
+            .service(inner);
+
+        let req = Request::get("/redis-backed")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req = Request::get("/redis-backed")
+            .body(Body::empty())
+            .expect("infallible response builder");
+        let resp = svc
+            .ready()
+            .await
+            .expect("infallible response builder")
+            .call(req)
+            .await
+            .expect("infallible response builder");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-cache-test")
+                .and_then(|v| v.to_str().ok()),
+            Some("persisted")
+        );
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("infallible response builder")
+            .to_bytes();
+        assert_eq!(body.as_ref(), b"redis-like");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "raw-byte backends should cache HTTP responses"
         );
     }
 
