@@ -241,10 +241,7 @@ const fn is_default_filterable(field: &Field) -> bool {
 }
 
 const fn is_default_readonly(field: &Field) -> bool {
-    matches!(
-        field.kind,
-        FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Uuid
-    )
+    matches!(field.kind, FieldKind::NaiveDateTime | FieldKind::DateTime)
 }
 
 const fn is_default_optional(field: &Field) -> bool {
@@ -1539,6 +1536,23 @@ pub struct Post {
         assert!(
             admin.contains("title: Patch::Set(new_row.title)"),
             "title should appear in UpdatePost"
+        );
+    }
+
+    #[test]
+    fn required_uuid_fields_are_editable_by_default() {
+        let tmp = project_with_model("api_token");
+        let plan = plan_admin(tmp.path(), "ApiToken", &["token:Uuid".into()]).unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let admin = fs::read_to_string(tmp.path().join("src/admin/api_token.rs")).unwrap();
+        assert!(
+            admin.contains("AdminField::new(\"token\", AdminFieldKind::Text),"),
+            "required user-provided UUID fields should be editable by default:\n{admin}"
+        );
+        assert!(
+            admin.contains("token: Patch::Set(new_row.token)"),
+            "required user-provided UUID fields must be included in admin updates:\n{admin}"
         );
     }
 

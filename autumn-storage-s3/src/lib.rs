@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use autumn_web::storage::{
     Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream, StorageS3Config,
+    validate_key,
 };
 use aws_credential_types::Credentials;
 use aws_sdk_s3::Client;
@@ -241,6 +242,7 @@ impl BlobStore for S3BlobStore {
     ) -> BlobFuture<'a, Blob> {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
+            validate_key(key)?;
             let result = self
                 .client
                 .put_object()
@@ -268,6 +270,7 @@ impl BlobStore for S3BlobStore {
         data: ByteStream<'a>,
     ) -> BlobFuture<'a, Blob> {
         Box::pin(async move {
+            validate_key(key)?;
             let mut stream = data;
             let mut current_part: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE);
 
@@ -409,6 +412,7 @@ impl BlobStore for S3BlobStore {
 
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
+            validate_key(key)?;
             let result = self
                 .client
                 .get_object()
@@ -435,6 +439,7 @@ impl BlobStore for S3BlobStore {
 
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
+            validate_key(key)?;
             self.client
                 .delete_object()
                 .bucket(&self.options.bucket)
@@ -448,6 +453,7 @@ impl BlobStore for S3BlobStore {
 
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
+            validate_key(key)?;
             let result = self
                 .client
                 .head_object()
@@ -487,6 +493,7 @@ impl BlobStore for S3BlobStore {
 
     fn presigned_url<'a>(&'a self, key: &'a str, expires_in: Duration) -> BlobFuture<'a, String> {
         Box::pin(async move {
+            validate_key(key)?;
             let presigning = PresigningConfig::expires_in(expires_in)
                 .map_err(|e| BlobStoreError::backend(e.to_string()))?;
             let req = self
@@ -574,6 +581,25 @@ mod tests {
                 .endpoint_url(endpoint)
                 .build(),
         )
+    }
+
+    fn test_store() -> S3BlobStore {
+        let client = test_client("http://127.0.0.1:9");
+        S3BlobStore {
+            client: client.clone(),
+            presign_client: client,
+            options: Arc::new(S3Options {
+                provider_id: "s3".to_owned(),
+                bucket: "test-bucket".to_owned(),
+            }),
+        }
+    }
+
+    fn assert_invalid_input<T: std::fmt::Debug>(result: Result<T, BlobStoreError>) {
+        match result {
+            Err(BlobStoreError::InvalidInput(_)) => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -774,6 +800,27 @@ mod tests {
             },
         ))
         .await;
+    }
+
+    #[tokio::test]
+    async fn operations_reject_invalid_keys_before_calling_s3() {
+        let store = test_store();
+
+        assert_invalid_input(store.put("", "text/plain", Bytes::from_static(b"x")).await);
+
+        let stream: ByteStream<'_> = Box::pin(futures::stream::once(async {
+            Ok(Bytes::from_static(b"x"))
+        }));
+        assert_invalid_input(store.put_stream("../x", "text/plain", stream).await);
+
+        assert_invalid_input(store.get("foo.meta").await);
+        assert_invalid_input(store.delete("con/file.txt").await);
+        assert_invalid_input(store.head("avatars/User.png").await);
+        assert_invalid_input(
+            store
+                .presigned_url("avatars//user.png", Duration::from_secs(60))
+                .await,
+        );
     }
 
     #[test]
