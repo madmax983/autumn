@@ -297,12 +297,22 @@ fn render_routes_file(
 //! these are ordinary user code.
 
 use autumn_web::extract::{{Form, Path}};
+use autumn_web::security::{{CsrfFormField, CsrfToken}};
 use autumn_web::{{AutumnError, AutumnResult, Db, Markup, get, html, post, secured}};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
 use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
 use crate::schema::{plural};
+
+fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{
+    let csrf_field_name = field.map(|field| field.0.as_str()).unwrap_or("_csrf");
+    html! {{
+        @if let Some(csrf) = csrf {{
+            input type="hidden" name=(csrf_field_name) value=(csrf.token());
+        }}
+    }}
+}}
 
 /// Wrap content in a minimal HTML layout. Replace with your real layout
 /// once you wire in Tailwind / your design system.
@@ -355,10 +365,14 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {{
 /// `GET /{plural}/new` — render the new-{snake_name} form.
 #[secured]
 #[get("/{plural}/new")]
-pub async fn new_form() -> AutumnResult<Markup> {{
+pub async fn new_form(
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
     Ok(layout("New {pascal_name}", html! {{
         h1 {{ "New {pascal_name}" }}
         form action="/{plural}" method="post" {{
+            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
 {inputs}            button type="submit" {{ "Create" }}
         }}
     }}))
@@ -381,7 +395,12 @@ pub async fn create(mut db: Db, Form(new): Form<New{pascal_name}>) -> AutumnResu
 /// remains available for API clients.
 #[secured]
 #[get("/{plural}/{{id}}/edit")]
-pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {{
+pub async fn edit_form(
+    id: Path<i64>,
+    mut db: Db,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
         .select({pascal_name}::as_select())
@@ -391,6 +410,7 @@ pub async fn edit_form(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {{
     Ok(layout(&format!("Edit {pascal_name} #{{}}", row.id), html! {{
         h1 {{ "Edit {pascal_name} #" (row.id) }}
         form action=(format!("/{plural}/{{}}/update", row.id)) method="post" {{
+            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
 {inputs}            button type="submit" {{ "Save" }}
         }}
     }}))
@@ -643,7 +663,7 @@ async fn main() {
         // (browsers can't submit PUT natively); the JSON `PUT /api/posts/{id}`
         // remains available via the auto-generated repository handler.
         assert!(routes.contains("#[post(\"/posts/{id}/update\")]"));
-        assert!(routes.contains("pub async fn new_form() -> AutumnResult<Markup>"));
+        assert!(routes.contains("pub async fn new_form("));
         assert!(routes.contains("Ok(layout(\"New Post\""));
         assert!(routes.contains("posts::title.eq(form.title.clone())"));
         // `execute()` returns the affected row count — `Ok(0)` means the id
@@ -658,6 +678,30 @@ async fn main() {
         // Update and delete remain available through JSON REST.
         assert!(!routes.contains("#[put("));
         assert!(!routes.contains("#[delete("));
+    }
+
+    #[test]
+    fn execute_writes_csrf_aware_form_handlers() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("use autumn_web::security::{CsrfFormField, CsrfToken};"));
+        assert!(routes.contains("fn csrf_input("));
+        assert!(routes.contains("input type=\"hidden\" name=(csrf_field_name"));
+        assert!(routes.contains("value=(csrf.token());"));
+        assert!(routes.contains("pub async fn new_form("));
+        assert!(routes.contains("csrf: Option<CsrfToken>"));
+        assert!(routes.contains("csrf_field: Option<CsrfFormField>"));
+        assert!(routes.contains("(csrf_input(csrf.as_ref(), csrf_field.as_ref()))"));
+        assert!(routes.contains("pub async fn edit_form("));
     }
 
     #[test]
