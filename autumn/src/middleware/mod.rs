@@ -19,12 +19,17 @@
 pub(crate) mod dev;
 pub(crate) mod error_page_filter;
 pub(crate) mod exception_filter;
+pub(crate) mod method_override;
 pub(crate) mod metrics;
 pub(crate) mod request_id;
 #[cfg(feature = "telemetry-otlp")]
 pub(crate) mod trace_context;
 
 pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLayer};
+pub use method_override::{
+    DEFAULT_METHOD_OVERRIDE_FIELD, MethodOverrideConfig, MethodOverrideLayer,
+    MethodOverrideService, OverriddenMethod,
+};
 pub use metrics::{MetricsCollector, MetricsLayer};
 pub use request_id::{RequestId, RequestIdLayer};
 #[cfg(feature = "telemetry-otlp")]
