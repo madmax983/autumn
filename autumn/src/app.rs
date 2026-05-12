@@ -2354,6 +2354,42 @@ fn start_task_scheduler(
     }
 }
 
+struct FixedDelayTaskContext {
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+    delay: std::time::Duration,
+    coordination: crate::task::TaskCoordination,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+fn spawn_fixed_delay_task(ctx: FixedDelayTaskContext) {
+    tokio::spawn(async move {
+        loop {
+            ctx.state
+                .task_registry
+                .record_next_run_at(&ctx.name, &format_next_task_run_after(ctx.delay));
+            tokio::select! {
+                () = ctx.shutdown.cancelled() => break,
+                () = tokio::time::sleep(ctx.delay) => {
+                    execute_fixed_delay_task(
+                        ctx.name.clone(),
+                        ctx.state.clone(),
+                        ctx.handler,
+                        ctx.delay,
+                        ctx.coordination,
+                        Arc::clone(&ctx.coordinator),
+                        ctx.lease_ttl,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
 fn start_task_scheduler_with_config(
@@ -2396,29 +2432,15 @@ fn start_task_scheduler_with_config(
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
-                let coordinator = Arc::clone(&coordinator);
-                let shutdown = shutdown.child_token();
-                tokio::spawn(async move {
-                    loop {
-                        state
-                            .task_registry
-                            .record_next_run_at(&name, &format_next_task_run_after(delay));
-                        tokio::select! {
-                            () = shutdown.cancelled() => break,
-                            () = tokio::time::sleep(delay) => {
-                                execute_fixed_delay_task(
-                                    name.clone(),
-                                    state.clone(),
-                                    handler,
-                                    delay,
-                                    coordination,
-                                    Arc::clone(&coordinator),
-                                    lease_ttl,
-                                )
-                                .await;
-                            }
-                        }
-                    }
+                spawn_fixed_delay_task(FixedDelayTaskContext {
+                    name,
+                    state: state.clone(),
+                    handler,
+                    delay,
+                    coordination,
+                    coordinator: Arc::clone(&coordinator),
+                    lease_ttl,
+                    shutdown: shutdown.child_token(),
                 });
             }
             crate::task::Schedule::Cron {
@@ -3026,6 +3048,58 @@ impl StorageBootstrap {
 /// first. Installation onto `AppState` happens later via
 /// [`StorageBootstrap::install`].
 #[cfg(feature = "storage")]
+fn resolve_local_storage_signing_keys(
+    config: &AutumnConfig,
+) -> (
+    crate::storage::local::SigningKey,
+    Vec<crate::storage::local::SigningKey>,
+) {
+    use crate::storage::local::SigningKey;
+
+    // Signing key precedence:
+    // 1. security.signing_secret (canonical, shared with session/CSRF)
+    // 2. storage.local.signing_key (legacy override — still respected)
+    // 3. Random ephemeral key (dev only — warns in prod)
+
+    if let Some(secret) = config
+        .security
+        .signing_secret
+        .secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        let current = SigningKey::new(secret.as_bytes().to_vec());
+        let previous = config
+            .security
+            .signing_secret
+            .previous_secrets
+            .iter()
+            .map(|s| SigningKey::new(s.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        return (current, previous);
+    }
+
+    if let Some(legacy) = config
+        .storage
+        .local
+        .signing_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        return (SigningKey::new(legacy.as_bytes().to_vec()), vec![]);
+    }
+
+    if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+        tracing::warn!(
+            "no signing secret configured in prod; blob URL signatures \
+             won't survive a process restart. Set \
+             AUTUMN_SECURITY__SIGNING_SECRET."
+        );
+    }
+    (SigningKey::random(), vec![])
+}
+
+#[cfg(feature = "storage")]
 #[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
 fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
     use crate::storage::StorageBackendPlan;
@@ -3084,7 +3158,7 @@ fn bootstrap_local_storage(
     default_url_expiry_secs: u64,
     warn_in_production: bool,
 ) -> StorageBootstrap {
-    use crate::storage::{LocalBlobStore, SharedBlobStore, local::SigningKey};
+    use crate::storage::{LocalBlobStore, SharedBlobStore};
 
     if warn_in_production {
         tracing::warn!(
@@ -3095,50 +3169,7 @@ fn bootstrap_local_storage(
         );
     }
 
-    // Signing key precedence:
-    // 1. security.signing_secret (canonical, shared with session/CSRF)
-    // 2. storage.local.signing_key (legacy override — still respected)
-    // 3. Random ephemeral key (dev only — warns in prod)
-    let (signing_key, previous_signing_keys) = config
-        .security
-        .signing_secret
-        .secret
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map_or_else(
-            || {
-                config
-                    .storage
-                    .local
-                    .signing_key
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map_or_else(
-                        || {
-                            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
-                                tracing::warn!(
-                                    "no signing secret configured in prod; blob URL signatures \
-                                     won't survive a process restart. Set \
-                                     AUTUMN_SECURITY__SIGNING_SECRET."
-                                );
-                            }
-                            (SigningKey::random(), vec![])
-                        },
-                        |legacy| (SigningKey::new(legacy.as_bytes().to_vec()), vec![]),
-                    )
-            },
-            |secret| {
-                let current = SigningKey::new(secret.as_bytes().to_vec());
-                let previous = config
-                    .security
-                    .signing_secret
-                    .previous_secrets
-                    .iter()
-                    .map(|s| SigningKey::new(s.as_bytes().to_vec()))
-                    .collect::<Vec<_>>();
-                (current, previous)
-            },
-        );
+    let (signing_key, previous_signing_keys) = resolve_local_storage_signing_keys(config);
 
     let store = match LocalBlobStore::new(
         provider_id.to_string(),
@@ -4147,10 +4178,8 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
     }
 }
 
-/// Build the configuration summary string.
-fn format_config_summary(config: &AutumnConfig) -> String {
-    let profile = config.profile.as_deref().unwrap_or("none");
-    let db_status = config.database.effective_primary_url().map_or_else(
+fn format_database_status(config: &AutumnConfig) -> String {
+    config.database.effective_primary_url().map_or_else(
         || "not configured".to_owned(),
         |url| {
             let primary = mask_database_url(url, config.database.effective_primary_pool_size());
@@ -4163,8 +4192,11 @@ fn format_config_summary(config: &AutumnConfig) -> String {
                 primary
             }
         },
-    );
-    let telemetry_status = if config.telemetry.enabled {
+    )
+}
+
+fn format_telemetry_status(config: &AutumnConfig) -> String {
+    if config.telemetry.enabled {
         let endpoint = config
             .telemetry
             .otlp_endpoint
@@ -4173,7 +4205,15 @@ fn format_config_summary(config: &AutumnConfig) -> String {
         format!("{:?} -> {endpoint}", config.telemetry.protocol)
     } else {
         "disabled".to_owned()
-    };
+    }
+}
+
+/// Build the configuration summary string.
+fn format_config_summary(config: &AutumnConfig) -> String {
+    let profile = config.profile.as_deref().unwrap_or("none");
+    let db_status = format_database_status(config);
+    let telemetry_status = format_telemetry_status(config);
+
     format!(
         "\
         \n    profile:    {profile}\
