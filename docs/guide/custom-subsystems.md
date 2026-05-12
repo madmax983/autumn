@@ -190,6 +190,34 @@ that doesn't fit the built-in memory/Redis split.
 
 ---
 
+## `ChannelsBackend` - replace the local/Redis realtime backend
+
+```rust,no_run
+use autumn_web::prelude::*;
+
+#[autumn_web::main]
+async fn main() {
+    autumn_web::app()
+        .with_channels_backend(LocalChannelsBackend::new(64))
+        .routes(routes![/* ... */])
+        .run()
+        .await;
+}
+```
+
+When you install a custom channels backend, AppState skips the config-driven
+`in_process` vs `redis` selection. The backend owns publish, subscribe,
+topic cleanup, and `/actuator/channels` metrics.
+
+**When to reach for it:** NATS, Postgres `LISTEN/NOTIFY`, sharded Redis,
+test harnesses, or application-specific fan-out rules that should still use
+the same `AppState::channels()` and `AppState::broadcast()` API.
+
+See [`realtime.md`](realtime.md) for the built-in Redis backend and htmx/SSE
+helpers.
+
+---
+
 ## `ErrorPageRenderer` — replace the built-in HTML error pages
 
 ```rust,no_run

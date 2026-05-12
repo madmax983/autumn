@@ -103,6 +103,12 @@ pub struct ApiDoc {
     pub success_status: u16,
     /// When `true`, the route is excluded from the generated spec.
     pub hidden: bool,
+    /// Optional query-parameter schema inferred from `Query<T>` extractors.
+    pub query_schema: Option<SchemaEntry>,
+    /// True when the route requires authentication (`#[secured]`).
+    pub secured: bool,
+    /// Roles required by `#[secured("role1")]`. Empty means any authenticated user.
+    pub required_roles: &'static [&'static str],
     /// Optional runtime hook that lets a handler register any extra
     /// component schemas with the generator.
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
@@ -158,6 +164,11 @@ pub struct OpenApiConfig {
     /// Path serving the Swagger UI HTML. Defaults to `/swagger-ui`. Set
     /// to `None` to disable the UI while still exposing the JSON.
     pub swagger_ui_path: Option<String>,
+    /// Session cookie name used by secured route security docs.
+    ///
+    /// Runtime OpenAPI mounting replaces this with `session.cookie_name`
+    /// from the loaded app config.
+    pub session_cookie_name: String,
     /// User-registered component schemas keyed by schema name.
     pub additional_schemas: BTreeMap<String, serde_json::Value>,
 }
@@ -171,8 +182,9 @@ impl OpenApiConfig {
             title: title.into(),
             version: version.into(),
             description: None,
-            openapi_json_path: "/v3/api-docs".to_owned(),
+            openapi_json_path: "/openapi.json".to_owned(),
             swagger_ui_path: Some("/swagger-ui".to_owned()),
+            session_cookie_name: "autumn.sid".to_owned(),
             additional_schemas: BTreeMap::new(),
         }
     }
@@ -198,6 +210,13 @@ impl OpenApiConfig {
         self
     }
 
+    /// Override the session cookie name documented for secured routes.
+    #[must_use]
+    pub fn session_cookie_name(mut self, name: impl Into<String>) -> Self {
+        self.session_cookie_name = name.into();
+        self
+    }
+
     /// Register a custom component schema. Useful when a handler's
     /// payload type does not implement `OpenApiSchema`.
     #[must_use]
@@ -217,7 +236,10 @@ impl OpenApiConfig {
 /// schemas in the generated spec. A blanket default is not provided —
 /// routes whose types do not implement this trait simply emit a generic
 /// `object` placeholder referring to the type name.
-#[cfg(feature = "openapi")]
+///
+/// This trait is always available (no feature gate) so that `#[model]`-generated
+/// types can implement it unconditionally. The spec generation machinery that
+/// consumes implementations is still gated behind the `openapi` feature.
 pub trait OpenApiSchema {
     /// Component schema name (appears under `#/components/schemas/`).
     fn schema_name() -> &'static str;
@@ -226,7 +248,6 @@ pub trait OpenApiSchema {
     fn schema() -> serde_json::Value;
 }
 
-#[cfg(feature = "openapi")]
 macro_rules! impl_primitive_schema {
     ($ty:ty, $name:literal, $json:literal) => {
         impl OpenApiSchema for $ty {
@@ -240,33 +261,19 @@ macro_rules! impl_primitive_schema {
     };
 }
 
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(bool, "boolean", "boolean");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(String, "string", "string");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(&'static str, "string", "string");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(i8, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(i16, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(i32, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(i64, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(u8, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(u16, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(u32, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(u64, "integer", "integer");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(f32, "number", "number");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(f64, "number", "number");
-#[cfg(feature = "openapi")]
 impl_primitive_schema!(serde_json::Value, "object", "object");
 
 // ──────────────────────────────────────────────────────────────────
@@ -282,7 +289,6 @@ pub struct SchemaRegistry {
 impl SchemaRegistry {
     /// Register a type via its `OpenApiSchema` implementation. A
     /// duplicate insertion is a no-op (the existing entry wins).
-    #[cfg(feature = "openapi")]
     pub fn register<T: OpenApiSchema>(&mut self) {
         let name = T::schema_name().to_owned();
         self.schemas.entry(name).or_insert_with(T::schema);
@@ -389,6 +395,9 @@ pub struct Operation {
     pub request_body: Option<RequestBody>,
     /// The list of possible responses as they are returned from executing this operation.
     pub responses: BTreeMap<String, Response>,
+    /// Security requirements for this operation. Non-empty when the route uses `#[secured]`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub security: Vec<BTreeMap<String, Vec<String>>>,
 }
 
 #[cfg(feature = "openapi")]
@@ -404,6 +413,14 @@ pub struct Parameter {
     pub required: bool,
     /// The schema defining the type used for the parameter.
     pub schema: serde_json::Value,
+    /// Serialization style. `"form"` with `explode: true` makes each object
+    /// property a separate query key — the correct mapping for `Query<T>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// When `true` with `style: "form"`, each schema property becomes an
+    /// independent query parameter (e.g. `?q=foo&page=2`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explode: Option<bool>,
 }
 
 #[cfg(feature = "openapi")]
@@ -441,11 +458,40 @@ pub struct MediaType {
 pub struct Components {
     /// Reusable Schema Objects.
     pub schemas: BTreeMap<String, serde_json::Value>,
+    /// Security scheme definitions (e.g. SessionAuth).
+    #[serde(rename = "securitySchemes", skip_serializing_if = "BTreeMap::is_empty")]
+    pub security_schemes: BTreeMap<String, serde_json::Value>,
 }
 
 // ──────────────────────────────────────────────────────────────────
 // Spec generator
 // ──────────────────────────────────────────────────────────────────
+
+/// Write the generated OpenAPI spec to `dist/openapi.json` and
+/// `dist/openapi.yaml` inside `dist_dir`.
+///
+/// Called during `autumn build` (when `AUTUMN_BUILD_STATIC=1`) to emit
+/// a machine-readable API contract alongside the pre-rendered HTML pages.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if the directory cannot be created or
+/// either file cannot be written.
+#[cfg(feature = "openapi")]
+pub fn write_openapi_spec_to_dist(
+    spec: &OpenApiSpec,
+    dist_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dist_dir)?;
+
+    let json = serde_json::to_string_pretty(spec).map_err(std::io::Error::other)?;
+    std::fs::write(dist_dir.join("openapi.json"), &json)?;
+
+    let yaml = serde_yaml::to_string(spec).map_err(std::io::Error::other)?;
+    std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
+
+    Ok(())
+}
 
 /// Build an [`OpenApiSpec`] from a collection of routes and user config.
 ///
@@ -460,6 +506,7 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
     for (name, schema) in &config.additional_schemas {
         registry.insert(name.clone(), schema.clone());
     }
+    registry.insert("ProblemDetails", problem_details_schema());
 
     // Collect every named schema reference produced by any operation so
     // we can back-fill component entries for types the user didn't
@@ -469,9 +516,14 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
     let mut referenced_names: std::collections::BTreeSet<&'static str> =
         std::collections::BTreeSet::new();
 
+    let mut any_secured = false;
+
     for api_doc in routes {
         if api_doc.hidden {
             continue;
+        }
+        if api_doc.secured {
+            any_secured = true;
         }
         if let Some(register) = api_doc.register_schemas {
             (register)(&mut registry);
@@ -481,6 +533,9 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
             collect_ref_names(entry, &mut referenced_names);
         }
         if let Some(entry) = &api_doc.response {
+            collect_ref_names(entry, &mut referenced_names);
+        }
+        if let Some(entry) = &api_doc.query_schema {
             collect_ref_names(entry, &mut referenced_names);
         }
 
@@ -514,17 +569,32 @@ pub fn generate_spec(config: &OpenApiConfig, routes: &[&ApiDoc]) -> OpenApiSpec 
         }
     }
 
+    // Register the same cookie-backed session auth that `#[secured]` uses at runtime.
+    let mut security_schemes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    if any_secured {
+        security_schemes.insert(
+            "SessionAuth".to_owned(),
+            serde_json::json!({
+                "type": "apiKey",
+                "in": "cookie",
+                "name": config.session_cookie_name.clone(),
+                "description": "Autumn session cookie. Secured routes check the configured auth.session_key inside the server-side session.",
+            }),
+        );
+    }
+
     let components_map = registry.into_map();
-    let components = if components_map.is_empty() {
-        None
-    } else {
+    let components = if !components_map.is_empty() || !security_schemes.is_empty() {
         Some(Components {
             schemas: components_map,
+            security_schemes,
         })
+    } else {
+        None
     };
 
     OpenApiSpec {
-        openapi: "3.0.3".to_owned(),
+        openapi: "3.1.0".to_owned(),
         info: Info {
             title: config.title.clone(),
             version: config.version.clone(),
@@ -545,7 +615,8 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
         api_doc.tags.iter().map(|s| (*s).to_owned()).collect()
     };
 
-    let parameters = api_doc
+    // Path parameters — always required.
+    let mut parameters: Vec<Parameter> = api_doc
         .path_params
         .iter()
         .map(|name| Parameter {
@@ -553,8 +624,25 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
             location: "path".to_owned(),
             required: true,
             schema: serde_json::json!({ "type": "string" }),
+            style: None,
+            explode: None,
         })
         .collect();
+
+    // Query parameters from `Query<T>` extractor.
+    // Use `style: form, explode: true` so each field of the query struct
+    // is serialized as an independent query key (e.g. `?q=foo&page=2`),
+    // which matches what the server's `Query<T>` deserialization expects.
+    if let Some(query_entry) = &api_doc.query_schema {
+        parameters.push(Parameter {
+            name: query_entry.name.to_owned(),
+            location: "query".to_owned(),
+            required: false,
+            schema: schema_value_for(query_entry),
+            style: Some("form".to_owned()),
+            explode: Some(true),
+        });
+    }
 
     let request_body = api_doc.request_body.as_ref().map(|entry| RequestBody {
         required: true,
@@ -594,6 +682,18 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
             content: response_content,
         },
     );
+    insert_problem_responses(&mut responses);
+
+    insert_problem_responses(&mut responses);
+
+    // Security requirement: `#[secured]` is backed by the Autumn session cookie.
+    let security = if api_doc.secured {
+        let mut req = BTreeMap::new();
+        req.insert("SessionAuth".to_owned(), Vec::new());
+        vec![req]
+    } else {
+        Vec::new()
+    };
 
     Operation {
         operation_id: api_doc.operation_id.to_owned(),
@@ -603,6 +703,7 @@ fn operation_for(api_doc: &ApiDoc) -> Operation {
         parameters,
         request_body,
         responses,
+        security,
     }
 }
 
@@ -618,24 +719,25 @@ fn schema_value_for(entry: &SchemaEntry) -> serde_json::Value {
             "items": schema_value_for(items),
         }),
         SchemaKind::Nullable(inner) => {
-            // OpenAPI 3.0 has no `type: "null"` (that's a 3.1 feature),
-            // so we use the 3.0-compatible patterns:
-            //   * For a `$ref`, wrap in `allOf` alongside
-            //     `nullable: true` — bare `$ref`s can't carry siblings,
-            //     and `allOf` is the standard workaround.
-            //   * For every other schema body, inject `nullable: true`
-            //     directly onto the existing object.
-            if inner.kind == SchemaKind::Ref {
-                serde_json::json!({
-                    "nullable": true,
-                    "allOf": [schema_value_for(inner)],
-                })
-            } else {
-                let mut v = schema_value_for(inner);
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("nullable".to_owned(), serde_json::Value::Bool(true));
+            // OpenAPI 3.1 aligns with JSON Schema 2020-12, which supports
+            // `type: "null"` natively:
+            //   * For a `$ref`, use `oneOf: [{$ref: ...}, {type: "null"}]`
+            //     so the ref can stand alone without `allOf` workarounds.
+            //   * For primitives, use the compact type-array form: `type: ["T", "null"]`.
+            //   * For all other schemas (arrays, nested nullable, etc.), use `oneOf`
+            //     so the full inner schema (e.g. `items`) is preserved.
+            match inner.kind {
+                SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
+                    serde_json::json!({
+                        "oneOf": [
+                            schema_value_for(inner),
+                            { "type": "null" },
+                        ],
+                    })
                 }
-                v
+                SchemaKind::Primitive(base_type) => {
+                    serde_json::json!({ "type": [base_type, "null"] })
+                }
             }
         }
     }
@@ -653,6 +755,91 @@ fn collect_ref_names(entry: &SchemaEntry, out: &mut std::collections::BTreeSet<&
         SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => collect_ref_names(inner, out),
         SchemaKind::Primitive(_) => {}
     }
+}
+
+#[cfg(feature = "openapi")]
+fn insert_problem_responses(responses: &mut BTreeMap<String, Response>) {
+    for status in [400_u16, 401, 403, 404, 409, 413, 415, 422, 500, 503] {
+        responses.entry(status.to_string()).or_insert_with(|| {
+            let mut content = BTreeMap::new();
+            content.insert(
+                "application/problem+json".to_owned(),
+                MediaType {
+                    schema: serde_json::json!({
+                        "$ref": "#/components/schemas/ProblemDetails",
+                    }),
+                },
+            );
+            Response {
+                description: status_description(status).to_owned(),
+                content,
+            }
+        });
+    }
+}
+
+#[cfg(feature = "openapi")]
+fn problem_details_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "type",
+            "title",
+            "status",
+            "detail",
+            "instance",
+            "code",
+            "request_id",
+            "errors",
+        ],
+        "properties": {
+            "type": {
+                "type": "string",
+                "format": "uri-reference",
+            },
+            "title": {
+                "type": "string",
+            },
+            "status": {
+                "type": "integer",
+                "minimum": 400,
+                "maximum": 599,
+            },
+            "detail": {
+                "type": "string",
+            },
+            "instance": {
+                "type": ["string", "null"],
+            },
+            "code": {
+                "type": "string",
+                "pattern": "^autumn\\.[a-z0-9_]+$",
+            },
+            "request_id": {
+                "type": ["string", "null"],
+            },
+            "errors": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["field", "messages"],
+                    "properties": {
+                        "field": {
+                            "type": "string",
+                        },
+                        "messages": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    })
 }
 
 #[cfg(feature = "openapi")]
@@ -676,8 +863,11 @@ const fn status_description(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "Response",
     }
 }
@@ -766,7 +956,7 @@ pub fn swagger_ui_html(
 #[must_use]
 pub fn swagger_ui_initializer_js(spec_url: &str) -> String {
     let spec_url = serde_json::to_string(spec_url)
-        .unwrap_or_else(|e| format!("\"/v3/api-docs?serialization_error={e}\""));
+        .unwrap_or_else(|e| format!("\"/openapi.json?serialization_error={e}\""));
     let mut out = String::with_capacity(256);
     out.push_str("window.onload = function() {\n");
     out.push_str("  window.ui = SwaggerUIBundle({\n");
@@ -809,8 +999,48 @@ mod tests {
             response: None,
             success_status: 200,
             hidden: false,
+            query_schema: None,
+            secured: false,
+            required_roles: &[],
             register_schemas: None,
         }
+    }
+
+    #[test]
+    fn config_builder_methods_work() {
+        let config = OpenApiConfig::new("Demo", "1.0.0")
+            .description("A cool API")
+            .openapi_json_path("/api.json")
+            .swagger_ui_path(None)
+            .session_cookie_name("demo.sid");
+
+        assert_eq!(config.title, "Demo");
+        assert_eq!(config.version, "1.0.0");
+        assert_eq!(config.description.unwrap(), "A cool API");
+        assert_eq!(config.openapi_json_path, "/api.json");
+        assert_eq!(config.swagger_ui_path, None);
+        assert_eq!(config.session_cookie_name, "demo.sid");
+    }
+
+    #[test]
+    fn secured_spec_uses_configured_session_cookie_name() {
+        let mut doc = make_doc();
+        doc.path = "/protected";
+        doc.operation_id = "protected";
+        doc.path_params = &[];
+        doc.secured = true;
+
+        let config = OpenApiConfig::new("Demo", "1.0.0").session_cookie_name("demo.sid");
+        let spec = generate_spec(&config, &[&doc]);
+        let scheme = &spec
+            .components
+            .as_ref()
+            .expect("secured routes emit security components")
+            .security_schemes["SessionAuth"];
+
+        assert_eq!(scheme["type"], "apiKey");
+        assert_eq!(scheme["in"], "cookie");
+        assert_eq!(scheme["name"], "demo.sid");
     }
 
     #[test]
@@ -819,7 +1049,7 @@ mod tests {
         let config = OpenApiConfig::new("Demo", "1.0.0");
         let spec = generate_spec(&config, &[&doc]);
 
-        assert_eq!(spec.openapi, "3.0.3");
+        assert_eq!(spec.openapi, "3.1.0");
         assert_eq!(spec.info.title, "Demo");
         assert!(spec.paths.contains_key("/users/{id}"));
 
@@ -897,52 +1127,9 @@ mod tests {
 
     #[test]
     fn swagger_ui_initializer_js_references_spec_url() {
-        let js = swagger_ui_initializer_js("/v3/api-docs");
+        let js = swagger_ui_initializer_js("/openapi.json");
         assert!(js.contains("SwaggerUIBundle"));
-        assert!(js.contains(r#""/v3/api-docs""#));
-    }
-
-    #[test]
-    fn nullable_ref_uses_openapi_3_0_shape() {
-        // OpenAPI 3.0 has no `type: "null"`, so nullable refs must use
-        // `nullable: true` + `allOf` instead. Wrapping in `anyOf` with
-        // a `type: "null"` member produces a spec that Swagger and
-        // OpenAPI validators reject.
-        static INNER: SchemaEntry = SchemaEntry {
-            name: "User",
-            kind: SchemaKind::Ref,
-        };
-        let entry = SchemaEntry {
-            name: "nullable",
-            kind: SchemaKind::Nullable(&INNER),
-        };
-        let value = schema_value_for(&entry);
-        assert_eq!(value["nullable"], true);
-        assert_eq!(
-            value["allOf"][0]["$ref"], "#/components/schemas/User",
-            "nullable refs must wrap in allOf so `$ref` can carry siblings"
-        );
-        assert!(value.get("anyOf").is_none(), "must not emit anyOf/null");
-        assert!(
-            value.get("type").is_none()
-                || value.get("type").unwrap() != &serde_json::Value::String("null".into()),
-            "must not emit type: null"
-        );
-    }
-
-    #[test]
-    fn nullable_primitive_inlines_nullable_flag() {
-        static INNER: SchemaEntry = SchemaEntry {
-            name: "integer",
-            kind: SchemaKind::Primitive("integer"),
-        };
-        let entry = SchemaEntry {
-            name: "nullable",
-            kind: SchemaKind::Nullable(&INNER),
-        };
-        let value = schema_value_for(&entry);
-        assert_eq!(value["type"], "integer");
-        assert_eq!(value["nullable"], true);
+        assert!(js.contains(r#""/openapi.json""#));
     }
 
     #[test]
@@ -1011,11 +1198,172 @@ mod tests {
     }
 
     #[test]
+    fn status_description_returns_correct_strings() {
+        assert_eq!(status_description(200), "OK");
+        assert_eq!(status_description(201), "Created");
+        assert_eq!(status_description(202), "Accepted");
+        assert_eq!(status_description(204), "No Content");
+        assert_eq!(status_description(301), "Moved Permanently");
+        assert_eq!(status_description(302), "Found");
+        assert_eq!(status_description(400), "Bad Request");
+        assert_eq!(status_description(401), "Unauthorized");
+        assert_eq!(status_description(403), "Forbidden");
+        assert_eq!(status_description(404), "Not Found");
+        assert_eq!(status_description(409), "Conflict");
+        assert_eq!(status_description(413), "Payload Too Large");
+        assert_eq!(status_description(415), "Unsupported Media Type");
+        assert_eq!(status_description(422), "Unprocessable Entity");
+        assert_eq!(status_description(500), "Internal Server Error");
+        assert_eq!(status_description(503), "Service Unavailable");
+        assert_eq!(status_description(418), "Response");
+    }
+
+    #[test]
     fn default_tag_picks_first_static_segment() {
         assert_eq!(default_tag("/users/{id}"), Some("users"));
         assert_eq!(default_tag("/api/v1/users"), Some("api"));
         assert_eq!(default_tag("/"), None);
         assert_eq!(default_tag("/{id}"), None);
+    }
+
+    // ── OpenAPI 3.1 compliance tests (RED phase) ───────────────────────────
+
+    #[test]
+    fn spec_version_is_3_1_0() {
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[]);
+        assert_eq!(
+            spec.openapi, "3.1.0",
+            "Autumn must emit OpenAPI 3.1.0, not {}",
+            spec.openapi
+        );
+    }
+
+    #[test]
+    fn nullable_ref_uses_openapi_3_1_one_of() {
+        // OpenAPI 3.1 aligns with JSON Schema 2020-12: nullable refs use
+        // `oneOf: [{$ref: ...}, {type: "null"}]` instead of 3.0's
+        // `nullable: true` + `allOf` workaround.
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "User",
+            kind: SchemaKind::Ref,
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert!(
+            value.get("nullable").is_none(),
+            "3.1 must not emit `nullable: true` (that is 3.0 only)"
+        );
+        assert!(
+            value.get("allOf").is_none(),
+            "3.1 must not use allOf for nullable refs"
+        );
+        let one_of = value["oneOf"]
+            .as_array()
+            .expect("3.1 nullable ref must use oneOf");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(
+            one_of[0]["$ref"], "#/components/schemas/User",
+            "first oneOf branch must be the $ref"
+        );
+        assert_eq!(
+            one_of[1]["type"], "null",
+            "second oneOf branch must be {{type: null}}"
+        );
+    }
+
+    #[test]
+    fn nullable_primitive_uses_type_array() {
+        // OpenAPI 3.1 uses `type: ["integer", "null"]` for nullable
+        // primitives instead of the 3.0 `nullable: true` flag.
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "integer",
+            kind: SchemaKind::Primitive("integer"),
+        };
+        let entry = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+        };
+        let value = schema_value_for(&entry);
+        assert!(
+            value.get("nullable").is_none(),
+            "3.1 must not emit `nullable: true`"
+        );
+        let types = value["type"]
+            .as_array()
+            .expect("3.1 nullable primitive must use a type array");
+        assert!(
+            types.contains(&serde_json::Value::String("integer".to_owned())),
+            "type array must include the base type"
+        );
+        assert!(
+            types.contains(&serde_json::Value::String("null".to_owned())),
+            "type array must include null"
+        );
+    }
+
+    #[test]
+    fn write_openapi_spec_to_dist_creates_json_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let config = OpenApiConfig::new("TestAPI", "2.0.0");
+        let spec = generate_spec(&config, &[]);
+
+        write_openapi_spec_to_dist(&spec, &dist).expect("write must succeed");
+
+        let json_path = dist.join("openapi.json");
+        assert!(json_path.exists(), "dist/openapi.json must be written");
+
+        let content = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["openapi"], "3.1.0");
+        assert_eq!(parsed["info"]["title"], "TestAPI");
+    }
+
+    #[test]
+    fn write_openapi_spec_to_dist_creates_yaml_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+
+        let config = OpenApiConfig::new("TestAPI", "2.0.0");
+        let spec = generate_spec(&config, &[]);
+
+        write_openapi_spec_to_dist(&spec, &dist).expect("write must succeed");
+
+        let yaml_path = dist.join("openapi.yaml");
+        assert!(yaml_path.exists(), "dist/openapi.yaml must be written");
+
+        let content = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            content.contains("openapi:"),
+            "YAML must include the openapi field"
+        );
+        assert!(content.contains("3.1.0"), "YAML must include the version");
+        assert!(content.contains("TestAPI"), "YAML must include the title");
+    }
+
+    #[test]
+    fn schema_registry_into_map_returns_all_schemas() {
+        let mut registry = SchemaRegistry::default();
+        registry.insert("Foo", serde_json::json!({ "type": "string" }));
+        registry.insert("Bar", serde_json::json!({ "type": "integer" }));
+
+        let map = registry.into_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.get("Foo").unwrap(),
+            &serde_json::json!({ "type": "string" })
+        );
+        assert_eq!(
+            map.get("Bar").unwrap(),
+            &serde_json::json!({ "type": "integer" })
+        );
     }
 
     #[test]

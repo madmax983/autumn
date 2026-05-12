@@ -28,6 +28,12 @@ fn compile_fail_tests() {
 
     // Cached macro failures
     t.compile_fail("tests/compile-fail/cached_self_receiver.rs");
+
+    // `policy = T` rejects a type that doesn't impl `Policy<Model>`
+    // at compile time, closing the silent-typo / wrong-type path that
+    // would otherwise only fail at request time with `500`.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_invalid_policy_type.rs");
 }
 
 #[test]
@@ -60,6 +66,14 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_draft_accessors.rs");
 
+    // Model factory builder (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_factory.rs");
+
+    // Model factory composition (#[factory_assoc]) — requires db feature
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_factory_composition.rs");
+
     // Repository compile-pass (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_no_hooks.rs");
@@ -69,14 +83,28 @@ fn compile_pass_tests() {
     t.pass("tests/compile-pass/repository_with_api.rs");
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_with_hooks_and_api.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_with_policy.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_policy_non_serialize_new.rs");
 
     // Cached macro
     t.pass("tests/compile-pass/cached_basic.rs");
     t.pass("tests/compile-pass/cached_result.rs");
 
+    // One-off operational task macro
+    t.pass("tests/compile-pass/task_basic.rs");
+    t.pass("tests/compile-pass/scheduled_coordination.rs");
+
     // WebSocket macro (requires ws feature)
     #[cfg(feature = "ws")]
     t.pass("tests/compile-pass/ws_basic.rs");
+
+    // Optimistic concurrency control: #[lock_version] (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_lock_version.rs");
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_lock_version.rs");
 }
 
 #[cfg(feature = "db")]

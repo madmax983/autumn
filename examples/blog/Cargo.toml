@@ -5,7 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-autumn-web = { path = "../../autumn" }
+autumn-web = { path = "../../autumn", features = ["i18n"] }
+autumn-admin-plugin = { path = "../../autumn-admin-plugin" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -15,3 +16,12 @@ maud = { version = "0.27", features = ["axum"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+# Enables TestDb (shared Postgres testcontainer) for integration tests.
+# The `db` feature is inherited from [dependencies]; test-support adds TestDb.
+autumn-web = { path = "../../autumn", features = ["test-support"] }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

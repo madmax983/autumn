@@ -30,11 +30,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::FutureExt as _;
 use tracing::Instrument as _;
 
 use crate::config::{AutumnConfig, ConfigLoader};
-#[cfg(feature = "db")]
-use crate::db::DatabasePoolProvider;
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -68,7 +67,11 @@ use crate::state::AppState;
 pub fn app() -> AppBuilder {
     AppBuilder {
         routes: Vec::new(),
+        route_sources: Vec::new(),
+        current_plugin: None,
         tasks: Vec::new(),
+        one_off_tasks: Vec::new(),
+        jobs: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -87,9 +90,24 @@ pub fn app() -> AppBuilder {
         pool_provider_factory: None,
         telemetry_provider: None,
         session_store: None,
+        #[cfg(feature = "ws")]
+        channels_backend: None,
+        #[cfg(feature = "storage")]
+        blob_store: None,
+        cache_backend: None,
         #[cfg(feature = "openapi")]
         openapi: None,
         audit_logger: None,
+        #[cfg(feature = "i18n")]
+        i18n_bundle: None,
+        #[cfg(feature = "i18n")]
+        i18n_auto_load: false,
+        policy_registrations: Vec::new(),
+        #[cfg(feature = "mail")]
+        mail_delivery_queue_factory: None,
+        #[cfg(feature = "mail")]
+        mail_previews: Vec::new(),
+        declared_routes: Vec::new(),
     }
 }
 
@@ -117,18 +135,15 @@ type PoolProviderFactory = Box<
         ) -> Pin<
             Box<
                 dyn Future<
-                        Output = Result<
-                            Option<
-                                diesel_async::pooled_connection::deadpool::Pool<
-                                    diesel_async::AsyncPgConnection,
-                                >,
-                            >,
-                            crate::db::PoolError,
-                        >,
+                        Output = Result<Option<crate::db::DatabaseTopology>, crate::db::PoolError>,
                     > + Send,
             >,
         > + Send,
 >;
+
+/// Closure that registers a policy or scope on the runtime
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+type PolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
 /// Builder for configuring and launching an Autumn application.
 ///
@@ -160,7 +175,14 @@ type PoolProviderFactory = Box<
 /// ```
 pub struct AppBuilder {
     routes: Vec<Route>,
+    /// Parallel to `routes`: registration origin for each route.
+    route_sources: Vec<crate::route_listing::RouteSource>,
+    /// Non-None while a plugin's `build()` is executing; routes and scoped
+    /// groups added during that window are attributed to this plugin.
+    current_plugin: Option<String>,
     tasks: Vec<crate::task::TaskInfo>,
+    one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
+    jobs: Vec<crate::job::JobInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     scoped_groups: Vec<ScopedGroup>,
@@ -193,6 +215,19 @@ pub struct AppBuilder {
     /// `apply_session_layer` skips the config-driven `memory`/`redis` selection
     /// and uses this store directly.
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    /// Custom channel backend (tier-1 subsystem replacement). When `Some`,
+    /// `AppState` skips config-driven `in_process`/`redis` channel selection.
+    #[cfg(feature = "ws")]
+    channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
+    /// Custom blob store installed via
+    /// [`AppBuilder::with_blob_store`]. When `Some`, `preflight_storage`
+    /// is skipped and this store is installed directly onto `AppState`.
+    #[cfg(feature = "storage")]
+    blob_store: Option<crate::storage::SharedBlobStore>,
+    /// Shared cache backend installed via [`AppBuilder::with_cache_backend`].
+    /// When `Some`, installed onto `AppState` as `shared_cache` before startup
+    /// hooks run.
+    cache_backend: Option<Arc<dyn crate::cache::Cache>>,
     /// `OpenAPI` generation configuration. When `Some`, the router mounts
     /// `/v3/api-docs` (serving `openapi.json`) and `/swagger-ui` (if the
     /// Swagger UI path is set). When `None`, no docs endpoints are mounted.
@@ -204,7 +239,43 @@ pub struct AppBuilder {
     openapi: Option<crate::openapi::OpenApiConfig>,
     /// Shared audit logger used for append-only compliance events.
     audit_logger: Option<Arc<crate::audit::AuditLogger>>,
+    /// Loaded i18n translation bundle. When `Some`, an `axum::Extension`
+    /// layer publishing this bundle is added at `run()` time so the
+    /// [`Locale`](crate::i18n::Locale) extractor can resolve translations.
+    #[cfg(feature = "i18n")]
+    i18n_bundle: Option<Arc<crate::i18n::Bundle>>,
+    /// Whether to load the i18n bundle after the active config loader resolves
+    /// [`AutumnConfig`]. This keeps `.i18n_auto()` aligned with
+    /// `.with_config_loader(...)`.
+    #[cfg(feature = "i18n")]
+    i18n_auto_load: bool,
+    /// Deferred [`Policy`](crate::authorization::Policy) and
+    /// [`Scope`](crate::authorization::Scope) registrations applied
+    /// to [`AppState::policy_registry`] just before the router is
+    /// built. Stored as boxed closures so we can carry the
+    /// generic type parameters across the builder boundary.
+    policy_registrations: Vec<PolicyRegistration>,
+    /// Durable mail delivery queue factory registered at builder time. Invoked
+    /// with the freshly-built [`AppState`] before `install_mailer` runs so it
+    /// can capture framework-managed resources (DB pool, channels, etc.).
+    #[cfg(feature = "mail")]
+    mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
+    /// Mail template previews registered for the dev preview UI.
+    #[cfg(feature = "mail")]
+    mail_previews: Vec<crate::mail::MailPreview>,
+    /// Routes explicitly declared by plugins for listing purposes, to complement
+    /// opaque `nest_routers`. Included in `autumn routes` output even though
+    /// the underlying Axum router is not enumerable.
+    declared_routes: Vec<crate::route_listing::RouteInfo>,
 }
+
+/// Boxed builder closure that constructs a durable
+/// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the live
+/// [`AppState`].
+#[cfg(feature = "mail")]
+pub(crate) type MailDeliveryQueueFactory = Box<
+    dyn FnOnce(&AppState) -> crate::AutumnResult<Arc<dyn crate::mail::MailDeliveryQueue>> + Send,
+>;
 
 /// A group of routes sharing a common path prefix and middleware layer.
 ///
@@ -213,6 +284,8 @@ pub struct AppBuilder {
 pub(crate) struct ScopedGroup {
     pub(crate) prefix: String,
     pub(crate) routes: Vec<Route>,
+    /// Registration origin: user application or a named plugin.
+    pub(crate) source: crate::route_listing::RouteSource,
     /// Closure that applies the layer to a sub-router.
     pub(crate) apply_layer:
         Box<dyn FnOnce(axum::Router<AppState>) -> axum::Router<AppState> + Send>,
@@ -319,6 +392,15 @@ impl AppBuilder {
     /// ```
     #[must_use]
     pub fn routes(mut self, routes: Vec<Route>) -> Self {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
+        for _ in &routes {
+            self.route_sources.push(source.clone());
+        }
         self.routes.extend(routes);
         self
     }
@@ -331,6 +413,23 @@ impl AppBuilder {
     #[must_use]
     pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
         self.tasks.extend(tasks);
+        self
+    }
+
+    /// Register one-off operational tasks runnable with `autumn task <name>`.
+    ///
+    /// Use the [`one_off_tasks!`](crate::one_off_tasks) macro to collect
+    /// `#[task]` handlers.
+    #[must_use]
+    pub fn one_off_tasks(mut self, tasks: Vec<crate::task::OneOffTaskInfo>) -> Self {
+        self.one_off_tasks.extend(tasks);
+        self
+    }
+
+    /// Register ad-hoc background jobs with the application.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
         self
     }
 
@@ -514,9 +613,16 @@ impl AppBuilder {
         <L::Service as tower::Service<axum::http::Request<axum::body::Body>>>::Future:
             Send + 'static,
     {
+        let source = self
+            .current_plugin
+            .as_ref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.clone())
+            });
         self.scoped_groups.push(ScopedGroup {
             prefix: prefix.to_owned(),
             routes,
+            source,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -707,6 +813,33 @@ impl AppBuilder {
         self
     }
 
+    /// Explicitly register route metadata for listing via `autumn routes`.
+    ///
+    /// Plugins that mount routes via [`AppBuilder::nest`] (which is opaque to
+    /// the route listing) can call this method so that `autumn routes --format json`
+    /// shows their routes with the correct plugin attribution.
+    ///
+    /// Routes are automatically attributed to the current plugin when called from
+    /// within a plugin's `build()` method. The `source` field of each supplied
+    /// `RouteInfo` is overwritten with that attribution.
+    #[must_use]
+    pub fn declare_plugin_routes(
+        mut self,
+        routes: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
+    ) -> Self {
+        let source = self
+            .current_plugin
+            .as_deref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            });
+        for mut route in routes {
+            route.source = source.clone();
+            self.declared_routes.push(route);
+        }
+        self
+    }
+
     /// Register an async startup hook that runs after [`AppState`] exists and
     /// before the server begins accepting requests.
     ///
@@ -785,6 +918,64 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Register a pre-loaded i18n translation bundle.
+    ///
+    /// Most apps prefer [`Self::i18n_auto`] which loads from the
+    /// `i18n/` directory using the configured `[i18n]` block. Use this
+    /// directly when you need to construct a [`Bundle`](crate::i18n::Bundle)
+    /// from non-filesystem sources (in-memory tests, embedded `.ftl` files,
+    /// translation-management-system clients, etc.).
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n(mut self, bundle: crate::i18n::Bundle) -> Self {
+        self.i18n_bundle = Some(Arc::new(bundle));
+        self.i18n_auto_load = false;
+        self
+    }
+
+    /// Auto-load the i18n translation bundle from the configured directory
+    /// (`i18n/` by default), reading the `[i18n]` block from the active
+    /// [`AutumnConfig`].
+    ///
+    /// Fails fast during [`Self::run`] if the configured default locale's file is
+    /// missing — the spec calls out this as the desired behaviour: a
+    /// half-localized app is worse than a clearly-broken one. The error
+    /// path here panics with the typed [`LoadError`](crate::i18n::LoadError)
+    /// formatted as a string so it surfaces in the same banner as other
+    /// fatal startup errors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when configuration cannot be loaded, the configured i18n
+    /// directory is unreadable, or the default locale bundle is missing or
+    /// invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    ///
+    /// #[get("/")]
+    /// async fn index() -> &'static str { "ok" }
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     # #[cfg(feature = "i18n")]
+    ///     autumn_web::app()
+    ///         .i18n_auto()
+    ///         .routes(routes![index])
+    ///         .run()
+    ///         .await;
+    /// }
+    /// ```
+    #[cfg(feature = "i18n")]
+    #[must_use]
+    pub fn i18n_auto(mut self) -> Self {
+        self.i18n_bundle = None;
+        self.i18n_auto_load = true;
+        self
+    }
+
     // ── Tier-1 subsystem replacement hooks ─────────────────────
     //
     // Each `with_*` method swaps a framework-default subsystem for a
@@ -816,7 +1007,7 @@ impl AppBuilder {
         self
     }
 
-    /// Install a custom [`DatabasePoolProvider`],
+    /// Install a custom [`crate::db::DatabasePoolProvider`],
     /// replacing the default `deadpool + diesel-async` pool factory.
     ///
     /// Useful for adding metrics/circuit-breaker wrappers, switching to a
@@ -836,7 +1027,7 @@ impl AppBuilder {
         }
         self.pool_provider_factory =
             Some(Box::new(move |config: crate::config::DatabaseConfig| {
-                Box::pin(async move { provider.create_pool(&config).await })
+                Box::pin(async move { provider.create_topology(&config).await })
             }));
         self
     }
@@ -881,6 +1072,158 @@ impl AppBuilder {
         self
     }
 
+    /// Install a custom [`ChannelsBackend`](crate::channels::ChannelsBackend),
+    /// bypassing the config-driven `in_process`/`redis` backend selection.
+    ///
+    /// Useful for NATS, Postgres `LISTEN/NOTIFY`, test harnesses, or a
+    /// sharded pub/sub fabric. Emits a `tracing::warn!` if a backend was
+    /// already installed.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn with_channels_backend<B>(mut self, backend: B) -> Self
+    where
+        B: crate::channels::ChannelsBackend,
+    {
+        if self.channels_backend.is_some() {
+            tracing::warn!(
+                "channels backend replaced; the previously-installed backend was overwritten"
+            );
+        }
+        self.channels_backend = Some(Arc::new(backend));
+        self
+    }
+
+    /// Install a custom [`BlobStore`](crate::storage::BlobStore),
+    /// bypassing the config-driven `local`/`s3` backend selection.
+    ///
+    /// The typical use case is the `autumn-storage-s3` plugin:
+    ///
+    /// ```rust,ignore
+    /// use autumn_storage_s3::S3BlobStore;
+    ///
+    /// # async fn example() {
+    /// let config = autumn_web::config::TomlEnvConfigLoader::new()
+    ///     .load().await.unwrap();
+    /// let store = S3BlobStore::from_config(&config.storage.s3)
+    ///     .await.unwrap();
+    /// autumn_web::app()
+    ///     .with_blob_store(store)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    ///
+    /// Emits a `tracing::warn!` if a store was already installed (last
+    /// call wins).
+    ///
+    /// # Note on `LocalBlobStore`
+    ///
+    /// **Do not** pass a [`LocalBlobStore`](crate::storage::LocalBlobStore)
+    /// here. The local backend requires the framework to mount a `/_blobs`
+    /// serving route (for HMAC-signed presigned URLs); that route is only
+    /// wired up when the store is provisioned through the config-driven path
+    /// (`backend = "local"` in `autumn.toml`). Calling
+    /// `.with_blob_store(LocalBlobStore::new(...))` will silently succeed but
+    /// presigned URLs will return 404. Use the `[storage]` config section for
+    /// local storage.
+    #[cfg(feature = "storage")]
+    #[must_use]
+    pub fn with_blob_store<B>(mut self, store: B) -> Self
+    where
+        B: crate::storage::BlobStore,
+    {
+        if self.blob_store.is_some() {
+            tracing::warn!("blob store replaced; the previously-installed store was overwritten");
+        }
+        self.blob_store = Some(std::sync::Arc::new(store));
+        self
+    }
+
+    /// Register a shared cache backend for the application.
+    ///
+    /// Once registered, `#[cached]` functions will use this backend as their
+    /// primary store (falling back to their per-function Moka cache only if the
+    /// global backend is absent). `CacheResponseLayer::from_app` returns a layer
+    /// wired to this same backend.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_cache_redis::RedisCache;
+    ///
+    /// let cache = RedisCache::connect("redis://redis:6379", "myapp:cache").await?;
+    /// autumn_web::app()
+    ///     .with_cache_backend(cache)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn with_cache_backend<C: crate::cache::Cache>(mut self, cache: C) -> Self {
+        if self.cache_backend.is_some() {
+            tracing::warn!(
+                "cache backend replaced; the previously-installed backend was overwritten"
+            );
+        }
+        self.cache_backend = Some(Arc::new(cache) as Arc<dyn crate::cache::Cache>);
+        self
+    }
+
+    /// Register a durable [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) for
+    /// [`Mailer::deliver_later`](crate::mail::Mailer::deliver_later).
+    ///
+    /// Must be called before [`run`](Self::run). Plugins call this inside their
+    /// `apply` implementation to satisfy the production delivery guard without
+    /// requiring `mail.allow_in_process_deliver_later_in_production`.
+    ///
+    /// Use [`Self::with_mail_delivery_queue_factory`] when the queue needs
+    /// framework-managed resources (the DB pool, channels, etc.) that only
+    /// exist after the [`AppState`] is constructed.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue(
+        mut self,
+        queue: impl crate::mail::MailDeliveryQueue + 'static,
+    ) -> Self {
+        let arc: Arc<dyn crate::mail::MailDeliveryQueue> = Arc::new(queue);
+        self.mail_delivery_queue_factory = Some(Box::new(move |_state| Ok(arc)));
+        self
+    }
+
+    /// Register a factory that builds the durable
+    /// [`MailDeliveryQueue`](crate::mail::MailDeliveryQueue) from the
+    /// fully-built [`AppState`].
+    ///
+    /// Use this when the queue captures framework-managed resources — for
+    /// example a DB-outbox queue that needs the connection pool returned by
+    /// [`AppState::pool`]. The factory runs once, immediately before
+    /// `install_mailer`, with the live `AppState`. Returning `Err` aborts
+    /// startup with the propagated error.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_mail_delivery_queue_factory<F, Q>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&AppState) -> crate::AutumnResult<Q> + Send + 'static,
+        Q: crate::mail::MailDeliveryQueue + 'static,
+    {
+        self.mail_delivery_queue_factory = Some(Box::new(move |state| {
+            factory(state).map(|q| Arc::new(q) as Arc<dyn crate::mail::MailDeliveryQueue>)
+        }));
+        self
+    }
+
+    /// Register mail template previews for the dev mail preview UI.
+    ///
+    /// Pair this with `#[mailer_preview]` and `mail_previews![...]`.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn mail_previews(
+        mut self,
+        previews: impl IntoIterator<Item = crate::mail::MailPreview>,
+    ) -> Self {
+        self.mail_previews.extend(previews);
+        self
+    }
+
     /// Register an additional audit sink for structured audit events.
     ///
     /// Multiple calls accumulate sinks. Logged events are fanned out to all
@@ -896,6 +1239,59 @@ impl AppBuilder {
             .map_or_else(crate::audit::AuditLogger::new, |logger| (*logger).clone())
             .with_sink(Arc::new(sink));
         self.audit_logger = Some(Arc::new(logger));
+        self
+    }
+
+    /// Register a [`Policy`](crate::authorization::Policy)
+    /// implementation for resource type `R`.
+    ///
+    /// Multiple policies per resource are not supported: registering
+    /// `R` twice causes a startup-time panic with a clear error
+    /// message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::authorization::{Policy, PolicyContext};
+    ///
+    /// #[derive(Default)]
+    /// struct PostPolicy;
+    /// impl Policy<Post> for PostPolicy { /* ... */ }
+    ///
+    /// autumn_web::app()
+    ///     .routes(routes![...])
+    ///     .policy::<Post, _>(PostPolicy)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[must_use]
+    pub fn policy<R, P>(mut self, policy: P) -> Self
+    where
+        R: Send + Sync + 'static,
+        P: crate::authorization::Policy<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_policy::<R, _>(policy);
+        }));
+        self
+    }
+
+    /// Register a [`Scope`](crate::authorization::Scope) implementation
+    /// for resource type `R`. The scope filters list endpoints
+    /// (`GET /<api>` for `#[repository(api = "...", scope = ...)]`)
+    /// to records the current user is allowed to read.
+    ///
+    /// Default impls return an empty list so a missing scope opt-in
+    /// fails closed.
+    #[must_use]
+    pub fn scope<R, S>(mut self, scope: S) -> Self
+    where
+        R: Send + Sync + 'static,
+        S: crate::authorization::Scope<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_scope::<R, _>(scope);
+        }));
         self
     }
 
@@ -920,8 +1316,14 @@ impl AppBuilder {
             );
             return self;
         }
-        self.registered_plugins.insert(name.into_owned());
-        plugin.build(self)
+        let name_str = name.into_owned();
+        self.registered_plugins.insert(name_str.clone());
+        // Save outer plugin context so nested plugin() calls don't permanently
+        // clear it; restore it after this plugin's build() returns.
+        let outer_plugin = self.current_plugin.replace(name_str);
+        let mut result = plugin.build(self);
+        result.current_plugin = outer_plugin;
+        result
     }
 
     /// Apply a [`Plugins`](crate::plugin::Plugins) bundle (a plugin or tuple
@@ -944,9 +1346,12 @@ impl AppBuilder {
     /// Register embedded Diesel migrations with the application.
     ///
     /// When migrations are registered:
+    /// - They always target the primary/write database role
+    ///   (`database.primary_url`, falling back to legacy `database.url`).
     /// - In **dev** mode, pending migrations run automatically on startup.
     /// - In **prod** mode, pending migrations are logged as warnings but
-    ///   not applied -- use `autumn migrate` to apply them explicitly.
+    ///   not applied -- use a one-shot `autumn migrate` job before rolling web
+    ///   replicas.
     ///
     /// # Examples
     ///
@@ -1001,9 +1406,32 @@ impl AppBuilder {
             return;
         }
 
+        // ── Route dump mode ────────────────────────────────────────────
+        // When AUTUMN_DUMP_ROUTES=1, print the route listing JSON and exit.
+        // This is triggered by `autumn routes` to introspect the app's
+        // route table without booting the server or connecting to a database.
+        if is_dump_routes_mode() {
+            self.run_dump_routes_mode().await;
+            return;
+        }
+
+        if is_list_one_off_tasks_mode() {
+            self.run_list_one_off_tasks_mode();
+            return;
+        }
+
+        if let Some(task_name) = one_off_task_name_from_env() {
+            self.run_one_off_task_mode(task_name).await;
+            return;
+        }
+
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks,
+            one_off_tasks: _,
+            jobs,
             static_metas: _,
             exception_filters,
             scoped_groups,
@@ -1022,9 +1450,24 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            cache_backend,
             #[cfg(feature = "openapi")]
             openapi,
             audit_logger,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
+            policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_previews,
+            declared_routes: _,
         } = self;
 
         let all_routes = routes;
@@ -1032,6 +1475,10 @@ impl AppBuilder {
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
 
         // 3. Validate routes
         assert!(
@@ -1058,34 +1505,127 @@ impl AppBuilder {
         // setup_database so a doomed boot doesn't run migrations first.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
 
+        // 4d. Validate signing secret — production must have a stable, private,
+        // entropy-meeting secret before the server binds. Dev/test are exempt.
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // 4e. Signed webhook configs must resolve to usable key material
+        // before the app binds. Missing secrets should fail before a real
+        // provider retry loop starts hammering a broken endpoint.
+        fail_fast_on_invalid_webhook_config(&config);
+
+        // 4f. Provision the configured BlobStore *before* `setup_database`.
+        // `LocalBlobStore::new` does real IO (creates + canonicalizes the
+        // root) and the storage code may `process::exit(1)` on failure
+        // (unwritable root, or `storage.backend = "s3"` with no plugin).
+        // Doing it before migrations means a doomed boot can't mutate
+        // the DB schema first.
+        // A custom store installed via `.with_blob_store(...)` bypasses
+        // config-driven instantiation entirely (no IO, no fail-fast).
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
+
         // 5. Create database pool and run migrations (if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, migrations, pool_provider_factory)
+        let database = setup_database(&config, migrations, pool_provider_factory)
             .await
             .unwrap_or_else(|e| {
                 tracing::error!("{e}");
                 std::process::exit(1);
             });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         #[cfg(feature = "db")]
         if pool.is_some() {
             tracing::info!(
-                max_connections = config.database.pool_size,
-                "Database pool configured"
+                primary_max_connections = config.database.effective_primary_pool_size(),
+                replica_configured = config.database.replica_url.is_some(),
+                replica_max_connections = config.database.effective_replica_pool_size(),
+                "Database topology configured"
             );
         } else {
             tracing::info!("Database not configured");
         }
 
+        // 5b. Fail-fast on `#[repository(api = ...)]` endpoints that
+        // were mounted without a paired `policy = ...` argument when
+        // running in `prod` profile and the explicit escape hatch is
+        // off. Hides exactly the footgun called out in the issue:
+        // "a developer who flips the `api =` switch on a
+        // `#[repository]` exposes mutate endpoints that any
+        // authenticated user can call against any record."
+        validate_repository_api_policies(&all_routes, &scoped_groups, &config);
+
         // 6. Build the router (with optional static-file layer)
-        let state = build_state(
+        let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
+            #[cfg(feature = "ws")]
+            channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
+        if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
+            state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
+        }
+        // Apply deferred policy / scope registrations onto the live
+        // app state. Done before the router is built so any panic
+        // from double-registration surfaces during startup, not
+        // mid-request.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+        // Now that registrations have been applied, verify that
+        // every `#[repository(policy = X)]`-annotated route has
+        // an X actually registered on the live registry. Catches
+        // the "wired the macro arg, forgot the `.policy(...)`
+        // builder call" footgun before any 500 lands.
+        validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            tracing::error!(error = %error, "Failed to configure mailer");
+            std::process::exit(1);
+        });
+        #[cfg(feature = "mail")]
+        state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+
+        // Install the preflighted blob store on the freshly-built
+        // AppState, and remember the serving router so it gets merged
+        // into the user's router below.
+        #[cfg(feature = "storage")]
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
+        install_webhook_registry(&state, &config);
+
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
         let dist_ref = if dist_dir.exists() {
@@ -1093,6 +1633,12 @@ impl AppBuilder {
         } else {
             None
         };
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers = merge_routers;
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_with_static_inner(
             all_routes,
             &config,
@@ -1106,8 +1652,14 @@ impl AppBuilder {
                 custom_layers,
                 error_page_renderer,
                 session_store,
+                // Respect the [openapi] profile gate: if disabled in config,
+                // suppress the endpoint even when .openapi(...) was called.
                 #[cfg(feature = "openapi")]
-                openapi,
+                openapi: if config.openapi_runtime.enabled {
+                    openapi
+                } else {
+                    None
+                },
             },
         )
         .unwrap_or_else(|error| {
@@ -1115,8 +1667,9 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        // 7. Bind and serve. We start listening before startup hooks finish so
-        // `/startup` can honestly report startup progress.
+        // 7. Bind and initialize pre-serve runtime dependencies. Once those
+        // are ready, start listening before startup hooks finish so `/startup`
+        // can honestly report startup progress.
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
@@ -1124,10 +1677,17 @@ impl AppBuilder {
                 tracing::error!(addr = %addr, "Failed to bind: {e}");
                 std::process::exit(1);
             });
-        tracing::info!(addr = %addr, "Listening");
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let server_shutdown = tokio_util::sync::CancellationToken::new();
+
+        if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
+            tracing::error!(error = %error, "job runtime initialization failed");
+            std::process::exit(1);
+        }
+
+        tracing::info!(addr = %addr, "Listening");
+
         let server_shutdown_wait = server_shutdown.clone();
         let server_task = tokio::spawn(async move {
             axum::serve(
@@ -1177,8 +1737,18 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty() {
-                start_task_scheduler(tasks, &state, server_shutdown.clone());
+            if !tasks.is_empty()
+                && let Err(error) = start_task_scheduler_with_config(
+                    tasks,
+                    &state,
+                    &server_shutdown,
+                    &config.scheduler,
+                )
+            {
+                tracing::error!(error = %error, "scheduled task runtime initialization failed");
+                server_shutdown.cancel();
+                server_task.abort();
+                std::process::exit(1);
             }
             state.probes().mark_startup_complete();
         }
@@ -1201,13 +1771,21 @@ impl AppBuilder {
     /// Triggered when `AUTUMN_BUILD_STATIC=1` is set (by `autumn build`).
     /// Builds the Axum router, renders each static route through it, and
     /// writes HTML + manifest to the `dist/` directory.
+    #[allow(clippy::too_many_lines)]
     async fn run_build_mode(self) {
         let Self {
             routes,
+            route_sources: _,
+            current_plugin: _,
             tasks: _,
+            one_off_tasks: _,
+            jobs: _,
             static_metas,
             exception_filters: _,
-            scoped_groups: _,
+            #[cfg(feature = "openapi")]
+            scoped_groups,
+            #[cfg(not(feature = "openapi"))]
+                scoped_groups: _,
             merge_routers: _,
             nest_routers: _,
             custom_layers,
@@ -1223,9 +1801,24 @@ impl AppBuilder {
             pool_provider_factory,
             telemetry_provider,
             session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            cache_backend,
             #[cfg(feature = "openapi")]
-                openapi: _,
+            openapi,
             audit_logger: _,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
+            policy_registrations,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
+            #[cfg(feature = "mail")]
+            mail_previews,
+            declared_routes: _,
         } = self;
 
         let all_routes = routes;
@@ -1233,6 +1826,40 @@ impl AppBuilder {
         // Load config (same as normal startup)
         let (config, _telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        // Snapshot ApiDocs before all_routes is moved into the router builder.
+        // Includes top-level routes and scoped groups (with prefixed paths) so
+        // the emitted dist/openapi.json matches what the runtime spec serves.
+        #[cfg(feature = "openapi")]
+        let api_docs_snapshot: Vec<crate::openapi::ApiDoc> = {
+            let mut docs: Vec<crate::openapi::ApiDoc> =
+                all_routes.iter().map(|r| r.api_doc.clone()).collect();
+            for group in &scoped_groups {
+                // Mirror the same normalization as the runtime OpenAPI builder:
+                // use join_nested_path for correct trailing-slash handling, and
+                // merge prefix path params so they appear in the operation.
+                let prefix_params = crate::router::extract_path_params(&group.prefix);
+                for route in &group.routes {
+                    let mut doc = route.api_doc.clone();
+                    let full = crate::router::join_nested_path(&group.prefix, route.api_doc.path);
+                    doc.path = Box::leak(full.into_boxed_str());
+                    if !prefix_params.is_empty() {
+                        let mut merged: Vec<&'static str> = prefix_params
+                            .iter()
+                            .map(|p| &*Box::leak(p.clone().into_boxed_str()))
+                            .collect();
+                        merged.extend_from_slice(doc.path_params);
+                        doc.path_params = Box::leak(merged.into_boxed_slice());
+                    }
+                    docs.push(doc);
+                }
+            }
+            docs
+        };
 
         if static_metas.is_empty() {
             eprintln!("No static routes registered. Nothing to build.");
@@ -1244,23 +1871,100 @@ impl AppBuilder {
         // was installed. Symmetrical to the same check in run() so static
         // builds don't run migrations against a doomed boot either.
         fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
+
+        // Preflight the configured BlobStore the same way `run()` does.
+        // Static routes can read presigned URLs out of `BlobStoreState`
+        // during pre-rendering (e.g. `<img src=blob.url()>`); without
+        // the bootstrap they'd 500 during `autumn build` even though
+        // the server path works. A custom store from `.with_blob_store()`
+        // bypasses config-driven instantiation.
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
 
         // Build state (with DB if configured)
         #[cfg(feature = "db")]
-        let pool = setup_database(&config, vec![], pool_provider_factory)
+        let database = setup_database(&config, vec![], pool_provider_factory)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("{e}");
                 std::process::exit(1);
             });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
 
         let mut state = build_state(
             &config,
             #[cfg(feature = "db")]
-            pool,
+            pool.as_ref(),
+            #[cfg(feature = "ws")]
+            channels_backend,
         );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
+        if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
+            state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
+        }
+        // Static-site builds are short-lived and don't run the request loop,
+        // so deliver_later is never invoked. install_mailer_with_factory skips
+        // the queue factory when enforce_durable_guard is false (the factory
+        // may open Redis/Harvest connections unavailable here), and the guard
+        // itself is bypassed too — the Mailer is still installed so static
+        // routes that extract `Mailer` for immediate `send` calls resolve.
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            false,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
+        #[cfg(feature = "mail")]
+        state.insert_extension(crate::mail::MailPreviewRegistry::new(mail_previews));
         // run_build_mode used ProbeState::default(), which does not start as pending
         state.probes = crate::probe::ProbeState::default();
+
+        // Apply deferred policy / scope registrations onto the live
+        // app state — same as `run()`. Static routes can carry
+        // `#[authorize]` checks or live behind `#[repository(policy =
+        // ..., scope = ...)]` index endpoints; without registering
+        // here, every such pre-render call would 500 at build time
+        // with `no policy/scope registered`, and `render_static_routes`
+        // would treat that as a build failure even though
+        // `.policy(...)` / `.scope(...)` was configured on the
+        // builder.
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+
+        #[cfg(feature = "i18n")]
+        let custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+
+        // Install the preflighted storage and remember the serving
+        // router so static generation hits the same `/_blobs/...`
+        // routes the server path serves.
+        #[cfg(feature = "storage")]
+        let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -1269,6 +1973,12 @@ impl AppBuilder {
         // would otherwise silently fall back to the config-driven backend.
         // Custom Tower layers registered via .layer(...) are likewise
         // applied so static output matches the production response pipeline.
+        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
+        #[cfg(feature = "storage")]
+        if let Some(router) = storage_router {
+            merge_routers.push(router);
+        }
         let router = crate::router::try_build_router_inner(
             all_routes,
             &config,
@@ -1276,7 +1986,7 @@ impl AppBuilder {
             crate::router::RouterContext {
                 exception_filters: Vec::new(),
                 scoped_groups: Vec::new(),
-                merge_routers: Vec::new(),
+                merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
                 error_page_renderer: None,
@@ -1307,6 +2017,272 @@ impl AppBuilder {
                 std::process::exit(1);
             }
         }
+
+        // When OpenAPI is configured, write the spec to dist/ so consumers
+        // can retrieve a machine-readable API contract alongside the HTML.
+        #[cfg(feature = "openapi")]
+        if let Some(openapi_config) = openapi {
+            let openapi_config =
+                openapi_config.session_cookie_name(config.session.cookie_name.clone());
+            let docs: Vec<&crate::openapi::ApiDoc> = api_docs_snapshot.iter().collect();
+            let spec = crate::openapi::generate_spec(&openapi_config, &docs);
+            match crate::openapi::write_openapi_spec_to_dist(&spec, &dist_dir) {
+                Ok(()) => {
+                    eprintln!(
+                        "  \u{2713} OpenAPI spec written \u{2192} {}/openapi.json",
+                        dist_dir.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
+            }
+        }
+    }
+
+    /// Dump the application's route listing as JSON and exit.
+    ///
+    /// Triggered when `AUTUMN_DUMP_ROUTES=1` is set (by `autumn routes`).
+    /// Exits with code 0 on success, code 1 on JSON serialization failure.
+    /// Does not connect to a database or bind a TCP port.
+    async fn run_dump_routes_mode(self) {
+        let Self {
+            routes,
+            route_sources,
+            scoped_groups,
+            merge_routers,
+            nest_routers,
+            declared_routes,
+            config_loader_factory,
+            telemetry_provider,
+            #[cfg(feature = "openapi")]
+            openapi,
+            ..
+        } = self;
+
+        // Raw Axum routers registered via .merge()/.nest() are opaque: there is
+        // no public API to enumerate their routes. Always warn so callers know
+        // some routes may be missing even if declare_plugin_routes was used.
+        let hidden = merge_routers.len() + nest_routers.len();
+        if hidden > 0 {
+            eprintln!(
+                "[autumn routes] warning: {hidden} raw router(s) added via \
+                 .merge()/.nest() are not enumerable and are omitted from this listing"
+            );
+        }
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        let mut infos =
+            crate::route_listing::collect_route_infos(&routes, &route_sources, &scoped_groups);
+        infos.extend(declared_routes);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
+        crate::route_listing::sort_route_infos(&mut infos);
+
+        let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
+            eprintln!("Failed to serialize route listing: {e}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
+
+    /// Dump registered one-off tasks as JSON and exit.
+    ///
+    /// Triggered by `AUTUMN_LIST_TASKS=1` from `autumn task --list`.
+    fn run_list_one_off_tasks_mode(self) {
+        let Self { one_off_tasks, .. } = self;
+
+        if let Err(error) = crate::task::validate_unique_one_off_task_names(&one_off_tasks) {
+            eprintln!("Invalid task registration: {error}");
+            std::process::exit(1);
+        }
+
+        let listing = crate::task::list_one_off_tasks(&one_off_tasks);
+        let json = serde_json::to_string_pretty(&listing).unwrap_or_else(|error| {
+            eprintln!("Failed to serialize task listing: {error}");
+            std::process::exit(1);
+        });
+        println!("{json}");
+        std::process::exit(0);
+    }
+
+    /// Run a registered one-off task with full application context and exit.
+    ///
+    /// Triggered by `AUTUMN_RUN_TASK=<name>` from `autumn task <name>`.
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
+    async fn run_one_off_task_mode(self, requested_name: String) {
+        let Self {
+            one_off_tasks,
+            jobs,
+            #[cfg(feature = "i18n")]
+            custom_layers,
+            #[cfg(not(feature = "i18n"))]
+                custom_layers: _,
+            startup_hooks,
+            shutdown_hooks,
+            config_loader_factory,
+            #[cfg(feature = "db")]
+            migrations,
+            #[cfg(feature = "db")]
+            pool_provider_factory,
+            telemetry_provider,
+            session_store,
+            #[cfg(feature = "ws")]
+            channels_backend,
+            #[cfg(feature = "storage")]
+            blob_store,
+            audit_logger,
+            #[cfg(feature = "i18n")]
+            i18n_bundle,
+            #[cfg(feature = "i18n")]
+            i18n_auto_load,
+            policy_registrations,
+            cache_backend,
+            #[cfg(feature = "mail")]
+            mail_delivery_queue_factory,
+            ..
+        } = self;
+
+        if let Err(error) = crate::task::validate_unique_one_off_task_names(&one_off_tasks) {
+            eprintln!("Invalid task registration: {error}");
+            std::process::exit(1);
+        }
+
+        let Some((task_name, task_handler)) = one_off_tasks
+            .iter()
+            .find(|task| task.name == requested_name)
+            .map(|task| (task.name.clone(), task.handler))
+        else {
+            eprintln!("No one-off task named '{requested_name}' is registered.");
+            print_available_one_off_tasks(&one_off_tasks);
+            std::process::exit(1);
+        };
+
+        let args = one_off_task_args_from_env().unwrap_or_else(|error| {
+            eprintln!("Invalid task args: {error}");
+            std::process::exit(1);
+        });
+
+        let (config, _telemetry_guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "i18n")]
+        let i18n_bundle =
+            resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &config, &crate::config::OsEnv);
+
+        fail_fast_on_invalid_session_config(&config, session_store.is_some());
+        fail_fast_on_invalid_signing_secret(&config);
+
+        #[cfg(feature = "storage")]
+        let storage_bootstrap = blob_store.map_or_else(
+            || preflight_storage(&config),
+            |store| {
+                Some(StorageBootstrap {
+                    store,
+                    serving: None,
+                })
+            },
+        );
+
+        #[cfg(feature = "db")]
+        let database = setup_database(&config, migrations, pool_provider_factory)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+        #[cfg(feature = "db")]
+        let pool = database.topology;
+        #[cfg(feature = "db")]
+        let replica_readiness = database.replica_readiness;
+        #[cfg(feature = "db")]
+        let replica_migration_check = database.replica_migration_check;
+
+        let mut state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            pool.as_ref(),
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        #[cfg(feature = "db")]
+        configure_replica_migration_check(&state, replica_migration_check);
+        #[cfg(feature = "db")]
+        apply_replica_migration_readiness(&state, replica_readiness);
+        if let Some(cache) = cache_backend {
+            crate::cache::set_global_cache(cache.clone());
+            state.shared_cache = Some(cache);
+        } else {
+            crate::cache::clear_global_cache();
+        }
+
+        for register in policy_registrations {
+            register(state.policy_registry());
+        }
+
+        #[cfg(feature = "mail")]
+        crate::mail::install_mailer_with_factory(
+            &state,
+            &config.mail,
+            mail_delivery_queue_factory,
+            true,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to configure mailer: {error}");
+            std::process::exit(1);
+        });
+
+        if let Some(logger) = audit_logger {
+            state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
+        }
+
+        #[cfg(feature = "i18n")]
+        let _custom_layers = install_i18n_bundle_layer(custom_layers, &state, i18n_bundle);
+
+        #[cfg(feature = "storage")]
+        let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
+
+        let task_shutdown = tokio_util::sync::CancellationToken::new();
+        if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
+            eprintln!("job runtime initialization failed: {error}");
+            std::process::exit(1);
+        }
+
+        if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
+            eprintln!("startup hook failed: {error}");
+            task_shutdown.cancel();
+            std::process::exit(1);
+        }
+        state.probes().mark_startup_complete();
+
+        tracing::info!(task = %task_name, "Running one-off task");
+        let span = tracing::info_span!("one_off_task", task = %task_name);
+        let result = (task_handler)(state.clone(), args).instrument(span).await;
+
+        task_shutdown.cancel();
+        run_shutdown_hooks(&shutdown_hooks).await;
+
+        match result {
+            Ok(()) => {
+                tracing::info!(task = %task_name, "One-off task completed");
+            }
+            Err(error) => {
+                tracing::error!(task = %task_name, error = %error, "One-off task failed");
+                eprintln!("Task '{task_name}' failed: {error}");
+                for cause in error.source_chain() {
+                    eprintln!("Caused by: {cause}");
+                }
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -1314,43 +2290,134 @@ pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
 }
 
+pub(crate) fn is_dump_routes_mode() -> bool {
+    std::env::var("AUTUMN_DUMP_ROUTES").as_deref() == Ok("1")
+}
+
+pub(crate) fn is_list_one_off_tasks_mode() -> bool {
+    std::env::var("AUTUMN_LIST_TASKS").as_deref() == Ok("1")
+}
+
+fn one_off_task_name_from_env() -> Option<String> {
+    std::env::var("AUTUMN_RUN_TASK")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn one_off_task_args_from_env() -> Result<Vec<String>, String> {
+    match std::env::var("AUTUMN_TASK_ARGS_JSON") {
+        Ok(raw) if !raw.trim().is_empty() => serde_json::from_str(&raw)
+            .map_err(|error| format!("AUTUMN_TASK_ARGS_JSON must be a JSON string array: {error}")),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn print_available_one_off_tasks(tasks: &[crate::task::OneOffTaskInfo]) {
+    let listing = crate::task::list_one_off_tasks(tasks);
+    if listing.is_empty() {
+        eprintln!("No one-off tasks are registered. Add .one_off_tasks(one_off_tasks![...]).");
+        return;
+    }
+
+    eprintln!("Available tasks:");
+    for task in listing {
+        if task.description.is_empty() {
+            eprintln!("  {}", task.name);
+        } else {
+            eprintln!("  {:<24} {}", task.name, task.description);
+        }
+    }
+}
+
 /// Start scheduled tasks in background Tokio tasks.
 ///
 /// Each task runs in its own spawned task with error logging.
-/// Uses `tokio::time` for fixed-delay scheduling and `tokio-cron-scheduler`
-/// for cron-based scheduling. The `shutdown` token is used to stop the cron
-/// scheduler gracefully when the server receives a termination signal.
+/// Uses `tokio::time` for fixed-delay scheduling and `croner` for cron-based
+/// scheduling. The `shutdown` token is used to stop cron loops gracefully when
+/// the server receives a termination signal.
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
+#[allow(dead_code)]
 fn start_task_scheduler(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
-    shutdown: tokio_util::sync::CancellationToken,
+    shutdown: &tokio_util::sync::CancellationToken,
 ) {
+    if let Err(error) = start_task_scheduler_with_config(
+        tasks,
+        state,
+        shutdown,
+        &crate::config::SchedulerConfig::default(),
+    ) {
+        tracing::error!(error = %error, "scheduled task runtime initialization failed");
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cognitive_complexity)]
+fn start_task_scheduler_with_config(
+    tasks: Vec<crate::task::TaskInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    scheduler_config: &crate::config::SchedulerConfig,
+) -> crate::AutumnResult<()> {
     tracing::info!(count = tasks.len(), "Starting scheduled tasks");
+    let coordinator = crate::scheduler::coordinator_from_config(scheduler_config, state)?;
+    let lease_ttl = std::time::Duration::from_secs(scheduler_config.lease_ttl_secs);
     for task_info in &tasks {
         let schedule_desc = task_info.schedule.to_string();
-        tracing::info!(name = %task_info.name, schedule = %schedule_desc, "Registered task");
+        tracing::info!(
+            name = %task_info.name,
+            schedule = %schedule_desc,
+            coordination = %task_info.coordination,
+            scheduler_backend = coordinator.backend(),
+            replica_id = coordinator.replica_id(),
+            lease_ttl_secs = scheduler_config.lease_ttl_secs,
+            "Registered task"
+        );
     }
 
-    let mut cron_tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)> =
-        Vec::new();
+    let mut cron_tasks: Vec<CronTaskSpec> = Vec::new();
 
     for task_info in tasks {
         let state = state.clone();
         let name = task_info.name.clone();
         let handler = task_info.handler;
+        let coordination = task_info.coordination;
         let schedule_desc = task_info.schedule.to_string();
+        state.task_registry.register_scheduled(
+            &name,
+            &schedule_desc,
+            coordination,
+            coordinator.backend(),
+            coordinator.replica_id(),
+        );
 
         match task_info.schedule {
             crate::task::Schedule::FixedDelay(delay) => {
-                // Register with the task registry for /actuator/tasks
-                state.task_registry.register(&name, &schedule_desc);
-
+                let coordinator = Arc::clone(&coordinator);
+                let shutdown = shutdown.child_token();
                 tokio::spawn(async move {
                     loop {
-                        tokio::time::sleep(delay).await;
-                        execute_fixed_delay_task(name.clone(), state.clone(), handler).await;
+                        state
+                            .task_registry
+                            .record_next_run_at(&name, &format_next_task_run_after(delay));
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(delay) => {
+                                execute_fixed_delay_task(
+                                    name.clone(),
+                                    state.clone(),
+                                    handler,
+                                    delay,
+                                    coordination,
+                                    Arc::clone(&coordinator),
+                                    lease_ttl,
+                                )
+                                .await;
+                            }
+                        }
                     }
                 });
             }
@@ -1358,18 +2425,20 @@ fn start_task_scheduler(
                 expression,
                 timezone,
             } => {
-                state.task_registry.register(&name, &schedule_desc);
-                cron_tasks.push((name, expression, timezone, handler));
+                cron_tasks.push(CronTaskSpec {
+                    name,
+                    expression,
+                    timezone,
+                    coordination,
+                    handler,
+                });
             }
         }
     }
 
-    if !cron_tasks.is_empty() {
-        let state = state.clone();
-        tokio::spawn(async move {
-            run_cron_scheduler(cron_tasks, state, shutdown).await;
-        });
-    }
+    run_cron_scheduler(cron_tasks, state, shutdown, &coordinator, lease_ttl);
+
+    Ok(())
 }
 
 #[allow(unused_variables, clippy::needless_pass_by_value)]
@@ -1415,28 +2484,113 @@ async fn execute_task_result(
         task = %name,
         schedule = schedule,
     );
-    let result = (handler)(state.clone()).instrument(task_span).await;
+    let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (handler)(state.clone()).instrument(task_span)
+    })) {
+        Ok(future) => future,
+        Err(panic) => {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return Err((duration_ms, format_scheduled_task_panic(panic.as_ref())));
+        }
+    };
+    let result = std::panic::AssertUnwindSafe(future).catch_unwind().await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     match result {
-        Ok(()) => Ok(duration_ms),
-        Err(e) => Err((duration_ms, e.to_string())),
+        Ok(Ok(())) => Ok(duration_ms),
+        Ok(Err(e)) => Err((duration_ms, e.to_string())),
+        Err(panic) => Err((duration_ms, format_scheduled_task_panic(panic.as_ref()))),
     }
 }
 
+fn format_scheduled_task_panic(panic: &(dyn Any + Send)) -> String {
+    let detail = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&'static str>().copied())
+        .unwrap_or("non-string panic payload");
+    format!("scheduled task handler panicked: {detail}")
+}
+
+async fn execute_task_result_with_optional_lease_ttl(
+    state: &AppState,
+    handler: crate::task::TaskHandler,
+    start: std::time::Instant,
+    name: &str,
+    schedule: &'static str,
+    lease_ttl: Option<std::time::Duration>,
+) -> Result<u64, (u64, String)> {
+    let Some(lease_ttl) = lease_ttl else {
+        return execute_task_result(state, handler, start, name, schedule).await;
+    };
+
+    tokio::time::timeout(
+        lease_ttl,
+        execute_task_result(state, handler, start, name, schedule),
+    )
+    .await
+    .map_or_else(
+        |_| {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Err((
+                duration_ms,
+                format!(
+                    "scheduled task exceeded lease TTL of {}s",
+                    lease_ttl.as_secs()
+                ),
+            ))
+        },
+        std::convert::identity,
+    )
+}
+
 /// Handle the execution of a single fixed-delay task.
+#[allow(clippy::cognitive_complexity)]
 async fn execute_fixed_delay_task(
     name: String,
     state: AppState,
     handler: crate::task::TaskHandler,
+    delay: std::time::Duration,
+    coordination: crate::task::TaskCoordination,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
+    let tick_key =
+        crate::scheduler::fixed_delay_tick_key(&name, delay, crate::scheduler::now_unix_duration());
+    let lease = match coordinator
+        .try_acquire(&name, &tick_key, coordination)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::debug!(task = %name, tick = %tick_key, "Scheduled task tick already claimed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire scheduled task lease");
+            return;
+        }
+    };
+    state
+        .task_registry
+        .record_leader(&name, lease.leader_id(), &tick_key);
     tracing::debug!(task = %name, "Running scheduled task");
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "fixed_delay").await {
+    let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
+    match execute_task_result_with_optional_lease_ttl(
+        &state,
+        handler,
+        start,
+        &name,
+        "fixed_delay",
+        lease_ttl,
+    )
+    .await
+    {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Task completed");
@@ -1463,17 +2617,53 @@ async fn execute_fixed_delay_task(
             );
         }
     }
+
+    if let Err(error) = lease.release().await {
+        tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to release scheduled task lease");
+    }
 }
 
 /// Handle the execution of a single cron task.
-async fn execute_cron_task(name: String, state: AppState, handler: crate::task::TaskHandler) {
+#[allow(clippy::cognitive_complexity)]
+async fn execute_cron_task(
+    name: String,
+    state: AppState,
+    handler: crate::task::TaskHandler,
+    coordination: crate::task::TaskCoordination,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
+    scheduled_unix_secs: u64,
+) {
+    let tick_key = crate::scheduler::cron_tick_key(&name, scheduled_unix_secs);
+    let lease = match coordinator
+        .try_acquire(&name, &tick_key, coordination)
+        .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::debug!(task = %name, tick = %tick_key, "Cron task tick already claimed");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to acquire cron task lease");
+            return;
+        }
+    };
+    state
+        .task_registry
+        .record_leader(&name, lease.leader_id(), &tick_key);
     tracing::debug!(task = %name, "Running cron task");
     state.task_registry.record_start(&name);
 
     send_ws_sys_task_msg(&state, "started", &name, vec![]);
 
     let start = std::time::Instant::now();
-    match execute_task_result(&state, handler, start, &name, "cron").await {
+    let lease_ttl = lease_ttl_for_run(&lease, coordination, lease_ttl);
+    match execute_task_result_with_optional_lease_ttl(
+        &state, handler, start, &name, "cron", lease_ttl,
+    )
+    .await
+    {
         Ok(duration_ms) => {
             state.task_registry.record_success(&name, duration_ms);
             tracing::debug!(task = %name, "Cron task completed");
@@ -1500,118 +2690,173 @@ async fn execute_cron_task(name: String, state: AppState, handler: crate::task::
             );
         }
     }
+
+    if let Err(error) = lease.release().await {
+        tracing::warn!(task = %name, tick = %tick_key, error = %error, "Failed to release cron task lease");
+    }
 }
 
-async fn register_cron_task(
-    sched: &tokio_cron_scheduler::JobScheduler,
+struct CronTaskSpec {
     name: String,
     expression: String,
     timezone: Option<String>,
+    coordination: crate::task::TaskCoordination,
     handler: crate::task::TaskHandler,
-    state: AppState,
+}
+
+fn lease_ttl_for_run(
+    lease: &crate::scheduler::SchedulerLease,
+    coordination: crate::task::TaskCoordination,
+    lease_ttl: std::time::Duration,
+) -> Option<std::time::Duration> {
+    (coordination == crate::task::TaskCoordination::Fleet && lease.backend() == "postgres")
+        .then_some(lease_ttl)
+}
+
+fn run_cron_scheduler(
+    tasks: Vec<CronTaskSpec>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    coordinator: &Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
-    let state_clone = state.clone();
-    let name_clone = name.clone();
+    if tasks.is_empty() {
+        return;
+    }
 
-    let job_result = build_cron_job(&expression, timezone.as_deref(), move |_uuid, _lock| {
-        let state = state_clone.clone();
-        let name = name_clone.clone();
-        Box::pin(async move {
-            execute_cron_task(name, state, handler).await;
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-    });
-
-    match job_result {
-        Ok(job) => {
-            if let Err(e) = sched.add(job).await {
-                tracing::error!(task = %name, error = %e, "Failed to add cron task to scheduler");
-            }
-        }
-        Err(e) => {
-            tracing::error!(task = %name, error = %e, "Failed to create cron job");
-        }
+    tracing::info!(count = tasks.len(), "Cron scheduler started");
+    for task in tasks {
+        let state = state.clone();
+        let coordinator = Arc::clone(coordinator);
+        let shutdown = shutdown.child_token();
+        tokio::spawn(async move {
+            run_cron_task_loop(task, state, shutdown, coordinator, lease_ttl).await;
+        });
     }
 }
 
-async fn setup_cron_scheduler(
-    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
-    state: AppState,
-) -> Option<tokio_cron_scheduler::JobScheduler> {
-    use tokio_cron_scheduler::JobScheduler;
-
-    let sched = match JobScheduler::new().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create cron job scheduler");
-            return None;
-        }
-    };
-
-    for (name, expression, timezone, handler) in tasks {
-        register_cron_task(&sched, name, expression, timezone, handler, state.clone()).await;
-    }
-
-    if let Err(e) = sched.start().await {
-        tracing::error!(error = %e, "Failed to start cron scheduler");
-        return None;
-    }
-
-    Some(sched)
-}
-
-/// Run the `tokio-cron-scheduler` for all cron tasks, shutting down when the
-/// `shutdown` token is cancelled.
 #[allow(clippy::cognitive_complexity)]
-async fn run_cron_scheduler(
-    tasks: Vec<(String, String, Option<String>, crate::task::TaskHandler)>,
+async fn run_cron_task_loop(
+    task: CronTaskSpec,
     state: AppState,
     shutdown: tokio_util::sync::CancellationToken,
+    coordinator: Arc<dyn crate::scheduler::SchedulerCoordinator>,
+    lease_ttl: std::time::Duration,
 ) {
-    let Some(mut sched) = setup_cron_scheduler(tasks, state).await else {
-        return;
+    let CronTaskSpec {
+        name,
+        expression,
+        timezone,
+        coordination,
+        handler,
+    } = task;
+
+    let cron = match expression.parse::<croner::Cron>() {
+        Ok(cron) => cron,
+        Err(error) => {
+            tracing::error!(task = %name, expression = %expression, error = %error, "Failed to create cron job");
+            return;
+        }
     };
+    let timezone = timezone
+        .as_deref()
+        .and_then(|timezone| {
+            timezone.parse::<chrono_tz::Tz>().map_or_else(
+                |_| {
+                    tracing::warn!(task = %name, timezone = %timezone, "Unrecognized timezone; falling back to UTC");
+                    None
+                },
+                Some,
+            )
+        })
+        .unwrap_or(chrono_tz::UTC);
+    let mut cursor = chrono::Utc::now().with_timezone(&timezone);
 
-    tracing::info!("Cron scheduler started");
-    shutdown.cancelled().await;
-    tracing::info!("Shutting down cron scheduler");
-
-    if let Err(e) = sched.shutdown().await {
-        tracing::error!(error = %e, "Failed to shut down cron scheduler");
-    }
-}
-
-/// Build a cron [`Job`](tokio_cron_scheduler::Job) for the given expression and optional
-/// IANA timezone string.
-///
-/// If `timezone` is `None` or cannot be parsed, UTC is used.
-fn build_cron_job<F>(
-    expression: &str,
-    timezone: Option<&str>,
-    run: F,
-) -> Result<tokio_cron_scheduler::Job, tokio_cron_scheduler::JobSchedulerError>
-where
-    F: 'static
-        + FnMut(
-            uuid::Uuid,
-            tokio_cron_scheduler::JobScheduler,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-        + Send
-        + Sync,
-{
-    use tokio_cron_scheduler::Job;
-
-    if let Some(tz_str) = timezone {
-        match tz_str.parse::<chrono_tz::Tz>() {
-            Ok(tz) => return Job::new_async_tz(expression, tz, run),
-            Err(_) => {
-                tracing::warn!(
-                    timezone = %tz_str,
-                    "Unrecognized timezone; falling back to UTC"
-                );
+    loop {
+        let now = chrono::Utc::now().with_timezone(&timezone);
+        let scheduled_at = match next_cron_occurrence_after(&cron, &cursor, &now) {
+            Ok(scheduled_at) => scheduled_at,
+            Err(error) => {
+                tracing::error!(task = %name, expression = %expression, error = %error, "Failed to compute next cron tick");
+                return;
+            }
+        };
+        state.task_registry.record_next_run_at(
+            &name,
+            &scheduled_at.with_timezone(&chrono::Utc).to_rfc3339(),
+        );
+        let sleep_for = cron_sleep_duration_until(&scheduled_at);
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = tokio::time::sleep(sleep_for) => {
+                let woke_at = chrono::Utc::now().with_timezone(&timezone);
+                match cron_occurrence_is_overdue(&cron, &scheduled_at, &woke_at) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            task = %name,
+                            scheduled_at = %scheduled_at,
+                            woke_at = %woke_at,
+                            "Skipping overdue cron task tick"
+                        );
+                        cursor = woke_at;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(task = %name, expression = %expression, error = %error, "Failed to evaluate cron tick lateness");
+                        return;
+                    }
+                }
+                let scheduled_unix_secs = u64::try_from(scheduled_at.timestamp()).unwrap_or_default();
+                tokio::spawn(execute_cron_task(
+                    name.clone(),
+                    state.clone(),
+                    handler,
+                    coordination,
+                    Arc::clone(&coordinator),
+                    lease_ttl,
+                    scheduled_unix_secs,
+                ));
+                cursor = scheduled_at;
             }
         }
     }
-    Job::new_async(expression, run)
+}
+
+fn format_next_task_run_after(delay: std::time::Duration) -> String {
+    let now = chrono::Utc::now();
+    let Ok(delay) = chrono::TimeDelta::from_std(delay) else {
+        return now.to_rfc3339();
+    };
+    (now + delay).to_rfc3339()
+}
+
+fn next_cron_occurrence_after<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    cursor: &chrono::DateTime<Tz>,
+    now: &chrono::DateTime<Tz>,
+) -> Result<chrono::DateTime<Tz>, croner::errors::CronError> {
+    let anchor = if cursor < now { now } else { cursor };
+    cron.find_next_occurrence(anchor, false)
+}
+
+fn cron_occurrence_is_overdue<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    scheduled_at: &chrono::DateTime<Tz>,
+    now: &chrono::DateTime<Tz>,
+) -> Result<bool, croner::errors::CronError> {
+    let next_after_scheduled = cron.find_next_occurrence(scheduled_at, false)?;
+    Ok(&next_after_scheduled <= now)
+}
+
+fn cron_sleep_duration_until<Tz: chrono::TimeZone>(
+    scheduled_at: &chrono::DateTime<Tz>,
+) -> std::time::Duration {
+    scheduled_at
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or_default()
 }
 
 async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::AutumnResult<()> {
@@ -1619,6 +2864,20 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
         hook(state.clone()).await?;
     }
     Ok(())
+}
+
+fn initialize_job_runtime(
+    jobs: Vec<crate::job::JobInfo>,
+    state: &AppState,
+    shutdown: &tokio_util::sync::CancellationToken,
+    config: &crate::config::JobConfig,
+) -> crate::AutumnResult<()> {
+    crate::job::clear_global_job_client();
+    if jobs.is_empty() {
+        Ok(())
+    } else {
+        crate::job::start_runtime(jobs, state, shutdown, config)
+    }
 }
 
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
@@ -1676,6 +2935,249 @@ fn fail_fast_on_invalid_session_config(config: &AutumnConfig, has_custom_session
     }
 }
 
+/// Fail immediately if the signing secret is misconfigured for the active profile.
+///
+/// In production, a missing, too-short, or demo-valued signing secret is a
+/// hard failure — the server must not bind. In dev/test the check is skipped
+/// so zero-config local development continues to work.
+fn fail_fast_on_invalid_signing_secret(config: &AutumnConfig) {
+    use crate::security::config::validate_signing_secret;
+
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let secret = config.security.signing_secret.secret.as_deref();
+
+    if let Err(error) = validate_signing_secret(secret, is_production) {
+        eprintln!("Invalid signing secret configuration: {error}");
+        eprintln!(
+            "  hint: generate a secret with `openssl rand -hex 32` and set \
+             AUTUMN_SECURITY__SIGNING_SECRET"
+        );
+        std::process::exit(1);
+    }
+
+    // Previous secrets accepted during rotation must meet the same bar as the
+    // current secret — a weak previous key can still be used to forge tokens.
+    if is_production {
+        for (i, prev) in config
+            .security
+            .signing_secret
+            .previous_secrets
+            .iter()
+            .enumerate()
+        {
+            if let Err(error) = validate_signing_secret(Some(prev.as_str()), true) {
+                eprintln!("Invalid signing secret configuration: previous_secrets[{i}]: {error}");
+                eprintln!(
+                    "  hint: every previous secret must meet the same entropy requirement \
+                     as the current secret"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn fail_fast_on_invalid_webhook_config(config: &AutumnConfig) {
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    if let Err(error) = config.security.webhooks.validate(is_production) {
+        eprintln!("Invalid signed webhook configuration: {error}");
+        std::process::exit(1);
+    }
+}
+
+pub(crate) fn install_webhook_registry(state: &AppState, config: &AutumnConfig) {
+    if let Err(error) =
+        crate::webhook::install_registry_from_config(state, &config.security.webhooks)
+    {
+        eprintln!("Invalid signed webhook configuration: {error}");
+        std::process::exit(1);
+    }
+}
+
+/// Constructed [`BlobStore`](crate::storage::BlobStore) plus the
+/// optional axum router that serves signed URLs for the Local backend.
+/// Returned by [`preflight_storage`] before any DB side effects so a
+/// doomed boot can't run migrations first; installed onto
+/// [`AppState`] later via [`StorageBootstrap::install`].
+#[cfg(feature = "storage")]
+struct StorageBootstrap {
+    store: crate::storage::SharedBlobStore,
+    serving: Option<axum::Router<AppState>>,
+}
+
+#[cfg(feature = "storage")]
+impl StorageBootstrap {
+    /// Install the preflighted store on `AppState` and return the
+    /// optional serving router so the caller can merge it into the
+    /// app router.
+    fn install(self, state: &AppState) -> Option<axum::Router<AppState>> {
+        state.insert_extension::<crate::storage::BlobStoreState>(
+            crate::storage::BlobStoreState::new(self.store),
+        );
+        self.serving
+    }
+}
+
+/// Provision the configured [`BlobStore`](crate::storage::BlobStore)
+/// before any database side effects. Construction is the side-effecting
+/// step (creates + canonicalizes the storage root, may
+/// `process::exit(1)` on a misconfiguration); we deliberately run it
+/// before `setup_database` so a doomed boot doesn't apply migrations
+/// first. Installation onto `AppState` happens later via
+/// [`StorageBootstrap::install`].
+#[cfg(feature = "storage")]
+#[allow(clippy::too_many_lines)] // Single switch over backend variants reads as one unit.
+fn preflight_storage(config: &AutumnConfig) -> Option<StorageBootstrap> {
+    use crate::storage::StorageBackendPlan;
+
+    let plan = config
+        .storage
+        .backend_plan(config.profile.as_deref())
+        .unwrap_or_else(|error| {
+            // Cover the cases `backend_plan` rejects up front:
+            // `LocalInProduction` (prod + local without ack),
+            // `MissingS3Bucket`/`MissingS3Region`/`S3FeatureDisabled`.
+            // Each is a configuration mistake — fail the boot loudly
+            // rather than running migrations and then dying.
+            tracing::error!(%error, "invalid storage backend config; aborting startup");
+            std::process::exit(1);
+        });
+
+    match plan {
+        StorageBackendPlan::Disabled => None,
+        StorageBackendPlan::Local {
+            provider_id,
+            root,
+            mount_path,
+            default_url_expiry_secs,
+            warn_in_production,
+        } => Some(bootstrap_local_storage(
+            config,
+            &provider_id,
+            &root,
+            &mount_path,
+            default_url_expiry_secs,
+            warn_in_production,
+        )),
+        StorageBackendPlan::S3 { .. } => {
+            // `storage.backend = "s3"` requires the `autumn-storage-s3` plugin.
+            // Construct an `S3BlobStore` and register it with `.with_blob_store()`
+            // before calling `.run()` — when you do, the custom store bypasses
+            // this path entirely and `preflight_storage` is never called.
+            tracing::error!(
+                "storage.backend=s3 requires the `autumn-storage-s3` plugin. \
+                 Add it to your Cargo.toml, build an S3BlobStore from your config, \
+                 and call `.with_blob_store(store)` on your AppBuilder. \
+                 Aborting startup."
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(feature = "storage")]
+fn bootstrap_local_storage(
+    config: &AutumnConfig,
+    provider_id: &str,
+    root: &std::path::Path,
+    mount_path: &str,
+    default_url_expiry_secs: u64,
+    warn_in_production: bool,
+) -> StorageBootstrap {
+    use crate::storage::{LocalBlobStore, SharedBlobStore, local::SigningKey};
+
+    if warn_in_production {
+        tracing::warn!(
+            "prod profile is using the local-disk blob store; \
+             bytes won't survive replica turnover. Set \
+             storage.backend=s3 or storage.allow_local_in_production=true \
+             to acknowledge"
+        );
+    }
+
+    // Signing key precedence:
+    // 1. security.signing_secret (canonical, shared with session/CSRF)
+    // 2. storage.local.signing_key (legacy override — still respected)
+    // 3. Random ephemeral key (dev only — warns in prod)
+    let (signing_key, previous_signing_keys) = config
+        .security
+        .signing_secret
+        .secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map_or_else(
+            || {
+                config
+                    .storage
+                    .local
+                    .signing_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || {
+                            if matches!(config.profile.as_deref(), Some("prod" | "production")) {
+                                tracing::warn!(
+                                    "no signing secret configured in prod; blob URL signatures \
+                                     won't survive a process restart. Set \
+                                     AUTUMN_SECURITY__SIGNING_SECRET."
+                                );
+                            }
+                            (SigningKey::random(), vec![])
+                        },
+                        |legacy| (SigningKey::new(legacy.as_bytes().to_vec()), vec![]),
+                    )
+            },
+            |secret| {
+                let current = SigningKey::new(secret.as_bytes().to_vec());
+                let previous = config
+                    .security
+                    .signing_secret
+                    .previous_secrets
+                    .iter()
+                    .map(|s| SigningKey::new(s.as_bytes().to_vec()))
+                    .collect::<Vec<_>>();
+                (current, previous)
+            },
+        );
+
+    let store = match LocalBlobStore::new(
+        provider_id.to_string(),
+        root.to_path_buf(),
+        mount_path.to_string(),
+        std::time::Duration::from_secs(default_url_expiry_secs),
+        signing_key,
+        previous_signing_keys,
+    ) {
+        Ok(store) => store,
+        Err(err) => {
+            // The operator explicitly chose `storage.backend = "local"`
+            // — a non-writable root means uploads can't possibly
+            // work, so abort the boot rather than letting upload
+            // handlers serve 500s after deploy.
+            tracing::error!(
+                error = %err,
+                root = %root.display(),
+                "failed to initialize local blob store; aborting startup"
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let serving = crate::storage::local::serve_router(&store);
+    let arc: SharedBlobStore = std::sync::Arc::new(store);
+
+    tracing::info!(
+        provider = %provider_id,
+        root = %root.display(),
+        mount = %mount_path,
+        "Local blob store mounted"
+    );
+
+    StorageBootstrap {
+        store: arc,
+        serving: Some(serving),
+    }
+}
 async fn load_config_and_telemetry(
     config_loader: Option<ConfigLoaderFactory>,
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
@@ -1705,22 +3207,71 @@ async fn load_config_and_telemetry(
     (config, telemetry_guard)
 }
 
+#[cfg(feature = "i18n")]
+fn resolve_i18n_bundle(
+    explicit_bundle: Option<Arc<crate::i18n::Bundle>>,
+    auto_load: bool,
+    config: &AutumnConfig,
+    env: &dyn crate::config::Env,
+) -> Option<Arc<crate::i18n::Bundle>> {
+    if explicit_bundle.is_some() {
+        return explicit_bundle;
+    }
+    if !auto_load {
+        return None;
+    }
+
+    let dir = project_dir(&config.i18n.dir, env);
+    Some(Arc::new(
+        crate::i18n::Bundle::load_from_dir(&dir, &config.i18n)
+            .unwrap_or_else(|e| panic!("i18n_auto: {e}")),
+    ))
+}
+
+#[cfg(feature = "i18n")]
+fn install_i18n_bundle_layer(
+    mut custom_layers: Vec<CustomLayerRegistration>,
+    state: &AppState,
+    bundle: Option<Arc<crate::i18n::Bundle>>,
+) -> Vec<CustomLayerRegistration> {
+    let Some(bundle) = bundle else {
+        return custom_layers;
+    };
+
+    tracing::info!(
+        locales = ?bundle.locales(),
+        default = bundle.default_locale(),
+        "i18n bundle loaded"
+    );
+    state.insert_extension::<Arc<crate::i18n::Bundle>>(bundle.clone());
+    // Use the existing IntoAppLayer plumbing so the Extension is visible to
+    // every request. axum::Extension<T> is itself a tower::Layer when T:
+    // Clone + Send + Sync + 'static.
+    let ext_layer = axum::Extension(bundle);
+    custom_layers.push(CustomLayerRegistration {
+        type_id: TypeId::of::<axum::Extension<Arc<crate::i18n::Bundle>>>(),
+        apply: Box::new(move |router| router.layer(ext_layer)),
+    });
+    custom_layers
+}
+
+#[cfg(feature = "db")]
+struct DatabaseBootstrap {
+    topology: Option<crate::db::DatabaseTopology>,
+    replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+    replica_migration_check: Option<(String, String)>,
+}
+
 #[cfg(feature = "db")]
 async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     pool_provider: Option<PoolProviderFactory>,
-) -> Result<
-    Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
-    String,
-> {
-    let pool = match pool_provider {
+) -> Result<DatabaseBootstrap, String> {
+    let check_replica_migrations = !migrations.is_empty();
+    let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
-        None => {
-            crate::db::DieselDeadpoolPoolProvider::new()
-                .create_pool(&config.database)
-                .await
-        }
+        None => crate::db::create_topology(&config.database),
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
@@ -1728,32 +3279,747 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if pool.is_some() {
-        if let Some(url) = &config.database.url {
-            for mig in migrations {
-                crate::migrate::auto_migrate(
-                    url,
-                    config.profile.as_deref(),
-                    config.database.auto_migrate_in_production,
-                    mig,
-                );
-            }
+    if topology.is_some()
+        && let Some(url) = config.database.effective_primary_url()
+    {
+        for mig in migrations {
+            crate::migrate::auto_migrate(
+                url,
+                config.profile.as_deref(),
+                config.database.auto_migrate_in_production,
+                mig,
+            );
         }
     }
 
-    Ok(pool)
+    let (replica_readiness, replica_migration_check) = if topology
+        .as_ref()
+        .is_some_and(|topology| check_replica_migrations && topology.replica().is_some())
+    {
+        match (
+            config.database.effective_primary_url(),
+            config.database.replica_url.as_deref(),
+        ) {
+            (Some(primary_url), Some(replica_url)) => {
+                let primary_url = primary_url.to_owned();
+                let replica_url = replica_url.to_owned();
+                let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+                    primary_url.clone(),
+                    replica_url.clone(),
+                )
+                .await;
+                (Some(readiness), Some((primary_url, replica_url)))
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
+    Ok(DatabaseBootstrap {
+        topology,
+        replica_readiness,
+        replica_migration_check,
+    })
+}
+
+#[cfg(feature = "db")]
+fn apply_replica_migration_readiness(
+    state: &AppState,
+    readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
+) {
+    let Some(readiness) = readiness else {
+        return;
+    };
+
+    if readiness.is_ready() {
+        state.probes().mark_replica_migrations_ready();
+    } else if let Some(detail) = readiness.detail() {
+        state.probes().mark_replica_migrations_unready(detail);
+    }
+}
+
+#[cfg(feature = "db")]
+fn configure_replica_migration_check(state: &AppState, check: Option<(String, String)>) {
+    let Some((primary_url, replica_url)) = check else {
+        return;
+    };
+
+    state
+        .probes()
+        .configure_replica_migration_check(primary_url, replica_url);
+}
+
+/// Refuse to start when a `#[repository(api = ...)]`-mounted route
+/// has no paired `policy = ...` argument in `prod` profile builds.
+///
+/// The issue text spells out the rationale: silently shipping
+/// auto-generated CRUD endpoints with no record-level authz is a
+/// security regression. The escape hatch is
+/// `[security] allow_unauthorized_repository_api = true`.
+/// Pure offender-collection logic for
+/// [`validate_repository_api_policies`].
+///
+/// Walks both top-level routes and routes registered under
+/// `.scoped(prefix, layer, routes)` groups, returning every
+/// `#[repository(api = ...)]`-mounted *mutating* route that has no
+/// paired `policy = ...` argument. Read-only mounts (GET
+/// `*_api_list` / `*_api_get`) are intentionally excluded — they
+/// don't fit the "any authenticated user can write to any record"
+/// footgun the issue calls out. Read-leak concerns are handled
+/// separately by `scope = ...`.
+///
+/// Returned in (resource type name, api path) form, deduped per
+/// `(type, path)` pair so a repository with multiple unguarded
+/// methods only shows up once.
+fn collect_unguarded_repository_writes(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> Vec<(String, String)> {
+    let mut offenders: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut record_route = |route: &Route| {
+        if let Some(meta) = route.repository
+            && !meta.has_policy
+            && is_mutating_method(&route.method)
+            && seen.insert((meta.resource_type_name, meta.api_path))
+        {
+            offenders.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+        }
+    };
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
+        }
+    }
+    offenders
+}
+
+/// Format a list of `(type, path)` offenders into the bulleted
+/// listing the startup tracing emits. Pure so the format string
+/// can be unit-tested without going through `tracing` machinery.
+fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in offenders {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\")]").unwrap();
+    }
+    s
+}
+
+fn validate_repository_api_policies(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict =
+        is_production_profile(profile) && !config.security.allow_unauthorized_repository_api;
+
+    let offenders = collect_unguarded_repository_writes(routes, scoped_groups);
+    if offenders.is_empty() {
+        return;
+    }
+
+    let listing = format_unguarded_repository_listing(&offenders);
+
+    if strict {
+        tracing::error!(
+            "refusing to start: the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument:\n{listing}\n\
+             Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
+        );
+        std::process::exit(1);
+    } else {
+        tracing::warn!(
+            "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
+             auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
+             This will become a startup-time error in `prod` profile builds."
+        );
+    }
+}
+
+/// Refuse to start when a `#[repository(policy = X)]`-annotated
+/// route exists but the corresponding `.policy::<R, _>(X)`
+/// registration was never actually applied to the live
+/// [`PolicyRegistry`](crate::authorization::PolicyRegistry).
+///
+/// `validate_repository_api_policies` runs *before* the registry is
+/// populated and only checks the macro-set `has_policy` flag. This
+/// runs *after* registrations are applied and walks the same routes,
+/// invoking the macro-emitted `policy_check` probe to confirm the
+/// policy is really there. Without this, forgetting the
+/// `.policy::<R, _>(...)` builder call would compile, boot, and
+/// then 500 on every protected request.
+/// `(resource_type_name, api_path)` pair identifying a repository
+/// route that's missing its required runtime registration.
+type MissingRepositoryRegistration = (String, String);
+
+/// Pure offender-collection logic for
+/// [`validate_repository_policies_registered`].
+///
+/// Walks the same routes + scoped groups and invokes the macro-
+/// emitted `policy_check` / `scope_check` probes against the live
+/// registry, returning `(missing_policies, missing_scopes)` deduped
+/// per `(type, path)` pair. Pure so the listing logic can be unit-
+/// tested without going through the actual `tracing::error!` +
+/// `std::process::exit(1)` strict path.
+fn collect_unregistered_repository_handlers(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    registry: &crate::authorization::PolicyRegistry,
+) -> (
+    Vec<MissingRepositoryRegistration>,
+    Vec<MissingRepositoryRegistration>,
+) {
+    let mut missing_policies: Vec<(String, String)> = Vec::new();
+    let mut missing_scopes: Vec<(String, String)> = Vec::new();
+    let mut seen_policies: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut seen_scopes: std::collections::HashSet<(&'static str, &'static str)> =
+        std::collections::HashSet::new();
+    let mut record_route = |route: &Route| {
+        if let Some(meta) = route.repository {
+            if let Some(check) = meta.policy_check
+                && !check(registry)
+                && seen_policies.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_policies
+                    .push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+            }
+            if let Some(check) = meta.scope_check
+                && !check(registry)
+                && seen_scopes.insert((meta.resource_type_name, meta.api_path))
+            {
+                missing_scopes.push((meta.resource_type_name.to_owned(), meta.api_path.to_owned()));
+            }
+        }
+    };
+    for route in routes {
+        record_route(route);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            record_route(route);
+        }
+    }
+    (missing_policies, missing_scopes)
+}
+
+/// Format a `(type, path)` listing for missing-policy startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in missing {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\", policy = ...)]: call `.policy::<{name}, _>(...)` on the app builder").unwrap();
+    }
+    s
+}
+
+/// Format a `(type, path)` listing for missing-scope startup
+/// errors. Pure so the format string can be unit-tested.
+fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut first = true;
+    for (name, path) in missing {
+        if !first {
+            s.push('\n');
+        }
+        first = false;
+        write!(s, "  - #[repository({name}, api = \"{path}\", scope = ...)]: call `.scope::<{name}, _>(...)` on the app builder").unwrap();
+    }
+    s
+}
+
+#[allow(clippy::cognitive_complexity)]
+fn validate_repository_policies_registered(
+    routes: &[Route],
+    scoped_groups: &[ScopedGroup],
+    state: &AppState,
+    config: &AutumnConfig,
+) {
+    let profile = config.profile.as_deref().unwrap_or("default");
+    let strict = is_production_profile(profile);
+
+    let (missing_policies, missing_scopes) =
+        collect_unregistered_repository_handlers(routes, scoped_groups, state.policy_registry());
+
+    if missing_policies.is_empty() && missing_scopes.is_empty() {
+        return;
+    }
+
+    if !missing_policies.is_empty() {
+        let listing = format_missing_policy_listing(&missing_policies);
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `policy = ...` argument, but no policy is registered for the resource type. Without registration, every protected request would fail at runtime with `500 no policy registered`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `policy = ...` but no matching `.policy::<R, _>(...)` registration is on the app builder. Protected requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
+
+    if !missing_scopes.is_empty() {
+        let listing = format_missing_scope_listing(&missing_scopes);
+
+        if strict {
+            tracing::error!(
+                "refusing to start: the following #[repository] routes declare a `scope = ...` argument, but no scope is registered for the resource type. Without registration, every list request would fail at runtime with `500 missing scope registration`:\n{listing}"
+            );
+        } else {
+            tracing::warn!(
+                "the following #[repository] routes declare `scope = ...` but no matching `.scope::<R, _>(...)` registration is on the app builder. List requests will 500 at runtime:\n{listing}\n\
+                 This will become a startup-time error in `prod` profile builds."
+            );
+        }
+    }
+
+    if strict {
+        std::process::exit(1);
+    }
+}
+
+const fn is_mutating_method(method: &http::Method) -> bool {
+    matches!(
+        *method,
+        http::Method::POST | http::Method::PUT | http::Method::PATCH | http::Method::DELETE
+    )
+}
+
+/// Returns `true` for the framework's accepted production profile
+/// names. Mirrors the `prod | production` matching used elsewhere
+/// (`app.rs::run_build_mode`, `migrate.rs::should_auto_apply`,
+/// etc.) so the repository startup guards don't silently weaken in
+/// deployments that pick the long-form alias.
+fn is_production_profile(profile: &str) -> bool {
+    matches!(profile, "prod" | "production")
+}
+
+#[cfg(test)]
+mod validate_repository_api_policies_tests {
+    use super::*;
+    use crate::RepositoryApiMeta;
+
+    fn build_route(
+        method: http::Method,
+        path: &'static str,
+        meta: Option<RepositoryApiMeta>,
+    ) -> Route {
+        Route {
+            method,
+            path,
+            handler: axum::routing::any(|| async { "" }),
+            name: "test_route",
+            api_doc: crate::openapi::ApiDoc::default(),
+            repository: meta,
+        }
+    }
+
+    fn unguarded(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+            policy_check: None,
+            scope_check: None,
+        }
+    }
+
+    /// Tests in this module historically used a duplicated copy of
+    /// the offender-collection logic. Now they call the production
+    /// helper directly so coverage tracks the real code path.
+    fn collect_offenders(routes: &[Route]) -> Vec<(String, String)> {
+        collect_unguarded_repository_writes(routes, &[])
+    }
+
+    #[test]
+    fn read_only_mount_without_policy_is_not_an_offender() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::GET,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert!(
+            offenders.is_empty(),
+            "read-only mounts should not trigger the unauthorized-repo guard"
+        );
+    }
+
+    #[test]
+    fn write_mount_without_policy_is_an_offender() {
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        )];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+        assert_eq!(offenders[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn mixed_mount_only_dedups_one_offender_per_repository() {
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::PUT,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(unguarded("/api/posts", "Post")),
+            ),
+        ];
+        let offenders = collect_offenders(&routes);
+        assert_eq!(offenders.len(), 1);
+    }
+
+    #[test]
+    fn is_mutating_method_classifies_methods() {
+        assert!(is_mutating_method(&http::Method::POST));
+        assert!(is_mutating_method(&http::Method::PUT));
+        assert!(is_mutating_method(&http::Method::PATCH));
+        assert!(is_mutating_method(&http::Method::DELETE));
+        assert!(!is_mutating_method(&http::Method::GET));
+        assert!(!is_mutating_method(&http::Method::HEAD));
+        assert!(!is_mutating_method(&http::Method::OPTIONS));
+    }
+
+    // ── registry-aware validation (post-registration) ─────────────
+
+    use crate::authorization::{Policy, PolicyRegistry};
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct TestPost;
+
+    #[derive(Default)]
+    struct TestPostPolicy;
+    impl Policy<TestPost> for TestPostPolicy {}
+
+    fn guarded_with_check(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: true,
+            policy_check: Some(|registry: &PolicyRegistry| registry.has_policy::<TestPost>()),
+            scope_check: None,
+        }
+    }
+
+    fn collect_missing(routes: &[Route], registry: &PolicyRegistry) -> Vec<(String, String)> {
+        let (missing_policies, _) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_policies
+    }
+
+    #[test]
+    fn registry_check_flags_routes_missing_their_policy_registration() {
+        // Macro emits `policy = X` but no `.policy::<TestPost, _>(...)`
+        // call on the builder — registry has nothing.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+        assert_eq!(missing[0].1, "/api/posts");
+    }
+
+    #[test]
+    fn registry_check_passes_when_policy_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_policy::<TestPost, _>(TestPostPolicy);
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty(), "policy is registered, no offenders");
+    }
+
+    #[test]
+    fn registry_check_skips_routes_without_policy_check_fn() {
+        // Routes mounted without `policy = ...` carry
+        // `policy_check: None` and are not subject to this check —
+        // they're handled by `validate_repository_api_policies` which
+        // looks at `has_policy` instead.
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn registry_check_dedups_one_offender_per_repository() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![
+            build_route(
+                http::Method::GET,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::POST,
+                "/api/posts",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+            build_route(
+                http::Method::DELETE,
+                "/api/posts/{id}",
+                Some(guarded_with_check("/api/posts", "TestPost")),
+            ),
+        ];
+        let missing = collect_missing(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+    }
+
+    // ── Scope registration validation ─────────────────────────────
+
+    use crate::authorization::{BoxFuture, PolicyContext, Scope};
+
+    #[derive(Default)]
+    struct TestPostScope;
+    impl Scope<TestPost> for TestPostScope {
+        fn list<'a>(
+            &'a self,
+            _ctx: &'a PolicyContext,
+            _conn: &'a mut diesel_async::AsyncPgConnection,
+        ) -> BoxFuture<'a, crate::AutumnResult<Vec<TestPost>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn scope_only_meta(path: &'static str, type_name: &'static str) -> RepositoryApiMeta {
+        RepositoryApiMeta {
+            resource_type_name: type_name,
+            api_path: path,
+            has_policy: false,
+            policy_check: None,
+            scope_check: Some(|registry: &PolicyRegistry| registry.scope::<TestPost>().is_some()),
+        }
+    }
+
+    fn collect_missing_scopes(
+        routes: &[Route],
+        registry: &PolicyRegistry,
+    ) -> Vec<(String, String)> {
+        let (_, missing_scopes) = collect_unregistered_repository_handlers(routes, &[], registry);
+        missing_scopes
+    }
+
+    #[test]
+    fn scope_check_flags_unregistered_scope() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+    }
+
+    #[test]
+    fn scope_check_passes_when_scope_is_registered() {
+        let registry = PolicyRegistry::default();
+        registry.register_scope::<TestPost, _>(TestPostScope);
+        let routes = vec![build_route(
+            http::Method::GET,
+            "/api/posts",
+            Some(scope_only_meta("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn scope_check_skips_routes_without_scope_check_fn() {
+        let registry = PolicyRegistry::default();
+        let routes = vec![build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "TestPost")),
+        )];
+        let missing = collect_missing_scopes(&routes, &registry);
+        assert!(missing.is_empty());
+    }
+
+    // ── prod / production profile parity ────────────────────────
+
+    #[test]
+    fn is_production_profile_matches_both_aliases() {
+        assert!(is_production_profile("prod"));
+        assert!(is_production_profile("production"));
+        assert!(!is_production_profile("dev"));
+        assert!(!is_production_profile("staging"));
+        assert!(!is_production_profile("test"));
+        assert!(!is_production_profile("default"));
+        // Case-sensitive (matches the framework's elsewhere
+        // matching pattern in app.rs::run_build_mode and
+        // migrate.rs).
+        assert!(!is_production_profile("Prod"));
+        assert!(!is_production_profile("Production"));
+    }
+
+    // ── Formatter helpers ─────────────────────────────────────────
+
+    #[test]
+    fn format_unguarded_listing_renders_one_bullet_per_offender() {
+        let offenders = vec![
+            ("Post".to_owned(), "/api/posts".to_owned()),
+            ("Comment".to_owned(), "/api/comments".to_owned()),
+        ];
+        let listing = format_unguarded_repository_listing(&offenders);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains("Comment"));
+        assert!(listing.contains("/api/comments"));
+        assert_eq!(listing.matches("\n  - ").count() + 1, 2);
+    }
+
+    #[test]
+    fn format_unguarded_listing_empty_input_yields_empty_string() {
+        let listing = format_unguarded_repository_listing(&[]);
+        assert!(listing.is_empty());
+    }
+
+    #[test]
+    fn format_missing_policy_listing_includes_policy_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_policy_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".policy::<Post, _>"));
+        assert!(listing.contains("policy = ..."));
+    }
+
+    #[test]
+    fn format_missing_scope_listing_includes_scope_call_hint() {
+        let missing = vec![("Post".to_owned(), "/api/posts".to_owned())];
+        let listing = format_missing_scope_listing(&missing);
+        assert!(listing.contains("Post"));
+        assert!(listing.contains("/api/posts"));
+        assert!(listing.contains(".scope::<Post, _>"));
+        assert!(listing.contains("scope = ..."));
+    }
+
+    // ── Scoped-groups path coverage ──────────────────────────────
+
+    #[test]
+    fn collect_unguarded_walks_scoped_groups() {
+        // The scoped-group path catches `#[repository(api = ...)]`
+        // mounts that live inside `.scoped(prefix, layer, routes)`.
+        // Without walking them, the prod-mode guard would silently
+        // miss those routes.
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(unguarded("/api/posts", "Post")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let offenders = collect_unguarded_repository_writes(&[], std::slice::from_ref(&group));
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].0, "Post");
+    }
+
+    #[test]
+    fn collect_unregistered_walks_scoped_groups() {
+        let group_route = build_route(
+            http::Method::POST,
+            "/api/posts",
+            Some(guarded_with_check("/api/posts", "TestPost")),
+        );
+        let group = ScopedGroup {
+            prefix: "/scoped".to_owned(),
+            routes: vec![group_route],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+        let registry = PolicyRegistry::default();
+        let (missing, _) =
+            collect_unregistered_repository_handlers(&[], std::slice::from_ref(&group), &registry);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, "TestPost");
+    }
 }
 
 fn build_state(
     config: &AutumnConfig,
-    #[cfg(feature = "db")] pool: Option<
-        diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
-    >,
+    #[cfg(feature = "db")] database_topology: Option<&crate::db::DatabaseTopology>,
+    #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
-    AppState {
+    #[cfg(feature = "ws")]
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    #[cfg(feature = "ws")]
+    let channels = channels_backend.map_or_else(
+        || {
+            crate::channels::Channels::from_config(&config.channels, shutdown.child_token())
+                .unwrap_or_else(|error| {
+                    tracing::error!(error = %error, "Failed to configure channels backend");
+                    std::process::exit(1);
+                })
+        },
+        crate::channels::Channels::with_shared_backend,
+    );
+
+    let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
-        pool,
+        pool: database_topology.map(|topology| topology.primary().clone()),
+        #[cfg(feature = "db")]
+        replica_pool: database_topology.and_then(|topology| topology.replica().cloned()),
         profile: config.profile.clone(),
         started_at: std::time::Instant::now(),
         health_detailed: config.health.detailed,
@@ -1761,12 +4027,25 @@ fn build_state(
         metrics: crate::middleware::MetricsCollector::new(),
         log_levels: crate::actuator::LogLevels::new(&config.log.level),
         task_registry: crate::actuator::TaskRegistry::new(),
+        job_registry: crate::actuator::JobRegistry::new(),
         config_props: crate::actuator::ConfigProperties::from_config(config),
         #[cfg(feature = "ws")]
-        channels: crate::channels::Channels::new(32),
+        channels,
         #[cfg(feature = "ws")]
-        shutdown: tokio_util::sync::CancellationToken::new(),
+        shutdown,
+        policy_registry: crate::authorization::PolicyRegistry::default(),
+        forbidden_response: config.security.forbidden_response,
+        auth_session_key: config.auth.session_key.clone(),
+        shared_cache: None,
+    };
+    #[cfg(feature = "db")]
+    if state.replica_pool.is_some() {
+        state
+            .probes()
+            .configure_replica_dependency(config.database.replica_fallback);
     }
+    state.insert_extension(config.clone());
+    state
 }
 
 /// Build the route listing string for the transparency log.
@@ -1871,9 +4150,19 @@ fn mask_database_url(url: &str, pool_size: usize) -> String {
 /// Build the configuration summary string.
 fn format_config_summary(config: &AutumnConfig) -> String {
     let profile = config.profile.as_deref().unwrap_or("none");
-    let db_status = config.database.url.as_deref().map_or_else(
+    let db_status = config.database.effective_primary_url().map_or_else(
         || "not configured".to_owned(),
-        |url| mask_database_url(url, config.database.pool_size),
+        |url| {
+            let primary = mask_database_url(url, config.database.effective_primary_pool_size());
+            if config.database.replica_url.is_some() {
+                format!(
+                    "primary={primary}, replica=configured (pool_size={})",
+                    config.database.effective_replica_pool_size()
+                )
+            } else {
+                primary
+            }
+        },
     );
     let telemetry_status = if config.telemetry.enabled {
         let endpoint = config
@@ -1951,7 +4240,35 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// Shared no-op `MailDeliveryQueue` used by builder tests so the trait
+    /// impl body is defined once and exercised by at least one test.
+    #[cfg(feature = "mail")]
+    struct MailTestNoopQueue;
+
+    #[cfg(feature = "mail")]
+    impl crate::mail::MailDeliveryQueue for MailTestNoopQueue {
+        fn enqueue<'a>(
+            &'a self,
+            _mail: crate::mail::Mail,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    fn test_mail() -> crate::mail::Mail {
+        crate::mail::Mail::builder()
+            .to("test@example.com")
+            .subject("hi")
+            .text("hello")
+            .build()
+            .expect("test mail should build")
+    }
 
     /// Helper to build a test router with default config and no database.
     pub fn test_router(routes: Vec<Route>) -> axum::Router {
@@ -1962,6 +4279,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -1969,13 +4288,222 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn build_state_applies_replica_fallback_policy_to_read_routing() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::Primary;
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn custom_pool_provider_preserves_configured_replica_topology() {
+        struct PassthroughPoolProvider;
+
+        impl crate::db::DatabasePoolProvider for PassthroughPoolProvider {
+            async fn create_pool(
+                &self,
+                config: &crate::config::DatabaseConfig,
+            ) -> Result<
+                Option<
+                    diesel_async::pooled_connection::deadpool::Pool<
+                        diesel_async::AsyncPgConnection,
+                    >,
+                >,
+                crate::db::PoolError,
+            > {
+                crate::db::create_pool(config)
+            }
+        }
+
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::FailReadiness;
+        let AppBuilder {
+            pool_provider_factory,
+            ..
+        } = app().with_pool_provider(PassthroughPoolProvider);
+
+        let database = setup_database(&config, Vec::new(), pool_provider_factory)
+            .await
+            .expect("custom provider should build database topology");
+        let topology = database.topology.expect("database should be configured");
+
+        assert_eq!(topology.primary().status().max_size, 5);
+        assert_eq!(
+            topology
+                .replica()
+                .expect("custom provider should create replica pool")
+                .status()
+                .max_size,
+            2
+        );
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        state
+            .probes()
+            .mark_replica_connection_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+        let (status, _) = crate::probe::readiness_response(&state).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn configure_replica_migration_check_stores_recheck_urls() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+
+        assert!(
+            state.probes().replica_migration_check().is_none(),
+            "build_state should not enable migration checks without registered migrations"
+        );
+
+        configure_replica_migration_check(
+            &state,
+            Some((
+                "postgres://localhost/primary".to_owned(),
+                "postgres://localhost/replica".to_owned(),
+            )),
+        );
+
+        let check = state
+            .probes()
+            .replica_migration_check()
+            .expect("replica migration check should be configured");
+
+        assert_eq!(check.primary_url, "postgres://localhost/primary");
+        assert_eq!(check.replica_url, "postgres://localhost/replica");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn replica_migration_readiness_marks_ready_endpoint_degraded() {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/primary".to_owned());
+        config.database.primary_pool_size = Some(5);
+        config.database.replica_url = Some("postgres://localhost/replica".to_owned());
+        config.database.replica_pool_size = Some(2);
+        config.database.replica_fallback = crate::config::ReplicaFallback::FailReadiness;
+        let topology = crate::db::create_topology(&config.database)
+            .expect("topology should build")
+            .expect("database should be configured");
+        let state = build_state(
+            &config,
+            Some(&topology),
+            #[cfg(feature = "ws")]
+            None,
+        );
+
+        apply_replica_migration_readiness(
+            &state,
+            Some(crate::migrate::ReplicaMigrationReadiness::Stale {
+                primary_latest: Some("00000000000002".to_owned()),
+                replica_latest: Some("00000000000001".to_owned()),
+            }),
+        );
+
+        let (status, _) = crate::probe::readiness_response(&state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn blocking_replica_migration_readiness_reports_unknown_connection_errors() {
+        let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+            "not-a-primary-url".to_owned(),
+            "not-a-replica-url".to_owned(),
+        )
+        .await;
+
+        assert!(matches!(
+            readiness,
+            crate::migrate::ReplicaMigrationReadiness::Unknown(_)
+        ));
+    }
+
+    #[cfg(feature = "ws")]
+    #[test]
+    fn with_channels_backend_overrides_config_driven_backend_selection() {
+        let builder = app().with_channels_backend(crate::channels::LocalChannelsBackend::new(4));
+        let AppBuilder {
+            channels_backend, ..
+        } = builder;
+        assert!(channels_backend.is_some());
+
+        let mut config = AutumnConfig::default();
+        config.channels.backend = crate::config::ChannelBackend::Redis;
+        config.channels.redis.url = None;
+
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            channels_backend,
+        );
+        let mut rx = state.channels().subscribe("override");
+
+        state
+            .broadcast()
+            .publish("override", "ok")
+            .expect("custom local backend should publish");
+
+        assert_eq!(rx.try_recv().expect("message should arrive").as_str(), "ok");
     }
 
     /// Helper to create a simple GET route for testing.
@@ -1992,7 +4520,156 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }
+    }
+
+    #[cfg(feature = "i18n")]
+    fn test_i18n_bundle(key: &str, value: &str) -> Arc<crate::i18n::Bundle> {
+        let mut messages = std::collections::HashMap::new();
+        let mut en = std::collections::HashMap::new();
+        en.insert(key.to_owned(), value.to_owned());
+        messages.insert("en".to_owned(), en);
+        Arc::new(crate::i18n::Bundle::from_messages(
+            messages,
+            &crate::i18n::I18nConfig::default(),
+        ))
+    }
+
+    #[cfg(feature = "i18n")]
+    #[test]
+    fn i18n_auto_defers_loading_until_runtime_config_is_available() {
+        let builder = app().i18n_auto();
+
+        assert!(builder.i18n_bundle.is_none());
+        assert!(builder.i18n_auto_load);
+    }
+
+    #[cfg(feature = "i18n")]
+    #[derive(Clone)]
+    struct StaticConfigLoader {
+        config: AutumnConfig,
+    }
+
+    #[cfg(feature = "i18n")]
+    impl crate::config::ConfigLoader for StaticConfigLoader {
+        async fn load(&self) -> Result<AutumnConfig, crate::config::ConfigError> {
+            Ok(self.config.clone())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    struct NoopTelemetryProvider;
+
+    #[cfg(feature = "i18n")]
+    impl crate::telemetry::TelemetryProvider for NoopTelemetryProvider {
+        fn init(
+            &self,
+            _log: &crate::config::LogConfig,
+            _telemetry: &crate::config::TelemetryConfig,
+            _profile: Option<&str>,
+        ) -> Result<crate::telemetry::TelemetryGuard, crate::telemetry::TelemetryInitError>
+        {
+            Ok(crate::telemetry::TelemetryGuard::disabled())
+        }
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
+        let project = tempfile::tempdir().expect("project dir");
+        let i18n_dir = project.path().join("custom-i18n");
+        std::fs::create_dir_all(&i18n_dir).expect("i18n dir");
+        std::fs::write(i18n_dir.join("en.ftl"), "nav.home = Loader Home\n").expect("bundle");
+
+        let mut config = AutumnConfig::default();
+        config.i18n.dir = "custom-i18n".to_owned();
+        let builder = app()
+            .with_config_loader(StaticConfigLoader { config })
+            .with_telemetry_provider(NoopTelemetryProvider)
+            .i18n_auto();
+        let AppBuilder {
+            config_loader_factory,
+            telemetry_provider,
+            i18n_bundle,
+            i18n_auto_load,
+            ..
+        } = builder;
+
+        let (loaded_config, _guard) =
+            load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+        let env = crate::config::MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            project.path().to_str().expect("utf-8 path"),
+        );
+        let bundle = resolve_i18n_bundle(i18n_bundle, i18n_auto_load, &loaded_config, &env)
+            .expect("bundle loaded from configured dir");
+
+        assert_eq!(bundle.translate("en", "nav.home", &[]), "Loader Home");
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
+    async fn i18n_bundle_layer_is_applied_to_static_route_rendering() {
+        async fn localized(locale: crate::i18n::Locale) -> String {
+            locale.t("nav.home")
+        }
+
+        let config = AutumnConfig::default();
+        let state = AppState::for_test();
+        let custom_layers = install_i18n_bundle_layer(
+            Vec::new(),
+            &state,
+            Some(test_i18n_bundle("nav.home", "Home")),
+        );
+        let router = crate::router::try_build_router_inner(
+            vec![Route {
+                method: http::Method::GET,
+                path: "/about",
+                handler: axum::routing::get(localized),
+                name: "localized",
+                api_doc: crate::openapi::ApiDoc {
+                    method: "GET",
+                    path: "/about",
+                    operation_id: "localized",
+                    success_status: 200,
+                    ..Default::default()
+                },
+                repository: None,
+            }],
+            &config,
+            state,
+            crate::router::RouterContext {
+                exception_filters: Vec::new(),
+                scoped_groups: Vec::new(),
+                merge_routers: Vec::new(),
+                nest_routers: Vec::new(),
+                custom_layers,
+                error_page_renderer: None,
+                session_store: None,
+                #[cfg(feature = "openapi")]
+                openapi: None,
+            },
+        )
+        .expect("router builds");
+        let tmp = tempfile::tempdir().expect("dist parent");
+        let dist = tmp.path().join("dist");
+
+        crate::static_gen::render_static_routes(
+            router,
+            &[crate::static_gen::StaticRouteMeta {
+                path: "/about",
+                name: "localized",
+                revalidate: None,
+                params_fn: None,
+            }],
+            &dist,
+        )
+        .await
+        .expect("static render succeeds");
+
+        let html = std::fs::read_to_string(dist.join("about/index.html")).expect("rendered html");
+        assert_eq!(html, "Home");
     }
 
     #[test]
@@ -2024,6 +4701,67 @@ mod tests {
             .extension::<String>()
             .expect("string extension should be present");
         assert_eq!(value, "haunted harvest");
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn app_builder_with_mail_delivery_queue_stores_queue_for_install() {
+        let builder = app().with_mail_delivery_queue(MailTestNoopQueue);
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("with_mail_delivery_queue should store a factory on the builder");
+
+        // Invoke the trivial wrapper closure built by with_mail_delivery_queue
+        // and verify it returns the wrapped queue successfully.
+        let state = AppState::for_test();
+        let queue = factory(&state).expect("trivial factory should produce the queue");
+        assert!(Arc::strong_count(&queue) >= 1);
+        // Cover the enqueue method body by invoking it once.
+        queue
+            .enqueue(test_mail())
+            .await
+            .expect("noop queue should always succeed");
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_runs_with_app_state() {
+        let observed_profile: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured = Arc::clone(&observed_profile);
+        let builder = app().with_mail_delivery_queue_factory(move |state| {
+            *captured.lock().expect("lock") = Some(state.profile().to_owned());
+            Ok::<_, crate::AutumnError>(MailTestNoopQueue)
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory should be stored on the builder");
+        let state = AppState::for_test().with_profile("dev");
+        let _queue = factory(&state).expect("factory should succeed");
+
+        assert_eq!(
+            observed_profile.lock().expect("lock").as_deref(),
+            Some("dev"),
+            "factory must run with the live AppState"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn app_builder_with_mail_delivery_queue_factory_propagates_errors() {
+        let builder = app().with_mail_delivery_queue_factory(|_state| {
+            Err::<MailTestNoopQueue, _>(crate::AutumnError::service_unavailable_msg("factory boom"))
+        });
+
+        let factory = builder
+            .mail_delivery_queue_factory
+            .expect("factory present");
+        let state = AppState::for_test();
+        match factory(&state) {
+            Ok(_) => panic!("factory should have errored"),
+            Err(err) => assert!(err.to_string().contains("factory boom")),
+        }
     }
 
     #[tokio::test]
@@ -2069,6 +4807,105 @@ mod tests {
 
         let recorded_events = events.lock().expect("events lock poisoned").clone();
         assert_eq!(recorded_events, vec!["start", "stop-b", "stop-a"]);
+    }
+
+    fn startup_noop_job_handler(
+        _state: AppState,
+        _payload: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test]
+    async fn startup_hooks_can_enqueue_jobs_after_runtime_init() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let builder = app()
+            .jobs(vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }])
+            .on_startup(|_state| async {
+                crate::job::enqueue("startup-seed", serde_json::json!({ "kind": "warmup" })).await
+            });
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+
+        initialize_job_runtime(
+            builder.jobs.clone(),
+            &state,
+            &shutdown,
+            &crate::config::JobConfig::default(),
+        )
+        .expect("job runtime should initialize before startup hooks");
+
+        run_startup_hooks(&builder.startup_hooks, state.clone())
+            .await
+            .expect("startup hook should be able to enqueue jobs");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.job_registry().snapshot();
+                let status = snapshot
+                    .get("startup-seed")
+                    .expect("job should be registered before startup hooks run");
+                if status.total_successes == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("startup-enqueued job should complete");
+
+        shutdown.cancel();
+        crate::job::clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn initialize_job_runtime_propagates_redis_init_errors() {
+        let _guard = crate::job::global_job_runtime_test_lock().lock().await;
+        crate::job::clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            backend: "redis".to_string(),
+            ..Default::default()
+        };
+
+        let error = initialize_job_runtime(
+            vec![crate::job::JobInfo {
+                name: "startup-seed".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 1,
+                handler: startup_noop_job_handler,
+            }],
+            &state,
+            &shutdown,
+            &config,
+        )
+        .expect_err("redis init errors should abort startup");
+
+        #[cfg(feature = "redis")]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requires jobs.redis.url"),
+            "unexpected error: {error}"
+        );
+
+        #[cfg(not(feature = "redis"))]
+        assert!(
+            error
+                .to_string()
+                .contains("jobs.backend=redis requested but redis feature is disabled"),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -2133,6 +4970,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -2140,11 +4979,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router =
             crate::router::build_router(vec![test_get_route("/dummy", "dummy")], &config, state);
@@ -2218,6 +5062,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         }];
         let config = AutumnConfig::default();
         let state = AppState {
@@ -2226,6 +5071,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -2233,11 +5080,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router(post_routes, &config, state);
 
@@ -2270,6 +5122,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: http::Method::POST,
@@ -2283,6 +5136,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
         ];
         let config = AutumnConfig::default();
@@ -2292,6 +5146,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -2299,11 +5155,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router(route_list, &config, state);
 
@@ -2573,6 +5434,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -2580,11 +5443,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/other", "other_page")],
@@ -2637,6 +5505,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }],
                 &config,
                 state,
@@ -2690,6 +5559,7 @@ mod tests {
                         success_status: 200,
                         ..Default::default()
                     },
+                    repository: None,
                 }]);
 
                 let response = router
@@ -2866,6 +5736,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -2873,11 +5745,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         crate::router::build_router(routes, config, state)
     }
@@ -3005,6 +5882,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -3012,11 +5891,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3042,6 +5926,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -3049,11 +5935,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let router = crate::router::build_router_with_static(
             vec![test_get_route("/test", "test")],
@@ -3104,6 +5995,7 @@ mod tests {
         let tasks = vec![crate::task::TaskInfo {
             name: "cleanup".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(300)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
@@ -3118,6 +6010,7 @@ mod tests {
                 expression: "0 0 * * *".into(),
                 timezone: None,
             },
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let output = format_task_lines(&tasks).unwrap();
@@ -3264,6 +6157,7 @@ mod tests {
         let tasks = vec![crate::task::TaskInfo {
             name: "cleanup".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         }];
         let config = AutumnConfig::default();
@@ -3286,6 +6180,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -3293,9 +6189,14 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -3304,6 +6205,7 @@ mod tests {
             name: "test_broadcaster".into(),
             // 1ms delay so it fires immediately
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| Box::pin(async { Ok(()) }),
         };
 
@@ -3313,7 +6215,7 @@ mod tests {
             super::start_task_scheduler(
                 vec![task],
                 &state_clone,
-                tokio_util::sync::CancellationToken::new(),
+                &tokio_util::sync::CancellationToken::new(),
             );
         });
 
@@ -3346,6 +6248,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -3353,9 +6257,14 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             channels: crate::channels::Channels::new(32),
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let mut rx = state.channels().subscribe("sys:tasks");
@@ -3363,6 +6272,7 @@ mod tests {
         let task = crate::task::TaskInfo {
             name: "test_failing_task".into(),
             schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_millis(1)),
+            coordination: crate::task::TaskCoordination::Fleet,
             handler: |_| {
                 Box::pin(async { Err(crate::AutumnError::bad_request_msg("forced error")) })
             },
@@ -3373,7 +6283,7 @@ mod tests {
             super::start_task_scheduler(
                 vec![task],
                 &state_clone,
-                tokio_util::sync::CancellationToken::new(),
+                &tokio_util::sync::CancellationToken::new(),
             );
         });
 
@@ -3415,5 +6325,625 @@ mod tests {
         let (duration_ms, msg) = result.unwrap_err();
         assert!(duration_ms < u64::MAX);
         assert!(msg.contains("test error"));
+    }
+
+    fn instantly_panicking_scheduled_handler(
+        _state: AppState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send>> {
+        panic!("panic before scheduled future")
+    }
+
+    #[tokio::test]
+    async fn execute_task_result_reports_immediate_handler_panics() {
+        let state = AppState::for_test();
+        let start = std::time::Instant::now();
+        let result = super::execute_task_result(
+            &state,
+            instantly_panicking_scheduled_handler,
+            start,
+            "test_task",
+            "fixed_delay",
+        )
+        .await;
+
+        let (duration_ms, msg) = result.expect_err("expected Err from panicking handler");
+        assert!(duration_ms < u64::MAX);
+        assert!(msg.contains("scheduled task handler panicked: panic before scheduled future"));
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_does_not_timeout_in_process_runs() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "slow_task",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "in_process",
+            "replica-a",
+        );
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                Ok(())
+            })
+        };
+        let coordinator = std::sync::Arc::new(
+            crate::scheduler::InProcessSchedulerCoordinator::new("replica-a"),
+        );
+
+        super::execute_fixed_delay_task(
+            "slow_task".to_owned(),
+            state.clone(),
+            handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["slow_task"];
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.last_result.as_deref(), Some("ok"));
+        assert_eq!(status.total_runs, 1);
+        assert_eq!(status.total_failures, 0);
+        assert!(status.last_error.is_none());
+    }
+
+    static SKIPPED_LEASE_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DenyingSchedulerCoordinator;
+
+    impl crate::scheduler::SchedulerCoordinator for DenyingSchedulerCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    struct GrantingSchedulerCoordinator {
+        backend: &'static str,
+        tick_keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        release_count: Option<std::sync::Arc<AtomicUsize>>,
+    }
+
+    impl crate::scheduler::SchedulerCoordinator for GrantingSchedulerCoordinator {
+        fn backend(&self) -> &'static str {
+            self.backend
+        }
+
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            tick_key: &'a str,
+            _coordination: crate::task::TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            Box::pin(async move {
+                self.tick_keys.lock().unwrap().push(tick_key.to_owned());
+                let lease = self.release_count.as_ref().map_or_else(
+                    || crate::scheduler::SchedulerLease::local(self.backend, "replica-a"),
+                    |release_count| {
+                        crate::scheduler::SchedulerLease::tracked(
+                            self.backend,
+                            "replica-a",
+                            std::sync::Arc::clone(release_count),
+                        )
+                    },
+                );
+                Ok(Some(lease))
+            })
+        }
+    }
+
+    fn counted_scheduled_handler(
+        _state: AppState,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send>> {
+        Box::pin(async {
+            SKIPPED_LEASE_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_skips_handler_when_lease_is_not_acquired() {
+        SKIPPED_LEASE_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "claimed_elsewhere",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let coordinator = std::sync::Arc::new(DenyingSchedulerCoordinator);
+
+        super::execute_fixed_delay_task(
+            "claimed_elsewhere".to_owned(),
+            state.clone(),
+            counted_scheduled_handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["claimed_elsewhere"];
+        assert_eq!(SKIPPED_LEASE_HANDLER_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(status.total_runs, 0);
+        assert!(status.current_leader.is_none());
+        assert!(status.last_tick.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_records_distributed_lease_ttl_timeout() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "slow_distributed_task",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                Ok(())
+            })
+        };
+        let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+            backend: "postgres",
+            tick_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            release_count: None,
+        });
+
+        super::execute_fixed_delay_task(
+            "slow_distributed_task".to_owned(),
+            state.clone(),
+            handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["slow_distributed_task"];
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.last_result.as_deref(), Some("failed"));
+        assert_eq!(status.total_runs, 1);
+        assert_eq!(status.total_failures, 1);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("lease TTL"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_cron_task_uses_scheduled_occurrence_for_tick_key() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "cron_review_task",
+            "cron */10 * * * * *",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let tick_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+            backend: "postgres",
+            tick_keys: std::sync::Arc::clone(&tick_keys),
+            release_count: None,
+        });
+        let handler: crate::task::TaskHandler = |_| Box::pin(async { Ok(()) });
+        let scheduled_unix_secs = 1_700_000_000;
+
+        super::execute_cron_task(
+            "cron_review_task".to_owned(),
+            state.clone(),
+            handler,
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(30),
+            scheduled_unix_secs,
+        )
+        .await;
+
+        assert_eq!(
+            tick_keys.lock().unwrap().as_slice(),
+            ["cron_review_task:1700000000"]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_fixed_delay_task_releases_lease_when_handler_panics() {
+        let state = AppState::for_test();
+        state.task_registry.register_scheduled(
+            "panic_task",
+            "every 1s",
+            crate::task::TaskCoordination::Fleet,
+            "postgres",
+            "replica-a",
+        );
+        let release_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let coordinator = std::sync::Arc::new(GrantingSchedulerCoordinator {
+            backend: "postgres",
+            tick_keys: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            release_count: Some(std::sync::Arc::clone(&release_count)),
+        });
+        let handler: crate::task::TaskHandler = |_| {
+            Box::pin(async {
+                panic!("forced scheduled panic");
+                #[allow(unreachable_code)]
+                Ok(())
+            })
+        };
+
+        super::execute_fixed_delay_task(
+            "panic_task".to_owned(),
+            state.clone(),
+            handler,
+            std::time::Duration::from_secs(1),
+            crate::task::TaskCoordination::Fleet,
+            coordinator,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        let snapshot = state.task_registry.snapshot();
+        let status = &snapshot["panic_task"];
+        assert_eq!(release_count.load(Ordering::SeqCst), 1);
+        assert_eq!(status.status, "idle");
+        assert_eq!(status.last_result.as_deref(), Some("failed"));
+        assert_eq!(status.total_runs, 1);
+        assert_eq!(status.total_failures, 1);
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("scheduled task handler panicked"))
+        );
+    }
+
+    #[test]
+    fn next_cron_occurrence_skips_overdue_slots() {
+        use chrono::TimeZone as _;
+
+        let cron = "0 * * * * *"
+            .parse::<croner::Cron>()
+            .expect("cron expression should parse");
+        let stale_cursor = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 0, 0)
+            .unwrap();
+        let now = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
+            .unwrap();
+        let next = super::next_cron_occurrence_after(&cron, &stale_cursor, &now)
+            .expect("next cron occurrence should resolve");
+
+        assert_eq!(
+            next,
+            chrono_tz::UTC
+                .with_ymd_and_hms(2026, 5, 5, 12, 31, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cron_occurrence_is_overdue_after_later_slot_passed() {
+        use chrono::TimeZone as _;
+
+        let cron = "0 * * * * *"
+            .parse::<croner::Cron>()
+            .expect("cron expression should parse");
+        let scheduled_at = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 1, 0)
+            .unwrap();
+        let slightly_late = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 1, 5)
+            .unwrap();
+        let after_later_slot = chrono_tz::UTC
+            .with_ymd_and_hms(2026, 5, 5, 12, 30, 5)
+            .unwrap();
+
+        assert!(
+            !super::cron_occurrence_is_overdue(&cron, &scheduled_at, &slightly_late)
+                .expect("overdue check should resolve")
+        );
+        assert!(
+            super::cron_occurrence_is_overdue(&cron, &scheduled_at, &after_later_slot)
+                .expect("overdue check should resolve")
+        );
+    }
+
+    #[cfg(feature = "storage")]
+    mod storage_preflight {
+        use super::super::{StorageBootstrap, preflight_storage};
+        use crate::AppState;
+        use crate::config::AutumnConfig;
+        use crate::storage::{BlobStoreState, StorageBackend, StorageConfig, StorageLocalConfig};
+
+        fn config_with_storage(storage: StorageConfig) -> AutumnConfig {
+            AutumnConfig {
+                profile: Some("dev".into()),
+                storage,
+                ..AutumnConfig::default()
+            }
+        }
+
+        #[test]
+        fn preflight_returns_none_when_disabled() {
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Disabled,
+                ..StorageConfig::default()
+            });
+            assert!(preflight_storage(&cfg).is_none());
+        }
+
+        #[test]
+        fn preflight_provisions_local_backend_against_tempdir() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap = preflight_storage(&cfg).expect("local backend should provision");
+            assert_eq!(bootstrap.store.provider_id(), "default");
+            assert!(bootstrap.serving.is_some(), "local backend mounts a route");
+        }
+
+        #[tokio::test]
+        async fn install_registers_blob_store_on_state() {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config_with_storage(StorageConfig {
+                backend: StorageBackend::Local,
+                local: StorageLocalConfig {
+                    root: dir.path().to_path_buf(),
+                    ..StorageLocalConfig::default()
+                },
+                ..StorageConfig::default()
+            });
+            let bootstrap: StorageBootstrap = preflight_storage(&cfg).unwrap();
+
+            let state = AppState::for_test();
+            assert!(state.extension::<BlobStoreState>().is_none());
+            let serving = bootstrap.install(&state);
+            assert!(serving.is_some());
+            assert!(state.extension::<BlobStoreState>().is_some());
+        }
+
+        #[test]
+        fn with_blob_store_stores_custom_store() {
+            use crate::storage::{
+                Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream,
+            };
+            use bytes::Bytes;
+            use std::time::Duration;
+
+            struct FakeStore;
+            impl BlobStore for FakeStore {
+                fn provider_id(&self) -> &'static str {
+                    "fake"
+                }
+                fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn put_stream<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _ct: &'a str,
+                    _d: ByteStream<'a>,
+                ) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn delete<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, ()> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn presigned_url<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _e: Duration,
+                ) -> BlobFuture<'a, String> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+            }
+
+            let builder = crate::app().with_blob_store(FakeStore);
+            assert!(builder.blob_store.is_some());
+        }
+
+        #[tokio::test]
+        async fn with_blob_store_is_installed_on_state() {
+            use crate::storage::{
+                Blob, BlobFuture, BlobMeta, BlobStore, BlobStoreError, ByteStream,
+            };
+            use bytes::Bytes;
+            use std::time::Duration;
+
+            struct FakeStore;
+            impl BlobStore for FakeStore {
+                fn provider_id(&self) -> &'static str {
+                    "fake-installed"
+                }
+                fn put<'a>(&'a self, _k: &'a str, _ct: &'a str, _b: Bytes) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn put_stream<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _ct: &'a str,
+                    _d: ByteStream<'a>,
+                ) -> BlobFuture<'a, Blob> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn get<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Bytes> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn delete<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, ()> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn head<'a>(&'a self, _k: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+                fn presigned_url<'a>(
+                    &'a self,
+                    _k: &'a str,
+                    _e: Duration,
+                ) -> BlobFuture<'a, String> {
+                    Box::pin(async { Err(BlobStoreError::Unsupported("fake".into())) })
+                }
+            }
+
+            let builder = crate::app().with_blob_store(FakeStore);
+            let bootstrap = builder.blob_store.map(|store| StorageBootstrap {
+                store,
+                serving: None,
+            });
+            let state = AppState::for_test();
+            assert!(state.extension::<BlobStoreState>().is_none());
+            if let Some(b) = bootstrap {
+                b.install(&state);
+            }
+            let installed = state
+                .extension::<BlobStoreState>()
+                .expect("store should be installed");
+            assert_eq!(installed.store().provider_id(), "fake-installed");
+        }
+    }
+
+    // ── Route source attribution ───────────────────────────────────────────
+
+    /// A minimal plugin that registers one route with a known name.
+    struct TestPlugin {
+        name: &'static str,
+        route: Route,
+    }
+
+    impl crate::plugin::Plugin for TestPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Borrowed(self.name)
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            app.routes(vec![self.route])
+        }
+    }
+
+    #[test]
+    fn routes_registered_before_plugin_are_user_sourced() {
+        let user_route = test_get_route("/home", "home");
+        let builder = app().routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    #[test]
+    fn routes_registered_inside_plugin_are_plugin_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin);
+        assert_eq!(builder.route_sources.len(), 1);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+    }
+
+    #[test]
+    fn routes_registered_after_plugin_revert_to_user_sourced() {
+        let plugin_route = test_get_route("/plugin-page", "plugin_page");
+        let user_route = test_get_route("/home", "home");
+        let plugin = TestPlugin {
+            name: "my-plugin",
+            route: plugin_route,
+        };
+        let builder = app().plugin(plugin).routes(vec![user_route]);
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("my-plugin".to_owned())
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::User
+        );
+    }
+
+    /// A plugin that registers a route and then registers a nested plugin.
+    struct OuterPlugin;
+
+    impl crate::plugin::Plugin for OuterPlugin {
+        fn name(&self) -> std::borrow::Cow<'static, str> {
+            "outer".into()
+        }
+
+        fn build(self, app: AppBuilder) -> AppBuilder {
+            let inner = TestPlugin {
+                name: "inner",
+                route: test_get_route("/inner", "inner"),
+            };
+            app.plugin(inner)
+                .routes(vec![test_get_route("/outer-after", "outer_after")])
+        }
+    }
+
+    #[test]
+    fn outer_plugin_source_restored_after_nested_plugin() {
+        let builder = app().plugin(OuterPlugin);
+        // Routes: [/inner from "inner", /outer-after from "outer"]
+        assert_eq!(builder.route_sources.len(), 2);
+        assert_eq!(
+            builder.route_sources[0],
+            crate::route_listing::RouteSource::Plugin("inner".to_owned()),
+            "first route should be attributed to inner plugin"
+        );
+        assert_eq!(
+            builder.route_sources[1],
+            crate::route_listing::RouteSource::Plugin("outer".to_owned()),
+            "second route should be re-attributed to outer plugin after nested build"
+        );
     }
 }

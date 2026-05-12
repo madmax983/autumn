@@ -13,7 +13,14 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cache::Cache;
+
+/// Newtype wrapper used to store the global cache in the extension map so that
+/// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
+pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
+
 use crate::actuator;
+use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
 #[cfg(feature = "db")]
@@ -50,9 +57,15 @@ pub struct AppState {
     /// state has been constructed.
     pub(crate) extensions: Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
 
-    /// Database connection pool, or `None` when no `database.url` is configured.
+    /// Primary/write database connection pool, or `None` when no
+    /// `database.primary_url` or legacy `database.url` is configured.
     #[cfg(feature = "db")]
     pub(crate) pool:
+        Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
+
+    /// Read-replica connection pool, or `None` when no replica role is configured.
+    #[cfg(feature = "db")]
+    pub(crate) replica_pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
     /// Active profile name (e.g., "dev", "prod", "staging").
@@ -75,6 +88,8 @@ pub struct AppState {
 
     /// Scheduled task registry for the `/actuator/tasks` endpoint.
     pub(crate) task_registry: actuator::TaskRegistry,
+    /// Job registry for the `/actuator/jobs` endpoint.
+    pub(crate) job_registry: actuator::JobRegistry,
 
     /// Resolved config properties with source tracking for `/actuator/configprops`.
     pub(crate) config_props: actuator::ConfigProperties,
@@ -92,6 +107,25 @@ pub struct AppState {
     /// when the server is stopping.
     #[cfg(feature = "ws")]
     pub(crate) shutdown: CancellationToken,
+
+    /// Per-resource policy + scope registry used by `#[authorize]`
+    /// and `#[repository(policy = ...)]`-generated handlers.
+    pub(crate) policy_registry: PolicyRegistry,
+
+    /// HTTP status returned when a [`Policy`] denies a record-level
+    /// action. Defaults to `404 Not Found` to mirror Rails / Phoenix
+    /// posture and avoid leaking record existence.
+    pub(crate) forbidden_response: ForbiddenResponse,
+
+    /// Session key the `#[authorize]` machinery reads to resolve the
+    /// authenticated user id for the
+    /// [`PolicyContext`](crate::authorization::PolicyContext).
+    /// Mirrors `[auth] session_key` (default: `"user_id"`).
+    pub(crate) auth_session_key: String,
+
+    /// Shared application cache backend. `None` means no global cache has been
+    /// registered; `#[cached]` will fall back to its per-function Moka store.
+    pub(crate) shared_cache: Option<Arc<dyn Cache>>,
 }
 
 impl AppState {
@@ -144,6 +178,34 @@ impl AppState {
         self.pool.as_ref()
     }
 
+    /// Returns the read-replica database connection pool, if configured.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
+
+    /// Returns the pool used for read-only work.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn read_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        if self.replica_pool.is_some() && self.probes.should_route_reads_to_replica() {
+            self.replica_pool.as_ref()
+        } else if self.replica_pool.is_some() && self.probes.should_fallback_reads_to_primary() {
+            self.pool.as_ref()
+        } else if self.replica_pool.is_some() {
+            None
+        } else {
+            self.pool.as_ref()
+        }
+    }
+
     /// Returns the metrics collector.
     #[must_use]
     pub const fn metrics(&self) -> &middleware::MetricsCollector {
@@ -160,6 +222,12 @@ impl AppState {
     #[must_use]
     pub const fn task_registry(&self) -> &actuator::TaskRegistry {
         &self.task_registry
+    }
+
+    /// Returns the job registry.
+    #[must_use]
+    pub const fn job_registry(&self) -> &actuator::JobRegistry {
+        &self.job_registry
     }
 
     /// Returns the config properties.
@@ -195,6 +263,17 @@ impl AppState {
         self
     }
 
+    /// Sets the read-replica database pool.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_replica_pool(
+        mut self,
+        pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+    ) -> Self {
+        self.replica_pool = Some(pool);
+        self
+    }
+
     /// Install a typed runtime extension while building test or ad-hoc state.
     #[must_use]
     pub fn with_extension<T>(self, value: T) -> Self
@@ -205,10 +284,88 @@ impl AppState {
         self
     }
 
+    /// Returns the registered global cache backend, if any.
+    ///
+    /// Checks the extension map first (populated at runtime by startup hooks
+    /// via [`Self::set_cache`]) so that a plugin replacing a build-time backend
+    /// is always visible. Falls back to `shared_cache` (set at build time via
+    /// [`Self::with_cache`]).
+    #[must_use]
+    pub fn cache(&self) -> Option<Arc<dyn Cache>> {
+        self.extension::<GlobalCacheEntry>()
+            .map(|e| e.0.clone())
+            .or_else(|| self.shared_cache.clone())
+    }
+
+    /// Register a global cache backend (builder / test helper, build-time).
+    #[must_use]
+    pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
+        self.shared_cache = Some(cache);
+        self
+    }
+
+    /// Install or replace the global cache backend at runtime (e.g. from a startup hook).
+    ///
+    /// Updates both the process-level global (used by `#[cached]` functions) and
+    /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
+    pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        crate::cache::set_global_cache(cache.clone());
+        self.insert_extension(GlobalCacheEntry(cache));
+    }
+
     /// Sets the active profile.
     #[must_use]
     pub fn with_profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = Some(profile.into());
+        self
+    }
+
+    /// Returns a reference to the [`PolicyRegistry`].
+    #[must_use]
+    pub const fn policy_registry(&self) -> &PolicyRegistry {
+        &self.policy_registry
+    }
+
+    /// Resolve the registered [`Policy`] for resource `R`, if any.
+    #[must_use]
+    pub fn policy<R: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<dyn Policy<R>>> {
+        self.policy_registry.policy::<R>()
+    }
+
+    /// Resolve the registered [`Scope`] for resource `R`, if any.
+    #[must_use]
+    pub fn scope<R: Send + Sync + 'static>(&self) -> Option<std::sync::Arc<dyn Scope<R>>> {
+        self.policy_registry.scope::<R>()
+    }
+
+    /// Configured deny-response shape. See
+    /// [`ForbiddenResponse`] for the trade-off between `403` and
+    /// `404` defaults.
+    #[must_use]
+    pub const fn forbidden_response(&self) -> ForbiddenResponse {
+        self.forbidden_response
+    }
+
+    /// Session key used to resolve the authenticated user id for
+    /// [`PolicyContext`](crate::authorization::PolicyContext).
+    #[must_use]
+    pub fn auth_session_key(&self) -> &str {
+        &self.auth_session_key
+    }
+
+    /// Override the configured deny response (test helper).
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_forbidden_response(mut self, value: ForbiddenResponse) -> Self {
+        self.forbidden_response = value;
+        self
+    }
+
+    /// Override the auth session key (test helper).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_auth_session_key(mut self, value: impl Into<String>) -> Self {
+        self.auth_session_key = value.into();
         self
     }
 
@@ -264,6 +421,13 @@ impl AppState {
         &self.channels
     }
 
+    /// Returns a high-level broadcast facade for raw and htmx HTML payloads.
+    #[cfg(feature = "ws")]
+    #[must_use]
+    pub fn broadcast(&self) -> crate::channels::Broadcast {
+        self.channels.broadcast()
+    }
+
     /// Returns a child cancellation token for the server shutdown signal.
     ///
     /// WebSocket handlers should select on this to clean up when the
@@ -311,6 +475,8 @@ impl AppState {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -318,11 +484,16 @@ impl AppState {
             metrics: middleware::MetricsCollector::new(),
             log_levels: actuator::LogLevels::new("info"),
             task_registry: actuator::TaskRegistry::new(),
+            job_registry: actuator::JobRegistry::new(),
             config_props: actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: CancellationToken::new(),
+            policy_registry: PolicyRegistry::default(),
+            forbidden_response: ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         }
     }
 
@@ -342,6 +513,20 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
+    }
+
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
+
+    fn read_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        Self::read_pool(self)
     }
 }
 
@@ -369,6 +554,14 @@ impl crate::probe::ProvideProbeState for AppState {
     {
         self.pool.as_ref()
     }
+
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.replica_pool.as_ref()
+    }
 }
 
 impl crate::actuator::ProvideActuatorState for AppState {
@@ -382,6 +575,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn task_registry(&self) -> &crate::actuator::TaskRegistry {
         &self.task_registry
+    }
+
+    fn job_registry(&self) -> &crate::actuator::JobRegistry {
+        &self.job_registry
     }
 
     fn config_props(&self) -> &crate::actuator::ConfigProperties {
@@ -413,6 +610,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
     {
         self.pool.as_ref()
     }
+    // a11y_posture() uses the trait default (all-false) intentionally: AppState
+    // cannot know whether the application's layout is accessible.  Override this
+    // method on your own state type — or in a custom ProvideActuatorState impl —
+    // once you have verified that your pages include lang, a skip link, and
+    // landmark regions.  See docs/guide/accessibility.md for details.
 }
 
 impl std::fmt::Debug for AppState {
@@ -472,6 +674,134 @@ mod tests {
         let state = AppState::for_test().with_pool(pool);
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn database_topology_state_exposes_replica_as_read_pool() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+
+        assert_eq!(state.pool().expect("primary pool").status().max_size, 5);
+        assert_eq!(
+            state
+                .replica_pool()
+                .expect("replica pool")
+                .status()
+                .max_size,
+            2
+        );
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 2);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn read_pool_uses_primary_when_replica_is_unready_and_policy_allows_fallback() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::Primary);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 5);
+        assert_eq!(
+            db::DbState::read_pool(&state)
+                .expect("trait read pool")
+                .status()
+                .max_size,
+            5
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn read_pool_does_not_route_to_unready_replica_when_policy_fails_readiness() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica connection failed");
+
+        assert!(state.read_pool().is_none());
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn readiness_fails_when_app_state_replica_is_unready_and_policy_is_fail_readiness() {
+        let primary_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/primary".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+        let replica_config = config::DatabaseConfig {
+            url: Some("postgres://localhost/replica".into()),
+            pool_size: 2,
+            ..Default::default()
+        };
+        let primary = db::create_pool(&primary_config).unwrap().unwrap();
+        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+
+        let state = AppState::for_test()
+            .with_pool(primary)
+            .with_replica_pool(replica);
+        state
+            .probes()
+            .configure_replica_dependency(config::ReplicaFallback::FailReadiness);
+        state
+            .probes()
+            .mark_replica_unready("replica migrations lag primary");
+
+        let (status, _) = crate::probe::readiness_response(&state).await;
+
+        assert_eq!(status, http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

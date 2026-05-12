@@ -1,8 +1,8 @@
 # Getting Started with Autumn
 
 This guide takes you from zero to a running Autumn web app with routes, a
-database, HTML templates, interactive UI, and the current post-`v0.1.0`
-framework surface on `trunk`. Budget about 30 minutes.
+database, HTML templates, interactive UI, and the published `autumn-web` 0.4
+release line. Budget about 30 minutes.
 
 Autumn is a convention-over-configuration web framework for Rust, built on
 [Axum](https://github.com/tokio-rs/axum). It bundles Diesel (database), Maud
@@ -10,16 +10,16 @@ Autumn is a convention-over-configuration web framework for Rust, built on
 profile-aware configuration, and newer CLI workflows behind a Spring Boot-style
 developer experience.
 
-> **Version note:** `v0.1.0` was tagged on 2026-03-26. This guide tracks the
-> current `trunk` branch, which already includes unreleased post-`v0.1.0`
-> features like `autumn dev`, `autumn build`, profiles, actuator, and static
-> generation.
+> **Version note:** This is the published-user path for `autumn-web` 0.4.x and
+> `autumn-cli` 0.4.x as of 2026-05-11. If you are contributing from a source
+> checkout, use the local development commands below only after confirming the
+> workspace version still matches this guide.
 
 ---
 
 ## Prerequisites
 
-- **Rust 1.86.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
+- **Rust 1.88.0+** (edition 2024) -- install via [rustup](https://rustup.rs/)
 - **PostgreSQL** -- only needed if you want database features; Autumn runs
   fine without one
 - A terminal and a text editor
@@ -27,7 +27,7 @@ developer experience.
 Verify your Rust toolchain:
 
 ```bash
-rustc --version   # 1.85.0 or later
+rustc --version   # 1.88.0 or later
 cargo --version
 ```
 
@@ -35,8 +35,15 @@ cargo --version
 
 ## Install the CLI
 
-Autumn ships a small CLI for project scaffolding and tooling setup. Install it
-from source (crates.io publication is not yet available):
+Autumn ships a small CLI for project scaffolding and tooling setup. Install the
+published CLI from crates.io:
+
+```bash
+cargo install autumn-cli --version 0.4.0
+```
+
+For local development only, from an Autumn source checkout, install the CLI you
+just built instead:
 
 ```bash
 cargo install --path autumn-cli
@@ -44,13 +51,60 @@ cargo install --path autumn-cli
 
 This gives you the `autumn` binary with the core workflow commands:
 
-| Command         | What it does                                |
-|-----------------|---------------------------------------------|
-| `autumn new`    | Scaffold a new project                      |
-| `autumn setup`  | Download Tailwind CSS (with checksum verify) |
-| `autumn dev`    | Run the dev server with file watching        |
-| `autumn build`  | Pre-render `#[static_get]` routes into `dist/` |
-| `autumn migrate`| Run migrations or inspect migration status   |
+| Command          | What it does                                |
+|------------------|---------------------------------------------|
+| `autumn doctor`  | Diagnose your environment before first run  |
+| `autumn new`     | Scaffold a new project                      |
+| `autumn setup`   | Download Tailwind CSS (with checksum verify) |
+| `autumn dev`     | Run the dev server with file watching        |
+| `autumn build`   | Pre-render `#[static_get]` routes into `dist/` |
+| `autumn migrate` | Run migrations or inspect migration status   |
+| `autumn seed`    | Populate the database with representative data |
+
+---
+
+## Run the Doctor
+
+After installing the CLI, the first command to run from any Autumn project
+root is `autumn doctor`. It checks your environment for common first-run
+problems and tells you exactly what to fix before you waste time chasing
+cryptic errors:
+
+```bash
+autumn doctor
+```
+
+Sample output on a healthy system:
+
+```
+🍂 autumn doctor
+
+✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
+✅ version_compat — autumn-cli 0.4.0 matches autumn-web 0.4.0
+✅ autumn_toml — autumn.toml is valid
+✅ db_connectivity — Postgres reachable at localhost:5432
+✅ pending_migrations — no pending migrations
+✅ port_bindable — port 3000 is available
+✅ tailwind_binary — target/autumn/tailwindcss is present
+✅ stale_artifacts — artifacts look fresh
+
+8 passed, 0 warnings, 0 failed — all clear
+```
+
+If anything is wrong, `autumn doctor` prints a one-line remediation hint
+beneath the failing check.
+
+**Exit codes**: `0` when all checks pass (warnings are allowed); `1` when any
+check fails. Use `--strict` to treat warnings as failures (useful in CI).
+Use `--json` for machine-readable output:
+
+```bash
+# CI pre-flight gate (fail on warnings too)
+autumn doctor --strict
+
+# Machine-readable output for scripts
+autumn doctor --json
+```
 
 ---
 
@@ -100,14 +154,16 @@ The files that matter right now:
 
 ## Your First Route
 
-Open `src/main.rs`. The scaffolded code looks like this:
+Open `src/main.rs`. The scaffolded app includes a Maud layout, embedded
+migrations, and these starter routes:
 
 ```rust
-use autumn_web::{get, routes};
-
 #[get("/")]
-async fn index() -> &'static str {
-    "Welcome to Autumn!"
+async fn index() -> maud::Markup {
+    layout("Welcome", maud::html! {
+        h1 { "Welcome to my-app!" }
+        p { "Edit " code { "src/main.rs" } " to get started." }
+    })
 }
 
 #[get("/hello")]
@@ -124,6 +180,7 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 async fn main() {
     autumn_web::app()
         .routes(routes![index, hello, hello_name])
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
@@ -136,6 +193,8 @@ The key pieces:
 - **`routes![...]`** -- collects annotated handlers into a `Vec<Route>`.
 - **`autumn_web::app().routes(...).run().await`** -- the app builder. Load config,
   create the database pool, mount routes, start the server.
+- **`.migrations(MIGRATIONS)`** -- embeds and applies the app's Diesel
+  migrations when a database is configured.
 - **`#[autumn_web::main]`** -- sets up the Tokio async runtime. It is a thin
   wrapper around `#[tokio::main]`.
 
@@ -165,7 +224,7 @@ You will see log output like:
 ```
 
 Visit [http://localhost:3000](http://localhost:3000) -- you should see
-"Welcome to Autumn!". Try
+"Welcome to my-app!". Try
 [http://localhost:3000/hello/world](http://localhost:3000/hello/world) for the
 path parameter route.
 
@@ -180,7 +239,7 @@ Probe endpoints are also available at `/live`, `/ready`, and `/startup`.
 The `/health` response looks like:
 
 ```json
-{ "status": "ok", "version": "0.1.0" }
+{ "status": "ok", "version": "0.4.0" }
 ```
 
 Press **Ctrl+C** to stop the server (graceful shutdown with a configurable
@@ -285,11 +344,28 @@ pool_size = 10
 connect_timeout_secs = 5
 ```
 
-You can also set the URL via environment variable, which takes precedence over
-the TOML file:
+`url` is the single-primary compatibility field. For production-shaped config,
+name the write role explicitly:
+
+```toml
+[database]
+primary_url = "postgres://localhost/my_app"
+# replica_url = "postgres://localhost:5433/my_app"
+primary_pool_size = 10
+replica_pool_size = 5
+replica_fallback = "fail_readiness"
+auto_migrate_in_production = false
+```
+
+`Db`, transactions, advisory locks, and `autumn migrate` use the primary role.
+The optional replica role is for read paths that can tolerate replica replay
+lag according to `replica_fallback`.
+
+You can also set the primary URL via environment variable, which takes
+precedence over the TOML file:
 
 ```bash
-export AUTUMN_DATABASE__URL="postgres://localhost/my_app"
+export AUTUMN_DATABASE__PRIMARY_URL="postgres://localhost/my_app"
 ```
 
 (Note the double underscore `__` separating section from field.)
@@ -380,7 +456,7 @@ Add the required dependencies to `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-web = "0.1.0"
+autumn-web = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -778,9 +854,15 @@ port = 3000                  # default
 shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
 
 [database]
-url = "postgres://user:pass@localhost:5432/my_app"
-pool_size = 10               # default, max connections
+primary_url = "postgres://user:pass@localhost:5432/my_app"
+# url = "postgres://user:pass@localhost:5432/my_app" # legacy single-primary alias
+# replica_url = "postgres://user:pass@localhost:5433/my_app"
+pool_size = 10               # default, max connections per role
+# primary_pool_size = 10
+# replica_pool_size = 5
+replica_fallback = "fail_readiness" # or "primary"
 connect_timeout_secs = 5     # default
+auto_migrate_in_production = false
 
 [log]
 level = "info"               # default, supports tracing filter syntax
@@ -804,7 +886,12 @@ Every config field can be overridden via environment variables. The pattern is
 | `AUTUMN_SERVER__HOST`                | `server.host`          |
 | `AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS` | `server.shutdown_timeout_secs` |
 | `AUTUMN_DATABASE__URL`               | `database.url`         |
+| `AUTUMN_DATABASE__PRIMARY_URL`       | `database.primary_url` |
+| `AUTUMN_DATABASE__REPLICA_URL`       | `database.replica_url` |
 | `AUTUMN_DATABASE__POOL_SIZE`         | `database.pool_size`   |
+| `AUTUMN_DATABASE__PRIMARY_POOL_SIZE` | `database.primary_pool_size` |
+| `AUTUMN_DATABASE__REPLICA_POOL_SIZE` | `database.replica_pool_size` |
+| `AUTUMN_DATABASE__REPLICA_FALLBACK`  | `database.replica_fallback` |
 | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` |
 | `AUTUMN_LOG__LEVEL`                  | `log.level`            |
 | `AUTUMN_LOG__FORMAT`                 | `log.format`           |
@@ -831,8 +918,8 @@ deployment with env vars.
 
 ### Running without a database
 
-If you omit the `[database]` section (or leave `url` unset), Autumn starts
-without a database pool. Handlers that use `Db` will return 503 Service
+If you omit the `[database]` section (or leave both `primary_url` and `url`
+unset), Autumn starts without a database pool. Handlers that use `Db` will return 503 Service
 Unavailable. This is useful for static sites, APIs that do not need a
 database, or during early development.
 
@@ -904,6 +991,10 @@ Here are some things to explore:
 - **Check `/health` and `/actuator/*`** -- `/health` gives a small health
   response, while actuator adds info, metrics, env/configprops, loggers, and
   scheduled task visibility depending on the active profile.
+- **Localize your UI** -- enable the opt-in `i18n` feature flag on `autumn-web`
+  and drop translation files at `i18n/<locale>.ftl`. See
+  [the i18n guide](./i18n.md) for the convention, the `Locale` extractor, and
+  the `t!()` macro.
 - **Inspect request IDs** -- every response includes an `X-Request-Id` header
   (UUID v4) for log correlation.
 - **Look at the example apps** -- [`examples/todo-app`](../../examples/todo-app),

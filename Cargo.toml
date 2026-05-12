@@ -1,19 +1,14 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo"]
+members = ["autumn", "autumn-macros", "autumn-cli", "autumn-admin-plugin", "autumn-storage-s3", "autumn-cache-redis", "examples/hello", "examples/todo-app", "examples/blog", "examples/bookmarks", "examples/bookmarks-distributed", "examples/wiki", "examples/reddit-clone", "examples/custom_config_loader", "examples/ws-echo", "examples/signed-webhooks"]
 resolver = "3"
 
-# Unify autumn-web across the workspace and any transitive consumers (e.g.
-# autumn-harvest-plugin from crates.io depends on autumn-web 0.2 — without
-# this patch the path version and the registry version would be treated as
-# different crates and types wouldn't unify across the boundary).
 [patch.crates-io]
 autumn-web = { path = "autumn" }
-autumn-harvest-plugin = { path = "patched-crates/autumn-harvest-plugin" }
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.3.0"
+version = "0.4.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/madmax983/autumn"
 
@@ -52,16 +47,18 @@ indexmap = "2"
 moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }
-# Pin time to a range that is compatible with MSRV 1.86.0. Without this,
-# bollard (pulled in by testcontainers dev/optional deps) resolves
-# bollard-stubs -> time@0.3.46+ which requires rustc 1.88.0.
+testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
+# Keep time on the 0.3 release line for the testcontainers/bollard dependency
+# graph used by integration tests.
 time = { version = ">=0.3, <0.4" }
 
 # Proc macro
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

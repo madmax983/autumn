@@ -25,7 +25,7 @@ pub const TOKENS_CSS: &str = include_str!("tokens.css");
 
 /// Flash-message CSS consuming the shared tokens.
 ///
-/// Paired with [`crate::flash::FlashLevel::as_str`] (`"success"` /
+/// Paired with `FlashLevel::as_str` (if the `flash` feature is enabled) (`"success"` /
 /// `"error"` / `"warning"` / `"info"`). Render a flash like:
 ///
 /// ```html

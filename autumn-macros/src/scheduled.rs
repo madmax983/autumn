@@ -13,6 +13,7 @@ struct ScheduledAttrs {
     cron: Option<String>,
     name: Option<String>,
     tz: Option<String>,
+    coordination: Option<String>,
 }
 
 fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
@@ -21,6 +22,7 @@ fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
         cron: None,
         name: None,
         tz: None,
+        coordination: None,
     };
 
     syn::meta::parser(|meta| {
@@ -40,8 +42,13 @@ fn parse_scheduled_args(attr: TokenStream) -> syn::Result<ScheduledAttrs> {
             let value: LitStr = meta.value()?.parse()?;
             result.tz = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("coordination") {
+            let value: LitStr = meta.value()?.parse()?;
+            result.coordination = Some(value.value());
+            Ok(())
         } else {
-            Err(meta.error("unsupported attribute: expected every, cron, name, or tz"))
+            Err(meta
+                .error("unsupported attribute: expected every, cron, name, tz, or coordination"))
         }
     })
     .parse2(attr)?;
@@ -110,6 +117,19 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let task_name_str = task_name;
+    let coordination_expr = match attrs.coordination.as_deref() {
+        None | Some("fleet") => quote! { ::autumn_web::task::TaskCoordination::Fleet },
+        Some("per_replica") => quote! { ::autumn_web::task::TaskCoordination::PerReplica },
+        Some(other) => {
+            return syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!(
+                    "invalid #[scheduled(coordination = {other:?})]; expected \"fleet\" or \"per_replica\""
+                ),
+            )
+            .to_compile_error();
+        }
+    };
 
     quote! {
         #input_fn
@@ -119,6 +139,7 @@ pub fn scheduled_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::autumn_web::task::TaskInfo {
                 name: #task_name_str.to_string(),
                 schedule: #schedule_expr,
+                coordination: #coordination_expr,
                 handler: |state: ::autumn_web::AppState| {
                     Box::pin(async move {
                         #fn_name(state).await

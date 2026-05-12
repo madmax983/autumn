@@ -13,7 +13,7 @@ use crate::repositories::{PgSubredditRepository, SubredditRepository};
 use crate::schema::{subreddits, users};
 use crate::slugify::slugify;
 
-use super::layout::{layout, redirect_to, time_ago};
+use super::layout::{layout, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -30,7 +30,7 @@ pub async fn list(session: Session, repo: PgSubredditRepository) -> AutumnResult
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "Communities" }
                 @if current_user.is_some() {
-                    a href="/r/create"
+                    a href=(paths::create_form())
                       class="px-4 py-2 bg-orange-500 text-white rounded hover:bg-orange-600 text-sm" {
                         "+ Create Community"
                     }
@@ -38,7 +38,7 @@ pub async fn list(session: Session, repo: PgSubredditRepository) -> AutumnResult
             }
             div class="space-y-3" {
                 @for sub in &all {
-                    a href=(format!("/r/{}", sub.slug))
+                    a href=(paths::show(&sub.slug))
                        class="block bg-white rounded-lg shadow-sm border border-gray-200 \
                               hover:border-orange-300 hover:shadow transition-all p-4" {
                         div class="flex items-center justify-between" {
@@ -78,7 +78,7 @@ pub async fn create_form(session: Session, csrf: CsrfToken) -> AutumnResult<Mark
         html! {
             div class="max-w-lg mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create a Community" }
-                form action="/r/create" method="post"
+                form action=(paths::create()) method="post"
                      class="space-y-4 bg-white rounded-lg shadow p-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     div {
@@ -130,7 +130,7 @@ pub async fn create(
     session: Session,
     mut db: Db,
     form: Form<CreateSubredditForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -164,7 +164,7 @@ pub async fn create(
         .await
         .map_err(|_| AutumnError::unprocessable_msg("Community name already taken"))?;
 
-    Ok(redirect_to(&format!("/r/{slug}")))
+    Ok(Redirect::to(&paths::show(slug)))
 }
 
 // ── Show subreddit with posts ──────────────────────────────────
@@ -222,7 +222,7 @@ pub async fn show(
                         }
                     }
                     @if current_user.is_some() {
-                        a href=(format!("/r/{}/submit", sub.slug))
+                        a href=(super::posts::__autumn_path_submit_to_sub_form(&sub.slug))
                           class="px-4 py-2 bg-orange-500 text-white rounded text-sm \
                                  hover:bg-orange-600" {
                             "New Post"
@@ -242,17 +242,17 @@ pub async fn show(
 
                             // Post info
                             div class="flex-1 min-w-0" {
-                                a href=(format!("/r/{}/posts/{}", sub.slug, post_slug))
+                                a href=(super::posts::__autumn_path_show(&sub.slug, post_slug))
                                    class="text-lg font-medium text-gray-900 hover:text-orange-600" {
                                     (title)
                                 }
                                 div class="text-xs text-gray-400 mt-1" {
                                     "posted by "
-                                    a href=(format!("/u/{author}"))
+                                    a href=(super::auth::__autumn_path_profile(author))
                                        class="text-gray-500 hover:underline" { "u/" (author) }
                                     " " (time_ago(created_at))
                                     " \u{2022} "
-                                    a href=(format!("/r/{}/posts/{}", sub.slug, post_slug))
+                                    a href=(super::posts::__autumn_path_show(&sub.slug, post_slug))
                                        class="text-gray-500 hover:text-orange-600" {
                                         (comment_count) " comments"
                                     }
@@ -270,3 +270,5 @@ pub async fn show(
         },
     ))
 }
+
+autumn_web::paths![list, create_form, create, show];

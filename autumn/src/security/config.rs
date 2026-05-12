@@ -37,14 +37,291 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__REQUESTS_PER_SECOND` | `security.rate_limit.requests_per_second` | `f64` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES` | `security.rate_limit.trusted_proxies` | comma-separated `String` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__BACKEND` | `security.webhooks.replay.backend` | `memory` / `redis` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__URL` | `security.webhooks.replay.redis.url` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__REDIS__KEY_PREFIX` | `security.webhooks.replay.redis.key_prefix` | `String` |
+//! | `AUTUMN_SECURITY__WEBHOOKS__REPLAY__ALLOW_MEMORY_IN_PRODUCTION` | `security.webhooks.replay.allow_memory_in_production` | `bool` |
+//! | per-endpoint `secret_env` | `security.webhooks.endpoints[*].secret` | environment variable name |
 //!
 //! Setting any header value to an empty string disables it (the header is
 //! not emitted). This is the escape hatch for opting out of a default.
 
+use std::sync::Arc;
+
 use serde::Deserialize;
+
+// ── Signing secret contract ────────────────────────────────────────────────
+
+/// Minimum byte length for a valid production signing secret (32 bytes / 256 bits).
+///
+/// A hex-encoded 32-byte value is 64 characters. Anything shorter is rejected
+/// at production startup.
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// Known demo / template / placeholder values that must never reach production.
+const DEMO_VALUES: &[&str] = &[
+    "changeme",
+    "change_me",
+    "change-me",
+    "secret",
+    "supersecret",
+    "super-secret",
+    "super_secret",
+    "your-secret-here",
+    "your_secret_here",
+    "insert-secret-here",
+    "replace-this",
+    "replace_me",
+    "todo",
+    "fixme",
+    "example",
+    "placeholder",
+    "dev_only",
+    "dev-only",
+    "test_secret",
+    "test-secret",
+    "test",
+    "password",
+];
+
+/// Signing-secret configuration for HMAC-signed framework surfaces.
+///
+/// The signing secret is the shared key used to sign sessions, CSRF tokens,
+/// flash/signed-cookie state, and local-storage signed URLs.
+///
+/// # Development and test
+///
+/// Leave `secret` unset. An ephemeral per-process key is generated automatically.
+/// This means sessions and signed URLs do **not** survive process restarts and
+/// replicas cannot share state — acceptable in dev, unacceptable in production.
+///
+/// # Production
+///
+/// Set `secret` via the `AUTUMN_SECURITY__SIGNING_SECRET` environment variable
+/// (or `[security.signing_secret] secret` in `autumn.toml`). The secret must be:
+/// - At least [`MIN_SECRET_LEN`] bytes long.
+/// - Not a known template/demo value.
+/// - Stable across restarts and identical on every replica.
+///
+/// Generate a secret: `openssl rand -hex 32`
+///
+/// # Rotation
+///
+/// When rotating, move the current secret to `previous_secrets` and set the
+/// new value in `secret`. New signatures use `secret`; tokens signed with any
+/// entry in `previous_secrets` continue to validate during the grace window.
+/// Remove expired entries from `previous_secrets` after the maximum relevant
+/// cookie/token lifetime has elapsed.
+///
+/// # `autumn.toml` example
+///
+/// ```toml
+/// [security.signing_secret]
+/// # secret set via AUTUMN_SECURITY__SIGNING_SECRET env var (never commit this)
+///
+/// # rotation grace window — leave populated until all existing tokens expire:
+/// previous_secrets = ["oldsecretvalue..."]
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SigningSecretConfig {
+    /// The current signing secret. In production, must come from an environment
+    /// variable or external secrets manager — never a committed literal.
+    pub secret: Option<String>,
+
+    /// Previous signing secrets accepted during a rotation grace window.
+    ///
+    /// New signatures always use `secret`. Tokens signed with an entry here
+    /// remain valid until removed. Remove entries after the maximum relevant
+    /// cookie/token lifetime has elapsed (e.g. `session.max_age_secs`).
+    #[serde(default)]
+    pub previous_secrets: Vec<String>,
+}
+
+/// Error returned when a signing secret fails production validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningSecretError {
+    /// No secret is configured but the production profile requires one.
+    MissingInProduction,
+    /// The secret is too short to meet the minimum entropy requirement.
+    TooShort {
+        /// Actual byte length of the supplied secret.
+        actual: usize,
+        /// Minimum required byte length ([`MIN_SECRET_LEN`]).
+        required: usize,
+    },
+    /// The secret matches a known insecure demo or template value.
+    KnownWeakValue(String),
+}
+
+impl std::fmt::Display for SigningSecretError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingInProduction => write!(
+                f,
+                "signing secret is required in production; set \
+                 AUTUMN_SECURITY__SIGNING_SECRET (generate with `openssl rand -hex 32`)"
+            ),
+            Self::TooShort { actual, required } => write!(
+                f,
+                "signing secret is too short ({actual} bytes, minimum {required}); \
+                 generate one with `openssl rand -hex 32`"
+            ),
+            Self::KnownWeakValue(v) => write!(
+                f,
+                "signing secret looks like a template/demo value ({v:?}); \
+                 generate one with `openssl rand -hex 32`"
+            ),
+        }
+    }
+}
+
+/// Validate a signing secret for production use.
+///
+/// In development and test the check is skipped — any value (including `None`)
+/// is accepted so zero-config local development continues to work.
+///
+/// In production:
+/// - `None` → [`SigningSecretError::MissingInProduction`]
+/// - Shorter than [`MIN_SECRET_LEN`] bytes → [`SigningSecretError::TooShort`]
+/// - Matches a known demo/template string → [`SigningSecretError::KnownWeakValue`]
+///
+/// # Errors
+///
+/// Returns [`SigningSecretError`] when production validation fails.
+pub fn validate_signing_secret(
+    secret: Option<&str>,
+    is_production: bool,
+) -> Result<(), SigningSecretError> {
+    if !is_production {
+        return Ok(());
+    }
+    let secret = secret.ok_or(SigningSecretError::MissingInProduction)?;
+    // Demo-value check first: "changeme" is more informative than "too short".
+    let lower = secret.to_ascii_lowercase();
+    for &demo in DEMO_VALUES {
+        if lower == demo {
+            return Err(SigningSecretError::KnownWeakValue(secret.to_owned()));
+        }
+    }
+    let byte_len = secret.len();
+    if byte_len < MIN_SECRET_LEN {
+        return Err(SigningSecretError::TooShort {
+            actual: byte_len,
+            required: MIN_SECRET_LEN,
+        });
+    }
+    Ok(())
+}
+
+// ── Resolved signing key material ─────────────────────────────────────────
+
+/// HMAC-SHA256 of `message` under `key`, returned as lowercase hex.
+///
+/// # Panics
+///
+/// This should not panic because HMAC accepts keys of any length. A panic would
+/// indicate a broken crypto crate invariant.
+#[must_use]
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    let bytes = mac.finalize().into_bytes();
+    bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
+}
+
+/// Constant-time string comparison for HMAC verification.
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Generate a random 32-byte ephemeral key from two UUID v4 values.
+fn generate_ephemeral_key() -> Vec<u8> {
+    let a = uuid::Uuid::new_v4();
+    let b = uuid::Uuid::new_v4();
+    let mut bytes = vec![0u8; 32];
+    bytes[..16].copy_from_slice(a.as_bytes());
+    bytes[16..].copy_from_slice(b.as_bytes());
+    bytes
+}
+
+/// Resolved signing keys for a running Autumn instance.
+///
+/// Created once at startup from [`SigningSecretConfig`] via [`resolve_signing_keys`]
+/// and shared via `Arc` across session, CSRF, and local storage signing.
+///
+/// - `current` signs new tokens.
+/// - `previous` are accepted during a rotation grace window.
+#[derive(Clone, Debug)]
+pub struct ResolvedSigningKeys {
+    /// Key used to sign new tokens.
+    pub current: Arc<[u8]>,
+    /// Former keys accepted during a rotation grace window. New signatures always
+    /// use `current`; tokens carrying a `previous` HMAC continue to verify until
+    /// removed (see docs/guide/signing-secrets.md).
+    pub previous: Vec<Arc<[u8]>>,
+}
+
+impl ResolvedSigningKeys {
+    /// Build from raw byte vectors.
+    pub fn new(current: Vec<u8>, previous: Vec<Vec<u8>>) -> Self {
+        Self {
+            current: current.into(),
+            previous: previous.into_iter().map(|v: Vec<u8>| v.into()).collect(),
+        }
+    }
+
+    /// HMAC-SHA256 of `message` under the current key, hex-encoded.
+    pub fn sign(&self, message: &[u8]) -> String {
+        hmac_sha256_hex(&self.current, message)
+    }
+
+    /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
+    /// any key (current first, then previous). All comparisons are constant-time.
+    pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
+        if ct_eq_str(&hmac_sha256_hex(&self.current, message), hex_sig) {
+            return true;
+        }
+        for prev in &self.previous {
+            if ct_eq_str(&hmac_sha256_hex(prev, message), hex_sig) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Resolve signing keys from a [`SigningSecretConfig`].
+///
+/// - When `secret` is set, its bytes become the current key.
+/// - When `secret` is absent (dev/test), an ephemeral random key is generated.
+///   This means signed tokens do not survive process restarts.
+/// - `previous_secrets` are always included for rotation grace-window verification.
+///
+/// Production boot validation (requiring `secret` to be non-empty, long enough,
+/// and not a demo value) is a separate step via [`validate_signing_secret`].
+pub fn resolve_signing_keys(config: &SigningSecretConfig) -> ResolvedSigningKeys {
+    let current = config
+        .secret
+        .as_deref()
+        .map_or_else(generate_ephemeral_key, |s| s.as_bytes().to_vec());
+    let previous = config
+        .previous_secrets
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+    ResolvedSigningKeys::new(current, previous)
+}
 
 /// Top-level security configuration section.
 ///
@@ -79,6 +356,38 @@ pub struct SecurityConfig {
     /// Multipart upload safeguards and validation policy.
     #[serde(default)]
     pub upload: UploadConfig,
+
+    /// Signed webhook intake endpoints.
+    #[serde(default)]
+    pub webhooks: crate::webhook::WebhookConfig,
+
+    /// HTTP status returned when a [`Policy`](crate::authorization::Policy)
+    /// denies a record-level action. Defaults to `"404"` to mirror the
+    /// Rails / Phoenix posture of hiding existence from unauthorized
+    /// clients.
+    #[serde(default)]
+    pub forbidden_response: crate::authorization::ForbiddenResponse,
+
+    /// Allow `#[repository(api = "...")]` to mount auto-generated
+    /// CRUD endpoints in `prod` builds without a paired `policy =`
+    /// argument.
+    ///
+    /// Default: `false`. The framework refuses to start when an
+    /// `api =` repository has no `policy =` because the auto-
+    /// generated endpoints would be reachable by any authenticated
+    /// user. Flip this to `true` only when the lack of authz is
+    /// genuinely intended (e.g. a fully-public read-only API).
+    #[serde(default)]
+    pub allow_unauthorized_repository_api: bool,
+
+    /// Signing-secret configuration for HMAC-signed framework surfaces.
+    ///
+    /// Covers sessions, CSRF tokens, flash/signed-cookie state, and
+    /// local-storage signed URLs. In dev the framework generates an
+    /// ephemeral per-process key; production MUST set a stable, private
+    /// secret via `AUTUMN_SECURITY__SIGNING_SECRET`.
+    #[serde(default)]
+    pub signing_secret: SigningSecretConfig,
 }
 
 /// Security response headers configuration.
@@ -282,6 +591,7 @@ impl Default for CsrfConfig {
 /// | `requests_per_second` | `10.0` |
 /// | `burst` | `20` |
 /// | `trust_forwarded_headers` | `false` |
+/// | `trusted_proxies` | `[]` |
 ///
 /// # Client IP resolution
 ///
@@ -291,6 +601,11 @@ impl Default for CsrfConfig {
 /// sits behind a trusted reverse proxy that strips and rewrites
 /// forwarding headers on every request.
 ///
+/// If trusted upstream proxies append to `X-Forwarded-For`, configure
+/// `trusted_proxies` with the trusted proxy IPs or CIDR ranges. Autumn
+/// then walks the header from right to left, skips those trusted proxy
+/// hops, and keys the bucket on the nearest untrusted client IP.
+///
 /// # Examples
 ///
 /// ```toml
@@ -299,6 +614,7 @@ impl Default for CsrfConfig {
 /// requests_per_second = 5.0
 /// burst = 10
 /// trust_forwarded_headers = false
+/// trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
@@ -323,6 +639,17 @@ pub struct RateLimitConfig {
     /// can rotate header values to bypass throttling.
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+
+    /// Trusted proxy IP addresses or CIDR ranges to skip at the right
+    /// side of an appended `X-Forwarded-For` chain.
+    ///
+    /// This is only used when `trust_forwarded_headers = true`. Include
+    /// the immediate peer proxy when `ConnectInfo` is available; forwarded
+    /// headers from non-trusted peers, or requests without peer metadata,
+    /// are ignored. Invalid entries are ignored; if every configured
+    /// entry is invalid, forwarded headers are ignored rather than trusted.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for RateLimitConfig {
@@ -332,6 +659,7 @@ impl Default for RateLimitConfig {
             requests_per_second: default_rps(),
             burst: default_burst(),
             trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -458,6 +786,132 @@ const fn default_max_file_size_bytes() -> usize {
 mod tests {
     use super::*;
 
+    // ── validate_signing_secret (RED phase) ─────────────────────────────────
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_none() {
+        assert!(validate_signing_secret(None, false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_weak_value() {
+        assert!(validate_signing_secret(Some("changeme"), false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_dev_skips_validation_with_short_value() {
+        assert!(validate_signing_secret(Some("short"), false).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_prod_missing_is_error() {
+        let err = validate_signing_secret(None, true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::MissingInProduction));
+    }
+
+    #[test]
+    fn signing_secret_prod_too_short_is_error() {
+        let short = "a".repeat(MIN_SECRET_LEN - 1);
+        let err = validate_signing_secret(Some(&short), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::TooShort { .. }));
+    }
+
+    #[test]
+    fn signing_secret_prod_exact_min_length_passes() {
+        let exactly_min = "a".repeat(MIN_SECRET_LEN);
+        assert!(validate_signing_secret(Some(&exactly_min), true).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_prod_known_demo_value_is_error() {
+        let err = validate_signing_secret(Some("changeme"), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::KnownWeakValue(_)));
+    }
+
+    #[test]
+    fn signing_secret_prod_demo_value_case_insensitive() {
+        let err = validate_signing_secret(Some("CHANGEME"), true).unwrap_err();
+        assert!(matches!(err, SigningSecretError::KnownWeakValue(_)));
+    }
+
+    #[test]
+    fn signing_secret_prod_valid_64char_hex_passes() {
+        let secret = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        assert!(validate_signing_secret(Some(secret), true).is_ok());
+    }
+
+    #[test]
+    fn signing_secret_config_defaults_to_none() {
+        let config = SigningSecretConfig::default();
+        assert!(config.secret.is_none());
+        assert!(config.previous_secrets.is_empty());
+    }
+
+    #[test]
+    fn signing_secret_error_missing_display_mentions_env_var() {
+        let err = SigningSecretError::MissingInProduction;
+        assert!(err.to_string().contains("AUTUMN_SECURITY__SIGNING_SECRET"));
+    }
+
+    #[test]
+    fn signing_secret_error_too_short_display_shows_lengths() {
+        let err = SigningSecretError::TooShort {
+            actual: 8,
+            required: 32,
+        };
+        let s = err.to_string();
+        assert!(s.contains('8'));
+        assert!(s.contains("32"));
+    }
+
+    #[test]
+    fn signing_secret_error_weak_value_display_mentions_demo() {
+        let err = SigningSecretError::KnownWeakValue("changeme".to_owned());
+        assert!(err.to_string().contains("template/demo"));
+    }
+
+    #[test]
+    fn signing_secret_prod_too_short_error_reports_actual_length() {
+        let short = "tooshort"; // 8 bytes
+        let err = validate_signing_secret(Some(short), true).unwrap_err();
+        if let SigningSecretError::TooShort { actual, required } = err {
+            assert_eq!(actual, 8);
+            assert_eq!(required, MIN_SECRET_LEN);
+        } else {
+            panic!("expected TooShort error");
+        }
+    }
+
+    #[test]
+    fn signing_secret_prod_secret_key_demo_value_fails() {
+        assert!(matches!(
+            validate_signing_secret(Some("secret"), true),
+            Err(SigningSecretError::KnownWeakValue(_))
+        ));
+    }
+
+    #[test]
+    fn signing_secret_prod_supersecret_demo_value_fails() {
+        assert!(matches!(
+            validate_signing_secret(Some("supersecret"), true),
+            Err(SigningSecretError::KnownWeakValue(_))
+        ));
+    }
+
+    #[test]
+    fn signing_secret_config_deserialize_from_toml() {
+        let toml_str = r#"
+            secret = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+            previous_secrets = ["oldsecret01234567890123456789012"]
+        "#;
+        let config: SigningSecretConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.secret.as_deref(),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4")
+        );
+        assert_eq!(config.previous_secrets.len(), 1);
+    }
+
     #[test]
     fn security_config_defaults() {
         let config = SecurityConfig::default();
@@ -562,21 +1016,24 @@ mod tests {
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
+        assert!(config.trusted_proxies.is_empty());
     }
 
     #[test]
     fn rate_limit_config_deserialize() {
-        let toml_str = r"
+        let toml_str = r#"
             enabled = true
             requests_per_second = 5.0
             burst = 100
             trust_forwarded_headers = true
-        ";
+            trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+        "#;
         let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
         assert!(config.enabled);
         assert!((config.requests_per_second - 5.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 100);
         assert!(config.trust_forwarded_headers);
+        assert_eq!(config.trusted_proxies, vec!["10.0.0.10", "203.0.113.0/24"]);
     }
 
     #[test]
@@ -587,6 +1044,7 @@ mod tests {
         assert!((config.requests_per_second - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
+        assert!(config.trusted_proxies.is_empty());
     }
 
     #[test]
@@ -640,5 +1098,79 @@ mod tests {
         assert_eq!(config.upload.max_request_size_bytes, 4096);
         assert_eq!(config.upload.max_file_size_bytes, 1024);
         assert_eq!(config.upload.allowed_mime_types, vec!["text/plain"]);
+    }
+
+    // ── ResolvedSigningKeys + resolve_signing_keys (RED phase) ─────────────
+
+    #[test]
+    fn resolve_signing_keys_dev_generates_non_empty_ephemeral() {
+        let config = SigningSecretConfig::default();
+        let keys = resolve_signing_keys(&config);
+        assert!(keys.current.len() >= MIN_SECRET_LEN);
+    }
+
+    #[test]
+    fn resolve_signing_keys_prod_uses_secret_bytes() {
+        let secret = "a".repeat(MIN_SECRET_LEN);
+        let config = SigningSecretConfig {
+            secret: Some(secret.clone()),
+            previous_secrets: vec![],
+        };
+        let keys = resolve_signing_keys(&config);
+        assert_eq!(keys.current.as_ref(), secret.as_bytes());
+    }
+
+    #[test]
+    fn resolve_signing_keys_includes_previous_secrets() {
+        let config = SigningSecretConfig {
+            secret: Some("a".repeat(MIN_SECRET_LEN)),
+            previous_secrets: vec!["b".repeat(MIN_SECRET_LEN)],
+        };
+        let keys = resolve_signing_keys(&config);
+        assert_eq!(keys.previous.len(), 1);
+        assert_eq!(
+            keys.previous[0].as_ref(),
+            "b".repeat(MIN_SECRET_LEN).as_bytes()
+        );
+    }
+
+    #[test]
+    fn resolved_keys_sign_and_verify_current() {
+        let keys = ResolvedSigningKeys::new(b"current-key-32-bytes-xxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys.sign(b"test-message");
+        assert!(keys.verify(b"test-message", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_rejects_wrong_message() {
+        let keys = ResolvedSigningKeys::new(b"current-key-32-bytes-xxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys.sign(b"message-a");
+        assert!(!keys.verify(b"message-b", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_previous_key_passes() {
+        let old_key = b"old-key-32-bytes-xxxxxxxxxxxx!x".to_vec();
+        let new_key = b"new-key-32-bytes-xxxxxxxxxxxx!x".to_vec();
+        let old_keys = ResolvedSigningKeys::new(old_key.clone(), vec![]);
+        let old_sig = old_keys.sign(b"session-id");
+        let new_keys = ResolvedSigningKeys::new(new_key, vec![old_key]);
+        assert!(new_keys.verify(b"session-id", &old_sig));
+    }
+
+    #[test]
+    fn resolved_keys_verify_wrong_key_fails() {
+        let keys_a = ResolvedSigningKeys::new(b"key-a-32-bytes-xxxxxxxxxxxxxxxx".to_vec(), vec![]);
+        let keys_b = ResolvedSigningKeys::new(b"key-b-32-bytes-xxxxxxxxxxxxxxxx".to_vec(), vec![]);
+        let sig = keys_a.sign(b"message");
+        assert!(!keys_b.verify(b"message", &sig));
+    }
+
+    #[test]
+    fn resolved_keys_sign_produces_64_char_hex() {
+        let keys = ResolvedSigningKeys::new(b"key".to_vec(), vec![]);
+        let sig = keys.sign(b"msg");
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 hex is 64 chars");
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

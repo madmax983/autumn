@@ -3,11 +3,8 @@
 #
 # Smart defaults already set: log.level=debug, log.format=Pretty,
 # health.detailed=true, actuator.sensitive=true.
-# We only need the database URL here.
-
+# The base [database] section names primary_url and replica_url. Dev only
+# changes pool sizing.
 [database]
-url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed"
-
-[distributed.database]
 primary_pool_size = 7
 replica_pool_size = 3

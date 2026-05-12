@@ -3,7 +3,7 @@
 //!
 #[cfg(feature = "multipart")]
 use autumn_web::extract::Multipart;
-use autumn_web::extract::{Form, Json};
+use autumn_web::extract::{Form, Json, Path, Query};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -20,6 +20,43 @@ struct JsonInput {
 #[derive(Serialize)]
 struct JsonOutput {
     doubled: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WrapperCompatInput {
+    title: String,
+}
+
+fn title_from_ref(input: &WrapperCompatInput) -> &str {
+    &input.title
+}
+
+const fn str_len(input: &str) -> usize {
+    input.len()
+}
+
+#[test]
+fn extractor_wrappers_preserve_axum_style_deref_coercions() {
+    let form = Form(WrapperCompatInput {
+        title: "form".to_owned(),
+    });
+    assert_eq!(title_from_ref(&form), "form");
+
+    let json = Json(WrapperCompatInput {
+        title: "json".to_owned(),
+    });
+    assert_eq!(title_from_ref(&json), "json");
+
+    let query = Query(WrapperCompatInput {
+        title: "query".to_owned(),
+    });
+    assert_eq!(title_from_ref(&query), "query");
+
+    let id = Path(42_i64);
+    assert_eq!(*id, 42);
+
+    let slug = Path("problem-details".to_owned());
+    assert_eq!(str_len(&slug), 15);
 }
 
 #[tokio::test]

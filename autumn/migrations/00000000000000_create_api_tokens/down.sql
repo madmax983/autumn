@@ -1,0 +1,1 @@
+-- No-op compatibility shim; see up.sql.

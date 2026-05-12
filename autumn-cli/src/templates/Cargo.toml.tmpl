@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Enable Redis-backed sessions later by switching to:
-# autumn-web = { version = "{{autumn_version}}", features = ["redis"] }
+# Enable optional subsystems later by switching to:
+# autumn-web = { version = "{{autumn_version}}", features = ["redis", "mail"] }
 autumn-web = "{{autumn_version}}"
+
+[dev-dependencies]
+# tokio runtime macros are needed for #[tokio::test] in integration tests.
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [workspace]

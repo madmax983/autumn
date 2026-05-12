@@ -8,17 +8,16 @@ use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 use crate::live_events::{
-    comment_created_event, publish_stored_live_event_best_effort, store_activity_event,
+    comment_created_event, publish_stored_live_event_best_effort, store_activity_event_for_state,
 };
 use crate::models::Comment;
 use crate::schema::{comments, posts, subreddits, users};
 
-use super::layout::redirect_to;
+use autumn_web::Redirect;
 
 #[derive(serde::Deserialize)]
 pub struct CommentForm {
@@ -34,7 +33,7 @@ pub async fn create(
     session: Session,
     mut db: Db,
     form: Form<CommentForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -55,12 +54,14 @@ pub async fn create(
     let post_slug_for_event = post_slug.clone();
     let body_for_insert = body.clone();
     let author_username_for_event = author_username.clone();
-    let event_id = (*db)
-        .transaction::<i64, AutumnError, _>(|conn| {
+    let state_for_event = state.clone();
+    let event_id = db
+        .tx(|conn| {
             let sub_slug = sub_slug_for_event.clone();
             let post_slug = post_slug_for_event.clone();
             let body = body_for_insert.clone();
             let author_username = author_username_for_event.clone();
+            let state = state_for_event.clone();
             async move {
                 let post_id: i64 = posts::table
                     .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
@@ -95,16 +96,19 @@ pub async fn create(
                     &author_username,
                     &body,
                 );
-                let event_id = store_activity_event(conn, &sub_slug, &event).await?;
+                let event_id =
+                    store_activity_event_for_state(&state, conn, &sub_slug, &event).await?;
 
-                Ok(event_id)
+                Ok::<_, AutumnError>(event_id)
             }
             .scope_boxed()
         })
         .await?;
     publish_stored_live_event_best_effort(&state, event_id).await;
 
-    Ok(redirect_to(&format!("/r/{sub_slug}/posts/{post_slug}")))
+    Ok(Redirect::to(&super::posts::__autumn_path_show(
+        &sub_slug, &post_slug,
+    )))
 }
 
 /// htmx endpoint: load comments for a post (for lazy loading).
@@ -135,7 +139,7 @@ pub async fn list_comments(
         @for (comment, author) in &post_comments {
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
                 div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                    a href=(format!("/u/{author}"))
+                    a href=(super::auth::__autumn_path_profile(author))
                        class="font-medium text-gray-600 hover:underline" {
                         "u/" (author)
                     }
@@ -155,3 +159,5 @@ pub async fn list_comments(
         }
     })
 }
+
+autumn_web::paths![create, list_comments];

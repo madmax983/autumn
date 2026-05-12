@@ -29,8 +29,6 @@ pub struct ErrorPageFilter {
 
 impl ExceptionFilter for ErrorPageFilter {
     fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
-        // Check if the original request wanted HTML (stored in extensions
-        // by the error page middleware layer).
         let wants_html = response
             .extensions()
             .get::<WantsHtml>()
@@ -40,76 +38,16 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
-        let request_id = response
-            .extensions()
-            .get::<ErrorPageRequestContext>()
-            .and_then(|ctx| {
-                ctx.request_id
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-            });
-
-        let path = response
-            .extensions()
-            .get::<ErrorPageRequestContext>()
-            .map(|ctx| ctx.uri.path().to_string())
-            .unwrap_or_default();
-
-        let ctx = ErrorContext {
-            status: error.status,
-            message: error.message.clone(),
-            path,
-            request_id: request_id.clone(),
-            details: error.details.clone(),
-            is_dev: self.is_dev,
-        };
-
+        let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
                 .into_string();
 
-        // In dev mode, inject the error badge before </body>
         if self.is_dev {
-            let badge_ctx = DevBadgeContext {
-                status_code: error.status.as_u16(),
-                status_reason: error
-                    .status
-                    .canonical_reason()
-                    .unwrap_or("Error")
-                    .to_string(),
-                message: error.message.clone(),
-                path: ctx.path,
-                request_id,
-                source_location: None,
-            };
-            let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
-            if let Some(pos) = html_body.rfind("</body>") {
-                html_body.insert_str(pos, &badge);
-            } else {
-                html_body.push_str(&badge);
-            }
+            Self::inject_dev_badge(&mut html_body, error, &ctx);
         }
 
-        let content_length = html_body.len();
-
-        let mut resp = (
-            error.status,
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            html_body,
-        )
-            .into_response();
-
-        // Re-attach error info so downstream filters still see it
-        resp.extensions_mut().insert(error.clone());
-
-        // Ensure content-length is set correctly, as middleware might otherwise
-        // drop it in some environments like fallback routes.
-        resp.headers_mut().insert(
-            axum::http::header::CONTENT_LENGTH,
-            axum::http::HeaderValue::from(content_length),
-        );
-
-        resp
+        Self::build_html_response(error, html_body)
     }
 }
 
@@ -122,7 +60,7 @@ pub struct WantsHtml(pub bool);
 #[derive(Clone, Debug)]
 pub struct ErrorPageRequestContext {
     pub uri: axum::http::Uri,
-    pub request_id: Option<crate::middleware::RequestId>,
+    pub request_id: Option<String>,
 }
 
 /// Tower layer that annotates requests with Accept header preference
@@ -167,7 +105,7 @@ where
         let request_id = req
             .extensions()
             .get::<crate::middleware::RequestId>()
-            .cloned();
+            .map(std::string::ToString::to_string);
 
         ErrorPageContextFuture {
             inner: self.inner.call(req),
@@ -184,7 +122,7 @@ pin_project_lite::pin_project! {
         inner: F,
         wants_html: bool,
         uri: axum::http::Uri,
-        request_id: Option<crate::middleware::RequestId>,
+        request_id: Option<String>,
     }
 }
 
@@ -204,9 +142,16 @@ where
                 response
                     .extensions_mut()
                     .insert(WantsHtml(*this.wants_html));
+                let request_id = this.request_id.clone().or_else(|| {
+                    response
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned)
+                });
                 response.extensions_mut().insert(ErrorPageRequestContext {
                     uri: this.uri.clone(),
-                    request_id: this.request_id.clone(),
+                    request_id,
                 });
                 std::task::Poll::Ready(Ok(response))
             }
@@ -220,8 +165,12 @@ where
 /// Returns `true` for typical browser requests (`text/html` or `*/*`),
 /// `false` for API requests (`application/json`).
 fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
-    let accept = req
-        .headers()
+    accept_prefers_html(req.headers())
+}
+
+/// Check whether an Accept header prefers an HTML response over JSON.
+pub fn accept_prefers_html(headers: &axum::http::HeaderMap) -> bool {
+    let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
@@ -251,18 +200,23 @@ fn accepts_html<B>(req: &axum::http::Request<B>) -> bool {
                 continue;
             }
 
-            if let Some(value) = segment.strip_prefix("q=") {
-                if let Ok(parsed) = value.trim().parse::<f32>() {
-                    q = parsed.clamp(0.0, 1.0);
-                }
+            if let Some(value) = segment.strip_prefix("q=")
+                && let Ok(parsed) = value.trim().parse::<f32>()
+            {
+                q = parsed.clamp(0.0, 1.0);
             }
+        }
+        if q <= 0.0 {
+            continue;
         }
 
         match mime {
             "text/html" if html.is_none_or(|(existing_q, _)| q > existing_q) => {
                 html = Some((q, index));
             }
-            "application/json" if json.is_none_or(|(existing_q, _)| q > existing_q) => {
+            "application/json" | "application/problem+json"
+                if json.is_none_or(|(existing_q, _)| q > existing_q) =>
+            {
                 json = Some((q, index));
             }
             "*/*" if wildcard.is_none_or(|(existing_q, _)| q > existing_q) => {
@@ -298,6 +252,78 @@ pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::U
 
     crate::error::AutumnError::not_found_msg(format!("No route matches {}", uri.path()))
         .into_response()
+}
+
+impl ErrorPageFilter {
+    fn build_error_context(
+        error: &AutumnErrorInfo,
+        response: &Response,
+        is_dev: bool,
+    ) -> ErrorContext {
+        let request_id = response
+            .extensions()
+            .get::<ErrorPageRequestContext>()
+            .and_then(|ctx| ctx.request_id.clone());
+
+        let path = response
+            .extensions()
+            .get::<ErrorPageRequestContext>()
+            .map(|ctx| ctx.uri.path().to_string())
+            .unwrap_or_default();
+
+        ErrorContext {
+            status: error.status,
+            message: error.message.clone(),
+            path,
+            request_id,
+            details: error.details.clone(),
+            is_dev,
+        }
+    }
+
+    fn inject_dev_badge(html_body: &mut String, error: &AutumnErrorInfo, ctx: &ErrorContext) {
+        let badge_ctx = DevBadgeContext {
+            status_code: error.status.as_u16(),
+            status_reason: error
+                .status
+                .canonical_reason()
+                .unwrap_or("Error")
+                .to_string(),
+            message: error.message.clone(),
+            path: ctx.path.clone(),
+            request_id: ctx.request_id.clone(),
+            source_location: None,
+        };
+        let badge = dev_badge::dev_error_badge_html(&badge_ctx).into_string();
+        if let Some(pos) = html_body.rfind("</body>") {
+            html_body.insert_str(pos, &badge);
+        } else {
+            html_body.push_str(&badge);
+        }
+    }
+
+    fn build_html_response(error: &AutumnErrorInfo, html_body: String) -> Response {
+        let content_length = html_body.len();
+
+        let mut resp = (
+            error.status,
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html_body,
+        )
+            .into_response();
+
+        // Re-attach error info so downstream filters still see it
+        resp.extensions_mut().insert(error.clone());
+
+        // Ensure content-length is set correctly, as middleware might otherwise
+        // drop it in some environments like fallback routes.
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_LENGTH,
+            axum::http::HeaderValue::from(content_length),
+        );
+
+        resp
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +387,15 @@ mod tests {
     fn prefers_json_when_json_has_higher_q() {
         let req = Request::builder()
             .header("accept", "text/html;q=0.4, application/json;q=0.9")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!accepts_html(&req));
+    }
+
+    #[test]
+    fn prefers_problem_json_when_problem_json_has_higher_q() {
+        let req = Request::builder()
+            .header("accept", "application/problem+json, text/html;q=0.1")
             .body(Body::empty())
             .unwrap();
         assert!(!accepts_html(&req));
@@ -502,14 +537,15 @@ mod tests {
             .to_str()
             .unwrap();
         assert!(
-            ct.contains("application/json"),
-            "JSON API should get JSON response, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON API should get Problem Details response, got: {ct}"
         );
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 404);
+        assert_eq!(json["status"], 404);
+        assert_eq!(json["code"], "autumn.not_found");
     }
 
     #[tokio::test]
@@ -662,8 +698,8 @@ mod tests {
             .to_str()
             .expect("content-type should be valid UTF-8");
         assert!(
-            ct.contains("application/json"),
-            "JSON requests should still get JSON, got: {ct}"
+            ct.contains("application/problem+json"),
+            "JSON requests should still get Problem Details, got: {ct}"
         );
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

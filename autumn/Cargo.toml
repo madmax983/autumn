@@ -2,6 +2,7 @@
 name = "autumn-web"
 description = "An opinionated, convention-over-configuration web framework for Rust"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -20,7 +21,7 @@ htmx = []
 multipart = ["axum/multipart"]
 tailwind = []
 oauth2 = ["dep:reqwest", "dep:jsonwebtoken"]
-openapi = []
+openapi = ["dep:serde_yaml"]
 db = [
     "dep:deadpool",
     "dep:diesel",
@@ -28,6 +29,7 @@ db = [
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
     "dep:pq-sys",
+    "dep:scoped-futures",
     "diesel/postgres",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
@@ -38,9 +40,22 @@ telemetry-otlp = [
     "dep:tracing-opentelemetry",
 ]
 redis = ["dep:redis"]
+i18n = []
+# Pluggable file storage backends. Off by default; enabling adds the
+# `BlobStore` trait, the `Blob` value type, and a Local backend.
+# For S3-compatible storage add `autumn-storage-s3` as a separate
+# dependency and call `.with_blob_store(S3BlobStore::from_config(...))`.
+# When combined with `db`, opts diesel into `serde_json` so the `Blob`
+# value type can round-trip through a Postgres `JSONB` column.
+storage = ["diesel?/serde_json"]
+mail = ["dep:lettre", "maud"]
+# Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
+# Depends on `db`; off by default so apps that don't seed pay zero compile cost.
+seed = ["db"]
+system-info = []
 
 [dependencies]
-autumn-macros = { version = "0.3.0", path = "../autumn-macros" }
+autumn-macros = { version = "0.4.0", path = "../autumn-macros" }
 axum.workspace = true
 bytes = "1"
 http-body-util = "0.1"
@@ -50,6 +65,7 @@ diesel = { workspace = true, optional = true }
 pq-sys = { workspace = true, optional = true }
 diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
+scoped-futures = { version = "0.1.4", optional = true }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
@@ -78,15 +94,20 @@ validator.workspace = true
 uuid = { version = "1", features = ["v4"] }
 chrono = { workspace = true }
 chrono-tz.workspace = true
+croner = "3.0.1"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
+serde_urlencoded = "0.7"
+serde_yaml = { version = "0.9", optional = true }
 subtle = "2.6.1"
 url = "2.5.8"
+percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 jsonwebtoken = { version = "10.1.0", optional = true }
-lru = "0.17.0"
+lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
+lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono"] }
@@ -107,6 +128,18 @@ loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
 rusty-fork = "0.3.1"
+
+# docs.rs feature posture: include all features except those that require
+# system libraries unavailable in the docs.rs sandbox.
+#   telemetry-otlp — requires protoc (grpc-tonic → tonic → prost-build)
+#   test-support   — only meaningful in test binary contexts
+[package.metadata.docs.rs]
+features = [
+  "maud", "htmx", "tailwind", "db", "cache-moka",
+  "ws", "flash", "multipart", "oauth2", "openapi",
+  "redis", "i18n", "storage", "mail", "seed", "system-info",
+]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints]
 workspace = true

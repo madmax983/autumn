@@ -1,18 +1,30 @@
 # Autumn Bookmarks Example
 
-A bookmark manager showcasing the newer Autumn feature set: profile-aware
-configuration, `#[model]`, `#[repository(api = ...)]`, scheduled tasks,
-embedded migrations, and actuator endpoints.
+A bookmark manager regenerated from:
+
+```bash
+autumn generate scaffold Bookmark url:String title:String tag:String alive:bool \
+  --index url \
+  --index tag \
+  --validate url=url \
+  --validate title=length:min=1,max=200 \
+  --default alive=true \
+  --query find_by_tag:tag \
+  --query find_by_alive:alive
+```
+
+The shipped example then layers on profile-aware configuration, scheduled
+tasks, embedded migrations, htmx, and actuator endpoints.
 
 ## What it demonstrates
 
 | Feature | Where | What it does |
 |---------|-------|--------------|
 | **Profiles** | `autumn.toml` + `autumn-dev.toml` | Dev profile auto-detected; DB URL only in dev config |
-| **`#[model]`** | `models.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
-| **`#[repository]`** | `repositories.rs` | Generates `PgBookmarkRepository` with CRUD + `find_by_tag` + REST handlers |
-| **Scheduled tasks** | `tasks.rs` | `#[scheduled(every = "1h")]` link health checker |
-| **Embedded migrations** | `main.rs` | Runs Diesel migrations at startup |
+| **`#[model]`** | `src/models/bookmark.rs` | Generates `Bookmark`, `NewBookmark`, `UpdateBookmark` from one struct |
+| **`#[repository]`** | `src/repositories/bookmark.rs` | Generates `PgBookmarkRepository` with CRUD + `find_by_tag` + REST handlers |
+| **Scheduled tasks** | `src/tasks.rs` | `#[scheduled(every = "1h")]` link health checker |
+| **Embedded migrations** | `src/main.rs` | Runs Diesel migrations at startup |
 | **Actuator** | Nav bar links | `/actuator/health`, `/actuator/info` auto-mounted |
 
 ## Prerequisites
@@ -43,9 +55,12 @@ The server starts at <http://localhost:3000>.
 
 | Method | Path         | Description                  |
 |--------|--------------|------------------------------|
-| GET    | `/`          | List all bookmarks           |
-| GET    | `/tag/{tag}` | Filter bookmarks by tag      |
-| GET    | `/new`       | Add bookmark form            |
+| GET    | `/`          | Redirect to `/bookmarks`     |
+| GET    | `/bookmarks` | List all bookmarks           |
+| GET    | `/bookmarks/{id}` | Show one bookmark        |
+| GET    | `/bookmarks/tag/{tag}` | Filter bookmarks by tag |
+| GET    | `/bookmarks/new` | Add bookmark form        |
+| GET    | `/bookmarks/{id}/edit` | Edit bookmark form   |
 
 ### JSON API
 

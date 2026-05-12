@@ -1,0 +1,249 @@
+# Mail
+
+Enable the optional mail subsystem when your app needs password resets, signup
+confirmations, or transactional notifications:
+
+```toml
+autumn-web = { version = "0.4", features = ["mail"] }
+```
+
+## Configuration
+
+Development profile defaults to log transport. Production refuses log transport
+unless you explicitly acknowledge it.
+
+```toml
+[mail]
+transport = "file" # log | file | smtp | disabled
+from = "Acme <noreply@example.com>"
+reply_to = "support@example.com"
+file_dir = "target/mail"
+
+[mail.smtp]
+host = "smtp.example.com"
+port = 587
+username = "apikey"
+password_env = "SMTP_PASSWORD"
+tls = "starttls" # disabled | starttls | tls
+```
+
+Environment overrides use the same nested naming as the rest of Autumn:
+`AUTUMN_MAIL__TRANSPORT`, `AUTUMN_MAIL__FROM`,
+`AUTUMN_MAIL__SMTP__HOST`, `AUTUMN_MAIL__SMTP__PASSWORD_ENV`.
+
+## Sending
+
+`Mailer` is a cloneable extractor backed by app state:
+
+```rust
+use autumn_web::prelude::*;
+
+#[post("/password-reset")]
+async fn reset(mailer: Mailer) -> AutumnResult<&'static str> {
+    let mail = Mail::builder()
+        .to("user@example.com")
+        .subject("Reset your password")
+        .html(html! { p { "Use this reset link." } })
+        .text("Use this reset link.")
+        .build()?;
+
+    mailer.send(mail).await?;
+    Ok("sent")
+}
+```
+
+## `#[mailer]`
+
+Put templates on a small struct and let the macro generate `send_*` and
+`deliver_later_*` helpers:
+
+```rust
+use autumn_web::prelude::*;
+
+struct AccountMailer;
+
+#[mailer]
+impl AccountMailer {
+    fn reset_password(&self, to: String, token: String) -> Mail {
+        Mail::builder()
+            .to(to)
+            .subject("Reset your password")
+            .html(html! { p { "Token: " (token) } })
+            .text(format!("Token: {token}"))
+            .build()
+            .expect("static template should be valid")
+    }
+}
+```
+
+Call `AccountMailer.send_reset_password(&mailer, to, token).await` for an
+immediate send. Call `deliver_later_reset_password` when the request should not
+wait on SMTP.
+
+If the route also persists DB state (for example, writing an outbox row plus
+creating a user), wrap the DB side in [`Db::tx`](transactions.md) so your write
+sequence is atomic.
+
+## Previewing Emails In Dev
+
+When the active profile is `dev` and `[mail] transport = "file"`, Autumn mounts
+the mail preview UI at `/_autumn/mail`. The index shows recent `.eml` captures
+from `mail.file_dir` newest-first and links to a detail view with sandboxed HTML,
+plain text, selected headers, and raw source.
+
+Register sample-data previews with `#[mailer_preview]` and `mail_previews![...]`:
+
+```rust
+use autumn_web::prelude::*;
+
+struct AccountMailer;
+
+#[mailer]
+impl AccountMailer {
+    fn reset_password(&self, to: String, token: String) -> Mail {
+        Mail::builder()
+            .to(to)
+            .subject("Reset your password")
+            .html(html! { p { "Token: " (token) } })
+            .text(format!("Token: {token}"))
+            .build()
+            .expect("static template should be valid")
+    }
+}
+
+#[mailer_preview]
+impl AccountMailer {
+    fn reset_password_preview() -> Mail {
+        AccountMailer.reset_password("preview@example.com".into(), "abc123".into())
+    }
+}
+
+autumn_web::app()
+    .mail_previews(mail_previews![AccountMailer])
+    .run()
+    .await;
+```
+
+Preview methods are zero-argument associated functions returning `Mail`; they
+render through the UI without invoking any transport. Adding a new preview method
+and refreshing `/_autumn/mail` is enough after the normal `autumn dev` recompile.
+
+The preview UI is a dev-only surface. Setting `[mail] preview = true` outside the
+`dev` profile fails startup with a `mail.preview` validation error instead of
+silently exposing captured email in production.
+
+## Deferred Delivery (`deliver_later`)
+
+`Mailer::deliver_later` and the generated `deliver_later_*` helpers do **not**
+imply durable delivery on their own. The framework provides two paths:
+
+1. **In-process Tokio fallback (default).** The mail send is spawned onto the
+   current Tokio runtime. This is fine for local development and small
+   single-process deployments, but it is not durable: a process restart, pod
+   eviction, or deploy can drop the email after the request has already
+   returned success.
+2. **Durable backend via [`MailDeliveryQueue`].** Implement the trait once
+   for your queue of choice (DB outbox row, Redis stream, Harvest job, etc.)
+   and register it via [`AppBuilder::with_mail_delivery_queue`] before
+   `.run()`:
+
+   ```rust
+   use autumn_web::prelude::*;
+
+   struct OutboxQueue { /* db handle */ }
+
+   impl MailDeliveryQueue for OutboxQueue {
+       fn enqueue<'a>(
+           &'a self,
+           mail: Mail,
+       ) -> std::pin::Pin<Box<dyn std::future::Future<
+           Output = Result<(), MailError>,
+       > + Send + 'a>> {
+           Box::pin(async move {
+               // INSERT into mail_outbox (...) VALUES (...)
+               // Return Ok(()) once the row is durably committed.
+               Ok(())
+           })
+       }
+   }
+
+   autumn_web::app()
+       .with_mail_delivery_queue(OutboxQueue { /* ... */ })
+       .run()
+       .await;
+   ```
+
+   When the queue needs framework-managed resources (the DB pool, channels,
+   etc.) that only exist after the [`AppState`] is built, use
+   [`AppBuilder::with_mail_delivery_queue_factory`] instead. The factory
+   runs once with the live `AppState` immediately before `install_mailer`:
+
+   ```rust,ignore
+   autumn_web::app()
+       .with_mail_delivery_queue_factory(|state| {
+           let pool = state.pool().expect("DB pool required").clone();
+           Ok(OutboxQueue::new(pool))
+       })
+       .run()
+       .await;
+   ```
+
+   When a queue is registered, `deliver_later` routes through it instead of
+   the in-process fallback.
+
+### Production Guard
+
+In `prod`/`production`, Autumn refuses to start with an active mail transport
+and no durable backend unless you explicitly opt in:
+
+```toml
+[mail]
+transport = "smtp"
+allow_in_process_deliver_later_in_production = true
+```
+
+Without that flag, startup fails with a clear message asking you to either
+install a `MailDeliveryQueueHandle` or set the flag. The flag is intended as an
+acknowledged single-replica escape hatch, not a recommended production setup.
+
+### DB-Write + Mail Patterns (Outbox)
+
+When a request both writes to the DB and dispatches mail, send mail **after**
+the DB transaction commits, but make the dispatch idempotent so retries
+recover:
+
+1. Inside `Db::tx`, insert the user row **and** an `email_outbox` row
+   (`(id, kind, payload, status='pending')`) atomically.
+2. After commit, call `mailer.deliver_later(...)`.
+3. A `MailDeliveryQueue` implementation reads the outbox row, sends the email,
+   and marks the row `sent`. On retry, it skips already-`sent` rows. This is
+   the canonical outbox pattern: the DB transaction is the source of truth for
+   "the user signed up", and the queue worker is responsible for at-least-once
+   delivery without losing mail across restarts.
+
+For the transaction shape see [`Db::tx`](transactions.md).
+
+## Transports
+
+- `log`: writes headers and full bodies to tracing at INFO. Default for `dev`.
+- `file`: writes `.eml` files under `target/mail` by default. This is ideal for
+  integration tests and local inspection.
+- `smtp`: sends through Lettre with rustls and Tokio.
+- `disabled`: accepts sends and drops them.
+
+For provider APIs like SES, Postmark, or SendGrid, implement `MailTransport` and
+build a `Mailer::with_transport(...)`.
+
+## Production Checklist
+
+- Enable the `mail` feature.
+- Use `transport = "smtp"` in `prod`.
+- Keep SMTP secrets in environment variables via `password_env`.
+- Add a plain-text fallback for every HTML email.
+- Assert file-transport `.eml` contents in integration tests.
+- Register a `MailDeliveryQueueHandle` (Harvest, DB outbox, Redis, etc.) for
+  durable `deliver_later` retries. Without one, `prod` startup fails unless
+  `mail.allow_in_process_deliver_later_in_production = true` is set, in which
+  case Autumn falls back to an in-process Tokio task and logs failures.
+- For DB-write + mail-orchestration flows, use the [Transactions
+  Guide](transactions.md) for the canonical atomic write pattern.

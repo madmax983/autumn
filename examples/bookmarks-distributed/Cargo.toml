@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 autumn-web = { path = "../../autumn" }
+autumn-cache-redis = { path = "../../autumn-cache-redis" }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -23,3 +24,9 @@ validator = { version = "0.20", features = ["derive"] }
 
 [dev-dependencies]
 autumn-web = { path = "../../autumn", features = ["test-support"] }
+autumn-cache-redis = { path = "../../autumn-cache-redis" }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -4,21 +4,19 @@
 //! #[secured] for write operations, htmx for voting and deletion,
 //! Maud templates with Tailwind CSS.
 
-use autumn_harvest_plugin::{enqueue_workflow_start_outbox, flush_workflow_start_outbox};
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::prelude::*;
 use diesel::prelude::*;
-use diesel_async::AsyncConnection;
 use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
-use tracing::warn;
 
+use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{Post, Subreddit, User};
 use crate::schema::{comments, posts, subreddits, users};
 use crate::slugify::slugify;
 
-use super::layout::{layout, redirect_to, time_ago, vote_controls};
+use super::layout::{layout, time_ago, vote_controls};
 
 /// (`post_id`, title, `post_slug`, score, `comment_count`, author, `sub_name`, `sub_slug`, `created_at`)
 type PostSummary = (
@@ -81,22 +79,22 @@ pub async fn front_page(session: Session, csrf: CsrfToken, mut db: Db) -> Autumn
                         div class="flex items-start gap-3 p-4" {
                             (vote_controls(*post_id, *score))
                             div class="flex-1 min-w-0" {
-                                a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                                a href=(paths::show(sub_slug, post_slug))
                                    class="text-lg font-medium text-gray-900 hover:text-orange-600 \
                                           line-clamp-2" {
                                     (title)
                                 }
                                 div class="text-xs text-gray-400 mt-1" {
-                                    a href=(format!("/r/{sub_slug}"))
+                                    a href=(super::subreddits::__autumn_path_show(sub_slug))
                                        class="font-medium text-gray-600 hover:underline" {
                                         "r/" (sub_name)
                                     }
                                     " \u{2022} posted by "
-                                    a href=(format!("/u/{author}"))
+                                    a href=(super::auth::__autumn_path_profile(author))
                                        class="text-gray-500 hover:underline" { "u/" (author) }
                                     " " (time_ago(created_at))
                                     " \u{2022} "
-                                    a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                                    a href=(paths::show(sub_slug, post_slug))
                                        class="text-gray-500 hover:text-orange-600" {
                                         (comment_count) " comments"
                                     }
@@ -142,7 +140,7 @@ pub async fn submit_form(session: Session, csrf: CsrfToken, mut db: Db) -> Autum
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Create a Post" }
-                form action="/submit" method="post"
+                form action=(paths::submit()) method="post"
                      class="space-y-4 bg-white rounded-lg shadow p-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     div {
@@ -225,7 +223,7 @@ pub async fn submit_to_sub_form(
                     "Post to "
                     span class="text-orange-600" { "r/" (sub.name) }
                 }
-                form action="/submit" method="post"
+                form action=(paths::submit()) method="post"
                      class="space-y-4 bg-white rounded-lg shadow p-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     input type="hidden" name="subreddit_id" value=(sub.id);
@@ -281,11 +279,10 @@ pub struct SubmitPostForm {
 #[secured]
 #[post("/submit")]
 pub async fn submit(
-    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<SubmitPostForm>,
-) -> AutumnResult<Markup> {
+) -> AutumnResult<Redirect> {
     let user_id: i64 = session
         .get("user_id")
         .await
@@ -332,72 +329,43 @@ pub async fn submit(
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    let url_for_insert = url.clone();
-    let title_for_insert = title.clone();
-    let slug_for_insert = slug.clone();
-    let author_username_for_outbox = author_username.clone();
-    let post_id = (*db)
-        .transaction::<i64, AutumnError, _>(|conn| {
-            let title = title_for_insert.clone();
-            let slug = slug_for_insert.clone();
-            let body = body.clone();
-            let url = url_for_insert.clone();
-            let subreddit_slug = subreddit_slug.clone();
-            let author_username = author_username_for_outbox.clone();
-            async move {
-                let post_id: i64 = diesel::insert_into(posts::table)
-                    .values((
-                        posts::title.eq(&title),
-                        posts::slug.eq(&slug),
-                        posts::body.eq(&body),
-                        posts::url.eq(&url),
-                        posts::author_id.eq(user_id),
-                        posts::subreddit_id.eq(subreddit_id),
-                        posts::score.eq(1_i64),
-                    ))
-                    .returning(posts::id)
-                    .get_result(conn)
-                    .await?;
+    db.tx(move |conn| {
+        async move {
+            let post_id: i64 = diesel::insert_into(posts::table)
+                .values((
+                    posts::title.eq(&title),
+                    posts::slug.eq(&slug),
+                    posts::body.eq(&body),
+                    posts::url.eq(&url),
+                    posts::author_id.eq(user_id),
+                    posts::subreddit_id.eq(subreddit_id),
+                    posts::score.eq(1_i64),
+                ))
+                .returning(posts::id)
+                .get_result(conn)
+                .await?;
 
-                diesel::insert_into(crate::schema::votes::table)
-                    .values((
-                        crate::schema::votes::user_id.eq(user_id),
-                        crate::schema::votes::post_id.eq(post_id),
-                        crate::schema::votes::value.eq(1_i16),
-                    ))
-                    .execute(conn)
-                    .await?;
+            diesel::insert_into(crate::schema::votes::table)
+                .values((
+                    crate::schema::votes::user_id.eq(user_id),
+                    crate::schema::votes::post_id.eq(post_id),
+                    crate::schema::votes::value.eq(1_i16),
+                ))
+                .execute(conn)
+                .await?;
 
-                let request = crate::workflows::post_publication_dispatch(
-                    post_id,
-                    &title,
-                    &slug,
-                    &subreddit_slug,
-                    &author_username,
-                );
-                enqueue_workflow_start_outbox(conn, &request)
-                    .await
-                    .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+            enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
+                .await?;
 
-                Ok(post_id)
-            }
-            .scope_boxed()
-        })
-        .await?;
+            Ok::<_, AutumnError>(())
+        }
+        .scope_boxed()
+    })
+    .await?;
 
-    if let Err(error) = flush_workflow_start_outbox(&state).await {
-        warn!(
-            post_id,
-            title = %title,
-            post_slug = %slug,
-            subreddit_slug = %sub.slug,
-            author_username = %author_username,
-            error = %error,
-            "failed to flush post publication workflow outbox"
-        );
-    }
-
-    Ok(redirect_to(&format!("/r/{}", sub.slug)))
+    Ok(Redirect::to(&super::subreddits::__autumn_path_show(
+        &sub.slug,
+    )))
 }
 
 // ── View single post with comments ─────────────────────────────
@@ -456,7 +424,7 @@ pub async fn show(
         html! {
             // Breadcrumbs
             div class="text-sm text-gray-500 mb-4" {
-                a href=(format!("/r/{}", sub.slug)) class="hover:text-orange-600" {
+                a href=(super::subreddits::__autumn_path_show(&sub.slug)) class="hover:text-orange-600" {
                     "r/" (sub.name)
                 }
                 " \u{203A} Post"
@@ -470,7 +438,7 @@ pub async fn show(
                         h1 class="text-2xl font-bold text-gray-900 mb-2" { (post.title) }
                         div class="text-xs text-gray-400 mb-4" {
                             "posted by "
-                            a href=(format!("/u/{}", author.username))
+                            a href=(super::auth::__autumn_path_profile(&author.username))
                                class="text-gray-500 hover:underline" {
                                 "u/" (author.username)
                             }
@@ -494,10 +462,10 @@ pub async fn show(
                         }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
-                                a href=(format!("/r/{}/posts/{}/edit", sub.slug, post.slug))
+                                a href=(paths::edit_form(&sub.slug, &post.slug))
                                    class="text-gray-500 hover:text-orange-600" { "Edit" }
                                 button
-                                    hx-delete=(format!("/r/{}/posts/{}", sub.slug, post.slug))
+                                    hx-delete=(paths::delete_post(&sub.slug, &post.slug))
                                     hx-confirm="Delete this post? This cannot be undone."
                                     class="text-red-500 hover:text-red-700 cursor-pointer" {
                                     "Delete"
@@ -510,7 +478,7 @@ pub async fn show(
 
             // Comment form
             @if current_user.is_some() {
-                form action=(format!("/r/{}/posts/{}/comments", sub.slug, post.slug))
+                form action=(super::comments::__autumn_path_create(&sub.slug, &post.slug))
                      method="post"
                      class="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
@@ -540,7 +508,7 @@ pub async fn show(
                 @for (comment, comment_author) in &post_comments {
                     div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
                         div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                            a href=(format!("/u/{comment_author}"))
+                            a href=(super::auth::__autumn_path_profile(comment_author))
                                class="font-medium text-gray-600 hover:underline" {
                                 "u/" (comment_author)
                             }
@@ -572,17 +540,12 @@ pub async fn show(
 #[get("/r/{sub_slug}/posts/{post_slug}/edit")]
 pub async fn edit_form(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
 
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
@@ -593,11 +556,7 @@ pub async fn edit_form(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only edit your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
 
     Ok(layout(
         &format!("Edit: {}", post.title),
@@ -606,7 +565,7 @@ pub async fn edit_form(
         html! {
             div class="max-w-2xl mx-auto" {
                 h1 class="text-2xl font-bold mb-6" { "Edit Post" }
-                form action=(format!("/r/{sub_slug}/posts/{post_slug}")) method="post"
+                form action=(paths::update(&sub_slug, &post_slug)) method="post"
                      class="space-y-4 bg-white rounded-lg shadow p-6" {
                     input type="hidden" name="_csrf" value=(csrf.token());
                     div {
@@ -634,7 +593,7 @@ pub async fn edit_form(
                                       hover:bg-orange-600 transition-colors" {
                             "Save"
                         }
-                        a href=(format!("/r/{sub_slug}/posts/{post_slug}"))
+                        a href=(paths::show(&sub_slug, &post_slug))
                            class="px-6 py-2 text-gray-500 hover:text-gray-700" { "Cancel" }
                     }
                 }
@@ -654,17 +613,11 @@ pub struct EditPostForm {
 #[post("/r/{sub_slug}/posts/{post_slug}")]
 pub async fn update(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
     form: Form<EditPostForm>,
-) -> AutumnResult<Markup> {
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
-
+) -> AutumnResult<Redirect> {
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
         .filter(subreddits::slug.eq(&sub_slug))
@@ -674,11 +627,7 @@ pub async fn update(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only edit your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "update", &post).await?;
 
     let title = form.0.title.trim().to_string();
     if title.is_empty() || title.len() > 300 {
@@ -706,7 +655,7 @@ pub async fn update(
         .execute(&mut *db)
         .await?;
 
-    Ok(redirect_to(&format!("/r/{sub_slug}/posts/{new_slug}")))
+    Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
 }
 
 // ── Delete post (htmx) ────────────────────────────────────────
@@ -715,16 +664,10 @@ pub async fn update(
 #[delete("/r/{sub_slug}/posts/{post_slug}")]
 pub async fn delete_post(
     Path((sub_slug, post_slug)): Path<(String, String)>,
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
-    let user_id: i64 = session
-        .get("user_id")
-        .await
-        .unwrap_or_default()
-        .parse()
-        .unwrap_or(0);
-
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
         .filter(subreddits::slug.eq(&sub_slug))
@@ -734,17 +677,15 @@ pub async fn delete_post(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    if post.author_id != user_id {
-        return Err(AutumnError::forbidden_msg(
-            "You can only delete your own posts",
-        ));
-    }
+    autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
 
     diesel::delete(posts::table.find(post.id))
         .execute(&mut *db)
         .await?;
 
-    Ok(super::layout::hx_redirect_to(&format!("/r/{sub_slug}")))
+    Ok(super::layout::hx_redirect_to(
+        &super::subreddits::__autumn_path_show(&sub_slug),
+    ))
 }
 
 // ── Helpers ────────────────────────────────────────────────────
@@ -772,6 +713,23 @@ async fn unique_slug(
     }
 }
 
+async fn enqueue_post_publication(
+    post_id: i64,
+    title: &str,
+    post_slug: &str,
+    subreddit_slug: &str,
+    author_username: &str,
+) -> AutumnResult<()> {
+    PostPublicationJob::enqueue(PostPublicationArgs::new(
+        post_id,
+        title,
+        post_slug,
+        subreddit_slug,
+        author_username,
+    ))
+    .await
+}
+
 /// Like `unique_slug`, but excludes a specific post ID (for updates).
 async fn unique_slug_excluding(
     base: &str,
@@ -794,5 +752,34 @@ async fn unique_slug_excluding(
         }
         slug = format!("{base}-{suffix}");
         suffix += 1;
+    }
+}
+
+autumn_web::paths![
+    front_page,
+    submit_form,
+    submit_to_sub_form,
+    submit,
+    show,
+    edit_form,
+    update,
+    delete_post
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn post_publication_enqueue_failure_is_returned_to_submit() {
+        let error =
+            enqueue_post_publication(99, "Ferris arrives", "ferris-arrives", "rust", "ferris")
+                .await
+                .expect_err("missing job runtime should fail post submission");
+
+        assert!(
+            error.to_string().contains("job runtime is not initialized"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -14,7 +14,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-// ── Schema & model definitions ──────────────────────────────────────
+// ── Schema & model definitions ─────────────────────────────────────────────────
 
 diesel::table! {
     test_articles (id) {
@@ -44,7 +44,7 @@ struct NewArticle {
     pub status: String,
 }
 
-// ── Hook implementations ────────────────────────────────────────────
+// ── Hook implementations ─────────────────────────────────────────────────────
 
 /// Rewrites the `slug` field from the `title` when title changes.
 #[derive(Clone, Default)]
@@ -91,7 +91,7 @@ impl MutationHooks for RejectEmptyTitleHooks {
     }
 }
 
-// ── Test helpers ────────────────────────────────────────────────────
+// ── Test helpers ────────────────────────────────────────────────────────────
 
 const CREATE_TABLE_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS test_articles (
@@ -135,7 +135,7 @@ async fn setup_pool() -> (
     (pool, container)
 }
 
-// ── Tests ───────────────────────────────────────────────────────────
+// ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -260,4 +260,194 @@ async fn draft_field_accessors_match_persisted_diff() {
     assert_eq!(persisted.status, "published");
     assert_eq!(persisted.slug, "original-title"); // unchanged
     assert_eq!(persisted.published_at, None); // unchanged
+}
+
+// ── DbApiTokenStore tests ────────────────────────────────────────────────────────────────────────
+
+const CREATE_API_TOKENS_SQL: &str = "
+    CREATE TABLE api_tokens (
+        id BIGSERIAL PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        principal_id TEXT NOT NULL,
+        created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        revoked_at TIMESTAMP
+    )
+";
+
+async fn setup_token_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start postgres container");
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    let pool = Pool::builder(manager).max_size(5).build().expect("pool");
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(CREATE_API_TOKENS_SQL)
+        .execute(&mut conn)
+        .await
+        .expect("create api_tokens table");
+    (pool, container)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn db_api_token_store_issue_and_verify() {
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
+    let (pool, _c) = setup_token_pool().await;
+    let store = DbApiTokenStore::new(pool);
+
+    let token = store.issue("user:42").await.unwrap();
+    assert!(!token.is_empty(), "issued token must be non-empty");
+
+    let principal = store.verify(&token).await.unwrap();
+    assert_eq!(principal, Some("user:42".to_owned()));
+
+    let unknown = store.verify("not_a_real_token").await.unwrap();
+    assert_eq!(unknown, None, "unknown token must return None");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn db_api_token_store_revoke_invalidates_token() {
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
+    let (pool, _c) = setup_token_pool().await;
+    let store = DbApiTokenStore::new(pool);
+
+    let token = store.issue("user:7").await.unwrap();
+    assert!(store.verify(&token).await.unwrap().is_some());
+
+    store.revoke(&token).await.unwrap();
+    assert_eq!(store.verify(&token).await.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn db_api_token_store_two_tokens_same_principal() {
+    use autumn_web::auth::{ApiTokenStore as _, DbApiTokenStore};
+    let (pool, _c) = setup_token_pool().await;
+    let store = DbApiTokenStore::new(pool);
+
+    let t1 = store.issue("user:1").await.unwrap();
+    let t2 = store.issue("user:1").await.unwrap();
+    assert_ne!(t1, t2, "each issued token must be unique");
+
+    assert_eq!(store.verify(&t1).await.unwrap(), Some("user:1".to_owned()));
+    assert_eq!(store.verify(&t2).await.unwrap(), Some("user:1".to_owned()));
+
+    // Revoking t1 must not affect t2.
+    store.revoke(&t1).await.unwrap();
+    assert_eq!(store.verify(&t1).await.unwrap(), None);
+    assert_eq!(store.verify(&t2).await.unwrap(), Some("user:1".to_owned()));
+}
+
+// ── PostgresIsrCoordinator tests ─────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_backend_name() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+    assert_eq!(coord.backend(), "postgres");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_acquire_grants_and_release_unlocks() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "first acquire must succeed"
+    );
+    // release must not panic
+    coord.release("/about", "window-1").await;
+
+    // after release, the same window is acquirable again
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "acquire after release must succeed"
+    );
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_blocks_duplicate_window() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // First acquisition holds the advisory lock on its connection.
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "first acquire must succeed"
+    );
+
+    // Second acquisition for the same (route, window) must fail: the advisory
+    // lock is session-scoped, and the first connection still holds it.
+    assert!(
+        !coord.try_acquire("/about", "window-1").await,
+        "duplicate acquire for the same window must fail"
+    );
+
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_release_without_acquire_is_noop() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // release without a preceding acquire must not panic (emits a warning).
+    coord.release("/about", "window-1").await;
+
+    // Subsequent acquire must still succeed.
+    assert!(
+        coord.try_acquire("/about", "window-1").await,
+        "acquire after orphaned release must succeed"
+    );
+    coord.release("/about", "window-1").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn postgres_isr_coordinator_independent_routes_and_windows() {
+    use autumn_web::static_gen::PostgresIsrCoordinator;
+    use autumn_web::static_gen::isr_coordinator::IsrCoordinator as _;
+
+    let (pool, _container) = setup_pool().await;
+    let coord = PostgresIsrCoordinator::new(pool);
+
+    // Different routes in the same window get different lock keys.
+    assert!(coord.try_acquire("/", "window-1").await);
+    assert!(coord.try_acquire("/about", "window-1").await);
+
+    coord.release("/", "window-1").await;
+    coord.release("/about", "window-1").await;
+
+    // Same route in different windows also gets different lock keys.
+    assert!(coord.try_acquire("/about", "window-1").await);
+    assert!(coord.try_acquire("/about", "window-2").await);
+
+    coord.release("/about", "window-1").await;
+    coord.release("/about", "window-2").await;
 }

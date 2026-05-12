@@ -22,16 +22,25 @@
 //! [`autumn_web::reexports`](crate::reexports).
 
 // ── Route macros ─────────────────────────────────────────────────
+/// HTTP redirect response.
+pub use crate::Redirect;
+/// Typed path helper extension trait (`.with_query()`).
+pub use crate::paths::PathExt;
 /// WebSocket route macro.
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, cached, delete, get, main, oauth2_callback, post, put, routes, scheduled, secured,
-    service, static_get, static_routes, tasks,
+    api_doc, authorize, cached, delete, get, job, jobs, main, oauth2_callback, one_off_tasks,
+    patch, paths, post, put, routes, scheduled, secured, service, static_get, static_routes, task,
+    tasks,
 };
+#[cfg(feature = "mail")]
+pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 
 // ── Rendering ────────────────────────────────────────────────────
+/// Resolve a logical static asset path to a fingerprinted URL in release builds.
+pub use crate::assets::asset_url;
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
@@ -60,10 +69,28 @@ pub use crate::htmx::HxResponseExt;
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+/// Transactional email types and extractor.
+#[cfg(feature = "mail")]
+pub use crate::mail::{
+    Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
+    MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
+};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
+/// Structured CLI argument extractor for one-off `#[task]` handlers.
+pub use crate::task::TaskArgs;
+/// Real-time broadcast facade and channel registry.
+#[cfg(feature = "ws")]
+pub use crate::{
+    Broadcast, BroadcastError, ChannelMessage, ChannelStats, Channels, ChannelsBackend,
+    LocalChannelsBackend,
+};
 /// State extractor.
 pub use axum::extract::State;
+/// Trait for types that can be converted into an HTTP response.
+pub use axum::response::IntoResponse;
+/// HTTP status codes.
+pub use http::StatusCode;
 
 // ── Error handling ───────────────────────────────────────────────
 /// Structured audit event types.
@@ -78,6 +105,14 @@ pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
+/// Validation trait — derive with `#[derive(Validate)]` on form/model types.
+pub use validator::Validate;
+
+// ── Form ─────────────────────────────────────────────────────────
+/// Changeset-style form helpers: [`Changeset`], [`ChangesetForm`], [`IntoChangeset`].
+///
+/// See [`crate::form`] for the full surface including Maud rendering helpers.
+pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
 // ── Hooks ───────────────────────────────────────────────────────
 /// Mutation hook types for repository lifecycle callbacks.
@@ -87,18 +122,45 @@ pub use crate::hooks::{
 };
 
 // ── Session & Auth ──────────────────────────────────────────────
-/// Auth extractor for retrieving the authenticated user.
+/// Extractor for the verified principal ID on bearer-token-protected routes.
+pub use crate::auth::ApiToken;
+/// Auth extractor for retrieving the authenticated user (session-based).
 pub use crate::auth::Auth;
+/// Tower layer that validates `Authorization: Bearer <token>` on API routes.
+pub use crate::auth::RequireApiToken;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 
+// ── Authorization ────────────────────────────────────────────────
+/// Record-level authorization primitives. See
+/// [`crate::authorization`] for the full surface.
+pub use crate::authorization::{Policy, PolicyContext, Scope, ScopeQuery, Scoped};
+
 // ── Security ───────────────────────────────────────────────────
+/// Configured CSRF form field name; use alongside [`CsrfToken`] to honour
+/// custom `security.csrf.form_field` values in hand-written templates.
+pub use crate::security::CsrfFormField;
 /// CSRF token extractor for embedding in forms.
 pub use crate::security::CsrfToken;
+/// Signed webhook extractor and configuration helpers.
+pub use crate::webhook::{
+    SignedWebhook, WebhookEndpointConfig, WebhookProvider, WebhookReplayBackend,
+    WebhookReplayConfig,
+};
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).
 pub use crate::state::AppState;
+
+// ── Internationalization ───────────────────────────────────────
+/// Request-scoped locale extractor (resolves from query, cookie,
+/// `Accept-Language`, and default in that order).
+#[cfg(feature = "i18n")]
+pub use crate::i18n::Locale;
+/// Translation lookup macro with compile-time key validation — see
+/// [`crate::i18n`] for usage.
+#[cfg(feature = "i18n")]
+pub use crate::i18n::t;
 
 #[cfg(test)]
 mod tests {
@@ -112,6 +174,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             pool: None,
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -119,11 +182,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         #[cfg(not(feature = "db"))]
         let _state = AppState {
@@ -137,11 +205,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
         let _err: AutumnResult<()> = Ok(());
     }

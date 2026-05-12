@@ -171,15 +171,15 @@ pub fn resolve_runtime_profile(
     }
 
     for (index, arg) in args.iter().enumerate() {
-        if arg == "--profile" {
-            if let Some(profile) = args.get(index + 1).filter(|value| !value.is_empty()) {
-                return Some(profile.clone());
-            }
+        if arg == "--profile"
+            && let Some(profile) = args.get(index + 1).filter(|value| !value.is_empty())
+        {
+            return Some(profile.clone());
         }
-        if let Some(profile) = arg.strip_prefix("--profile=") {
-            if !profile.is_empty() {
-                return Some(profile.to_owned());
-            }
+        if let Some(profile) = arg.strip_prefix("--profile=")
+            && !profile.is_empty()
+        {
+            return Some(profile.to_owned());
         }
     }
 
@@ -209,7 +209,11 @@ impl fmt::Display for DistributedConfigLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingSection { path } => {
-                write!(f, "missing [distributed] section in {}", path.display())
+                write!(
+                    f,
+                    "missing [database] primary/replica topology section in {}",
+                    path.display()
+                )
             }
             Self::Io { path, source } => {
                 write!(
@@ -249,6 +253,14 @@ fn load_distributed_section(
                     path: path.to_path_buf(),
                     source: Box::new(source),
                 })?;
+            if let Some(database) = table.get("database").and_then(toml::Value::as_table)
+                && canonical_database_table_has_topology(database)
+            {
+                let mut section = toml::map::Map::new();
+                section.insert("database".to_owned(), toml::Value::Table(database.clone()));
+                return Ok(Some(toml::Value::Table(section)));
+            }
+
             Ok(toml::Value::Table(table).get("distributed").cloned())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -257,6 +269,17 @@ fn load_distributed_section(
             source,
         }),
     }
+}
+
+fn canonical_database_table_has_topology(database: &toml::Table) -> bool {
+    [
+        "primary_url",
+        "replica_url",
+        "primary_pool_size",
+        "replica_pool_size",
+    ]
+    .iter()
+    .any(|key| database.contains_key(*key))
 }
 
 fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
@@ -291,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_primary_and_replica_urls_from_toml() {
+    fn parses_primary_and_replica_urls_from_canonical_database_toml() {
         let temp_dir = unique_temp_dir("autumn-bookmarks-distributed-parse");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -299,7 +322,7 @@ mod tests {
         fs::write(
             temp_dir.join("autumn.toml"),
             r#"
-                [distributed.database]
+                [database]
                 primary_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_primary"
                 replica_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_replica"
                 primary_pool_size = 7
@@ -360,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_layered_distributed_section_from_example_files() {
+    fn loads_layered_canonical_database_section_from_example_files() {
         let temp_dir = unique_temp_dir("autumn-bookmarks-distributed-config");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -368,7 +391,7 @@ mod tests {
         fs::write(
             temp_dir.join("autumn.toml"),
             r#"
-                [distributed.database]
+                [database]
                 primary_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_primary"
                 replica_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_replica"
                 primary_pool_size = 4
@@ -379,7 +402,7 @@ mod tests {
         fs::write(
             temp_dir.join("autumn-staging.toml"),
             r#"
-                [distributed.database]
+                [database]
                 primary_pool_size = 7
                 replica_pool_size = 3
             "#,
@@ -404,7 +427,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_distributed_section_is_an_error() {
+    fn legacy_distributed_database_section_still_loads() {
+        let temp_dir = unique_temp_dir("autumn-bookmarks-distributed-legacy-config");
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).expect("temp dir should be created");
+
+        fs::write(
+            temp_dir.join("autumn.toml"),
+            r#"
+                [distributed.database]
+                primary_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_primary"
+                replica_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed_replica"
+            "#,
+        )
+        .expect("base config should be written");
+
+        let config = DistributedConfig::load_from_dir(Path::new(&temp_dir), None)
+            .expect("legacy distributed config should still load");
+
+        assert_eq!(
+            config.database.primary_url.as_deref(),
+            Some("postgres://autumn:autumn@localhost:5432/bookmarks_distributed_primary")
+        );
+        assert_eq!(
+            config.database.replica_url.as_deref(),
+            Some("postgres://autumn:autumn@localhost:5432/bookmarks_distributed_replica")
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn missing_database_topology_section_is_an_error() {
         let temp_dir = unique_temp_dir("autumn-bookmarks-distributed-config-missing");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
@@ -413,9 +467,9 @@ mod tests {
             .expect("base config should be written");
 
         let error = DistributedConfig::load_from_dir(Path::new(&temp_dir), None)
-            .expect_err("missing distributed section should fail");
+            .expect_err("missing database topology section should fail");
 
-        assert!(error.to_string().contains("distributed"));
+        assert!(error.to_string().contains("database"));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

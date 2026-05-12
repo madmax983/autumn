@@ -11,8 +11,9 @@ use std::convert::Infallible;
 use std::sync::LazyLock;
 
 use autumn_web::flash::Flash;
+use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
-use autumn_web::security::CsrfToken;
+use autumn_web::security::{CsrfFormField, CsrfToken};
 use autumn_web::{AppState, AutumnError, AutumnResult};
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -38,17 +39,30 @@ use crate::traits::{
 /// Autumn enables CSRF only for the `prod` profile by default, so a plain
 /// `CsrfToken` extractor would crash every admin page in dev/test with a
 /// 500. This wrapper reads the same request extension and falls back to an
-/// empty token when the layer isn't installed — the rendered `_csrf`
+/// empty token when the layer isn't installed — the rendered CSRF
 /// hidden input and `<meta>` are then harmless because the middleware
 /// that would validate them isn't running either.
 #[derive(Debug, Clone, Default)]
-pub struct AdminCsrf(String);
+pub struct AdminCsrf {
+    token: String,
+    form_field: String,
+}
 
 impl AdminCsrf {
     /// The CSRF token, or `""` if `CsrfLayer` is not installed.
     #[must_use]
     pub fn token(&self) -> &str {
-        &self.0
+        &self.token
+    }
+
+    /// The configured form field name, or Autumn's default when CSRF is absent.
+    #[must_use]
+    pub fn form_field(&self) -> &str {
+        if self.form_field.is_empty() {
+            "_csrf"
+        } else {
+            &self.form_field
+        }
     }
 }
 
@@ -61,7 +75,11 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
             .get::<CsrfToken>()
             .map(|t| t.token().to_owned())
             .unwrap_or_default();
-        Ok(Self(token))
+        let form_field = parts
+            .extensions
+            .get::<CsrfFormField>()
+            .map_or_else(|| "_csrf".to_owned(), |field| field.0.clone());
+        Ok(Self { token, form_field })
     }
 }
 
@@ -104,6 +122,11 @@ pub fn admin_router(
     let router = axum::Router::new()
         // Dashboard
         .route("/", routing::get(dashboard))
+        .route("/jobs", routing::get(jobs_dashboard))
+        .route("/jobs/counters", routing::get(jobs_counters))
+        .route("/jobs/{id}/retry", routing::post(job_retry))
+        .route("/jobs/{id}/discard", routing::post(job_discard))
+        .route("/jobs/{id}/cancel", routing::post(job_cancel))
         // Model routes (dynamic dispatch via slug)
         .route("/{slug}", routing::get(model_list).post(model_create))
         .route("/{slug}/new", routing::get(model_new_form))
@@ -166,8 +189,38 @@ struct ListQuery {
     dir: SortDirection,
 }
 
+#[derive(Debug, Deserialize)]
+struct JobsQuery {
+    #[serde(default = "default_page", rename = "enqueued_page")]
+    enqueued: u64,
+    #[serde(default = "default_page", rename = "running_page")]
+    running: u64,
+    #[serde(default = "default_page", rename = "completed_page")]
+    completed: u64,
+    #[serde(default = "default_page", rename = "failed_page")]
+    failed: u64,
+    #[serde(default = "default_jobs_per_page", rename = "per_page")]
+    per: u64,
+}
+
+impl From<JobsQuery> for JobAdminQuery {
+    fn from(query: JobsQuery) -> Self {
+        Self {
+            enqueued_page: query.enqueued.max(1),
+            running_page: query.running.max(1),
+            completed_page: query.completed.max(1),
+            failed_page: query.failed.max(1),
+            per_page: query.per.clamp(1, 100),
+        }
+    }
+}
+
 const fn default_page() -> u64 {
     1
+}
+
+const fn default_jobs_per_page() -> u64 {
+    25
 }
 
 // ── Shared resolution ───────────────────────────────────────────────
@@ -295,7 +348,114 @@ async fn dashboard(
     )))
 }
 
-/// `GET /admin/{slug}` — Model list view.
+/// `GET /admin/jobs` -- built-in background jobs dashboard.
+async fn jobs_dashboard(
+    State(state): State<AppState>,
+    axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    Query(query): Query<JobsQuery>,
+    csrf: AdminCsrf,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let mut snapshot = match job_admin_backend(&state) {
+        Some(backend) => backend.snapshot(query.into()).await?,
+        None => JobAdminSnapshot::empty(),
+    };
+    snapshot.schedules = scheduled_job_summaries(&state);
+    let messages = flash.consume().await;
+
+    Ok(render(templates::jobs_page(
+        &registry,
+        &snapshot,
+        &messages,
+        csrf.token(),
+        csrf.form_field(),
+        &prefix,
+        &actuator_prefix,
+    )))
+}
+
+/// `GET /admin/jobs/counters` -- HTMX counter refresh fragment.
+async fn jobs_counters(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Query(query): Query<JobsQuery>,
+) -> AutumnResult<Response> {
+    let mut snapshot = match job_admin_backend(&state) {
+        Some(backend) => backend.snapshot(query.into()).await?,
+        None => JobAdminSnapshot::empty(),
+    };
+    snapshot.schedules = scheduled_job_summaries(&state);
+    Ok(render(templates::jobs_counters(&snapshot, &prefix)))
+}
+
+/// `POST /admin/jobs/{id}/retry` -- retry a failed job.
+async fn job_retry(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.retry(&id).await?;
+    flash.success(format!("Retried job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+/// `POST /admin/jobs/{id}/discard` -- discard a failed job.
+async fn job_discard(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.discard(&id).await?;
+    flash.success(format!("Discarded job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+/// `POST /admin/jobs/{id}/cancel` -- cancel a job that has not started.
+async fn job_cancel(
+    State(state): State<AppState>,
+    axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    Path(id): Path<String>,
+    flash: Flash,
+) -> AutumnResult<Response> {
+    let backend = job_admin_backend(&state)
+        .ok_or_else(|| AutumnError::service_unavailable_msg("job runtime is not initialized"))?;
+    backend.cancel(&id).await?;
+    flash.success(format!("Canceled job {id}.")).await;
+    Ok(Redirect::to(&format!("{prefix}/jobs")).into_response())
+}
+
+fn scheduled_job_summaries(state: &AppState) -> Vec<JobScheduleSummary> {
+    let mut schedules: Vec<_> = state
+        .task_registry()
+        .snapshot()
+        .into_iter()
+        .map(|(name, status)| {
+            let last_run_status = status
+                .last_error
+                .as_ref()
+                .map(|error| format!("failed: {error}"))
+                .or(status.last_result);
+            JobScheduleSummary {
+                name,
+                schedule: status.schedule,
+                next_run_at: status.next_run_at,
+                last_run_status,
+            }
+        })
+        .collect();
+    schedules.sort_by(|a, b| a.name.cmp(&b.name));
+    schedules
+}
+
+/// `GET /admin/{slug}` -- Model list view.
 #[allow(clippy::too_many_arguments)]
 async fn model_list(
     State(state): State<AppState>,
@@ -354,6 +514,7 @@ async fn model_list(
         &filters,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -384,6 +545,7 @@ async fn model_new_form(
         None,
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -401,8 +563,9 @@ async fn model_create(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
     let record = model
-        .create(&pool, strip_meta_fields(form_data, &fields))
+        .create(&pool, form_data)
         .await
         .map_err(|e| admin_err("Create failed", e))?;
     // The post-create redirect needs a routable ID. Treat a missing or
@@ -491,6 +654,7 @@ async fn model_edit_form(
         Some(id),
         &messages,
         csrf.token(),
+        csrf.form_field(),
         &prefix,
         &actuator_prefix,
     )))
@@ -508,8 +672,9 @@ async fn model_update(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
     model
-        .update(&pool, id, strip_meta_fields(form_data, &fields))
+        .update(&pool, id, form_data)
         .await
         .map_err(|e| admin_err("Update failed", e))?;
     flash
@@ -521,7 +686,7 @@ async fn model_update(
 /// `POST /admin/{slug}/actions` — Execute a bulk action.
 ///
 /// Form body carries `action=<name>`, repeated `ids=<id>` for each selected
-/// row, and `_csrf=<token>`. Validates the action name against the model's
+/// row, and the CSRF token field. Validates the action name against the model's
 /// declared `actions()` list, parses every `ids` entry as `i64`, then
 /// dispatches to [`AdminModel::execute_action`].
 async fn model_action(
@@ -546,7 +711,7 @@ async fn model_action(
                 Ok(id) => ids.push(id),
                 Err(_) => malformed_id = true,
             },
-            // ignore _csrf and any unknown keys
+            // ignore the CSRF token field and any unknown keys
             _ => {}
         }
     }
@@ -652,10 +817,93 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
     data
 }
 
+fn coerce_form_fields(mut data: Value, fields: &[AdminField]) -> Value {
+    let Some(obj) = data.as_object_mut() else {
+        return data;
+    };
+
+    for field in fields {
+        let Some(value) = obj.get_mut(field.name) else {
+            continue;
+        };
+        coerce_form_value(value, field);
+    }
+
+    data
+}
+
+fn coerce_form_value(value: &mut Value, field: &AdminField) {
+    if !field.required
+        && matches!(
+            field.kind,
+            AdminFieldKind::Integer
+                | AdminFieldKind::Float
+                | AdminFieldKind::Date
+                | AdminFieldKind::DateTime
+        )
+        && matches!(value, Value::String(raw) if raw.trim().is_empty())
+    {
+        *value = Value::Null;
+        return;
+    }
+
+    match &field.kind {
+        AdminFieldKind::Boolean => {
+            if let Value::String(raw) = value
+                && let Some(parsed) = parse_form_bool(raw)
+            {
+                *value = Value::Bool(parsed);
+            }
+        }
+        AdminFieldKind::Integer => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = raw.parse::<i64>()
+            {
+                *value = Value::Number(parsed.into());
+            }
+        }
+        AdminFieldKind::Float => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = raw.parse::<f64>()
+                && let Some(number) = serde_json::Number::from_f64(parsed)
+            {
+                *value = Value::Number(number);
+            }
+        }
+        AdminFieldKind::Json => {
+            if let Value::String(raw) = value
+                && let Ok(parsed) = serde_json::from_str(raw)
+            {
+                *value = parsed;
+            }
+        }
+        AdminFieldKind::Text
+        | AdminFieldKind::TextArea
+        | AdminFieldKind::Date
+        | AdminFieldKind::DateTime
+        | AdminFieldKind::Select(_)
+        | AdminFieldKind::Hidden
+        | AdminFieldKind::Password => {}
+    }
+}
+
+fn parse_form_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" | "" => Some(false),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_web::job::{JobAdminBackendEntry, JobAdminMemoryBackend};
+    use autumn_web::session::Session;
+    use axum::body::Body;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
 
     fn fields(specs: &[(&'static str, AdminFieldKind)]) -> Vec<AdminField> {
         specs
@@ -663,6 +911,56 @@ mod tests {
             .cloned()
             .map(|(name, kind)| AdminField::new(name, kind))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn jobs_route_renders_without_database_pool() {
+        let backend = JobAdminMemoryBackend::new();
+        let state =
+            AppState::for_test().with_extension(JobAdminBackendEntry(std::sync::Arc::new(backend)));
+        state.task_registry().register_scheduled(
+            "cleanup",
+            "every 60s",
+            autumn_web::task::TaskCoordination::Fleet,
+            "local",
+            "replica-a",
+        );
+        state
+            .task_registry()
+            .record_next_run_at("cleanup", "2026-05-08T12:00:00Z");
+        let session = Session::new_for_test("sid".to_owned(), HashMap::new());
+        let app = admin_router(
+            std::sync::Arc::new(AdminRegistry::new()),
+            "/admin",
+            "/actuator".to_owned(),
+            "user_id".to_owned(),
+            None,
+        )
+        .layer(axum::Extension(session))
+        .with_state(state);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/jobs")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(html.contains("Jobs"), "html: {html}");
+        assert!(html.contains("Enqueued"), "html: {html}");
+        assert!(
+            html.contains(r#"hx-get="/admin/jobs/counters""#),
+            "html: {html}"
+        );
+        assert!(html.contains("cleanup"), "html: {html}");
+        assert!(html.contains("2026-05-08T12:00:00Z"), "html: {html}");
     }
 
     #[test]
@@ -702,6 +1000,64 @@ mod tests {
         ]);
         let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
         assert_eq!(out, json!({"name": "", "bio": ""}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_boolean_strings() {
+        let fields = fields(&[("published", AdminFieldKind::Boolean)]);
+        let out = coerce_form_fields(json!({"published": "true"}), &fields);
+        assert_eq!(out, json!({"published": true}));
+
+        let out = coerce_form_fields(json!({"published": "false"}), &fields);
+        assert_eq!(out, json!({"published": false}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_numeric_and_json_strings() {
+        let fields = fields(&[
+            ("count", AdminFieldKind::Integer),
+            ("rating", AdminFieldKind::Float),
+            ("settings", AdminFieldKind::Json),
+        ]);
+        let out = coerce_form_fields(
+            json!({
+                "count": "42",
+                "rating": "3.5",
+                "settings": "{\"published\":true}"
+            }),
+            &fields,
+        );
+
+        assert_eq!(
+            out,
+            json!({
+                "count": 42,
+                "rating": 3.5,
+                "settings": {"published": true}
+            })
+        );
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_blank_optional_numeric_strings_to_null() {
+        let fields = vec![
+            AdminField::new("count", AdminFieldKind::Integer).optional(),
+            AdminField::new("rating", AdminFieldKind::Float).optional(),
+        ];
+        let out = coerce_form_fields(json!({"count": "", "rating": ""}), &fields);
+
+        assert_eq!(out, json!({"count": null, "rating": null}));
+    }
+
+    #[test]
+    fn coerce_form_fields_converts_blank_optional_date_strings_to_null() {
+        let fields = vec![
+            AdminField::new("published_on", AdminFieldKind::Date).optional(),
+            AdminField::new("starts_at", AdminFieldKind::DateTime).optional(),
+        ];
+        let out = coerce_form_fields(json!({"published_on": "", "starts_at": "   "}), &fields);
+
+        assert_eq!(out, json!({"published_on": null, "starts_at": null}));
     }
 
     #[test]
@@ -849,6 +1205,7 @@ mod tests {
             .await
             .expect("infallible");
         assert_eq!(extracted.token(), "");
+        assert_eq!(extracted.form_field(), "_csrf");
     }
 
     #[tokio::test]
@@ -879,6 +1236,22 @@ mod tests {
             .unwrap();
         // No panic, no 500 — just an empty-string body because no CsrfLayer.
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_csrf_extractor_reads_configured_form_field_from_extensions() {
+        let req = axum::http::Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+        parts
+            .extensions
+            .insert(CsrfFormField("authenticity_token".to_owned()));
+
+        let extracted = AdminCsrf::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
+
+        assert_eq!(extracted.token(), "");
+        assert_eq!(extracted.form_field(), "authenticity_token");
     }
 
     #[test]

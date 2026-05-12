@@ -4,24 +4,13 @@ use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
 use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, Markup, PreEscaped, html};
 
-/// Render a meta-refresh redirect page (for regular form submissions).
-pub fn redirect_to(url: &str) -> Markup {
-    html! {
-        (PreEscaped("<!DOCTYPE html>"))
-        html {
-            head { meta http-equiv="refresh" content=(format!("0;url={url}")); }
-            body { p { "Redirecting to " a href=(url) { (url) } "..." } }
-        }
-    }
-}
-
-/// Redirect that works for htmx requests.
+/// Redirect that works for both regular and htmx requests.
 ///
 /// Returns an `HX-Redirect` header so htmx performs a full-page navigation
 /// instead of swapping the response into the triggering element. Also
-/// includes a meta-refresh fallback for non-htmx clients.
+/// includes a standard HTTP redirect fallback for non-htmx clients.
 pub fn hx_redirect_to(url: &str) -> Response {
-    let mut response = redirect_to(url).into_response();
+    let mut response = autumn_web::Redirect::to(url).into_response();
     response.headers_mut().insert(
         http::header::HeaderName::from_static("hx-redirect"),
         http::header::HeaderValue::from_str(url)
@@ -57,49 +46,67 @@ pub fn layout(
                 script src=(HTMX_CSRF_JS_PATH) {}
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {
-                // Navigation bar
-                nav class="bg-white border-b border-gray-200 shadow-sm sticky top-0 z-10" {
-                    div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between" {
-                        div class="flex items-center gap-6" {
-                            a href="/" class="text-xl font-bold text-orange-600 hover:text-orange-700" {
-                                "autumn/reddit"
-                            }
-                            div class="hidden sm:flex items-center gap-4 text-sm" {
-                                a href="/r" class="text-gray-600 hover:text-orange-600" { "Communities" }
-                                a href="/about" class="text-gray-600 hover:text-orange-600" { "About" }
-                                a href="/actuator/health" class="text-gray-500 hover:text-orange-600" { "Health" }
-                            }
-                        }
-                        div class="flex items-center gap-3 text-sm" {
-                            @if let Some(name) = username {
-                                span class="text-gray-600" { "u/" (name) }
-                                a href="/submit"
-                                  class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
-                                    "New Post"
+                // Skip-to-content link — first focusable element for keyboard users.
+                a href="#main-content"
+                  class="skip-link sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 \
+                         focus:z-50 focus:px-4 focus:py-2 focus:bg-white focus:text-gray-900 \
+                         focus:border focus:border-gray-300 focus:rounded focus:shadow" {
+                    "Skip to main content"
+                }
+
+                // ARIA live region for htmx swap announcements.
+                // Update this element's content via hx-swap-oob="true" in htmx responses
+                // to announce dynamic changes to screen readers without moving focus.
+                div id="htmx-status" role="status" aria-live="polite" aria-atomic="true"
+                    class="sr-only" {}
+
+                // Site-wide navigation banner
+                header role="banner" {
+                    nav aria-label="Main navigation"
+                        class="bg-white border-b border-gray-200 shadow-sm sticky top-0 z-10" {
+                        div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between" {
+                            div class="flex items-center gap-6" {
+                                a href="/" class="text-xl font-bold text-orange-600 hover:text-orange-700" {
+                                    "autumn/reddit"
                                 }
-                                button
-                                    hx-post="/logout"
-                                    class="text-gray-500 hover:text-orange-600 cursor-pointer" {
-                                    "Log out"
+                                div class="hidden sm:flex items-center gap-4 text-sm" {
+                                    a href="/r" class="text-gray-600 hover:text-orange-600" { "Communities" }
+                                    a href="/about" class="text-gray-600 hover:text-orange-600" { "About" }
+                                    a href="/actuator/health" class="text-gray-500 hover:text-orange-600" { "Health" }
                                 }
-                            } @else {
-                                a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }
-                                a href="/register"
-                                  class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
-                                    "Sign up"
+                            }
+                            div class="flex items-center gap-3 text-sm" {
+                                @if let Some(name) = username {
+                                    span class="text-gray-600" { "u/" (name) }
+                                    a href="/submit"
+                                      class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
+                                        "New Post"
+                                    }
+                                    button
+                                        hx-post="/logout"
+                                        aria-label="Log out"
+                                        class="text-gray-500 hover:text-orange-600 cursor-pointer" {
+                                        "Log out"
+                                    }
+                                } @else {
+                                    a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }
+                                    a href="/register"
+                                      class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
+                                        "Sign up"
+                                    }
                                 }
                             }
                         }
                     }
                 }
 
-                // Main content
-                main class="max-w-5xl mx-auto py-6 px-4" {
+                // Main content landmark
+                main id="main-content" class="max-w-5xl mx-auto py-6 px-4" {
                     (content)
                 }
 
-                // Footer
-                footer class="border-t border-gray-200 mt-12" {
+                // Site footer
+                footer role="contentinfo" class="border-t border-gray-200 mt-12" {
                     div class="max-w-5xl mx-auto text-center text-xs text-gray-400 py-6" {
                         "Built with "
                         a href="https://github.com/madmax983/autumn"
@@ -118,7 +125,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
         div id=(format!("votes-{post_id}"))
             class="flex flex-col items-center gap-0.5 text-sm select-none" {
             button
-                hx-post=(format!("/posts/{post_id}/upvote"))
+                hx-post=(super::votes::__autumn_path_upvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-orange-500 cursor-pointer text-lg leading-none" {
@@ -126,7 +133,7 @@ pub fn vote_controls(post_id: i64, score: i64) -> Markup {
             }
             span class="font-semibold text-gray-700" { (score) }
             button
-                hx-post=(format!("/posts/{post_id}/downvote"))
+                hx-post=(super::votes::__autumn_path_downvote(post_id))
                 hx-target=(format!("#votes-{post_id}"))
                 hx-swap="outerHTML"
                 class="text-gray-400 hover:text-blue-500 cursor-pointer text-lg leading-none" {

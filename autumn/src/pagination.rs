@@ -246,15 +246,8 @@ where
 /// behaviour of `serde_urlencoded`.
 fn parse_query(query: &str) -> PageRequest {
     let mut req = PageRequest::default();
-    for pair in query.split('&').filter(|s| !s.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let Ok(key) = percent_decode(raw_key) else {
-            continue;
-        };
-        let Ok(value) = percent_decode(raw_value) else {
-            continue;
-        };
-        match key.as_str() {
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
             "page" => {
                 if let Ok(n) = value.parse::<u32>() {
                     req.page = Some(n);
@@ -269,41 +262,6 @@ fn parse_query(query: &str) -> PageRequest {
         }
     }
     req
-}
-
-/// Decode a single URL-encoded segment. `+` is treated as a space (the
-/// `application/x-www-form-urlencoded` convention used by
-/// `serde_urlencoded` and browsers).
-fn percent_decode(input: &str) -> Result<String, std::str::Utf8Error> {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    // h and l are both `0..=15` from `to_digit(16)`, so
-                    // `(h << 4) | l` fits in a u8 by construction.
-                    out.push(u8::try_from((h << 4) | l).unwrap_or(0));
-                    i += 3;
-                } else {
-                    out.push(bytes[i]);
-                    i += 1;
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    std::str::from_utf8(&out).map(ToOwned::to_owned)
 }
 
 // ── Page<T> ─────────────────────────────────────────────────────────
@@ -710,17 +668,10 @@ where
 /// `cursor`/`size` win.
 fn parse_cursor_query(query: &str) -> CursorRequest {
     let mut req = CursorRequest::default();
-    for pair in query.split('&').filter(|s| !s.is_empty()) {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        let Ok(key) = percent_decode(raw_key) else {
-            continue;
-        };
-        let Ok(value) = percent_decode(raw_value) else {
-            continue;
-        };
-        match key.as_str() {
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
             "cursor" if !value.is_empty() => {
-                req.cursor = Some(value);
+                req.cursor = Some(value.into_owned());
             }
             "size" => {
                 if let Ok(n) = value.parse::<u32>() {
@@ -915,6 +866,15 @@ mod tests {
         let r = PageRequest::new(1, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.limit(), i64::from(MAX_PAGE_SIZE));
+
+        let exact = PageRequest::new(1, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = PageRequest::new(1, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = PageRequest::new(1, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
     }
 
     #[test]
@@ -985,32 +945,6 @@ mod tests {
         assert!(mapped.has_next);
         assert!(mapped.has_previous);
         assert_eq!(mapped.content, vec!["1", "2", "3"]);
-    }
-
-    // ── percent_decode ─────────────────────────────────────────
-
-    #[test]
-    fn percent_decode_happy_path() {
-        assert_eq!(percent_decode("hello%20world").unwrap(), "hello world");
-        assert_eq!(percent_decode("a%2Bb").unwrap(), "a+b");
-        assert_eq!(percent_decode("%32").unwrap(), "2");
-    }
-
-    #[test]
-    fn percent_decode_plus_to_space() {
-        assert_eq!(percent_decode("hello+world").unwrap(), "hello world");
-    }
-
-    #[test]
-    fn percent_decode_invalid_hex_is_ignored() {
-        assert_eq!(percent_decode("abc%3Gdef").unwrap(), "abc%3Gdef");
-        assert_eq!(percent_decode("%%%").unwrap(), "%%%");
-    }
-
-    #[test]
-    fn percent_decode_incomplete_at_eof() {
-        assert_eq!(percent_decode("abc%").unwrap(), "abc%");
-        assert_eq!(percent_decode("abc%2").unwrap(), "abc%2");
     }
 
     // ── JSON serialization ─────────────────────────────────────
@@ -1242,6 +1176,15 @@ mod tests {
         let r = CursorRequest::new(None, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
         assert_eq!(r.fetch_limit(), i64::from(MAX_PAGE_SIZE) + 1);
+
+        let exact = CursorRequest::new(None, MAX_PAGE_SIZE);
+        assert_eq!(exact.size(), MAX_PAGE_SIZE);
+
+        let over = CursorRequest::new(None, MAX_PAGE_SIZE + 1);
+        assert_eq!(over.size(), MAX_PAGE_SIZE);
+
+        let under = CursorRequest::new(None, MAX_PAGE_SIZE - 1);
+        assert_eq!(under.size(), MAX_PAGE_SIZE - 1);
     }
 
     #[test]
@@ -1312,6 +1255,23 @@ mod tests {
     }
 
     #[test]
+    fn cursor_page_from_overfetched_handles_encoding_failure() {
+        let req = CursorRequest::new(None, 2);
+        let items = vec![1_i32, 2, 3];
+        let page = CursorPage::from_overfetched_inner(
+            items,
+            &req,
+            |&n| n,
+            |_| None::<String>, // Force encoding to fail
+        );
+
+        assert_eq!(page.content, vec![1, 2]);
+        assert_eq!(page.size, 2);
+        assert!(page.next_cursor.is_none());
+        assert!(!page.has_next);
+    }
+
+    #[test]
     fn cursor_page_empty_helper() {
         let req = CursorRequest::new(None, 10);
         let page: CursorPage<i32> = CursorPage::empty(&req);
@@ -1319,6 +1279,10 @@ mod tests {
         assert_eq!(page.size, 10);
         assert!(!page.has_next);
         assert!(page.next_cursor.is_none());
+
+        let req_diff_size = CursorRequest::new(None, 5);
+        let page_diff_size: CursorPage<i32> = CursorPage::empty(&req_diff_size);
+        assert_eq!(page_diff_size.size, 5);
     }
 
     #[test]
@@ -1326,10 +1290,13 @@ mod tests {
         let req = CursorRequest::new(None, 2);
         let items = vec![1_i32, 2, 3]; // overfetch by 1
         let page = CursorPage::from_overfetched(items, &req, |&n| serde_json::json!({"id": n}));
+
+        let original_cursor = page.next_cursor.clone();
+
         let mapped = page.map(|n| n.to_string());
         assert_eq!(mapped.content, vec!["1", "2"]);
         assert!(mapped.has_next);
-        assert!(mapped.next_cursor.is_some());
+        assert_eq!(mapped.next_cursor, original_cursor);
         assert_eq!(mapped.size, 2);
     }
 
@@ -1399,6 +1366,17 @@ mod tests {
     #[tokio::test]
     async fn cursor_extractor_clamps_size_over_max() {
         let (status, body) = fetch_cursor("/feed?cursor=t&size=9999").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
+
+        // Exact MAX_PAGE_SIZE
+        let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={MAX_PAGE_SIZE}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
+
+        // MAX_PAGE_SIZE + 1
+        let size = MAX_PAGE_SIZE + 1;
+        let (status, body) = fetch_cursor(&format!("/feed?cursor=t&size={size}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, format!("t|{MAX_PAGE_SIZE}|{}", MAX_PAGE_SIZE + 1));
     }
@@ -1657,5 +1635,72 @@ mod tests {
         let c = Cursor::encode_signed(&p, b"k2").unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[tokio::test]
+    async fn page_request_extractor_defaults_on_missing_uri_query() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+
+        let extracted = PageRequest::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted.page(), 1);
+        assert_eq!(extracted.size(), 20); // Default is 20
+    }
+
+    #[tokio::test]
+    async fn cursor_extractor_defaults_on_missing_uri_query() {
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+        let req = Request::builder().uri("/").body(()).unwrap();
+        let (mut parts, ()) = req.into_parts();
+
+        let extracted = CursorRequest::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(extracted.size(), 20); // Default is 20
+        assert!(extracted.cursor.is_none());
+    }
+
+    #[test]
+    fn base64url_encode_pad_branch() {
+        // 2 byte string leads to rem.len() == 2, which exercises the second padding path.
+        let encoded = base64url_encode(b"ab");
+        assert_eq!(encoded, "YWI");
+    }
+
+    #[test]
+    fn base64url_decode_pad_branch() {
+        // Try to decode exactly a length that produces rem 3.
+        // YWI decodes to 'ab' (2 bytes)
+        let decoded = base64url_decode("YWI").unwrap();
+        assert_eq!(decoded, b"ab");
+    }
+
+    #[test]
+    fn cursor_encode_fails_gracefully_on_serialization_error() {
+        use serde::Serialize;
+
+        struct FailToSerialize;
+
+        impl Serialize for FailToSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("forced failure"))
+            }
+        }
+
+        let res = Cursor::encode(&FailToSerialize);
+        assert!(res.is_err());
+
+        let res_signed = Cursor::encode_signed(&FailToSerialize, b"key");
+        assert!(res_signed.is_err());
     }
 }

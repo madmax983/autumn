@@ -38,6 +38,62 @@
 //! | [`TestResponse`] | `MvcResult` | Response with assertion helpers |
 //! | `TestDb` | `@DataJpaTest` | Shared Postgres testcontainer with pool |
 //!
+//! # Test-data factories
+//!
+//! `#[model]` generates a `{Model}Factory` builder so tests only declare the
+//! fields that matter for the scenario under test — all others stay at
+//! `Default::default()`:
+//!
+//! ```rust
+//! mod schema {
+//!     autumn_web::reexports::diesel::table! {
+//!         notes (id) {
+//!             id -> Int8,
+//!             title -> Text,
+//!             body -> Text,
+//!             pinned -> Bool,
+//!         }
+//!     }
+//! }
+//! use schema::notes;
+//!
+//! #[autumn_web::model]
+//! pub struct Note {
+//!     #[id]
+//!     pub id: i64,
+//!     pub title: String,
+//!     pub body: String,
+//!     pub pinned: bool,
+//! }
+//!
+//! // Zero required args — every field defaults to its type's `Default`.
+//! let draft: NewNote = Note::factory().build();
+//! assert_eq!(draft.title, "");
+//! assert!(!draft.pinned);
+//!
+//! // Override only the fields relevant to your test.
+//! let draft = Note::factory().title("Hello").pinned(true).build();
+//! assert_eq!(draft.title, "Hello");
+//! assert!(draft.pinned);
+//! assert_eq!(draft.body, ""); // untouched
+//! ```
+//!
+//! To persist the record call `.create(&pool)` instead of `.build()` — it
+//! inserts via Diesel and returns the fully-populated model (PK included).
+//! Pair it with `TestDb` for a self-contained DB test:
+//!
+//! ```rust,ignore
+//! #[tokio::test]
+//! #[ignore = "requires Docker (testcontainers)"]
+//! async fn note_round_trip() {
+//!     let db = TestDb::shared().await;
+//!     // run CREATE TABLE ... against db.pool() first, then:
+//!     let note = Note::factory().title("TDD").create(&db.pool()).await;
+//!     assert!(note.id > 0);
+//!     assert_eq!(note.title, "TDD");
+//! }
+//! ```
+//!
 //! # Database testing
 //!
 //! For tests that need a real database, use `TestDb` to share a single
@@ -111,7 +167,18 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "db")]
     pool: Option<Pool<AsyncPgConnection>>,
+    #[cfg(feature = "db")]
+    replica_pool: Option<Pool<AsyncPgConnection>>,
+    /// Deferred policy / scope registrations applied during
+    /// [`TestApp::build`].
+    policy_registrations: Vec<TestPolicyRegistration>,
+    /// Override for [`AppState::forbidden_response`]. Defaults to
+    /// the value derived from
+    /// [`SecurityConfig::forbidden_response`](crate::security::SecurityConfig::forbidden_response).
+    forbidden_response_override: Option<crate::authorization::ForbiddenResponse>,
 }
+
+type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
 impl TestApp {
     /// Create a new test app builder with default configuration.
@@ -132,7 +199,53 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            policy_registrations: Vec::new(),
+            forbidden_response_override: None,
         }
+    }
+
+    /// Register a [`Policy`](crate::authorization::Policy) for
+    /// resource type `R`. Mirrors
+    /// [`AppBuilder::policy`](crate::app::AppBuilder::policy).
+    #[must_use]
+    pub fn policy<R, P>(mut self, policy: P) -> Self
+    where
+        R: Send + Sync + 'static,
+        P: crate::authorization::Policy<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_policy::<R, _>(policy);
+        }));
+        self
+    }
+
+    /// Register a [`Scope`](crate::authorization::Scope) for resource
+    /// type `R`. Mirrors
+    /// [`AppBuilder::scope`](crate::app::AppBuilder::scope).
+    #[must_use]
+    pub fn scope<R, S>(mut self, scope: S) -> Self
+    where
+        R: Send + Sync + 'static,
+        S: crate::authorization::Scope<R>,
+    {
+        self.policy_registrations.push(Box::new(move |registry| {
+            registry.register_scope::<R, _>(scope);
+        }));
+        self
+    }
+
+    /// Override the deny-response shape used by `#[authorize]` and
+    /// `#[repository(policy = ...)]` handlers. Useful for
+    /// round-tripping the `403`-vs-`404` decision in tests.
+    #[must_use]
+    pub const fn forbidden_response(
+        mut self,
+        value: crate::authorization::ForbiddenResponse,
+    ) -> Self {
+        self.forbidden_response_override = Some(value);
+        self
     }
 
     /// Enable `OpenAPI` spec generation for the test app.
@@ -224,14 +337,23 @@ impl TestApp {
     /// This constructs the full Axum router with all middleware applied,
     /// identical to what `AppBuilder::run()` produces -- without binding
     /// a TCP listener.
+    ///
+    /// The process-level global cache is cleared unconditionally so that
+    /// `#[cached]` functions inside this test app always use their
+    /// per-function Moka stores and do not accidentally inherit a Redis or
+    /// other shared backend installed by a previous test.
     #[must_use]
     pub fn build(self) -> TestClient {
+        // Reset the global cache to prevent cross-test contamination.
+        crate::cache::clear_global_cache();
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
             #[cfg(feature = "db")]
             pool: self.pool,
+            #[cfg(feature = "db")]
+            replica_pool: self.replica_pool,
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,
@@ -239,12 +361,24 @@ impl TestApp {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new(&self.config.log.level),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: self
+                .forbidden_response_override
+                .unwrap_or(self.config.security.forbidden_response),
+            auth_session_key: self.config.auth.session_key.clone(),
+            shared_cache: None,
         };
+
+        for register in self.policy_registrations {
+            register(state.policy_registry());
+        }
+        crate::app::install_webhook_registry(&state, &self.config);
 
         let router = crate::router::try_build_router_inner(
             self.routes,
@@ -452,6 +586,29 @@ impl RequestBuilder {
 ///     .assert_header("content-type", "application/json")
 ///     .assert_body_contains("Alice");
 /// ```
+///
+/// Fields are public so you can construct a `TestResponse` directly in unit
+/// tests that don't need a full HTTP round-trip:
+///
+/// ```rust
+/// use autumn_web::test::TestResponse;
+/// use axum::http::StatusCode;
+///
+/// let resp = TestResponse {
+///     status: StatusCode::OK,
+///     headers: vec![
+///         ("content-type".into(), "application/json".into()),
+///         ("x-request-id".into(), "abc-123".into()),
+///     ],
+///     body: br#"{"name":"Alice"}"#.to_vec(),
+/// };
+///
+/// resp.assert_ok()
+///     .assert_header_contains("content-type", "json")
+///     .assert_body_contains("Alice");
+///
+/// assert_eq!(resp.header("x-request-id"), Some("abc-123"));
+/// ```
 pub struct TestResponse {
     /// HTTP status code.
     pub status: StatusCode,
@@ -469,7 +626,12 @@ impl TestResponse {
     /// Panics if the body is not valid UTF-8.
     #[must_use]
     pub fn text(&self) -> String {
-        String::from_utf8(self.body.clone()).expect("response body is not valid UTF-8")
+        String::from_utf8(self.body.clone()).unwrap_or_else(|e| {
+            panic!(
+                "response body is not valid UTF-8: {e}\nRaw bytes: {:?}",
+                self.body
+            )
+        })
     }
 
     /// Deserialize the response body as JSON.
@@ -480,7 +642,12 @@ impl TestResponse {
     /// into `T`.
     #[must_use]
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> T {
-        serde_json::from_slice(&self.body).expect("failed to parse response body as JSON")
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "failed to parse response body as JSON: {e}\nBody: {}",
+                String::from_utf8_lossy(&self.body)
+            )
+        })
     }
 
     /// Get the value of a response header.
@@ -536,9 +703,12 @@ impl TestResponse {
     /// Assert a response header exists and equals the expected value.
     #[track_caller]
     pub fn assert_header(&self, name: &str, expected: &str) -> &Self {
-        let value = self
-            .header(name)
-            .unwrap_or_else(|| panic!("expected header `{name}` to be present"));
+        let value = self.header(name).unwrap_or_else(|| {
+            panic!(
+                "expected header `{name}` to be present.\nAvailable headers: {:?}",
+                self.headers
+            )
+        });
         assert_eq!(
             value, expected,
             "header `{name}`: expected `{expected}`, got `{value}`"
@@ -549,9 +719,12 @@ impl TestResponse {
     /// Assert a response header exists and contains the expected substring.
     #[track_caller]
     pub fn assert_header_contains(&self, name: &str, substring: &str) -> &Self {
-        let value = self
-            .header(name)
-            .unwrap_or_else(|| panic!("expected header `{name}` to be present"));
+        let value = self.header(name).unwrap_or_else(|| {
+            panic!(
+                "expected header `{name}` to be present.\nAvailable headers: {:?}",
+                self.headers
+            )
+        });
         assert!(
             value.contains(substring),
             "header `{name}`: expected `{value}` to contain `{substring}`"
@@ -574,7 +747,7 @@ impl TestResponse {
     #[track_caller]
     pub fn assert_body_eq(&self, expected: &str) -> &Self {
         let body = self.text();
-        assert_eq!(body, expected, "body mismatch");
+        assert_eq!(body, expected, "body mismatch.\nActual Body: {body}");
         self
     }
 
@@ -768,6 +941,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: Method::POST,
@@ -781,6 +955,7 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             },
             Route {
                 method: Method::POST,
@@ -794,6 +969,7 @@ mod tests {
                     success_status: 201,
                     ..Default::default()
                 },
+                repository: None,
             },
         ]
     }

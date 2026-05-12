@@ -1,0 +1,63 @@
+# Production configuration for {{project_name}}.
+# Copy to autumn.toml (or load via AUTUMN_PROFILE=prod) and replace placeholder values.
+# WARNING: Never commit real credentials — use environment variables for secrets.
+
+[server]
+host = "0.0.0.0"
+port = 3000
+# shutdown_timeout_secs = 30
+
+[log]
+level = "info"
+format = "Json"
+
+[health]
+path = "/health"
+# live_path = "/live"
+# ready_path = "/ready"
+
+# Database topology:
+# - primary_url is the write role used by Db, transactions, advisory locks, and migrations.
+# - replica_url is optional; use it only for read replicas that have replayed migrations.
+# - database.url and DATABASE_URL remain valid single-primary compatibility paths.
+# Prefer AUTUMN_DATABASE__PRIMARY_URL for real production secrets.
+[database]
+primary_url = "postgres://user:CHANGE_ME@localhost:5432/{{project_name}}_prod"
+# replica_url = "postgres://user:CHANGE_ME@replica:5432/{{project_name}}_prod"
+pool_size = 10
+# primary_pool_size = 10
+# replica_pool_size = 5
+replica_fallback = "fail_readiness" # fail_readiness | primary
+connect_timeout_secs = 5
+# Production migrations belong to one explicit primary-role job:
+#   AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate
+# Keep web replicas out of migration ownership.
+auto_migrate_in_production = false
+
+# ── Signing secret (REQUIRED in production) ─────────────────────────────────
+#
+# The signing secret protects sessions, CSRF tokens, flash/signed-cookie state,
+# and local-storage signed URLs. Production startup will refuse to bind if this
+# is missing, shorter than 32 bytes, or matches a known demo value.
+#
+# Generate:  openssl rand -hex 32
+# Set via environment variable — NEVER commit the actual value here:
+#
+#   export AUTUMN_SECURITY__SIGNING_SECRET="<generated-value>"
+#
+# All replicas must use the same value. See docs/guide/signing-secrets.md for
+# the full contract including rotation and multi-replica setup.
+#
+# Rotation grace window: add the old secret here while deploying the new one.
+# Remove it after session.max_age_secs has elapsed.
+# [security.signing_secret]
+# previous_secrets = []
+
+# Uncomment for OpenTelemetry / OTLP tracing:
+# [telemetry]
+# enabled = true
+# service_name = "{{project_name}}"
+# service_namespace = "apps"
+# environment = "production"
+# otlp_endpoint = "http://otel-collector:4317"
+# protocol = "Grpc"

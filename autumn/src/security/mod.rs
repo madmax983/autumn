@@ -50,6 +50,8 @@
 //! enabled = true                       # per-IP token bucket
 //! requests_per_second = 10.0
 //! burst = 20
+//! trust_forwarded_headers = true       # only behind trusted proxies
+//! trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
 //! ```
 //!
 //! ## Quick start
@@ -83,6 +85,6 @@ pub use config::{
     CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
     default_content_security_policy,
 };
-pub use csrf::{CsrfLayer, CsrfToken};
+pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;

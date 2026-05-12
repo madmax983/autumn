@@ -7,8 +7,10 @@ level = "info"
 [health]
 path = "/health"
 
-[distributed.database]
+[database]
 primary_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed"
 replica_url = "postgres://autumn:autumn@localhost:5433/bookmarks_distributed"
 primary_pool_size = 4
 replica_pool_size = 2
+replica_fallback = "fail_readiness"
+auto_migrate_in_production = false

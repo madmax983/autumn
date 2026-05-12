@@ -1,4 +1,4 @@
-﻿# Chapter 10: Configuration and Production Defaults
+# Chapter 10: Configuration and Production Defaults
 
 **Goal:** By the end of this chapter, you will understand Autumn's profile-aware
 configuration system, know how to override settings with environment variables,
@@ -53,7 +53,8 @@ understanding are:
 - `[health]` for `/health`, `/live`, `/ready`, and `/startup`
 - `[telemetry]` for OTLP export and service metadata
 - `[session]` and `[session.redis]` when you move beyond a single process
-- `[database]` for connection URL, pool size, and connect timeout
+- `[database]` for primary/write URL, optional replica/read URL, pool sizes,
+  replica fallback behavior, and connect timeout
 - `[actuator]` for prefix and sensitive endpoint exposure
 
 ## Environment Variable Overrides
@@ -94,8 +95,8 @@ metrics, config properties, loggers, and task visibility based on the
 
 ## Telemetry
 
-For production, treat telemetry as a first-class config section instead of a
-future TODO:
+For production, treat telemetry as a first-class config section rather than a
+later chore:
 
 ```toml
 [telemetry]
@@ -117,7 +118,9 @@ copy per replica or your application code can coordinate ownership explicitly.
 
 Use Harvest when the work needs durability, retries, workflow history, or clear
 singleton semantics across multiple replicas. The framework-level scheduler is
-not a distributed job system.
+not a distributed job system. Harvest is a companion project with its own
+release train because it integrates with Autumn Web rather than being part of
+the core web crate.
 
 ## Deployment Checkpoint
 
@@ -131,4 +134,4 @@ At this point your app should have:
 
 ---
 
-Previous: [Chapter 9 - Error Handling](09-errors.md) | Next: [Chapter 11 - What's Next](11-whats-next.md)
+Previous: [Chapter 9 - Error Handling](09-errors.md) | Next: [Chapter 11 - Writing Integration Tests](11-testing.md)

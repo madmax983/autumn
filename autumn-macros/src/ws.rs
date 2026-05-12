@@ -12,13 +12,13 @@ use crate::parse;
 
 /// Check if a type pattern looks like `AppState` (bare identifier).
 fn is_app_state_type(ty: &syn::Type) -> bool {
-    if let syn::Type::Path(type_path) = ty {
-        if type_path.qself.is_none() {
-            let segments: Vec<_> = type_path.path.segments.iter().collect();
-            // Match `AppState` or `autumn_web::AppState` etc.
-            if let Some(last) = segments.last() {
-                return last.ident == "AppState" && last.arguments.is_none();
-            }
+    if let syn::Type::Path(type_path) = ty
+        && type_path.qself.is_none()
+    {
+        let segments: Vec<_> = type_path.path.segments.iter().collect();
+        // Match `AppState` or `autumn_web::AppState` etc.
+        if let Some(last) = segments.last() {
+            return last.ident == "AppState" && last.arguments.is_none();
         }
     }
     false
@@ -124,7 +124,8 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[doc(hidden)]
         #vis fn #route_info_name() -> ::autumn_web::Route {
             ::autumn_web::Route {
-                method: ::autumn_web::reexports::http::Method::GET,
+                method: ::autumn_web::reexports::http::Method::from_bytes(b"WS")
+                    .expect("WS is a valid method token"),
                 path: #path,
                 handler: ::autumn_web::reexports::axum::routing::get(#upgrade_name),
                 name: ::core::stringify!(#fn_name),
@@ -144,8 +145,12 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     response: ::core::option::Option::None,
                     success_status: 101,
                     hidden: true,
+                    query_schema: ::core::option::Option::None,
+                    secured: false,
+                    required_roles: &[],
                     register_schemas: ::core::option::Option::None,
                 },
+                repository: ::core::option::Option::None,
             }
         }
     }

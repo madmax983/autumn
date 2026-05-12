@@ -3,6 +3,9 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
+Examples in this guide track the published Autumn 0.4.x line and Rust 1.88.0+
+as of 2026-05-11.
+
 ---
 
 ## Startup Log: What Did Autumn Configure?
@@ -11,7 +14,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.1.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -20,7 +23,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.1.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -47,7 +50,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.1.0" profile="dev"
+  INFO autumn: Autumn starting version="0.4.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -441,6 +444,50 @@ async fn admin_panel(__autumn_session: Session) -> AutumnResult<&'static str> {
   logged in)
 - Roles listed (`#[secured("admin", "editor")]`) = must have at least one of
   the listed roles (403 if missing)
+
+### `#[authorize("action", resource = Type)]`
+
+Injects hidden `Session` and `State<AppState>` extractors and a
+record-level [`Policy`](./authorization.md) check at the top of your
+handler. Mirrors `#[secured]` but answers "are you allowed to act on
+*this* record?" instead of "are you allowed to call this *route*?"
+
+**You write:**
+
+```rust
+#[get("/posts/{id}/edit")]
+#[authorize("update", resource = Post)]
+async fn edit_post(post: Post) -> AutumnResult<Markup> {
+    Ok(html! { h1 { (post.title) } })
+}
+```
+
+**Effectively becomes:**
+
+```rust
+#[get("/posts/{id}/edit")]
+async fn edit_post(
+    __autumn_session: Session,
+    State(__autumn_state): State<AppState>,
+    post: Post,
+) -> AutumnResult<Markup> {
+    ::autumn_web::authorization::__check_policy::<Post>(
+        &__autumn_state,
+        &__autumn_session,
+        "update",
+        &post,
+    ).await?;
+    Ok(html! { h1 { (post.title) } })
+}
+```
+
+- The `from = name` argument overrides the default snake-case parameter
+  binding (default: `Post` → `post`).
+- The check returns the configured deny status — `404` by default to
+  avoid leaking record existence, configurable via
+  `[security] forbidden_response = "403"`.
+- Coexists with `#[secured]`: stack both attributes when a route should
+  require both authentication/role gating and a record-level check.
 
 ### `#[static_get("/path")]`
 

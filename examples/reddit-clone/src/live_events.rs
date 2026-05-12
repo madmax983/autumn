@@ -13,7 +13,6 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
-use autumn_harvest::notify::{QueueListener, QueueWaitOutcome, queue_channel};
 use autumn_web::AppState;
 use autumn_web::app::AppBuilder;
 use autumn_web::config::AutumnConfig;
@@ -25,6 +24,7 @@ use diesel::QueryDsl;
 use diesel::SelectableHelper;
 use diesel::dsl::max;
 use diesel::sql_types::Text;
+use diesel_async::AsyncConnection;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use futures::StreamExt;
@@ -32,7 +32,6 @@ use redis::AsyncCommands;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use crate::live_bus::{LiveFeedBusConfig, LiveFeedBusKind};
 
@@ -41,6 +40,14 @@ const LIVE_EVENT_POLL_INTERVAL_MS: u64 = 250;
 const LIVE_EVENT_RECONNECT_INTERVAL_MS: u64 = 250;
 const LIVE_EVENT_RETENTION_DAYS: i64 = 7;
 const LIVE_EVENT_NOTIFY_QUEUE: &str = "reddit_live_feed";
+
+fn live_event_notify_channel(queue_name: &str) -> String {
+    format!("autumn_live_event_{queue_name}")
+}
+
+fn quote_pg_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
 
 diesel::table! {
     live_feed_events (id) {
@@ -294,13 +301,13 @@ impl LiveFeedRelayHealth {
                 .replayed_events
                 .fetch_add(replayed as u64, Ordering::Relaxed);
             self.inner.last_seen_id.store(cursor, Ordering::Relaxed);
-            if let Some(created_at) = last_created_at {
-                if let Ok(mut last_replayed_at) = self.inner.last_replayed_at.write() {
-                    *last_replayed_at = Some(
-                        chrono::DateTime::<Utc>::from_naive_utc_and_offset(created_at, Utc)
-                            .to_rfc3339(),
-                    );
-                }
+            if let Some(created_at) = last_created_at
+                && let Ok(mut last_replayed_at) = self.inner.last_replayed_at.write()
+            {
+                *last_replayed_at = Some(
+                    chrono::DateTime::<Utc>::from_naive_utc_and_offset(created_at, Utc)
+                        .to_rfc3339(),
+                );
             }
         }
     }
@@ -314,7 +321,9 @@ struct LiveEventBusPublisher {
 
 #[derive(Clone)]
 enum LiveEventBusPublisherInner {
-    PostgresNotify,
+    PostgresNotify {
+        channel: String,
+    },
     RedisPubSub {
         channel: String,
         client: redis::Client,
@@ -324,7 +333,7 @@ enum LiveEventBusPublisherInner {
 struct LiveEventBusListener {
     label: String,
     redis: Option<redis::aio::PubSub>,
-    postgres: Option<QueueListener>,
+    postgres: Option<PostgresLiveEventListener>,
     #[cfg(test)]
     test_rx: Option<tokio::sync::mpsc::UnboundedReceiver<LiveFeedWakeSource>>,
 }
@@ -332,7 +341,7 @@ struct LiveEventBusListener {
 impl LiveEventBusListener {
     fn from_parts(
         redis: Option<redis::aio::PubSub>,
-        postgres: Option<QueueListener>,
+        postgres: Option<PostgresLiveEventListener>,
     ) -> Option<Self> {
         if redis.is_none() && postgres.is_none() {
             None
@@ -371,13 +380,30 @@ impl LiveEventBusListener {
     }
 }
 
+struct PostgresLiveEventListener {
+    conn: AsyncPgConnection,
+}
+
+impl PostgresLiveEventListener {
+    async fn connect(database_url: &str, channel: &str) -> AutumnResult<Self> {
+        let mut conn = AsyncPgConnection::establish(database_url)
+            .await
+            .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?;
+        let listen = format!("LISTEN {}", quote_pg_identifier(channel));
+        diesel::sql_query(listen).execute(&mut conn).await?;
+        Ok(Self { conn })
+    }
+}
+
 impl LiveEventBusPublisher {
     fn from_config(
         config: &LiveFeedBusConfig,
         health: Arc<LiveFeedRelayHealth>,
     ) -> AutumnResult<Self> {
         let inner = match config.kind {
-            LiveFeedBusKind::PostgresNotify => LiveEventBusPublisherInner::PostgresNotify,
+            LiveFeedBusKind::PostgresNotify => LiveEventBusPublisherInner::PostgresNotify {
+                channel: config.channel.clone(),
+            },
             LiveFeedBusKind::RedisPubSub => {
                 let redis_url = config.redis_url.as_deref().ok_or_else(|| {
                     AutumnError::service_unavailable_msg(
@@ -396,9 +422,17 @@ impl LiveEventBusPublisher {
         Ok(Self { inner, health })
     }
 
+    fn postgres_notify_channel(&self) -> String {
+        let channel = match &self.inner {
+            LiveEventBusPublisherInner::PostgresNotify { channel }
+            | LiveEventBusPublisherInner::RedisPubSub { channel, .. } => channel,
+        };
+        live_event_notify_channel(channel)
+    }
+
     async fn publish(&self, event_id: i64) -> AutumnResult<()> {
         let result = match &self.inner {
-            LiveEventBusPublisherInner::PostgresNotify => Ok(()),
+            LiveEventBusPublisherInner::PostgresNotify { .. } => Ok(()),
             LiveEventBusPublisherInner::RedisPubSub { channel, client } => {
                 let payload = serde_json::to_string(&LiveEventBusMessage { event_id })
                     .expect("live-event bus payload should serialize");
@@ -420,6 +454,13 @@ impl LiveEventBusPublisher {
         let _ = event_id;
         result
     }
+}
+
+fn live_event_notify_channel_for_state(state: &AppState) -> String {
+    state
+        .extension::<LiveEventBusPublisher>()
+        .map(|publisher| publisher.postgres_notify_channel())
+        .unwrap_or_else(|| live_event_notify_channel(LIVE_EVENT_NOTIFY_QUEUE))
 }
 
 type LiveEventConnectFuture<'a> =
@@ -469,8 +510,8 @@ fn ensure_live_feed_relay_health(
 
 /// Plugin that spawns the durable live-feed relay during app startup.
 ///
-/// Serves as a second in-tree example of the [`Plugin`] trait, alongside the
-/// first-party `HarvestPlugin`, to validate that the contract generalises.
+/// Serves as an in-tree example of the [`Plugin`] trait for app-owned runtime
+/// infrastructure.
 #[derive(Default)]
 pub struct LiveFeedPlugin;
 
@@ -580,7 +621,7 @@ async fn connect_live_event_listener(
             let postgres = connect_postgres_live_event_listener(database_url, &bus.channel).await;
             if postgres.is_some() {
                 debug!(
-                    channel = %queue_channel(&bus.channel),
+                    channel = %live_event_notify_channel(&bus.channel),
                     "reddit-clone live-feed Postgres backup listener connected for Redis bus"
                 );
             }
@@ -591,15 +632,15 @@ async fn connect_live_event_listener(
 
 async fn connect_postgres_live_event_listener(
     database_url: Option<&str>,
-    _channel: &str,
-) -> Option<QueueListener> {
+    channel: &str,
+) -> Option<PostgresLiveEventListener> {
     match database_url {
         Some(database_url) => {
-            let queue = LIVE_EVENT_NOTIFY_QUEUE.to_owned();
-            match QueueListener::connect(database_url, std::slice::from_ref(&queue)).await {
+            let channel = live_event_notify_channel(channel);
+            match PostgresLiveEventListener::connect(database_url, &channel).await {
                 Ok(listener) => {
                     debug!(
-                        channel = %queue_channel(LIVE_EVENT_NOTIFY_QUEUE),
+                        channel = %channel,
                         "reddit-clone live-feed Postgres listener connected"
                     );
                     Some(listener)
@@ -607,7 +648,7 @@ async fn connect_postgres_live_event_listener(
                 Err(error) => {
                     warn!(
                         error = %error,
-                        channel = %queue_channel(LIVE_EVENT_NOTIFY_QUEUE),
+                        channel = %channel,
                         "failed to start reddit-clone live-feed Postgres listener; falling back to polling"
                     );
                     None
@@ -774,6 +815,36 @@ pub async fn store_activity_event(
     subreddit_slug: &str,
     event: &Value,
 ) -> Result<i64, diesel::result::Error> {
+    store_activity_event_on_channel(
+        conn,
+        subreddit_slug,
+        event,
+        &live_event_notify_channel(LIVE_EVENT_NOTIFY_QUEUE),
+    )
+    .await
+}
+
+pub async fn store_activity_event_for_state(
+    state: &AppState,
+    conn: &mut AsyncPgConnection,
+    subreddit_slug: &str,
+    event: &Value,
+) -> Result<i64, diesel::result::Error> {
+    store_activity_event_on_channel(
+        conn,
+        subreddit_slug,
+        event,
+        &live_event_notify_channel_for_state(state),
+    )
+    .await
+}
+
+async fn store_activity_event_on_channel(
+    conn: &mut AsyncPgConnection,
+    subreddit_slug: &str,
+    event: &Value,
+    notify_channel: &str,
+) -> Result<i64, diesel::result::Error> {
     let event_id: i64 = diesel::insert_into(live_feed_events::table)
         .values(NewLiveFeedEventRow {
             subreddit_slug,
@@ -782,7 +853,7 @@ pub async fn store_activity_event(
         .returning(live_feed_events::id)
         .get_result(conn)
         .await?;
-    notify_live_event_stored(conn, event_id).await?;
+    notify_live_event_stored(conn, event_id, notify_channel).await?;
 
     Ok(event_id)
 }
@@ -826,7 +897,7 @@ pub fn post_created_event(
         "post_slug": post_slug,
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
-        "path": format!("/r/{subreddit_slug}/posts/{post_slug}"),
+        "path": crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug),
     })
 }
 
@@ -847,7 +918,7 @@ pub fn comment_created_event(
         "subreddit_slug": subreddit_slug,
         "author_username": author_username,
         "body_preview": comment_body_preview(body),
-        "path": format!("/r/{subreddit_slug}/posts/{post_slug}#comment-{comment_id}"),
+        "path": format!("{}#comment-{comment_id}", crate::routes::posts::__autumn_path_show(subreddit_slug, post_slug)),
     })
 }
 
@@ -871,12 +942,10 @@ async fn load_current_live_event_cursor(
 async fn notify_live_event_stored(
     conn: &mut AsyncPgConnection,
     event_id: i64,
+    channel: &str,
 ) -> Result<(), diesel::result::Error> {
-    let channel = queue_channel(LIVE_EVENT_NOTIFY_QUEUE);
-    let payload = serde_json::to_string(&autumn_harvest::notify::NotifyPayload {
-        task_id: Uuid::nil(),
-    })
-    .expect("live-feed notify payload should serialize");
+    let payload = serde_json::to_string(&LiveEventBusMessage { event_id })
+        .expect("live-feed notify payload should serialize");
 
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(channel)
@@ -884,7 +953,6 @@ async fn notify_live_event_stored(
         .execute(conn)
         .await?;
 
-    let _ = event_id;
     Ok(())
 }
 
@@ -979,19 +1047,15 @@ async fn wait_for_live_event_wakeup(
 }
 
 async fn wait_for_postgres_notification(
-    listener: &mut QueueListener,
+    listener: &mut PostgresLiveEventListener,
     poll_interval: Duration,
 ) -> AutumnResult<LiveFeedWakeOutcome> {
-    match listener
-        .wait_for_notification_outcome(poll_interval)
-        .await
-        .map_err(|error| AutumnError::service_unavailable_msg(error.to_string()))?
-    {
-        QueueWaitOutcome::Notification(_) => {
-            Ok(LiveFeedWakeOutcome::Wake(LiveFeedWakeSource::Postgres))
-        }
-        QueueWaitOutcome::TimedOut => Ok(LiveFeedWakeOutcome::TimedOut),
-        QueueWaitOutcome::ChannelClosed => Ok(LiveFeedWakeOutcome::ListenerClosed),
+    let mut notifications = std::pin::pin!(listener.conn.notifications_stream());
+    match tokio::time::timeout(poll_interval, notifications.next()).await {
+        Ok(Some(Ok(_notification))) => Ok(LiveFeedWakeOutcome::Wake(LiveFeedWakeSource::Postgres)),
+        Ok(Some(Err(error))) => Err(AutumnError::service_unavailable_msg(error.to_string())),
+        Ok(None) => Ok(LiveFeedWakeOutcome::ListenerClosed),
+        Err(_elapsed) => Ok(LiveFeedWakeOutcome::TimedOut),
     }
 }
 
@@ -1490,6 +1554,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_notify_channel_uses_installed_bus_channel() {
+        let state = AppState::detached();
+        install_live_event_bus_with_config(
+            &state,
+            LiveFeedBusConfig {
+                kind: LiveFeedBusKind::PostgresNotify,
+                redis_url: None,
+                channel: "custom_live_feed".to_owned(),
+            },
+        )
+        .await
+        .expect("custom live-event bus should install");
+
+        assert_eq!(
+            live_event_notify_channel_for_state(&state),
+            "autumn_live_event_custom_live_feed"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn relay_health_tracks_publish_and_wake_sources() {
         let success_state = AppState::detached().with_profile("relay-metrics-success");
@@ -1595,10 +1679,10 @@ mod tests {
         .expect("runner pool should exist");
 
         let web_state = AppState::detached()
-            .with_profile("split-web")
+            .with_profile("redis-web")
             .with_pool(web_pool);
         let runner_state = AppState::detached()
-            .with_profile("split-runner")
+            .with_profile("redis-worker")
             .with_pool(runner_pool);
 
         (container, database_url, web_state, runner_state)

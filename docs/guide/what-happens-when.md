@@ -27,11 +27,22 @@ async fn list(mut db: Db) -> AutumnResult<Json<Vec<Todo>>> {
    error, constraint violation, etc.)
 2. The `?` operator hits the blanket `From<E: Error> for AutumnError` impl,
    which wraps it as a 500
-3. `AutumnError` implements `IntoResponse`, producing:
+3. `AutumnError` implements `IntoResponse`, producing Problem Details JSON:
    ```json
-   { "error": { "status": 500, "message": "connection reset" } }
+   {
+     "type": "https://autumn.dev/problems/internal-server-error",
+     "title": "Internal Server Error",
+     "status": 500,
+     "detail": "Internal server error",
+     "instance": "/todos",
+     "code": "autumn.internal_server_error",
+     "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+     "errors": []
+   }
    ```
-4. The error message comes from the inner error's `Display` impl
+4. In production, 5xx `detail` is client-safe; use `request_id` to find the
+   full operator-facing cause in logs. In development, `detail` includes the
+   original diagnostic message.
 
 ### Refining the status code
 
@@ -79,9 +90,9 @@ Not an error. Autumn uses its compiled-in defaults:
 | `server.host` | 127.0.0.1         |
 | `log.level`   | info              |
 | `log.format`  | Auto              |
-| `database.url`| (none -- no DB)   |
+| `database.primary_url` / `database.url` | (none -- no DB) |
 
-### No `[database]` section (or no `url`)
+### No `[database]` section (or no primary URL)
 
 Autumn starts without a database pool. Handlers that inject `Db` return 503:
 
@@ -90,7 +101,16 @@ Autumn starts without a database pool. Handlers that inject `Db` return 503:
 ```
 
 ```json
-{ "error": { "status": 503, "message": "Database not configured" } }
+{
+  "type": "https://autumn.dev/problems/service-unavailable",
+  "title": "Service Unavailable",
+  "status": 503,
+  "detail": "Database not configured",
+  "instance": "/todos",
+  "code": "autumn.service_unavailable",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": []
+}
 ```
 
 This is intentional -- static sites and API gateways don't need a database.
@@ -112,12 +132,12 @@ matching) and falls back to defaults:
 WARN autumn: Unknown profile "dvv", did you mean "dev"?
 ```
 
-### Invalid `database.url` scheme
+### Invalid database URL scheme
 
 Configuration validation catches it immediately:
 
 ```
-Failed to load configuration: database.url must start with postgres:// or postgresql://
+Failed to load configuration: database.primary_url must start with postgres:// or postgresql://
 ```
 
 ### Environment variable overrides
@@ -222,14 +242,17 @@ If validation fails, your handler never runs. The response is:
 
 ```json
 {
-  "error": {
-    "status": 422,
-    "message": "Validation failed",
-    "details": {
-      "title": ["length must be between 1 and 200"],
-      "body": ["length must be at least 10"]
-    }
-  }
+  "type": "https://autumn.dev/problems/validation-failed",
+  "title": "Validation Failed",
+  "status": 422,
+  "detail": "Validation failed",
+  "instance": "/posts",
+  "code": "autumn.validation_failed",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": [
+    { "field": "title", "messages": ["length must be between 1 and 200"] },
+    { "field": "body", "messages": ["length must be at least 10"] }
+  ]
 }
 ```
 
@@ -336,7 +359,16 @@ first handler that uses `Db` will fail with 503 when it tries to acquire a
 connection:
 
 ```json
-{ "error": { "status": 503, "message": "connection refused" } }
+{
+  "type": "https://autumn.dev/problems/service-unavailable",
+  "title": "Service Unavailable",
+  "status": 503,
+  "detail": "connection refused",
+  "instance": "/todos",
+  "code": "autumn.service_unavailable",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": []
+}
 ```
 
 The health endpoint at `/health` will still respond (it doesn't require a DB
@@ -347,11 +379,20 @@ health check will report the database as unhealthy.
 
 ## What Happens When You Use `Db` Without a Database?
 
-If no `database.url` is configured, the pool is `None`. The `Db` extractor
-returns 503 immediately:
+If neither `database.primary_url` nor the legacy `database.url` is configured,
+the primary/write pool is `None`. The `Db` extractor returns 503 immediately:
 
 ```json
-{ "error": { "status": 503, "message": "Database not configured" } }
+{
+  "type": "https://autumn.dev/problems/service-unavailable",
+  "title": "Service Unavailable",
+  "status": 503,
+  "detail": "Database not configured",
+  "instance": "/todos",
+  "code": "autumn.service_unavailable",
+  "request_id": "018f4f30-6b7c-4b4c-8dc0-70a2c8d7f97d",
+  "errors": []
+}
 ```
 
 Your handler code never executes. This means you can safely have database

@@ -5,9 +5,9 @@
 //! [`AppBuilder::run`](crate::app::AppBuilder::run) and stored in
 //! [`crate::state::AppState`].
 //!
-//! When no `database.url` is configured, [`create_pool`] returns `Ok(None)`
-//! and the application runs without a database -- useful for static-site or
-//! API-gateway use cases.
+//! When no `database.primary_url` or legacy `database.url` is configured,
+//! [`create_pool`] returns `Ok(None)` and the application runs without a
+//! database -- useful for static-site or API-gateway use cases.
 //!
 //! # The [`Db`] extractor
 //!
@@ -41,6 +41,18 @@ use crate::error::AutumnError;
 pub trait DbState {
     /// Returns the database connection pool, if configured.
     fn pool(&self) -> Option<&Pool<AsyncPgConnection>>;
+
+    /// Returns the read/replica connection pool, if configured.
+    fn replica_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        None
+    }
+
+    /// Returns the pool used for read-only work.
+    ///
+    /// Defaults to the replica role when present, otherwise the primary role.
+    fn read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        self.replica_pool().or_else(|| self.pool())
+    }
 }
 
 /// Error type for pool creation failures.
@@ -49,36 +61,145 @@ pub trait DbState {
 /// the pool cannot be constructed (e.g., invalid max-size configuration).
 pub type PoolError = diesel_async::pooled_connection::deadpool::BuildError;
 
+/// Primary plus optional read-replica database pools.
+#[derive(Clone)]
+pub struct DatabaseTopology {
+    primary: Pool<AsyncPgConnection>,
+    replica: Option<Pool<AsyncPgConnection>>,
+}
+
+impl DatabaseTopology {
+    /// Build a topology from explicit primary and optional replica pools.
+    ///
+    /// This is useful for custom [`DatabasePoolProvider`] implementations that
+    /// need to create or decorate both roles themselves.
+    #[must_use]
+    pub const fn from_pools(
+        primary: Pool<AsyncPgConnection>,
+        replica: Option<Pool<AsyncPgConnection>>,
+    ) -> Self {
+        Self { primary, replica }
+    }
+
+    /// Build a topology from a primary pool only.
+    #[must_use]
+    pub const fn primary_only(primary: Pool<AsyncPgConnection>) -> Self {
+        Self {
+            primary,
+            replica: None,
+        }
+    }
+
+    /// Primary/write role pool.
+    #[must_use]
+    pub const fn primary(&self) -> &Pool<AsyncPgConnection> {
+        &self.primary
+    }
+
+    /// Optional read/replica role pool.
+    #[must_use]
+    pub const fn replica(&self) -> Option<&Pool<AsyncPgConnection>> {
+        self.replica.as_ref()
+    }
+
+    /// Pool used for read-only work.
+    #[must_use]
+    pub fn read(&self) -> &Pool<AsyncPgConnection> {
+        self.replica.as_ref().unwrap_or(&self.primary)
+    }
+}
+
+fn build_pool(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+) -> Result<Pool<AsyncPgConnection>, PoolError> {
+    let timeout = Duration::from_secs(connect_timeout_secs);
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
+    Pool::builder(manager)
+        .max_size(pool_size.max(1))
+        .wait_timeout(Some(timeout))
+        .create_timeout(Some(timeout))
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()
+}
+
 /// Create a connection pool from the database configuration.
 ///
-/// Returns `Ok(None)` if no database URL is configured (`database.url` is
-/// absent or `null` in `autumn.toml`).
+/// Returns `Ok(None)` if no primary database URL is configured
+/// (`database.primary_url` and the legacy `database.url` are absent or `null`
+/// in `autumn.toml`).
 ///
 /// # Errors
 ///
 /// Returns [`PoolError`] if the pool cannot be built (e.g., invalid
 /// max-size configuration).
 pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
-    let Some(url) = &config.url else {
+    let Some(url) = config.effective_primary_url() else {
         return Ok(None);
     };
 
-    let timeout = Duration::from_secs(config.connect_timeout_secs);
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-    let pool = Pool::builder(manager)
-        .max_size(config.pool_size.max(1))
-        .wait_timeout(Some(timeout))
-        .create_timeout(Some(timeout))
-        .runtime(deadpool::Runtime::Tokio1)
-        .build()?;
+    let pool = build_pool(
+        url,
+        config.effective_primary_pool_size(),
+        config.connect_timeout_secs,
+    )?;
 
     Ok(Some(pool))
+}
+
+/// Create primary and optional replica pools from the database configuration.
+///
+/// Returns `Ok(None)` when neither `database.primary_url` nor the legacy
+/// `database.url` compatibility field is configured.
+///
+/// # Errors
+///
+/// Returns [`PoolError`] if either configured role cannot be built.
+pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopology>, PoolError> {
+    let Some(primary_url) = config.effective_primary_url() else {
+        return Ok(None);
+    };
+
+    let primary = build_pool(
+        primary_url,
+        config.effective_primary_pool_size(),
+        config.connect_timeout_secs,
+    )?;
+    let replica = config
+        .replica_url
+        .as_deref()
+        .map(|url| {
+            build_pool(
+                url,
+                config.effective_replica_pool_size(),
+                config.connect_timeout_secs,
+            )
+        })
+        .transpose()?;
+
+    Ok(Some(DatabaseTopology { primary, replica }))
 }
 
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
 type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncPgConnection>;
+
+struct TxDepthGuard<'a> {
+    depth: &'a mut usize,
+    poisoned: &'a mut bool,
+    disarmed: bool,
+}
+
+impl Drop for TxDepthGuard<'_> {
+    fn drop(&mut self) {
+        *self.depth -= 1;
+        if !self.disarmed {
+            *self.poisoned = true;
+        }
+    }
+}
 
 /// Async database connection extractor.
 ///
@@ -91,7 +212,8 @@ type PooledConnection = diesel_async::pooled_connection::deadpool::Object<AsyncP
 /// `diesel_async::AsyncPgConnection`, so you can use it directly with
 /// Diesel query methods.
 ///
-/// If no database is configured (i.e., `database.url` is absent),
+/// If no database is configured (i.e., `database.primary_url` and legacy
+/// `database.url` are absent),
 /// requests that use `Db` will receive a `503 Service Unavailable`
 /// response.
 ///
@@ -115,6 +237,8 @@ pub struct Db {
     /// per-query spans as children with
     /// [`tracing::Instrument::instrument`].
     span: tracing::Span,
+    tx_depth: usize,
+    tx_poisoned: bool,
 }
 
 impl Db {
@@ -140,17 +264,78 @@ impl Db {
     pub const fn span(&self) -> &tracing::Span {
         &self.span
     }
+
+    /// Run an async closure inside a database transaction.
+    ///
+    /// Commits when the closure returns `Ok(_)`, rolls back when it returns
+    /// `Err(_)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AutumnError`] when:
+    ///
+    /// - the underlying transaction returns an error,
+    /// - the closure returns an error that converts into `AutumnError`,
+    /// - this `Db` is already inside a transaction,
+    /// - this `Db` has been poisoned by a previously cancelled/dropped
+    ///   transaction future.
+    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
+    where
+        T: Send + 'a,
+        E: From<diesel::result::Error> + Send + Sync + 'a,
+        crate::error::AutumnError: From<E>,
+        F: for<'r> FnOnce(
+                &'r mut PooledConnection,
+            ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
+            + Send
+            + 'a,
+    {
+        use diesel_async::AsyncConnection as _;
+
+        if self.tx_poisoned {
+            return Err(crate::error::AutumnError::service_unavailable_msg(
+                "Database connection is in an invalid transaction state",
+            ));
+        }
+        if self.tx_depth > 0 {
+            return Err(crate::error::AutumnError::bad_request_msg(
+                "Nested Db::tx calls are not supported",
+            ));
+        }
+        self.tx_depth += 1;
+        let mut guard = TxDepthGuard {
+            depth: &mut self.tx_depth,
+            poisoned: &mut self.tx_poisoned,
+            disarmed: false,
+        };
+
+        let result = self
+            .conn
+            .transaction::<T, E, _>(f)
+            .await
+            .map_err(Into::into);
+        guard.disarmed = true;
+        result
+    }
 }
 
 impl std::ops::Deref for Db {
     type Target = AsyncPgConnection;
     fn deref(&self) -> &Self::Target {
+        assert!(
+            !self.tx_poisoned,
+            "Db connection is poisoned due to a cancelled/dropped transaction"
+        );
         &self.conn
     }
 }
 
 impl std::ops::DerefMut for Db {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        assert!(
+            !self.tx_poisoned,
+            "Db connection is poisoned due to a cancelled/dropped transaction"
+        );
         &mut self.conn
     }
 }
@@ -189,7 +374,12 @@ where
         .instrument(span.clone())
         .await?;
 
-        Ok(Self { conn, span })
+        Ok(Self {
+            conn,
+            span,
+            tx_depth: 0,
+            tx_poisoned: false,
+        })
     }
 }
 
@@ -209,6 +399,12 @@ where
 /// fixed at `Pool<AsyncPgConnection>` for now. Swapping to a different backend
 /// (e.g. `MySQL`, `SQLite`) would require generic `Pool<C>` propagation through
 /// `Db` / `DbState` / `AppState` and is intentionally out of scope.
+///
+/// Providers that only implement [`DatabasePoolProvider::create_pool`] still
+/// participate in primary/replica topology: the default
+/// [`DatabasePoolProvider::create_topology`] uses the custom primary pool and
+/// builds the configured replica role with Autumn's deadpool factory. Override
+/// `create_topology` when both roles need custom construction.
 ///
 /// # Example
 ///
@@ -240,6 +436,39 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
         &self,
         config: &DatabaseConfig,
     ) -> impl std::future::Future<Output = Result<Option<Pool<AsyncPgConnection>>, PoolError>> + Send;
+
+    /// Create primary and optional replica pools from the resolved
+    /// [`DatabaseConfig`].
+    ///
+    /// The default implementation preserves the provider's custom primary pool
+    /// and builds a replica pool when `database.replica_url` is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] if either configured role cannot be built.
+    fn create_topology(
+        &self,
+        config: &DatabaseConfig,
+    ) -> impl std::future::Future<Output = Result<Option<DatabaseTopology>, PoolError>> + Send {
+        async move {
+            let Some(primary) = self.create_pool(config).await? else {
+                return Ok(None);
+            };
+            let replica = config
+                .replica_url
+                .as_deref()
+                .map(|url| {
+                    build_pool(
+                        url,
+                        config.effective_replica_pool_size(),
+                        config.connect_timeout_secs,
+                    )
+                })
+                .transpose()?;
+
+            Ok(Some(DatabaseTopology::from_pools(primary, replica)))
+        }
+    }
 }
 
 /// Default [`DatabasePoolProvider`] — the `deadpool + diesel-async` factory.
@@ -388,6 +617,45 @@ mod tests {
     // ── Db extractor tests ───────────────────────────────────────
 
     #[test]
+    fn database_topology_builds_primary_and_replica_pools() {
+        let config = DatabaseConfig {
+            primary_url: Some("postgres://localhost/primary".into()),
+            replica_url: Some("postgres://localhost/replica".into()),
+            primary_pool_size: Some(6),
+            replica_pool_size: Some(2),
+            ..Default::default()
+        };
+
+        let topology = create_topology(&config)
+            .expect("topology should build")
+            .expect("topology should be configured");
+
+        assert_eq!(topology.primary().status().max_size, 6);
+        assert_eq!(
+            topology.replica().expect("replica pool").status().max_size,
+            2
+        );
+        assert_eq!(topology.read().status().max_size, 2);
+    }
+
+    #[test]
+    fn database_topology_single_url_builds_only_primary_pool() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/single".into()),
+            pool_size: 5,
+            ..Default::default()
+        };
+
+        let topology = create_topology(&config)
+            .expect("topology should build")
+            .expect("topology should be configured");
+
+        assert_eq!(topology.primary().status().max_size, 5);
+        assert!(topology.replica().is_none());
+        assert_eq!(topology.read().status().max_size, 5);
+    }
+
+    #[test]
     fn config_runtime_drift_pool_applies_connect_timeout_to_wait_and_create() {
         let config = DatabaseConfig {
             url: Some("postgres://localhost/test".into()),
@@ -403,9 +671,41 @@ mod tests {
         assert_eq!(timeouts.create, Some(Duration::from_secs(7)));
     }
 
+    #[derive(Clone)]
+    struct TestDbState;
+
+    impl DbState for TestDbState {
+        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+            None
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestReadState {
+        primary: Pool<AsyncPgConnection>,
+    }
+
+    impl DbState for TestReadState {
+        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+            Some(&self.primary)
+        }
+    }
+
+    #[test]
+    fn database_topology_read_pool_falls_back_to_primary() {
+        let config = DatabaseConfig {
+            url: Some("postgres://localhost/read-fallback".into()),
+            pool_size: 3,
+            ..Default::default()
+        };
+        let primary = create_pool(&config).unwrap().unwrap();
+        let state = TestReadState { primary };
+
+        assert_eq!(state.read_pool().expect("read pool").status().max_size, 3);
+    }
+
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -416,24 +716,9 @@ mod tests {
             "ok"
         }
 
-        let app = Router::new().route("/", get(handler)).with_state(AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let app = Router::new()
+            .route("/", get(handler))
+            .with_state(TestDbState);
 
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())

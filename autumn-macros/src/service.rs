@@ -27,16 +27,16 @@ fn parse_deps(trait_def: &ItemTrait) -> syn::Result<Vec<DepField>> {
     let mut deps_method = None;
 
     for item in &trait_def.items {
-        if let TraitItem::Fn(method) = item {
-            if method.sig.ident == "deps" {
-                if deps_method.is_some() {
-                    return Err(syn::Error::new_spanned(
-                        &method.sig.ident,
-                        "duplicate `deps` declaration",
-                    ));
-                }
-                deps_method = Some(method);
+        if let TraitItem::Fn(method) = item
+            && method.sig.ident == "deps"
+        {
+            if deps_method.is_some() {
+                return Err(syn::Error::new_spanned(
+                    &method.sig.ident,
+                    "duplicate `deps` declaration",
+                ));
             }
+            deps_method = Some(method);
         }
     }
 

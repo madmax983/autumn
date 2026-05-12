@@ -42,7 +42,7 @@
 //! assert_eq!(err.status(), StatusCode::NOT_FOUND);
 //! ```
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 
@@ -61,18 +61,36 @@ impl std::fmt::Display for StringError {
 
 impl std::error::Error for StringError {}
 
-/// Typed JSON body for error responses -- avoids dynamic `serde_json::Value`.
-#[derive(Serialize)]
-struct ErrorBody {
-    error: ErrorInner,
+/// JSON body for RFC 7807 Problem Details responses.
+#[derive(Clone, Debug, Serialize)]
+pub struct ProblemDetails {
+    /// Problem type URI. Autumn uses stable `https://autumn.dev/problems/...`
+    /// URIs for framework-generated errors.
+    #[serde(rename = "type")]
+    pub type_uri: String,
+    /// Short human-readable title for the status/problem class.
+    pub title: String,
+    /// HTTP status code.
+    pub status: u16,
+    /// Client-safe human-readable explanation.
+    pub detail: String,
+    /// Request path or URI reference for the specific occurrence.
+    pub instance: Option<String>,
+    /// Stable machine-readable Autumn error code.
+    pub code: String,
+    /// Request ID for log correlation, when the request pipeline assigned one.
+    pub request_id: Option<String>,
+    /// Field-level validation failures. Empty for non-validation errors.
+    pub errors: Vec<ProblemFieldError>,
 }
 
-#[derive(Serialize)]
-struct ErrorInner {
-    status: u16,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<std::collections::HashMap<String, Vec<String>>>,
+/// Field-level validation detail in the Problem Details `errors` extension.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProblemFieldError {
+    /// Field name as seen by the request payload or form.
+    pub field: String,
+    /// Stable list of validation messages for this field.
+    pub messages: Vec<String>,
 }
 
 /// Framework error type wrapping any error with an HTTP status code.
@@ -118,6 +136,7 @@ pub struct AutumnError {
     inner: Box<dyn std::error::Error + Send + Sync>,
     status: StatusCode,
     details: Option<std::collections::HashMap<String, Vec<String>>>,
+    problem_type: Option<&'static str>,
 }
 
 /// Convenience alias -- the standard return type for Autumn handlers.
@@ -146,6 +165,7 @@ where
             inner: Box::new(err),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
+            problem_type: None,
         }
     }
 }
@@ -185,6 +205,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -204,6 +225,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::NOT_FOUND,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -223,6 +245,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::BAD_REQUEST,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -245,6 +268,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -264,6 +288,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::SERVICE_UNAVAILABLE,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -283,6 +308,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::UNAUTHORIZED,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -302,6 +328,7 @@ impl AutumnError {
             inner: Box::new(err),
             status: StatusCode::FORBIDDEN,
             details: None,
+            problem_type: None,
         }
     }
 
@@ -332,6 +359,7 @@ impl AutumnError {
             inner: Box::new(StringError("Validation failed".into())),
             status: StatusCode::UNPROCESSABLE_ENTITY,
             details: Some(details),
+            problem_type: None,
         }
     }
 
@@ -443,6 +471,44 @@ impl AutumnError {
         Self::service_unavailable(StringError(msg.into()))
     }
 
+    /// Create a `409 Conflict` error.
+    ///
+    /// Use this for optimistic-lock conflicts surfaced by repository `update`
+    /// calls when the client's expected version is stale.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::conflict(std::io::Error::other("stale version"));
+    /// assert_eq!(err.status(), StatusCode::CONFLICT);
+    /// ```
+    pub fn conflict(err: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Box::new(err),
+            status: StatusCode::CONFLICT,
+            details: None,
+            problem_type: Some("https://autumn.dev/problems/conflict"),
+        }
+    }
+
+    /// Create a `409 Conflict` error from a plain string message.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use autumn_web::error::AutumnError;
+    /// use http::StatusCode;
+    ///
+    /// let err = AutumnError::conflict_msg("Concurrent edit: please reload and retry");
+    /// assert_eq!(err.status(), StatusCode::CONFLICT);
+    /// ```
+    pub fn conflict_msg(msg: impl Into<String>) -> Self {
+        Self::conflict(StringError(msg.into()))
+    }
+
     /// Returns the HTTP status code associated with this error.
     ///
     /// # Examples
@@ -458,6 +524,21 @@ impl AutumnError {
     pub const fn status(&self) -> StatusCode {
         self.status
     }
+
+    /// Return the wrapped error's source chain as displayable messages.
+    ///
+    /// The top-level [`AutumnError`] display already prints the wrapped error
+    /// message, so this list starts at that wrapped error's first source.
+    #[must_use]
+    pub fn source_chain(&self) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut source = self.inner.source();
+        while let Some(error) = source {
+            chain.push(error.to_string());
+            source = error.source();
+        }
+        chain
+    }
 }
 
 impl std::fmt::Display for AutumnError {
@@ -472,7 +553,169 @@ impl std::fmt::Debug for AutumnError {
             .field("status", &self.status)
             .field("inner", &self.inner)
             .field("details", &self.details)
+            .field("problem_type", &self.problem_type)
             .finish()
+    }
+}
+
+impl ProblemDetails {
+    /// Build a Problem Details payload from framework error metadata.
+    #[must_use]
+    pub fn new(
+        status: StatusCode,
+        detail: impl Into<String>,
+        details: Option<&std::collections::HashMap<String, Vec<String>>>,
+    ) -> Self {
+        problem_details(status, detail.into(), details, None, None, None, true)
+    }
+}
+
+/// Build the canonical Problem Details payload.
+#[must_use]
+pub(crate) fn problem_details(
+    status: StatusCode,
+    detail: String,
+    details: Option<&std::collections::HashMap<String, Vec<String>>>,
+    explicit_type: Option<&'static str>,
+    request_id: Option<String>,
+    instance: Option<String>,
+    expose_internal_detail: bool,
+) -> ProblemDetails {
+    let has_validation_errors = details.is_some_and(|map| !map.is_empty());
+    let safe_detail = if status.is_server_error() && !expose_internal_detail {
+        server_error_detail(status)
+    } else {
+        detail
+    };
+
+    ProblemDetails {
+        type_uri: explicit_type
+            .unwrap_or_else(|| problem_type_for(status, has_validation_errors))
+            .to_owned(),
+        title: problem_title_for(status, has_validation_errors).to_owned(),
+        status: status.as_u16(),
+        detail: safe_detail,
+        instance,
+        code: problem_code_for(status, has_validation_errors).to_owned(),
+        request_id,
+        errors: validation_errors(details),
+    }
+}
+
+/// Serialize a Problem Details payload for middleware that cannot return
+/// `axum::Json` directly because its response body type is generic.
+#[must_use]
+pub(crate) fn problem_details_json_string(
+    status: StatusCode,
+    detail: impl Into<String>,
+    details: Option<&std::collections::HashMap<String, Vec<String>>>,
+    explicit_type: Option<&'static str>,
+    request_id: Option<String>,
+    instance: Option<String>,
+    expose_internal_detail: bool,
+) -> String {
+    let problem = problem_details(
+        status,
+        detail.into(),
+        details,
+        explicit_type,
+        request_id,
+        instance,
+        expose_internal_detail,
+    );
+    problem_details_to_json_string(&problem)
+}
+
+/// Serialize an already-built Problem Details payload.
+#[must_use]
+pub(crate) fn problem_details_to_json_string(problem: &ProblemDetails) -> String {
+    serde_json::to_string(&problem).unwrap_or_else(|_| {
+        r#"{"type":"https://autumn.dev/problems/internal-server-error","title":"Internal Server Error","status":500,"detail":"Internal server error","instance":null,"code":"autumn.internal_server_error","request_id":null,"errors":[]}"#.to_owned()
+    })
+}
+
+fn validation_errors(
+    details: Option<&std::collections::HashMap<String, Vec<String>>>,
+) -> Vec<ProblemFieldError> {
+    let mut errors: Vec<_> = details
+        .into_iter()
+        .flat_map(std::collections::HashMap::iter)
+        .map(|(field, messages)| ProblemFieldError {
+            field: field.clone(),
+            messages: messages.clone(),
+        })
+        .collect();
+    errors.sort_by(|left, right| left.field.cmp(&right.field));
+    errors
+}
+
+const fn problem_type_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+    if has_validation_errors {
+        return "https://autumn.dev/problems/validation-failed";
+    }
+
+    match status {
+        StatusCode::BAD_REQUEST => "https://autumn.dev/problems/bad-request",
+        StatusCode::UNAUTHORIZED => "https://autumn.dev/problems/unauthorized",
+        StatusCode::FORBIDDEN => "https://autumn.dev/problems/forbidden",
+        StatusCode::NOT_FOUND => "https://autumn.dev/problems/not-found",
+        StatusCode::CONFLICT => "https://autumn.dev/problems/conflict",
+        StatusCode::PAYLOAD_TOO_LARGE => "https://autumn.dev/problems/payload-too-large",
+        StatusCode::UNPROCESSABLE_ENTITY => "https://autumn.dev/problems/unprocessable-entity",
+        StatusCode::INTERNAL_SERVER_ERROR => "https://autumn.dev/problems/internal-server-error",
+        StatusCode::NOT_IMPLEMENTED => "https://autumn.dev/problems/not-implemented",
+        StatusCode::SERVICE_UNAVAILABLE => "https://autumn.dev/problems/service-unavailable",
+        _ => "about:blank",
+    }
+}
+
+fn problem_title_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+    if has_validation_errors {
+        return "Validation Failed";
+    }
+
+    match status {
+        StatusCode::BAD_REQUEST => "Bad Request",
+        StatusCode::UNAUTHORIZED => "Unauthorized",
+        StatusCode::FORBIDDEN => "Forbidden",
+        StatusCode::NOT_FOUND => "Not Found",
+        StatusCode::CONFLICT => "Conflict",
+        StatusCode::PAYLOAD_TOO_LARGE => "Payload Too Large",
+        StatusCode::UNPROCESSABLE_ENTITY => "Unprocessable Entity",
+        StatusCode::INTERNAL_SERVER_ERROR => "Internal Server Error",
+        StatusCode::NOT_IMPLEMENTED => "Not Implemented",
+        StatusCode::SERVICE_UNAVAILABLE => "Service Unavailable",
+        _ => status.canonical_reason().unwrap_or("Error"),
+    }
+}
+
+fn problem_code_for(status: StatusCode, has_validation_errors: bool) -> &'static str {
+    if has_validation_errors {
+        return "autumn.validation_failed";
+    }
+
+    match status {
+        StatusCode::BAD_REQUEST => "autumn.bad_request",
+        StatusCode::UNAUTHORIZED => "autumn.unauthorized",
+        StatusCode::FORBIDDEN => "autumn.forbidden",
+        StatusCode::NOT_FOUND => "autumn.not_found",
+        StatusCode::CONFLICT => "autumn.conflict",
+        StatusCode::PAYLOAD_TOO_LARGE => "autumn.payload_too_large",
+        StatusCode::UNPROCESSABLE_ENTITY => "autumn.unprocessable_entity",
+        StatusCode::INTERNAL_SERVER_ERROR => "autumn.internal_server_error",
+        StatusCode::NOT_IMPLEMENTED => "autumn.not_implemented",
+        StatusCode::SERVICE_UNAVAILABLE => "autumn.service_unavailable",
+        _ if status.is_client_error() => "autumn.client_error",
+        _ if status.is_server_error() => "autumn.server_error",
+        _ => "autumn.error",
+    }
+}
+
+fn server_error_detail(status: StatusCode) -> String {
+    match status {
+        StatusCode::SERVICE_UNAVAILABLE => "Service unavailable".to_owned(),
+        StatusCode::NOT_IMPLEMENTED => "Not implemented".to_owned(),
+        _ => "Internal server error".to_owned(),
     }
 }
 
@@ -480,24 +723,38 @@ impl IntoResponse for AutumnError {
     fn into_response(self) -> Response {
         let status = self.status;
         let message = self.inner.to_string();
+        let details = self.details.clone();
+        let problem_type = self.problem_type;
 
         // Stash error metadata for exception filters to inspect without
         // parsing the response body.
         let error_info = crate::middleware::AutumnErrorInfo {
             status,
             message: message.clone(),
-            details: self.details.clone(),
+            details: details.clone(),
+            problem_type,
         };
 
-        let body = ErrorBody {
-            error: ErrorInner {
-                status: status.as_u16(),
-                message,
-                details: self.details,
-            },
-        };
-
+        let body = problem_details(
+            status,
+            message,
+            details.as_ref(),
+            problem_type,
+            None,
+            None,
+            true,
+        );
         let mut response = (status, axum::Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+        if status == StatusCode::CONFLICT {
+            response.headers_mut().insert(
+                "HX-Trigger",
+                HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
+            );
+        }
         response.extensions_mut().insert(error_info);
         response
     }
@@ -518,6 +775,24 @@ mod tests {
     }
 
     impl std::error::Error for TestError {}
+
+    #[derive(Debug)]
+    struct WrappedError {
+        message: String,
+        source: TestError,
+    }
+
+    impl std::fmt::Display for WrappedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for WrappedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.source)
+        }
+    }
 
     #[test]
     fn blanket_from_defaults_to_500() {
@@ -640,6 +915,19 @@ mod tests {
     }
 
     #[test]
+    fn source_chain_lists_inner_sources() {
+        let err = AutumnError::internal_server_error(WrappedError {
+            message: "failed to backfill".to_string(),
+            source: TestError("database connection dropped".to_string()),
+        });
+
+        assert_eq!(
+            err.source_chain(),
+            vec!["database connection dropped".to_string()]
+        );
+    }
+
+    #[test]
     fn into_response_has_correct_status() {
         let err = AutumnError::not_found(TestError("not found".into()));
         let response = err.into_response();
@@ -654,8 +942,9 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
 
-        assert_eq!(json["error"]["status"], 404);
-        assert_eq!(json["error"]["message"], "not found");
+        assert_eq!(json["status"], 404);
+        assert_eq!(json["detail"], "not found");
+        assert_eq!(json["code"], "autumn.not_found");
         Ok(())
     }
 
@@ -675,8 +964,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
-        assert_eq!(json["error"]["status"], 422);
-        assert_eq!(json["error"]["message"], "title required");
+        assert_eq!(json["status"], 422);
+        assert_eq!(json["detail"], "title required");
+        assert_eq!(json["code"], "autumn.unprocessable_entity");
         Ok(())
     }
 
@@ -688,8 +978,51 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
-        assert_eq!(json["error"]["status"], 503);
-        assert_eq!(json["error"]["message"], "db down");
+        assert_eq!(json["status"], 503);
+        assert_eq!(json["detail"], "db down");
+        assert_eq!(json["code"], "autumn.service_unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn conflict_is_409() {
+        let err = AutumnError::conflict(TestError("stale version".into()));
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn conflict_msg_is_409() {
+        let err = AutumnError::conflict_msg("please reload and retry");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(err.to_string(), "please reload and retry");
+    }
+
+    #[tokio::test]
+    async fn conflict_response_is_409_json() -> Result<(), axum::Error> {
+        let err = AutumnError::conflict_msg("version mismatch");
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["status"], 409);
+        assert_eq!(json["detail"], "version mismatch");
+        assert_eq!(json["type"], "https://autumn.dev/problems/conflict");
+        assert_eq!(json["title"], "Conflict");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflict_response_has_hx_trigger_header() -> Result<(), axum::Error> {
+        let err = AutumnError::conflict_msg("version mismatch");
+        let response = err.into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let hx_trigger = response
+            .headers()
+            .get("HX-Trigger")
+            .expect("HX-Trigger header present");
+        assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
 }

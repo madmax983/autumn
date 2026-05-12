@@ -74,6 +74,7 @@ impl Parse for StaticGetAttrs {
 ///    (identical to what `#[get]` produces).
 /// 3. `__autumn_static_meta_{name}()` returning
 ///    `::autumn_web::static_gen::StaticRouteMeta`.
+#[allow(clippy::too_many_lines)]
 pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs: StaticGetAttrs = match syn::parse2(attr) {
         Ok(a) => a,
@@ -176,8 +177,12 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     response: ::core::option::Option::None,
                     success_status: 200,
                     hidden: false,
+                    query_schema: ::core::option::Option::None,
+                    secured: false,
+                    required_roles: &[],
                     register_schemas: ::core::option::Option::None,
                 },
+                repository: ::core::option::Option::None,
             }
         }
 

@@ -4,6 +4,7 @@
 [![codecov](https://codecov.io/gh/madmax983/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/madmax983/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/madmax983/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
 
@@ -18,18 +19,24 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Pre-rendering pages to static HTML** - `#[static_get]` + `static_routes![]` with `autumn build` pre-rendering to `dist/`
 - **Application builder** - `.routes()`, `.tasks()`, `.static_routes()`, `.scoped()`, `.merge()`, and `.nest()`
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
-- **Database ergonomics** - async Postgres pool, `Db` extractor, `#[model]`, `#[repository]`, hooks, and embedded migrations
+- **Database ergonomics** - async Postgres primary/replica pools, `Db` extractor for the primary/write role, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
-- **Background work** - `#[scheduled]` tasks and runtime task visibility at `/actuator/tasks`
+- **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
+- **Companion workflows** - [Autumn Harvest](docs/autumn-workflow-architecture.md) is the separate durable workflow engine for multi-step orchestration when `#[scheduled]` or `#[job]` is not enough
+- **Transactional email** - optional `mail` feature with Maud templates, log/file/SMTP transports, and a `Mailer` extractor
 - **Security primitives** - session cookies, auth extractor, security headers, CSRF, and `#[secured]`
-- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, and `autumn migrate`
+- **File storage (optional)** - pluggable `BlobStore` trait with built-in `Local` and S3-compatible backends, HMAC-signed URLs, and `MultipartField::save_to_blob_store` (see [storage guide](docs/guide/storage.md))
+- **CLI workflow** - `autumn new`, `autumn setup`, `autumn dev`, `autumn build`, `autumn migrate`, and `autumn task`
 
 ## Quickstart
 
 ```bash
-# Install the CLI from this workspace
-cargo install --path autumn-cli
+# Install the published CLI
+cargo install autumn-cli --version 0.4.0
+
+# Local development only, from an Autumn checkout:
+# cargo install --path autumn-cli
 
 # Create a new project
 autumn new my-app
@@ -37,6 +44,9 @@ cd my-app
 
 # Optional: download Tailwind CSS for styled builds
 autumn setup
+
+# Optional: scaffold a CRUD resource (see docs/guide/generators.md)
+# autumn generate scaffold Post title:String body:Text published:bool
 
 # Development server with file watching
 autumn dev
@@ -78,16 +88,51 @@ If you add `#[static_get]` routes, `autumn build` pre-renders them into
 Autumn still distinguishes between "works on your laptop" and "safe to run in a
 multi-replica deployment":
 
-- Local-safe defaults: in-memory sessions, pretty logs in `dev`, process-local `#[scheduled]` tasks, and single-binary startup.
-- Production-safe defaults: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, container scaffolding from `autumn new`, and explicit migration jobs before web replicas roll.
+- Local-safe defaults: in-memory sessions, pretty logs in `dev`, `scheduler.backend = "in_process"` for `#[scheduled]`, and single-binary startup.
+- Production-safe options: `/live`, `/ready`, `/startup` probes, OTLP telemetry config, Redis-backed sessions, Redis-backed channels/jobs, Postgres-coordinated scheduled tasks, container scaffolding from `autumn new`, and explicit migration jobs before web replicas roll.
 
 If you are deploying beyond a single process, read the
 [Cloud-Native Guide](docs/guide/cloud-native.md) before treating the defaults as
 done.
 
+## Database Topologies
+
+Autumn supports three explicit database shapes:
+
+- **Single primary**: set `database.url` or `database.primary_url`. Writes,
+  transactions, advisory locks, and `autumn migrate` use that primary role.
+- **Primary plus read replica**: set `database.primary_url` and
+  `database.replica_url`, with optional `primary_pool_size`,
+  `replica_pool_size`, and `replica_fallback = "fail_readiness"` or
+  `"primary"`.
+- **One-shot migrator path**: run `autumn migrate` once against the primary
+  before rolling web replicas. Production web replicas should keep
+  `auto_migrate_in_production = false`.
+
+`database.url` and `DATABASE_URL` remain valid for existing single-URL apps.
+For new production config, prefer `AUTUMN_DATABASE__PRIMARY_URL` so the write
+role is named plainly. `autumn doctor --strict` reports missing primaries,
+unsafe production startup migrations, role connectivity failures, and stale
+replica migrations without printing credentials.
+
+## Autumn Harvest
+
+Autumn Harvest is the companion workflow engine for durable, multi-step work:
+workflow history, activity retries, timers, singleton orchestration, and
+long-running business processes. It is intentionally a separate release train
+from `autumn-web`: Harvest can depend on Autumn Web's `AppState` and builder
+surface, but Autumn Web's examples and tests should not need Harvest in order to
+ship a web release. That keeps the dependency graph pointed in one direction
+instead of forming a circular release dependency.
+
+Use built-in `#[scheduled]` tasks and `#[job]` handlers for lightweight app-local
+background work. Reach for Harvest when the work needs workflow durability or a
+dedicated runner. See the [Harvest architecture notes](docs/autumn-workflow-architecture.md)
+for the model and roadmap.
+
 ## Example
 
-This is the `main.rs` generated by `autumn new`:
+This is the small-app shape Autumn is built around:
 
 ```rust
 use autumn_web::prelude::*;
@@ -123,20 +168,35 @@ async fn main() {
 
 ## Examples
 
+See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, prerequisites, run commands, and success proofs.
+
 | Example | Description |
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
 | [`examples/todo-app`](examples/todo-app) | Classic full-stack CRUD app with Diesel, Maud, htmx, Tailwind, and JSON endpoints |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
+| [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone using Autumn's server-first stack: auth, sessions, CSRF, `#[secured]`, `#[model]`, `#[repository]`, hooks, `#[scheduled]`, `#[static_get]`, `#[ws]` channels, real autumn-harvest onboarding and post-publication workflows, htmx voting, and profiles |
+| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, and profiles |
+| [`examples/custom_config_loader`](examples/custom_config_loader) | Replace the default TOML + env config loader with a custom `ConfigLoader` (JSON file, Vault, Secrets Manager, etc.) |
+| [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
+| [`examples/signed-webhooks`](examples/signed-webhooks) | Signed webhook intake with provider-shaped HMAC verification, replay protection, and fixture tests |
 
 ## Documentation
 
 - [Getting Started Guide](docs/guide/getting-started.md)
+- [Signed Webhook Intake](docs/guide/signed-webhooks.md)
+- [Docs Smoke Procedure](docs/guide/docs-smoke.md) - release gate for first-run docs
+- [Release Checklist](docs/release-checklist.md)
+- [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
+- [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
+- [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
+- [Mail Guide](docs/guide/mail.md)
 - [Cloud-Native Guide](docs/guide/cloud-native.md)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
+- [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments

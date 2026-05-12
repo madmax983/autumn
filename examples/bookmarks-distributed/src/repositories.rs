@@ -271,6 +271,30 @@ impl BookmarkRepository {
     pub(crate) async fn release_shard_lease(lease: ShardLease) -> AutumnResult<()> {
         Self::unlock_shard_lease(lease).await
     }
+
+    pub async fn count_all(&self) -> AutumnResult<i64> {
+        let mut conn = Self::conn(Self::role_for(BookmarkOperation::FindAll)).await?;
+        bookmarks::table
+            .count()
+            .get_result::<i64>(&mut conn)
+            .await
+            .map_err(AutumnError::from)
+    }
+}
+
+/// Returns the total number of bookmarks, cached for 30 s across all replicas.
+///
+/// When `RedisCachePlugin` is active (docker profile) this count is shared
+/// across all replicas so only one DB round-trip happens per 30-second window,
+/// regardless of which replica receives the request.
+#[cached(ttl = "30s", result)]
+pub async fn cached_bookmark_count() -> AutumnResult<i64> {
+    BookmarkRepository.count_all().await
+}
+
+#[get("/api/bookmarks/count")]
+pub async fn bookmark_api_count() -> AutumnResult<Json<i64>> {
+    Ok(Json(cached_bookmark_count().await?))
 }
 
 #[get("/api/bookmarks")]

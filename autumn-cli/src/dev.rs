@@ -222,10 +222,10 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // Watch the default directories.
     for dir in DEFAULT_WATCH_DIRS {
         let path = Path::new(dir);
-        if path.exists() {
-            if let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive) {
-                eprintln!("  Warning: could not watch {dir}/: {e}");
-            }
+        if path.exists()
+            && let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive)
+        {
+            eprintln!("  Warning: could not watch {dir}/: {e}");
         }
     }
 
@@ -490,10 +490,10 @@ fn execute_plan(
         }
     }
 
-    if let Some(reload_state) = reload_state.as_mut() {
-        if let Err(error) = reload_state.signal(applied_reload) {
-            eprintln!("  Warning: live reload signal failed: {error}");
-        }
+    if let Some(reload_state) = reload_state.as_mut()
+        && let Err(error) = reload_state.signal(applied_reload)
+    {
+        eprintln!("  Warning: live reload signal failed: {error}");
     }
 }
 
@@ -590,13 +590,13 @@ fn stop_server(child: &mut Option<Child>) {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            if let Some(pid) = validate_pid_for_kill(proc.id()) {
-                if let Err(e) = nix::sys::signal::kill(
+            if let Some(pid) = validate_pid_for_kill(proc.id())
+                && let Err(e) = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGTERM,
-                ) {
-                    eprintln!("  Warning: failed to send SIGTERM to process: {e}");
-                }
+                )
+            {
+                eprintln!("  Warning: failed to send SIGTERM to process: {e}");
             }
             // Wait briefly for graceful shutdown before forcing
             if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {

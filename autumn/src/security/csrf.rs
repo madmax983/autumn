@@ -47,7 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::{Request, Response, StatusCode};
 use http::header::HeaderName;
 
@@ -59,13 +59,21 @@ use super::config::CsrfConfig;
 /// Error body returned with a `403 Forbidden` when CSRF validation fails.
 const CSRF_FORBIDDEN_MESSAGE: &str = "CSRF token missing or invalid";
 
+/// The configured CSRF form field name, placed in request extensions by [`CsrfLayer`].
+///
+/// [`ChangesetForm`](crate::form::ChangesetForm) reads this so `form_tag` emits the
+/// hidden input under the correct field name even when `security.csrf.form_field` has
+/// been customised from its default `"_csrf"`.
+#[derive(Clone, Debug)]
+pub struct CsrfFormField(pub String);
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
 /// in HTML forms. The token is generated per-request and stored in
 /// request extensions by the [`CsrfLayer`].
 ///
-/// # Examples
+/// ## Examples
 ///
 /// ```rust,ignore
 /// use autumn_web::prelude::*;
@@ -89,6 +97,11 @@ impl CsrfToken {
     #[must_use]
     pub fn token(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new(token: String) -> Self {
+        Self(token)
     }
 }
 
@@ -115,6 +128,51 @@ where
     }
 }
 
+impl<S> OptionalFromRequestParts<S> for CsrfToken
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
+    }
+}
+
+impl<S> FromRequestParts<S> for CsrfFormField
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        parts.extensions.get::<Self>().cloned().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CSRF form field not found in request extensions. Is CsrfLayer enabled?",
+        ))
+    }
+}
+
+impl<S> OptionalFromRequestParts<S> for CsrfFormField
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<Self>().cloned())
+    }
+}
+
 /// Shared CSRF configuration.
 #[derive(Debug, Clone)]
 struct CsrfSettings {
@@ -123,6 +181,7 @@ struct CsrfSettings {
     form_field: String,
     safe_methods: Vec<http::Method>,
     exempt_paths: Vec<String>,
+    signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 }
 
 /// Tower [`Layer`] that applies CSRF protection.
@@ -155,8 +214,23 @@ impl CsrfLayer {
                 form_field: config.form_field.clone(),
                 safe_methods,
                 exempt_paths: config.exempt_paths.clone(),
+                signing_keys: None,
             }),
         }
+    }
+
+    /// Attach signing keys so CSRF tokens are HMAC-signed.
+    ///
+    /// When set, tokens are in `{uuid}.{hmac_hex}` format. Unsigned tokens are
+    /// rejected. Previous keys (see `ResolvedSigningKeys`) allow tokens signed
+    /// with an old key to remain valid during a rotation grace window.
+    #[must_use]
+    pub fn with_signing_keys(
+        mut self,
+        keys: Arc<crate::security::config::ResolvedSigningKeys>,
+    ) -> Self {
+        Arc::make_mut(&mut self.settings).signing_keys = Some(keys);
+        self
     }
 }
 
@@ -213,21 +287,28 @@ fn extract_cookie_token(req_headers: &http::HeaderMap, cookie_name: &str) -> Opt
     let mut found_token = None;
 
     for cookie_header in &req_headers.get_all(http::header::COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((name, value)) = pair.split_once('=') {
-                    if name.trim() == cookie_name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(value.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if name.trim() != cookie_name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(value.trim().to_owned());
         }
     }
 
@@ -239,7 +320,7 @@ where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    ResBody: From<&'static str> + Send + 'static,
+    ResBody: From<&'static str> + From<String> + Default + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -257,15 +338,32 @@ where
             .iter()
             .any(|prefix| path.starts_with(prefix.as_str()));
         let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
-        let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
+        let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
 
-        // For safe methods, generate a new token if none exists
-        let token = cookie_token
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        // When signing is active, discard any cookie that fails HMAC verification
+        // (unsigned pre-upgrade cookies, removed-key cookies, etc.) so a fresh signed
+        // token is minted and the Set-Cookie header refreshes the browser value.
+        let cookie_token = match (&raw_cookie_token, &self.settings.signing_keys) {
+            (Some(tok), Some(_)) if !validate_cookie_token_hmac(tok, &self.settings) => None,
+            _ => raw_cookie_token.clone(),
+        };
 
-        // Insert CsrfToken into request extensions for handler access
+        // Generate a new token if none exists in the cookie.
+        // When signing keys are active, the token is {uuid}.{hmac_hex}.
+        let token = cookie_token.clone().unwrap_or_else(|| {
+            let raw = Uuid::new_v4().to_string();
+            if let Some(keys) = &self.settings.signing_keys {
+                let sig = keys.sign(raw.as_bytes());
+                format!("{raw}.{sig}")
+            } else {
+                raw
+            }
+        });
+
+        // Insert CsrfToken and the configured form field name into request extensions.
         req.extensions_mut().insert(CsrfToken(token.clone()));
+        req.extensions_mut()
+            .insert(CsrfFormField(self.settings.form_field.clone()));
 
         // Check if we need to set a cookie
         let set_cookie = if cookie_token.is_none() {
@@ -285,6 +383,15 @@ where
 
         Box::pin(async move {
             if !is_safe && !verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await {
+                let request_id = req
+                    .extensions()
+                    .get::<crate::middleware::RequestId>()
+                    .map(std::string::ToString::to_string);
+                let instance = Some(req.uri().path().to_owned());
+                if wants_problem_details(req.headers()) {
+                    return Ok(csrf_problem_response(request_id, instance));
+                }
+
                 let mut response = Response::new(ResBody::from(CSRF_FORBIDDEN_MESSAGE));
                 *response.status_mut() = StatusCode::FORBIDDEN;
                 response.headers_mut().insert(
@@ -297,15 +404,57 @@ where
             // Validation passed (or method is safe)
             let mut response = inner.call(req).await?;
 
-            if let Some(cookie) = set_cookie {
-                if let Ok(val) = http::header::HeaderValue::from_str(&cookie) {
-                    response.headers_mut().append(http::header::SET_COOKIE, val);
-                }
+            if let Some(cookie) = set_cookie
+                && let Ok(val) = http::header::HeaderValue::from_str(&cookie)
+            {
+                response.headers_mut().append(http::header::SET_COOKIE, val);
             }
 
             Ok(response)
         })
     }
+}
+
+fn wants_problem_details(headers: &http::HeaderMap) -> bool {
+    !crate::middleware::error_page_filter::accept_prefers_html(headers)
+}
+
+fn csrf_problem_response<ResBody: From<String> + Default>(
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let mut problem = crate::error::problem_details(
+        StatusCode::FORBIDDEN,
+        CSRF_FORBIDDEN_MESSAGE.to_owned(),
+        None,
+        Some("https://autumn.dev/problems/csrf"),
+        request_id,
+        instance,
+        true,
+    );
+    "autumn.csrf".clone_into(&mut problem.code);
+    let body = crate::error::problem_details_to_json_string(&problem);
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
+        .unwrap_or_default()
+}
+
+/// Validate a CSRF cookie token's HMAC when signing is active.
+///
+/// Returns `false` when signing keys are set but the token is unsigned or carries
+/// an invalid HMAC (catches tampered or pre-rotation unsigned tokens).
+fn validate_cookie_token_hmac(cookie_token: &str, settings: &CsrfSettings) -> bool {
+    let Some(keys) = &settings.signing_keys else {
+        return true; // signing not active — accept raw token
+    };
+    // Signed format: "{uuid}.{hmac_hex}"
+    let Some((uuid_part, sig)) = cookie_token.split_once('.') else {
+        return false; // unsigned token rejected when signing is required
+    };
+    keys.verify(uuid_part.as_bytes(), sig)
 }
 
 async fn verify_csrf_token(
@@ -321,10 +470,13 @@ async fn verify_csrf_token(
         .get(&settings.token_header)
         .and_then(|v| v.to_str().ok());
 
-    if let (Some(c), Some(h)) = (cookie_token, header_token) {
-        if !c.is_empty() && !h.is_empty() && constant_time_eq(c, h) {
-            token_found = true;
-        }
+    if let (Some(c), Some(h)) = (cookie_token, header_token)
+        && !c.is_empty()
+        && !h.is_empty()
+        && validate_cookie_token_hmac(c, settings)
+        && constant_time_eq(c, h)
+    {
+        token_found = true;
     }
 
     if token_found {
@@ -350,18 +502,17 @@ async fn verify_csrf_token(
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
-    if let Ok(body_str) = std::str::from_utf8(&bytes) {
-        for pair in body_str.split('&') {
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == settings.form_field {
-                    if let Some(c) = cookie_token {
-                        if !c.is_empty() && !value.is_empty() && constant_time_eq(c, value) {
-                            token_found = true;
-                        }
-                    }
-                    break;
-                }
+    for (key, value) in url::form_urlencoded::parse(&bytes) {
+        if key == settings.form_field {
+            if let Some(c) = cookie_token
+                && !c.is_empty()
+                && !value.is_empty()
+                && validate_cookie_token_hmac(c, settings)
+                && constant_time_eq(c, value.as_ref())
+            {
+                token_found = true;
             }
+            break;
         }
     }
 
@@ -373,6 +524,30 @@ async fn verify_csrf_token(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn post_with_url_encoded_token_passes() {
+        let raw_token = "abc+123/xyz=456";
+        let encoded_token = "abc%2B123%2Fxyz%3D456";
+        let app = Router::new()
+            .route("/submit", post(|| async { "created" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("_csrf={encoded_token}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     use super::*;
     use axum::Router;
     use axum::body::Body;
@@ -444,6 +619,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/submit")
+                    .header(http::header::ACCEPT, "text/html")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -464,6 +640,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/submit")
+                    .header(http::header::ACCEPT, "text/html")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -855,5 +1032,175 @@ mod tests {
         };
         let layer = CsrfLayer::from_config(&config);
         assert_eq!(layer.settings.token_header.as_str(), "x-csrf-token");
+    }
+
+    // ── Signed CSRF tokens (RED phase) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn csrf_token_is_hmac_signed_when_keys_set() {
+        use crate::security::config::{SigningSecretConfig, resolve_signing_keys};
+        use std::sync::Arc;
+
+        let keys = Arc::new(resolve_signing_keys(&SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        }));
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_signing_keys(keys);
+
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(layer);
+
+        let resp = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("should set CSRF cookie")
+            .to_str()
+            .unwrap();
+        let cookie_value = set_cookie
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim();
+
+        assert!(
+            cookie_value.contains('.'),
+            "signed CSRF cookie must be {{uuid}}.{{hmac}}, got: {cookie_value}"
+        );
+        let (_uuid_part, sig_part) = cookie_value.split_once('.').unwrap();
+        assert_eq!(sig_part.len(), 64, "HMAC hex must be 64 chars");
+    }
+
+    #[tokio::test]
+    async fn csrf_signed_token_validates_on_post() {
+        use crate::security::config::{SigningSecretConfig, resolve_signing_keys};
+        use std::sync::Arc;
+
+        let keys = Arc::new(resolve_signing_keys(&SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        }));
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_signing_keys(keys);
+
+        let app = Router::new()
+            .route("/", post(|| async { "created" }))
+            .layer(layer);
+
+        // Mint a valid signed token
+        let config = SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        };
+        let signing_keys = resolve_signing_keys(&config);
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let sig = signing_keys.sign(uuid.as_bytes());
+        let signed_token = format!("{uuid}.{sig}");
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("Cookie", format!("autumn-csrf={signed_token}"))
+                    .header("X-CSRF-Token", &signed_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn csrf_unsigned_token_rejected_when_signing_active() {
+        use crate::security::config::{SigningSecretConfig, resolve_signing_keys};
+        use std::sync::Arc;
+
+        let keys = Arc::new(resolve_signing_keys(&SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        }));
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_signing_keys(keys);
+
+        let app = Router::new()
+            .route("/", post(|| async { "created" }))
+            .layer(layer);
+
+        // Raw UUID without HMAC — should be rejected when signing is active
+        let raw_token = uuid::Uuid::new_v4().to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("Cookie", format!("autumn-csrf={raw_token}"))
+                    .header("X-CSRF-Token", &raw_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "unsigned CSRF token must be rejected when signing is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn csrf_previous_key_signed_token_accepted() {
+        use crate::security::config::{
+            ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys,
+        };
+        use std::sync::Arc;
+
+        let old_secret = "old-key".repeat(5); // 35 bytes
+        let old_keys = resolve_signing_keys(&SigningSecretConfig {
+            secret: Some(old_secret.clone()),
+            previous_secrets: vec![],
+        });
+
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let old_sig = old_keys.sign(uuid.as_bytes());
+        let old_signed_token = format!("{uuid}.{old_sig}");
+
+        let new_keys = Arc::new(ResolvedSigningKeys::new(
+            "new-key".repeat(5).into_bytes(),
+            vec![old_secret.into_bytes()],
+        ));
+        let layer = CsrfLayer::from_config(&default_csrf_config()).with_signing_keys(new_keys);
+
+        let app = Router::new()
+            .route("/", post(|| async { "created" }))
+            .layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header("Cookie", format!("autumn-csrf={old_signed_token}"))
+                    .header("X-CSRF-Token", &old_signed_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "previous-key-signed CSRF token must pass during grace window"
+        );
     }
 }

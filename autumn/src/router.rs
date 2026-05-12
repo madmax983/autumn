@@ -13,7 +13,9 @@ use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
-use crate::middleware::exception_filter::{ExceptionFilter, ExceptionFilterLayer};
+use crate::middleware::exception_filter::{
+    ExceptionFilter, ExceptionFilterLayer, ProblemDetailsFilter,
+};
 use crate::route::Route;
 use crate::state::AppState;
 use axum::middleware::Next;
@@ -248,14 +250,18 @@ pub fn try_build_router_inner(
     // Build the OpenAPI spec BEFORE moving the routes into axum, because
     // group_and_mount_routes consumes the Route list.
     #[cfg(feature = "openapi")]
-    let openapi_router =
-        build_openapi_router(&route_list, &ctx.scoped_groups, ctx.openapi.as_ref())?;
+    let openapi_router = build_openapi_router(
+        &route_list,
+        &ctx.scoped_groups,
+        ctx.openapi.as_ref(),
+        &config.session.cookie_name,
+    )?;
 
     let mut router = group_and_mount_routes(route_list);
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
-    router = mount_framework_routes(router, dev_reload_enabled);
+    router = mount_framework_routes(router, config, dev_reload_enabled);
 
     let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
     router = router_with_probes;
@@ -268,9 +274,13 @@ pub fn try_build_router_inner(
     }
 
     // Static file serving from project's static/ directory.
+    // Fingerprinted assets (e.g. `autumn.a1b2c3d4.css`) are served with
+    // `Cache-Control: public, max-age=31536000, immutable`; all other static
+    // files use the default browser policy.
     let env = crate::config::OsEnv;
     let static_dir = crate::app::project_dir("static", &env);
     router = router.nest_service("/static", tower_http::services::ServeDir::new(&static_dir));
+    router = router.layer(axum::middleware::from_fn(asset_cache_control));
 
     router = mount_scoped_groups(router, ctx.scoped_groups);
 
@@ -301,24 +311,25 @@ pub fn try_build_router_inner(
 /// runtime spec assembly (which sees scope prefixes that the macro
 /// never does) produces consistent parameter lists.
 #[cfg(feature = "openapi")]
-fn extract_path_params(path: &str) -> Vec<String> {
+pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
-                let inner = &path[i + 1..i + 1 + end_rel];
-                let name = inner.split(':').next().unwrap_or(inner).trim();
-                if !name.is_empty() {
-                    out.push(name.to_owned());
-                }
-                i += 1 + end_rel + 1;
-                continue;
-            }
+    let mut remaining = path;
+
+    while let Some(start) = remaining.find('{') {
+        let after_brace = &remaining[start + 1..];
+        let Some(end_rel) = after_brace.find('}') else {
+            break;
+        };
+
+        let inner = &after_brace[..end_rel];
+        let name = inner.split(':').next().unwrap_or(inner).trim();
+        if !name.is_empty() {
+            out.push(name.to_owned());
         }
-        i += 1;
+
+        remaining = &after_brace[end_rel + 1..];
     }
+
     out
 }
 
@@ -331,14 +342,18 @@ fn extract_path_params(path: &str) -> Vec<String> {
 /// The spec is rendered once at build time and stored in an `Arc<String>`
 /// so the `/v3/api-docs` handler performs no serialization per request.
 #[cfg(feature = "openapi")]
+#[allow(clippy::too_many_lines)]
 fn build_openapi_router(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
     openapi_config: Option<&crate::openapi::OpenApiConfig>,
+    session_cookie_name: &str,
 ) -> Result<Option<axum::Router<AppState>>, RouterBuildError> {
     let Some(config) = openapi_config else {
         return Ok(None);
     };
+    let mut config = config.clone();
+    session_cookie_name.clone_into(&mut config.session_cookie_name);
 
     // Validate user-provided paths up front so a typo like
     // `"openapi.json"` surfaces as a recoverable RouterBuildError
@@ -395,7 +410,7 @@ fn build_openapi_router(
     }
 
     let refs: Vec<&crate::openapi::ApiDoc> = docs.iter().collect();
-    let spec = crate::openapi::generate_spec(config, &refs);
+    let spec = crate::openapi::generate_spec(&config, &refs);
     let spec_json = serde_json::to_string_pretty(&spec)
         .unwrap_or_else(|e| format!("{{\"error\": \"failed to serialize spec: {e}\"}}"));
 
@@ -508,7 +523,7 @@ fn build_openapi_router(
 /// `/api` + `/` recorded as `/api/` but axum routes it at `/api`) or
 /// generating a spec whose URLs don't match what axum serves.
 #[cfg(feature = "openapi")]
-fn join_nested_path(prefix: &str, child: &str) -> String {
+pub fn join_nested_path(prefix: &str, child: &str) -> String {
     let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
         if prefix_trimmed.is_empty() {
@@ -618,16 +633,17 @@ fn reject_openapi_path_collisions(
         return Ok(());
     };
 
-    // Gather every path a GET will already own by the time we merge.
+    // Gather every path a GET (or WS, which mounts as GET) will already
+    // own by the time we merge.
     let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
     for route in route_list {
-        if route.method == http::Method::GET {
+        if route.method == http::Method::GET || route.method.as_str() == "WS" {
             claimed.insert(route.path.to_owned());
         }
     }
     for group in scoped_groups {
         for route in &group.routes {
-            if route.method == http::Method::GET {
+            if route.method == http::Method::GET || route.method.as_str() == "WS" {
                 claimed.insert(join_nested_path(&group.prefix, route.path));
             }
         }
@@ -653,6 +669,15 @@ fn reject_openapi_path_collisions(
     if dev::is_enabled_with_env(&crate::config::OsEnv) {
         claimed.insert(dev::LIVE_RELOAD_PATH.to_owned());
         claimed.insert(dev::LIVE_RELOAD_SCRIPT_PATH.to_owned());
+    }
+    #[cfg(feature = "mail")]
+    if config
+        .mail
+        .preview_routes_enabled(config.profile.as_deref())
+    {
+        claimed.insert(crate::mail::MAIL_PREVIEW_PATH.to_owned());
+        claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
+        claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
     }
 
     check_openapi_path_against(
@@ -757,10 +782,16 @@ fn group_and_mount_routes(route_list: Vec<Route>) -> axum::Router<AppState> {
     router
 }
 
+#[cfg_attr(not(feature = "mail"), allow(unused_variables))]
+#[allow(clippy::cognitive_complexity)]
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
+    config: &AutumnConfig,
     dev_reload_enabled: bool,
 ) -> axum::Router<AppState> {
+    #[cfg(not(feature = "mail"))]
+    let _ = config;
+
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
@@ -799,13 +830,31 @@ fn mount_framework_routes(
         );
     }
 
+    #[cfg(feature = "mail")]
+    if config
+        .mail
+        .preview_routes_enabled(config.profile.as_deref())
+    {
+        router = router.merge(crate::mail::mail_preview_router(
+            config.mail.file_dir.clone(),
+        ));
+        tracing::debug!(
+            path = crate::mail::MAIL_PREVIEW_PATH,
+            "Mounted dev mail preview endpoints"
+        );
+    }
+
     router
 }
 
-fn mount_probe_endpoints(
-    mut router: axum::Router<AppState>,
+fn mount_probe_endpoints<S>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> (std::collections::HashSet<String>, axum::Router<AppState>) {
+) -> (std::collections::HashSet<String>, axum::Router<S>)
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: axum::extract::FromRef<S>,
+{
     // Probe endpoints (auto-mounted)
     let mut mounted_probe_paths = std::collections::HashSet::new();
 
@@ -830,7 +879,7 @@ fn mount_probe_endpoints(
     if mounted_probe_paths.insert(config.health.path.clone()) {
         router = router.route(
             &config.health.path,
-            axum::routing::get(crate::health::handler),
+            axum::routing::get(crate::health::handler::<AppState>),
         );
     }
     tracing::debug!(
@@ -913,15 +962,19 @@ fn mount_raw_routers(
     // Nest user-supplied raw Axum routers under path prefixes.
     for (prefix, raw_router) in nest_routers {
         tracing::debug!(prefix = %prefix, "Nested raw Axum router");
-        router = router.nest(&prefix, raw_router);
+        // We explicitly apply the fallback to the nested router before nesting,
+        // so that unmatched routes within this prefix are protected by global middleware.
+        let nested_router =
+            raw_router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+        router = router.nest(&prefix, nested_router);
     }
     router
 }
 
-fn apply_cors_middleware(
-    mut router: axum::Router<AppState>,
-    config: &AutumnConfig,
-) -> axum::Router<AppState> {
+fn apply_cors_middleware<S>(mut router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // CORS middleware (only applied when allowed_origins is non-empty)
     if !config.cors.allowed_origins.is_empty() {
         let cors = build_cors_layer(&config.cors);
@@ -935,23 +988,33 @@ fn apply_cors_middleware(
     router
 }
 
-fn apply_csrf_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_csrf_middleware<S>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+    signing_keys: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>>,
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // CSRF middleware (only applied when enabled)
     if config.security.csrf.enabled {
-        let csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        let mut csrf_layer = crate::security::CsrfLayer::from_config(&config.security.csrf);
+        if let Some(keys) = signing_keys {
+            csrf_layer = csrf_layer.with_signing_keys(keys);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
     router
 }
 
-fn apply_rate_limit_middleware(
-    mut router: axum::Router<AppState>,
+fn apply_rate_limit_middleware<S>(
+    mut router: axum::Router<S>,
     config: &AutumnConfig,
-) -> axum::Router<AppState> {
+) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     // Rate limiting middleware (only applied when enabled)
     if config.security.rate_limit.enabled {
         let layer = crate::security::RateLimitLayer::from_config(&config.security.rate_limit);
@@ -965,10 +1028,10 @@ fn apply_rate_limit_middleware(
     router
 }
 
-fn apply_upload_middleware(
-    router: axum::Router<AppState>,
-    config: &AutumnConfig,
-) -> axum::Router<AppState> {
+fn apply_upload_middleware<S>(router: axum::Router<S>, config: &AutumnConfig) -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let upload_config = config.security.upload.clone();
     tracing::info!(
         max_request_size_bytes = upload_config.max_request_size_bytes,
@@ -988,6 +1051,7 @@ fn apply_upload_middleware(
     ))
 }
 
+#[allow(clippy::cognitive_complexity)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -997,8 +1061,27 @@ fn apply_middleware(
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
+    // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
+    // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
+    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
+
+    // Resolve signing keys once; shared across session and CSRF layers.
+    let is_production = matches!(config.profile.as_deref(), Some("prod" | "production"));
+    let signing_keys = std::sync::Arc::new(crate::security::config::resolve_signing_keys(
+        &config.security.signing_secret,
+    ));
+    // Only thread signing keys when a secret is configured (or in production where
+    // fail_fast already ensures one is present). In dev without a configured secret
+    // the ephemeral key is generated per-process — useful but not required.
+    let signing_keys_opt: Option<std::sync::Arc<crate::security::config::ResolvedSigningKeys>> =
+        if config.security.signing_secret.secret.is_some() || is_production {
+            Some(signing_keys)
+        } else {
+            None
+        };
+
     router = apply_cors_middleware(router, config);
-    router = apply_csrf_middleware(router, config);
+    router = apply_csrf_middleware(router, config, signing_keys_opt.clone());
     router = apply_rate_limit_middleware(router, config);
     router = apply_upload_middleware(router, config);
 
@@ -1006,9 +1089,6 @@ fn apply_middleware(
     let security_headers =
         crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
     tracing::debug!("Security headers enabled");
-
-    // 404 fallback handler for unmatched routes
-    router = router.fallback(crate::middleware::error_page_filter::fallback_404_handler);
 
     // User-registered Tower layers (AppBuilder::layer). Applied BEFORE
     // RequestIdLayer wraps the router, so user middleware sits INNER to
@@ -1031,6 +1111,7 @@ fn apply_middleware(
         &config.session,
         config.profile.as_deref(),
         session_store,
+        signing_keys_opt,
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
 
@@ -1044,9 +1125,13 @@ fn apply_middleware(
     let error_page_filter =
         crate::middleware::error_page_filter::ErrorPageFilter { renderer, is_dev };
 
-    // Combine the error page filter with user exception filters.
-    // The error page filter runs first (innermost), then user filters.
-    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![Arc::new(error_page_filter)];
+    // Combine the Problem Details normalizer and error page filter with user
+    // exception filters. Problem Details runs first so HTML negotiation can
+    // still replace the JSON response for browser requests.
+    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![
+        Arc::new(ProblemDetailsFilter { is_dev }),
+        Arc::new(error_page_filter),
+    ];
     all_filters.extend(exception_filters);
 
     let count = all_filters.len();
@@ -1218,19 +1303,19 @@ pub fn try_build_router_with_static_inner(
                     } else {
                         path
                     };
-                    if let Some(file_path) = static_layer.resolve(normalized) {
-                        if let Ok(contents) = tokio::fs::read(&file_path).await {
-                            let body = if is_head {
-                                axum::body::Body::empty()
-                            } else {
-                                axum::body::Body::from(contents)
-                            };
-                            return http::Response::builder()
-                                .status(http::StatusCode::OK)
-                                .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
-                                .body(body)
-                                .expect("infallible response builder");
-                        }
+                    if let Some(file_path) = static_layer.resolve(normalized)
+                        && let Ok(contents) = tokio::fs::read(&file_path).await
+                    {
+                        let body = if is_head {
+                            axum::body::Body::empty()
+                        } else {
+                            axum::body::Body::from(contents)
+                        };
+                        return http::Response::builder()
+                            .status(http::StatusCode::OK)
+                            .header(http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+                            .body(body)
+                            .expect("infallible response builder");
                     }
                 }
                 next.run(req).await
@@ -1400,6 +1485,45 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
 }
 
+/// Set `Cache-Control` headers for static assets based on whether the path is
+/// fingerprinted.
+///
+/// | Path | Header |
+/// |------|--------|
+/// | `/static/**.<8hex>.*` | `public, max-age=31536000, immutable` |
+/// | `/static/**` (other) | `public, max-age=0, must-revalidate` |
+/// | Everything else | unchanged |
+///
+/// The short `must-revalidate` policy for plain static paths ensures that
+/// returning visitors always fetch the latest file after a deploy, while the
+/// long `immutable` policy for fingerprinted files lets browsers skip the
+/// network entirely for assets whose content will never change.
+pub async fn asset_cache_control(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.uri().path().to_owned();
+    let mut resp = next.run(req).await;
+    if path.starts_with("/static/") && resp.status().is_success() {
+        // Use manifest membership rather than filename pattern so that
+        // user-authored assets like `vendor.deadbeef.js` are never given an
+        // immutable cache lifetime.
+        let is_immutable = path
+            .strip_prefix("/static/")
+            .is_some_and(crate::assets::is_manifest_asset);
+        let header = if is_immutable {
+            "public, max-age=31536000, immutable"
+        } else {
+            "public, max-age=0, must-revalidate"
+        };
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static(header),
+        );
+    }
+    resp
+}
+
 #[cfg(feature = "htmx")]
 pub async fn htmx_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1446,6 +1570,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: Some("test".to_owned()),
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1453,11 +1579,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         }
     }
 
@@ -1653,7 +1784,7 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+        let router = apply_csrf_middleware(base, &config, None).with_state(test_state());
 
         // Without CSRF the POST should pass through with no CSRF-specific response
         let response = router
@@ -1729,6 +1860,164 @@ mod tests {
         assert!(blocked.headers().get("retry-after").is_some());
     }
 
+    #[cfg(feature = "mail")]
+    fn dev_mail_preview_config(dir: &std::path::Path) -> AutumnConfig {
+        AutumnConfig {
+            profile: Some("dev".to_owned()),
+            mail: crate::mail::MailConfig {
+                transport: crate::mail::Transport::File,
+                file_dir: dir.to_path_buf(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "mail")]
+    async fn response_text(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should collect");
+        String::from_utf8(body.to_vec()).expect("body should be utf8")
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_mounts_dev_mail_preview_empty_state_for_file_transport() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("No captured emails"),
+            "missing empty state: {body}"
+        );
+        assert!(
+            body.contains("mail.transport = &quot;file&quot;"),
+            "empty state should explain capture setup: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_lists_captured_mail_newest_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let older = dir.path().join("older.eml");
+        let newer = dir.path().join("newer.eml");
+        std::fs::write(
+            &older,
+            "To: first@example.com\nSubject: First\nDate: Tue, 05 May 2026 10:00:00 +0000\nMessage-Id: <first@example.com>\n\nfirst body\n",
+        )
+        .expect("write older eml");
+        std::fs::write(
+            &newer,
+            "To: second@example.com\nSubject: Second\nDate: Tue, 05 May 2026 10:01:00 +0000\nMessage-Id: <second@example.com>\n\nsecond body\n",
+        )
+        .expect("write newer eml");
+        filetime::set_file_mtime(&older, filetime::FileTime::from_unix_time(100, 0))
+            .expect("set older mtime");
+        filetime::set_file_mtime(&newer, filetime::FileTime::from_unix_time(200, 0))
+            .expect("set newer mtime");
+
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        let second = body.find("Second").expect("newer subject should render");
+        let first = body.find("First").expect("older subject should render");
+        assert!(second < first, "newest message should render first: {body}");
+        assert!(
+            body.contains("second@example.com"),
+            "missing To column: {body}"
+        );
+        assert!(
+            body.contains("Timestamp"),
+            "missing timestamp column: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_mail_preview_detail_renders_html_in_sandboxed_iframe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("detail.eml"),
+            "From: Autumn <noreply@example.com>\nTo: ada@example.com\nReply-To: support@example.com\nSubject: Reset\nDate: Tue, 05 May 2026 10:00:00 +0000\nMessage-Id: <reset@example.com>\nMIME-Version: 1.0\nContent-Type: multipart/alternative; boundary=\"autumn-mail\"\n\n--autumn-mail\nContent-Type: text/plain; charset=utf-8\n\nPlain reset\n--autumn-mail\nContent-Type: text/html; charset=utf-8\n\n<h1>Hello iframe</h1>\n--autumn-mail--\n",
+        )
+        .expect("write detail eml");
+
+        let config = dev_mail_preview_config(dir.path());
+        let router = build_router(Vec::new(), &config, test_state());
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail/messages/detail.eml")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("<iframe"), "missing iframe: {body}");
+        assert!(body.contains("sandbox"), "iframe must be sandboxed: {body}");
+        assert!(body.contains("Hello iframe"), "missing html body: {body}");
+        assert!(body.contains("Plain text"), "missing text toggle: {body}");
+        assert!(body.contains("Headers"), "missing headers toggle: {body}");
+        assert!(
+            body.contains("Raw .eml"),
+            "missing raw source toggle: {body}"
+        );
+        assert!(
+            body.contains("Message-Id"),
+            "missing message id header: {body}"
+        );
+    }
+
+    #[cfg(feature = "mail")]
+    #[tokio::test]
+    async fn build_router_does_not_mount_mail_preview_outside_dev() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = dev_mail_preview_config(dir.path());
+        config.profile = Some("prod".to_owned());
+        let router = build_router(Vec::new(), &config, test_state());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/_autumn/mail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn apply_csrf_middleware_blocks_without_token_when_enabled() {
         let mut config = AutumnConfig::default();
@@ -1736,7 +2025,7 @@ mod tests {
 
         let base: axum::Router<AppState> =
             axum::Router::new().route("/form", axum::routing::post(|| async { "posted" }));
-        let router = apply_csrf_middleware(base, &config).with_state(test_state());
+        let router = apply_csrf_middleware(base, &config, None).with_state(test_state());
 
         // POST without CSRF token should be rejected
         let response = router
@@ -1801,7 +2090,9 @@ mod tests {
                     success_status: 200,
                     ..Default::default()
                 },
+                repository: None,
             }],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
@@ -1867,15 +2158,17 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
             routes: vec![child],
+            source: crate::route_listing::RouteSource::User,
             apply_layer: Box::new(|r| r),
         };
 
         let config = OpenApiConfig::new("Demo", "1.0.0");
-        let router = super::build_openapi_router(&[], &[group], Some(&config))
+        let router = super::build_openapi_router(&[], &[group], Some(&config), "autumn.sid")
             .expect("openapi sub-router builds")
             .expect("openapi sub-router present when config is Some");
         let state = test_state();
@@ -1884,7 +2177,7 @@ mod tests {
         let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/v3/api-docs")
+                    .uri("/openapi.json")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1907,11 +2200,69 @@ mod tests {
     }
 
     #[cfg(feature = "openapi")]
+    #[tokio::test]
+    async fn openapi_documents_configured_session_cookie_name() {
+        use crate::openapi::{ApiDoc, OpenApiConfig};
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        let route = Route {
+            method: http::Method::GET,
+            path: "/protected",
+            handler: axum::routing::get(handler),
+            name: "protected",
+            api_doc: ApiDoc {
+                method: "GET",
+                path: "/protected",
+                operation_id: "protected",
+                success_status: 200,
+                secured: true,
+                ..Default::default()
+            },
+            repository: None,
+        };
+
+        let protected_routes = vec![route];
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let docs_router =
+            super::build_openapi_router(&protected_routes, &[], Some(&config), "demo.sid")
+                .expect("openapi sub-router builds")
+                .expect("openapi sub-router present when config is Some");
+        let docs_router = docs_router.with_state(test_state());
+
+        let response = docs_router
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let schemes = &spec["components"]["securitySchemes"];
+
+        assert_eq!(schemes["SessionAuth"]["type"], "apiKey");
+        assert_eq!(schemes["SessionAuth"]["in"], "cookie");
+        assert_eq!(schemes["SessionAuth"]["name"], "demo.sid");
+        assert!(
+            schemes.get("BearerAuth").is_none(),
+            "secured routes must not be documented as bearer JWT routes"
+        );
+    }
+
+    #[cfg(feature = "openapi")]
     #[test]
     fn openapi_rejects_json_path_without_leading_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("openapi.json");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -1929,7 +2280,7 @@ mod tests {
         // endpoints are static. Catch it before axum panics.
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id}");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("captures should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1939,7 +2290,7 @@ mod tests {
     fn openapi_rejects_path_with_unbalanced_brace() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/{id");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("unbalanced brace should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1949,7 +2300,7 @@ mod tests {
     fn openapi_rejects_path_with_wildcard() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("/docs/*rest");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("wildcard should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1959,7 +2310,7 @@ mod tests {
     fn openapi_rejects_path_with_double_slash() {
         let config =
             crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("//docs");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("double-slash should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1969,7 +2320,7 @@ mod tests {
     fn openapi_rejects_swagger_ui_path_without_leading_slash() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .swagger_ui_path(Some("docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("non-slash path should be rejected");
         assert!(matches!(
             err,
@@ -1984,7 +2335,7 @@ mod tests {
     #[test]
     fn openapi_rejects_empty_json_path() {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0").openapi_json_path("");
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("empty path should be rejected");
         assert!(matches!(err, RouterBuildError::InvalidOpenApiPath { .. }));
     }
@@ -1995,7 +2346,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/api-docs")
             .swagger_ui_path(Some("/ui".to_owned()));
-        let out = super::build_openapi_router(&[], &[], Some(&config))
+        let out = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect("valid paths must not error");
         assert!(out.is_some());
     }
@@ -2006,7 +2357,7 @@ mod tests {
         let config = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
             .openapi_json_path("/docs")
             .swagger_ui_path(Some("/docs".to_owned()));
-        let err = super::build_openapi_router(&[], &[], Some(&config))
+        let err = super::build_openapi_router(&[], &[], Some(&config), "autumn.sid")
             .expect_err("colliding paths should be rejected before axum panics");
         assert!(matches!(
             err,
@@ -2039,6 +2390,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {
@@ -2104,6 +2456,7 @@ mod tests {
                 success_status: 200,
                 ..Default::default()
             },
+            repository: None,
         };
 
         let ctx = RouterContext {

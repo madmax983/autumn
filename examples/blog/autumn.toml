@@ -11,3 +11,7 @@ format = "Pretty"
 
 [health]
 path = "/health"
+
+[i18n]
+default_locale = "en"
+supported_locales = ["en", "es"]

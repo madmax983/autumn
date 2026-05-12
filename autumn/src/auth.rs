@@ -167,8 +167,22 @@ pub async fn __check_secured(
     session: &crate::session::Session,
     roles: &[&str],
 ) -> crate::AutumnResult<()> {
+    __check_secured_with_key(session, "user_id", roles).await
+}
+
+/// Runtime check used by `#[secured]` when `AppState` is available.
+///
+/// Accepts the configured auth session key so generated login/signup/reset
+/// handlers and `#[secured]` resolve authentication through the same session
+/// entry.
+#[doc(hidden)]
+pub async fn __check_secured_with_key(
+    session: &crate::session::Session,
+    auth_session_key: &str,
+    roles: &[&str],
+) -> crate::AutumnResult<()> {
     // Check authentication: session must contain the auth key
-    if session.get("user_id").await.is_none() {
+    if session.get(auth_session_key).await.is_none() {
         return Err(crate::AutumnError::unauthorized_msg(
             "authentication required",
         ));
@@ -240,16 +254,7 @@ pub struct AuthRejection;
 
 impl IntoResponse for AuthRejection {
     fn into_response(self) -> Response {
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(serde_json::json!({
-                "error": {
-                    "status": 401,
-                    "message": "authentication required"
-                }
-            })),
-        )
-            .into_response()
+        crate::AutumnError::unauthorized_msg("authentication required").into_response()
     }
 }
 
@@ -347,18 +352,21 @@ where
             if is_authenticated {
                 inner.call(req).await
             } else {
-                let body = serde_json::json!({
-                    "error": {
-                        "status": 401,
-                        "message": "authentication required"
-                    }
-                });
+                let body = crate::error::problem_details_json_string(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication required",
+                    None,
+                    None,
+                    req.extensions()
+                        .get::<crate::middleware::RequestId>()
+                        .map(std::string::ToString::to_string),
+                    Some(req.uri().path().to_owned()),
+                    true,
+                );
                 let response = Response::builder()
                     .status(StatusCode::UNAUTHORIZED)
-                    .header(http::header::CONTENT_TYPE, "application/json")
-                    .body(ResBody::from(
-                        serde_json::to_string(&body).unwrap_or_default(),
-                    ))
+                    .header(http::header::CONTENT_TYPE, "application/problem+json")
+                    .body(ResBody::from(body))
                     .unwrap_or_default();
                 Ok(response)
             }
@@ -726,16 +734,27 @@ fn parse_oauth2_token_response(
         });
     }
 
-    let form: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect();
-    let access_token = form.get("access_token").cloned().ok_or_else(|| {
+    let mut access_token = None;
+    let mut token_type = None;
+    let mut id_token = None;
+
+    for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+        match k.as_ref() {
+            "access_token" => access_token = Some(v.into_owned()),
+            "token_type" => token_type = Some(v.into_owned()),
+            "id_token" => id_token = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+
+    let access_token = access_token.ok_or_else(|| {
         crate::AutumnError::bad_request_msg("token response missing access_token")
     })?;
+
     Ok(OAuth2TokenResponse {
         access_token,
-        token_type: form.get("token_type").cloned(),
-        id_token: form.get("id_token").cloned(),
+        token_type,
+        id_token,
     })
 }
 
@@ -850,6 +869,575 @@ impl Default for AuthConfig {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Token Authentication
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Backend trait for storing and verifying API bearer tokens.
+///
+/// Implementations persist only the token hash — the raw token is never stored
+/// at rest. The default backend for tests is [`InMemoryApiTokenStore`].
+/// Production deployments should use a database-backed implementation.
+///
+/// All methods take `&self`; use interior mutability where write access is
+/// needed.
+pub trait ApiTokenStore: Send + Sync + 'static {
+    /// Issue a new token for `principal_id` and return the raw value.
+    ///
+    /// Only the hash is persisted. The raw token must be delivered to the
+    /// caller immediately — it cannot be recovered later.
+    fn issue<'a>(
+        &'a self,
+        principal_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>>;
+
+    /// Verify `raw_token` and return its principal ID, or `None` for unknown
+    /// or revoked tokens.
+    fn verify<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>;
+
+    /// Revoke a token so that subsequent requests are rejected.
+    fn revoke<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
+}
+
+/// Compute the SHA-256 hash of a raw API token as a lowercase 64-char hex string.
+///
+/// The hash is deterministic: the same input always produces the same output.
+/// Only the hash is ever stored; the raw token is never persisted.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::auth::hash_api_token;
+///
+/// let h = hash_api_token("my_token");
+/// assert_eq!(h.len(), 64);
+/// assert_eq!(h, hash_api_token("my_token")); // deterministic
+/// ```
+#[must_use]
+pub fn hash_api_token(raw: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(raw.as_bytes())
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+/// Generate a 256-bit random raw API token as a lowercase hex string.
+///
+/// Uses two UUID v4 values (128 bits each) concatenated for a 64-char result.
+fn generate_raw_token() -> String {
+    let u1 = uuid::Uuid::new_v4();
+    let u2 = uuid::Uuid::new_v4();
+    format!("{}{}", u1.simple(), u2.simple())
+}
+
+/// In-memory API token store for development and testing.
+///
+/// Tokens are stored as SHA-256 hashes mapped to principal IDs inside a
+/// `RwLock`-protected `HashMap`. **Not suitable for production** — state is
+/// lost on restart and is not shared across processes.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use autumn_web::auth::{ApiTokenStore, InMemoryApiTokenStore};
+///
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let store = Arc::new(InMemoryApiTokenStore::default());
+/// let token = store.issue("user:1").await.unwrap();
+/// assert_eq!(store.verify(&token).await.unwrap(), Some("user:1".to_owned()));
+/// store.revoke(&token).await.unwrap();
+/// assert_eq!(store.verify(&token).await.unwrap(), None);
+/// # });
+/// ```
+#[derive(Clone)]
+pub struct InMemoryApiTokenStore {
+    // hash → principal_id
+    tokens: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+}
+
+impl Default for InMemoryApiTokenStore {
+    fn default() -> Self {
+        Self {
+            tokens: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+}
+
+impl ApiTokenStore for InMemoryApiTokenStore {
+    fn issue<'a>(
+        &'a self,
+        principal_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let raw = generate_raw_token();
+            let hash = hash_api_token(&raw);
+            self.tokens
+                .write()
+                .expect("api token store lock poisoned")
+                .insert(hash, principal_id.to_owned());
+            Ok(raw)
+        })
+    }
+
+    fn verify<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+        Box::pin(async move {
+            let hash = hash_api_token(raw_token);
+            Ok(self
+                .tokens
+                .read()
+                .expect("api token store lock poisoned")
+                .get(&hash)
+                .cloned())
+        })
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let hash = hash_api_token(raw_token);
+            self.tokens
+                .write()
+                .expect("api token store lock poisoned")
+                .remove(&hash);
+            Ok(())
+        })
+    }
+}
+
+/// Issue a new API token for `principal_id` using `store`.
+///
+/// Returns the raw token string that must be transmitted to the client once.
+///
+/// # Errors
+///
+/// Propagates any error from the underlying store.
+pub async fn issue_api_token(
+    store: &dyn ApiTokenStore,
+    principal_id: &str,
+) -> crate::AutumnResult<String> {
+    store.issue(principal_id).await
+}
+
+/// Revoke a previously issued API token using `store`.
+///
+/// After revocation [`RequireApiToken`] rejects requests presenting this token.
+///
+/// # Errors
+///
+/// Propagates any error from the underlying store.
+pub async fn revoke_api_token(
+    store: &dyn ApiTokenStore,
+    raw_token: &str,
+) -> crate::AutumnResult<()> {
+    store.revoke(raw_token).await
+}
+
+/// Private marker inserted into request extensions by [`RequireApiToken`] after
+/// a bearer token is successfully verified.
+#[derive(Clone)]
+struct ApiTokenPrincipal(String);
+
+/// Extractor that yields the verified principal ID from a bearer-protected route.
+///
+/// The principal ID is inserted by [`RequireApiToken`] after verifying the
+/// `Authorization: Bearer <token>` header. Without `RequireApiToken` on the
+/// route this extractor returns `401 Unauthorized`.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+/// use autumn_web::auth::ApiToken;
+///
+/// #[get("/whoami")]
+/// async fn whoami(ApiToken(principal): ApiToken) -> String {
+///     format!("authenticated as {principal}")
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ApiToken(pub String);
+
+impl<S> FromRequestParts<S> for ApiToken
+where
+    S: Send + Sync,
+{
+    type Rejection = AuthRejection;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let principal = parts.extensions.get::<ApiTokenPrincipal>().cloned();
+        async move { principal.map(|p| Self(p.0)).ok_or(AuthRejection) }
+    }
+}
+
+/// Tower [`Layer`](tower::Layer) that validates `Authorization: Bearer <token>`
+/// on every inbound request.
+///
+/// On success the verified principal ID is inserted into request extensions
+/// so handlers can retrieve it via the [`ApiToken`] extractor.
+/// Requests with a missing, malformed, or revoked token are rejected with
+/// `401 Unauthorized` using the same Problem Details contract as
+/// [`AuthRejection`].
+///
+/// Composes with [`RequireAuth`] and session middleware without conflict.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use autumn_web::auth::{InMemoryApiTokenStore, RequireApiToken};
+/// use autumn_web::reexports::axum::{Router, routing::get};
+/// use autumn_web::AppState;
+///
+/// let store = Arc::new(InMemoryApiTokenStore::default());
+/// let api_routes = Router::<AppState>::new()
+///     .route("/data", get(|| async { "ok" }))
+///     .layer(RequireApiToken::new(store));
+/// ```
+#[derive(Clone)]
+pub struct RequireApiToken {
+    store: Arc<dyn ApiTokenStore>,
+}
+
+impl RequireApiToken {
+    /// Create a new [`RequireApiToken`] layer backed by `store`.
+    ///
+    /// Accepts any `Arc<S>` where `S: ApiTokenStore`, so callers do not need
+    /// to explicitly cast to `Arc<dyn ApiTokenStore>`.
+    #[must_use]
+    pub fn new<S: ApiTokenStore + 'static>(store: Arc<S>) -> Self {
+        Self { store }
+    }
+}
+
+impl<S> tower::Layer<S> for RequireApiToken {
+    type Service = RequireApiTokenService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequireApiTokenService {
+            inner,
+            store: Arc::clone(&self.store),
+        }
+    }
+}
+
+/// Tower service produced by [`RequireApiToken`].
+#[derive(Clone)]
+pub struct RequireApiTokenService<S> {
+    inner: S,
+    store: Arc<dyn ApiTokenStore>,
+}
+
+impl<S, ResBody> tower::Service<axum::extract::Request> for RequireApiTokenService<S>
+where
+    S: tower::Service<axum::extract::Request, Response = Response<ResBody>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    ResBody: From<String> + Default + Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
+        let store = Arc::clone(&self.store);
+        let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
+
+        Box::pin(async move {
+            // Parse "Authorization: Bearer <token>"
+            let raw_token = req
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_bearer_token)
+                .map(str::to_owned);
+
+            let Some(raw_token) = raw_token else {
+                let (request_id, instance) = api_token_problem_context(&req);
+                return Ok(api_token_unauthorized_response(request_id, instance));
+            };
+
+            match store.verify(&raw_token).await {
+                Ok(Some(principal_id)) => {
+                    req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
+                    inner.call(req).await
+                }
+                Ok(None) => {
+                    let (request_id, instance) = api_token_problem_context(&req);
+                    Ok(api_token_unauthorized_response(request_id, instance))
+                }
+                Err(err) => {
+                    let (request_id, instance) = api_token_problem_context(&req);
+                    Ok(api_token_error_response(&err, request_id, instance))
+                }
+            }
+        })
+    }
+}
+
+fn parse_bearer_token(header: &str) -> Option<&str> {
+    let (scheme, token) = header.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("Bearer").then_some(token)
+}
+
+/// Build a `401 Unauthorized` response using the standard Problem Details body.
+fn api_token_unauthorized_response<ResBody: From<String> + Default>(
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let body = crate::error::problem_details_json_string(
+        StatusCode::UNAUTHORIZED,
+        "authentication required",
+        None,
+        None,
+        request_id,
+        instance,
+        true,
+    );
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
+        .unwrap_or_default()
+}
+
+/// Build a Problem Details response from the API token store error.
+fn api_token_error_response<ResBody: From<String> + Default>(
+    err: &crate::AutumnError,
+    request_id: Option<String>,
+    instance: Option<String>,
+) -> Response<ResBody> {
+    let status = err.status();
+    let message = err.to_string();
+    let body = crate::error::problem_details_json_string(
+        status,
+        message.clone(),
+        None,
+        None,
+        request_id,
+        instance,
+        true,
+    );
+    let mut response = Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/problem+json")
+        .body(ResBody::from(body))
+        .unwrap_or_default();
+    response
+        .extensions_mut()
+        .insert(crate::middleware::AutumnErrorInfo {
+            status,
+            message,
+            details: None,
+            problem_type: None,
+        });
+    response
+}
+
+fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, Option<String>) {
+    (
+        req.extensions()
+            .get::<crate::middleware::RequestId>()
+            .map(std::string::ToString::to_string),
+        Some(req.uri().path().to_owned()),
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diesel-backed API Token Store
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Embedded Diesel migrations for the `api_tokens` table.
+///
+/// Include this in your application's `.migrations()` call so that dev/test
+/// startup migration checks can create and validate the `api_tokens` table
+/// alongside your own migrations. In production, `autumn migrate` applies the
+/// matching framework migration before token commands or `DbApiTokenStore`
+/// need the table:
+///
+/// ```rust,ignore
+/// use autumn_web::auth::API_TOKEN_MIGRATIONS;
+///
+/// #[autumn_web::main]
+/// async fn main() {
+///     autumn_web::app()
+///         .migrations(API_TOKEN_MIGRATIONS)
+///         .run()
+///         .await;
+/// }
+/// ```
+#[cfg(feature = "db")]
+pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("migrations");
+
+#[cfg(feature = "db")]
+mod db_store {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use diesel::OptionalExtension as _;
+    use diesel::prelude::*;
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::RunQueryDsl;
+    use diesel_async::pooled_connection::deadpool::Pool;
+
+    use super::{ApiTokenStore, generate_raw_token, hash_api_token};
+    use crate::error::AutumnError;
+
+    diesel::table! {
+        api_tokens (id) {
+            id -> Int8,
+            token_hash -> Text,
+            principal_id -> Text,
+            created_at -> Timestamp,
+            revoked_at -> Nullable<Timestamp>,
+        }
+    }
+
+    #[derive(Insertable)]
+    #[diesel(table_name = api_tokens)]
+    struct NewApiToken<'a> {
+        token_hash: &'a str,
+        principal_id: &'a str,
+    }
+
+    /// Postgres-backed [`ApiTokenStore`].
+    ///
+    /// Tokens are hashed at rest (SHA-256) and never stored in plaintext.
+    /// Suitable for production deployments where token state must survive
+    /// process restarts and be shared across instances.
+    ///
+    /// # Setup
+    ///
+    /// Pass [`super::API_TOKEN_MIGRATIONS`] to your app builder so dev/test
+    /// startup migration checks can create and validate the `api_tokens`
+    /// table automatically. In production, run `autumn migrate`; the CLI
+    /// applies the matching framework migration explicitly.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::auth::{API_TOKEN_MIGRATIONS, DbApiTokenStore};
+    /// use autumn_web::db::Pool;
+    ///
+    /// let store = DbApiTokenStore::new(pool.clone());
+    /// autumn_web::app()
+    ///     .migrations(API_TOKEN_MIGRATIONS)
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[derive(Clone)]
+    pub struct DbApiTokenStore {
+        pool: Pool<AsyncPgConnection>,
+    }
+
+    impl DbApiTokenStore {
+        /// Create a [`DbApiTokenStore`] backed by `pool`.
+        #[must_use]
+        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+            Self { pool }
+        }
+    }
+
+    impl ApiTokenStore for DbApiTokenStore {
+        fn issue<'a>(
+            &'a self,
+            principal_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<String>> + Send + 'a>> {
+            Box::pin(async move {
+                let raw = generate_raw_token();
+                let hash = hash_api_token(&raw);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                diesel::insert_into(api_tokens::table)
+                    .values(NewApiToken {
+                        token_hash: &hash,
+                        principal_id,
+                    })
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(raw)
+            })
+        }
+
+        fn verify<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let hash = hash_api_token(raw_token);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                let principal: Option<String> = api_tokens::table
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .filter(api_tokens::revoked_at.is_null())
+                    .select(api_tokens::principal_id)
+                    .first(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(principal)
+            })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let hash = hash_api_token(raw_token);
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                diesel::update(api_tokens::table)
+                    .filter(api_tokens::token_hash.eq(&hash))
+                    .set(api_tokens::revoked_at.eq(diesel::dsl::now.nullable()))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                Ok(())
+            })
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+pub use db_store::DbApiTokenStore;
 
 #[cfg(test)]
 mod tests {
@@ -989,11 +1577,23 @@ mod tests {
     fn parse_oauth2_token_response_supports_form_encoded_payload() {
         let token = parse_oauth2_token_response(
             Some("application/x-www-form-urlencoded"),
-            "access_token=abc123&token_type=bearer",
+            "access_token=abc123&token_type=bearer&id_token=xyz789&extra_field=ignored",
         )
         .unwrap();
         assert_eq!(token.access_token, "abc123");
         assert_eq!(token.token_type.as_deref(), Some("bearer"));
+        assert_eq!(token.id_token.as_deref(), Some("xyz789"));
+    }
+
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn parse_oauth2_token_response_fails_without_access_token() {
+        let err = parse_oauth2_token_response(
+            Some("application/x-www-form-urlencoded"),
+            "token_type=bearer&id_token=xyz789",
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "token response missing access_token");
     }
 
     #[cfg(feature = "oauth2")]
@@ -1086,6 +1686,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1093,11 +1695,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new().route("/", get(handler)).with_state(state);
@@ -1138,6 +1745,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1145,11 +1754,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         // Middleware that inserts a user into extensions
@@ -1198,6 +1812,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1205,11 +1821,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1314,6 +1935,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1321,11 +1944,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1380,6 +2008,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1387,11 +2017,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1415,6 +2050,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn secured_macro_honors_configured_auth_session_key() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
+
+        #[autumn_macros::secured]
+        async fn account_handler() -> crate::AutumnResult<&'static str> {
+            Ok("account")
+        }
+
+        let store = MemoryStore::new();
+        store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([
+                    ("uid".into(), "42".into()),
+                    ("account_id".into(), "42".into()),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        let state = AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "uid".to_owned(),
+            shared_cache: None,
+        };
+
+        let app = Router::new()
+            .route("/account", get(account_handler))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/account")
+                    .header(COOKIE, "autumn.sid=sess1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "account");
     }
 
     #[tokio::test]
@@ -1451,6 +2164,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1458,11 +2173,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1518,6 +2238,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1525,11 +2247,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1578,6 +2305,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1585,11 +2314,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1683,8 +2417,9 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["status"], 401);
-        assert_eq!(json["error"]["message"], "authentication required");
+        assert_eq!(json["status"], 401);
+        assert_eq!(json["detail"], "authentication required");
+        assert_eq!(json["code"], "autumn.unauthorized");
     }
 
     #[test]
@@ -1773,5 +2508,572 @@ mod tests {
         // Truncated hash
         let result2 = super::verify_password(&test_input, "$2b$04$").await;
         assert!(result2.is_err() || !result2.unwrap());
+    }
+}
+
+// ── API token tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod api_token_tests {
+    use std::sync::Arc;
+
+    use http::StatusCode;
+
+    use super::{
+        ApiToken, ApiTokenStore, InMemoryApiTokenStore, RequireApiToken, hash_api_token,
+        issue_api_token, revoke_api_token,
+    };
+
+    struct FailingApiTokenStore;
+
+    impl ApiTokenStore for FailingApiTokenStore {
+        fn issue<'a>(
+            &'a self,
+            _principal_id: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<String>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+
+        fn verify<'a>(
+            &'a self,
+            _raw_token: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>,
+        > {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+
+        fn revoke<'a>(
+            &'a self,
+            _raw_token: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(crate::AutumnError::service_unavailable_msg(
+                    "api token store unavailable",
+                ))
+            })
+        }
+    }
+
+    // ── hash_api_token ───────────────────────────────────────────────────────
+
+    #[test]
+    fn hash_api_token_is_deterministic() {
+        let h1 = hash_api_token("abc123");
+        let h2 = hash_api_token("abc123");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn hash_api_token_produces_64_char_hex() {
+        let hash = hash_api_token("any_raw_token");
+        assert_eq!(hash.len(), 64, "SHA-256 hex must be 64 chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash must be lowercase hex digits"
+        );
+    }
+
+    #[test]
+    fn hash_api_token_differs_from_input() {
+        let raw = "my_raw_token";
+        assert_ne!(hash_api_token(raw), raw);
+    }
+
+    #[test]
+    fn hash_api_token_different_inputs_produce_different_hashes() {
+        assert_ne!(hash_api_token("token_a"), hash_api_token("token_b"));
+    }
+
+    // ── InMemoryApiTokenStore ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn in_memory_store_issue_returns_unique_tokens() {
+        let store = InMemoryApiTokenStore::default();
+        let t1 = store.issue("user:1").await.unwrap();
+        let t2 = store.issue("user:1").await.unwrap();
+        assert_ne!(t1, t2, "each issued token must be unique");
+        assert!(t1.len() >= 32, "token must have sufficient entropy");
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_verify_returns_principal_for_valid_token() {
+        let store = InMemoryApiTokenStore::default();
+        let raw = store.issue("user:42").await.unwrap();
+        let principal = store.verify(&raw).await.unwrap();
+        assert_eq!(principal, Some("user:42".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_verify_returns_none_for_unknown_token() {
+        let store = InMemoryApiTokenStore::default();
+        let result = store.verify("not_a_real_token").await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_revoke_invalidates_token() {
+        let store = InMemoryApiTokenStore::default();
+        let raw = store.issue("user:7").await.unwrap();
+        assert_eq!(
+            store.verify(&raw).await.unwrap(),
+            Some("user:7".to_owned()),
+            "token must be valid before revoking"
+        );
+        store.revoke(&raw).await.unwrap();
+        assert_eq!(store.verify(&raw).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_raw_token_not_stored_verbatim() {
+        let store = InMemoryApiTokenStore::default();
+        let raw = store.issue("user:1").await.unwrap();
+        // Appending a character changes the hash → lookup must return None.
+        let tampered = format!("{raw}x");
+        assert_eq!(store.verify(&tampered).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn issue_api_token_helper_issues_verifiable_token() {
+        let store = InMemoryApiTokenStore::default();
+        let raw = issue_api_token(&store, "user:5").await.unwrap();
+        assert_eq!(store.verify(&raw).await.unwrap(), Some("user:5".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn revoke_api_token_helper_revokes_token() {
+        let store = InMemoryApiTokenStore::default();
+        let raw = store.issue("user:6").await.unwrap();
+        revoke_api_token(&store, &raw).await.unwrap();
+        assert_eq!(store.verify(&raw).await.unwrap(), None);
+    }
+
+    // ── RequireApiToken middleware ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn require_api_token_rejects_missing_authorization_header() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_rejects_non_bearer_scheme() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_rejects_unknown_bearer_token() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, "Bearer unknown_token_xyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_propagates_store_verify_errors() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(FailingApiTokenStore);
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, "Bearer valid_client_token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .map(|value| value.to_str().unwrap_or_default()),
+            Some("application/problem+json")
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], 503);
+        assert_eq!(json["code"], "autumn.service_unavailable");
+        assert_eq!(json["detail"], "api token store unavailable");
+    }
+
+    #[tokio::test]
+    async fn require_api_token_allows_valid_bearer_token() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("user:1").await.unwrap();
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(Arc::clone(&store)));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_accepts_case_insensitive_bearer_scheme() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("user:1").await.unwrap();
+
+        for scheme in ["bearer", "bEaReR"] {
+            let app = axum::Router::new()
+                .route("/", axum::routing::get(|| async { "ok" }))
+                .layer(RequireApiToken::new(Arc::clone(&store)));
+
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/")
+                        .header(http::header::AUTHORIZATION, format!("{scheme} {raw}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "scheme {scheme}");
+        }
+    }
+
+    #[tokio::test]
+    async fn require_api_token_rejects_revoked_token() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("user:1").await.unwrap();
+        store.revoke(&raw).await.unwrap();
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(Arc::clone(&store)));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_401_response_has_problem_details() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("application/problem+json")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], 401);
+        assert_eq!(json["code"], "autumn.unauthorized");
+        assert!(json["detail"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_401_problem_details_include_request_context() {
+        use crate::middleware::RequestIdLayer;
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let app = axum::Router::new()
+            .route("/api/private", axum::routing::get(|| async { "ok" }))
+            .layer(RequireApiToken::new(store))
+            .layer(RequestIdLayer);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("request id header should be present")
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["request_id"], request_id);
+        assert_eq!(json["instance"], "/api/private");
+    }
+
+    // ── ApiToken extractor ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn api_token_extractor_yields_principal_id_to_handler() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        async fn handler(ApiToken(principal): ApiToken) -> String {
+            principal
+        }
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("user:99").await.unwrap();
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(handler))
+            .layer(RequireApiToken::new(Arc::clone(&store)));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "user:99");
+    }
+
+    #[tokio::test]
+    async fn api_token_extractor_rejects_when_no_principal_in_extensions() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        async fn handler(ApiToken(principal): ApiToken) -> String {
+            principal
+        }
+
+        let app = axum::Router::new().route("/", axum::routing::get(handler));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Composition with session auth ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn api_token_and_session_auth_compose_without_conflict() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        async fn api_handler(ApiToken(principal): ApiToken) -> String {
+            principal
+        }
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = store.issue("api_user").await.unwrap();
+
+        let session_store = MemoryStore::new();
+        session_store
+            .save(
+                "sess1",
+                std::collections::HashMap::from([("user_id".into(), "session_user".into())]),
+            )
+            .await
+            .unwrap();
+
+        let app = axum::Router::new()
+            .route(
+                "/api",
+                axum::routing::get(api_handler).layer(RequireApiToken::new(Arc::clone(&store))),
+            )
+            .layer(SessionLayer::new(session_store, SessionConfig::default()));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api")
+                    .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "api_user");
+    }
+
+    // ── poll_ready propagation ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn require_api_token_poll_ready_propagates_to_inner() {
+        use std::task::{Context, Poll};
+        use tower::{Layer, Service};
+
+        #[derive(Clone)]
+        struct MockService {
+            ready: bool,
+        }
+
+        impl tower::Service<axum::extract::Request> for MockService {
+            type Response = axum::response::Response;
+            type Error = std::convert::Infallible;
+            type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                if self.ready {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+
+            fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
+                std::future::ready(Ok(axum::response::Response::new(axum::body::Body::empty())))
+            }
+        }
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let layer = RequireApiToken::new(store);
+        let mut svc = layer.layer(MockService { ready: false });
+        assert!(svc.poll_ready(&mut cx).is_pending());
+
+        let store2 = Arc::new(InMemoryApiTokenStore::default());
+        let layer2 = RequireApiToken::new(store2);
+        let mut svc2 = layer2.layer(MockService { ready: true });
+        assert!(svc2.poll_ready(&mut cx).is_ready());
     }
 }

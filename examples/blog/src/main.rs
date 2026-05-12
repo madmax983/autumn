@@ -1,9 +1,12 @@
+mod admin;
 mod models;
 mod routes;
 mod schema;
+mod tasks;
 
+use autumn_admin_plugin::AdminPlugin;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
-use autumn_web::{routes, static_routes};
+use autumn_web::{jobs, one_off_tasks, routes, static_routes};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -11,11 +14,22 @@ const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        // Auto-load i18n bundle from `i18n/<locale>.ftl` according to the
+        // `[i18n]` block in `autumn.toml`. Visit `/greet` to see it work
+        // end-to-end with a locale switcher.
+        .i18n_auto()
+        .plugin(
+            AdminPlugin::new()
+                .prefix("/backoffice")
+                .require_role(None::<String>)
+                .register(admin::PostAdmin),
+        )
         .routes(routes![
             // Public routes
             routes::about::about, // #[static_get] — pre-rendered
             routes::posts::index,
             routes::posts::show,
+            routes::greet::greet, // i18n demo
             // Admin routes
             routes::posts::admin_list,
             routes::posts::new_form,
@@ -26,7 +40,10 @@ async fn main() {
             // JSON API
             routes::api::list_json,
             routes::api::create_json,
+            routes::api::enqueue_publish_webhook,
         ])
+        .jobs(jobs![routes::api::publish_webhook])
+        .one_off_tasks(one_off_tasks![tasks::cleanup_posts])
         .static_routes(static_routes![routes::about::about,])
         .run()
         .await;
@@ -35,6 +52,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    use autumn_admin_plugin::prelude::*;
 
     const MIGRATION_SQL: &str = include_str!("../migrations/00000000000000_create_posts/up.sql");
 
@@ -61,5 +80,52 @@ mod tests {
             sql.contains("ALTER SEQUENCE posts_id_seq AS BIGINT"),
             "post upgrade migration must widen the backing sequence to BIGINT",
         );
+    }
+
+    #[test]
+    fn backoffice_admin_fields_match_blog_post_shape() {
+        let fields = super::admin::PostAdmin.fields();
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "title"
+                    && matches!(field.kind, AdminFieldKind::Text)
+                    && field.searchable
+            }),
+            "expected searchable title field in admin schema"
+        );
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "published"
+                    && matches!(field.kind, AdminFieldKind::Boolean)
+                    && field.filterable
+            }),
+            "expected filterable published field in admin schema"
+        );
+        assert!(
+            fields.iter().any(|field| {
+                field.name == "created_at"
+                    && matches!(field.kind, AdminFieldKind::DateTime)
+                    && !field.editable
+            }),
+            "expected readonly created_at field in admin schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_about_page_renders_translated_layout_labels() {
+        let bundle = autumn_web::i18n::Bundle::load_from_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("i18n"),
+            &autumn_web::i18n::I18nConfig {
+                supported_locales: vec!["en".to_owned(), "es".to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect("blog i18n bundle");
+        let locale = autumn_web::i18n::Locale::new("en").with_bundle(std::sync::Arc::new(bundle));
+
+        let html = super::routes::about::about(locale).await.into_string();
+
+        assert!(html.contains("Autumn Blog"), "html: {html}");
+        assert!(!html.contains("nav.brand"), "html: {html}");
     }
 }

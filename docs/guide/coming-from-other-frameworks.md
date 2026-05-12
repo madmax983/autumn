@@ -220,6 +220,26 @@ async fn admin_panel() -> &'static str {
 }
 ```
 
+### Record-level authorization
+
+Spring Security's `@PreAuthorize` / `@PostAuthorize`, Rails Pundit,
+Phoenix Bodyguard, Django `has_object_permission`, and Rails
+`before_action` all answer the same question: "is this user allowed to
+act on *this specific record*?" Autumn's `Policy` trait + `#[authorize]`
+macro is the trait-plugin idiom for the same surface.
+
+| Framework            | Record-level authz idiom                                                  | Autumn equivalent                                                                       |
+|----------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|
+| Spring               | `@PreAuthorize("...")` / `@PostAuthorize`                                 | `#[authorize("update", resource = Post)]`                                               |
+| Rails                | `Pundit` — `authorize @post`, `policy_scope(Post)`, `before_action`       | `#[authorize(...)]` + `Scope` trait + `Policy::register_*`                              |
+| Phoenix              | `Bodyguard.permit(MyApp.Blog, :update_post, user, post)`                  | `autumn_web::authorization::authorize::<Post>(...)` (inline) or `#[authorize]`          |
+| Django               | `has_object_permission` (DRF) / `django-guardian`                         | `Policy::can_show / can_update / can_delete`                                            |
+| Loco.rs / axum / actix-web / rocket | Hand-rolled `if record.author_id != user_id` everywhere    | Single `Policy<R>` impl + `.policy::<R, _>(...)` registration                           |
+
+See [`docs/guide/authorization.md`](./authorization.md) for the full
+walkthrough including scope queries, `[security] forbidden_response`,
+and the reddit-clone migration.
+
 ### Actuator
 
 Both frameworks provide actuator endpoints out of the box:
@@ -573,8 +593,15 @@ autumn_web::app()
     .await;
 ```
 
-No Redis or external job queue needed for simple scheduled tasks. For durable
-workflows with retries and complex DAGs, see `autumn-harvest`.
+No Redis or external job queue is needed for simple scheduled tasks. For
+durable request-triggered background work with retries, use Autumn's `#[job]`
+runtime.
+
+For Temporal, Celery canvas, Sidekiq batches, Spring Batch, or Camunda-style
+orchestration, use Autumn Harvest. Harvest is the companion workflow engine for
+workflow history, long-running activities, timers, and singleton execution
+across replicas. It depends on Autumn Web integration points, so it stays on its
+own release train instead of being required by core web examples.
 
 ### Convention vs. Configuration
 
@@ -608,6 +635,7 @@ workflows with retries and complex DAGs, see `autumn-harvest`.
 | Config file            | `application.yml`      | `settings.py`         | `config/*.yml`         | `autumn.toml`                   |
 | Profiles               | `spring.profiles`      | `DJANGO_SETTINGS`     | `RAILS_ENV`            | `AUTUMN_PROFILE`                |
 | Background tasks       | `@Scheduled`           | Celery                | Sidekiq                | `#[scheduled(every = "5m")]`    |
+| Durable workflows      | Spring Batch / Camunda | Celery canvas         | Sidekiq batches        | Autumn Harvest (`autumn-harvest`) |
 | Template engine        | Thymeleaf              | Django templates      | ERB                    | Maud (compile-time HTML)        |
 | Middleware             | Servlet Filter         | Middleware             | Rack middleware         | Tower layers                    |
 | Health check           | Actuator               | Custom                | Custom                 | Built-in `/health`              |

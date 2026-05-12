@@ -16,6 +16,30 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+/// Scaffold-level accessibility posture reported by `/actuator/a11y`.
+///
+/// Each field indicates whether a foundational WCAG 2.1 AA scaffold concern is
+/// addressed in the application.  Apps generated with `autumn new` satisfy all
+/// three by default; existing apps can opt in incrementally.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct A11yPosture {
+    /// `<html lang="…">` is set in the page template.
+    pub lang_set: bool,
+    /// A skip-to-content link is present as the first focusable element.
+    pub skip_link_present: bool,
+    /// Semantic landmark regions (`<header>`, `<main>`, `<nav>`, `<footer>`)
+    /// are used in the page layout.
+    pub landmark_regions_present: bool,
+}
+
+impl A11yPosture {
+    /// Returns `true` when all scaffold-level a11y concerns are addressed.
+    #[must_use]
+    pub const fn is_compliant(&self) -> bool {
+        self.lang_set && self.skip_link_present && self.landmark_regions_present
+    }
+}
+
 /// Trait to abstract the state requirements for actuator handlers.
 ///
 /// Implement this trait on your application's state type to provide
@@ -33,6 +57,10 @@ pub trait ProvideActuatorState {
     /// Returns a reference to the [`TaskRegistry`] holding status and metadata
     /// for async scheduled background tasks.
     fn task_registry(&self) -> &TaskRegistry;
+
+    /// Returns a reference to the [`JobRegistry`] holding queue and failure
+    /// information for ad-hoc background jobs.
+    fn job_registry(&self) -> &JobRegistry;
 
     /// Returns a reference to the [`ConfigProperties`] snapshot, providing
     /// active configuration state for the environment endpoint.
@@ -61,6 +89,15 @@ pub trait ProvideActuatorState {
     fn pool(
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>;
+
+    /// Returns the scaffold-level accessibility posture reported by `/actuator/a11y`.
+    ///
+    /// Override this in your `AppState` implementation to declare which
+    /// WCAG 2.1 AA scaffold concerns your application addresses.  The default
+    /// returns all-false (no concerns addressed) — a conservative safe default.
+    fn a11y_posture(&self) -> A11yPosture {
+        A11yPosture::default()
+    }
 }
 
 // ── Shared types for AppState ──────────────────────────────────
@@ -113,26 +150,25 @@ impl LogLevels {
     /// Set the level for a specific logger. Returns the previous level if any.
     #[must_use]
     pub fn set_logger_level(&self, name: &str, level: &str) -> Option<String> {
-        if let Ok(mut guard) = self.inner.write() {
-            // Prevent unbounded memory growth from arbitrary logger names
-            if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
-                return None;
-            }
-
-            let previous = guard.logger_overrides.get(name).cloned();
-            guard
-                .logger_overrides
-                .insert(name.to_string(), level.to_string());
-            // If setting the root level, update current_level too
-            if name == "root" || name.is_empty() {
-                let prev = Some(guard.current_level.clone());
-                guard.current_level = level.to_string();
-                return prev;
-            }
-            previous
-        } else {
-            None
+        let Ok(mut guard) = self.inner.write() else {
+            return None;
+        };
+        // Prevent unbounded memory growth from arbitrary logger names
+        if guard.logger_overrides.len() >= 1000 && !guard.logger_overrides.contains_key(name) {
+            return None;
         }
+
+        let previous = guard.logger_overrides.get(name).cloned();
+        guard
+            .logger_overrides
+            .insert(name.to_string(), level.to_string());
+        // If setting the root level, update current_level too
+        if name == "root" || name.is_empty() {
+            let prev = Some(guard.current_level.clone());
+            guard.current_level = level.to_string();
+            return prev;
+        }
+        previous
     }
 }
 
@@ -149,6 +185,24 @@ impl std::fmt::Debug for LogLevels {
 pub struct TaskStatus {
     /// The schedule description (e.g., "every 5m" or "cron 0 0 * * *").
     pub schedule: String,
+    /// Whether this task is coordinated across the fleet or per replica.
+    pub coordination: crate::task::TaskCoordination,
+    /// Scheduler backend currently coordinating this task.
+    pub scheduler_backend: String,
+    /// Replica id for this process.
+    pub replica_id: String,
+    /// Replica id that last acquired leadership for this task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_leader: Option<String>,
+    /// Last global tick key observed for this task.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tick: Option<String>,
+    /// Last time this task fired (ISO 8601), if ever.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+    /// Next scheduled run time (ISO 8601), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<String>,
     /// Current task state.
     pub status: String,
     /// Last time the task ran (ISO 8601), if ever.
@@ -175,6 +229,135 @@ pub struct TaskRegistry {
     inner: Arc<RwLock<HashMap<String, TaskStatus>>>,
 }
 
+/// On-demand background job status information.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobStatus {
+    /// Approximate queued jobs waiting to run.
+    pub queued: u64,
+    /// Number of currently running jobs.
+    pub in_flight: u64,
+    /// Total successful executions.
+    pub total_successes: u64,
+    /// Total failed executions.
+    pub total_failures: u64,
+    /// Total dead-lettered executions.
+    pub dead_letters: u64,
+    /// Last observed error for this job, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+/// Registry of ad-hoc jobs and their runtime status.
+#[derive(Clone)]
+pub struct JobRegistry {
+    inner: Arc<RwLock<HashMap<String, JobStatus>>>,
+}
+
+impl JobRegistry {
+    /// Create a new empty job registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a job name with initial counters.
+    pub fn register(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.entry(name.to_string()).or_insert(JobStatus {
+                queued: 0,
+                in_flight: 0,
+                total_successes: 0,
+                total_failures: 0,
+                dead_letters: 0,
+                last_error: None,
+            });
+        }
+    }
+
+    /// Record that a new job instance was enqueued.
+    pub fn record_enqueue(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write() {
+            let status = guard.entry(name.to_string()).or_insert(JobStatus {
+                queued: 0,
+                in_flight: 0,
+                total_successes: 0,
+                total_failures: 0,
+                dead_letters: 0,
+                last_error: None,
+            });
+            status.queued = status.queued.saturating_add(1);
+        }
+    }
+
+    /// Record that a queued job started execution.
+    pub fn record_start(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
+        }
+    }
+
+    /// Record that a queued job was canceled before execution.
+    pub fn record_cancel(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+        }
+    }
+
+    /// Record a successful execution.
+    pub fn record_success(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.total_successes = status.total_successes.saturating_add(1);
+            status.last_error = None;
+        }
+    }
+
+    /// Record a retriable failure.
+    pub fn record_retry(&self, name: &str, error: &str, _attempt: u32) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.last_error = Some(error.to_string());
+        }
+    }
+
+    /// Record a terminal failure.
+    pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.in_flight = status.in_flight.saturating_sub(1);
+            status.total_failures = status.total_failures.saturating_add(1);
+            status.last_error = Some(error);
+            if dead_lettered {
+                status.dead_letters = status.dead_letters.saturating_add(1);
+            }
+        }
+    }
+
+    /// Snapshot all registered jobs.
+    #[must_use]
+    pub fn snapshot(&self) -> HashMap<String, JobStatus> {
+        self.inner.read().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl Default for JobRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskRegistry {
     /// Create a new empty task registry.
     #[must_use]
@@ -186,59 +369,119 @@ impl TaskRegistry {
 
     /// Register a task with its schedule description.
     pub fn register(&self, name: &str, schedule: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            guard.insert(
-                name.to_string(),
-                TaskStatus {
-                    schedule: schedule.to_string(),
-                    status: "idle".to_string(),
-                    last_run: None,
-                    last_duration_ms: None,
-                    last_result: None,
-                    last_error: None,
-                    total_runs: 0,
-                    total_failures: 0,
-                },
-            );
-        }
+        self.register_scheduled(
+            name,
+            schedule,
+            crate::task::TaskCoordination::Fleet,
+            "in_process",
+            "unknown",
+        );
+    }
+
+    /// Register a scheduled task with scheduler coordination metadata.
+    pub fn register_scheduled(
+        &self,
+        name: &str,
+        schedule: &str,
+        coordination: crate::task::TaskCoordination,
+        scheduler_backend: &str,
+        replica_id: &str,
+    ) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        guard.insert(
+            name.to_string(),
+            TaskStatus {
+                schedule: schedule.to_string(),
+                coordination,
+                scheduler_backend: scheduler_backend.to_string(),
+                replica_id: replica_id.to_string(),
+                current_leader: None,
+                last_tick: None,
+                last_fired_at: None,
+                next_run_at: None,
+                status: "idle".to_string(),
+                last_run: None,
+                last_duration_ms: None,
+                last_result: None,
+                last_error: None,
+                total_runs: 0,
+                total_failures: 0,
+            },
+        );
+    }
+
+    /// Record the replica that acquired leadership for a global task tick.
+    pub fn record_leader(&self, name: &str, leader_id: &str, tick_key: &str) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.current_leader = Some(leader_id.to_string());
+        task.last_tick = Some(tick_key.to_string());
     }
 
     /// Record that a task started running.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "running".to_string();
-            }
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "running".to_string();
+        task.next_run_at = None;
+    }
+
+    /// Record the next scheduled run time for an idle task.
+    pub fn record_next_run_at(&self, name: &str, next_run_at: &str) {
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.next_run_at = Some(next_run_at.to_string());
     }
 
     /// Record that a task completed successfully.
     pub fn record_success(&self, name: &str, duration_ms: u64) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "idle".to_string();
-                task.last_run = Some(chrono::Utc::now().to_rfc3339());
-                task.last_duration_ms = Some(duration_ms);
-                task.last_result = Some("ok".to_string());
-                task.last_error = None;
-                task.total_runs += 1;
-            }
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "idle".to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        task.last_run = Some(now.clone());
+        task.last_fired_at = Some(now);
+        task.last_duration_ms = Some(duration_ms);
+        task.last_result = Some("ok".to_string());
+        task.last_error = None;
+        task.total_runs += 1;
     }
 
     /// Record that a task failed.
     pub fn record_failure(&self, name: &str, duration_ms: u64, error: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(task) = guard.get_mut(name) {
-                task.status = "idle".to_string();
-                task.last_run = Some(chrono::Utc::now().to_rfc3339());
-                task.last_duration_ms = Some(duration_ms);
-                task.last_result = Some("failed".to_string());
-                task.last_error = Some(error.to_string());
-                task.total_runs += 1;
-                task.total_failures += 1;
-            }
-        }
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        let Some(task) = guard.get_mut(name) else {
+            return;
+        };
+        task.status = "idle".to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        task.last_run = Some(now.clone());
+        task.last_fired_at = Some(now);
+        task.last_duration_ms = Some(duration_ms);
+        task.last_result = Some("failed".to_string());
+        task.last_error = Some(error.to_string());
+        task.total_runs += 1;
+        task.total_failures += 1;
     }
 
     /// Get a snapshot of all task statuses.
@@ -299,6 +542,7 @@ impl ConfigProperties {
         Self::track_health_props(&mut props, config, &defaults, &profile_str);
         Self::track_actuator_props(&mut props, config, &defaults, &profile_str);
         Self::track_session_props(&mut props, config, &defaults, &profile_str);
+        Self::track_channels_props(&mut props, config, &defaults, &profile_str);
 
         Self {
             inner: Arc::new(RwLock::new(props)),
@@ -341,12 +585,47 @@ impl ConfigProperties {
         profile_str: &str,
     ) {
         let db_url = config.database.url.as_deref().unwrap_or("").to_string();
+        let primary_url = config
+            .database
+            .primary_url
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+        let replica_url = config
+            .database
+            .replica_url
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
         Self::track_property(props, "database.url", &db_url, "", profile_str);
+        Self::track_property(props, "database.primary_url", &primary_url, "", profile_str);
+        Self::track_property(props, "database.replica_url", &replica_url, "", profile_str);
         Self::track_property(
             props,
             "database.pool_size",
             &config.database.pool_size.to_string(),
             &defaults.database.pool_size.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.primary_pool_size",
+            &config.database.effective_primary_pool_size().to_string(),
+            &defaults.database.effective_primary_pool_size().to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.replica_pool_size",
+            &config.database.effective_replica_pool_size().to_string(),
+            &defaults.database.effective_replica_pool_size().to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.replica_fallback",
+            &format!("{:?}", config.database.replica_fallback),
+            &format!("{:?}", defaults.database.replica_fallback),
             profile_str,
         );
     }
@@ -580,6 +859,42 @@ impl ConfigProperties {
             "session.redis.key_prefix",
             &config.session.redis.key_prefix,
             &defaults.session.redis.key_prefix,
+            profile_str,
+        );
+    }
+
+    fn track_channels_props(
+        props: &mut HashMap<String, ConfigProperty>,
+        config: &crate::config::AutumnConfig,
+        defaults: &crate::config::AutumnConfig,
+        profile_str: &str,
+    ) {
+        Self::track_property(
+            props,
+            "channels.backend",
+            &format!("{:?}", config.channels.backend),
+            &format!("{:?}", defaults.channels.backend),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.capacity",
+            &config.channels.capacity.to_string(),
+            &defaults.channels.capacity.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.redis.url",
+            config.channels.redis.url.as_deref().unwrap_or(""),
+            defaults.channels.redis.url.as_deref().unwrap_or(""),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "channels.redis.key_prefix",
+            &config.channels.redis.key_prefix,
+            &defaults.channels.redis.key_prefix,
             profile_str,
         );
     }
@@ -996,6 +1311,26 @@ pub(crate) async fn tasks_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     }))
 }
 
+/// `GET <actuator-prefix>/jobs` -- ad-hoc background job status.
+pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let jobs = state.job_registry().snapshot();
+    Json(serde_json::json!({ "jobs": jobs }))
+}
+
+// ── A11y ───────────────────────────────────────────────────────
+
+/// `GET <actuator-prefix>/a11y` -- scaffold-level accessibility posture.
+///
+/// Returns a JSON object describing which WCAG 2.1 AA scaffold concerns the
+/// application addresses.  Available in all profiles (like `/actuator/health`).
+pub(crate) async fn a11y_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<A11yPosture> {
+    Json(state.a11y_posture())
+}
+
 // ── Channels (sensitive) ───────────────────────────────────────
 
 /// `GET <actuator-prefix>/channels` -- get current channel snapshots.
@@ -1084,6 +1419,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         actuator_route_path(prefix, "/health"),
         actuator_route_path(prefix, "/info"),
         actuator_route_path(prefix, "/metrics"),
+        actuator_route_path(prefix, "/a11y"),
         actuator_route_path(prefix, "/ui"),
         actuator_route_path(prefix, "/ui/metrics"),
     ];
@@ -1093,6 +1429,7 @@ pub(crate) fn actuator_endpoint_paths(prefix: &str, sensitive: bool) -> Vec<Stri
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
         paths.push(actuator_route_path(prefix, "/tasks"));
+        paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/prometheus"));
         #[cfg(feature = "ws")]
@@ -1136,6 +1473,10 @@ pub(crate) fn actuator_router_with_prefix<
         .route(
             &actuator_route_path(prefix, "/metrics"),
             axum::routing::get(metrics_endpoint::<S>),
+        )
+        .route(
+            &actuator_route_path(prefix, "/a11y"),
+            axum::routing::get(a11y_endpoint::<S>),
         );
 
     if sensitive {
@@ -1165,9 +1506,21 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(tasks_endpoint::<S>),
             )
             .route(
+                &actuator_route_path(prefix, "/jobs"),
+                axum::routing::get(jobs_endpoint::<S>),
+            )
+            .route(
                 &actuator_route_path(prefix, "/ui/tasks"),
                 axum::routing::get(ui_tasks::<S>),
             );
+
+        #[cfg(feature = "system-info")]
+        {
+            router = router.route(
+                &actuator_route_path(prefix, "/system"),
+                axum::routing::get(crate::system_info::system_info_handler),
+            );
+        }
 
         #[cfg(feature = "ws")]
         {
@@ -1199,30 +1552,186 @@ pub(crate) fn actuator_router_with_prefix<
 mod tests {
     use super::*;
     use crate::config::AutumnConfig;
-    use crate::state::AppState;
+
+    #[test]
+    fn task_registry_flow() {
+        let registry = TaskRegistry::new();
+
+        registry.register_scheduled(
+            "my_task",
+            "0 * * * * *",
+            crate::task::TaskCoordination::Fleet,
+            "mock",
+            "node-1",
+        );
+        let snap1 = registry.snapshot();
+        assert_eq!(snap1.get("my_task").unwrap().total_runs, 0);
+
+        registry.record_leader("my_task", "node-1", "mock_tick");
+        let snap3 = registry.snapshot();
+        assert_eq!(
+            snap3.get("my_task").unwrap().current_leader.as_deref(),
+            Some("node-1")
+        );
+
+        registry.record_start("my_task");
+        let snap4 = registry.snapshot();
+        assert_eq!(snap4.get("my_task").unwrap().status, "running");
+
+        registry.record_next_run_at("my_task", "tomorrow");
+        let snap5 = registry.snapshot();
+        assert_eq!(
+            snap5.get("my_task").unwrap().next_run_at.as_deref(),
+            Some("tomorrow")
+        );
+
+        registry.record_success("my_task", 100);
+        let snap6 = registry.snapshot();
+        assert_eq!(snap6.get("my_task").unwrap().total_runs, 1);
+        assert_eq!(snap6.get("my_task").unwrap().last_error, None);
+
+        registry.record_failure("my_task", 150, "error message");
+        let snap7 = registry.snapshot();
+        assert_eq!(snap7.get("my_task").unwrap().total_runs, 2);
+        assert_eq!(snap7.get("my_task").unwrap().total_failures, 1);
+        assert_eq!(
+            snap7.get("my_task").unwrap().last_error.as_deref(),
+            Some("error message")
+        );
+
+        let registry2 = TaskRegistry::default();
+        assert!(registry2.snapshot().is_empty());
+    }
+    #[test]
+    fn job_registry_flow() {
+        let registry = JobRegistry::new();
+
+        registry.register("my_job");
+        let snap1 = registry.snapshot();
+        assert_eq!(snap1.get("my_job").unwrap().queued, 0);
+
+        registry.record_enqueue("my_job");
+        let snap2 = registry.snapshot();
+        assert_eq!(snap2.get("my_job").unwrap().queued, 1);
+
+        registry.record_start("my_job");
+        let snap3 = registry.snapshot();
+        assert_eq!(snap3.get("my_job").unwrap().queued, 0);
+        assert_eq!(snap3.get("my_job").unwrap().in_flight, 1);
+
+        registry.record_retry("my_job", "timeout", 1);
+        let snap4 = registry.snapshot();
+        assert_eq!(snap4.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(
+            snap4.get("my_job").unwrap().last_error.as_deref(),
+            Some("timeout")
+        );
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_success("my_job");
+        let snap5 = registry.snapshot();
+        assert_eq!(snap5.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(snap5.get("my_job").unwrap().total_successes, 1);
+        assert_eq!(snap5.get("my_job").unwrap().last_error, None);
+
+        registry.record_enqueue("my_job");
+        registry.record_cancel("my_job");
+        let snap6 = registry.snapshot();
+        assert_eq!(snap6.get("my_job").unwrap().queued, 0);
+        assert_eq!(snap6.get("my_job").unwrap().in_flight, 0);
+
+        registry.record_enqueue("my_job");
+        registry.record_start("my_job");
+        registry.record_failure("my_job", "failure".to_string(), true);
+        let snap7 = registry.snapshot();
+        assert_eq!(snap7.get("my_job").unwrap().in_flight, 0);
+        assert_eq!(snap7.get("my_job").unwrap().total_failures, 1);
+        assert_eq!(snap7.get("my_job").unwrap().dead_letters, 1);
+        assert_eq!(
+            snap7.get("my_job").unwrap().last_error.as_deref(),
+            Some("failure")
+        );
+
+        let registry2 = JobRegistry::default();
+        let snap8 = registry2.snapshot();
+        assert!(snap8.is_empty());
+    }
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn test_state() -> AppState {
+    #[derive(Clone)]
+    struct TestActuatorState {
+        profile: String,
+        metrics: crate::middleware::MetricsCollector,
+        log_levels: LogLevels,
+        task_registry: TaskRegistry,
+        job_registry: JobRegistry,
+        config_props: ConfigProperties,
+        #[cfg(feature = "db")]
+        pool: Option<
+            diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+        >,
+        #[cfg(feature = "ws")]
+        channels: crate::channels::Channels,
+        #[cfg(feature = "ws")]
+        shutdown: tokio_util::sync::CancellationToken,
+    }
+
+    impl ProvideActuatorState for TestActuatorState {
+        fn metrics(&self) -> &crate::middleware::MetricsCollector {
+            &self.metrics
+        }
+        fn log_levels(&self) -> &LogLevels {
+            &self.log_levels
+        }
+        fn task_registry(&self) -> &TaskRegistry {
+            &self.task_registry
+        }
+        fn job_registry(&self) -> &JobRegistry {
+            &self.job_registry
+        }
+        fn config_props(&self) -> &ConfigProperties {
+            &self.config_props
+        }
+        fn profile(&self) -> &str {
+            &self.profile
+        }
+        fn uptime_display(&self) -> String {
+            "test_uptime".to_string()
+        }
+        #[cfg(feature = "db")]
+        fn pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+        {
+            self.pool.as_ref()
+        }
+        #[cfg(feature = "ws")]
+        fn channels(&self) -> &crate::channels::Channels {
+            &self.channels
+        }
+        #[cfg(feature = "ws")]
+        fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+            self.shutdown.clone()
+        }
+    }
+
+    fn test_state() -> TestActuatorState {
         test_state_with_config(&AutumnConfig::default())
     }
 
-    fn test_state_with_config(config: &AutumnConfig) -> AppState {
-        AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            profile: config.profile.clone().or_else(|| Some("dev".into())),
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
+    fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
+        TestActuatorState {
+            profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
+            job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
+            #[cfg(feature = "db")]
+            pool: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
@@ -1730,6 +2239,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn actuator_jobs_returns_registered_jobs() {
+        let state = test_state();
+        state.job_registry().register("send_email");
+        state.job_registry().record_enqueue("send_email");
+        state.job_registry().record_start("send_email");
+        state.job_registry().record_success("send_email");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/jobs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let job = &json["jobs"]["send_email"];
+        assert_eq!(job["queued"], 0);
+        assert_eq!(job["in_flight"], 0);
+        assert_eq!(job["total_successes"], 1);
+        assert_eq!(job["total_failures"], 0);
+    }
+
+    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn actuator_channels_returns_metrics() {
+        let state = test_state();
+        let mut rx = state.channels().subscribe("feed");
+        state
+            .channels()
+            .broadcast()
+            .publish("feed", "hello")
+            .expect("publish should succeed");
+        rx.try_recv().expect("subscriber should receive payload");
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/channels")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let feed = &json["channels"]["feed"];
+        assert_eq!(feed["subscriber_count"], 1);
+        assert_eq!(feed["lifetime_publish_count"], 1);
+        assert_eq!(feed["dropped_count"], 0);
+        assert_eq!(feed["lagged_count"], 0);
+    }
+
+    #[tokio::test]
     async fn actuator_tasks_hidden_in_nonsensitive_mode() {
         let app = actuator_router(false).with_state(test_state());
         let resp = app
@@ -1950,6 +2525,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ── RED: /actuator/a11y endpoint ───────────────────────────────
+
+    #[tokio::test]
+    async fn actuator_a11y_returns_posture_json() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["lang_set"].is_boolean(), "{json}");
+        assert!(json["skip_link_present"].is_boolean(), "{json}");
+        assert!(json["landmark_regions_present"].is_boolean(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_available_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_posture_default_values() {
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/a11y")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Default test state should report false for all posture fields
+        assert_eq!(json["lang_set"], false, "{json}");
+        assert_eq!(json["skip_link_present"], false, "{json}");
+        assert_eq!(json["landmark_regions_present"], false, "{json}");
+    }
+
+    #[test]
+    fn a11y_posture_all_passing_is_compliant() {
+        let posture = A11yPosture {
+            lang_set: true,
+            skip_link_present: true,
+            landmark_regions_present: true,
+        };
+        assert!(posture.is_compliant());
+    }
+
+    #[test]
+    fn a11y_posture_missing_lang_is_not_compliant() {
+        let posture = A11yPosture {
+            lang_set: false,
+            skip_link_present: true,
+            landmark_regions_present: true,
+        };
+        assert!(!posture.is_compliant());
+    }
+
+    #[tokio::test]
+    async fn actuator_a11y_endpoint_paths_includes_a11y() {
+        let paths = actuator_endpoint_paths("/actuator", false);
+        assert!(
+            paths.iter().any(|p| p == "/actuator/a11y"),
+            "a11y path not found in: {paths:?}"
+        );
     }
 }
 

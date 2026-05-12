@@ -5,14 +5,9 @@ version.workspace = true
 publish = false
 default-run = "reddit-clone"
 
-[[bin]]
-name = "reddit-clone-harvest-runner"
-path = "src/bin/harvest-runner.rs"
-
 [dependencies]
-autumn-harvest = "0.1"
-autumn-harvest-plugin = "0.1"
-autumn-web = { path = "../../autumn", features = ["ws"] }
+autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart", "redis"] }
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -33,5 +28,12 @@ thiserror = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+autumn-storage-s3 = { path = "../../autumn-storage-s3" }
+aws-sdk-s3 = "1"
+temp-env = { version = "0.3.6", features = ["async_closure"] }
+tempfile = "3"
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

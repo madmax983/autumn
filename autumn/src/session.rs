@@ -559,21 +559,28 @@ fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     let mut found_token = None;
 
     for cookie_header in headers.get_all(COOKIE) {
-        if let Ok(cookie_str) = cookie_header.to_str() {
-            for pair in cookie_str.split(';') {
-                let pair = pair.trim();
-                if let Some((k, v)) = pair.split_once('=') {
-                    if k.trim() == name {
-                        if found_token.is_some() {
-                            // Multiple cookies with the same name found.
-                            // This indicates a potential Cookie Tossing attack!
-                            // Reject by returning None.
-                            return None;
-                        }
-                        found_token = Some(v.trim().to_owned());
-                    }
-                }
+        let Ok(cookie_str) = cookie_header.to_str() else {
+            continue;
+        };
+
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+
+            if k.trim() != name {
+                continue;
             }
+
+            if found_token.is_some() {
+                // Multiple cookies with the same name found.
+                // This indicates a potential Cookie Tossing attack!
+                // Reject by returning None.
+                return None;
+            }
+
+            found_token = Some(v.trim().to_owned());
         }
     }
     found_token
@@ -623,6 +630,7 @@ fn build_expire_cookie(config: &SessionConfig) -> String {
 pub struct SessionLayer<S: SessionStore> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
+    signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -631,7 +639,23 @@ impl<S: SessionStore> SessionLayer<S> {
         Self {
             store: Arc::new(store),
             config: Arc::new(config),
+            signing_keys: None,
         }
+    }
+
+    /// Attach signing keys so session cookies are HMAC-signed.
+    ///
+    /// When set, the cookie value becomes `{session_id}.{hmac_hex}`. Cookies
+    /// without a valid HMAC are treated as absent (new session started).
+    /// Previous keys (see `ResolvedSigningKeys`) are tried during verification
+    /// so existing sessions remain valid across a key rotation.
+    #[must_use]
+    pub fn with_signing_keys(
+        mut self,
+        keys: Arc<crate::security::config::ResolvedSigningKeys>,
+    ) -> Self {
+        self.signing_keys = Some(keys);
+        self
     }
 }
 
@@ -643,6 +667,7 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
             inner,
             store: Arc::clone(&self.store),
             config: Arc::clone(&self.config),
+            signing_keys: self.signing_keys.clone(),
         }
     }
 }
@@ -653,6 +678,7 @@ pub struct SessionService<S: SessionStore, Inner> {
     inner: Inner,
     store: Arc<S>,
     config: Arc<SessionConfig>,
+    signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 }
 
 impl<St, Inner> Service<Request> for SessionService<St, Inner>
@@ -673,25 +699,38 @@ where
     fn call(&mut self, mut req: Request) -> Self::Future {
         let store = Arc::clone(&self.store);
         let config = Arc::clone(&self.config);
+        let signing_keys = self.signing_keys.clone();
         let mut inner = self.inner.clone();
         // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            // 1. Extract or create session ID
-            let existing_id = get_cookie(req.headers(), &config.cookie_name);
-            let mut generated_new_id = false;
+            // 1. Extract or create session ID (verify HMAC if signing is active)
+            let raw_cookie = get_cookie(req.headers(), &config.cookie_name);
+            let existing_id: Option<String> = match (raw_cookie, &signing_keys) {
+                (None, _) => None,
+                (Some(raw), None) => Some(raw),
+                (Some(raw), Some(keys)) => {
+                    // Signed format: "{session_id}.{hmac_hex}"
+                    if let Some((id, sig)) = raw.split_once('.') {
+                        if keys.verify(id.as_bytes(), sig) {
+                            Some(id.to_owned())
+                        } else {
+                            None // bad HMAC — treat as no session
+                        }
+                    } else {
+                        None // unsigned cookie when signing is required
+                    }
+                }
+            };
+
             let (session_id, data) = if let Some(ref id) = existing_id {
                 match store.load(id).await {
                     Ok(Some(data)) => (id.clone(), data),
-                    Ok(None) => {
-                        generated_new_id = true;
-                        (Uuid::new_v4().to_string(), HashMap::new())
-                    }
+                    Ok(None) => (Uuid::new_v4().to_string(), HashMap::new()),
                     Err(error) => return Ok(session_store_unavailable_response(&error)),
                 }
             } else {
-                generated_new_id = true;
                 (Uuid::new_v4().to_string(), HashMap::new())
             };
 
@@ -711,19 +750,24 @@ where
                 if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
-            } else if inner_guard.dirty || generated_new_id {
+            } else if inner_guard.dirty {
                 let data = inner_guard.data.clone();
                 let sid = inner_guard.id.clone();
-                if let Some(ref old_id) = inner_guard.old_id {
-                    if let Err(error) = store.destroy(old_id).await {
-                        return Ok(session_store_unavailable_response(&error));
-                    }
+                if let Some(ref old_id) = inner_guard.old_id
+                    && let Err(error) = store.destroy(old_id).await
+                {
+                    return Ok(session_store_unavailable_response(&error));
                 }
                 drop(inner_guard);
                 if let Err(error) = store.save(&sid, data).await {
                     return Ok(session_store_unavailable_response(&error));
                 }
-                if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &sid)) {
+                // Sign the session ID when signing keys are active
+                let cookie_value = signing_keys.as_ref().map_or_else(
+                    || sid.clone(),
+                    |keys| format!("{sid}.{}", keys.sign(sid.as_bytes())),
+                );
+                if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
                     response.headers_mut().append(SET_COOKIE, val);
                 }
             }
@@ -738,17 +782,22 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "Session store unavailable").into_response()
 }
 
-pub(crate) fn apply_session_layer(
-    router: axum::Router<crate::state::AppState>,
+pub(crate) fn apply_session_layer<S: Clone + Send + Sync + 'static>(
+    router: axum::Router<S>,
     config: &SessionConfig,
     profile: Option<&str>,
     custom_store: Option<Arc<dyn BoxedSessionStore>>,
-) -> Result<axum::Router<crate::state::AppState>, SessionBackendConfigError> {
+    signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
+) -> Result<axum::Router<S>, SessionBackendConfigError> {
     if let Some(store) = custom_store {
         tracing::debug!(
             "Custom session store installed via with_session_store(); skipping config-driven backend selection"
         );
-        return Ok(router.layer(SessionLayer::new(ArcSessionStore(store), config.clone())));
+        let mut layer = SessionLayer::new(ArcSessionStore(store), config.clone());
+        if let Some(keys) = signing_keys {
+            layer = layer.with_signing_keys(keys);
+        }
+        return Ok(router.layer(layer));
     }
 
     match config.backend_plan(profile)? {
@@ -759,13 +808,21 @@ pub(crate) fn apply_session_layer(
                      session.allow_memory_in_production=true to acknowledge the risk"
                 );
             }
-            Ok(router.layer(SessionLayer::new(MemoryStore::new(), config.clone())))
+            let mut layer = SessionLayer::new(MemoryStore::new(), config.clone());
+            if let Some(keys) = signing_keys {
+                layer = layer.with_signing_keys(keys);
+            }
+            Ok(router.layer(layer))
         }
         SessionBackendPlan::Redis { .. } => {
             #[cfg(feature = "redis")]
             {
                 let store = crate::session_redis::RedisStore::from_config(config)?;
-                Ok(router.layer(SessionLayer::new(store, config.clone())))
+                let mut layer = SessionLayer::new(store, config.clone());
+                if let Some(keys) = signing_keys {
+                    layer = layer.with_signing_keys(keys);
+                }
+                Ok(router.layer(layer))
             }
 
             #[cfg(not(feature = "redis"))]
@@ -1079,6 +1136,8 @@ mod tests {
             )),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1086,11 +1145,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         };
 
         let app = Router::new()
@@ -1120,6 +1184,8 @@ mod tests {
             extensions: Arc::new(std::sync::RwLock::new(HashMap::new())),
             #[cfg(feature = "db")]
             pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,
@@ -1127,11 +1193,16 @@ mod tests {
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: crate::actuator::LogLevels::new("info"),
             task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
             config_props: crate::actuator::ConfigProperties::default(),
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
         }
     }
 
@@ -1297,5 +1368,146 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── Signed session cookies (RED phase) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn session_cookie_is_signed_when_signing_keys_set() {
+        use crate::security::config::{SigningSecretConfig, resolve_signing_keys};
+        use std::sync::Arc;
+
+        let config = SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        };
+        let keys = Arc::new(resolve_signing_keys(&config));
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|s: Session| async move {
+                    s.insert("k", "v").await;
+                    "ok"
+                }),
+            )
+            .layer(
+                SessionLayer::new(MemoryStore::new(), SessionConfig::default())
+                    .with_signing_keys(keys),
+            );
+
+        let req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        let set_cookie = resp
+            .headers()
+            .get("set-cookie")
+            .expect("should set cookie")
+            .to_str()
+            .unwrap();
+        let cookie_value = set_cookie
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim();
+
+        assert!(
+            cookie_value.contains('.'),
+            "signed session cookie must be {{id}}.{{hmac}}, got: {cookie_value}"
+        );
+        let (id_part, sig_part) = cookie_value.split_once('.').unwrap();
+        assert!(!id_part.is_empty());
+        assert_eq!(sig_part.len(), 64, "HMAC-SHA256 hex must be 64 chars");
+    }
+
+    #[tokio::test]
+    async fn session_layer_rejects_tampered_cookie() {
+        use crate::security::config::{SigningSecretConfig, resolve_signing_keys};
+        use std::sync::Arc;
+
+        let keys = Arc::new(resolve_signing_keys(&SigningSecretConfig {
+            secret: Some("k".repeat(32)),
+            previous_secrets: vec![],
+        }));
+
+        let store = MemoryStore::new();
+        let session_id = Uuid::new_v4().to_string();
+        let mut data = HashMap::new();
+        data.insert("user".to_owned(), "alice".to_owned());
+        store.save(&session_id, data).await.unwrap();
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|s: Session| async move {
+                    s.get("user").await.unwrap_or_else(|| "none".to_owned())
+                }),
+            )
+            .layer(SessionLayer::new(store, SessionConfig::default()).with_signing_keys(keys));
+
+        // Valid UUID but bad 64-char hex HMAC
+        let bad_sig = "0".repeat(64);
+        let bad_cookie = format!("autumn.sid={session_id}.{bad_sig}");
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("cookie", bad_cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(&body[..], b"none", "tampered cookie must not load session");
+    }
+
+    #[tokio::test]
+    async fn session_layer_accepts_previous_key_signed_cookie() {
+        use crate::security::config::{
+            ResolvedSigningKeys, SigningSecretConfig, resolve_signing_keys,
+        };
+        use std::sync::Arc;
+
+        let old_secret = "old-key".repeat(5); // 35 bytes
+        let old_keys = resolve_signing_keys(&SigningSecretConfig {
+            secret: Some(old_secret.clone()),
+            previous_secrets: vec![],
+        });
+
+        let session_id = Uuid::new_v4().to_string();
+        let old_sig = old_keys.sign(session_id.as_bytes());
+        let signed_value = format!("{session_id}.{old_sig}");
+
+        let new_keys = Arc::new(ResolvedSigningKeys::new(
+            "new-key".repeat(5).into_bytes(),
+            vec![old_secret.into_bytes()],
+        ));
+
+        let store = MemoryStore::new();
+        let mut data = HashMap::new();
+        data.insert("user".to_owned(), "bob".to_owned());
+        store.save(&session_id, data).await.unwrap();
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|s: Session| async move {
+                    s.get("user").await.unwrap_or_else(|| "none".to_owned())
+                }),
+            )
+            .layer(SessionLayer::new(store, SessionConfig::default()).with_signing_keys(new_keys));
+
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("cookie", format!("autumn.sid={signed_value}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"bob",
+            "previous-key-signed cookie must load session"
+        );
     }
 }

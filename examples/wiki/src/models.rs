@@ -8,6 +8,8 @@ pub struct Page {
     pub slug: String,
     pub body: String,
     pub status: String,
+    #[lock_version]
+    pub lock_version: i32,
     #[default]
     pub created_at: chrono::NaiveDateTime,
     #[default]

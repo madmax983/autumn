@@ -5,6 +5,11 @@ edition = "2024"
 publish = false
 
 [dependencies]
-autumn-web = { path = "../../autumn", features = ["ws"] }
+autumn-web = { path = "../../autumn", features = ["ws", "redis"] }
+maud = { workspace = true }
+serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

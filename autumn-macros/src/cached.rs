@@ -115,22 +115,32 @@ fn generate_cache_body(
         static __AUTUMN_CACHE: ::std::sync::OnceLock<
             ::autumn_web::cache::MokaCache
         > = ::std::sync::OnceLock::new();
-        let __autumn_cache = __AUTUMN_CACHE.get_or_init(|| {
-            ::autumn_web::cache::MokaCache::new(#max_expr, #ttl_expr)
+        // Evaluate TTL once; Duration is Copy so it can be used for both
+        // the Moka initializer and the Redis insert call.
+        let __autumn_ttl: ::std::option::Option<::std::time::Duration> = #ttl_expr;
+        let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
+            ::autumn_web::cache::MokaCache::new(#max_expr, __autumn_ttl)
         });
-        let __autumn_key = ::autumn_web::cache::make_cache_key(#fn_name_str, #key_args);
+        // Use the process-level shared backend when registered, otherwise fall
+        // back to the per-function Moka store so zero-config local dev still works.
+        let __autumn_global = ::autumn_web::cache::global_cache();
+        let __autumn_cache: &dyn ::autumn_web::cache::Cache =
+            __autumn_global
+                .as_deref()
+                .unwrap_or(__autumn_moka as &dyn ::autumn_web::cache::Cache);
+        let __autumn_key = ::autumn_web::cache::make_cache_key(concat!(module_path!(), "::", #fn_name_str), #key_args);
     };
 
     if attrs.result {
         quote! {
             #cache_init
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+            if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
-                    ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone());
+                    ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl);
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
                 Err(__autumn_err) => Err(__autumn_err),
@@ -139,11 +149,11 @@ fn generate_cache_body(
     } else {
         quote! {
             #cache_init
-            if let Some(__autumn_cached) = ::autumn_web::cache::get::<#value_type>(__autumn_cache, &__autumn_key) {
+            if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return __autumn_cached;
             }
             let __autumn_result = #compute;
-            ::autumn_web::cache::insert::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone());
+            ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl);
             __autumn_result
         }
     }
@@ -291,6 +301,14 @@ mod tests {
         assert!(
             output_str.contains("OnceLock"),
             "should use OnceLock for static"
+        );
+        assert!(
+            output_str.contains("get_cached"),
+            "should use get_cached for serde-aware retrieval"
+        );
+        assert!(
+            output_str.contains("insert_cached"),
+            "should use insert_cached for serde-aware storage"
         );
     }
 

@@ -1,8 +1,8 @@
 //! `#[secured]` proc macro implementation.
 //!
 //! Generates an authentication/authorization guard that runs before
-//! the handler body. Injects a hidden `Session` extractor and prepends
-//! a call to the runtime check function.
+//! the handler body. Injects hidden `Session` and `AppState` extractors
+//! and prepends a call to the runtime check function.
 //!
 //! ## Forms
 //!
@@ -14,6 +14,8 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::parse::Parser as _;
 use syn::{ItemFn, LitStr};
+
+use crate::param_helpers::has_input_named;
 
 /// Parse the `#[secured(...)]` attribute arguments.
 ///
@@ -47,23 +49,36 @@ pub fn secured_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error();
     }
 
-    // Build the roles slice expression
-    let check_call = if roles.is_empty() {
-        quote! {
-            ::autumn_web::auth::__check_secured(&__autumn_session, &[]).await?;
-        }
-    } else {
-        let role_literals = roles.iter().map(|r| quote! { #r });
-        quote! {
-            ::autumn_web::auth::__check_secured(&__autumn_session, &[#(#role_literals),*]).await?;
-        }
+    let role_literals = roles.iter().map(|role| quote! { #role });
+    let check_call = quote! {
+        // Route macros read this marker when #[secured] expands before #[get]/#[post]/etc.
+        const __AUTUMN_SECURED_ROLES: &[&str] = &[#(#role_literals),*];
+        ::autumn_web::auth::__check_secured_with_key(
+            &__autumn_session,
+            __autumn_state.auth_session_key(),
+            __AUTUMN_SECURED_ROLES,
+        ).await?;
     };
 
-    // Inject the hidden Session parameter at the start of the parameter list
-    let session_param: syn::FnArg = syn::parse_quote! {
-        __autumn_session: ::autumn_web::session::Session
-    };
-    input_fn.sig.inputs.insert(0, session_param);
+    // Inject hidden State<AppState> and Session parameters at the start of
+    // the parameter list, but only if no other macro (typically `#[authorize]`) has
+    // already injected them. Without these guards, stacking
+    // `#[authorize]` + `#[secured]` in either attribute order would
+    // produce duplicate hidden parameters and fail to
+    // compile.
+    if !has_input_named(&input_fn, "__autumn_state") {
+        let state_param: syn::FnArg = syn::parse_quote! {
+            ::autumn_web::reexports::axum::extract::State(__autumn_state):
+                ::autumn_web::reexports::axum::extract::State<::autumn_web::AppState>
+        };
+        input_fn.sig.inputs.insert(0, state_param);
+    }
+    if !has_input_named(&input_fn, "__autumn_session") {
+        let session_param: syn::FnArg = syn::parse_quote! {
+            __autumn_session: ::autumn_web::session::Session
+        };
+        input_fn.sig.inputs.insert(0, session_param);
+    }
 
     // Prepend the check call to the function body
     let original_body = &input_fn.block;

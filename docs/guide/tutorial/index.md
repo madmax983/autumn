@@ -28,7 +28,16 @@ stuck, compare your code against the example.
 8. [JSON API](08-json-api.md) — `Json<T>` for request and response
 9. [Error Handling](09-errors.md) — `AutumnResult`, status codes, validation
 10. [Configuration and Production Defaults](10-configuration.md) — `autumn.toml`, env vars, logging
-11. [What's Next](11-whats-next.md) — extending the app, further reading
+11. [Writing Integration Tests](11-testing.md) — `TestApp`, `TestDb`, smoke tests and DB round-trips
+12. [What's Next](12-whats-next.md) — extending the app, further reading
+
+> **Going multilingual?** When you finish the tutorial, see the
+> [i18n guide](../i18n.md) for the opt-in Project Fluent integration —
+> file convention, `Locale` extractor, and the `t!()` macro.
+
+> **Accepting third-party callbacks?** See the
+> [signed webhook guide](../signed-webhooks.md) for Stripe/GitHub/Slack-style
+> HMAC verification and replay protection.
 
 ## How to Use This Tutorial
 
@@ -44,3 +53,20 @@ full file at any point, check the corresponding checkpoint or refer to
 If you have already read the [Getting Started guide](../getting-started.md),
 you can skim Chapter 1 — it covers similar ground but establishes the project
 you will build on for the rest of the tutorial.
+
+## Want the short version?
+
+If you're already comfortable with Rust web frameworks and just want a
+working CRUD app, the [Code Generators guide](../generators.md) collapses
+this whole tutorial into five commands:
+
+```bash
+autumn new my-app
+cd my-app
+autumn generate scaffold Post title:String body:Text published:bool
+autumn migrate
+autumn dev
+```
+
+The tutorial explains *why* each piece exists; the generators guide
+shows *how* to skip the typing once you know.

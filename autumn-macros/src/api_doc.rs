@@ -35,7 +35,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::parse::{Parse, ParseStream};
+use syn::parse::{Parse, ParseStream, Parser as _};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
@@ -265,24 +265,31 @@ fn slice_str(items: &[LitStr]) -> TokenStream {
 ///
 /// Closing braces without an opening brace are ignored. Segments that
 /// contain regex (`{id:[0-9]+}`) take only the name before the colon.
+/// Escaped braces (`{{` / `}}`) are treated as literal characters and skipped.
 pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let bytes = path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end_rel) = bytes[i + 1..].iter().position(|b| *b == b'}') {
-                let inner = &path[i + 1..i + 1 + end_rel];
-                let name = inner.split(':').next().unwrap_or(inner).trim();
-                if !name.is_empty() {
-                    out.push(name.to_owned());
-                }
-                i += 1 + end_rel + 1;
-                continue;
-            }
+    let mut remaining = path;
+
+    while let Some(start) = remaining.find('{') {
+        let after_brace = &remaining[start + 1..];
+        // `{{` is an escaped literal brace — skip both characters and continue.
+        if let Some(rest) = after_brace.strip_prefix('{') {
+            remaining = rest;
+            continue;
         }
-        i += 1;
+        let Some(end_rel) = after_brace.find('}') else {
+            break;
+        };
+
+        let inner = &after_brace[..end_rel];
+        let name = inner.split(':').next().unwrap_or(inner).trim();
+        if !name.is_empty() {
+            out.push(name.to_owned());
+        }
+
+        remaining = &after_brace[end_rel + 1..];
     }
+
     out
 }
 
@@ -331,10 +338,10 @@ fn unwrap_json_body(ty: &syn::Type) -> Option<syn::Type> {
     if let Some(inner) = unwrap_single_generic(ty, "Json") {
         return Some(inner);
     }
-    if let Some(inner) = unwrap_single_generic(ty, "Valid") {
-        if let Some(payload) = unwrap_single_generic(&inner, "Json") {
-            return Some(payload);
-        }
+    if let Some(inner) = unwrap_single_generic(ty, "Valid")
+        && let Some(payload) = unwrap_single_generic(&inner, "Json")
+    {
+        return Some(payload);
     }
     None
 }
@@ -401,7 +408,7 @@ fn unwrap_result_ok(ty: &syn::Type) -> Option<syn::Type> {
 
 /// If `ty` is `Name<Inner>` (single generic argument), return `Inner`.
 /// The outermost segment of `ty`'s path must match `wrapper`.
-fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
+pub fn unwrap_single_generic(ty: &syn::Type, wrapper: &str) -> Option<syn::Type> {
     let syn::Type::Path(path) = ty else {
         return None;
     };
@@ -470,7 +477,7 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
 }
 
 /// Map a short Rust primitive name to its JSON-schema `type` keyword.
-fn primitive_json_type(name: &str) -> Option<&'static str> {
+pub fn primitive_json_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "String" | "str" => "string",
         "bool" => "boolean",
@@ -483,11 +490,157 @@ fn primitive_json_type(name: &str) -> Option<&'static str> {
 }
 
 /// Return the final identifier in a type's path (e.g. `foo::Bar` → `"Bar"`).
-fn last_segment_name(ty: &syn::Type) -> Option<String> {
+pub fn last_segment_name(ty: &syn::Type) -> Option<String> {
     match ty {
         syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
         syn::Type::Reference(r) => last_segment_name(&r.elem),
         _ => None,
+    }
+}
+
+/// Inspect the handler's parameter list for `Query<T>` query-string extractors.
+///
+/// Returns `Some(tokens)` producing a `SchemaEntry` initializer when a
+/// `Query<T>` parameter is found, `None` otherwise. Only the first `Query`
+/// extractor is used — multiple `Query<T>` parameters are uncommon and the
+/// first one captures the intent.
+pub fn infer_query_params(input_fn: &syn::ItemFn) -> Option<TokenStream> {
+    for arg in &input_fn.sig.inputs {
+        let syn::FnArg::Typed(pat) = arg else {
+            continue;
+        };
+        if let Some(inner) = unwrap_single_generic(&pat.ty, "Query") {
+            return Some(schema_entry_for_type(&inner));
+        }
+    }
+    None
+}
+
+/// Detect `#[secured]` on a handler and return `(secured, required_roles)`.
+///
+/// Two detection strategies:
+/// 1. `#[secured]` still in attrs (route macro is outermost; secured is below it).
+/// 2. Function-local `__AUTUMN_SECURED_ROLES` marker present (secured was
+///    above the route macro and already expanded its body).
+/// 3. Legacy fallback: `__autumn_session` param present.
+pub fn extract_secured_info(input_fn: &syn::ItemFn) -> (bool, TokenStream) {
+    // Case 1 — #[secured] or #[autumn_web::secured] visible as a remaining attribute.
+    for attr in &input_fn.attrs {
+        if attr.path().is_ident("secured")
+            || attr
+                .path()
+                .segments
+                .last()
+                .is_some_and(|s| s.ident == "secured")
+        {
+            let roles = extract_secured_roles(attr);
+            let roles_tokens = emit_static_str_slice(&roles);
+            return (true, roles_tokens);
+        }
+    }
+
+    // Case 2 — #[secured] was above the route macro and already expanded;
+    // read the marker emitted into the guarded function body.
+    if let Some(roles) = extract_secured_roles_marker(input_fn) {
+        let roles_tokens = emit_static_str_slice(&roles);
+        return (true, roles_tokens);
+    }
+
+    // Case 3 — compatibility fallback for expansions produced before the
+    // marker existed. This can only recover that the route is secured.
+    let has_session = input_fn.sig.inputs.iter().any(|param| {
+        if let syn::FnArg::Typed(pt) = param
+            && let syn::Pat::Ident(pi) = pt.pat.as_ref()
+        {
+            return pi.ident == "__autumn_session";
+        }
+        false
+    });
+    if has_session {
+        return (true, quote! { &[] });
+    }
+
+    (false, quote! { &[] })
+}
+
+fn extract_secured_roles_marker(input_fn: &syn::ItemFn) -> Option<Vec<String>> {
+    extract_secured_roles_marker_from_stmts(&input_fn.block.stmts)
+}
+
+fn extract_secured_roles_marker_from_stmts(stmts: &[syn::Stmt]) -> Option<Vec<String>> {
+    stmts
+        .iter()
+        .find_map(extract_secured_roles_marker_from_stmt)
+}
+
+fn extract_secured_roles_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<String>> {
+    match stmt {
+        syn::Stmt::Item(syn::Item::Const(item_const))
+            if item_const.ident == "__AUTUMN_SECURED_ROLES" =>
+        {
+            extract_roles_from_marker_expr(&item_const.expr)
+        }
+        syn::Stmt::Expr(expr, _) => extract_secured_roles_marker_from_expr(expr),
+        syn::Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .and_then(|init| extract_secured_roles_marker_from_expr(&init.expr)),
+        _ => None,
+    }
+}
+
+fn extract_secured_roles_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
+    match expr {
+        syn::Expr::Block(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Async(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Unsafe(block) => extract_secured_roles_marker_from_stmts(&block.block.stmts),
+        _ => None,
+    }
+}
+
+fn extract_roles_from_marker_expr(expr: &syn::Expr) -> Option<Vec<String>> {
+    let syn::Expr::Reference(reference) = expr else {
+        return None;
+    };
+    let syn::Expr::Array(array) = reference.expr.as_ref() else {
+        return None;
+    };
+
+    let mut roles = Vec::with_capacity(array.elems.len());
+    for elem in &array.elems {
+        let syn::Expr::Lit(lit) = elem else {
+            return None;
+        };
+        let syn::Lit::Str(role) = &lit.lit else {
+            return None;
+        };
+        roles.push(role.value());
+    }
+    Some(roles)
+}
+
+fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
+    let syn::Meta::List(list) = &attr.meta else {
+        return Vec::new();
+    };
+    let roles: syn::Result<syn::punctuated::Punctuated<syn::LitStr, syn::Token![,]>> =
+        syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+            .parse2(list.tokens.clone());
+    match roles {
+        Ok(r) => r.iter().map(syn::LitStr::value).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn emit_static_str_slice(items: &[String]) -> TokenStream {
+    if items.is_empty() {
+        quote! { &[] }
+    } else {
+        let lits: Vec<_> = items
+            .iter()
+            .map(|s| LitStr::new(s, Span::call_site()))
+            .collect();
+        quote! { &[#(#lits),*] }
     }
 }
 
@@ -536,10 +689,62 @@ mod tests {
     }
 
     #[test]
+    fn extract_path_params_skips_escaped_braces() {
+        // `{{hello}}` is a static route segment, not a path parameter.
+        assert!(extract_path_params("/{{hello}}").is_empty());
+        // Escaped brace followed by a real param.
+        assert_eq!(
+            extract_path_params("/{{literal}}/{id}"),
+            vec!["id".to_owned()]
+        );
+    }
+
+    #[test]
     fn primitive_json_type_matches_common() {
         assert_eq!(primitive_json_type("String"), Some("string"));
         assert_eq!(primitive_json_type("i64"), Some("integer"));
         assert_eq!(primitive_json_type("bool"), Some("boolean"));
         assert_eq!(primitive_json_type("Foo"), None);
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &["admin", "editor"];
+            }
+        };
+
+        assert_eq!(
+            extract_secured_roles_marker(&input_fn),
+            Some(vec!["admin".to_owned(), "editor".to_owned()])
+        );
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_empty_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_ROLES: &[&str] = &[];
+            }
+        };
+
+        assert_eq!(extract_secured_roles_marker(&input_fn), Some(Vec::new()));
+    }
+
+    #[test]
+    fn secured_roles_marker_extracts_nested_roles() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                {
+                    const __AUTUMN_SECURED_ROLES: &[&str] = &["admin"];
+                }
+            }
+        };
+
+        assert_eq!(
+            extract_secured_roles_marker(&input_fn),
+            Some(vec!["admin".to_owned()])
+        );
     }
 }

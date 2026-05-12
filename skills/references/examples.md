@@ -97,13 +97,13 @@ async fn main() {
 This is the reference app for building production-grade autumn-web applications.
 It demonstrates every framework feature: auth, sessions, CSRF, `#[secured]`,
 `#[model]`, `#[repository]`, mutation hooks, `#[scheduled]`, `#[static_get]`,
-`#[ws]`, autumn-harvest durable workflows, plugins, and htmx voting.
+`#[ws]`, `#[job]`, plugins, and htmx voting.
 
 ```rust
 // examples/reddit-clone/src/main.rs
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
-use reddit_clone::{harvest_runtime, live_events, repositories, routes, tasks};
+use reddit_clone::{live_events, repositories, routes, tasks};
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
@@ -149,10 +149,8 @@ async fn main() {
             tasks::recalculate_hot_ranks,
             tasks::prune_live_feed_events,
         ])
-        .plugins((
-            harvest_runtime::harvest_plugin(),
-            live_events::LiveFeedPlugin::new(),
-        ))
+        .jobs(reddit_clone::jobs::registered_jobs())
+        .plugin(live_events::LiveFeedPlugin::new())
         .run()
         .await;
 }
@@ -167,14 +165,9 @@ version.workspace = true
 publish = false
 default-run = "reddit-clone"
 
-[[bin]]
-name = "reddit-clone-harvest-runner"
-path = "src/bin/harvest-runner.rs"
 
 [dependencies]
-autumn-harvest = "0.1"
-autumn-harvest-plugin = "0.1"
-autumn-web = { path = "../../autumn", features = ["ws"] }
+autumn-web = { path = "../../autumn", features = ["mail", "ws", "storage", "multipart", "redis"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono", "serde_json"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -196,13 +189,16 @@ uuid = { version = "1", features = ["v4"] }
 
 ### Key patterns from reddit-clone
 
-- **Two binaries**: main app + standalone harvest worker (`src/bin/harvest-runner.rs`)
-- **lib.rs**: Exports shared modules so both binaries and tests can access them
-- **Plugins tuple**: `.plugins((harvest_plugin(), LiveFeedPlugin::new()))` — multiple
-  plugins passed as a tuple
+- **lib.rs**: Exports shared modules so tests and binaries can access them
+- **Jobs registration**: `.jobs(reddit_clone::jobs::registered_jobs())` wires typed `#[job]` handlers into the runtime.
+- **Plugin registration**: `.plugin(LiveFeedPlugin::new())` starts the durable live-feed relay.
+- **Harvest boundary**: reddit-clone uses built-in jobs so autumn-web examples
+  do not depend on `autumn-harvest`. For durable multi-step workflows, use
+  Autumn Harvest as the companion workflow engine.
 - **Repository-generated API routes**: `repositories::subreddit_api_list` etc. come
   from the `#[repository]` macro, not from hand-written route handlers
 - **Static + dynamic routes coexist**: `about` is both in `routes![]` (dynamic) and
   `static_routes![]` (pre-rendered by `autumn build`)
 - **Workspace patch**: Root Cargo.toml uses `[patch.crates-io] autumn-web = { path = "autumn" }`
   to unify the local version across all workspace members
+

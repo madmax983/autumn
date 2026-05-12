@@ -24,9 +24,7 @@ fn main() {
         .status()
         .expect("Failed to run Tailwind CLI");
 
-    if !status.success() {
-        panic!("Tailwind CSS compilation failed");
-    }
+    assert!(status.success(), "Tailwind CSS compilation failed");
 }
 
 fn find_tailwind_cli() -> Option<std::path::PathBuf> {

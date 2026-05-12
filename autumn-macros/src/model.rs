@@ -53,7 +53,8 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`) that shouldn't be on the query struct (they'd confuse Diesel derives).
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`) that shouldn't be on the query struct
+/// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
         .attrs
@@ -63,14 +64,68 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("indexed")
                 && !a.path().is_ident("validate")
                 && !a.path().is_ident("default")
+                && !a.path().is_ident("factory_assoc")
+                && !a.path().is_ident("lock_version")
         })
         .collect()
 }
 
-/// True if a field has `#[id]` or `#[default]` — either way it's excluded
-/// from the `NewX` insert type.
+/// Extract the associated model type from `#[factory_assoc(TypeName)]` if present.
+///
+/// Returns `Some(Ident)` for the associated type, or `None` if the attribute is absent.
+/// Panics if `factory_assoc` is present but fails to parse — callers should run
+/// `validate_factory_assoc_attrs` first to surface a proper compile error.
+fn factory_assoc_type(field: &Field) -> Option<syn::Ident> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("factory_assoc")
+            && let Ok(ident) = attr.parse_args::<syn::Ident>()
+        {
+            return Some(ident);
+        }
+    }
+    None
+}
+
+/// Validate that every `#[factory_assoc(...)]` attribute contains a valid Ident.
+///
+/// Returns a compile error token stream on the first malformed attribute so the
+/// user gets a clear diagnostic instead of silent fallback-to-normal-field behavior.
+fn validate_factory_assoc_attrs(fields: &[&Field]) -> Option<TokenStream> {
+    for field in fields {
+        for attr in &field.attrs {
+            if attr.path().is_ident("factory_assoc") {
+                // Reject unparseable attribute argument.
+                if let Err(err) = attr.parse_args::<syn::Ident>() {
+                    return Some(err.to_compile_error());
+                }
+                // Reject Option<T> fields — the factory uses Option<T> itself to
+                // represent "not yet set vs. explicit value", so Option<Option<T>>
+                // would be generated, leading to an arm-type mismatch in create().
+                if is_option_type(&field.ty) {
+                    return Some(
+                        syn::Error::new_spanned(
+                            attr,
+                            "#[factory_assoc] cannot be applied to an Option<T> field; \
+                             factory_assoc is designed for non-nullable FK fields (e.g. i64). \
+                             Use a plain field setter to supply a nullable association.",
+                        )
+                        .to_compile_error(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+/// True if a field has `#[id]`, `#[default]`, or `#[lock_version]` — all
+/// three are excluded from the `NewX` insert type.
+///
+/// `#[lock_version]` fields are excluded because the DB column must carry a
+/// `DEFAULT 0` constraint; the initial version is always zero and is never
+/// supplied by the caller on insert.
 fn excluded_from_new(field: &Field) -> bool {
-    has_attr(field, "id") || has_attr(field, "default")
+    has_attr(field, "id") || has_attr(field, "default") || has_attr(field, "lock_version")
 }
 
 /// Convert a `snake_case` identifier to `PascalCase`.
@@ -97,7 +152,121 @@ fn is_option_type(ty: &syn::Type) -> bool {
     }
 }
 
+/// Return the final path segment name of a type (e.g. `foo::Bar` → `"Bar"`).
+fn type_name_str(ty: &syn::Type) -> String {
+    crate::api_doc::last_segment_name(ty).unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Emit a `TokenStream` that evaluates (at runtime) to a `serde_json::Value`
+/// representing the JSON Schema for the given Rust type.
+///
+/// Handles `Option<T>` (nullable), `Vec<T>` (array), primitives (`String`,
+/// `i64`, etc.), and everything else as a `$ref` to a component schema.
+fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
+    // Option<T> → OpenAPI 3.1 nullable: oneOf [{T-schema}, {type:null}]
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Option") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __inner = #inner_tokens;
+            ::autumn_web::reexports::serde_json::json!({ "oneOf": [__inner, { "type": "null" }] })
+        }};
+    }
+
+    // Vec<T> → {"type": "array", "items": <T-schema>}
+    if let Some(inner) = crate::api_doc::unwrap_single_generic(ty, "Vec") {
+        let inner_tokens = emit_json_schema_tokens(&inner);
+        return quote! {{
+            let __items = #inner_tokens;
+            ::autumn_web::reexports::serde_json::json!({ "type": "array", "items": __items })
+        }};
+    }
+
+    let name = type_name_str(ty);
+    crate::api_doc::primitive_json_type(&name).map_or_else(
+        || {
+            let ref_path = format!("#/components/schemas/{name}");
+            quote! { ::autumn_web::reexports::serde_json::json!({ "$ref": #ref_path }) }
+        },
+        |json_type| {
+            quote! { ::autumn_web::reexports::serde_json::json!({ "type": #json_type }) }
+        },
+    )
+}
+
+/// Emit the body of `OpenApiSchema::schema()` for a list of fields.
+///
+/// `all_optional` is `true` for `UpdateX` structs where every field is
+/// conceptually optional (backed by `Patch<T>`).
+fn emit_schema_fn_body(fields: &[&&Field], all_optional: bool) -> TokenStream {
+    emit_schema_fn_body_ext(fields, all_optional, &[])
+}
+
+fn emit_schema_fn_body_ext(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+) -> TokenStream {
+    let insertions: Vec<TokenStream> = fields
+        .iter()
+        .chain(extra_required.iter())
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let field_name = ident.to_string();
+            let schema_expr = emit_json_schema_tokens(&f.ty);
+            quote! {
+                __props.insert(#field_name.to_owned(), #schema_expr);
+            }
+        })
+        .collect();
+
+    let mut required_names: Vec<String> = if all_optional {
+        Vec::new()
+    } else {
+        fields
+            .iter()
+            .filter(|f| !is_option_type(&f.ty))
+            .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
+            .collect()
+    };
+    for f in extra_required {
+        if let Some(id) = f.ident.as_ref() {
+            required_names.push(id.to_string());
+        }
+    }
+
+    let required_tokens: Vec<TokenStream> = required_names
+        .iter()
+        .map(|name| {
+            quote! { ::autumn_web::reexports::serde_json::json!(#name) }
+        })
+        .collect();
+
+    quote! {
+        let mut __props = ::autumn_web::reexports::serde_json::Map::new();
+        #(#insertions)*
+        let mut __schema = ::autumn_web::reexports::serde_json::Map::new();
+        __schema.insert(
+            "type".to_owned(),
+            ::autumn_web::reexports::serde_json::json!("object"),
+        );
+        __schema.insert(
+            "properties".to_owned(),
+            ::autumn_web::reexports::serde_json::Value::Object(__props),
+        );
+        let __required: ::std::vec::Vec<::autumn_web::reexports::serde_json::Value> =
+            ::std::vec![#(#required_tokens),*];
+        if !__required.is_empty() {
+            __schema.insert(
+                "required".to_owned(),
+                ::autumn_web::reexports::serde_json::Value::Array(__required),
+            );
+        }
+        ::autumn_web::reexports::serde_json::Value::Object(__schema)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::cognitive_complexity)]
 pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input: DeriveInput = match syn::parse2(item) {
         Ok(input) => input,
@@ -151,7 +320,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         id_fields.iter().filter_map(|f| f.ident.as_ref()).collect()
     };
 
-    // Fields for NewX: exclude #[id], #[default], and auto-detected ID fields
+    // PK field ident + type — used by the test-support factory to generate
+    // `__autumn_pk()` so association setters don't hardcode `.id`.
+    let pk_field_for_factory: Option<(&syn::Ident, &syn::Type)> = if id_fields.is_empty() {
+        all_fields
+            .iter()
+            .find(|f| {
+                if let syn::Type::Path(tp) = &f.ty {
+                    tp.path.is_ident("i32") || tp.path.is_ident("i64")
+                } else {
+                    false
+                }
+            })
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    } else {
+        id_fields
+            .first()
+            .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
+    };
+
+    // Fields for NewX: exclude #[id], #[default], #[lock_version], and auto-detected ID fields
     let fields_for_new: Vec<&&Field> = all_fields
         .iter()
         .filter(|f| {
@@ -162,7 +350,20 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Fields for UpdateX: same set as NewX (all become Patch<T>)
+    // The single #[lock_version] field (if any). Only one is supported; the
+    // first one wins. The field is excluded from NewX but is included in
+    // UpdateX as a plain (non-Patch) required field so the client always
+    // sends the version they read.
+    let lock_version_field: Option<&&Field> =
+        all_fields.iter().find(|f| has_attr(f, "lock_version"));
+
+    // Validate #[factory_assoc] attributes before using them.
+    if let Some(err) = validate_factory_assoc_attrs(&all_fields) {
+        return err;
+    }
+
+    // Fields for UpdateX: Patch fields (from fields_for_new) plus the
+    // lock_version field (plain required type, not Patch<T>).
 
     // Check if any field has #[validate(...)]
     let has_validation = all_fields.iter().any(|f| !validate_attrs(f).is_empty());
@@ -189,9 +390,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Build UpdateX fields (non-ID, all Patch<T>; no #[validate] — validation
-    // doesn't apply to Patch<T> fields, only to NewX and the merged model)
-    let update_fields: Vec<TokenStream> = fields_for_new
+    // Build UpdateX fields:
+    // - Regular mutable fields: Patch<T> (no #[validate] — validation only
+    //   applies to NewX and the merged model)
+    // - #[lock_version] field: plain required T (the client supplies the
+    //   version they read; the framework increments it atomically)
+    let mut update_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
@@ -202,6 +406,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    if let Some(lv_field) = lock_version_field {
+        let ident = &lv_field.ident;
+        let ty = &lv_field.ty;
+        update_fields.push(quote! {
+            pub #ident: #ty
+        });
+    }
 
     // Build XField enum variants (one per mutable field, PascalCase)
     let field_enum_name = format_ident!("{name}Field");
@@ -222,7 +433,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Build merge arms for `from_patch` (applies Patch fields onto a cloned model)
-    let merge_arms: Vec<TokenStream> = fields_for_new
+    let mut merge_arms: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
@@ -250,6 +461,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // For #[lock_version] fields, from_patch always increments the version in
+    // `after` by one — the client-supplied patch.{field} is the expected
+    // (before) version; the repository validates it and the changeset carries
+    // the incremented value into the DB.
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        merge_arms.push(quote! {
+            after.#ident = current.#ident.wrapping_add(1);
+        });
+    }
 
     // Build per-field DraftField accessor method signatures (for the trait)
     let draft_accessor_sigs: Vec<TokenStream> = fields_for_new
@@ -283,7 +504,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Build Diesel-compatible changeset bridge (private struct with Option<T> fields)
     let changeset_name = format_ident!("__{}Changeset", name);
 
-    let changeset_fields: Vec<TokenStream> = fields_for_new
+    let mut changeset_fields: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = &f.ident;
@@ -295,8 +516,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { pub #ident: Option<#ty> }
         })
         .collect();
+    // The lock_version column must be in the changeset so the UPDATE can
+    // atomically bump it to current+1.
+    if let Some(lv_field) = lock_version_field {
+        let ident = &lv_field.ident;
+        let ty = &lv_field.ty;
+        changeset_fields.push(quote! { pub #ident: Option<#ty> });
+    }
 
-    let changeset_conversions: Vec<TokenStream> = fields_for_new
+    let mut changeset_conversions: Vec<TokenStream> = fields_for_new
         .iter()
         .map(|f| {
             let ident = f.ident.as_ref().unwrap();
@@ -324,6 +552,277 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         })
         .collect();
+    // The lock_version field in UpdateX holds the version the client expects;
+    // the changeset always sets it to current+1 (wrapping to avoid overflow).
+    if let Some(lv_field) = lock_version_field {
+        let ident = lv_field.ident.as_ref().unwrap();
+        changeset_conversions.push(quote! {
+            #ident: Some(self.#ident.wrapping_add(1))
+        });
+    }
+
+    // ── Factory builder ────────────────────────────────────────
+    let factory_name = format_ident!("{name}Factory");
+
+    // PK ident/type used for __autumn_pk() — fall back to a dummy `id: i64` if
+    // no PK can be detected (the factory will fail to compile at the call site,
+    // which is a better diagnostic than a macro panic).
+    let (pk_id, pk_ty): (&syn::Ident, &syn::Type) = pk_field_for_factory.unwrap_or_else(|| {
+        // Dummy values — unreachable for well-formed models, which always
+        // have at least one i32/i64 field or an explicit #[id] annotation.
+        panic!("#[model]: could not detect primary-key field for factory generation")
+    });
+
+    // Whether any factory field is an association (drives depth-check generation).
+    let has_assoc_fields = fields_for_new
+        .iter()
+        .any(|f| factory_assoc_type(f).is_some());
+
+    // Factory struct fields.
+    // - Normal fields:  `pub {ident}: {ty}`
+    // - Assoc fields:   `pub {ident}: Option<{ty}>` (None = auto-create on create())
+    let factory_struct_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            let ty = &f.ty;
+            if factory_assoc_type(f).is_some() {
+                quote! { pub #ident: ::core::option::Option<#ty> }
+            } else {
+                quote! { pub #ident: #ty }
+            }
+        })
+        .collect();
+
+    // Default impl.
+    // - Normal fields:  `{ident}: Default::default()`
+    // - Assoc fields:   `{ident}: None`
+    let factory_default_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            if factory_assoc_type(f).is_some() {
+                quote! { #ident: ::core::option::Option::None }
+            } else {
+                quote! { #ident: ::core::default::Default::default() }
+            }
+        })
+        .collect();
+
+    // Per-field setter methods.
+    // - Normal fields:  `pub fn {ident}(mut self, val: impl Into<T>) -> Self`
+    // - Assoc fields:   same setter (stores `Some(val.into())`), PLUS
+    //                   `pub fn {assoc_snake}(mut self, val: &AssocType) -> Self`
+    //                   that extracts `.id` from a pre-built instance.
+    let factory_setters: Vec<TokenStream> = fields_for_new
+        .iter()
+        .flat_map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            let ty = &f.ty;
+
+            factory_assoc_type(f).map_or_else(
+                // Normal field: a single setter that assigns directly.
+                || {
+                    vec![quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = val.into();
+                            self
+                        }
+                    }]
+                },
+                // Assoc field: two setters — explicit id and pre-built instance.
+                |assoc_type| {
+                    let explicit_setter = quote! {
+                        #[must_use]
+                        pub fn #ident(mut self, val: impl ::core::convert::Into<#ty>) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.into());
+                            self
+                        }
+                    };
+                    // Name derived from the field ident by stripping the `_id` suffix:
+                    // `user_id` → `.user()`, `author_id` → `.author()`.
+                    let field_str = ident.to_string();
+                    let assoc_snake = if field_str.ends_with("_id") {
+                        format_ident!("{}", &field_str[..field_str.len() - 3])
+                    } else {
+                        format_ident!("{}_assoc", field_str)
+                    };
+                    let pre_built_setter = quote! {
+                        /// Override the association with a pre-built instance.
+                        /// Extracts the primary key so no additional DB insert is performed on `create()`.
+                        #[must_use]
+                        pub fn #assoc_snake(mut self, val: &#assoc_type) -> Self {
+                            self.#ident = ::core::option::Option::Some(val.__autumn_pk());
+                            self
+                        }
+                    };
+                    vec![explicit_setter, pre_built_setter]
+                },
+            )
+        })
+        .collect();
+
+    // build() — assemble NewX.
+    // - Normal fields:  `{ident}: self.{ident}`
+    // - Assoc fields:   `{ident}: self.{ident}.unwrap_or_default()`
+    let factory_build_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = &f.ident;
+            if factory_assoc_type(f).is_some() {
+                quote! { #ident: self.#ident.unwrap_or_default() }
+            } else {
+                quote! { #ident: self.#ident }
+            }
+        })
+        .collect();
+
+    // create() — auto-resolve assoc fields, then insert.
+    //
+    // For each assoc field, emit a `let __resolved_{ident}` that either uses the
+    // supplied value or auto-creates the associated model via its factory.
+    //
+    // A thread-local depth counter guards against cyclic associations: if the
+    // chain exceeds 32 levels the factory panics with a clear message rather than
+    // overflowing the stack.
+    let assoc_resolutions: Vec<TokenStream> = fields_for_new
+        .iter()
+        .filter_map(|f| {
+            let assoc_type = factory_assoc_type(f)?;
+            let ident = f.ident.as_ref().unwrap();
+            let resolved = format_ident!("__resolved_{ident}");
+            Some(quote! {
+                let #resolved = match self.#ident {
+                    ::core::option::Option::Some(id) => id,
+                    ::core::option::Option::None => {
+                        #assoc_type::factory().create(pool).await.__autumn_pk()
+                    }
+                };
+            })
+        })
+        .collect();
+
+    // NewX construction inside create() uses resolved values for assoc fields.
+    let create_build_fields: Vec<TokenStream> = fields_for_new
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().unwrap();
+            if factory_assoc_type(f).is_some() {
+                let resolved = format_ident!("__resolved_{ident}");
+                quote! { #ident: #resolved }
+            } else {
+                quote! { #ident: self.#ident }
+            }
+        })
+        .collect();
+
+    // create() inner body — shared by both the assoc and non-assoc paths.
+    let create_inner_body = quote! {
+        use ::autumn_web::reexports::diesel::prelude::*;
+        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        #(#assoc_resolutions)*
+
+        let new_record = #new_name {
+            #(#create_build_fields,)*
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .expect("factory: failed to acquire db connection");
+        ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
+            .values(&new_record)
+            .returning(#name::as_returning())
+            .get_result(&mut *conn)
+            .await
+            .expect("factory: insert failed")
+    };
+
+    // create() — insert via Diesel and return the persisted model.
+    //
+    // For models with #[factory_assoc] fields, the body is wrapped in a
+    // `tokio::task_local` scope so the depth counter is maintained correctly
+    // when the future migrates between worker threads (work-stealing runtimes).
+    // Thread-local storage would corrupt the counter across await points.
+    let factory_create_method = if has_assoc_fields {
+        quote! {
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Fields annotated with `#[factory_assoc(Type)]` are auto-created via
+            /// `Type::factory().create(pool).await` when no explicit value was set.
+            /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
+            /// to skip the extra insert.
+            ///
+            /// Panics if the insert fails or if a cyclic association chain is detected
+            /// (depth > 32).
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                let __depth = ::autumn_web::__private::FACTORY_DEPTH
+                    .try_with(|d| d + 1)
+                    .unwrap_or(1_u32);
+                assert!(
+                    __depth <= 32,
+                    "factory `{}`: cyclic #[factory_assoc] chain exceeds depth 32 — \
+                     break the cycle by supplying a pre-built instance via a pre-built setter.",
+                    stringify!(#name),
+                );
+                ::autumn_web::__private::FACTORY_DEPTH
+                    .scope(__depth, async move { #create_inner_body })
+                    .await
+            }
+        }
+    } else {
+        quote! {
+            /// Insert a record built from this factory into the database and return
+            /// the fully-populated model (with server-assigned primary key).
+            ///
+            /// Panics if the insert fails.
+            pub async fn create(
+                self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> #name {
+                #create_inner_body
+            }
+        }
+    };
+
+    // ── Optimistic-lock helper bodies ──────────────────────────────────────
+    // Generate the bodies for the two hidden lock-version methods.
+    // For models without #[lock_version] both bodies return `None` so the
+    // repository macro can call them unconditionally.
+    let lock_version_actual_body: TokenStream = lock_version_field.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lv_field| {
+            let ident = lv_field.ident.as_ref().unwrap();
+            quote! { ::core::option::Option::Some(self.#ident as i64) }
+        },
+    );
+
+    let lock_version_expected_body: TokenStream = lock_version_field.map_or_else(
+        || quote! { ::core::option::Option::None },
+        |lv_field| {
+            let ident = lv_field.ident.as_ref().unwrap();
+            quote! { ::core::option::Option::Some(self.#ident as i64) }
+        },
+    );
+
+    // Compute schema bodies for OpenApiSchema impls.
+    // all_fields is Vec<&Field>; emit_schema_fn_body expects &[&&Field].
+    let all_field_refs: Vec<&&Field> = all_fields.iter().collect();
+    let query_struct_schema_body = emit_schema_fn_body(&all_field_refs, false);
+    let new_struct_schema_body = emit_schema_fn_body(&fields_for_new, false);
+    let update_struct_schema_body = {
+        let extra: &[&&Field] = lock_version_field.as_slice();
+        emit_schema_fn_body_ext(&fields_for_new, true, extra)
+    };
 
     quote! {
         #[derive(Debug, Clone, ::diesel::Queryable, ::diesel::Selectable, ::diesel::AsChangeset)]
@@ -397,6 +896,117 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             #(#draft_accessors)*
         }
+
+        /// Factory builder for [`#name`].
+        ///
+        /// Produced by [`#name::factory()`]. All fields are pre-filled with
+        /// `Default::default()` so callers only need to specify the fields that
+        /// matter for their scenario.
+        #[derive(Debug, Clone)]
+        #vis struct #factory_name {
+            #(#factory_struct_fields,)*
+        }
+
+        impl ::core::default::Default for #factory_name {
+            fn default() -> Self {
+                Self {
+                    #(#factory_default_fields,)*
+                }
+            }
+        }
+
+        impl #factory_name {
+            #(#factory_setters)*
+
+            /// Build a [`#new_name`] instance from the current factory state.
+            ///
+            /// Does not touch the database. Use [`#factory_name::create`] to
+            /// also persist the record.
+            #[must_use]
+            pub fn build(self) -> #new_name {
+                #new_name {
+                    #(#factory_build_fields,)*
+                }
+            }
+
+            #factory_create_method
+        }
+
+        impl #name {
+            /// Create a factory builder for constructing [`#name`] instances.
+            ///
+            /// Returns a [`#factory_name`] with all fields at their [`Default`]
+            /// value. Override any subset with the fluent setter methods, then call
+            /// `build()` for an in-memory instance or `create(pool)` to persist it.
+            #[must_use]
+            pub fn factory() -> #factory_name {
+                #factory_name::default()
+            }
+
+            /// Returns the primary-key value of this model.
+            ///
+            /// Used by generated `#[factory_assoc]` code to extract the PK from a
+            /// pre-built associated instance without hardcoding the field name.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_pk(&self) -> #pk_ty {
+                self.#pk_id.clone()
+            }
+        }
+
+        // ── Optimistic-lock helpers ─────────────────────────────────────
+        // Always emitted so the generated repository code can call them
+        // unconditionally regardless of whether the model has a
+        // `#[lock_version]` field.  The `None` paths compile away with zero
+        // overhead for models that don't use optimistic locking.
+
+        impl #name {
+            /// Returns the current stored lock version, or `None` if this model
+            /// does not have a `#[lock_version]` field.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_lock_version_actual(&self) -> ::core::option::Option<i64> {
+                #lock_version_actual_body
+            }
+        }
+
+        impl #update_name {
+            /// Returns the client-supplied expected lock version, or `None`
+            /// if this model does not have a `#[lock_version]` field.
+            ///
+            /// The repository compares this against the stored version and
+            /// returns `RepositoryError::Conflict` on a mismatch.
+            #[doc(hidden)]
+            #[inline]
+            pub fn __autumn_lock_version_expected(&self) -> ::core::option::Option<i64> {
+                #lock_version_expected_body
+            }
+        }
+
+        // ── OpenAPI schema impls ────────────────────────────────────────
+        // Always emitted (OpenApiSchema is not feature-gated) so external
+        // crates can register rich schemas without the openapi feature.
+
+        impl ::autumn_web::openapi::OpenApiSchema for #name {
+            fn schema_name() -> &'static str { stringify!(#name) }
+            fn schema() -> ::serde_json::Value {
+                #query_struct_schema_body
+            }
+        }
+
+        impl ::autumn_web::openapi::OpenApiSchema for #new_name {
+            fn schema_name() -> &'static str { stringify!(#new_name) }
+            fn schema() -> ::serde_json::Value {
+                #new_struct_schema_body
+            }
+        }
+
+        impl ::autumn_web::openapi::OpenApiSchema for #update_name {
+            fn schema_name() -> &'static str { stringify!(#update_name) }
+            fn schema() -> ::serde_json::Value {
+                #update_struct_schema_body
+            }
+        }
     }
 }
 
@@ -420,6 +1030,62 @@ pub fn pascal_to_snake(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RED: #[lock_version] detection ────────────────────────────────────
+    // These tests cover the new `excluded_from_new` behaviour (must also
+    // exclude `#[lock_version]` fields) and the helper that detects whether
+    // a field carries the attribute.
+
+    #[test]
+    fn lock_version_attr_detected_by_has_attr() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub version: i32
+        };
+        assert!(has_attr(&field, "lock_version"));
+    }
+
+    #[test]
+    fn lock_version_field_is_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub lock_version: i32
+        };
+        // A #[lock_version] field must be absent from NewModel (the DB
+        // supplies the initial value via a DEFAULT constraint).
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn regular_field_is_not_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            pub title: String
+        };
+        assert!(!excluded_from_new(&field));
+    }
+
+    #[test]
+    fn id_field_is_still_excluded_from_new() {
+        let field: syn::Field = syn::parse_quote! {
+            #[id]
+            pub id: i64
+        };
+        assert!(excluded_from_new(&field));
+    }
+
+    #[test]
+    fn lock_version_filtered_from_user_attrs() {
+        let field: syn::Field = syn::parse_quote! {
+            #[lock_version]
+            pub version: i32
+        };
+        let attrs = user_attrs(&field);
+        // The lock_version attribute must not leak onto the generated Diesel
+        // struct — Diesel doesn't know about it and would emit a warning/error.
+        assert!(attrs.is_empty());
+    }
+
+    // ── Existing tests ────────────────────────────────────────────────────
 
     #[test]
     fn pascal_to_snake_simple() {

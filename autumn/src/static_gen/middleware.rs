@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::StaticManifest;
+use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
 
 /// Per-route ISR state, tracking whether a regeneration is in flight
 /// and when the last regeneration attempt occurred.
@@ -52,6 +53,12 @@ pub struct StaticFileLayer {
     /// The Axum router used for ISR regeneration. Cloned from the app
     /// router at construction time. `None` if ISR is not needed.
     isr_router: Option<Arc<axum::Router>>,
+    /// Coordination backend that prevents duplicate regeneration.
+    /// Defaults to [`LocalIsrCoordinator`] (in-process only).
+    /// Use [`with_isr_coordinator`](Self::with_isr_coordinator) to supply
+    /// a distributed backend such as `PostgresIsrCoordinator` for
+    /// multi-replica deployments.
+    isr_coordinator: Arc<dyn IsrCoordinator>,
 }
 
 impl StaticFileLayer {
@@ -75,6 +82,7 @@ impl StaticFileLayer {
             manifest: Arc::new(manifest),
             isr_state: Arc::new(isr_state),
             isr_router: None,
+            isr_coordinator: Arc::new(LocalIsrCoordinator::new()),
         })
     }
 
@@ -85,6 +93,31 @@ impl StaticFileLayer {
     #[must_use]
     pub fn with_router(mut self, router: axum::Router) -> Self {
         self.isr_router = Some(Arc::new(router));
+        self
+    }
+
+    /// Set the ISR coordination backend.
+    ///
+    /// The default is [`LocalIsrCoordinator`], which is suitable for
+    /// single-replica and development deployments. For multi-replica
+    /// deployments sharing a writable `dist/` volume, supply a distributed
+    /// backend such as `PostgresIsrCoordinator` (feature `db`) to prevent
+    /// stampede writes.
+    ///
+    /// # Example (production multi-replica)
+    ///
+    /// ```rust,ignore
+    /// use std::sync::Arc;
+    /// use autumn_web::static_gen::{StaticFileLayer, PostgresIsrCoordinator};
+    ///
+    /// let layer = StaticFileLayer::new("dist")
+    ///     .unwrap()
+    ///     .with_router(app_router)
+    ///     .with_isr_coordinator(Arc::new(PostgresIsrCoordinator::new(pool)));
+    /// ```
+    #[must_use]
+    pub fn with_isr_coordinator(mut self, coordinator: Arc<dyn IsrCoordinator>) -> Self {
+        self.isr_coordinator = coordinator;
         self
     }
 
@@ -149,32 +182,55 @@ impl StaticFileLayer {
             return;
         }
 
-        // Try to claim the in-flight flag (CAS: false -> true)
+        // Try to claim the in-flight flag (CAS: false -> true).
+        // This prevents this process from spawning more than one task per route.
         if route_state
             .in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            // Another task is already regenerating this route
+            // Another task is already regenerating this route in this process
             return;
         }
 
         // Record attempt time
         route_state.last_attempt.store(now, Ordering::Relaxed);
 
+        // Compute the revalidation window key for distributed coordination
+        let window_key = isr_window_key(url_path, revalidate_secs, now);
+
         // Spawn background regeneration
         let router = Arc::clone(router);
         let url = url_path.to_owned();
         let dest = file_path.to_owned();
         let in_flight = Arc::clone(&self.isr_state);
+        let coordinator = Arc::clone(&self.isr_coordinator);
 
         tokio::spawn(async move {
+            // RAII guard: clears the in_flight flag when this scope exits,
+            // including on panic, so ISR is never permanently disabled for
+            // a route after a handler crash.
+            let _guard = InFlightReset {
+                state: &in_flight,
+                url: &url,
+            };
+
+            // Distributed coordination: prevents multiple replicas from
+            // regenerating the same route in the same revalidation window.
+            let acquired = coordinator.try_acquire(&url, &window_key).await;
+            if !acquired {
+                tracing::debug!(
+                    route = %url,
+                    backend = coordinator.backend(),
+                    "ISR: another replica holds the lock for this window, skipping"
+                );
+                return; // _guard drops here, resetting in_flight
+            }
+
             let result = regenerate_page(&router, &url, &dest).await;
 
-            // Clear the in-flight flag
-            if let Some(state) = in_flight.get(&url) {
-                state.in_flight.store(false, Ordering::Release);
-            }
+            // Release distributed lock before the guard drops.
+            coordinator.release(&url, &window_key).await;
 
             match result {
                 Ok(()) => {
@@ -184,7 +240,25 @@ impl StaticFileLayer {
                     tracing::warn!(route = %url, error = %e, "ISR: regeneration failed");
                 }
             }
+            // _guard drops here, resetting in_flight
         });
+    }
+}
+
+/// RAII guard that resets the per-route `in_flight` flag when dropped.
+///
+/// Placed at the top of every ISR background task so the flag is always
+/// cleared on normal exit, early return, or panic.
+struct InFlightReset<'a> {
+    state: &'a HashMap<String, IsrRouteState>,
+    url: &'a str,
+}
+
+impl Drop for InFlightReset<'_> {
+    fn drop(&mut self) {
+        if let Some(s) = self.state.get(self.url) {
+            s.in_flight.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -610,5 +684,60 @@ mod tests {
         // Original file should be untouched
         let content = std::fs::read_to_string(&dest).unwrap();
         assert_eq!(content, "old content");
+    }
+
+    #[tokio::test]
+    async fn isr_coordinator_deny_clears_in_flight_and_skips_regen() {
+        use crate::static_gen::isr_coordinator::IsrFuture;
+
+        // A coordinator that always denies acquisition — exercises the
+        // `if !acquired { return; }` branch in the spawned ISR task.
+        struct DenyCoordinator;
+        impl IsrCoordinator for DenyCoordinator {
+            fn backend(&self) -> &'static str {
+                "deny"
+            }
+
+            fn try_acquire<'a>(&'a self, _: &'a str, _: &'a str) -> IsrFuture<'a, bool> {
+                Box::pin(async { false })
+            }
+
+            fn release<'a>(&'a self, _: &'a str, _: &'a str) -> IsrFuture<'a, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let tmp = create_isr_dist(1);
+        let dist = tmp.path().join("dist");
+        let file = dist.join("about/index.html");
+
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(100);
+        let _ = filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(old_time));
+
+        let router =
+            axum::Router::new().fallback(axum::routing::get(|| async { "should not appear" }));
+        let layer = StaticFileLayer::new(&dist)
+            .expect("layer")
+            .with_router(router)
+            .with_isr_coordinator(Arc::new(DenyCoordinator));
+
+        // Trigger the ISR background task.
+        let _ = layer.resolve("/about");
+
+        // Wait for the spawned task to run the deny branch and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // InFlightReset guard must have cleared the flag despite early return.
+        let state = layer.isr_state.get("/about").unwrap();
+        assert!(
+            !state.in_flight.load(Ordering::Relaxed),
+            "in_flight must be cleared when coordinator denies acquisition"
+        );
+
+        // File must be unchanged — regeneration was skipped.
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "<h1>About (stale)</h1>"
+        );
     }
 }

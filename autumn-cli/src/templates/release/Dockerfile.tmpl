@@ -1,0 +1,83 @@
+# ── Stage 1: cargo-chef planner ──────────────────────────────────────────────
+FROM rust:{{rust_version}}-bookworm AS chef
+WORKDIR /app
+
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: builder ──────────────────────────────────────────────────────────
+FROM chef AS builder
+
+ARG TAILWIND_VERSION=v4.1.4
+ARG AUTUMN_CLI_VERSION={{autumn_cli_version}}
+ARG DIESEL_CLI_VERSION={{diesel_cli_version}}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libpq-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-build dependencies — this layer is cached unless Cargo.lock changes.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Download Tailwind CSS for asset compilation; detect arch for ARM64/x86_64 support.
+RUN mkdir -p target/autumn \
+    && arch=$(uname -m) \
+    && if [ "$arch" = "x86_64" ]; then suffix="linux-x64"; \
+       elif [ "$arch" = "aarch64" ]; then suffix="linux-arm64"; \
+       else echo "Unsupported architecture: $arch" && exit 1; fi \
+    && curl -fsSL \
+        -o target/autumn/tailwindcss \
+        "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-${suffix}" \
+    && chmod +x target/autumn/tailwindcss
+
+COPY . .
+RUN cargo build --release
+RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
+RUN cargo install diesel_cli \
+    --version "${DIESEL_CLI_VERSION}" \
+    --no-default-features \
+    --features postgres
+
+# ── Stage 3: runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libpq5 \
+        tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --create-home --uid 10001 autumn \
+    && mkdir -p /app && chown autumn:autumn /app
+
+WORKDIR /app
+
+COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
+COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
+COPY --chown=autumn:autumn --from=builder /app/static /app/static
+COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
+# Use the production config example as the runtime autumn.toml.
+# It sets host = "0.0.0.0" and leaves migration ownership to an explicit
+# one-shot primary-role job.
+COPY --chown=autumn:autumn --from=builder /app/autumn.production.toml.example /app/autumn.toml
+
+ENV AUTUMN_PROFILE=prod
+EXPOSE 3000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+USER autumn
+
+# Run migrations once before rolling web replicas, targeting only the primary:
+#   AUTUMN_DATABASE__PRIMARY_URL=... autumn migrate
+# Then start this image as the web process. Replica lag should fail readiness
+# or fall back to primary according to database.replica_fallback.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/usr/local/bin/{{project_name}}"]

@@ -1,17 +1,18 @@
+mod build_support;
+
 fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=static/css/input.css");
     println!("cargo:rerun-if-changed=tailwind.config.js");
+    println!("cargo:rerun-if-changed=static/css/autumn.css");
+    println!("cargo:rerun-if-env-changed=AUTUMN_REQUIRE_TAILWIND");
 
     let Some(tailwind) = find_tailwind_cli() else {
-        println!(
-            "cargo:warning=Tailwind CSS CLI not found — CSS will not be compiled. \
-             Run `autumn setup` or install tailwindcss manually."
-        );
+        handle_tailwind_unavailable("Tailwind CSS CLI not found");
         return;
     };
 
-    let status = std::process::Command::new(&tailwind)
+    let output = std::process::Command::new(&tailwind)
         .args([
             "-i",
             "static/css/input.css",
@@ -21,11 +22,32 @@ fn main() {
             "src/**/*.rs",
             "--minify",
         ])
-        .status()
-        .expect("Failed to run Tailwind CLI");
+        .output();
 
-    if !status.success() {
-        panic!("Tailwind CSS compilation failed");
+    match output {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            handle_tailwind_unavailable(&format!(
+                "Tailwind CSS CLI exited with status {}: {stderr}",
+                output.status
+            ));
+        }
+        Err(error) => {
+            handle_tailwind_unavailable(&format!("failed to run Tailwind CSS CLI: {error}"));
+        }
+    }
+}
+
+fn handle_tailwind_unavailable(reason: &str) {
+    let require_tailwind = build_support::require_tailwind_from_env();
+    match build_support::tailwind_failure_action(require_tailwind) {
+        build_support::TailwindFailureAction::FailBuild => {
+            panic!("{reason}; AUTUMN_REQUIRE_TAILWIND is set");
+        }
+        build_support::TailwindFailureAction::SkipRegeneration => {
+            println!("cargo:warning={reason}; skipping static/css/autumn.css regeneration");
+        }
     }
 }
 

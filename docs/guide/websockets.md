@@ -32,7 +32,7 @@ async fn main() {
 Enable the feature in your `Cargo.toml`:
 
 ```toml
-autumn-web = { version = "0.2", features = ["ws"] }
+autumn-web = { version = "0.4", features = ["ws"] }
 ```
 
 ## The two-function pattern
@@ -130,6 +130,10 @@ let mut rx = channels.subscribe("lobby");   // consumer
 Every `#[ws]` handler can own its own subscriber, so a single publish
 fans out to every connected socket.
 
+For SSE streams, htmx out-of-band HTML broadcasts, Redis-backed
+multi-replica fan-out, and channel actuator metrics, see
+[`realtime.md`](realtime.md).
+
 ## Testing
 
 See `examples/ws-echo` for a runnable minimal server and
@@ -142,8 +146,7 @@ The `#[ws]` macro is a thin, ergonomic wrapper over Axum's WebSocket
 support. It deliberately does **not** ship with:
 
 - Application-level protocols (Socket.io, STOMP, GraphQL subscriptions)
-- Cross-process pub/sub (Redis, NATS) — pair `Channels` with your own
-  relay
-- Automatic fallback to SSE or long-polling
+- Durable replay or event persistence
+- Client-side htmx extension bundling beyond Autumn's embedded htmx core
 
 Build those on top when you need them; the primitives are here.

@@ -11,3 +11,22 @@ path = "/health"
 
 [security.csrf]
 enabled = true
+
+# Production file-storage configuration. Uncomment to push uploaded
+# blobs (avatars, attachments) to an S3-compatible bucket so they
+# survive container restarts and are visible to every replica.
+#
+# Requires the `autumn-storage-s3` plugin; see docs/guide/storage.md.
+#
+# [profile.prod.storage]
+# backend = "s3"
+# default_provider = "default"
+#
+# [profile.prod.storage.s3]
+# bucket = "reddit-clone-uploads"
+# region = "us-east-1"
+# # Custom endpoint for non-AWS S3-compatible providers (R2, MinIO, ...)
+# # endpoint = "https://<account>.r2.cloudflarestorage.com"
+# access_key_id_env = "AWS_ACCESS_KEY_ID"
+# secret_access_key_env = "AWS_SECRET_ACCESS_KEY"
+# force_path_style = false
