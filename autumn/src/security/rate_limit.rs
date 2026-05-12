@@ -241,9 +241,9 @@ impl Limiter {
     /// If trusted proxies are configured, the `X-Forwarded-For` chain is
     /// walked from right to left and configured proxy IPs/CIDRs are
     /// skipped, but only when the request peer is present and trusted.
-    /// Without a trusted proxy list, the first non-empty XFF entry is used
-    /// for the existing single-proxy setup where standard proxies append
-    /// `client, proxy`.
+    /// Without a trusted proxy list, the last non-empty XFF entry is used
+    /// for the existing single-proxy setup where proxies append the peer
+    /// address after any client-supplied header value.
     fn client_ip<B>(&self, req: &Request<B>) -> Option<String> {
         if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
             let xff_ip = req
@@ -289,7 +289,7 @@ impl Limiter {
     fn client_ip_from_x_forwarded_for(&self, header: &str) -> Option<String> {
         if !self.trusted_proxies_configured {
             return header
-                .split(',')
+                .rsplit(',')
                 .next()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -586,28 +586,28 @@ mod tests {
     }
 
     #[test]
-    fn client_ip_uses_forwarded_client_entry_without_proxy_list() {
+    fn client_ip_uses_proxy_appended_entry_without_proxy_list() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "attacker_spoofed_ip, real_client_ip")
             .body(())
             .expect("infallible response builder");
         assert_eq!(
             limiter(true).client_ip(&req).as_deref(),
-            Some("attacker_spoofed_ip")
+            Some("real_client_ip")
         );
     }
 
     #[test]
-    fn client_ip_prefers_x_forwarded_for_client_entry_when_trusted_without_proxy_list() {
+    fn client_ip_prefers_x_forwarded_for_proxy_appended_entry_without_proxy_list() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "1.2.3.4, 5.6.7.8")
             .body(())
             .expect("infallible response builder");
-        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("1.2.3.4"));
+        assert_eq!(limiter(true).client_ip(&req).as_deref(), Some("5.6.7.8"));
     }
 
     #[test]
-    fn client_ip_uses_forwarded_client_entry_without_configured_proxy_list() {
+    fn client_ip_uses_rightmost_forwarded_entry_without_configured_proxy_list() {
         let req: Request<()> = Request::builder()
             .header("X-Forwarded-For", "198.51.100.77, 203.0.113.10")
             .body(())
@@ -615,7 +615,7 @@ mod tests {
 
         assert_eq!(
             limiter(true).client_ip(&req).as_deref(),
-            Some("198.51.100.77")
+            Some("203.0.113.10")
         );
     }
 
