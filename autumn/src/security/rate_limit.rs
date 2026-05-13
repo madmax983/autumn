@@ -1221,4 +1221,54 @@ mod tests {
             .expect("infallible response builder");
         assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
     }
+
+    // ── Redis backend build_backend fallback tests ────────────────────────────
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_backend_falls_back_to_memory_when_redis_url_missing() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: None,
+                key_prefix: "test:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailOpen,
+        };
+        // When no Redis URL is provided, build_backend must not panic and the
+        // limiter must still enforce in-memory rate limits.
+        let limiter = Limiter::from_config(&config);
+        assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn build_backend_falls_back_to_memory_for_invalid_redis_url() {
+        use super::super::config::{
+            RateLimitBackend, RateLimitBackendFailure, RateLimitRedisConfig,
+        };
+        let config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 10.0,
+            burst: 5,
+            trust_forwarded_headers: false,
+            trusted_proxies: Vec::new(),
+            backend: RateLimitBackend::Redis,
+            redis: RateLimitRedisConfig {
+                url: Some("not_a_valid_redis_url://???".to_owned()),
+                key_prefix: "test:rl".to_owned(),
+            },
+            on_backend_failure: RateLimitBackendFailure::FailClosed,
+        };
+        let limiter = Limiter::from_config(&config);
+        assert!(matches!(limiter.backend, BucketBackend::Memory(_)));
+    }
 }

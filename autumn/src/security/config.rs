@@ -1222,6 +1222,52 @@ mod tests {
         assert!(config.redis.url.is_none());
     }
 
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_backend_from_env_value() {
+        assert_eq!(
+            RateLimitBackend::from_env_value("memory"),
+            Some(RateLimitBackend::Memory)
+        );
+        assert_eq!(
+            RateLimitBackend::from_env_value("redis"),
+            Some(RateLimitBackend::Redis)
+        );
+        assert_eq!(
+            RateLimitBackend::from_env_value("REDIS"),
+            Some(RateLimitBackend::Redis)
+        );
+        assert_eq!(RateLimitBackend::from_env_value("postgres"), None);
+        assert_eq!(RateLimitBackend::from_env_value(""), None);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn rate_limit_backend_failure_from_env_value() {
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("fail_open"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("open"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("FAIL_OPEN"),
+            Some(RateLimitBackendFailure::FailOpen)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("fail_closed"),
+            Some(RateLimitBackendFailure::FailClosed)
+        );
+        assert_eq!(
+            RateLimitBackendFailure::from_env_value("closed"),
+            Some(RateLimitBackendFailure::FailClosed)
+        );
+        assert_eq!(RateLimitBackendFailure::from_env_value("panic"), None);
+        assert_eq!(RateLimitBackendFailure::from_env_value(""), None);
+    }
+
     #[test]
     fn rate_limit_config_deserialize() {
         let toml_str = r#"
