@@ -145,8 +145,7 @@ mod tests {
     #[test]
     fn default_profile_uses_postgres_jobs_backend() {
         let env = MockEnv::new().with("AUTUMN_MANIFEST_DIR", env!("CARGO_MANIFEST_DIR"));
-        let config =
-            AutumnConfig::load_with_env(&env).expect("default config should load");
+        let config = AutumnConfig::load_with_env(&env).expect("default config should load");
         assert_eq!(
             config.jobs.backend, "postgres",
             "autumn.toml must set jobs.backend = \"postgres\" as the default"

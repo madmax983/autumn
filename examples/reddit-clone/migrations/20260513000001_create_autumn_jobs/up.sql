@@ -1,3 +1,5 @@
+-- Autumn framework job queue table.
+-- Required when jobs.backend = "postgres" (see autumn.toml).
 CREATE TABLE IF NOT EXISTS autumn_jobs (
     id                TEXT        PRIMARY KEY,
     name              TEXT        NOT NULL,
@@ -15,16 +17,13 @@ CREATE TABLE IF NOT EXISTS autumn_jobs (
     run_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Fast path for workers polling for ready jobs
 CREATE INDEX IF NOT EXISTS idx_autumn_jobs_ready
     ON autumn_jobs (run_at ASC)
     WHERE status = 'enqueued';
 
--- Dashboard queries filter by status and finished_at
 CREATE INDEX IF NOT EXISTS idx_autumn_jobs_status_finished
     ON autumn_jobs (status, finished_at DESC);
 
--- Dashboard enqueued-tab sorted by enqueued_at
 CREATE INDEX IF NOT EXISTS idx_autumn_jobs_enqueued_dashboard
     ON autumn_jobs (enqueued_at DESC)
     WHERE status = 'enqueued';

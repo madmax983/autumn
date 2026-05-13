@@ -17,12 +17,12 @@
 //! cargo test -p reddit-clone -- --ignored
 //! ```
 
+use autumn_web::AppState;
 use diesel::sql_types::{BigInt, Text};
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use reddit_clone::jobs::{UserOnboardingArgs, user_onboarding};
-use autumn_web::AppState;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
@@ -156,7 +156,10 @@ async fn pg_job_enqueue_participates_in_transaction() {
             .count;
 
     assert_eq!(job_count, 0, "job row must roll back with the transaction");
-    assert_eq!(user_count, 0, "user row must roll back with the transaction");
+    assert_eq!(
+        user_count, 0,
+        "user row must roll back with the transaction"
+    );
 }
 
 // ── Test 2: enqueue → claim (SKIP LOCKED) → run handler → ack ──────────────
@@ -223,7 +226,10 @@ async fn user_onboarding_enqueue_run_ack_cycle() {
     .expect("claim job")
     .id;
 
-    assert_eq!(claimed_id, job_id, "claimed job should be the one we enqueued");
+    assert_eq!(
+        claimed_id, job_id,
+        "claimed job should be the one we enqueued"
+    );
 
     // ── Run handler ────────────────────────────────────────────────────────
     let state = AppState::detached().with_pool(pool.clone());

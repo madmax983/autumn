@@ -970,6 +970,11 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
 /// `redis` and `local` backends the `conn` argument is ignored and the
 /// call falls back to the normal enqueue path.
 ///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args`
+/// cannot be serialized to JSON, or if the database INSERT fails.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -1064,7 +1069,9 @@ impl JobClient {
     ) -> AutumnResult<()> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
-            return redis.enqueue(id, name, payload, max_attempts, backoff_ms).await;
+            return redis
+                .enqueue(id, name, payload, max_attempts, backoff_ms)
+                .await;
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
@@ -1083,6 +1090,11 @@ impl JobClient {
     /// enqueue semantics: if the surrounding `db.tx` rolls back, the job row
     /// disappears atomically. For `redis` and `local` backends the `conn`
     /// argument is ignored and the call falls back to the normal enqueue path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a registered job, or if the
+    /// database INSERT fails.
     #[cfg(feature = "db")]
     pub async fn enqueue_on_conn(
         &self,
@@ -1112,8 +1124,15 @@ impl JobClient {
             .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
 
         let result = if self.pg_pool.is_some() {
-            pg_enqueue_on_conn(conn, id.clone(), name, payload, job_max_attempts, job_backoff_ms)
-                .await
+            pg_enqueue_on_conn(
+                conn,
+                id.clone(),
+                name,
+                payload,
+                job_max_attempts,
+                job_backoff_ms,
+            )
+            .await
         } else if let Some(sender) = &self.local_sender {
             sender
                 .send(QueuedJob {
@@ -2867,6 +2886,7 @@ const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, at
 /// A job row read from the `autumn_jobs` Postgres table.
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName, Debug, Clone)]
+#[allow(dead_code)]
 struct PgJobRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     id: String,
@@ -2908,8 +2928,8 @@ impl PgJobRow {
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
             started_at: self.started_at.map(format_job_admin_time),
             finished_at: self.finished_at.map(format_job_admin_time),
-            attempt: self.attempt as u32,
-            max_attempts: self.max_attempts as u32,
+            attempt: u32::try_from(self.attempt).unwrap_or(0),
+            max_attempts: u32::try_from(self.max_attempts).unwrap_or(1),
             last_error: self.last_error.clone(),
             principal_id,
             correlation_id,
@@ -2927,20 +2947,9 @@ struct PgCount {
 
 /// Exponential backoff delay in ms for attempt `attempt` (1-indexed).
 #[cfg(feature = "db")]
-const fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
-    initial_backoff_ms.saturating_mul(
-        2_i64.saturating_pow(attempt.saturating_sub(1) as u32),
-    )
-}
-
-/// Return true when a claimed job's lease has expired.
-#[cfg(feature = "db")]
-fn pg_claim_is_stale(
-    claimed_at: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-    visibility_timeout_ms: i64,
-) -> bool {
-    (now - claimed_at).num_milliseconds() > visibility_timeout_ms
+fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
+    let exp = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
+    initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
 }
 
 /// Insert a new job row into `autumn_jobs`.
@@ -2970,8 +2979,8 @@ async fn pg_enqueue_job(
     .bind::<diesel::sql_types::Text, _>(id)
     .bind::<diesel::sql_types::Text, _>(name)
     .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(max_attempts as i32)
-    .bind::<diesel::sql_types::BigInt, _>(initial_backoff_ms as i64)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
     .execute(&mut *conn)
     .await
     .map(|_| ())
@@ -3005,8 +3014,8 @@ async fn pg_enqueue_on_conn(
     .bind::<diesel::sql_types::Text, _>(id)
     .bind::<diesel::sql_types::Text, _>(name)
     .bind::<diesel::sql_types::Text, _>(payload_str)
-    .bind::<diesel::sql_types::Integer, _>(max_attempts as i32)
-    .bind::<diesel::sql_types::BigInt, _>(initial_backoff_ms as i64)
+    .bind::<diesel::sql_types::Integer, _>(i32::try_from(max_attempts).unwrap_or(i32::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(initial_backoff_ms).unwrap_or(i64::MAX))
     .execute(conn)
     .await
     .map(|_| ())
@@ -3129,6 +3138,40 @@ async fn pg_nack_failure(
     }
 }
 
+/// Dead-letter a job unconditionally, regardless of remaining attempts.
+///
+/// Used for panics, which are always terminal regardless of `max_attempts`.
+#[cfg(feature = "db")]
+async fn pg_ack_dead_letter(
+    pool: &PgPool,
+    job_id: &str,
+    worker_id: &str,
+    error: &str,
+) -> AutumnResult<()> {
+    use diesel_async::RunQueryDsl as _;
+
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg pool error: {e}")))?;
+    diesel::sql_query(
+        "UPDATE autumn_jobs \
+         SET status = 'failed', \
+             finished_at = NOW(), \
+             claimed_by = NULL, \
+             claimed_at = NULL, \
+             last_error = $1 \
+         WHERE id = $2 AND claimed_by = $3 AND status = 'running'",
+    )
+    .bind::<diesel::sql_types::Text, _>(error)
+    .bind::<diesel::sql_types::Text, _>(job_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut *conn)
+    .await
+    .map(|_| ())
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
+}
+
 /// Recover jobs whose visibility timeout has expired.
 ///
 /// Uses a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` so
@@ -3172,7 +3215,7 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
            FOR UPDATE SKIP LOCKED \
          )",
     )
-    .bind::<diesel::sql_types::BigInt, _>(visibility_timeout_ms as i64)
+    .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
     .execute(&mut *conn)
     .await
     .map_err(|e| tracing::warn!(error = %e, "postgres stale claim recovery failed"));
@@ -3188,7 +3231,10 @@ async fn pg_execute_job(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) {
-    if job_admin.try_record_start(&row.id, row.attempt as u32) == JobAdminStartDecision::Canceled {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+    let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
+
+    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
         state.job_registry.record_cancel(&row.name);
         pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row)
             .await
@@ -3206,7 +3252,9 @@ async fn pg_execute_job(
 
     let Some(handler) = handler_opt else {
         let error = format!("unknown job '{}'", row.name);
-        state.job_registry.record_failure(&row.name, error.clone(), true);
+        state
+            .job_registry
+            .record_failure(&row.name, error.clone(), true);
         job_admin.record_failure(&row.id, error.clone());
         pg_nack_failure(pool, &row.id, worker_id, &error, &row)
             .await
@@ -3221,22 +3269,28 @@ async fn pg_execute_job(
             pg_ack_success(pool, &row.id, worker_id).await.ok();
         }
         JobExecutionOutcome::Failed(error) => {
-            if (row.attempt as u32) < (row.max_attempts as u32) {
-                state.job_registry.record_retry(&row.name, &error, row.attempt as u32);
+            if attempt < max_attempts {
+                state.job_registry.record_retry(&row.name, &error, attempt);
                 job_admin.record_retrying(&row.id, &error);
             } else {
-                state.job_registry.record_failure(&row.name, error.clone(), true);
+                state
+                    .job_registry
+                    .record_failure(&row.name, error.clone(), true);
                 job_admin.record_failure(&row.id, error.clone());
             }
             pg_nack_failure(pool, &row.id, worker_id, &error, &row)
                 .await
                 .ok();
         }
+        // Panics dead-letter immediately regardless of remaining attempts,
+        // matching the local and redis backend behaviour.
         JobExecutionOutcome::Panicked(error) => {
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
-            state.job_registry.record_failure(&row.name, error.clone(), true);
+            state
+                .job_registry
+                .record_failure(&row.name, error.clone(), true);
             job_admin.record_failure(&row.id, error.clone());
-            pg_nack_failure(pool, &row.id, worker_id, &error, &row)
+            pg_ack_dead_letter(pool, &row.id, worker_id, &error)
                 .await
                 .ok();
         }
@@ -3294,7 +3348,7 @@ impl PgJobAdminBackend {
         let mut conn = self.pool.get().await.map_err(|e| {
             AutumnError::internal_server_error_msg(format!("pg admin pool error: {e}"))
         })?;
-        let per_page = query.per_page.clamp(1, 100) as i64;
+        let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
         let now = chrono::Utc::now();
 
         let enqueued = pg_admin_page(
@@ -3449,11 +3503,11 @@ async fn pg_admin_page(
     page: u64,
     per_page: i64,
 ) -> AutumnResult<JobAdminPage> {
-    use diesel::OptionalExtension as _;
     use diesel_async::RunQueryDsl as _;
 
     let page = page.max(1);
-    let offset = ((page - 1) * per_page as u64) as i64;
+    let offset = i64::try_from((page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+        .unwrap_or(0);
     let admin_status = match status {
         PG_STATUS_ENQUEUED => JobAdminStatus::Enqueued,
         PG_STATUS_RUNNING => JobAdminStatus::Running,
@@ -3489,14 +3543,15 @@ async fn pg_admin_page(
 
         (total, rows)
     } else {
-        let total = diesel::sql_query(
-            "SELECT COUNT(*) AS count FROM autumn_jobs WHERE status = $1",
-        )
-        .bind::<diesel::sql_types::Text, _>(status)
-        .get_result::<PgCount>(&mut **conn)
-        .await
-        .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?
-        .count;
+        let total =
+            diesel::sql_query("SELECT COUNT(*) AS count FROM autumn_jobs WHERE status = $1")
+                .bind::<diesel::sql_types::Text, _>(status)
+                .get_result::<PgCount>(&mut **conn)
+                .await
+                .map_err(|e| {
+                    AutumnError::internal_server_error_msg(format!("pg admin count: {e}"))
+                })?
+                .count;
 
         let rows = diesel::sql_query(format!(
             "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
@@ -3514,8 +3569,16 @@ async fn pg_admin_page(
         (total, rows)
     };
 
-    let records = rows.iter().map(|r| r.to_admin_record(admin_status)).collect();
-    Ok(JobAdminPage::new(records, total as u64, page, per_page as u64))
+    let records = rows
+        .iter()
+        .map(|r| r.to_admin_record(admin_status))
+        .collect();
+    Ok(JobAdminPage::new(
+        records,
+        u64::try_from(total).unwrap_or(0),
+        page,
+        u64::try_from(per_page).unwrap_or(10),
+    ))
 }
 
 /// Start the Postgres job runtime.
@@ -5172,22 +5235,6 @@ mod tests {
             assert_eq!(pg_retry_delay_ms(250, 4), 2_000);
         }
 
-        #[test]
-        fn pg_stale_claim_older_than_timeout_is_recoverable() {
-            let timeout_ms = 30_000_i64;
-            let now = chrono::Utc::now();
-
-            let fresh = now - chrono::TimeDelta::seconds(10);
-            assert!(!pg_claim_is_stale(fresh, now, timeout_ms));
-
-            let stale = now - chrono::TimeDelta::seconds(60);
-            assert!(pg_claim_is_stale(stale, now, timeout_ms));
-
-            // Boundary: exactly at the timeout is NOT yet stale (strictly >)
-            let boundary = now - chrono::TimeDelta::milliseconds(timeout_ms);
-            assert!(!pg_claim_is_stale(boundary, now, timeout_ms));
-        }
-
         #[tokio::test]
         async fn pg_start_runtime_without_pool_fails_with_actionable_error() {
             let _guard = global_job_runtime_test_lock().lock().await;
@@ -5225,9 +5272,9 @@ mod tests {
 
         // ── Integration tests (Docker required) ───────────────────────────
 
-        async fn pg_test_pool(url: &str) -> PgPool {
-            use diesel_async::pooled_connection::deadpool::Pool;
+        fn pg_test_pool(url: &str) -> PgPool {
             use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+            use diesel_async::pooled_connection::deadpool::Pool;
             let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(url);
             Pool::builder(manager).max_size(4).build().unwrap()
         }
@@ -5257,7 +5304,7 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
@@ -5304,7 +5351,7 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
             pg_enqueue_job(
@@ -5339,7 +5386,7 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
@@ -5361,7 +5408,11 @@ mod tests {
             assert_eq!(after_first.attempt, 2);
 
             // Fast-forward run_at so claim is immediately available
-            pg_exec(&pool, &format!("UPDATE autumn_jobs SET run_at = NOW() WHERE id = '{job_id}'")).await;
+            pg_exec(
+                &pool,
+                &format!("UPDATE autumn_jobs SET run_at = NOW() WHERE id = '{job_id}'"),
+            )
+            .await;
 
             // Attempt 2: claim and fail again (max_attempts = 2 → dead-letter)
             let job2 = pg_claim_next_job(&pool, "worker-1")
@@ -5387,7 +5438,7 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
             let job_id = uuid::Uuid::new_v4().to_string();
@@ -5406,10 +5457,16 @@ mod tests {
             pg_recover_stale_claims(&pool, 1_000).await;
 
             let row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
-            assert_eq!(row.status, PG_STATUS_ENQUEUED, "stale job should be re-enqueued");
+            assert_eq!(
+                row.status, PG_STATUS_ENQUEUED,
+                "stale job should be re-enqueued"
+            );
             assert_eq!(row.attempt, 2, "attempt should be incremented");
             assert!(row.claimed_by.is_none(), "claim should be cleared");
-            assert!(row.claimed_at.is_none(), "claim timestamp should be cleared");
+            assert!(
+                row.claimed_at.is_none(),
+                "claim timestamp should be cleared"
+            );
         }
 
         #[tokio::test]
@@ -5422,13 +5479,20 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
 
             // Enqueued
-            pg_enqueue_job(&pool, "enq-1".to_string(), "digest", serde_json::json!({}), 5, 250)
-                .await
-                .unwrap();
+            pg_enqueue_job(
+                &pool,
+                "enq-1".to_string(),
+                "digest",
+                serde_json::json!({}),
+                5,
+                250,
+            )
+            .await
+            .unwrap();
 
             // Running: enqueue then claim (don't ack)
             pg_enqueue_job(
@@ -5456,7 +5520,11 @@ mod tests {
             .unwrap();
             // claim must pick up the enqueued one (both enqueued and run-1 compete; run-1 is running)
             // so we need to force a specific claim
-            pg_exec(&pool, "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'cmp-1'").await;
+            pg_exec(
+                &pool,
+                "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'cmp-1'",
+            )
+            .await;
             let job_c = pg_claim_next_job(&pool, "w1")
                 .await
                 .expect("completed job to claim");
@@ -5473,7 +5541,11 @@ mod tests {
             )
             .await
             .unwrap();
-            pg_exec(&pool, "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-1'").await;
+            pg_exec(
+                &pool,
+                "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-1'",
+            )
+            .await;
             let job_f = pg_claim_next_job(&pool, "w1")
                 .await
                 .expect("failed job to claim");
@@ -5484,9 +5556,15 @@ mod tests {
             let backend = PgJobAdminBackend { pool: pool.clone() };
             let snapshot = backend.snapshot(JobAdminQuery::default()).await.unwrap();
 
-            assert!(snapshot.enqueued.total >= 1, "expected at least one enqueued");
+            assert!(
+                snapshot.enqueued.total >= 1,
+                "expected at least one enqueued"
+            );
             assert!(snapshot.running.total >= 1, "expected at least one running");
-            assert!(snapshot.completed.total >= 1, "expected at least one completed");
+            assert!(
+                snapshot.completed.total >= 1,
+                "expected at least one completed"
+            );
             assert!(snapshot.failed.total >= 1, "expected at least one failed");
         }
 
@@ -5500,16 +5578,25 @@ mod tests {
             let port = container.get_host_port_ipv4(5432).await.unwrap();
             let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-            let pool = pg_test_pool(&url).await;
+            let pool = pg_test_pool(&url);
             pg_run_migration(&pool).await;
             let backend = PgJobAdminBackend { pool: pool.clone() };
 
             // --- Retry ---
-            pg_enqueue_job(&pool, "fail-r".to_string(), "job", serde_json::json!({}), 1, 1)
+            pg_enqueue_job(
+                &pool,
+                "fail-r".to_string(),
+                "job",
+                serde_json::json!({}),
+                1,
+                1,
+            )
+            .await
+            .unwrap();
+            let jf = pg_claim_next_job(&pool, "w").await.unwrap();
+            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf)
                 .await
                 .unwrap();
-            let jf = pg_claim_next_job(&pool, "w").await.unwrap();
-            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf).await.unwrap();
 
             backend.retry("fail-r").await.expect("retry should succeed");
             let row = pg_fetch_by_id(&pool, "fail-r").await.unwrap();
@@ -5517,22 +5604,48 @@ mod tests {
             assert_eq!(row.attempt, 1);
 
             // --- Discard ---
-            pg_enqueue_job(&pool, "fail-d".to_string(), "job", serde_json::json!({}), 1, 1)
+            pg_enqueue_job(
+                &pool,
+                "fail-d".to_string(),
+                "job",
+                serde_json::json!({}),
+                1,
+                1,
+            )
+            .await
+            .unwrap();
+            pg_exec(
+                &pool,
+                "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-d'",
+            )
+            .await;
+            let jd = pg_claim_next_job(&pool, "w").await.unwrap();
+            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd)
                 .await
                 .unwrap();
-            pg_exec(&pool, "UPDATE autumn_jobs SET run_at = NOW() - INTERVAL '1 second' WHERE id = 'fail-d'").await;
-            let jd = pg_claim_next_job(&pool, "w").await.unwrap();
-            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd).await.unwrap();
 
-            backend.discard("fail-d").await.expect("discard should succeed");
+            backend
+                .discard("fail-d")
+                .await
+                .expect("discard should succeed");
             let row = pg_fetch_by_id(&pool, "fail-d").await.unwrap();
             assert_eq!(row.status, "discarded");
 
             // --- Cancel ---
-            pg_enqueue_job(&pool, "cancel-c".to_string(), "job", serde_json::json!({}), 5, 1)
+            pg_enqueue_job(
+                &pool,
+                "cancel-c".to_string(),
+                "job",
+                serde_json::json!({}),
+                5,
+                1,
+            )
+            .await
+            .unwrap();
+            backend
+                .cancel("cancel-c")
                 .await
-                .unwrap();
-            backend.cancel("cancel-c").await.expect("cancel should succeed");
+                .expect("cancel should succeed");
             let row = pg_fetch_by_id(&pool, "cancel-c").await.unwrap();
             assert_eq!(row.status, "discarded");
         }
