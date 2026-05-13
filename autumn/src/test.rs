@@ -1104,4 +1104,39 @@ mod tests {
             .await
             .assert_status(400);
     }
+
+    /// The outer `MethodOverrideLayer` stamps a `MethodOverrideRejection`
+    /// extension instead of short-circuiting, so the inner
+    /// `method_override_rejection_filter` produces the `400` from inside
+    /// the per-route layer chain. Verify that framework response
+    /// middleware (request-ID header, security headers) still wraps that
+    /// `400` — i.e. malformed requests inherit the same response middleware
+    /// as ordinary handler responses, rather than bypassing it.
+    #[tokio::test]
+    async fn invalid_method_override_response_carries_framework_middleware() {
+        let client = TestApp::new().routes(test_routes()).build();
+
+        let response = client.post("/create").form("_method=BREW").send().await;
+        response.assert_status(400);
+
+        // RequestIdLayer is applied via `Router::layer` in
+        // `apply_middleware` and stamps a response header on every
+        // request that flows through the inner router. If the override
+        // layer short-circuited at the outer wrapper, this header would
+        // be absent.
+        assert!(
+            response.header("x-request-id").is_some(),
+            "framework request-id header must wrap method-override rejections; \
+             observed headers: {:?}",
+            response.headers
+        );
+        // SecurityHeadersLayer applies a default set of headers; pick a
+        // representative one to assert the layer ran on this response.
+        assert!(
+            response.header("x-content-type-options").is_some(),
+            "framework security headers must wrap method-override rejections; \
+             observed headers: {:?}",
+            response.headers
+        );
+    }
 }

@@ -25,6 +25,21 @@
 //!   honoured: this convention is documented for browser HTML forms
 //!   only, not for arbitrary REST tunneling.
 //!
+//! ## How the rejection flows through middleware
+//!
+//! The layer is wrapped outside the router so it can rewrite the HTTP
+//! method **before route matching**. Returning a `400`/`413` directly
+//! from that outer wrapper would bypass every framework layer applied
+//! via `Router::layer` — security headers, request IDs, metrics,
+//! exception filter, error-page renderer, and so on. Instead, the
+//! layer stamps a [`MethodOverrideRejection`] extension on the request
+//! and forwards it down the stack untouched. A companion middleware,
+//! [`method_override_rejection_filter`], is applied as an inner
+//! `Router::layer` so the rejection is converted into a `400`/`413`
+//! response **inside** the framework's response middleware stack. The
+//! result is the same status the user sees, but with security headers,
+//! request IDs, metrics, and error-page rendering all applied.
+//!
 //! # Interaction with CSRF
 //!
 //! The CSRF layer wraps this middleware on the outside, so CSRF still
@@ -94,6 +109,70 @@ pub struct OverriddenMethod {
     pub transport: http::Method,
     /// The effective method the request was rewritten to.
     pub effective: http::Method,
+}
+
+/// Reason the override middleware needs to fail the request.
+///
+/// Stamped on the request extensions by the outer Tower layer so the
+/// inner [`method_override_rejection_filter`] can convert it into a
+/// proper `400`/`413` response that flows through the framework's
+/// response middleware stack (security headers, request IDs, error
+/// pages, etc.).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MethodOverrideRejection {
+    /// `_method` carried a value that wasn't `PUT`, `PATCH`, or `DELETE`
+    /// (case-insensitive). Rendered as `400 Bad Request`.
+    InvalidValue,
+    /// Form body was too large to buffer for override scanning and the
+    /// bytes have already been consumed. Rendered as `413 Payload Too
+    /// Large`.
+    BodyTooLarge,
+}
+
+/// Inner middleware that converts a [`MethodOverrideRejection`] into a
+/// `400`/`413` response.
+///
+/// Applied via `Router::layer` so the rejection is rendered inside the
+/// per-route layer chain. Running here means the response inherits the
+/// framework's outer middleware (security headers, request IDs,
+/// metrics, error-page filter, exception filter) rather than bypassing
+/// them.
+///
+/// The filter is a no-op when no rejection extension is present, so it
+/// is safe to apply to every route in the router.
+pub async fn method_override_rejection_filter(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if let Some(rejection) = request
+        .extensions()
+        .get::<MethodOverrideRejection>()
+        .copied()
+    {
+        return match rejection {
+            MethodOverrideRejection::InvalidValue => (
+                StatusCode::BAD_REQUEST,
+                [(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                )],
+                "Invalid method override value: must be PUT, PATCH, or DELETE.",
+            )
+                .into_response(),
+            MethodOverrideRejection::BodyTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                [(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
+                )],
+                "Form body too large for method-override scanning.",
+            )
+                .into_response(),
+        };
+    }
+    next.run(request).await
 }
 
 /// Tower [`Layer`] that applies the HTML form method override convention.
@@ -202,7 +281,7 @@ where
     S: Service<Request<axum::body::Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Send + 'static,
-    ResBody: From<&'static str> + Default + Send + 'static,
+    ResBody: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -243,19 +322,16 @@ where
             let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY_SCAN_BYTES).await else {
                 // Body exceeded the scan cap while buffering (e.g.
                 // chunked transfer with no Content-Length) or read
-                // failed. We've already consumed the body, so we can
-                // no longer forward the request faithfully — return
-                // an explicit 413 instead of silently corrupting it
-                // with an empty body.
-                let mut response = Response::new(ResBody::from(
-                    "Form body too large for method-override scanning.",
-                ));
-                *response.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
-                response.headers_mut().insert(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                );
-                return Ok(response);
+                // failed. The bytes are gone, so we can't forward a
+                // faithful request — but we still want the eventual
+                // `413` to flow through the framework's response
+                // middleware. Stamp the rejection and pass the request
+                // through with an empty body; the inner
+                // `method_override_rejection_filter` short-circuits to
+                // `413` before any handler is called.
+                req.extensions_mut()
+                    .insert(MethodOverrideRejection::BodyTooLarge);
+                return inner.call(req).await;
             };
 
             let outcome = scan_form_for_override(&bytes, &config.field_name);
@@ -275,15 +351,14 @@ where
                     inner.call(req).await
                 }
                 OverrideOutcome::Invalid => {
-                    let mut response = Response::new(ResBody::from(
-                        "Invalid method override value: must be PUT, PATCH, or DELETE.",
-                    ));
-                    *response.status_mut() = StatusCode::BAD_REQUEST;
-                    response.headers_mut().insert(
-                        http::header::CONTENT_TYPE,
-                        http::HeaderValue::from_static("text/plain; charset=utf-8"),
-                    );
-                    Ok(response)
+                    // Stamp the rejection and forward as POST. The
+                    // inner rejection filter converts this to `400`
+                    // from inside the framework's response middleware
+                    // stack, so security headers, request IDs, metrics,
+                    // and error-page rendering all apply.
+                    req.extensions_mut()
+                        .insert(MethodOverrideRejection::InvalidValue);
+                    inner.call(req).await
                 }
             }
         })
@@ -307,13 +382,20 @@ mod tests {
     /// returns `405` before the layer ever runs. The override convention
     /// requires running before route matching, so wrap the router as a
     /// `tower::Service`.
+    ///
+    /// The inner `method_override_rejection_filter` is applied via
+    /// `Router::layer` so that `MethodOverrideRejection` extensions
+    /// stamped by the outer layer are converted into `400`/`413`
+    /// responses inside the per-route middleware chain — mirroring the
+    /// production wiring in `router::apply_middleware`.
     fn layered_router() -> MethodOverrideService<Router> {
         let router = Router::new()
             .route("/items", post(|| async { "created" }))
             .route("/items/{id}", put(|| async { "put-ok" }))
             .route("/items/{id}", patch(|| async { "patch-ok" }))
             .route("/items/{id}", delete(|| async { "delete-ok" }))
-            .route("/items/{id}", get(|| async { "show" }));
+            .route("/items/{id}", get(|| async { "show" }))
+            .layer(axum::middleware::from_fn(method_override_rejection_filter));
         MethodOverrideLayer::new().layer(router)
     }
 
@@ -672,14 +754,19 @@ mod tests {
 
     /// A POST whose body actually exceeds the scan cap during buffering
     /// (e.g. chunked transfer encoding without an accurate Content-Length)
-    /// returns an explicit `413` rather than passing an empty body to
-    /// downstream handlers.
+    /// is stamped with [`MethodOverrideRejection::BodyTooLarge`] and the
+    /// inner `method_override_rejection_filter` converts it into an
+    /// explicit `413` — inside the per-route layer chain — rather than
+    /// the outer layer short-circuiting and bypassing framework
+    /// middleware.
     #[tokio::test]
     async fn unbounded_oversized_form_post_returns_413() {
         async fn handler(body: String) -> String {
             body
         }
-        let router = Router::new().route("/x", post(handler));
+        let router = Router::new()
+            .route("/x", post(handler))
+            .layer(axum::middleware::from_fn(method_override_rejection_filter));
         let app = MethodOverrideLayer::new().layer(router);
 
         // No Content-Length header -> content_length_exceeds returns
@@ -699,6 +786,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// When the outer `MethodOverrideLayer` is composed without the
+    /// inner `method_override_rejection_filter`, the rejection
+    /// extension is still stamped on the request — but no handler
+    /// short-circuits, so the request continues to flow normally.
+    /// This matches how the framework wires the two pieces, and
+    /// proves that the outer layer doesn't generate `400`/`413`
+    /// responses on its own.
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static OBSERVED_REJECTION: OnceLock<Mutex<Option<MethodOverrideRejection>>> = OnceLock::new();
+
+    async fn capture_rejection(
+        request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        if let Some(rej) = request
+            .extensions()
+            .get::<MethodOverrideRejection>()
+            .copied()
+        {
+            *OBSERVED_REJECTION
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .unwrap() = Some(rej);
+        }
+        next.run(request).await
+    }
+
+    #[tokio::test]
+    async fn outer_layer_stamps_extension_without_short_circuiting() {
+        let cell = OBSERVED_REJECTION.get_or_init(|| Mutex::new(None));
+        cell.lock().unwrap().take();
+
+        let router = Router::new()
+            .route("/x", post(|| async { "post-ok" }))
+            .layer(axum::middleware::from_fn(capture_rejection));
+        let app = MethodOverrideLayer::new().layer(router);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/x")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("_method=BREW"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *cell.lock().unwrap(),
+            Some(MethodOverrideRejection::InvalidValue)
+        );
     }
 
     #[test]
