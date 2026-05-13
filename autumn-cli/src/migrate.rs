@@ -167,8 +167,10 @@ fn check_concurrent_index_transaction_opt_out(
     findings: &mut Vec<safety::SafetyFinding>,
 ) {
     let lower = sql.to_lowercase();
-    let uses_concurrently = lower.contains("create index concurrently")
-        || lower.contains("create unique index concurrently");
+    // Collapse whitespace so multi-line statements like `CREATE INDEX\n  CONCURRENTLY` match.
+    let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let uses_concurrently = normalized.contains("create index concurrently")
+        || normalized.contains("create unique index concurrently");
     if !uses_concurrently {
         return;
     }
@@ -778,6 +780,24 @@ replica_url = "postgres://replica:5432/app"
         check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
 
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn concurrent_index_multiline_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX\n  CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "multi-line CREATE INDEX CONCURRENTLY should be flagged when metadata.toml is absent"
+        );
         assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
     }
 
