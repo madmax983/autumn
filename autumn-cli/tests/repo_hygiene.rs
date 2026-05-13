@@ -341,6 +341,27 @@ fn publish_dry_run_script_uses_list_not_no_verify() {
 }
 
 #[test]
+fn publish_gate_prepare_release_does_not_mutate_changelog() {
+    let root = workspace_root();
+    let workflow_path = root.join(".github/workflows/publish-gate.yml");
+    let workflow = std::fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", workflow_path.display()));
+
+    for forbidden in [
+        "git-cliff --config cliff.toml --output CHANGELOG.md",
+        "Commit CHANGELOG.md to trunk",
+        "git commit -m \"docs: update CHANGELOG.md",
+        "git push origin HEAD:trunk",
+        "contents: write",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "publish-gate must not mutate CHANGELOG.md from a detached tag checkout; found `{forbidden}`",
+        );
+    }
+}
+
+#[test]
 fn release_notes_script_detects_breaking_section_with_long_changelog_entry() {
     let root = workspace_root();
     let tmp = tempfile::TempDir::new().expect("tempdir");
