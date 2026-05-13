@@ -38,6 +38,10 @@
 //! | `AUTUMN_SECURITY__RATE_LIMIT__BURST` | `security.rate_limit.burst` | `u32` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS` | `security.rate_limit.trust_forwarded_headers` | `bool` |
 //! | `AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES` | `security.rate_limit.trusted_proxies` | comma-separated `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__BACKEND` | `security.rate_limit.backend` | `memory` / `redis` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE` | `security.rate_limit.on_backend_failure` | `fail_open` / `fail_closed` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL` | `security.rate_limit.redis.url` | `String` |
+//! | `AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX` | `security.rate_limit.redis.key_prefix` | `String` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_REQUEST_SIZE_BYTES` | `security.upload.max_request_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__MAX_FILE_SIZE_BYTES` | `security.upload.max_file_size_bytes` | `usize` |
 //! | `AUTUMN_SECURITY__UPLOAD__ALLOWED_MIME_TYPES` | `security.upload.allowed_mime_types` | comma-separated `String` |
@@ -615,6 +619,14 @@ impl Default for CsrfConfig {
 /// burst = 10
 /// trust_forwarded_headers = false
 /// trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+///
+/// # Multi-replica: share the budget across all pods
+/// backend = "redis"
+/// on_backend_failure = "fail_open"
+///
+/// [security.rate_limit.redis]
+/// url = "redis://redis:6379"
+/// key_prefix = "myapp:rate_limit"
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitConfig {
@@ -650,6 +662,24 @@ pub struct RateLimitConfig {
     /// entry is invalid, forwarded headers are ignored rather than trusted.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Bucket store backend. Default: `"memory"` (in-process, single-replica).
+    ///
+    /// Set to `"redis"` in multi-replica deployments so the configured
+    /// rate cap is enforced globally rather than per pod.
+    #[serde(default)]
+    pub backend: RateLimitBackend,
+
+    /// Redis backend options. Used when `backend = "redis"`.
+    #[serde(default)]
+    pub redis: RateLimitRedisConfig,
+
+    /// Behavior when the backend is unavailable. Default: `"fail_open"`.
+    ///
+    /// `"fail_open"` lets requests through (matches single-replica posture).
+    /// `"fail_closed"` returns `429` until the backend recovers.
+    #[serde(default)]
+    pub on_backend_failure: RateLimitBackendFailure,
 }
 
 impl Default for RateLimitConfig {
@@ -660,8 +690,75 @@ impl Default for RateLimitConfig {
             burst: default_burst(),
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            backend: RateLimitBackend::default(),
+            redis: RateLimitRedisConfig::default(),
+            on_backend_failure: RateLimitBackendFailure::default(),
         }
     }
+}
+
+/// Storage backend for per-IP token buckets.
+///
+/// Matches the pattern established by [`CacheBackend`](crate::config::CacheBackend)
+/// (issue #535) and `SchedulerBackend` (issue #531): one `backend = "redis"` flip
+/// per subsystem, identical failure semantics.
+///
+/// [`CacheBackend`]: crate::config::CacheBackend
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitBackend {
+    /// In-process LRU of token buckets (default). Each replica maintains its own
+    /// store; a 3-replica deployment permits up to 3× the configured rate.
+    #[default]
+    Memory,
+    /// Shared Redis store coordinated via an atomic Lua script. The configured
+    /// rate is enforced globally across all replicas.
+    Redis,
+}
+
+/// Behavior when the rate-limit backend becomes unreachable.
+///
+/// Configures the limiter's posture when the storage backend (Redis) is
+/// unavailable. Matches the pattern used by the webhook replay store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitBackendFailure {
+    /// Allow the request through. Matches the existing single-replica posture:
+    /// a lost limiter is invisible to clients. **Default.**
+    #[default]
+    #[serde(alias = "open")]
+    FailOpen,
+    /// Deny the request with `429 Too Many Requests` until the backend recovers.
+    #[serde(alias = "closed")]
+    FailClosed,
+}
+
+/// Redis-specific options for the rate-limit backend.
+///
+/// Used when `security.rate_limit.backend = "redis"`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitRedisConfig {
+    /// Redis connection URL (e.g. `redis://127.0.0.1:6379`).
+    /// Reuses the same Redis instance as sessions, cache, and the scheduler.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Key prefix for all token-bucket hashes stored in Redis.
+    #[serde(default = "default_rate_limit_redis_key_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for RateLimitRedisConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            key_prefix: default_rate_limit_redis_key_prefix(),
+        }
+    }
+}
+
+fn default_rate_limit_redis_key_prefix() -> String {
+    "autumn:rate_limit".to_owned()
 }
 
 /// Multipart upload configuration.
@@ -1017,6 +1114,68 @@ mod tests {
         assert_eq!(config.burst, 20);
         assert!(!config.trust_forwarded_headers);
         assert!(config.trusted_proxies.is_empty());
+        assert_eq!(config.backend, RateLimitBackend::Memory);
+        assert_eq!(config.on_backend_failure, RateLimitBackendFailure::FailOpen);
+        assert_eq!(
+            config.redis.key_prefix,
+            "autumn:rate_limit"
+        );
+    }
+
+    #[test]
+    fn rate_limit_backend_deserializes_memory() {
+        let config: RateLimitConfig = toml::from_str("backend = \"memory\"").unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Memory);
+    }
+
+    #[test]
+    fn rate_limit_backend_deserializes_redis() {
+        let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Redis);
+    }
+
+    #[test]
+    fn rate_limit_on_backend_failure_deserializes_fail_open() {
+        let config: RateLimitConfig =
+            toml::from_str("on_backend_failure = \"fail_open\"").unwrap();
+        assert_eq!(
+            config.on_backend_failure,
+            RateLimitBackendFailure::FailOpen
+        );
+    }
+
+    #[test]
+    fn rate_limit_on_backend_failure_deserializes_fail_closed() {
+        let config: RateLimitConfig =
+            toml::from_str("on_backend_failure = \"fail_closed\"").unwrap();
+        assert_eq!(
+            config.on_backend_failure,
+            RateLimitBackendFailure::FailClosed
+        );
+    }
+
+    #[test]
+    fn rate_limit_redis_config_deserializes() {
+        let toml_str = r#"
+            backend = "redis"
+            [redis]
+            url = "redis://localhost:6379"
+            key_prefix = "myapp:rl"
+        "#;
+        let config: RateLimitConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.backend, RateLimitBackend::Redis);
+        assert_eq!(
+            config.redis.url.as_deref(),
+            Some("redis://localhost:6379")
+        );
+        assert_eq!(config.redis.key_prefix, "myapp:rl");
+    }
+
+    #[test]
+    fn rate_limit_redis_config_defaults_key_prefix() {
+        let config: RateLimitConfig = toml::from_str("backend = \"redis\"").unwrap();
+        assert_eq!(config.redis.key_prefix, "autumn:rate_limit");
+        assert!(config.redis.url.is_none());
     }
 
     #[test]

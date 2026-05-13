@@ -29,6 +29,26 @@
 //! invoke the router via [`tower::ServiceExt::oneshot`] fall into this
 //! bucket and must not be throttled.
 //!
+//! # Backends
+//!
+//! The bucket store is configurable via [`RateLimitConfig::backend`]:
+//!
+//! - `"memory"` (default): in-process LRU of token buckets. Zero-config for
+//!   development. Each replica enforces the limit independently, so a
+//!   3-replica deployment permits up to 3× the configured rate.
+//! - `"redis"`: shared bucket store coordinated across replicas via an atomic
+//!   Lua script. The configured rate is enforced globally regardless of replica
+//!   count. Reuses the same Redis connection as sessions, cache, and the
+//!   scheduler.
+//!
+//! When the Redis backend is unavailable, behavior is controlled by
+//! [`RateLimitConfig::on_backend_failure`]:
+//! - `"fail_open"` (default): allow the request through, matching the
+//!   existing single-replica posture.
+//! - `"fail_closed"`: return `429` until the backend recovers.
+//!
+//! A single `tracing::warn!` is emitted per outage, not per request.
+//!
 //! # Configuration
 //!
 //! See [`RateLimitConfig`] for available settings.
@@ -38,6 +58,14 @@
 //! enabled = true
 //! requests_per_second = 10.0
 //! burst = 20
+//!
+//! # Multi-replica: share the budget across all pods
+//! backend = "redis"
+//! on_backend_failure = "fail_open"
+//!
+//! [security.rate_limit.redis]
+//! url = "redis://redis:6379"
+//! key_prefix = "myapp:rate_limit"
 //! ```
 
 use lru::LruCache;
@@ -45,7 +73,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -55,10 +83,257 @@ use axum::http::{HeaderValue, Request, Response, StatusCode};
 use http::header::{HeaderName, RETRY_AFTER};
 use tower::{Layer, Service};
 
-use super::config::RateLimitConfig;
+use super::config::{RateLimitBackend, RateLimitBackendFailure, RateLimitConfig};
 
 const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
 const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+
+/// Outcome of consuming one token from a bucket.
+#[derive(Debug, Clone, Copy)]
+enum Decision {
+    Allowed { remaining: u32 },
+    Denied { retry_after_secs: u64 },
+}
+
+// ── In-memory bucket store ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+/// Per-IP token bucket state stored in-process.
+#[derive(Debug)]
+struct MemoryStore {
+    buckets: Mutex<LruCache<String, Bucket>>,
+}
+
+impl MemoryStore {
+    fn new() -> Self {
+        Self {
+            buckets: Mutex::new(LruCache::new(
+                NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
+            )),
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn decide(&self, key: &str, now: Instant, burst: f64, refill_per_sec: f64) -> Decision {
+        let tokens_after = {
+            let mut buckets = match self.buckets.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
+                tokens: burst,
+                last_refill: now,
+            });
+
+            let elapsed = now
+                .saturating_duration_since(bucket.last_refill)
+                .as_secs_f64();
+            bucket.tokens = elapsed
+                .mul_add(refill_per_sec, bucket.tokens)
+                .min(burst);
+            bucket.last_refill = now;
+
+            let result = if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                Ok(bucket.tokens)
+            } else {
+                Err(bucket.tokens)
+            };
+
+            buckets.put(key.to_owned(), bucket);
+            result
+        };
+
+        match tokens_after {
+            Ok(remaining_tokens) => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let remaining = remaining_tokens.floor() as u32;
+                Decision::Allowed { remaining }
+            }
+            Err(current_tokens) => {
+                let deficit = 1.0 - current_tokens;
+                let secs = (deficit / refill_per_sec).ceil().max(1.0);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let retry_after_secs = secs as u64;
+                Decision::Denied { retry_after_secs }
+            }
+        }
+    }
+}
+
+// ── Redis bucket store ────────────────────────────────────────────────────────
+
+/// Lua script that atomically applies a token-bucket consume on a Redis hash.
+///
+/// Keys:
+///   KEYS[1] - the per-IP hash key
+///
+/// Arguments (all f64 / integers passed as strings):
+///   ARGV[1] - burst capacity (float)
+///   ARGV[2] - refill rate in tokens/second (float)
+///   ARGV[3] - current wall-clock time in milliseconds (integer)
+///
+/// Returns a three-element array: `{allowed, remaining_floor, retry_after_secs}`
+/// - `allowed`:           1 if the request is permitted, 0 if denied
+/// - `remaining_floor`:   floor of remaining tokens after consume (only valid when allowed=1)
+/// - `retry_after_secs`:  ceil of seconds until one token refills (only valid when allowed=0)
+#[cfg(feature = "redis")]
+const RATE_LIMIT_LUA: &str = r#"
+local key = KEYS[1]
+local burst = tonumber(ARGV[1])
+local refill_per_sec = tonumber(ARGV[2])
+local now_ms = tonumber(ARGV[3])
+
+local data = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(data[1])
+local last_ts = tonumber(data[2])
+
+if tokens == nil then
+    tokens = burst
+    last_ts = now_ms
+end
+
+local elapsed_secs = (now_ms - last_ts) / 1000.0
+tokens = math.min(burst, tokens + elapsed_secs * refill_per_sec)
+
+local allowed = 0
+local remaining = 0
+local retry_after_secs = 0
+
+if tokens >= 1.0 then
+    tokens = tokens - 1.0
+    allowed = 1
+    remaining = math.floor(tokens)
+else
+    allowed = 0
+    local deficit = 1.0 - tokens
+    retry_after_secs = math.ceil(deficit / refill_per_sec)
+    if retry_after_secs < 1 then retry_after_secs = 1 end
+end
+
+local expiry_secs = math.ceil(burst / refill_per_sec) + 2
+redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(now_ms))
+redis.call('EXPIRE', key, expiry_secs)
+
+return {allowed, remaining, retry_after_secs}
+"#;
+
+#[cfg(feature = "redis")]
+struct RedisStore {
+    connection: redis::aio::ConnectionManager,
+    key_prefix: String,
+    failure_mode: RateLimitBackendFailure,
+    /// Set to `true` once on the first Redis error; reset when it recovers.
+    outage_logged: AtomicBool,
+}
+
+#[cfg(feature = "redis")]
+impl std::fmt::Debug for RedisStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisStore")
+            .field("key_prefix", &self.key_prefix)
+            .field("failure_mode", &self.failure_mode)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "redis")]
+impl RedisStore {
+    fn new(
+        connection: redis::aio::ConnectionManager,
+        key_prefix: String,
+        failure_mode: RateLimitBackendFailure,
+    ) -> Self {
+        Self {
+            connection,
+            key_prefix,
+            failure_mode,
+            outage_logged: AtomicBool::new(false),
+        }
+    }
+
+    async fn decide(
+        &self,
+        key: &str,
+        burst: f64,
+        refill_per_sec: f64,
+    ) -> Option<Decision> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let redis_key = format!("{}:{}", self.key_prefix, key);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+
+        let script = redis::Script::new(RATE_LIMIT_LUA);
+        let result: redis::RedisResult<Vec<i64>> = {
+            let mut conn = self.connection.clone();
+            script
+                .key(&redis_key)
+                .arg(burst)
+                .arg(refill_per_sec)
+                .arg(now_ms as i64)
+                .invoke_async(&mut conn)
+                .await
+        };
+
+        match result {
+            Ok(values) if values.len() == 3 => {
+                // Redis recovered after an outage — reset the flag so we warn again next time.
+                self.outage_logged.store(false, Ordering::Relaxed);
+                let allowed = values[0] == 1;
+                if allowed {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let remaining = values[1] as u32;
+                    Some(Decision::Allowed { remaining })
+                } else {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let retry_after_secs = values[2].max(1) as u64;
+                    Some(Decision::Denied { retry_after_secs })
+                }
+            }
+            Err(err) => {
+                // Emit one warning per outage, not per request.
+                if !self.outage_logged.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %err,
+                        key_prefix = %self.key_prefix,
+                        "rate-limit Redis backend unavailable; \
+                         switching to on_backend_failure posture"
+                    );
+                }
+                match self.failure_mode {
+                    RateLimitBackendFailure::FailOpen => None,
+                    RateLimitBackendFailure::FailClosed => {
+                        Some(Decision::Denied { retry_after_secs: 1 })
+                    }
+                }
+            }
+            Ok(_) => {
+                // Unexpected script return shape — treat as backend error.
+                None
+            }
+        }
+    }
+}
+
+// ── Backend enum ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum BucketBackend {
+    Memory(MemoryStore),
+    #[cfg(feature = "redis")]
+    Redis(RedisStore),
+}
+
+// ── Limiter (shared state) ────────────────────────────────────────────────────
 
 /// Shared rate limiter state.
 #[derive(Debug)]
@@ -69,13 +344,7 @@ struct Limiter {
     trust_forwarded_headers: bool,
     trusted_proxies_configured: bool,
     trusted_proxies: Vec<TrustedProxy>,
-    buckets: Mutex<LruCache<String, Bucket>>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Bucket {
-    tokens: f64,
-    last_refill: Instant,
+    backend: BucketBackend,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,13 +406,6 @@ impl TrustedProxy {
     }
 }
 
-/// Outcome of consuming one token from a bucket.
-#[derive(Debug, Clone, Copy)]
-enum Decision {
-    Allowed { remaining: u32 },
-    Denied { retry_after_secs: u64 },
-}
-
 impl Limiter {
     fn from_config(config: &RateLimitConfig) -> Self {
         let burst = f64::from(config.burst.max(1));
@@ -163,6 +425,9 @@ impl Limiter {
                 })
             })
             .collect();
+
+        let backend = Self::build_backend(config);
+
         Self {
             refill_per_sec,
             burst,
@@ -170,58 +435,66 @@ impl Limiter {
             trust_forwarded_headers: config.trust_forwarded_headers,
             trusted_proxies_configured,
             trusted_proxies,
-            buckets: Mutex::new(LruCache::new(
-                NonZeroUsize::new(10_000).expect("10_000 is non-zero"),
-            )),
+            backend,
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)] // lock protects the bucket mutation
-    fn decide(&self, key: &str, now: Instant) -> Decision {
-        // Scope the lock guard so it's released before we produce the final
-        // `Decision`. Keeps the critical section tight.
-        let tokens_after = {
-            let mut buckets = match self.buckets.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-
-            let mut bucket = buckets.get(key).copied().unwrap_or(Bucket {
-                tokens: self.burst,
-                last_refill: now,
-            });
-
-            let elapsed = now
-                .saturating_duration_since(bucket.last_refill)
-                .as_secs_f64();
-            bucket.tokens = elapsed
-                .mul_add(self.refill_per_sec, bucket.tokens)
-                .min(self.burst);
-            bucket.last_refill = now;
-
-            let result = if bucket.tokens >= 1.0 {
-                bucket.tokens -= 1.0;
-                Ok(bucket.tokens)
+    fn build_backend(config: &RateLimitConfig) -> BucketBackend {
+        #[cfg(feature = "redis")]
+        if config.backend == RateLimitBackend::Redis {
+            if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
+                match redis::Client::open(url) {
+                    Ok(client) => {
+                        match redis::aio::ConnectionManager::new_lazy_with_config(
+                            client,
+                            redis::aio::ConnectionManagerConfig::new(),
+                        ) {
+                            Ok(conn) => {
+                                return BucketBackend::Redis(RedisStore::new(
+                                    conn,
+                                    config.redis.key_prefix.clone(),
+                                    config.on_backend_failure,
+                                ));
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    url = %url,
+                                    "rate-limit Redis backend: failed to create \
+                                     connection manager; falling back to memory"
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            url = %url,
+                            "rate-limit Redis backend: invalid Redis URL; \
+                             falling back to memory"
+                        );
+                    }
+                }
             } else {
-                Err(bucket.tokens)
-            };
-
-            buckets.put(key.to_owned(), bucket);
-            result
-        };
-
-        match tokens_after {
-            Ok(remaining_tokens) => {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let remaining = remaining_tokens.floor() as u32;
-                Decision::Allowed { remaining }
+                tracing::warn!(
+                    "rate-limit backend = \"redis\" but no redis.url configured; \
+                     falling back to memory"
+                );
             }
-            Err(current_tokens) => {
-                let deficit = 1.0 - current_tokens;
-                let secs = (deficit / self.refill_per_sec).ceil().max(1.0);
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let retry_after_secs = secs as u64;
-                Decision::Denied { retry_after_secs }
+        }
+        BucketBackend::Memory(MemoryStore::new())
+    }
+
+    /// Consume one token for `key`. Returns `None` when throttling must be bypassed
+    /// (no client, or Redis fail-open).
+    async fn decide(&self, key: &str) -> Option<Decision> {
+        match &self.backend {
+            BucketBackend::Memory(store) => {
+                Some(store.decide(key, Instant::now(), self.burst, self.refill_per_sec))
+            }
+            #[cfg(feature = "redis")]
+            BucketBackend::Redis(store) => {
+                store.decide(key, self.burst, self.refill_per_sec).await
             }
         }
     }
@@ -328,6 +601,8 @@ impl Limiter {
     }
 }
 
+// ── Tower layer & service ─────────────────────────────────────────────────────
+
 /// Tower [`Layer`] that applies rate limiting.
 ///
 /// Applied automatically when `security.rate_limit.enabled = true`.
@@ -381,15 +656,8 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let now = Instant::now();
-        // When no identifiable client is present (no trusted forwarding
-        // header, no ConnectInfo), bypass rate limiting. This covers
-        // in-process callers like the static site generator and test
-        // harnesses that invoke the router via `oneshot`.
-        let decision = self
-            .limiter
-            .client_ip(&req)
-            .map(|key| self.limiter.decide(&key, now));
+        // Extract the client key synchronously (no I/O required).
+        let client_key = self.limiter.client_ip(&req);
 
         let limiter = Arc::clone(&self.limiter);
         let mut inner = self.inner.clone();
@@ -397,6 +665,12 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
+            // Resolve the rate-limit decision (may be async for the Redis backend).
+            let decision = match client_key {
+                Some(key) => limiter.decide(&key).await,
+                None => None,
+            };
+
             match decision {
                 Some(Decision::Denied { retry_after_secs }) => {
                     let mut response = Response::new(ResBody::default());
@@ -438,6 +712,7 @@ mod tests {
             // they don't need a real TCP listener.
             trust_forwarded_headers: true,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -463,6 +738,7 @@ mod tests {
             burst: 5,
             trust_forwarded_headers: trust,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -473,6 +749,7 @@ mod tests {
             burst: 5,
             trust_forwarded_headers: true,
             trusted_proxies: proxies.iter().map(|proxy| (*proxy).to_owned()).collect(),
+            ..Default::default()
         })
     }
 
@@ -794,6 +1071,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         };
         let app = app(&config);
         let peer: SocketAddr = "198.51.100.1:2000"
@@ -834,6 +1112,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -884,6 +1163,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: false,
             trusted_proxies: Vec::new(),
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -915,6 +1195,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
 
@@ -948,6 +1229,7 @@ mod tests {
             burst: 1,
             trust_forwarded_headers: true,
             trusted_proxies: vec!["203.0.113.10:443".to_owned(), "198.51.100.0/999".to_owned()],
+            ..Default::default()
         };
         let app = app(&config);
         let peer: SocketAddr = "192.0.2.44:4000"
