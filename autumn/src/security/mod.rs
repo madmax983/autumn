@@ -10,7 +10,7 @@
 //! |-----------|--------|-------------|
 //! | Security headers | `headers` | X-Frame-Options, X-Content-Type-Options, HSTS, CSP, etc. |
 //! | CSRF protection | `csrf` | Token-based CSRF validation for mutating requests |
-//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket throttling with `429` + `Retry-After` |
+//! | Rate limiting | `rate_limit` | Per-client-IP token-bucket; memory (default) or Redis backend for multi-replica global enforcement |
 //! | Configuration | `config` | `[security]` section in `autumn.toml` |
 //!
 //! Authentication, session management, and password hashing live in
@@ -52,6 +52,14 @@
 //! burst = 20
 //! trust_forwarded_headers = true       # only behind trusted proxies
 //! trusted_proxies = ["10.0.0.10", "203.0.113.0/24"]
+//!
+//! # Multi-replica: share the budget globally across all pods
+//! backend = "redis"                    # "memory" (default) or "redis"
+//! on_backend_failure = "fail_open"     # "fail_open" (default) or "fail_closed"
+//!
+//! [security.rate_limit.redis]
+//! url = "redis://redis:6379"
+//! key_prefix = "myapp:rate_limit"
 //! ```
 //!
 //! ## Quick start
@@ -82,9 +90,11 @@ pub(crate) mod rate_limit;
 
 // Re-export commonly used types at the module level.
 pub use config::{
-    CsrfConfig, HeadersConfig, RateLimitConfig, SecurityConfig, UploadConfig,
+    CsrfConfig, HeadersConfig, RateLimitBackend, RateLimitConfig, SecurityConfig, UploadConfig,
     default_content_security_policy,
 };
+#[cfg(feature = "redis")]
+pub use config::{RateLimitBackendFailure, RateLimitRedisConfig};
 pub use csrf::{CsrfFormField, CsrfLayer, CsrfToken};
 pub use headers::SecurityHeadersLayer;
 pub use rate_limit::RateLimitLayer;

@@ -1766,6 +1766,40 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
             &mut self.security.rate_limit.trusted_proxies,
         );
+        // BACKEND is always parsed so misconfiguration is surfaced even without
+        // the redis feature (build_backend will warn and fall back to memory).
+        if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {
+            match crate::security::config::RateLimitBackend::from_env_value(&val) {
+                Some(backend) => self.security.rate_limit.backend = backend,
+                None => eprintln!(
+                    "Warning: AUTUMN_SECURITY__RATE_LIMIT__BACKEND={val:?} is not valid \
+                     (expected memory or redis), ignoring"
+                ),
+            }
+        }
+        #[cfg(feature = "redis")]
+        {
+            use crate::security::config::RateLimitBackendFailure;
+            if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE") {
+                match RateLimitBackendFailure::from_env_value(&val) {
+                    Some(mode) => self.security.rate_limit.on_backend_failure = mode,
+                    None => eprintln!(
+                        "Warning: AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE={val:?} is not \
+                         valid (expected fail_open or fail_closed), ignoring"
+                    ),
+                }
+            }
+            parse_env_option_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL",
+                &mut self.security.rate_limit.redis.url,
+            );
+            parse_env_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX",
+                &mut self.security.rate_limit.redis.key_prefix,
+            );
+        }
     }
 
     #[cfg(feature = "storage")]
@@ -3494,6 +3528,86 @@ path = "/healthz"
             config.security.rate_limit.trusted_proxies,
             vec!["10.0.0.10", "203.0.113.0/24"]
         );
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_redis() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "redis");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Redis);
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_memory() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "memory");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Memory);
+    }
+
+    #[test]
+    fn env_override_rate_limit_backend_invalid_ignored() {
+        use crate::security::config::RateLimitBackend;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__BACKEND", "postgres");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.backend, RateLimitBackend::Memory);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_on_backend_failure_fail_closed() {
+        use crate::security::config::RateLimitBackendFailure;
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE",
+            "fail_closed",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.on_backend_failure,
+            RateLimitBackendFailure::FailClosed
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_on_backend_failure_invalid_ignored() {
+        use crate::security::config::RateLimitBackendFailure;
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE", "explode");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.on_backend_failure,
+            RateLimitBackendFailure::FailOpen
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_redis_url() {
+        let env = MockEnv::new().with(
+            "AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL",
+            "redis://myhost:6379",
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.security.rate_limit.redis.url.as_deref(),
+            Some("redis://myhost:6379")
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn env_override_rate_limit_redis_key_prefix() {
+        let env = MockEnv::new().with("AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX", "prod:rl");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.security.rate_limit.redis.key_prefix, "prod:rl");
     }
 
     #[test]
