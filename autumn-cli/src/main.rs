@@ -16,6 +16,7 @@ mod seed;
 mod setup;
 mod task;
 mod token;
+mod webhook;
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -168,6 +169,9 @@ enum Commands {
     #[command(subcommand, verbatim_doc_comment)]
     Release(ReleaseCommands),
 
+    /// Simulate a signed webhook request to the local application.
+    #[command(subcommand, verbatim_doc_comment)]
+    Webhook(WebhookCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -295,6 +299,26 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+}
+
+/// Subcommands for `autumn token`.
+
+#[derive(Subcommand)]
+enum WebhookCommands {
+    /// Send a simulated webhook request with a generated HMAC signature.
+    Sim {
+        /// The provider to simulate (stripe, github, slack, generic).
+        provider: String,
+        /// The target URL to send the webhook to.
+        url: String,
+        /// The webhook secret used to sign the request.
+        #[arg(long)]
+        #[arg(long, env = "AUTUMN_WEBHOOK_SECRET")]
+        secret: String,
+        /// The payload to send in the request body.
+        #[arg(long)]
+        payload: String,
+    },
 }
 
 /// Subcommands for `autumn token`.
@@ -525,6 +549,13 @@ fn run_command(command: Commands) {
                 with_seed,
             },
         ),
+
+        Commands::Webhook(WebhookCommands::Sim {
+            provider,
+            url,
+            secret,
+            payload,
+        }) => webhook::run_sim(&provider, &url, &secret, &payload),
         Commands::Seed { profile, package } => seed::run(&profile, package.as_deref()),
         Commands::Task {
             package,
