@@ -823,6 +823,10 @@ A few notes:
   the header automatically.
 - Unknown override values (anything other than `PUT`, `PATCH`, `DELETE`,
   case-insensitive) reject with `400 Bad Request` before your handler runs.
+- Form-urlencoded bodies larger than 2 MiB are rejected with
+  `413 Payload Too Large` so an oversized form with `_method=DELETE`
+  isn't silently demoted to a `POST` (body-size-driven semantics).
+  Use `multipart/form-data` for large submissions.
 - CSRF still treats the transport `POST` as unsafe — an overridden
   `DELETE` without a valid token returns `403 Forbidden` just like any
   other mutating POST.
