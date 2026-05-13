@@ -81,19 +81,12 @@ fn split_statements(sql: &str) -> Vec<String> {
 
 /// Strip line comments, collapse whitespace, and lowercase a single statement.
 fn normalize_statement(stmt: &str) -> String {
-    let stripped: String = stmt
-        .lines()
-        .map(|line| {
-            if let Some(idx) = line.find("--") {
-                &line[..idx]
-            } else {
-                line
-            }
-        })
+    stmt.lines()
+        .map(|line| line.find("--").map_or(line, |i| &line[..i]))
+        .flat_map(str::split_whitespace)
         .collect::<Vec<_>>()
-        .join(" ");
-
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
@@ -156,12 +149,8 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // ALTER COLUMN TYPE
-    if normalized.contains("alter column") {
-        let after_alter = normalized
-            .find("alter column")
-            .map(|i| &normalized[i..])
-            .unwrap_or("");
-        if after_alter.contains(" type ") {
+    if let Some(i) = normalized.find("alter column") {
+        if normalized[i..].contains(" type ") {
             findings.push(SafetyFinding {
                 operation: "ALTER COLUMN TYPE".to_owned(),
                 risk: RiskLevel::Destructive,
@@ -174,10 +163,18 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // ADD COLUMN NOT NULL without DEFAULT
-    if normalized.contains(" add column ") {
-        if let Some(finding) = check_add_column_not_null(normalized) {
-            findings.push(finding);
-        }
+    if normalized.contains(" add column ")
+        && normalized.contains("not null")
+        && !normalized.contains("default")
+    {
+        findings.push(SafetyFinding {
+            operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate every \
+                  existing row under an exclusive lock. On a large table this may time out.",
+            next_action: "Provide a DEFAULT value, or add the column as nullable first, backfill \
+                          existing rows, then add the NOT NULL constraint in a later migration.",
+        });
     }
 
     // CREATE INDEX without CONCURRENTLY
@@ -195,22 +192,6 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     findings
-}
-
-/// Inspect an ADD COLUMN statement: flag NOT NULL without a DEFAULT.
-fn check_add_column_not_null(normalized: &str) -> Option<SafetyFinding> {
-    if normalized.contains("not null") && !normalized.contains("default") {
-        Some(SafetyFinding {
-            operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
-            risk: RiskLevel::PotentiallyBlocking,
-            why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate every \
-                  existing row under an exclusive lock. On a large table this may time out.",
-            next_action: "Provide a DEFAULT value, or add the column as nullable first, backfill \
-                          existing rows, then add the NOT NULL constraint in a later migration.",
-        })
-    } else {
-        None
-    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
