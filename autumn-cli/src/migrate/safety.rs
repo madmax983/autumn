@@ -580,6 +580,7 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     if normalized.starts_with("update ")
         || normalized.starts_with("insert into ")
         || normalized.starts_with("delete from ")
+        || normalized.starts_with("merge into ")
     {
         findings.push(SafetyFinding {
             operation: "Bulk DML (data backfill)".to_owned(),
@@ -630,6 +631,33 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
+    // ALTER TYPE RENAME VALUE — renaming an enum label breaks old replicas that
+    // still INSERT or compare against the old label during a rolling deploy.
+    if normalized.starts_with("alter type") && normalized.contains(" rename value ") {
+        findings.push(SafetyFinding {
+            operation: "ALTER TYPE RENAME VALUE".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming an enum label breaks old replicas that still insert, compare, or \
+                  decode the old label. Errors will appear immediately during a rolling deploy.",
+            next_action: "Use expand/contract: add a new enum value, migrate all writes to use \
+                          it, then remove the old value in a subsequent release.",
+        });
+        return findings;
+    }
+
+    // ALTER TYPE RENAME TO — renaming the type itself breaks references in old replicas.
+    if normalized.starts_with("alter type") && normalized.contains(" rename to ") {
+        findings.push(SafetyFinding {
+            operation: "ALTER TYPE RENAME".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming a type breaks all references to its old name in old replicas, \
+                  causing errors during a rolling deploy.",
+            next_action: "Coordinate a maintenance window or use expand/contract by creating \
+                          the new type, migrating columns/code, then dropping the old one.",
+        });
+        return findings;
+    }
+
     // Generic catch-all — DDL/DML not matched by any rule above
     let is_known_start = normalized.starts_with("drop table")
         || normalized.starts_with("drop index")
@@ -640,12 +668,13 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         || normalized.starts_with("update ")
         || normalized.starts_with("insert into ")
         || normalized.starts_with("delete from ")
+        || normalized.starts_with("merge into ")
         || normalized.starts_with("comment on")
         || normalized.starts_with("create sequence")
         || normalized.starts_with("alter sequence")
         || normalized.starts_with("drop sequence")
         || normalized.starts_with("create type")
-        || normalized.starts_with("alter type")
+        // `alter type` is intentionally absent — unclassified forms fall through to ManualReview
         // `drop type` is intentionally absent — falls through to ManualReview
         || normalized.starts_with("create extension")
         || normalized.starts_with("create view")
@@ -854,6 +883,42 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::Irreversible);
         assert_eq!(findings[0].operation, "RENAME TABLE");
+    }
+
+    #[test]
+    fn alter_type_rename_value_is_irreversible() {
+        let findings = classify_sql("ALTER TYPE status RENAME VALUE 'draft' TO 'pending';");
+        assert_eq!(
+            findings.len(),
+            1,
+            "ALTER TYPE RENAME VALUE must be flagged: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Irreversible);
+        assert_eq!(findings[0].operation, "ALTER TYPE RENAME VALUE");
+    }
+
+    #[test]
+    fn alter_type_rename_to_is_irreversible() {
+        let findings = classify_sql("ALTER TYPE order_status RENAME TO status;");
+        assert_eq!(
+            findings.len(),
+            1,
+            "ALTER TYPE RENAME TO must be flagged: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Irreversible);
+        assert_eq!(findings[0].operation, "ALTER TYPE RENAME");
+    }
+
+    #[test]
+    fn alter_type_add_value_requires_manual_review() {
+        // ADD VALUE is not specifically classified — operator must review.
+        let findings = classify_sql("ALTER TYPE status ADD VALUE 'archived';");
+        assert_eq!(
+            findings.len(),
+            1,
+            "unclassified ALTER TYPE must require manual review: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
     }
 
     #[test]
@@ -1228,6 +1293,22 @@ mod tests {
     }
 
     // ── data backfill patterns ────────────────────────────────────────────────
+
+    #[test]
+    fn merge_into_is_data_backfill() {
+        let sql = "MERGE INTO posts AS target \
+                   USING staging AS src ON target.id = src.id \
+                   WHEN MATCHED THEN UPDATE SET title = src.title \
+                   WHEN NOT MATCHED THEN INSERT (id, title) VALUES (src.id, src.title);";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "MERGE INTO must be classified as a data backfill: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+        assert_eq!(findings[0].operation, "Bulk DML (data backfill)");
+    }
 
     #[test]
     fn bulk_update_is_data_backfill() {
