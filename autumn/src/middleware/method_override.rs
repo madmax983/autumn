@@ -32,13 +32,26 @@
 //! 2. `Sec-Fetch-Site: same-site` — **not** sufficient on its own
 //!    because `same-site` accepts sibling origins under the same
 //!    registrable domain (e.g. `evil.example.com` -> `app.example.com`).
-//!    Fall back to the `Origin` vs `Host` check before allowing.
+//!    Fall back to the full `Origin` check before allowing.
 //! 3. `Sec-Fetch-Site: cross-site` (or any other value) is rejected.
-//! 4. When `Sec-Fetch-Site` is absent, compare `Origin` host-for-host
-//!    with `Host`. A mismatch is rejected.
-//! 5. If both signals are absent, the override is **not** applied —
+//! 4. When `Sec-Fetch-Site` is absent, fall back to the full `Origin`
+//!    check.
+//! 5. If `Origin` is missing too, the override is **not** applied —
 //!    the request is forwarded as the original `POST` so route
 //!    matching rejects it on its own (fail closed).
+//!
+//! The full `Origin` check compares scheme, host, and port:
+//!
+//! - The Origin host:port must match `X-Forwarded-Host` (if surfaced
+//!   by the reverse proxy) or `Host`.
+//! - If `X-Forwarded-Proto` is set (e.g. by a TLS-terminating proxy),
+//!   the Origin's scheme must match it. The leftmost element of a
+//!   comma-separated proxy chain is used.
+//! - When neither `X-Forwarded-Proto` is set nor the request URI
+//!   carries a scheme, the middleware can't observe the underlying
+//!   transport, so it falls back to host:port matching alone.
+//!   Deployments that need strict scheme enforcement should run
+//!   behind a proxy that sets `X-Forwarded-Proto`.
 //!
 //! # Failure modes
 //!
@@ -341,41 +354,95 @@ fn is_form_urlencoded(headers: &http::HeaderMap) -> bool {
 ///    thing is to forward the request as the original `POST` and let
 ///    route matching reject it.
 fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
-    let origin_host_match = || {
+    let origin_full_match = || {
         let origin = headers
             .get(http::header::ORIGIN)
             .and_then(|v| v.to_str().ok())?;
-        let host = headers
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())?;
-        Some(origin_matches_host(origin, host))
+        Some(origin_matches_request(origin, headers))
     };
 
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return match site {
             "same-origin" | "none" => true,
             // `same-site` is broader than same-origin; require an
-            // explicit Origin/Host match for the documented guarantee.
-            "same-site" => origin_host_match().unwrap_or(false),
+            // explicit Origin/Host (and scheme) match for the
+            // documented guarantee.
+            "same-site" => origin_full_match().unwrap_or(false),
             // `cross-site` or any unrecognised value: reject.
             _ => false,
         };
     }
 
-    origin_host_match().unwrap_or(false)
+    origin_full_match().unwrap_or(false)
 }
 
-/// `Origin` is a scheme + host (+ optional port); `Host` is host
-/// (+ optional port). We treat them as same-origin when the
-/// host:port portion matches.
-fn origin_matches_host(origin: &str, host: &str) -> bool {
-    let origin_authority = origin
-        .strip_prefix("https://")
-        .or_else(|| origin.strip_prefix("http://"))
-        .unwrap_or(origin);
-    // Trim any trailing path (defensive — `Origin` should not include one).
-    let origin_authority = origin_authority.split('/').next().unwrap_or("");
-    origin_authority.eq_ignore_ascii_case(host)
+/// Same-origin requires scheme + host + port to match. `Origin` carries
+/// all three; the request side gets host:port from `Host` (or
+/// `X-Forwarded-Host` if the deployment surfaces it) and the scheme
+/// from `X-Forwarded-Proto` when running behind a TLS-terminating
+/// reverse proxy.
+///
+/// If we can determine the request's scheme and Origin's scheme
+/// differs, we reject — that's a true cross-origin request from a
+/// different scheme. If we cannot determine the scheme (no
+/// `X-Forwarded-Proto` set; not behind a proxy), we fall back to
+/// requiring just the host:port match. That's a deployment-specific
+/// limitation: the middleware can't observe the underlying transport
+/// from inside the request, so configurations that need strict
+/// scheme enforcement should run behind a proxy that sets
+/// `X-Forwarded-Proto`.
+fn origin_matches_request(origin: &str, headers: &http::HeaderMap) -> bool {
+    let Some((origin_scheme, origin_authority)) = parse_origin(origin) else {
+        return false;
+    };
+
+    let expected_host = headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            headers
+                .get(http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+        });
+    let Some(expected_host) = expected_host else {
+        return false;
+    };
+    if !origin_authority.eq_ignore_ascii_case(expected_host) {
+        return false;
+    }
+
+    if let Some(scheme) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        // Multiple `X-Forwarded-Proto` values can be chained by
+        // intermediaries; the leftmost (client-facing) is the one
+        // that matters here.
+        let outermost = scheme.split(',').next().unwrap_or(scheme).trim();
+        return outermost.eq_ignore_ascii_case(origin_scheme);
+    }
+
+    // No scheme signal: host:port match is the best we can do.
+    true
+}
+
+/// Split a serialized `Origin` value into `(scheme, authority)`.
+///
+/// Returns `None` for malformed values (missing scheme, opaque
+/// origins like `null`, or unrecognised schemes). Only `http` and
+/// `https` are accepted — the override convention is documented for
+/// browser HTML forms only.
+fn parse_origin(origin: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = origin.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    // Defensive: `Origin` is just scheme://authority with no path.
+    let authority = rest.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    Some((scheme, authority))
 }
 
 impl<S, ResBody> Service<Request<axum::body::Body>> for MethodOverrideService<S>
@@ -1090,6 +1157,107 @@ mod tests {
 
         // /items/1 has no POST handler, so a non-overridden POST yields 405.
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// Regression: when `X-Forwarded-Proto: https` is set by the reverse
+    /// proxy, an `Origin: http://...` carries a different scheme and
+    /// therefore is NOT same-origin, even if the host matches. The
+    /// override must not be honoured.
+    #[tokio::test]
+    async fn origin_scheme_mismatch_via_forwarded_proto_is_rejected() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "http://app.example")
+                    .header("host", "app.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "different Origin scheme is not same-origin"
+        );
+    }
+
+    /// `X-Forwarded-Proto` may carry a chained list (e.g. through
+    /// nested proxies). The leftmost (client-facing) value is what
+    /// the browser saw; that's the value we must compare against.
+    #[tokio::test]
+    async fn origin_scheme_match_via_chained_forwarded_proto() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://app.example")
+                    .header("host", "app.example")
+                    // First hop saw HTTPS; later hops were HTTP between
+                    // proxy and app. Only the client-facing scheme
+                    // matters for the same-origin comparison.
+                    .header("x-forwarded-proto", "https, http")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// When the proxy surfaces a different `X-Forwarded-Host`, that's
+    /// the host the browser saw — Origin must match the forwarded host,
+    /// not the internal `Host` header from the proxy.
+    #[tokio::test]
+    async fn forwarded_host_takes_precedence_over_host_header() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://app.example")
+                    .header("host", "internal.cluster.local")
+                    .header("x-forwarded-host", "app.example")
+                    .header("x-forwarded-proto", "https")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `parse_origin` unit cases.
+    #[test]
+    fn parse_origin_accepts_http_and_https_only() {
+        assert_eq!(
+            parse_origin("https://app.example"),
+            Some(("https", "app.example"))
+        );
+        assert_eq!(
+            parse_origin("http://app.example:8080"),
+            Some(("http", "app.example:8080"))
+        );
+        // Unknown / opaque origins are rejected.
+        assert_eq!(parse_origin("null"), None);
+        assert_eq!(parse_origin("file:///etc/passwd"), None);
+        assert_eq!(parse_origin("javascript:alert(1)"), None);
+        // Missing scheme/authority.
+        assert_eq!(parse_origin("app.example"), None);
+        assert_eq!(parse_origin("https://"), None);
     }
 
     /// Helper-level cases that don't require the full router wiring.

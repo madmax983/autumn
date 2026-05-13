@@ -813,14 +813,18 @@ A few notes:
 - It is also enforced as **same-origin**: the request must carry
   `Sec-Fetch-Site: same-origin` or `none` (sent by every browser
   since ~2020), or — for `same-site` or when `Sec-Fetch-Site` is
-  absent — its `Origin` header must match the `Host` header. This
-  is stricter than `same-site` alone, because `same-site` accepts
-  sibling subdomains under the same registrable domain (e.g.
-  `evil.example.com` -> `app.example.com`). Requests that don't
-  meet any of these conditions are forwarded as the original `POST`
-  so a cross-origin form can never reach a route declared only as
-  `#[delete]`. The `autumn_web::test::TestApp` `form()` helper sets
-  the header automatically.
+  absent — its `Origin` header must match the request's scheme,
+  host, and port. This is stricter than `same-site` alone, because
+  `same-site` accepts sibling subdomains under the same registrable
+  domain (e.g. `evil.example.com` -> `app.example.com`). When
+  running behind a TLS-terminating reverse proxy, the scheme is
+  read from `X-Forwarded-Proto` (leftmost client-facing value);
+  the host is read from `X-Forwarded-Host` if surfaced, otherwise
+  from `Host`. Requests that don't meet these conditions are
+  forwarded as the original `POST` so a cross-origin form can
+  never reach a route declared only as `#[delete]`. The
+  `autumn_web::test::TestApp` `form()` helper sets
+  `Sec-Fetch-Site: same-origin` automatically.
 - Unknown override values (anything other than `PUT`, `PATCH`, `DELETE`,
   case-insensitive) reject with `400 Bad Request` before your handler runs.
 - Form-urlencoded bodies larger than 2 MiB are rejected with
