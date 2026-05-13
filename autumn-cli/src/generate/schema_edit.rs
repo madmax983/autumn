@@ -177,10 +177,21 @@ fn split_on_keyword(s: &str, keyword: &str) -> Option<(String, String)> {
 }
 
 /// SQL for adding columns to a table.
+///
+/// Prepends an `autumn-safety` comment for `NOT NULL` columns that have no
+/// `DEFAULT` — those require a backfill or a default before the constraint can
+/// be added safely on a live table.
 #[must_use]
 pub fn add_columns_up_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields {
+        if !f.nullable {
+            let _ = writeln!(
+                out,
+                "-- autumn-safety: potentially-blocking \
+                 -- add a DEFAULT or backfill existing rows before enforcing NOT NULL"
+            );
+        }
         let _ = writeln!(
             out,
             "ALTER TABLE {table} ADD COLUMN {} {} {};",
@@ -203,10 +214,20 @@ pub fn add_columns_down_sql(table: &str, fields: &[Field]) -> String {
 }
 
 /// SQL for removing columns from a table.
+///
+/// Prepends an `autumn-safety` comment for each `DROP COLUMN` to make the
+/// rolling-deploy risk visible at a glance and machine-parseable by
+/// `autumn migrate check`.
 #[must_use]
 pub fn remove_columns_up_sql(table: &str, fields: &[Field]) -> String {
     let mut out = String::new();
     for f in fields {
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: destructive \
+             -- old replicas that reference this column will fail until restarted; \
+             use expand/contract"
+        );
         let _ = writeln!(out, "ALTER TABLE {table} DROP COLUMN {};", f.name);
     }
     out

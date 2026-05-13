@@ -36,17 +36,6 @@ pub enum MigrateAction {
     Check,
 }
 
-/// Read every migration directory in `dir`, classify its `up.sql`, and return
-/// a sorted list of `(migration_name, findings)` pairs.
-///
-/// Migration directories that have no `up.sql` are silently skipped.
-/// TODO(red): stub — always returns empty; implement in green phase
-pub fn check_migrations_in_dir(
-    _dir: &Path,
-) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
-    Ok(vec![])
-}
-
 /// Run the migrate command.
 pub fn run(action: MigrateAction) {
     eprintln!("\u{1F342} autumn migrate\n");
@@ -83,8 +72,90 @@ pub fn run(action: MigrateAction) {
     }
 }
 
-fn run_safety_check(_migrations_dir: &str) {
-    eprintln!("  TODO: implement safety check in green phase");
+/// Run the migration safety preflight check against all SQL files in `migrations_dir`.
+///
+/// Prints a human-readable report to stderr and exits with code 1 if any
+/// unsafe or potentially-blocking operations are detected.
+fn run_safety_check(migrations_dir: &str) {
+    let reports = match check_migrations_in_dir(Path::new(migrations_dir)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\u{2717} Migration safety check failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if reports.is_empty() {
+        eprintln!("\u{2713} No migrations found in {migrations_dir}/");
+        return;
+    }
+
+    let total = reports.len();
+    eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
+
+    let mut any_unsafe = false;
+    for (name, findings) in &reports {
+        if findings.is_empty() {
+            eprintln!("  \u{2713} {name}  [safe]");
+        } else {
+            eprintln!("  \u{2717} {name}");
+            for f in findings {
+                eprintln!("      \u{2022} {} [{}]", f.operation, f.risk);
+                eprintln!("        Why:  {}", f.why);
+                eprintln!("        Next: {}", f.next_action);
+            }
+            any_unsafe = true;
+        }
+    }
+
+    eprintln!();
+    if any_unsafe {
+        eprintln!(
+            "\u{2717} One or more migrations contain operations that are unsafe for a live \
+             rolling deploy."
+        );
+        eprintln!(
+            "  Review the findings above, apply the expand/contract pattern where needed,"
+        );
+        eprintln!(
+            "  or coordinate a maintenance window before deploying these migrations."
+        );
+        std::process::exit(1);
+    } else {
+        eprintln!("\u{2713} All {total} migration(s) are safe for a rolling deploy.");
+    }
+}
+
+/// Read every migration directory in `dir`, classify its `up.sql`, and return
+/// a sorted list of `(migration_name, findings)` pairs.
+///
+/// Migration directories that have no `up.sql` are silently skipped.
+pub fn check_migrations_in_dir(
+    dir: &Path,
+) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+
+    // Sort by directory name (which starts with a timestamp) for stable output.
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut results = Vec::new();
+    for entry in entries {
+        let migration_name = entry.file_name().to_string_lossy().into_owned();
+        let up_sql_path = entry.path().join("up.sql");
+        if !up_sql_path.exists() {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&up_sql_path)
+            .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
+        let findings = safety::classify_sql(&sql);
+        results.push((migration_name, findings));
+    }
+
+    Ok(results)
 }
 
 /// Resolve the primary/write database URL from autumn.toml and environment variables.

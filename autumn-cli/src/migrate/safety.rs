@@ -52,9 +52,11 @@ pub struct SafetyFinding {
 /// Classify the SQL content of an `up.sql` file and return all safety findings.
 ///
 /// Returns an empty `Vec` when the migration is fully additive and safe.
-/// TODO(red): stub — always returns empty; implement in green phase
-pub fn classify_sql(_sql: &str) -> Vec<SafetyFinding> {
-    vec![]
+pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
+    split_statements(sql)
+        .iter()
+        .flat_map(|stmt| classify_statement(&normalize_statement(stmt)))
+        .collect()
 }
 
 /// True iff there are no findings above `Safe` risk level.
@@ -65,6 +67,150 @@ pub fn is_safe(findings: &[SafetyFinding]) -> bool {
 /// True iff any finding exceeds the `Safe` risk level.
 pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
     findings.iter().any(|f| f.risk > RiskLevel::Safe)
+}
+
+// ── internals ────────────────────────────────────────────────────────────────
+
+fn split_statements(sql: &str) -> Vec<String> {
+    sql.split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Strip line comments, collapse whitespace, and lowercase a single statement.
+fn normalize_statement(stmt: &str) -> String {
+    let stripped: String = stmt
+        .lines()
+        .map(|line| {
+            if let Some(idx) = line.find("--") {
+                &line[..idx]
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
+fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
+    if normalized.is_empty() {
+        return vec![];
+    }
+
+    let mut findings = Vec::new();
+
+    // DROP TABLE — check first; it subsumes DROP COLUMN detection
+    if normalized.starts_with("drop table") {
+        findings.push(SafetyFinding {
+            operation: "DROP TABLE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Drops the entire table and all its data. Old replicas that reference this \
+                  table will error immediately.",
+            next_action: "Use expand/contract: first deploy code that stops using the table, \
+                          then drop it in a subsequent release.",
+        });
+        return findings;
+    }
+
+    // DROP COLUMN
+    if normalized.contains(" drop column ") {
+        findings.push(SafetyFinding {
+            operation: "DROP COLUMN".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Removes a column and its data. Old replicas that SELECT or INSERT this column \
+                  will error until they restart.",
+            next_action: "Use expand/contract: first deploy code that no longer reads or writes \
+                          this column, then drop it in the next release.",
+        });
+    }
+
+    // RENAME COLUMN
+    if normalized.contains(" rename column ") {
+        findings.push(SafetyFinding {
+            operation: "RENAME COLUMN".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming a column breaks queries from old replicas that still reference the \
+                  old name, causing errors during a rolling deploy.",
+            next_action: "Use expand/contract: add the new column, dual-write, backfill existing \
+                          rows, update all code, then drop the old column.",
+        });
+    }
+
+    // RENAME TABLE
+    if normalized.contains("alter table") && normalized.contains(" rename to ")
+        && !normalized.contains(" rename column ")
+    {
+        findings.push(SafetyFinding {
+            operation: "RENAME TABLE".to_owned(),
+            risk: RiskLevel::Irreversible,
+            why: "Renaming a table breaks all queries from old replicas that reference the \
+                  original name.",
+            next_action: "Create a view under the old name while the new name rolls out, or \
+                          coordinate a maintenance window.",
+        });
+    }
+
+    // ALTER COLUMN TYPE
+    if normalized.contains("alter column") {
+        let after_alter = normalized
+            .find("alter column")
+            .map(|i| &normalized[i..])
+            .unwrap_or("");
+        if after_alter.contains(" type ") {
+            findings.push(SafetyFinding {
+                operation: "ALTER COLUMN TYPE".to_owned(),
+                risk: RiskLevel::Destructive,
+                why: "Changing a column's type rewrites the column data and may be incompatible \
+                      with values read by old replicas or application code.",
+                next_action: "Add a new column with the target type, migrate data, update code to \
+                              use the new column, then drop the old one.",
+            });
+        }
+    }
+
+    // ADD COLUMN NOT NULL without DEFAULT
+    if normalized.contains(" add column ") {
+        if let Some(finding) = check_add_column_not_null(normalized) {
+            findings.push(finding);
+        }
+    }
+
+    // CREATE INDEX without CONCURRENTLY
+    if normalized.starts_with("create index")
+        && !normalized.starts_with("create index concurrently")
+    {
+        findings.push(SafetyFinding {
+            operation: "CREATE INDEX (non-concurrent)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Non-concurrent index creation holds an exclusive table lock for the entire \
+                  build, blocking all reads and writes.",
+            next_action: "Use CREATE INDEX CONCURRENTLY instead. Note: concurrent index \
+                          creation cannot run inside a transaction block.",
+        });
+    }
+
+    findings
+}
+
+/// Inspect an ADD COLUMN statement: flag NOT NULL without a DEFAULT.
+fn check_add_column_not_null(normalized: &str) -> Option<SafetyFinding> {
+    if normalized.contains("not null") && !normalized.contains("default") {
+        Some(SafetyFinding {
+            operation: "ADD COLUMN NOT NULL (no default)".to_owned(),
+            risk: RiskLevel::PotentiallyBlocking,
+            why: "Adding a NOT NULL column without a DEFAULT forces Postgres to validate every \
+                  existing row under an exclusive lock. On a large table this may time out.",
+            next_action: "Provide a DEFAULT value, or add the column as nullable first, backfill \
+                          existing rows, then add the NOT NULL constraint in a later migration.",
+        })
+    } else {
+        None
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
