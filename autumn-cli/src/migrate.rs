@@ -146,11 +146,50 @@ pub fn check_migrations_in_dir(
         }
         let sql = std::fs::read_to_string(&up_sql_path)
             .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
-        let findings = safety::classify_sql(&sql);
+        let mut findings = safety::classify_sql(&sql);
+        check_concurrent_index_transaction_opt_out(&sql, &entry.path(), &mut findings);
         results.push((migration_name, findings));
     }
 
     Ok(results)
+}
+
+/// If the SQL uses `CREATE INDEX CONCURRENTLY` but the migration directory does not
+/// opt out of Diesel's default transaction wrapping via `metadata.toml`, add a
+/// `PotentiallyBlocking` finding.
+///
+/// `PostgreSQL` rejects `CREATE INDEX CONCURRENTLY` inside a transaction block.
+/// Without `run_in_transaction = false` in `metadata.toml`, Diesel wraps the
+/// migration in a transaction and the deployment job will fail.
+fn check_concurrent_index_transaction_opt_out(
+    sql: &str,
+    migration_dir: &Path,
+    findings: &mut Vec<safety::SafetyFinding>,
+) {
+    let lower = sql.to_lowercase();
+    let uses_concurrently = lower.contains("create index concurrently")
+        || lower.contains("create unique index concurrently");
+    if !uses_concurrently {
+        return;
+    }
+
+    let metadata_path = migration_dir.join("metadata.toml");
+    let opted_out = std::fs::read_to_string(&metadata_path)
+        .map(|content| content.contains("run_in_transaction = false"))
+        .unwrap_or(false);
+
+    if !opted_out {
+        findings.push(safety::SafetyFinding {
+            operation: "CREATE INDEX CONCURRENTLY (missing transaction opt-out)".to_owned(),
+            risk: safety::RiskLevel::PotentiallyBlocking,
+            why: "PostgreSQL rejects CONCURRENTLY inside a transaction block. Diesel wraps \
+                  migrations in a transaction by default, so this migration will fail at \
+                  deploy time unless the transaction is disabled.",
+            next_action: "Add `run_in_transaction = false` to the migration's `metadata.toml` \
+                          (create the file if absent). Example: \
+                          echo 'run_in_transaction = false' > migrations/<name>/metadata.toml",
+        });
+    }
 }
 
 /// Resolve the primary/write database URL from autumn.toml and environment variables.
@@ -644,5 +683,152 @@ replica_url = "postgres://replica:5432/app"
         let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
 
         assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    // ── check_concurrent_index_transaction_opt_out ────────────────────────
+
+    #[test]
+    fn concurrent_index_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+        assert!(
+            findings[0].operation.contains("CONCURRENTLY"),
+            "finding should mention CONCURRENTLY"
+        );
+        assert!(
+            findings[0]
+                .next_action
+                .contains("run_in_transaction = false"),
+            "next_action should guide user to metadata.toml"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_run_in_transaction_false_is_not_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "correctly opted-out CONCURRENTLY should produce no additional findings"
+        );
+    }
+
+    #[test]
+    fn concurrent_index_with_metadata_toml_missing_flag_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "# Diesel migration metadata\n",
+        )
+        .unwrap();
+
+        let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn non_concurrent_index_is_not_flagged_by_opt_out_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE INDEX idx_posts_title ON posts (title);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "non-CONCURRENTLY index should not be flagged by opt-out check"
+        );
+    }
+
+    #[test]
+    fn concurrent_unique_index_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_unique_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "CREATE UNIQUE INDEX CONCURRENTLY idx_posts_slug ON posts (slug);";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn check_migrations_in_dir_flags_concurrent_index_without_metadata() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("up.sql"),
+            "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);",
+        )
+        .unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.operation.contains("CONCURRENTLY")),
+            "missing metadata.toml should produce a CONCURRENTLY finding"
+        );
+    }
+
+    #[test]
+    fn check_migrations_in_dir_concurrent_index_with_metadata_is_safe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_add_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("up.sql"),
+            "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);",
+        )
+        .unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+        std::fs::write(
+            migration_dir.join("metadata.toml"),
+            "run_in_transaction = false\n",
+        )
+        .unwrap();
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.operation.contains("CONCURRENTLY")),
+            "opted-out CONCURRENTLY should not produce a transaction opt-out finding"
+        );
     }
 }
