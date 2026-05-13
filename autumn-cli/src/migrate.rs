@@ -13,6 +13,8 @@
 //! migrations (via `.migrations()` on `AppBuilder`). This CLI command
 //! is a convenience wrapper for explicit migration management.
 
+pub mod safety;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -29,11 +31,34 @@ pub enum MigrateAction {
     Run,
     /// Show migration status (pending / applied).
     Status,
+    /// Preflight safety check — classifies all migration SQL files and returns
+    /// a non-zero exit code if any unsafe or unclassified operations are found.
+    Check,
+}
+
+/// Read every migration directory in `dir`, classify its `up.sql`, and return
+/// a sorted list of `(migration_name, findings)` pairs.
+///
+/// Migration directories that have no `up.sql` are silently skipped.
+/// TODO(red): stub — always returns empty; implement in green phase
+pub fn check_migrations_in_dir(
+    _dir: &Path,
+) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
+    Ok(vec![])
 }
 
 /// Run the migrate command.
 pub fn run(action: MigrateAction) {
     eprintln!("\u{1F342} autumn migrate\n");
+
+    match action {
+        MigrateAction::Check => {
+            let migrations_dir = resolve_migrations_dir();
+            run_safety_check(&migrations_dir);
+            return;
+        }
+        _ => {}
+    }
 
     // 1. Resolve database URL from autumn.toml + env
     let database_url = resolve_database_url();
@@ -54,7 +79,12 @@ pub fn run(action: MigrateAction) {
             show_status(&database_url, &migrations_dir);
             show_framework_status(&database_url);
         }
+        MigrateAction::Check => unreachable!("handled above"),
     }
+}
+
+fn run_safety_check(_migrations_dir: &str) {
+    eprintln!("  TODO: implement safety check in green phase");
 }
 
 /// Resolve the primary/write database URL from autumn.toml and environment variables.
@@ -291,7 +321,118 @@ mod tests {
     fn migrate_action_eq() {
         assert_eq!(MigrateAction::Run, MigrateAction::Run);
         assert_eq!(MigrateAction::Status, MigrateAction::Status);
+        assert_eq!(MigrateAction::Check, MigrateAction::Check);
         assert_ne!(MigrateAction::Run, MigrateAction::Status);
+        assert_ne!(MigrateAction::Run, MigrateAction::Check);
+    }
+
+    // ── check_migrations_in_dir ────────────────────────────────────────────
+
+    fn write_migration(dir: &std::path::Path, name: &str, up_sql: &str) {
+        let migration_dir = dir.join(name);
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(migration_dir.join("up.sql"), up_sql).unwrap();
+        std::fs::write(migration_dir.join("down.sql"), "").unwrap();
+    }
+
+    #[test]
+    fn check_empty_migrations_dir_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn check_safe_migration_produces_no_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260101000000_create_posts",
+            "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (name, findings) = &results[0];
+        assert_eq!(name, "20260101000000_create_posts");
+        assert!(findings.is_empty(), "CREATE TABLE should produce no findings");
+    }
+
+    #[test]
+    fn check_destructive_migration_produces_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260102000000_remove_body_from_posts",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        let (_, findings) = &results[0];
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn check_results_are_sorted_by_migration_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(tmp.path(), "20260103000000_third", "SELECT 1;");
+        write_migration(tmp.path(), "20260101000000_first", "SELECT 1;");
+        write_migration(tmp.path(), "20260102000000_second", "SELECT 1;");
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        let names: Vec<_> = results.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["20260101000000_first", "20260102000000_second", "20260103000000_third"]
+        );
+    }
+
+    #[test]
+    fn check_directories_without_up_sql_are_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("incomplete_migration")).unwrap();
+        write_migration(tmp.path(), "20260101000000_valid", "SELECT 1;");
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "20260101000000_valid");
+    }
+
+    #[test]
+    fn check_multiple_migrations_reports_each() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260101000000_create_posts",
+            "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY);",
+        );
+        write_migration(
+            tmp.path(),
+            "20260102000000_remove_body",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_empty(), "first migration should be safe");
+        assert!(!results[1].1.is_empty(), "second migration should have findings");
+    }
+
+    #[test]
+    fn check_non_concurrent_index_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration(
+            tmp.path(),
+            "20260103000000_add_index",
+            "CREATE INDEX idx_posts_title ON posts (title);",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        let (_, findings) = &results[0];
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
     }
 
     #[test]

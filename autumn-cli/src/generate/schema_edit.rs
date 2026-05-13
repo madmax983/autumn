@@ -565,6 +565,37 @@ mod tests {
     }
 
     #[test]
+    fn add_columns_up_sql_includes_safety_comment_for_not_null() {
+        let f = fields(&["title:String"]);
+        let sql = add_columns_up_sql("posts", &f);
+        assert!(
+            sql.contains("autumn-safety: potentially-blocking"),
+            "NOT NULL column must carry a safety comment; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn add_columns_up_sql_no_safety_comment_for_nullable() {
+        let f = fields(&["subtitle:Option<String>"]);
+        let sql = add_columns_up_sql("posts", &f);
+        assert!(
+            !sql.contains("autumn-safety"),
+            "nullable column must NOT carry a safety comment; got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn remove_columns_up_sql_includes_safety_comment() {
+        let f = fields(&["body:String"]);
+        let sql = remove_columns_up_sql("posts", &f);
+        assert!(
+            sql.contains("autumn-safety: destructive"),
+            "DROP COLUMN must carry a safety comment; got:\n{sql}"
+        );
+        assert!(sql.contains("ALTER TABLE posts DROP COLUMN body;"));
+    }
+
+    #[test]
     fn add_columns_down_sql_drops_in_reverse() {
         let f = fields(&["title:String", "count:i32"]);
         let sql = add_columns_down_sql("posts", &f);
