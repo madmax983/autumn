@@ -7,11 +7,11 @@
 //! # Known limitations
 //!
 //! - Statement splitting uses `;` as the delimiter with awareness of
-//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`).
-//!   Semicolons inside a dollar-quoted function body are kept intact so that
-//!   a `-- autumn-safety: reviewed` marker correctly suppresses the whole
-//!   statement. Semicolons inside single-quoted string literals are not
-//!   handled; that pattern is essentially absent from real migration files.
+//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`) and
+//!   `--` line comments. Semicolons inside a dollar-quoted function body or
+//!   inside a `--` comment are kept intact so they do not produce spurious
+//!   statement fragments. Semicolons inside single-quoted string literals are
+//!   not handled; that pattern is essentially absent from real migration files.
 //! - Line comment stripping matches `--` by position on each line. A `--`
 //!   sequence inside a string literal would be incorrectly treated as a comment
 //!   start. Again, this pattern is essentially absent from real migration files.
@@ -141,7 +141,14 @@ fn split_statements(sql: &str) -> Vec<String> {
             }
         }
 
-        if rest.starts_with(';') {
+        // Line comment: consume to end-of-line without treating the semicolons
+        // inside the comment as statement separators.  The comment text is kept
+        // in `current` so that `has_review_suppression` can still see it.
+        if rest.starts_with("--") {
+            let end = rest.find('\n').unwrap_or(rest.len());
+            current.push_str(&rest[..end]);
+            i += end;
+        } else if rest.starts_with(';') {
             let trimmed = current.trim().to_owned();
             if !trimmed.is_empty() {
                 statements.push(trimmed);
@@ -267,14 +274,26 @@ const STABLE_FN_PREFIXES: &[&str] = &["now(", "current_timestamp(", "localtimest
 /// Returns `true` when `default_expr` is a volatile function call that `PostgreSQL`
 /// cannot optimise via the PG 11+ fast-constant-default path.
 ///
-/// STABLE/IMMUTABLE functions (e.g. `now()`) are evaluated once at statement time
-/// and stored as a constant, so they do not require a table rewrite.  Only truly
-/// VOLATILE functions (e.g. `random()`, `gen_random_uuid()`) must be flagged.
+/// Only VOLATILE function calls are flagged.  Grouped constant expressions such as
+/// `(0)` or `('draft')` have `(` as the first non-space character (no identifier
+/// before the parenthesis) and are treated as constants — they use the fast path.
+/// STABLE/IMMUTABLE functions (e.g. `now()`) are also exempt via `STABLE_FN_PREFIXES`.
 fn is_volatile_function_default(default_expr: &str) -> bool {
-    default_expr.contains('(')
-        && !STABLE_FN_PREFIXES
-            .iter()
-            .any(|p| default_expr.starts_with(p))
+    let Some(paren_pos) = default_expr.find('(') else {
+        return false; // no parentheses — constant literal
+    };
+    // A function call has an identifier character immediately before `(`.
+    // A grouped constant like `(0)` or `('x')` has nothing or whitespace before it.
+    let is_fn_call = default_expr[..paren_pos]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if !is_fn_call {
+        return false; // parenthesized constant — uses the fast-default path
+    }
+    !STABLE_FN_PREFIXES
+        .iter()
+        .any(|p| default_expr.starts_with(p))
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
@@ -796,6 +815,24 @@ mod tests {
     }
 
     #[test]
+    fn add_not_null_column_with_parenthesized_constant_default_is_safe() {
+        // `DEFAULT (0)` and `DEFAULT ('draft')` are parenthesized constants, not function
+        // calls.  They use the PG11+ fast-default path and must not be flagged as volatile.
+        let findings_int =
+            classify_sql("ALTER TABLE posts ADD COLUMN score INT NOT NULL DEFAULT (0);");
+        assert!(
+            findings_int.is_empty(),
+            "DEFAULT (0) must be safe: {findings_int:?}"
+        );
+        let findings_str =
+            classify_sql("ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT ('draft');");
+        assert!(
+            findings_str.is_empty(),
+            "DEFAULT ('draft') must be safe: {findings_str:?}"
+        );
+    }
+
+    #[test]
     fn add_not_null_column_with_constant_default_is_safe() {
         // Constant literals use the PG11+ fast path — no table rewrite.
         let findings =
@@ -865,6 +902,21 @@ mod tests {
         let sql = "-- Removing old column\nALTER TABLE posts DROP COLUMN body;";
         let findings = classify_sql(sql);
         assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn line_comment_with_semicolon_does_not_hide_following_statement() {
+        // A `;` inside a `--` comment must not be treated as a statement separator.
+        // Before the fix, `-- rollout complete; safe\nDROP TABLE posts` would be split
+        // and the fragment `safe\nDROP TABLE posts` no longer starts with `drop table`.
+        let sql = "-- rollout complete; safe to proceed\nDROP TABLE posts;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "DROP TABLE must be found after a line comment containing ';': {findings:?}"
+        );
         assert_eq!(findings[0].risk, RiskLevel::Destructive);
     }
 
