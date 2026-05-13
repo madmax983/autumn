@@ -331,6 +331,45 @@ With this setup:
   (same HMAC key).
 - CSRF tokens validate regardless of which replica handles the form submission.
 
+### Global rate limiting
+
+By default the rate limiter keeps per-IP token buckets **in memory per replica**.
+A 3-replica deployment therefore permits up to 3× the configured rate — enough
+to undermine the protection intended by your `requests_per_second` setting.
+
+To enforce the budget globally, point the rate limiter at the same Redis instance
+as your session store:
+
+```toml
+[security.rate_limit]
+enabled = true
+requests_per_second = 10.0
+burst = 20
+backend = "redis"
+on_backend_failure = "fail_open"   # or "fail_closed"
+
+[security.rate_limit.redis]
+url = "redis://redis:6379"
+key_prefix = "myapp:rate_limit"
+```
+
+Or with environment variables alongside the session and cache settings:
+
+```bash
+AUTUMN_SECURITY__RATE_LIMIT__BACKEND=redis
+AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL=redis://redis:6379
+```
+
+| Setting | Effect |
+|---|---|
+| `backend = "memory"` | Default. Each replica enforces the limit independently. |
+| `backend = "redis"` | Global enforcement via atomic Lua token-bucket in Redis. |
+| `on_backend_failure = "fail_open"` | Requests pass through when Redis is unreachable (default). |
+| `on_backend_failure = "fail_closed"` | Requests receive `429` until Redis recovers. |
+
+One `tracing::warn!` is emitted when Redis becomes unavailable and again when it
+recovers, so log volume stays low during outages.
+
 ---
 
 ## Next steps
