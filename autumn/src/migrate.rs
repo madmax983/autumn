@@ -283,7 +283,11 @@ pub(crate) fn auto_migrate(
                 if is_prod {
                     tracing::warn!(
                         "Production profile detected: automatic migrations are disabled by default. \
-                         Set database.auto_migrate_in_production=true to opt in."
+                         Run `autumn migrate check` to review safety before applying, then \
+                         `autumn migrate` in your deployment job. \
+                         Set database.auto_migrate_in_production=true only for single-process \
+                         deployments after confirming all pending migrations are safe for a \
+                         rolling deploy (expand/contract pattern)."
                     );
                 }
                 tracing::warn!(

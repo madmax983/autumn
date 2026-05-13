@@ -191,6 +191,63 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
+    // Data backfill — bulk DML inside a migration requires a separate job
+    if normalized.starts_with("update ") || normalized.starts_with("insert into ") {
+        findings.push(SafetyFinding {
+            operation: "Bulk DML (data backfill)".to_owned(),
+            risk: RiskLevel::DataBackfill,
+            why: "Running bulk UPDATE or INSERT inside a migration locks rows for the duration \
+                  of the transaction. On large tables this can time out or block application \
+                  traffic for seconds to minutes.",
+            next_action: "Run the data backfill as a separate idempotent background job or \
+                          one-off task (`autumn task`) after the schema migration has deployed. \
+                          Add a NOT VALID constraint first if you need the constraint enforced \
+                          before the backfill completes.",
+        });
+    }
+
+    // Manual review catch-all — DDL or DML not covered by the rules above
+    // Unknown DDL/DML that Autumn has no rule for — require operator review.
+    // Check only statements that look like DDL but don't match any known starter.
+    let is_known_start = normalized.starts_with("drop table")
+        || normalized.starts_with("drop index")
+        || normalized.starts_with("alter table")
+        || normalized.starts_with("create table")
+        || normalized.starts_with("create index")
+        || normalized.starts_with("create unique index")
+        || normalized.starts_with("update ")
+        || normalized.starts_with("insert into ")
+        || normalized.starts_with("comment on")
+        || normalized.starts_with("create sequence")
+        || normalized.starts_with("alter sequence")
+        || normalized.starts_with("drop sequence")
+        || normalized.starts_with("create type")
+        || normalized.starts_with("alter type")
+        || normalized.starts_with("drop type")
+        || normalized.starts_with("create extension")
+        || normalized.starts_with("create view")
+        || normalized.starts_with("drop view")
+        || normalized.starts_with("select ");
+
+    let starts_with_ddl_keyword = normalized.starts_with("create ")
+        || normalized.starts_with("drop ")
+        || normalized.starts_with("alter ")
+        || normalized.starts_with("truncate ")
+        || normalized.starts_with("grant ")
+        || normalized.starts_with("revoke ");
+
+    if starts_with_ddl_keyword && !is_known_start {
+        findings.push(SafetyFinding {
+            operation: "Unclassified DDL".to_owned(),
+            risk: RiskLevel::ManualReview,
+            why: "Autumn cannot automatically assess the safety of this statement for a rolling \
+                  deploy. Operator review is required before applying this migration in \
+                  production.",
+            next_action: "Review the statement manually. If it is safe, you may suppress this \
+                          finding by adding `-- autumn-safety: reviewed` above the statement.",
+        });
+    }
+
     findings
 }
 
@@ -428,6 +485,66 @@ mod tests {
             f.next_action.to_lowercase().contains("concurrently"),
             "next_action should recommend CONCURRENTLY: {}",
             f.next_action
+        );
+    }
+
+    // ── data backfill patterns ────────────────────────────────────────────────
+
+    #[test]
+    fn bulk_update_is_data_backfill() {
+        let findings = classify_sql("UPDATE posts SET status = 'draft' WHERE status IS NULL;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+        assert_eq!(findings[0].operation, "Bulk DML (data backfill)");
+    }
+
+    #[test]
+    fn insert_select_is_data_backfill() {
+        let findings = classify_sql(
+            "INSERT INTO post_tags (post_id, tag) SELECT id, 'untagged' FROM posts;",
+        );
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+    }
+
+    #[test]
+    fn data_backfill_finding_recommends_separate_job() {
+        let findings = classify_sql("UPDATE posts SET slug = LOWER(title);");
+        let f = &findings[0];
+        assert!(!f.why.is_empty());
+        assert!(
+            f.next_action.to_lowercase().contains("background job")
+                || f.next_action.to_lowercase().contains("task"),
+            "next_action should recommend a separate job or task: {}",
+            f.next_action
+        );
+    }
+
+    // ── manual review patterns ────────────────────────────────────────────────
+
+    #[test]
+    fn create_function_requires_manual_review() {
+        let sql = "CREATE FUNCTION update_modified() RETURNS trigger AS $$ BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql;";
+        let findings = classify_sql(sql);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+        assert_eq!(findings[0].operation, "Unclassified DDL");
+    }
+
+    #[test]
+    fn truncate_requires_manual_review() {
+        let findings = classify_sql("TRUNCATE TABLE staging_data;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+    }
+
+    #[test]
+    fn known_ddl_does_not_trigger_manual_review() {
+        // CREATE TABLE is safe — must not get a ManualReview finding on top
+        let findings = classify_sql("CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);");
+        assert!(
+            findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
+            "known DDL should not also produce ManualReview: {findings:?}"
         );
     }
 }

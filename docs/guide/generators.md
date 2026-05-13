@@ -127,6 +127,70 @@ The name detection is purely cosmetic — Autumn treats both `Post` and
 `Remove…From…`, the generator just emits empty `up.sql` and `down.sql`
 files for you to fill in.
 
+### Generated safety comments
+
+When `autumn generate migration` produces SQL that could be dangerous for a
+rolling deploy, it prepends an `-- autumn-safety:` comment to the statement:
+
+```sql
+-- autumn-safety: potentially-blocking
+ALTER TABLE posts ADD COLUMN score INTEGER NOT NULL;
+```
+
+```sql
+-- autumn-safety: destructive
+ALTER TABLE posts DROP COLUMN body;
+```
+
+These comments are purely informational; they do not change runtime behavior.
+`autumn migrate check` strips them before classifying statements so they do not
+produce duplicate findings.
+
+### Expand/contract: safe column rename or removal
+
+The naive approach — `autumn generate migration RenameBodyToContent` then hand-
+editing the SQL to `RENAME COLUMN body TO content` — produces an `irreversible`
+finding from `autumn migrate check` because old replicas still running the prior
+code will error on any query that references the old name.
+
+The expand/contract pattern splits the change into two consecutive deploys:
+
+**Step 1 — Expand** (add the new column alongside the old one):
+
+```bash
+autumn generate migration AddContentToPosts content:String
+```
+
+Edit the generated `up.sql` to copy existing data:
+
+```sql
+ALTER TABLE posts ADD COLUMN content TEXT;
+UPDATE posts SET content = body WHERE content IS NULL;
+```
+
+Deploy this. All replicas now see both `body` and `content`. Update application
+code to dual-write both columns and read from `content`.
+
+**Step 2 — Contract** (remove the old column once all replicas run the new code):
+
+```bash
+autumn generate migration RemoveBodyFromPosts body:String
+```
+
+The generated `up.sql` will contain:
+
+```sql
+-- autumn-safety: destructive
+ALTER TABLE posts DROP COLUMN body;
+```
+
+Run `autumn migrate check` — the finding will now be `destructive`, not
+`irreversible`, because the column rename is already complete. This migration is
+safe to apply because no running code references `body` any longer.
+
+The same two-step pattern applies to column type changes and to removing columns
+with foreign-key references.
+
 ## `autumn generate task`
 
 For operational scripts that should run through the full Autumn app context.
