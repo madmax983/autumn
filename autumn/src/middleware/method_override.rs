@@ -28,12 +28,15 @@
 //!
 //! The check uses, in order:
 //!
-//! 1. `Sec-Fetch-Site` (sent by all browsers since ~2020). Allowed
-//!    values: `same-origin`, `same-site`, `none`. `cross-site` is
-//!    rejected.
-//! 2. Fallback when `Sec-Fetch-Site` is absent: `Origin` is compared
-//!    host-for-host with `Host`. A mismatch is rejected.
-//! 3. If both signals are absent, the override is **not** applied —
+//! 1. `Sec-Fetch-Site: same-origin` or `none` — accept outright.
+//! 2. `Sec-Fetch-Site: same-site` — **not** sufficient on its own
+//!    because `same-site` accepts sibling origins under the same
+//!    registrable domain (e.g. `evil.example.com` -> `app.example.com`).
+//!    Fall back to the `Origin` vs `Host` check before allowing.
+//! 3. `Sec-Fetch-Site: cross-site` (or any other value) is rejected.
+//! 4. When `Sec-Fetch-Site` is absent, compare `Origin` host-for-host
+//!    with `Host`. A mismatch is rejected.
+//! 5. If both signals are absent, the override is **not** applied —
 //!    the request is forwarded as the original `POST` so route
 //!    matching rejects it on its own (fail closed).
 //!
@@ -320,36 +323,49 @@ fn content_length_exceeds(headers: &http::HeaderMap, limit: usize) -> bool {
 ///
 /// Decision matrix (returns `true` to allow the override):
 ///
-/// 1. `Sec-Fetch-Site` is sent by every browser released since ~2020
-///    and is the most reliable signal. We allow `same-origin`,
-///    `same-site`, and `none` (user-initiated, no opener) and reject
-///    `cross-site`.
-/// 2. When `Sec-Fetch-Site` is absent, fall back to comparing the
-///    `Origin` header against `Host`. Modern browsers always send
-///    `Origin` for `POST`, so a mismatch here means the request really
-///    is cross-origin.
-/// 3. When both signals are absent, deny the override (fail closed).
-///    Such requests are either an extremely old browser or a non-
-///    browser client; in either case the documented browser-form
-///    convention does not apply, so the safe thing is to forward the
-///    request as the original `POST` and let route matching reject it.
+/// 1. `Sec-Fetch-Site: same-origin` or `none` — accept outright.
+///    `same-origin` is exactly what we want. `none` is user-initiated
+///    with no opener (typed URL, bookmark, redirect chain origin) and
+///    is documented as safe by Fetch Metadata Request Headers.
+/// 2. `Sec-Fetch-Site: same-site` — **not** sufficient on its own,
+///    because `same-site` accepts any origin under the same
+///    registrable domain (`evil.example.com` -> `app.example.com`).
+///    Fall back to the `Origin` vs `Host` comparison to confirm a
+///    true same-origin match before honouring the override.
+/// 3. `Sec-Fetch-Site: cross-site` — reject outright.
+/// 4. `Sec-Fetch-Site` absent — fall back to comparing the `Origin`
+///    header against `Host`. Modern browsers always send `Origin`
+///    for `POST`, so a mismatch here means the request really is
+///    cross-origin.
+/// 5. When both `Sec-Fetch-Site` and `Origin` are absent, deny the
+///    override (fail closed). Such requests are either an extremely
+///    old browser or a non-browser client; in either case the
+///    documented browser-form convention does not apply, so the safe
+///    thing is to forward the request as the original `POST` and let
+///    route matching reject it.
 fn is_same_origin_form(headers: &http::HeaderMap) -> bool {
+    let origin_host_match = || {
+        let origin = headers
+            .get(http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())?;
+        let host = headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())?;
+        Some(origin_matches_host(origin, host))
+    };
+
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
-        return matches!(site, "same-origin" | "same-site" | "none");
+        return match site {
+            "same-origin" | "none" => true,
+            // `same-site` is broader than same-origin; require an
+            // explicit Origin/Host match for the documented guarantee.
+            "same-site" => origin_host_match().unwrap_or(false),
+            // `cross-site` or any unrecognised value: reject.
+            _ => false,
+        };
     }
 
-    let origin = headers
-        .get(http::header::ORIGIN)
-        .and_then(|v| v.to_str().ok());
-    let host = headers
-        .get(http::header::HOST)
-        .and_then(|v| v.to_str().ok());
-
-    match (origin, host) {
-        (Some(origin), Some(host)) => origin_matches_host(origin, host),
-        // No origin and no Sec-Fetch-Site: fail closed.
-        _ => false,
-    }
+    origin_host_match().unwrap_or(false)
 }
 
 /// `Origin` is a scheme + host (+ optional port); `Host` is host
@@ -1034,6 +1050,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Regression test from the second Codex same-origin review:
+    /// `Sec-Fetch-Site: same-site` includes sibling subdomains under
+    /// the same registrable domain (e.g. `evil.example.com` ->
+    /// `app.example.com`). The override must NOT be honoured purely on
+    /// the `same-site` signal — without a matching `Origin`/`Host`
+    /// pair the request must be forwarded as the original `POST` and
+    /// route matching is left to reject it.
+    #[tokio::test]
+    async fn same_site_sibling_origin_is_not_honoured_as_override() {
+        let app = layered_router();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/items/1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("sec-fetch-site", "same-site")
+                    .header("origin", "https://evil.example")
+                    .header("host", "app.example")
+                    .body(Body::from("_method=DELETE"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "same-site with mismatched Origin/Host must not be honoured as override"
+        );
+    }
+
     /// Neither `Sec-Fetch-Site` nor `Origin` present: fail closed. The
     /// override is not applied — the request flows through as POST.
     #[tokio::test]
@@ -1058,8 +1106,9 @@ mod tests {
     /// Helper-level cases that don't require the full router wiring.
     #[test]
     fn is_same_origin_form_decision_matrix() {
-        // Sec-Fetch-Site values
-        for site in ["same-origin", "same-site", "none"] {
+        // `same-origin` and `none` are accepted on the Sec-Fetch-Site
+        // signal alone.
+        for site in ["same-origin", "none"] {
             let mut h = http::HeaderMap::new();
             h.insert("sec-fetch-site", http::HeaderValue::from_str(site).unwrap());
             assert!(
@@ -1067,6 +1116,57 @@ mod tests {
                 "sec-fetch-site={site} should be allowed"
             );
         }
+
+        // `same-site` is NOT sufficient alone: it allows sibling
+        // origins under the same registrable domain. Require an
+        // Origin/Host match before honouring it.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("same-site"),
+        );
+        assert!(
+            !is_same_origin_form(&h),
+            "same-site alone must not be accepted"
+        );
+
+        // `same-site` plus a matching Origin/Host pair: accepted.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("same-site"),
+        );
+        h.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://app.example"),
+        );
+        h.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("app.example"),
+        );
+        assert!(is_same_origin_form(&h));
+
+        // `same-site` with a sibling Origin: the registrable domain is
+        // the same so the browser sends `same-site`, but the Origin
+        // differs and we must reject.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("same-site"),
+        );
+        h.insert(
+            http::header::ORIGIN,
+            http::HeaderValue::from_static("https://evil.example"),
+        );
+        h.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("app.example"),
+        );
+        assert!(
+            !is_same_origin_form(&h),
+            "same-site with mismatched Origin/Host must be rejected"
+        );
+
         let mut h = http::HeaderMap::new();
         h.insert(
             "sec-fetch-site",
@@ -1074,7 +1174,15 @@ mod tests {
         );
         assert!(!is_same_origin_form(&h));
 
-        // Origin matches Host
+        // Unknown / spoofed Sec-Fetch-Site value: reject.
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "sec-fetch-site",
+            http::HeaderValue::from_static("undefined"),
+        );
+        assert!(!is_same_origin_form(&h));
+
+        // No Sec-Fetch-Site: Origin matches Host.
         let mut h = http::HeaderMap::new();
         h.insert(
             http::header::ORIGIN,
@@ -1086,7 +1194,7 @@ mod tests {
         );
         assert!(is_same_origin_form(&h));
 
-        // Origin does not match Host
+        // No Sec-Fetch-Site: Origin does not match Host.
         let mut h = http::HeaderMap::new();
         h.insert(
             http::header::ORIGIN,
