@@ -146,7 +146,8 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // RENAME TABLE
-    if normalized.contains("alter table") && normalized.contains(" rename to ")
+    if normalized.contains("alter table")
+        && normalized.contains(" rename to ")
         && !normalized.contains(" rename column ")
     {
         findings.push(SafetyFinding {
@@ -212,8 +213,8 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
-    let is_create_index = normalized.starts_with("create index")
-        || normalized.starts_with("create unique index");
+    let is_create_index =
+        normalized.starts_with("create index") || normalized.starts_with("create unique index");
     let is_concurrent = normalized.starts_with("create index concurrently")
         || normalized.starts_with("create unique index concurrently");
     if is_create_index && !is_concurrent {
@@ -309,7 +310,10 @@ mod tests {
     #[test]
     fn risk_level_display() {
         assert_eq!(RiskLevel::Safe.to_string(), "safe");
-        assert_eq!(RiskLevel::PotentiallyBlocking.to_string(), "potentially-blocking");
+        assert_eq!(
+            RiskLevel::PotentiallyBlocking.to_string(),
+            "potentially-blocking"
+        );
         assert_eq!(RiskLevel::Destructive.to_string(), "destructive");
         assert_eq!(RiskLevel::Irreversible.to_string(), "irreversible");
         assert_eq!(RiskLevel::DataBackfill.to_string(), "data-backfill");
@@ -325,30 +329,43 @@ mod tests {
 
     #[test]
     fn create_table_is_safe() {
-        let sql = "CREATE TABLE posts (\n    id BIGSERIAL PRIMARY KEY,\n    title TEXT NOT NULL\n);";
+        let sql =
+            "CREATE TABLE posts (\n    id BIGSERIAL PRIMARY KEY,\n    title TEXT NOT NULL\n);";
         let findings = classify_sql(sql);
-        assert!(findings.is_empty(), "CREATE TABLE should be safe: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "CREATE TABLE should be safe: {findings:?}"
+        );
     }
 
     #[test]
     fn add_nullable_column_is_safe() {
         let sql = "ALTER TABLE posts ADD COLUMN subtitle TEXT NULL;";
         let findings = classify_sql(sql);
-        assert!(findings.is_empty(), "ADD COLUMN NULL should be safe: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "ADD COLUMN NULL should be safe: {findings:?}"
+        );
     }
 
     #[test]
     fn add_not_null_column_with_default_is_safe() {
         let sql = "ALTER TABLE posts ADD COLUMN status TEXT NOT NULL DEFAULT 'draft';";
         let findings = classify_sql(sql);
-        assert!(findings.is_empty(), "ADD COLUMN NOT NULL DEFAULT should be safe: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "ADD COLUMN NOT NULL DEFAULT should be safe: {findings:?}"
+        );
     }
 
     #[test]
     fn create_concurrent_index_is_safe() {
         let sql = "CREATE INDEX CONCURRENTLY idx_posts_title ON posts (title);";
         let findings = classify_sql(sql);
-        assert!(findings.is_empty(), "CREATE INDEX CONCURRENTLY should be safe: {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "CREATE INDEX CONCURRENTLY should be safe: {findings:?}"
+        );
     }
 
     #[test]
@@ -467,7 +484,11 @@ mod tests {
         let findings = classify_sql(sql);
         assert_eq!(findings.len(), 2);
         assert!(findings.iter().any(|f| f.risk == RiskLevel::Destructive));
-        assert!(findings.iter().any(|f| f.risk == RiskLevel::PotentiallyBlocking));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.risk == RiskLevel::PotentiallyBlocking)
+        );
     }
 
     // ── line comments are ignored ─────────────────────────────────────────────
@@ -529,8 +550,14 @@ mod tests {
     fn drop_column_finding_names_the_risk_and_next_action() {
         let findings = classify_sql("ALTER TABLE posts DROP COLUMN body;");
         let f = &findings[0];
-        assert!(!f.why.is_empty(), "why must explain the rolling-deploy risk");
-        assert!(!f.next_action.is_empty(), "next_action must tell the operator what to do");
+        assert!(
+            !f.why.is_empty(),
+            "why must explain the rolling-deploy risk"
+        );
+        assert!(
+            !f.next_action.is_empty(),
+            "next_action must tell the operator what to do"
+        );
     }
 
     #[test]
@@ -556,9 +583,8 @@ mod tests {
 
     #[test]
     fn insert_select_is_data_backfill() {
-        let findings = classify_sql(
-            "INSERT INTO post_tags (post_id, tag) SELECT id, 'untagged' FROM posts;",
-        );
+        let findings =
+            classify_sql("INSERT INTO post_tags (post_id, tag) SELECT id, 'untagged' FROM posts;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
     }
@@ -604,8 +630,7 @@ mod tests {
 
     #[test]
     fn drop_constraint_requires_manual_review() {
-        let findings =
-            classify_sql("ALTER TABLE users DROP CONSTRAINT users_email_key;");
+        let findings = classify_sql("ALTER TABLE users DROP CONSTRAINT users_email_key;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::ManualReview);
         assert_eq!(findings[0].operation, "Unclassified ALTER TABLE");
@@ -613,8 +638,7 @@ mod tests {
 
     #[test]
     fn alter_column_set_not_null_requires_manual_review() {
-        let findings =
-            classify_sql("ALTER TABLE users ALTER COLUMN email SET NOT NULL;");
+        let findings = classify_sql("ALTER TABLE users ALTER COLUMN email SET NOT NULL;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::ManualReview);
         assert_eq!(findings[0].operation, "Unclassified ALTER TABLE");

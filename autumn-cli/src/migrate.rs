@@ -103,7 +103,9 @@ fn run_safety_check(migrations_dir: &str) {
         }
     }
 
-    let any_unsafe = reports.iter().any(|(_, findings)| safety::has_unsafe_findings(findings));
+    let any_unsafe = reports
+        .iter()
+        .any(|(_, findings)| safety::has_unsafe_findings(findings));
 
     eprintln!();
     if any_unsafe {
@@ -111,12 +113,8 @@ fn run_safety_check(migrations_dir: &str) {
             "\u{2717} One or more migrations contain operations that are unsafe for a live \
              rolling deploy."
         );
-        eprintln!(
-            "  Review the findings above, apply the expand/contract pattern where needed,"
-        );
-        eprintln!(
-            "  or coordinate a maintenance window before deploying these migrations."
-        );
+        eprintln!("  Review the findings above, apply the expand/contract pattern where needed,");
+        eprintln!("  or coordinate a maintenance window before deploying these migrations.");
         std::process::exit(1);
     } else {
         eprintln!("\u{2713} All {total} migration(s) are safe for a rolling deploy.");
@@ -423,7 +421,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         let (name, findings) = &results[0];
         assert_eq!(name, "20260101000000_create_posts");
-        assert!(findings.is_empty(), "CREATE TABLE should produce no findings");
+        assert!(
+            findings.is_empty(),
+            "CREATE TABLE should produce no findings"
+        );
     }
 
     #[test]
@@ -453,7 +454,11 @@ mod tests {
         let names: Vec<_> = results.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
-            vec!["20260101000000_first", "20260102000000_second", "20260103000000_third"]
+            vec![
+                "20260101000000_first",
+                "20260102000000_second",
+                "20260103000000_third"
+            ]
         );
     }
 
@@ -485,7 +490,10 @@ mod tests {
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].1.is_empty(), "first migration should be safe");
-        assert!(!results[1].1.is_empty(), "second migration should have findings");
+        assert!(
+            !results[1].1.is_empty(),
+            "second migration should have findings"
+        );
     }
 
     #[test]
