@@ -40,13 +40,10 @@ pub enum MigrateAction {
 pub fn run(action: MigrateAction) {
     eprintln!("\u{1F342} autumn migrate\n");
 
-    match action {
-        MigrateAction::Check => {
-            let migrations_dir = resolve_migrations_dir();
-            run_safety_check(&migrations_dir);
-            return;
-        }
-        _ => {}
+    if action == MigrateAction::Check {
+        let migrations_dir = resolve_migrations_dir();
+        run_safety_check(&migrations_dir);
+        return;
     }
 
     // 1. Resolve database URL from autumn.toml + env
@@ -93,9 +90,8 @@ fn run_safety_check(migrations_dir: &str) {
     let total = reports.len();
     eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
 
-    let mut any_unsafe = false;
     for (name, findings) in &reports {
-        if findings.is_empty() {
+        if safety::is_safe(findings) {
             eprintln!("  \u{2713} {name}  [safe]");
         } else {
             eprintln!("  \u{2717} {name}");
@@ -104,9 +100,10 @@ fn run_safety_check(migrations_dir: &str) {
                 eprintln!("        Why:  {}", f.why);
                 eprintln!("        Next: {}", f.next_action);
             }
-            any_unsafe = true;
         }
     }
+
+    let any_unsafe = reports.iter().any(|(_, findings)| safety::has_unsafe_findings(findings));
 
     eprintln!();
     if any_unsafe {
@@ -135,12 +132,12 @@ pub fn check_migrations_in_dir(
 ) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|entry| entry.path().is_dir())
         .collect();
 
     // Sort by directory name (which starts with a timestamp) for stable output.
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     let mut results = Vec::new();
     for entry in entries {

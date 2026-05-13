@@ -3,6 +3,16 @@
 //! Inspects the contents of `up.sql` files and classifies each SQL statement
 //! into a risk tier. The result drives `autumn migrate check`'s exit code and
 //! human-readable safety report printed to stderr.
+//!
+//! # Known limitations
+//!
+//! - Statement splitting uses `;` as the delimiter. Semicolons inside string
+//!   literals or `PostgreSQL` dollar-quoted blocks (`$$…$$`) will produce
+//!   incorrect splits. Real migration files almost never embed semicolons in
+//!   strings, so this is an acceptable approximation.
+//! - Comment stripping matches `--` by position on each line. A `--` sequence
+//!   inside a string literal would be incorrectly treated as a comment start.
+//!   Again, this pattern is essentially absent from real migration files.
 
 use std::fmt;
 
@@ -59,7 +69,7 @@ pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
         .collect()
 }
 
-/// True iff there are no findings above `Safe` risk level.
+/// True iff all findings are at the `Safe` risk level (or there are none).
 pub fn is_safe(findings: &[SafetyFinding]) -> bool {
     findings.iter().all(|f| f.risk == RiskLevel::Safe)
 }
@@ -90,6 +100,7 @@ fn normalize_statement(stmt: &str) -> String {
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
+#[allow(clippy::too_many_lines)]
 fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     if normalized.is_empty() {
         return vec![];
@@ -149,17 +160,17 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // ALTER COLUMN TYPE
-    if let Some(i) = normalized.find("alter column") {
-        if normalized[i..].contains(" type ") {
-            findings.push(SafetyFinding {
-                operation: "ALTER COLUMN TYPE".to_owned(),
-                risk: RiskLevel::Destructive,
-                why: "Changing a column's type rewrites the column data and may be incompatible \
-                      with values read by old replicas or application code.",
-                next_action: "Add a new column with the target type, migrate data, update code to \
-                              use the new column, then drop the old one.",
-            });
-        }
+    if let Some(i) = normalized.find("alter column")
+        && normalized[i..].contains(" type ")
+    {
+        findings.push(SafetyFinding {
+            operation: "ALTER COLUMN TYPE".to_owned(),
+            risk: RiskLevel::Destructive,
+            why: "Changing a column's type rewrites the column data and may be incompatible \
+                  with values read by old replicas or application code.",
+            next_action: "Add a new column with the target type, migrate data, update code to \
+                          use the new column, then drop the old one.",
+        });
     }
 
     // ADD COLUMN NOT NULL without DEFAULT
@@ -177,10 +188,35 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // CREATE INDEX without CONCURRENTLY
-    if normalized.starts_with("create index")
-        && !normalized.starts_with("create index concurrently")
-    {
+    // Unclassified ALTER TABLE subcommand — catch operations like DROP CONSTRAINT,
+    // ADD CONSTRAINT, and ALTER COLUMN SET NOT NULL that aren't covered by the rules
+    // above. Only fires when none of the specific rules produced a finding.
+    if normalized.starts_with("alter table") && findings.is_empty() {
+        let known_subcommand = normalized.contains(" add column ")
+            || normalized.contains(" drop column ")
+            || normalized.contains(" rename ") // RENAME COLUMN or RENAME TO
+            || (normalized.contains(" alter column ") && normalized.contains(" type "));
+        if !known_subcommand {
+            findings.push(SafetyFinding {
+                operation: "Unclassified ALTER TABLE".to_owned(),
+                risk: RiskLevel::ManualReview,
+                why: "Autumn cannot automatically assess the safety of this ALTER TABLE \
+                      subcommand for a rolling deploy. Some operations (e.g. DROP CONSTRAINT, \
+                      ALTER COLUMN SET NOT NULL, ADD CONSTRAINT) acquire table locks or validate \
+                      existing rows.",
+                next_action: "Review the statement manually. If it is safe, you may suppress \
+                              this finding by adding `-- autumn-safety: reviewed` above the \
+                              statement.",
+            });
+        }
+    }
+
+    // CREATE INDEX / CREATE UNIQUE INDEX without CONCURRENTLY
+    let is_create_index = normalized.starts_with("create index")
+        || normalized.starts_with("create unique index");
+    let is_concurrent = normalized.starts_with("create index concurrently")
+        || normalized.starts_with("create unique index concurrently");
+    if is_create_index && !is_concurrent {
         findings.push(SafetyFinding {
             operation: "CREATE INDEX (non-concurrent)".to_owned(),
             risk: RiskLevel::PotentiallyBlocking,
@@ -192,7 +228,10 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
     }
 
     // Data backfill — bulk DML inside a migration requires a separate job
-    if normalized.starts_with("update ") || normalized.starts_with("insert into ") {
+    if normalized.starts_with("update ")
+        || normalized.starts_with("insert into ")
+        || normalized.starts_with("delete from ")
+    {
         findings.push(SafetyFinding {
             operation: "Bulk DML (data backfill)".to_owned(),
             risk: RiskLevel::DataBackfill,
@@ -206,17 +245,16 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         });
     }
 
-    // Manual review catch-all — DDL or DML not covered by the rules above
-    // Unknown DDL/DML that Autumn has no rule for — require operator review.
-    // Check only statements that look like DDL but don't match any known starter.
+    // Generic catch-all — DDL/DML not matched by any rule above
     let is_known_start = normalized.starts_with("drop table")
         || normalized.starts_with("drop index")
-        || normalized.starts_with("alter table")
+        || normalized.starts_with("alter table") // unclassified subcommands handled above
         || normalized.starts_with("create table")
         || normalized.starts_with("create index")
         || normalized.starts_with("create unique index")
         || normalized.starts_with("update ")
         || normalized.starts_with("insert into ")
+        || normalized.starts_with("delete from ")
         || normalized.starts_with("comment on")
         || normalized.starts_with("create sequence")
         || normalized.starts_with("alter sequence")
@@ -313,6 +351,16 @@ mod tests {
         assert!(findings.is_empty(), "CREATE INDEX CONCURRENTLY should be safe: {findings:?}");
     }
 
+    #[test]
+    fn create_unique_index_concurrently_is_safe() {
+        let sql = "CREATE UNIQUE INDEX CONCURRENTLY idx_posts_slug ON posts (slug);";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "CREATE UNIQUE INDEX CONCURRENTLY should be safe: {findings:?}"
+        );
+    }
+
     // ── destructive patterns ──────────────────────────────────────────────────
 
     #[test]
@@ -377,6 +425,14 @@ mod tests {
     #[test]
     fn create_non_concurrent_index_is_blocking() {
         let findings = classify_sql("CREATE INDEX idx_posts_title ON posts (title);");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+        assert_eq!(findings[0].operation, "CREATE INDEX (non-concurrent)");
+    }
+
+    #[test]
+    fn create_unique_index_without_concurrently_is_blocking() {
+        let findings = classify_sql("CREATE UNIQUE INDEX idx_posts_slug ON posts (slug);");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
         assert_eq!(findings[0].operation, "CREATE INDEX (non-concurrent)");
@@ -508,6 +564,14 @@ mod tests {
     }
 
     #[test]
+    fn bulk_delete_is_data_backfill() {
+        let findings = classify_sql("DELETE FROM posts WHERE created_at < '2020-01-01';");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::DataBackfill);
+        assert_eq!(findings[0].operation, "Bulk DML (data backfill)");
+    }
+
+    #[test]
     fn data_backfill_finding_recommends_separate_job() {
         let findings = classify_sql("UPDATE posts SET slug = LOWER(title);");
         let f = &findings[0];
@@ -539,12 +603,40 @@ mod tests {
     }
 
     #[test]
+    fn drop_constraint_requires_manual_review() {
+        let findings =
+            classify_sql("ALTER TABLE users DROP CONSTRAINT users_email_key;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+        assert_eq!(findings[0].operation, "Unclassified ALTER TABLE");
+    }
+
+    #[test]
+    fn alter_column_set_not_null_requires_manual_review() {
+        let findings =
+            classify_sql("ALTER TABLE users ALTER COLUMN email SET NOT NULL;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+        assert_eq!(findings[0].operation, "Unclassified ALTER TABLE");
+    }
+
+    #[test]
     fn known_ddl_does_not_trigger_manual_review() {
         // CREATE TABLE is safe — must not get a ManualReview finding on top
         let findings = classify_sql("CREATE TABLE comments (id BIGSERIAL PRIMARY KEY);");
         assert!(
             findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
             "known DDL should not also produce ManualReview: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn add_column_does_not_trigger_unclassified_alter_table() {
+        // A safe ADD COLUMN must not also generate a ManualReview finding.
+        let findings = classify_sql("ALTER TABLE posts ADD COLUMN subtitle TEXT NULL;");
+        assert!(
+            findings.iter().all(|f| f.risk != RiskLevel::ManualReview),
+            "safe ADD COLUMN should not produce ManualReview: {findings:?}"
         );
     }
 }
