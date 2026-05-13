@@ -962,6 +962,42 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
+/// Enqueue a job using an **already-open connection** so the INSERT
+/// participates in the caller's transaction.
+///
+/// For the `postgres` backend this provides atomic enqueue: if the
+/// surrounding `db.tx` rolls back, the job disappears with it. For
+/// `redis` and `local` backends the `conn` argument is ignored and the
+/// call falls back to the normal enqueue path.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// db.tx(move |conn| async move {
+///     diesel::insert_into(orders::table).values(&order).execute(conn).await?;
+///     autumn_web::job::enqueue_on_conn("send_confirmation", &args, conn).await?;
+///     Ok(())
+/// }.scope_boxed()).await?;
+/// ```
+#[cfg(feature = "db")]
+pub async fn enqueue_on_conn<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client.enqueue_on_conn(name, payload, conn).await
+}
+
 impl JobClient {
     /// Enqueue a job by name with a JSON payload.
     ///
@@ -1038,6 +1074,71 @@ impl JobClient {
         Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime backend is unavailable",
         )))
+    }
+
+    /// Enqueue a job using an **already-open connection**, so the INSERT
+    /// participates in the caller's transaction.
+    ///
+    /// For the `postgres` backend this provides exactly-once-per-commit
+    /// enqueue semantics: if the surrounding `db.tx` rolls back, the job row
+    /// disappears atomically. For `redis` and `local` backends the `conn`
+    /// argument is ignored and the call falls back to the normal enqueue path.
+    #[cfg(feature = "db")]
+    pub async fn enqueue_on_conn(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+    ) -> AutumnResult<()> {
+        let Some((job_max_attempts, job_backoff_ms)) = self.per_job_defaults.get(name).copied()
+        else {
+            return Err(AutumnError::internal_server_error(std::io::Error::other(
+                format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
+            )));
+        };
+        let job_max_attempts = if job_max_attempts != 0 {
+            job_max_attempts
+        } else {
+            self.default_max_attempts
+        };
+        let job_backoff_ms = if job_backoff_ms != 0 {
+            job_backoff_ms
+        } else {
+            self.default_initial_backoff_ms
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        self.registry.record_enqueue(name);
+        self.job_admin
+            .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
+
+        let result = if self.pg_pool.is_some() {
+            pg_enqueue_on_conn(conn, id.clone(), name, payload, job_max_attempts, job_backoff_ms)
+                .await
+        } else if let Some(sender) = &self.local_sender {
+            sender
+                .send(QueuedJob {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    payload,
+                    attempt: 1,
+                    max_attempts: job_max_attempts,
+                    initial_backoff_ms: job_backoff_ms,
+                })
+                .await
+                .map_err(|e| {
+                    AutumnError::internal_server_error(std::io::Error::other(format!(
+                        "failed to enqueue job: {e}"
+                    )))
+                })
+        } else {
+            self.enqueue_durable(id.clone(), name, payload, job_max_attempts, job_backoff_ms)
+                .await
+        };
+        if result.is_err() {
+            self.registry.record_cancel(name);
+            self.job_admin.record_cancelled(&id);
+        }
+        result
     }
 }
 
@@ -2872,6 +2973,41 @@ async fn pg_enqueue_job(
     .bind::<diesel::sql_types::Integer, _>(max_attempts as i32)
     .bind::<diesel::sql_types::BigInt, _>(initial_backoff_ms as i64)
     .execute(&mut *conn)
+    .await
+    .map(|_| ())
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))
+}
+
+/// Insert a job into `autumn_jobs` using an **already-open connection**.
+///
+/// Unlike [`pg_enqueue_job`], this function does not acquire a new connection
+/// from the pool. The INSERT participates in whatever transaction the caller
+/// has open, so if the caller rolls back, the job row disappears atomically.
+#[cfg(feature = "db")]
+async fn pg_enqueue_on_conn(
+    conn: &mut diesel_async::AsyncPgConnection,
+    id: String,
+    name: &str,
+    payload: Value,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+) -> AutumnResult<()> {
+    use diesel_async::RunQueryDsl as _;
+
+    let payload_str = serde_json::to_string(&payload).map_err(|e| {
+        AutumnError::internal_server_error_msg(format!("serialize job payload: {e}"))
+    })?;
+    diesel::sql_query(
+        "INSERT INTO autumn_jobs \
+         (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, enqueued_at, run_at) \
+         VALUES ($1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW())",
+    )
+    .bind::<diesel::sql_types::Text, _>(id)
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(payload_str)
+    .bind::<diesel::sql_types::Integer, _>(max_attempts as i32)
+    .bind::<diesel::sql_types::BigInt, _>(initial_backoff_ms as i64)
+    .execute(conn)
     .await
     .map(|_| ())
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}")))

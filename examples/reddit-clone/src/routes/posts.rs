@@ -354,8 +354,12 @@ pub async fn submit(
                 .execute(conn)
                 .await?;
 
-            enqueue_post_publication(post_id, &title, &slug, &subreddit_slug, &author_username)
-                .await?;
+            autumn_web::job::enqueue_on_conn(
+                PostPublicationJob::NAME,
+                PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),
+                conn,
+            )
+            .await?;
 
             Ok::<_, AutumnError>(())
         }
@@ -713,23 +717,6 @@ async fn unique_slug(
     }
 }
 
-async fn enqueue_post_publication(
-    post_id: i64,
-    title: &str,
-    post_slug: &str,
-    subreddit_slug: &str,
-    author_username: &str,
-) -> AutumnResult<()> {
-    PostPublicationJob::enqueue(PostPublicationArgs::new(
-        post_id,
-        title,
-        post_slug,
-        subreddit_slug,
-        author_username,
-    ))
-    .await
-}
-
 /// Like `unique_slug`, but excludes a specific post ID (for updates).
 async fn unique_slug_excluding(
     base: &str,
@@ -772,10 +759,15 @@ mod tests {
 
     #[tokio::test]
     async fn post_publication_enqueue_failure_is_returned_to_submit() {
-        let error =
-            enqueue_post_publication(99, "Ferris arrives", "ferris-arrives", "rust", "ferris")
-                .await
-                .expect_err("missing job runtime should fail post submission");
+        let error = PostPublicationJob::enqueue(PostPublicationArgs::new(
+            99,
+            "Ferris arrives",
+            "ferris-arrives",
+            "rust",
+            "ferris",
+        ))
+        .await
+        .expect_err("missing job runtime should fail post submission");
 
         assert!(
             error.to_string().contains("job runtime is not initialized"),
