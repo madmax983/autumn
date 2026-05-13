@@ -149,7 +149,8 @@ fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
 fn is_known_alter_subcommand(subcommand: &str) -> bool {
     subcommand.starts_with("add column ")
         || subcommand.starts_with("drop column ")
-        || subcommand.starts_with("rename ") // RENAME COLUMN or RENAME TO
+        || subcommand.starts_with("rename column ") // RENAME COLUMN
+        || subcommand.starts_with("rename to ") // RENAME TABLE (ALTER TABLE … RENAME TO …)
         || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
 }
 
@@ -206,6 +207,24 @@ pub fn contains_concurrent_index(sql: &str) -> bool {
             || normalized.contains("create unique index concurrently ")
             || normalized.starts_with("drop index concurrently ")
     })
+}
+
+/// `PostgreSQL` STABLE/IMMUTABLE function prefixes that are safe as NOT NULL column
+/// defaults: Postgres evaluates them once at statement time and stores the result as
+/// a constant, so the PG 11+ fast-default path applies — no table rewrite needed.
+const STABLE_FN_PREFIXES: &[&str] = &["now(", "current_timestamp(", "localtimestamp("];
+
+/// Returns `true` when `default_expr` is a volatile function call that `PostgreSQL`
+/// cannot optimise via the PG 11+ fast-constant-default path.
+///
+/// STABLE/IMMUTABLE functions (e.g. `now()`) are evaluated once at statement time
+/// and stored as a constant, so they do not require a table rewrite.  Only truly
+/// VOLATILE functions (e.g. `random()`, `gen_random_uuid()`) must be flagged.
+fn is_volatile_function_default(default_expr: &str) -> bool {
+    default_expr.contains('(')
+        && !STABLE_FN_PREFIXES
+            .iter()
+            .any(|p| default_expr.starts_with(p))
 }
 
 /// Apply all pattern checks to a single normalized (lowercase, single-spaced) statement.
@@ -308,13 +327,15 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
         for subcommand in alter_table_subcommands(normalized) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 let has_default = subcommand.contains(" default ");
-                // A DEFAULT is "volatile" when it contains a function call (has `(`
-                // anywhere after the `default` keyword).  Constant literals such as
-                // `DEFAULT 0` or `DEFAULT ''` do not contain `(`.
+                // A DEFAULT is "volatile" when it is a VOLATILE function call —
+                // i.e. one that Postgres must evaluate per-row, preventing the PG11+
+                // fast-constant-default path.  STABLE functions (e.g. `now()`) are
+                // evaluated once at statement time and do not require a table rewrite.
                 let has_volatile_default = has_default
-                    && subcommand
-                        .find(" default ")
-                        .is_some_and(|pos| subcommand[pos..].contains('('));
+                    && subcommand.find(" default ").is_some_and(|pos| {
+                        let default_expr = subcommand[pos + " default ".len()..].trim();
+                        is_volatile_function_default(default_expr)
+                    });
 
                 if !has_default {
                     findings.push(SafetyFinding {
@@ -332,9 +353,9 @@ fn classify_statement(normalized: &str) -> Vec<SafetyFinding> {
                     findings.push(SafetyFinding {
                         operation: "ADD COLUMN NOT NULL (volatile default)".to_owned(),
                         risk: RiskLevel::PotentiallyBlocking,
-                        why: "A function-call DEFAULT (e.g. random(), now(), gen_random_uuid()) \
-                              is volatile: Postgres must evaluate it for every existing row under \
-                              an exclusive lock, potentially rewriting the entire table.",
+                        why: "A volatile function-call DEFAULT (e.g. random(), gen_random_uuid()) \
+                              is evaluated per-row: Postgres cannot use the PG11+ fast-constant \
+                              path and must rewrite the entire table under an exclusive lock.",
                         next_action: "Use a constant literal DEFAULT instead (e.g. DEFAULT 0, \
                                       DEFAULT ''), or add the column nullable, backfill, then \
                                       add the NOT NULL constraint in a later migration.",
@@ -648,6 +669,20 @@ mod tests {
         assert_eq!(findings[0].operation, "RENAME TABLE");
     }
 
+    #[test]
+    fn rename_constraint_requires_manual_review() {
+        // RENAME CONSTRAINT is a schema change that Autumn cannot auto-classify —
+        // it must not silently pass as safe.
+        let findings = classify_sql("ALTER TABLE users RENAME CONSTRAINT old_name TO new_name;");
+        assert_eq!(
+            findings.len(),
+            1,
+            "RENAME CONSTRAINT must not silently pass: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+        assert_eq!(findings[0].operation, "Unclassified ALTER TABLE");
+    }
+
     // ── potentially blocking patterns ─────────────────────────────────────────
 
     #[test]
@@ -698,15 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn add_not_null_column_with_now_default_is_blocking() {
+    fn add_not_null_column_with_now_default_is_safe() {
+        // now() is STABLE: Postgres evaluates it once at statement time and stores the
+        // constant, so the PG11+ fast-default path applies — no table rewrite needed.
         let findings = classify_sql(
             "ALTER TABLE posts ADD COLUMN created_at TIMESTAMP NOT NULL DEFAULT now();",
         );
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
-        assert_eq!(
-            findings[0].operation,
-            "ADD COLUMN NOT NULL (volatile default)"
+        assert!(
+            findings.is_empty(),
+            "DEFAULT now() is stable and must not be flagged as volatile: {findings:?}"
         );
     }
 
