@@ -26,7 +26,7 @@ if tokens == nil then
     last_ts = now_ms
 end
 
-local elapsed_secs = (now_ms - last_ts) / 1000.0
+local elapsed_secs = math.max(0, (now_ms - last_ts) / 1000.0)
 tokens = math.min(burst, tokens + elapsed_secs * refill_per_sec)
 
 local allowed = 0
