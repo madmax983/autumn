@@ -1766,6 +1766,38 @@ impl AutumnConfig {
             "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES",
             &mut self.security.rate_limit.trusted_proxies,
         );
+        #[cfg(feature = "redis")]
+        {
+            use crate::security::config::{RateLimitBackend, RateLimitBackendFailure};
+            if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__BACKEND") {
+                match RateLimitBackend::from_env_value(&val) {
+                    Some(backend) => self.security.rate_limit.backend = backend,
+                    None => eprintln!(
+                        "Warning: AUTUMN_SECURITY__RATE_LIMIT__BACKEND={val:?} is not valid \
+                         (expected memory or redis), ignoring"
+                    ),
+                }
+            }
+            if let Ok(val) = env.var("AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE") {
+                match RateLimitBackendFailure::from_env_value(&val) {
+                    Some(mode) => self.security.rate_limit.on_backend_failure = mode,
+                    None => eprintln!(
+                        "Warning: AUTUMN_SECURITY__RATE_LIMIT__ON_BACKEND_FAILURE={val:?} is not \
+                         valid (expected fail_open or fail_closed), ignoring"
+                    ),
+                }
+            }
+            parse_env_option_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__URL",
+                &mut self.security.rate_limit.redis.url,
+            );
+            parse_env_string(
+                env,
+                "AUTUMN_SECURITY__RATE_LIMIT__REDIS__KEY_PREFIX",
+                &mut self.security.rate_limit.redis.key_prefix,
+            );
+        }
     }
 
     #[cfg(feature = "storage")]

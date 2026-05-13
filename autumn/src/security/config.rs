@@ -731,6 +731,17 @@ pub enum RateLimitBackend {
     Redis,
 }
 
+#[cfg(feature = "redis")]
+impl RateLimitBackend {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "memory" => Some(Self::Memory),
+            "redis" => Some(Self::Redis),
+            _ => None,
+        }
+    }
+}
+
 /// Behavior when the rate-limit backend becomes unreachable.
 ///
 /// Configures the limiter's posture when the storage backend (Redis) is
@@ -749,6 +760,17 @@ pub enum RateLimitBackendFailure {
     /// Deny the request with `429 Too Many Requests` until the backend recovers.
     #[serde(alias = "closed")]
     FailClosed,
+}
+
+#[cfg(feature = "redis")]
+impl RateLimitBackendFailure {
+    pub(crate) fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fail_open" | "open" => Some(Self::FailOpen),
+            "fail_closed" | "closed" => Some(Self::FailClosed),
+            _ => None,
+        }
+    }
 }
 
 /// Redis-specific options for the rate-limit backend.

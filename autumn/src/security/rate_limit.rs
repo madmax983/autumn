@@ -168,60 +168,8 @@ impl MemoryStore {
 
 // ── Redis bucket store ────────────────────────────────────────────────────────
 
-/// Lua script that atomically applies a token-bucket consume on a Redis hash.
-///
-/// Keys:
-///   KEYS[1] - the per-IP hash key
-///
-/// Arguments (all f64 / integers passed as strings):
-///   ARGV[1] - burst capacity (float)
-///   ARGV[2] - refill rate in tokens/second (float)
-///   ARGV[3] - current wall-clock time in milliseconds (integer)
-///
-/// Returns a three-element array: `{allowed, remaining_floor, retry_after_secs}`
-/// - `allowed`:           1 if the request is permitted, 0 if denied
-/// - `remaining_floor`:   floor of remaining tokens after consume (only valid when allowed=1)
-/// - `retry_after_secs`:  ceil of seconds until one token refills (only valid when allowed=0)
 #[cfg(feature = "redis")]
-const RATE_LIMIT_LUA: &str = r#"
-local key = KEYS[1]
-local burst = tonumber(ARGV[1])
-local refill_per_sec = tonumber(ARGV[2])
-local now_ms = tonumber(ARGV[3])
-
-local data = redis.call('HMGET', key, 'tokens', 'ts')
-local tokens = tonumber(data[1])
-local last_ts = tonumber(data[2])
-
-if tokens == nil then
-    tokens = burst
-    last_ts = now_ms
-end
-
-local elapsed_secs = (now_ms - last_ts) / 1000.0
-tokens = math.min(burst, tokens + elapsed_secs * refill_per_sec)
-
-local allowed = 0
-local remaining = 0
-local retry_after_secs = 0
-
-if tokens >= 1.0 then
-    tokens = tokens - 1.0
-    allowed = 1
-    remaining = math.floor(tokens)
-else
-    allowed = 0
-    local deficit = 1.0 - tokens
-    retry_after_secs = math.ceil(deficit / refill_per_sec)
-    if retry_after_secs < 1 then retry_after_secs = 1 end
-end
-
-local expiry_secs = math.ceil(burst / refill_per_sec) + 2
-redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(now_ms))
-redis.call('EXPIRE', key, expiry_secs)
-
-return {allowed, remaining, retry_after_secs}
-"#;
+const RATE_LIMIT_LUA: &str = include_str!("rate_limit.lua");
 
 #[cfg(feature = "redis")]
 struct RedisStore {
@@ -244,7 +192,7 @@ impl std::fmt::Debug for RedisStore {
 
 #[cfg(feature = "redis")]
 impl RedisStore {
-    fn new(
+    const fn new(
         connection: redis::aio::ConnectionManager,
         key_prefix: String,
         failure_mode: RateLimitBackendFailure,
@@ -273,7 +221,7 @@ impl RedisStore {
                 .key(&redis_key)
                 .arg(burst)
                 .arg(refill_per_sec)
-                .arg(now_ms as i64)
+                .arg(i64::try_from(now_ms).unwrap_or(i64::MAX))
                 .invoke_async(&mut conn)
                 .await
         };
@@ -314,9 +262,25 @@ impl RedisStore {
                     }),
                 }
             }
-            Ok(_) => {
+            Ok(values) => {
                 // Unexpected script return shape — treat as backend error.
-                None
+                if !self
+                    .outage_logged
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        ?values,
+                        key_prefix = %self.key_prefix,
+                        "rate-limit Redis backend: unexpected script return value; \
+                         switching to on_backend_failure posture"
+                    );
+                }
+                match self.failure_mode {
+                    RateLimitBackendFailure::FailOpen => None,
+                    RateLimitBackendFailure::FailClosed => Some(Decision::Denied {
+                        retry_after_secs: 1,
+                    }),
+                }
             }
         }
     }
@@ -437,15 +401,10 @@ impl Limiter {
         }
     }
 
-    fn build_backend(_config: &RateLimitConfig) -> BucketBackend {
+    fn build_backend(#[allow(unused_variables)] config: &RateLimitConfig) -> BucketBackend {
         #[cfg(feature = "redis")]
-        if _config.backend == RateLimitBackend::Redis {
-            if let Some(url) = _config
-                .redis
-                .url
-                .as_deref()
-                .filter(|u| !u.trim().is_empty())
-            {
+        if config.backend == RateLimitBackend::Redis {
+            if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
                 match redis::Client::open(url) {
                     Ok(client) => {
                         match redis::aio::ConnectionManager::new_lazy_with_config(
@@ -455,8 +414,8 @@ impl Limiter {
                             Ok(conn) => {
                                 return BucketBackend::Redis(RedisStore::new(
                                     conn,
-                                    _config.redis.key_prefix.clone(),
-                                    _config.on_backend_failure,
+                                    config.redis.key_prefix.clone(),
+                                    config.on_backend_failure,
                                 ));
                             }
                             Err(err) => {
