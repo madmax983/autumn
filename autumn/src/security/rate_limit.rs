@@ -250,11 +250,20 @@ impl Limiter {
         let peer_ip = Self::peer_ip(req);
 
         if self.trust_forwarded_headers && self.forwarded_headers_allowed(req) {
-            let xff_ip = req
+            let xff_headers: Vec<&str> = req
                 .headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| self.client_ip_from_x_forwarded_for(s, peer_ip));
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+
+            let joined = xff_headers.join(",");
+
+            let xff_ip = if joined.is_empty() {
+                None
+            } else {
+                self.client_ip_from_x_forwarded_for(&joined, peer_ip)
+            };
 
             if xff_ip.is_some() {
                 return xff_ip;
