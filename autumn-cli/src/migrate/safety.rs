@@ -10,9 +10,11 @@
 //!   literals or `PostgreSQL` dollar-quoted blocks (`$$…$$`) will produce
 //!   incorrect splits. Real migration files almost never embed semicolons in
 //!   strings, so this is an acceptable approximation.
-//! - Comment stripping matches `--` by position on each line. A `--` sequence
-//!   inside a string literal would be incorrectly treated as a comment start.
-//!   Again, this pattern is essentially absent from real migration files.
+//! - Line comment stripping matches `--` by position on each line. A `--`
+//!   sequence inside a string literal would be incorrectly treated as a comment
+//!   start. Again, this pattern is essentially absent from real migration files.
+//! - Block comment stripping (`/* … */`) similarly does not handle `/*` or `*/`
+//!   tokens that appear inside string literals.
 
 use std::fmt;
 
@@ -147,9 +149,39 @@ fn is_known_alter_subcommand(subcommand: &str) -> bool {
         || (subcommand.starts_with("alter column ") && subcommand.contains(" type "))
 }
 
+/// Remove `/* ... */` block comments from `sql`.
+///
+/// Handles single-line and multi-line block comments. Unclosed block comments
+/// are consumed to end-of-input. Block comments inside string literals are an
+/// edge case not handled here (same limitation as `--` in strings).
+fn strip_block_comments(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next(); // consume '*'
+            loop {
+                match chars.next() {
+                    Some('*') if chars.peek() == Some(&'/') => {
+                        chars.next(); // consume '/'
+                        break;
+                    }
+                    None => break, // unclosed block comment
+                    _ => {}
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Strip line comments, collapse whitespace, and lowercase a single statement.
 fn normalize_statement(stmt: &str) -> String {
-    stmt.lines()
+    let without_block_comments = strip_block_comments(stmt);
+    without_block_comments
+        .lines()
         .map(|line| line.find("--").map_or(line, |i| &line[..i]))
         .flat_map(str::split_whitespace)
         .collect::<Vec<_>>()
@@ -157,17 +189,18 @@ fn normalize_statement(stmt: &str) -> String {
         .to_lowercase()
 }
 
-/// Returns `true` when `sql` contains an executable `CREATE INDEX CONCURRENTLY`
-/// or `CREATE UNIQUE INDEX CONCURRENTLY` statement.
+/// Returns `true` when `sql` contains an executable concurrent index operation
+/// (`CREATE [UNIQUE] INDEX CONCURRENTLY` or `DROP INDEX CONCURRENTLY`).
 ///
 /// Uses the same comment-stripping and whitespace-normalization pipeline as
-/// [`classify_sql`] so that a concurrent index mentioned only inside a SQL
-/// comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) is not counted.
+/// [`classify_sql`] so that concurrent index keywords mentioned only inside a
+/// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
 pub fn contains_concurrent_index(sql: &str) -> bool {
     split_statements(sql).iter().any(|stmt| {
         let normalized = normalize_statement(stmt);
         normalized.contains("create index concurrently")
             || normalized.contains("create unique index concurrently")
+            || normalized.contains("drop index concurrently")
     })
 }
 
@@ -944,6 +977,63 @@ mod tests {
         assert!(
             contains_concurrent_index(sql),
             "multi-line CONCURRENTLY statement must be detected"
+        );
+    }
+
+    #[test]
+    fn contains_concurrent_index_true_for_drop_index_concurrently() {
+        assert!(
+            contains_concurrent_index("DROP INDEX CONCURRENTLY idx_posts_title;"),
+            "DROP INDEX CONCURRENTLY must be detected"
+        );
+    }
+
+    // ── block comment stripping ───────────────────────────────────────────────
+
+    #[test]
+    fn block_comment_before_drop_table_is_still_classified() {
+        let sql = "/* cleanup old table */ DROP TABLE posts;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "DROP TABLE must be found after block comment"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn block_comment_before_create_index_is_still_classified() {
+        let sql = "/* needs index */ CREATE INDEX idx ON posts (title);";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "CREATE INDEX must be found after block comment"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
+    }
+
+    #[test]
+    fn multiline_block_comment_is_stripped() {
+        let sql = "/*\n * Remove legacy column\n */\nALTER TABLE posts DROP COLUMN body;";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "DROP COLUMN must be found after multi-line block comment"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn block_comment_only_mention_of_keyword_is_not_classified() {
+        // Only mentions DROP TABLE inside a block comment; actual statement is safe.
+        let sql = "/* was: DROP TABLE posts; */ ALTER TABLE posts ADD COLUMN active BOOL;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().all(|f| f.risk != RiskLevel::Destructive),
+            "Destructive keyword inside block comment must not produce a Destructive finding"
         );
     }
 }

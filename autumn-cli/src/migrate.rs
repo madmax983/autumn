@@ -183,11 +183,11 @@ fn check_concurrent_index_transaction_opt_out(
 
     if !opted_out {
         findings.push(safety::SafetyFinding {
-            operation: "CREATE INDEX CONCURRENTLY (missing transaction opt-out)".to_owned(),
+            operation: "CONCURRENTLY index operation (missing transaction opt-out)".to_owned(),
             risk: safety::RiskLevel::PotentiallyBlocking,
-            why: "PostgreSQL rejects CONCURRENTLY inside a transaction block. Diesel wraps \
-                  migrations in a transaction by default, so this migration will fail at \
-                  deploy time unless the transaction is disabled.",
+            why: "`PostgreSQL` rejects `CREATE INDEX CONCURRENTLY` and `DROP INDEX CONCURRENTLY` \
+                  inside a transaction block. Diesel wraps migrations in a transaction by default, \
+                  so this migration will fail at deploy time unless the transaction is disabled.",
             next_action: "Add `run_in_transaction = false` to the migration's `metadata.toml` \
                           (create the file if absent). Example: \
                           echo 'run_in_transaction = false' > migrations/<name>/metadata.toml",
@@ -885,6 +885,24 @@ replica_url = "postgres://replica:5432/app"
                 .iter()
                 .any(|f| f.operation.contains("CONCURRENTLY")),
             "missing metadata.toml should produce a CONCURRENTLY finding"
+        );
+    }
+
+    #[test]
+    fn drop_index_concurrently_without_metadata_toml_is_flagged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260104000000_drop_index");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+
+        let sql = "DROP INDEX CONCURRENTLY idx_posts_title;";
+        let mut findings = Vec::new();
+        check_concurrent_index_transaction_opt_out(sql, &migration_dir, &mut findings);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+        assert!(
+            findings[0].operation.contains("CONCURRENTLY"),
+            "finding should mention CONCURRENTLY"
         );
     }
 
