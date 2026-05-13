@@ -41,11 +41,11 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
-        .unwrap();
+        .expect("failed to initialize HTTP client");
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is set before Unix epoch")
         .as_secs();
 
     let mut req = client

@@ -303,7 +303,7 @@ enum MigrateCommands {
 /// Subcommands for `autumn token`.
 
 #[derive(Subcommand)]
-pub enum WebhookCommands {
+enum WebhookCommands {
     /// Send a simulated webhook request with a generated HMAC signature.
     Sim {
         /// The provider to simulate (stripe, github, slack, generic).
@@ -312,6 +312,7 @@ pub enum WebhookCommands {
         url: String,
         /// The webhook secret used to sign the request.
         #[arg(long)]
+        #[arg(long, env = "AUTUMN_WEBHOOK_SECRET")]
         secret: String,
         /// The payload to send in the request body.
         #[arg(long)]
