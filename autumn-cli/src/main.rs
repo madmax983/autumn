@@ -299,6 +299,23 @@ enum Commands {
 enum MigrateCommands {
     /// Show migration status (applied and pending)
     Status,
+    /// Run a production-safety preflight check on all migration SQL files.
+    ///
+    /// Classifies every `up.sql` in the migrations directory into one of:
+    /// safe, potentially-blocking, destructive, irreversible, data-backfill,
+    /// or manual-review-required.
+    ///
+    /// Exits with code 0 when all migrations are safe for a rolling deploy.
+    /// Exits with code 1 and prints a detailed report when any unsafe or
+    /// unclassified operations are detected.
+    ///
+    /// Does not require a database connection — safe to run in CI before deploy.
+    ///
+    /// # Example
+    ///
+    ///   autumn migrate check
+    #[command(verbatim_doc_comment)]
+    Check,
 }
 
 /// Subcommands for `autumn token`.
@@ -532,6 +549,7 @@ fn run_command(command: Commands) {
         Commands::Migrate { action } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
+                Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
                 None => migrate::MigrateAction::Run,
             };
             migrate::run(action);
@@ -1000,6 +1018,23 @@ mod tests {
                 action: Some(MigrateCommands::Status)
             }
         ));
+    }
+
+    #[test]
+    fn parse_migrate_check() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Migrate {
+                action: Some(MigrateCommands::Check)
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_migrate_no_subcommand_runs_migrations() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        assert!(matches!(cli.command, Commands::Migrate { action: None }));
     }
 
     #[test]
