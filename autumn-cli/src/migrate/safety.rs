@@ -238,6 +238,7 @@ fn strip_block_comments(sql: &str) -> String {
                 match chars.next() {
                     Some('*') if chars.peek() == Some(&'/') => {
                         chars.next(); // consume '/'
+                        result.push(' '); // preserve token boundary where the comment was
                         break;
                     }
                     None => break, // unclosed block comment
@@ -1356,6 +1357,19 @@ mod tests {
             findings.len(),
             1,
             "DROP TABLE after a block comment containing ';' must still be classified"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn block_comment_between_keywords_preserves_token_boundary() {
+        // `DROP/* note */TABLE posts` must not concatenate to `DROPTABLE posts`,
+        // which would miss both the `drop table` rule and the `drop ` catch-all.
+        let findings = classify_sql("DROP/* note */TABLE posts;");
+        assert_eq!(
+            findings.len(),
+            1,
+            "block comment between keywords must not merge them: {findings:?}"
         );
         assert_eq!(findings[0].risk, RiskLevel::Destructive);
     }
