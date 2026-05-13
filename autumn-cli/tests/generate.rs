@@ -952,3 +952,173 @@ fn generate_auth_help_documents_command() {
     );
     assert!(stdout.contains("--force"), "help should mention --force");
 }
+
+// ── TOML config (issue #669) ──────────────────────────────────────────────────
+
+/// Scaffold a resource using only a `--config` file, no inline CLI metadata.
+#[test]
+fn generate_scaffold_from_config_file() {
+    let (_tmp, project) = fresh_project("scaffold-config-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.Bookmark]\n\
+         fields      = [\"url:String\", \"title:String\", \"tag:String\", \"alive:bool\"]\n\
+         indexes     = [\"url\", \"tag\"]\n\
+         validations = [\"url=url\", \"title=length:min=1,max=200\"]\n\
+         defaults    = [\"alive=true\"]\n\
+         queries     = [\"find_by_tag:tag\", \"find_by_alive:alive\"]\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Bookmark", "--config", "autumn.generate.toml"],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/bookmark.rs")).unwrap();
+    assert!(
+        model.contains("#[indexed]\n    #[validate(url)]\n    pub url: String,"),
+        "model missing indexed+validated url field:\n{model}"
+    );
+    assert!(
+        model.contains("#[validate(length(min = 1, max = 200))]\n    pub title: String,"),
+        "model missing length-validated title field:\n{model}"
+    );
+    assert!(
+        model.contains("#[indexed]\n    pub tag: String,"),
+        "model missing indexed tag field:\n{model}"
+    );
+    assert!(
+        model.contains("#[default]\n    pub alive: bool,"),
+        "model missing defaulted alive field:\n{model}"
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/bookmark.rs")).unwrap();
+    assert!(
+        repo.contains("fn find_by_tag(tag: String) -> Vec<Bookmark>;"),
+        "repo missing find_by_tag query:\n{repo}"
+    );
+    assert!(
+        repo.contains("fn find_by_alive(alive: bool) -> Vec<Bookmark>;"),
+        "repo missing find_by_alive query:\n{repo}"
+    );
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_bookmarks")
+        })
+        .expect("create_bookmarks migration must exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(up.contains("alive BOOLEAN NOT NULL DEFAULT TRUE"), "SQL missing default: {up}");
+    assert!(
+        up.contains("CREATE INDEX idx_bookmarks_url ON bookmarks (url);"),
+        "SQL missing url index: {up}"
+    );
+    assert!(
+        up.contains("CREATE INDEX idx_bookmarks_tag ON bookmarks (tag);"),
+        "SQL missing tag index: {up}"
+    );
+
+    let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_toml.contains("validator ="),
+        "Cargo.toml missing validator dep:\n{cargo_toml}"
+    );
+}
+
+/// CLI flags override the corresponding TOML values when both are present.
+#[test]
+fn generate_scaffold_cli_overrides_toml_config() {
+    let (_tmp, project) = fresh_project("scaffold-config-override-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.Post]\nfields  = [\"title:String\", \"body:Text\"]\nindexes = [\"title\"]\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "content:String",
+            "--index",
+            "content",
+            "--config",
+            "autumn.generate.toml",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(model.contains("pub content: String"), "model must have CLI field 'content': {model}");
+    assert!(!model.contains("pub title: String"), "model must not have TOML field 'title': {model}");
+    assert!(!model.contains("pub body:"), "model must not have TOML field 'body': {model}");
+
+    let migration = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .expect("create_posts migration must exist");
+    let up = fs::read_to_string(migration.path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("CREATE INDEX idx_posts_content ON posts (content);"),
+        "SQL must have CLI index on 'content': {up}"
+    );
+    assert!(
+        !up.contains("idx_posts_title"),
+        "SQL must not have TOML index on 'title': {up}"
+    );
+}
+
+/// A non-existent config file must cause a non-zero exit with the filename
+/// mentioned in the error output.
+#[test]
+fn generate_scaffold_rejects_missing_config_file() {
+    let (_tmp, project) = fresh_project("scaffold-missing-config-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--config", "nonexistent.toml"],
+    );
+
+    assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
+    assert!(
+        stderr.contains("nonexistent.toml"),
+        "error must mention the missing file name; got:\n{stderr}"
+    );
+}
+
+/// When the config file exists but has no entry for the requested resource,
+/// the command must fail with a helpful error message.
+#[test]
+fn generate_scaffold_rejects_config_missing_resource_section() {
+    let (_tmp, project) = fresh_project("scaffold-missing-section-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.OtherResource]\nfields = [\"name:String\"]\n",
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "scaffold", "Post", "--config", "autumn.generate.toml"],
+    );
+
+    assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
+    assert!(
+        stderr.contains("Post"),
+        "error must mention the resource name; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("autumn.generate.toml"),
+        "error must mention the config file name; got:\n{stderr}"
+    );
+}
