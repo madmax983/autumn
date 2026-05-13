@@ -811,13 +811,16 @@ A few notes:
   `Content-Type: application/x-www-form-urlencoded`. Headers like
   `X-HTTP-Method-Override` are intentionally not enabled by default.
 - It is also enforced as **same-origin**: the request must carry
-  `Sec-Fetch-Site: same-origin|same-site|none` (sent by every browser
-  since ~2020), or — if `Sec-Fetch-Site` is absent — its `Origin`
-  header must match the `Host` header. Requests that satisfy neither
-  signal are forwarded as the original `POST` so a cross-origin form
-  can never reach a route declared only as `#[delete]`. The
-  `autumn_web::test::TestApp` `form()` helper sets the header
-  automatically.
+  `Sec-Fetch-Site: same-origin` or `none` (sent by every browser
+  since ~2020), or — for `same-site` or when `Sec-Fetch-Site` is
+  absent — its `Origin` header must match the `Host` header. This
+  is stricter than `same-site` alone, because `same-site` accepts
+  sibling subdomains under the same registrable domain (e.g.
+  `evil.example.com` -> `app.example.com`). Requests that don't
+  meet any of these conditions are forwarded as the original `POST`
+  so a cross-origin form can never reach a route declared only as
+  `#[delete]`. The `autumn_web::test::TestApp` `form()` helper sets
+  the header automatically.
 - Unknown override values (anything other than `PUT`, `PATCH`, `DELETE`,
   case-insensitive) reject with `400 Bad Request` before your handler runs.
 - CSRF still treats the transport `POST` as unsafe — an overridden
