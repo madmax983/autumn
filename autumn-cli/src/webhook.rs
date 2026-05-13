@@ -123,11 +123,26 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
     match req.send() {
         Ok(response) => {
             let status = response.status();
-            println!("✅ Response Status: {status}");
-            if let Ok(text) = response.text()
-                && !text.is_empty()
-            {
-                println!("📝 Response Body: {text}");
+
+            match response.text() {
+                Ok(text) => {
+                    if status.is_success() {
+                        println!("✅ Response Status: {status}");
+                        if !text.is_empty() {
+                            println!("📝 Response Body: {text}");
+                        }
+                    } else {
+                        eprintln!("❌ Webhook endpoint returned status: {status}");
+                        if !text.is_empty() {
+                            eprintln!("Response Body: {text}");
+                        }
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("❌ Failed to read webhook response body: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Err(e) => {
