@@ -44,7 +44,9 @@ else
     if retry_after_secs < 1 then retry_after_secs = 1 end
 end
 
-local expiry_secs = math.ceil(burst / refill_per_sec) + 2
+-- Cap at 7 days so math.ceil(burst/refill_per_sec) never produces infinity
+-- when refill_per_sec is near zero (Rust clamps it to f64::MIN_POSITIVE).
+local expiry_secs = math.min(math.ceil(burst / refill_per_sec) + 2, 604800)
 -- Use math.max to keep the stored timestamp monotonic across replicas with clock skew.
 local stored_ts = math.max(now_ms, last_ts)
 redis.call('HSET', key, 'tokens', tostring(tokens), 'ts', tostring(stored_ts))
