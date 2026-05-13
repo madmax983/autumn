@@ -168,12 +168,30 @@ Use `#[scheduled]` when:
 - duplicate execution per replica is acceptable or explicitly coordinated
 - you do not need durable retries or workflow history
 
-Use Harvest when:
+Use Harvest (`#[job]`) when:
 
 - the task must survive restarts
 - retries and visibility matter
 - work should be coordinated across replicas
 - you are really describing a workflow, not a cron callback
+
+### Choosing a Harvest backend
+
+| Backend | When to pick it |
+|---|---|
+| `local` | Local dev and single-process demos; jobs are lost on restart |
+| `postgres` | Production with Postgres already in the stack; no Redis required |
+| `redis` | Very high job throughput, or Redis is already a dependency |
+
+`postgres` reuses the configured `[database]` pool and claims jobs via
+`SELECT … FOR UPDATE SKIP LOCKED`, making it safe across any number of replicas
+without adding Redis. Enable it with `jobs.backend = "postgres"` and run
+`autumn migrate` before the first worker starts.
+
+`redis` offers a higher throughput ceiling and sub-millisecond poll latency but
+adds Redis as an infrastructure dependency. Prefer `postgres` if your ops budget
+does not include Redis, and switch to `redis` if job throughput saturates the
+Postgres connection pool.
 
 ## Migration Jobs
 
@@ -407,6 +425,6 @@ Before calling an Autumn app "cloud ready", verify:
 - file uploads use the `S3` blob store if replicas > 1
 - mail uses SMTP, not log/file transport
 - migrations run before web rollout
-- background jobs use the right runtime model
+- background jobs use `postgres` or `redis` backend (not `local`) in multi-replica deployments
 - multi-replica write paths use `#[lock_version]` (optimistic) or `with_lock` (pessimistic) to prevent lost updates
 - the generated container image builds without manual template surgery
