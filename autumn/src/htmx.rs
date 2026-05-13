@@ -294,6 +294,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hx_response_ext_empty_values_are_valid() {
+        use axum::response::IntoResponse;
+
+        let response = "hello".hx_location("").into_response();
+        let headers = response.headers();
+        assert_eq!(headers.get("hx-location").unwrap(), "");
+    }
+    #[tokio::test]
     async fn hx_response_ext_ignores_invalid_header_values() {
         use axum::response::IntoResponse;
 
@@ -328,6 +336,24 @@ mod tests {
         assert!(headers.get("hx-trigger-after-swap").is_none());
     }
 
+    #[tokio::test]
+    async fn hx_request_extractor_handles_false_headers() -> Result<(), axum::http::Error> {
+        let req = Request::builder()
+            .header("hx-request", "false")
+            .header("hx-history-restore-request", "false")
+            .header("hx-boosted", "false")
+            .body(())?;
+        let (mut parts, ()) = req.into_parts();
+
+        let hx = HxRequest::from_request_parts(&mut parts, &())
+            .await
+            .expect("infallible");
+
+        assert!(!hx.is_htmx);
+        assert!(!hx.history_restore_request);
+        assert!(!hx.boosted);
+        Ok(())
+    }
     #[tokio::test]
     async fn hx_request_extractor_handles_missing_headers() -> Result<(), axum::http::Error> {
         let req = Request::builder().body(())?;

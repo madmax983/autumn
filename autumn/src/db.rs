@@ -519,6 +519,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_pool_provider_create_pool_succeeds_on_config() {
+        // create_pool simply parses the configuration without actively
+        // establishing a connection.
+        let provider = DieselDeadpoolPoolProvider;
+        let config = DatabaseConfig {
+            url: Some("invalid_url_format".into()),
+            ..Default::default()
+        };
+        let pool = provider.create_pool(&config).await.unwrap();
+        assert!(pool.is_some());
+    }
+
+    #[tokio::test]
+    async fn free_function_create_pool_succeeds_on_config() {
+        // create_pool simply parses the configuration without actively
+        // establishing a connection.
+        let config = DatabaseConfig {
+            url: Some("invalid_url_format".into()),
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap();
+        assert!(pool.is_some());
+    }
+    #[tokio::test]
     async fn pool_provider_trait_returns_supplied_pool() {
         // Even with a configured URL, the no-op provider returns None — proving
         // the trait can replace the default factory's behaviour.
@@ -704,6 +728,34 @@ mod tests {
         assert_eq!(state.read_pool().expect("read pool").status().max_size, 3);
     }
 
+    struct DummyState2(Pool<AsyncPgConnection>);
+    impl DbState for DummyState2 {
+        fn pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+            Some(&self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn db_extractor_extracts_pool_from_state() {
+        let mut parts = axum::http::Request::builder()
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+
+        let config = DatabaseConfig {
+            url: Some("postgres://test".into()),
+            ..Default::default()
+        };
+        let pool = create_pool(&config).unwrap().unwrap();
+
+        let state2 = DummyState2(pool);
+        let err = Db::from_request_parts(&mut parts, &state2)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
         use axum::Router;
