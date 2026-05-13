@@ -5,216 +5,63 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-## [0.4.0] - 2026-05-11
-
-### Breaking Changes
-
-- **security:** Production profiles now require a stable signing secret before
-  the server binds. Set `AUTUMN_SECURITY__SIGNING_SECRET` to a generated
-  32-byte-or-longer value, and use
-  `security.signing_secret.previous_secrets` for rotation windows.
-- **storage:** The `storage-s3` cargo feature was removed from `autumn-web`.
-  S3-compatible storage now lives in the separate `autumn-storage-s3` crate.
-- **authorization:** `#[repository(api = "...")]` now requires `policy = ...`
-  in `prod`/`production` unless
-  `[security] allow_unauthorized_repository_api = true` is set explicitly.
-- **mail:** Production `deliver_later` requires a durable
-  `MailDeliveryQueue`, a disabled transport, or the explicit
-  `mail.allow_in_process_deliver_later_in_production = true` acknowledgement.
+## [0.4.0] - 2026-05-12
 
 ### Added
 
-- **security — production signing-secret gate (#597):** Autumn now validates
-  the signing secret before the server binds. All framework-owned signed
-  surfaces — sessions, CSRF tokens, flash/signed-cookie state, and
-  local-storage signed URLs — share one secret configured via
-  `AUTUMN_SECURITY__SIGNING_SECRET`.
+- **webhook:** Add signed webhook intake with durable replay protection (#737)([7bcd8d4](https://github.com/madmax983/autumn/commit/7bcd8d4bec289e94bbc5b66ed32c29697661a0d6))
+- Standardize JSON errors as problem details (#722)([42c6501](https://github.com/madmax983/autumn/commit/42c6501675e8b052ecfd0aa873344674836f2f0c))
+- **release:** Gate crates.io releases with compatibility checks (#594) (#715)([6134619](https://github.com/madmax983/autumn/commit/613461928e000b65de4b89404b56eac14e3996bf))
+- Make router-constructing functions generic over state (#712)([76d9c85](https://github.com/madmax983/autumn/commit/76d9c85a05ace4f75b6999d2932aa6d2e9f3e390))
+- **cli:** Add `autumn generate admin` for autumn-admin-plugin adapters (#709)([991fb4a](https://github.com/madmax983/autumn/commit/991fb4a70985589fb4a8a1f4222389c33cccc6d2))
+- **admin:** Add jobs dashboard for background work (#688)([e473d5f](https://github.com/madmax983/autumn/commit/e473d5ff518bcea6d8c504d4b6db75c0f3682099))
+- **plugins:** Add plugin conformance checks — autumn plugin-check CLI and library API (#692)([287c8fa](https://github.com/madmax983/autumn/commit/287c8fab3acfd18e4c95858131323f9dd462e415))
+- **a11y:** Add accessible form helpers, /actuator/a11y endpoint, and accessible scaffold (#678)([18b8a6d](https://github.com/madmax983/autumn/commit/18b8a6dd147a233388f95483b887c4f7617ef427))
+- **cli:** Add scaffold metadata flags and regenerate bookmarks (#670)([d085f9b](https://github.com/madmax983/autumn/commit/d085f9bb81bcd67e296347ebc933b4db1b4736d6))
+- **scheduler:** Coordinate scheduled tasks across replicas (#644)([2bb5015](https://github.com/madmax983/autumn/commit/2bb5015b3efa0bc51ede10acc5894a0aef3381fe))
+- Broadcast (#636)([9212b52](https://github.com/madmax983/autumn/commit/9212b520621f3f216000a8b6d52643fe26431738))
+- Add ChannelAuditSink to broadcast audit events over websockets (#507)([4ad4f86](https://github.com/madmax983/autumn/commit/4ad4f86f19bef14ce02c81b151d99abd3039dd0f))
 
-  **Behaviour by profile:**
-  - `dev` / `test`: zero-config — an ephemeral per-process key is generated
-    automatically. Sessions and signed URLs do *not* survive restarts; this
-    is expected and documented.
-  - `prod` / `production`: the server **refuses to start** if the secret is
-    missing, shorter than 32 bytes, or matches a known demo/template value
-    (e.g. `"changeme"`, `"secret"`).
+### Fixed
 
-  **Rotation:** set `secret` to the new value and move the previous value to
-  `security.signing_secret.previous_secrets`. New signatures use `secret`;
-  existing tokens signed with any `previous_secrets` entry continue to validate
-  during the grace window. Remove old entries after the maximum relevant
-  cookie/token lifetime elapses.
-
-  **`autumn doctor`** now includes a `signing_secret` check that reports
-  readiness in human-readable and JSON output; `--strict` treats production
-  secret problems as failures.
-
-  **Migration** (pre-1.0 production deployments): generate a secret with
-  `openssl rand -hex 32`, then set `AUTUMN_SECURITY__SIGNING_SECRET` before
-  upgrading. Without it, production startup will fail.
-
-- **generators:** `autumn generate scaffold` now accepts repeatable
-  `--index`, `--validate`, `--default`, and `--query` flags so generated
-  resources can include field indexes, validator attributes, SQL defaults,
-  and derived repository query methods without a handwritten model/repository
-  diff.
+- **db:** Enforce replica_fallback in readiness and read routing (#732)([82cfda3](https://github.com/madmax983/autumn/commit/82cfda3a772dcec4751cb5f39a00c21a76b5418a))
+- **csrf:** Remove misplaced CsrfToken doc block above CsrfFormField (#672)([4283c9b](https://github.com/madmax983/autumn/commit/4283c9b1e8d8d10982ef1b5353462282b165fa16))
+- **doctor:** Avoid executing project-local Tailwind binary (#615)([519f9d9](https://github.com/madmax983/autumn/commit/519f9d9bd65eef5475268ce2587fd2c5de5c716b))
+- **auth:** Pass create payload into policy checks (#614)([f24fa55](https://github.com/madmax983/autumn/commit/f24fa553962623272407dad18ba2413a751e866c))
+- **cli:** Make scaffold generation auth-safe by default (#613)([f9e629d](https://github.com/madmax983/autumn/commit/f9e629d40608e70f51d7124376973afb657d82ef))
+- Resolve broken intra-doc links in lib.rs and tokens.rs (#589)([11e9e52](https://github.com/madmax983/autumn/commit/11e9e52c6e7070cf17b6ccc42b5454fd149e3b15))
 
 ### Changed
 
-- **examples:** Regenerated `examples/bookmarks` from
-  `autumn generate scaffold Bookmark url:String title:String tag:String alive:bool`
-  plus the new scaffold metadata flags, then reapplied the example-specific
-  htmx layout, scheduled link checker, and local-demo write routes (#534).
+- Flatten error page filters and reuse home link (#684)([b14d9c4](https://github.com/madmax983/autumn/commit/b14d9c4d27f72a0a4e4d06257a24ccda748be267))
+- Remove AppState circular dependencies from tests (#570)([8864634](https://github.com/madmax983/autumn/commit/88646344943f4b2c7aa6cf94a4708b66afa5ee87))
+- **actuator:** Replace deeply nested if-let blocks with let-else guard clauses (#549)([5b3c73e](https://github.com/madmax983/autumn/commit/5b3c73e7ff3fabcf61ea74322c9f6ba340aa2740))
 
-- **storage:** The `storage-s3` cargo feature on `autumn-web` has been
-  **removed**. S3-compatible blob storage now lives in the separate
-  `autumn-storage-s3` crate (#530). The `BlobStore` trait, `Blob` value
-  type, `LocalBlobStore`, multipart bridge, and all `[storage]`
-  configuration types remain in `autumn-web` under the existing `storage`
-  feature.
+### Documentation
 
-  **Migration** (affects any app that was using the `storage-s3` feature;
-  since that feature stub returned `BlobStoreError::Unsupported` on every
-  operation, real usage was not yet possible):
+- Certify first-run docs against published crates (#720)([3adf8be](https://github.com/madmax983/autumn/commit/3adf8bec65c2339fca4ab29487add5d2f4acc86a))
+- **todo-app:** Mention scaffold generator alternative (#668)([340f50b](https://github.com/madmax983/autumn/commit/340f50b9f7b628830d99eb830d4ef0582f4e3f7d))
+- Fix broken intra-doc links across workspace (#551)([3eb08b1](https://github.com/madmax983/autumn/commit/3eb08b165f05806d46a2a71804613d8d76168aa7))
+- Update CHANGELOG.md for v0.3.0([2a0c7f3](https://github.com/madmax983/autumn/commit/2a0c7f3deb09aba19bfe6cf16dff822810e9eac1))
 
-  ```toml
-  # Before (no longer valid):
-  autumn-web = { version = "0.4", features = ["storage", "storage-s3"] }
+### Testing
 
-  # After:
-  autumn-web        = { version = "0.4", features = ["storage"] }
-  autumn-storage-s3 = "0.4"
-  ```
+- **cli:** Add live scaffold HTTP verification (#665)([718f6c7](https://github.com/madmax983/autumn/commit/718f6c7916d3c32b28346dff09f1d9c8356cc14a))
+- **auth:** RED - add failing tests for API token authentication (#627)([ff38f9c](https://github.com/madmax983/autumn/commit/ff38f9cadd50ae39b4b880d1549c946e3bb2dd70))
+- **i18n:** RED phase — failing tests for Fluent-based i18n module (#503) (#567)([f53eb1f](https://github.com/madmax983/autumn/commit/f53eb1f1cecba28d45e4869313422c0d67bfea5b))
 
-  Wire up in `main`:
+### Miscellaneous
 
-  ```rust,ignore
-  let store = S3BlobStore::from_config(&config.storage.s3).await?;
-  autumn_web::app()
-      .with_blob_store(store)
-      .run()
-      .await;
-  ```
+- **deps:** Update getrandom requirement from 0.3 to 0.4 (#634)([9dcb20a](https://github.com/madmax983/autumn/commit/9dcb20a86827672ecf169bfa4d586a7e37fb7f8e))
+- **deps:** Update lru requirement from 0.17.0 to 0.18.0 (#526)([1cc652c](https://github.com/madmax983/autumn/commit/1cc652c48e20e7acd82f4b0c78ac163e7c261863))
 
-- **AppBuilder:** New `with_blob_store(impl BlobStore)` method
-  (mirrors `with_session_store`). When called, `preflight_storage` is
-  bypassed and the supplied store is installed directly onto `AppState`.
-  This is the installation contract for `autumn-storage-s3` and any
-  future storage plugins.
+### Warden
 
-### Added
+- Fix TOCTOU vulnerability in file storage (#547)([bce10da](https://github.com/madmax983/autumn/commit/bce10da3c5e73ffc95d5ae9b9049bbe06a59e8e4))
 
-- **mail:** Pluggable durable backend for `Mailer::deliver_later` and
-  `#[mailer]`'s generated `deliver_later_*` helpers (#649). Implement
-  `MailDeliveryQueue` for your queue (DB outbox row, Redis stream, Harvest
-  job, ...) and register it via
-  `AppBuilder::with_mail_delivery_queue(queue)` (or
-  `with_mail_delivery_queue_factory(|state| ...)` when the queue needs
-  framework-managed resources like the DB pool) before `.run()`; plugins
-  call this inside `apply`. `deliver_later` then routes mail through the
-  queue instead of the in-process Tokio fallback. In `prod`/`production`,
-  startup now fails when no durable queue is registered and the transport is
-  not `disabled`, unless the new
-  `mail.allow_in_process_deliver_later_in_production` acknowledgement flag
-  is set. The flag opts into the non-durable fallback explicitly; without
-  it, `prod` deployments must wire a real backend. See the
-  [Mail guide](docs/guide/mail.md) for the outbox pattern.
+### Autumn-cli/src/templates/release/Dockerfile.tmpl
 
-- **i18n:** New opt-in `i18n` feature flag on `autumn-web` for first-class
-  locale-aware text resolution (#503). Translations live at
-  `i18n/<locale>.ftl` (Project Fluent format), discovered from the project
-  root at startup. Adds an `[i18n]` config block (`default_locale`,
-  `supported_locales`, `fallback_chain`, `dir`), a request-scoped `Locale`
-  extractor with stable resolution order
-  (query → signed session cookie → plain cookie → `Accept-Language` →
-  default), a `t!()` **proc-macro** with **compile-time key validation**
-  (reads the default locale's `.ftl` at expansion time and emits
-  `compile_error!` with a "did you mean" suggestion on typos),
-  `set_locale_in_session()` for HMAC-signed session-backed persistence,
-  automatic runtime fallback to the default locale on miss with a
-  rate-limited `tracing::warn!`, and an `AppBuilder::i18n_auto()`
-  convenience that fail-fasts at startup when the default locale's `.ftl`
-  file is absent. The feature is **off by default**; apps that don't enable
-  it pay zero compile cost and see no behaviour change. `autumn new
-  --with-i18n` scaffolds a new project with the `i18n/` directory, stub
-  `en.ftl`, the `[i18n]` block, the feature flag, and the `.i18n_auto()`
-  call wired into `main.rs`. `examples/blog` is fully migrated — its
-  shared `layout()` is translated through `t!()`, the nav contains a
-  locale switcher, and `/greet` is an end-to-end demo with English and
-  Spanish bundles. New `docs/guide/i18n.md` documents the convention,
-  extractor order, the compile-time check, validation localization
-  pattern, and a "migrating from monolingual" section.
-- **typed path helpers:** Route macros (`#[get]`, `#[post]`, `#[put]`,
-  `#[delete]`, `#[patch]`) now emit a companion
-  `pub fn __autumn_path_{name}(params…) -> String` helper alongside every
-  handler (#499). The `paths![show, create, …]` macro expands into a
-  `pub mod paths { pub use super::__autumn_path_show as show; … }` so
-  templates write `paths::show(post.id)` instead of
-  `format!("/posts/{}", post.id)`. A `name = "custom_name"` attribute
-  argument overrides the helper's short name. The `PathExt` trait
-  (re-exported from `autumn_web::prelude`) adds `.with_query("key",
-  value)` for building query strings with RFC 3986 percent-encoding.
-  `axum::response::Redirect` is re-exported as `autumn_web::Redirect` and
-  added to the prelude, replacing every hand-rolled meta-refresh HTML
-  redirect in the examples. `#[repository(api = "…")]` now also emits
-  path helpers (`__autumn_path_{prefix}_api_list()`,
-  `__autumn_path_{prefix}_api_delete(id)`, etc.) for its generated REST
-  endpoints. All five examples migrated: `git grep 'format!("/'
-  examples/` and `git grep 'fn redirect_to' examples/` both return zero
-  hits.
-
-- **authorization:** First-class record-level authorization — `Policy` /
-  `Scope` traits, `PolicyContext` carrying the resolved `Session` /
-  user / role set / `Db` handle / `PolicyRegistry`, an `#[authorize("action",
-  resource = Type)]` attribute macro that resolves the registered policy
-  and short-circuits with the configured deny response before the
-  handler body runs, a `policy = SomePolicy` argument on
-  `#[repository(api = "...")]` that wires the same checks into every
-  auto-generated POST/PUT/DELETE endpoint plus `GET /<api>/{id}` for
-  read scoping, a `scope = SomeScope` companion that constrains list
-  endpoints, a `Scoped` blanket trait that adds
-  `Post::scope(&ctx).load(&mut db).await?` ergonomics to every type
-  (mirroring Pundit's `policy_scope`), and a `[security]
-  forbidden_response = "404" | "403"` knob (default `"404"` to mirror
-  Rails / Phoenix and avoid leaking record existence). Register on the
-  app builder via `.policy::<R, _>(...)` / `.scope::<R, _>(...)`.
-  `examples/reddit-clone`'s `PostPolicy` replaces every hand-rolled
-  `if post.author_id != user_id` check; `git grep -n "author_id != user_id"
-  examples/reddit-clone/` now returns empty (#496).
-  - **Behavior change:** `#[repository(api = "...")]` without a paired
-    `policy = ...` argument is now a startup-time error in `prod`
-    profile builds. The escape hatch is `[security]
-    allow_unauthorized_repository_api = true`. Downstream apps using the
-    `api =` switch must add `policy = SomePolicy` (or opt out
-    explicitly) — this is the one behavior change downstream apps have
-    to address.
-- **storage:** New optional `autumn-web` `storage` cargo feature (off by default) introducing a pluggable file-storage abstraction (#494). Adds the `BlobStore` trait (`put`, `get`, `delete`, `head`, `presigned_url`, `put_stream`), the `Blob` value type with Postgres `JSONB` round-tripping via Diesel `AsExpression` / `FromSqlRow`, a `Local` backend with HMAC-signed URLs and an autumn-mounted serving route at `[storage.local].mount_path` (default `/_blobs`), the `add_blob_column!` migration helper macro, and a feature-gated `S3BlobStore` shell behind `storage-s3` (real SDK wiring tracked as #530). `MultipartField::save_to_blob_store` streams uploads straight through to `BlobStore::put_stream` without buffering, with multipart parser errors preserving their client-facing 4xx status. Profile-aware defaults mirror sessions: `dev` auto-defaults to `Local` rooted at `target/blobs/`; `prod` fails fast on `local` unless `storage.allow_local_in_production = true` is explicitly set. The local backend uses temp-file + cross-platform atomic-replace semantics so partial writes never leave corrupted blobs and re-uploads work on Windows as well as POSIX. `examples/reddit-clone` carries the database-backed UI demo (`Blob` column on the user model + upload form + presigned-URL profile picture); framework-level integration tests pin restart survival on the `Local` backend. Apps that don't enable `storage` see no surface change — this is non-breaking. See [`docs/guide/storage.md`](docs/guide/storage.md).
-- **seed:** New `autumn seed` CLI subcommand and `autumn_web::seed::SeedContext`
-  library surface for project-defined database seeding (#501). Convention:
-  seed code lives in `src/bin/seed.rs`; `autumn seed` runs it via
-  `cargo run --bin seed` after verifying the file exists and checking for
-  pending migrations (errors with an actionable message if either check
-  fails). Accepts `--profile <name>` (default `dev`) forwarded as
-  `AUTUMN_ENV` so seed binaries can branch on environment. New opt-in
-  `seed` cargo feature on `autumn-web` (enables `autumn_web::seed::SeedContext`
-  which wires database URL + profile resolution in one `.build().await` call)
-  — apps that don't seed pay zero compile cost. `autumn new --with-seed`
-  (default off) scaffolds a stub `src/bin/seed.rs` and the matching `[[bin]]`
-  entry. `examples/todo-app` ships a reference seed demonstrating the
-  count-based idempotency guard. New `docs/guide/seeding.md` documents the
-  full story. Non-breaking: existing apps without `src/bin/seed.rs` see no
-  behavior change.
-- **cli:** `autumn generate model | migration | scaffold` for one-command
-  resource scaffolding (#493). Emits `#[model]` structs, Diesel migrations,
-  `schema.rs` entries, `#[repository(api = ...)]` blocks, Maud HTML route
-  handlers, smoke tests, and updates `routes![]` in `src/main.rs`. Supports
-  the documented field-type DSL (`String`, `Text`, `i32`, `i64`, `bool`,
-  `f32`, `f64`, `Uuid`, `NaiveDateTime`, `DateTime`, `Vec<u8>`/`Bytea`, plus
-  `Option<…>` for any of them) and `--dry-run` / `--force` flags. New
-  `docs/guide/generators.md` walks through the five-commands-to-CRUD flow.
-  Non-breaking; no runtime surface changes.
-
+- 2 now builds from rust:{{rust_version}}-bookworm and installs cargo-chef, so rendered release images use the declared 1.88.0 MSRV instead of Rust 1.86.([f073899](https://github.com/madmax983/autumn/commit/f0738991cb83dada0b05406f35c517c7f96fdf46))
 ## [0.3.0] - 2026-04-27
 
 ### Added
