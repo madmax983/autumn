@@ -1122,3 +1122,56 @@ fn generate_scaffold_rejects_config_missing_resource_section() {
         "error must mention the config file name; got:\n{stderr}"
     );
 }
+
+/// Slow compile-check: scaffold a fresh project from a TOML config file and
+/// verify that `cargo check --tests` succeeds against the local `autumn-web`
+/// crate.  Ensures that the config-driven generator adds every dependency its
+/// emitted code needs (validator, maud, etc.) and that all generated files
+/// type-check without manual edits.
+///
+/// Ignored by default; run with:
+/// `cargo test -p autumn-cli --test generate generated_scaffold_config_cargo_checks -- --ignored --exact`
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_scaffold_config_cargo_checks() {
+    let (_tmp, project) = fresh_project("scaffold-config-build");
+
+    patch_generated_cargo_toml(&project);
+    let _ = fs::remove_file(project.join("build.rs"));
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.Bookmark]\n\
+         fields      = [\"url:String\", \"title:String\", \"tag:String\", \"alive:bool\"]\n\
+         indexes     = [\"url\", \"tag\"]\n\
+         validations = [\"url=url\", \"title=length:min=1,max=200\"]\n\
+         defaults    = [\"alive=true\"]\n\
+         queries     = [\"find_by_tag:tag\", \"find_by_alive:alive\"]\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Bookmark", "--config", "autumn.generate.toml"],
+    );
+
+    let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    for dep in ["chrono", "diesel", "diesel-async", "maud", "serde", "serde_urlencoded", "url", "validator"] {
+        assert!(
+            cargo_toml.contains(&format!("{dep} =")),
+            "Cargo.toml missing '{dep}' after config-driven scaffold"
+        );
+    }
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests", "--offline"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on config-driven scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}

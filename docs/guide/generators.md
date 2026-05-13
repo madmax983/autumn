@@ -341,13 +341,63 @@ intentionally small and documents which gaps are outside the generic generator:
 | Hourly `#[scheduled]` link checker | Operational workflow; generate or write a task separately. |
 | Mounting `POST`/`PUT`/`DELETE` JSON API routes | Application policy; scaffold keeps only read APIs registered by default. |
 
+### Reusable scaffold config (`autumn.generate.toml`)
+
+Long scaffolds with many metadata flags can be checked in as a TOML file
+so the intent is reviewable and reproducible without spelunking shell
+history. Create a file at any path — `autumn.generate.toml` is the
+conventional name — with one `[scaffold.<ResourceName>]` section per
+resource:
+
+```toml
+[scaffold.Bookmark]
+fields      = ["url:String", "title:String", "tag:String", "alive:bool"]
+indexes     = ["url", "tag"]
+validations = ["url=url", "title=length:min=1,max=200"]
+defaults    = ["alive=true"]
+queries     = ["find_by_tag:tag", "find_by_alive:alive"]
+```
+
+Pass the file with `--config`:
+
+```bash
+autumn generate scaffold Bookmark --config autumn.generate.toml
+```
+
+All the same keys are supported as their CLI counterparts — see the
+metadata flags table above for the accepted syntax of each.
+
+**Precedence rules (CLI wins):** if a CLI flag is supplied alongside
+`--config`, it completely replaces the corresponding TOML list for that
+key. An empty CLI slice (i.e. the flag was not passed) falls back to the
+TOML value. This matches normal CLI ergonomics where the explicit flag is
+always authoritative:
+
+| Scenario | Effective value |
+|---|---|
+| TOML only | TOML list |
+| CLI only (no `--config`) | CLI list |
+| Both, CLI non-empty | CLI list (TOML ignored for that key) |
+| Both, CLI empty / flag absent | TOML list |
+
+This applies independently to each key: you can keep `fields` and
+`validations` from TOML while overriding `indexes` on the CLI for a
+one-off variant.
+
+The config is additive, not a replacement — existing CLI flags always
+work without a config file, and the config never changes the output of
+any previously working invocation.
+
 ### Slow live scaffold verification
 
 The CLI test suite includes two ignored scaffold checks:
 
 ```bash
-# Compile-check the generated app and its generated smoke test.
+# Compile-check the generated app and its generated smoke test (CLI flags).
 cargo test -p autumn-cli --test generate generated_scaffold_cargo_checks -- --ignored --exact
+
+# Compile-check a config-file-driven scaffold (--config flag).
+cargo test -p autumn-cli --test generate generated_scaffold_config_cargo_checks -- --ignored --exact
 
 # Boot Postgres, run `autumn migrate`, start the generated server, and
 # verify GET /posts and GET /api/posts over real HTTP.
