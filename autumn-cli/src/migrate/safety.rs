@@ -75,10 +75,33 @@ pub fn classify_sql(sql: &str) -> Vec<SafetyFinding> {
     // semicolon inside a block comment (e.g. `/* note; end */`) does not produce
     // a spurious empty statement fragment.
     let without_block_comments = strip_block_comments(sql);
-    split_statements(&without_block_comments)
+    let stmts = split_statements(&without_block_comments);
+
+    // Tables created within this migration have no existing rows or live traffic,
+    // so a non-concurrent index build on them is safe.  Collect the names upfront
+    // so we can suppress the false-positive PotentiallyBlocking finding for those
+    // tables when we encounter their CREATE INDEX statements below.
+    let newly_created: Vec<String> = stmts
+        .iter()
+        .filter(|s| !has_review_suppression(s))
+        .filter_map(|s| extract_created_table_name(&normalize_statement(s)))
+        .collect();
+
+    stmts
         .iter()
         .filter(|stmt| !has_review_suppression(stmt))
-        .flat_map(|stmt| classify_statement(&normalize_statement(stmt)))
+        .flat_map(|stmt| {
+            let normalized = normalize_statement(stmt);
+            let mut findings = classify_statement(&normalized);
+            // Drop any non-concurrent-index finding whose table was created earlier
+            // in this same migration file.
+            findings.retain(|f| {
+                f.operation != "CREATE INDEX (non-concurrent)"
+                    || extract_index_table_name(&normalized)
+                        .is_none_or(|t| !newly_created.iter().any(|c| c == t))
+            });
+            findings
+        })
         .collect()
 }
 
@@ -105,6 +128,25 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/// Extract the table name from a normalized `CREATE TABLE [IF NOT EXISTS] name …` statement.
+fn extract_created_table_name(normalized: &str) -> Option<String> {
+    let rest = normalized.strip_prefix("create table ")?;
+    let rest = rest.strip_prefix("if not exists ").unwrap_or(rest);
+    let name = rest.split([' ', '(']).next()?;
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// Extract the target table name from a normalized `CREATE [UNIQUE] INDEX … ON name …` statement.
+fn extract_index_table_name(normalized: &str) -> Option<&str> {
+    let after_on = normalized.find(" on ").map(|i| &normalized[i + 4..])?;
+    let name = after_on.split([' ', '(']).next()?;
+    if name.is_empty() { None } else { Some(name) }
+}
 
 /// Split `sql` into individual statements, using `;` as the delimiter.
 ///
@@ -951,6 +993,45 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
         assert_eq!(findings[0].operation, "CREATE INDEX (non-concurrent)");
+    }
+
+    #[test]
+    fn non_concurrent_index_on_newly_created_table_is_safe() {
+        // The table is created in the same migration — no existing rows to lock.
+        // This is the shape emitted by `autumn generate ... --index`.
+        let sql = "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL);\n\
+                   CREATE INDEX idx_posts_title ON posts (title);";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "non-concurrent index on a table created in the same migration must be safe: \
+             {findings:?}"
+        );
+    }
+
+    #[test]
+    fn unique_non_concurrent_index_on_newly_created_table_is_safe() {
+        let sql = "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY, slug TEXT NOT NULL);\n\
+                   CREATE UNIQUE INDEX idx_posts_slug ON posts (slug);";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.is_empty(),
+            "non-concurrent unique index on a newly created table must be safe: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_concurrent_index_on_different_table_is_still_blocking() {
+        // CREATE TABLE `posts` does not exempt an index on a different table `comments`.
+        let sql = "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY);\n\
+                   CREATE INDEX idx_comments_post_id ON comments (post_id);";
+        let findings = classify_sql(sql);
+        assert_eq!(
+            findings.len(),
+            1,
+            "non-concurrent index on a pre-existing table must still be flagged: {findings:?}"
+        );
+        assert_eq!(findings[0].risk, RiskLevel::PotentiallyBlocking);
     }
 
     // ── multi-statement SQL ───────────────────────────────────────────────────
